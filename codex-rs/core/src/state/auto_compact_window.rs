@@ -93,10 +93,7 @@ impl AutoCompactWindow {
     }
 
     pub(super) fn set_estimated_prefill(&mut self, tokens: i64) {
-        if matches!(
-            self.prefill_input_tokens,
-            Some(AutoCompactWindowPrefill::ServerObserved(_))
-        ) {
+        if self.prefill_input_tokens.is_some() {
             return;
         }
 
@@ -128,6 +125,20 @@ impl AutoCompactWindow {
 mod tests {
     use super::*;
     use pretty_assertions::assert_eq;
+
+    #[test]
+    fn repeated_missing_usage_estimates_do_not_rebase_window_growth() {
+        let mut window = AutoCompactWindow::new_with_ids(AutoCompactWindowIds::new_initial());
+        window.set_estimated_prefill(100);
+        window.set_estimated_prefill(150);
+        window.set_estimated_prefill(200);
+        assert_eq!(window.snapshot().prefill_input_tokens, Some(100));
+        window.ensure_server_observed_prefill_from_usage(&TokenUsage { input_tokens: 125, ..Default::default() });
+        assert_eq!(window.snapshot().prefill_input_tokens, Some(125));
+        window.advance();
+        window.set_estimated_prefill(300);
+        assert_eq!(window.snapshot().prefill_input_tokens, Some(300));
+    }
 
     #[test]
     fn tracks_prefill_and_window_boundaries() {

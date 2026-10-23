@@ -11,6 +11,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::LazyLock;
 use std::sync::Mutex;
+use std::sync::Once;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 use std::time::Instant;
@@ -346,8 +347,8 @@ impl CodexAppsToolsCache {
         auth_key: CodexAppsToolsCacheKey,
     ) -> CodexAppsToolsCacheContext {
         let cache = self.clone();
-        // Cold seeding holds the registry lock, so lock acquisition belongs on
-        // the worker as well; warm callers must never wait on it on the executor.
+        // Cold disk seeding and registry acquisition both belong on a worker,
+        // but unrelated warm entries must not wait behind that disk I/O.
         tokio::task::spawn_blocking(move || cache.context_blocking(codex_home, auth_key))
             .await
             .expect("Codex Apps cache initialization worker failed")
@@ -358,11 +359,25 @@ impl CodexAppsToolsCache {
         codex_home: PathBuf,
         auth_key: CodexAppsToolsCacheKey,
     ) -> CodexAppsToolsCacheContext {
+        self.context_blocking_with_seed(
+            codex_home,
+            auth_key,
+            load_cached_codex_apps_tools_for_identity,
+        )
+    }
+
+    fn context_blocking_with_seed(
+        &self,
+        codex_home: PathBuf,
+        auth_key: CodexAppsToolsCacheKey,
+        load: impl FnOnce(&CodexAppsToolsCacheIdentity) -> Option<Vec<ToolInfo>>,
+    ) -> CodexAppsToolsCacheContext {
         let identity = CodexAppsToolsCacheIdentity {
             codex_home,
             auth_key,
         };
         let entry = lock_unpoisoned(&self.entries).context_entry(identity);
+        entry.seed_with(|| load(&entry.identity));
         CodexAppsToolsCacheContext { entry }
     }
 }
@@ -389,6 +404,7 @@ pub(crate) struct CodexAppsToolsFetchTicket {
 
 struct CodexAppsToolsCacheEntry {
     identity: CodexAppsToolsCacheIdentity,
+    disk_seed: Once,
     current_snapshot: ArcSwapOption<CodexAppsToolsSnapshot>,
     next_fetch_generation: AtomicU64,
     last_accepted_generation: Mutex<u64>,
@@ -396,19 +412,33 @@ struct CodexAppsToolsCacheEntry {
 
 impl CodexAppsToolsCacheEntry {
     fn new(identity: CodexAppsToolsCacheIdentity) -> Self {
-        let current_snapshot = load_cached_codex_apps_tools_for_identity(&identity).map(|tools| {
-            Arc::new(CodexAppsToolsSnapshot {
-                tools,
-                published_at: None,
-                content_revision: 0,
-            })
-        });
         Self {
             identity,
-            current_snapshot: ArcSwapOption::from(current_snapshot),
+            disk_seed: Once::new(),
+            current_snapshot: ArcSwapOption::empty(),
             next_fetch_generation: AtomicU64::new(0),
             last_accepted_generation: Mutex::new(0),
         }
+    }
+
+    fn seed_with(&self, load: impl FnOnce() -> Option<Vec<ToolInfo>>) {
+        self.disk_seed.call_once(|| {
+            // Only same-identity cold callers wait for this read. The registry
+            // has already released its lock and the retained Arc prevents pruning.
+            let tools = load();
+            let generation = lock_unpoisoned(&self.last_accepted_generation);
+            // Publication shares this short critical section: an old disk read
+            // must never overwrite a live catalog that won while it was loading.
+            if *generation == 0 && self.current_snapshot.load_full().is_none() {
+                self.current_snapshot.store(tools.map(|tools| {
+                    Arc::new(CodexAppsToolsSnapshot {
+                        tools,
+                        published_at: None,
+                        content_revision: 0,
+                    })
+                }));
+            }
+        });
     }
 }
 

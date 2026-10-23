@@ -1,4 +1,7 @@
 use super::*;
+#[cfg(test)]
+#[path = "spawn_audit151_tests.rs"]
+mod audit151_tests;
 use crate::agent::control::SpawnAgentForkMode;
 use crate::agent::control::SpawnAgentOptions;
 use crate::agent::next_thread_spawn_depth;
@@ -35,16 +38,21 @@ use codex_agent_task_store::TaskCapsuleHandle;
 use codex_agent_task_store::TaskCapsuleV1;
 use codex_agent_task_store::WorkspaceStrategy;
 use codex_agent_task_store::normalize_repo_path;
+use codex_agent_task_store::normalize_repo_scopes;
+use codex_agent_task_store::repo_path_identity_keys;
 use codex_context_fragments::ModelContextBudget;
 use codex_git_utils::get_git_repo_root;
 use codex_otel::SessionTelemetry;
 use codex_protocol::AgentPath;
 use codex_protocol::ThreadId;
 use codex_protocol::error::CodexErr;
+use codex_protocol::protocol::SessionSource;
+use codex_protocol::protocol::SubAgentSource;
 use codex_tools::ToolSpec;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use sha2::Digest;
 use sha2::Sha256;
+use std::collections::BTreeSet;
 use std::collections::HashSet;
 use std::io::ErrorKind;
 use std::path::Path;
@@ -63,6 +71,8 @@ use uuid::Uuid;
 
 const MAX_OVERLAY_SNAPSHOT_FILE_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_OVERLAY_SNAPSHOT_TOTAL_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_WORKTREE_GIT_STDOUT_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_WORKTREE_GIT_STDERR_BYTES: u64 = 1024 * 1024;
 const WORKTREE_GIT_TIMEOUT: Duration = Duration::from_secs(120);
 
 #[derive(Default)]
@@ -168,7 +178,8 @@ async fn handle_spawn_agent(
     } else {
         // The legacy message shape remains accepted and receives a durable repository-scoped
         // diagnostic claim so its identity and overlap remain visible without blocking work.
-        AgentRole::Worker
+        // A read-only agent_type that the compatibility claim can satisfy keeps its role.
+        legacy_message_role(args.agent_type.as_deref())
     };
     let fork_mode = args.fork_mode(
         typed_role,
@@ -205,6 +216,9 @@ async fn handle_spawn_agent(
         (None, true) => None,
     };
     let legacy_parent_assignment_id = if turn.session_source.is_non_root_agent() {
+        if matches!(&turn.session_source, SessionSource::SubAgent(SubAgentSource::Other(label)) if label.starts_with("agent_job:")) {
+            return Err(FunctionCallError::RespondToModel("CSV workers cannot spawn nested agents until structured ancestry is supported; ask the root agent to delegate".into()));
+        }
         let coordinator = session.services.agent_control.task_coordinator();
         match coordinator.binding_for_turn(&turn) {
             Some(binding) => {
@@ -303,7 +317,8 @@ async fn handle_spawn_agent(
     config.cwd = admission_cwd.clone();
 
     // Every V2 spawn becomes a durable typed assignment. Legacy message-shaped
-    // calls have no explicit agent_type, but their durable role is Worker, so
+    // calls have no explicit contract; their durable role is Worker unless
+    // legacy_message_role keeps a read-only Explorer, so
     // carry that canonical role through admission instead of constructing a
     // role-less ThreadSpawn source that typed admission must reject.
     // The spawn source stores the durable assignment role, not the optional
@@ -349,8 +364,22 @@ async fn handle_spawn_agent(
                 .await
                 .map_err(typed_task_store_error)?
             {
+                let requested_handles = reuse_request_handles(
+                    matches!(fork_mode, Some(SpawnAgentForkMode::TaskCapsule)),
+                    &repo_root,
+                    &assignment.read_scope,
+                    &assignment.write_scope,
+                    assignment.relevant_handles.clone(),
+                )
+                .await?;
+                let result = reusable_spawn_result(
+                    &session.services.agent_control,
+                    existing,
+                    requested_handles.as_deref(),
+                )
+                .await?;
                 emit_admission_reuse_metric(&turn.session_telemetry);
-                return reusable_spawn_result(coordinator, existing).await;
+                return Ok(result);
             }
         }
     }
@@ -554,6 +583,7 @@ async fn handle_spawn_agent(
                         )
                     })?,
                     legacy_parent_assignment_id,
+                    role,
                 ),
                 Vec::new(),
             ),
@@ -594,6 +624,9 @@ async fn handle_spawn_agent(
                 return Err(collab_spawn_error(error));
             }
         };
+        // A duplicate rejection can offer reuse, whose handles must validate
+        // against these requested scopes exactly as this fresh launch would.
+        let requested_scopes = (draft.read_scope.clone(), draft.write_scope.clone());
         let admitted = match coordinator
             .create_admitted_assignment(
                 &repo_root,
@@ -611,7 +644,6 @@ async fn handle_spawn_agent(
                     reusable_assignment_id: Some(assignment_id),
                 } = &error
                 {
-                    emit_admission_reuse_metric(&turn.session_telemetry);
                     if let Some(workspace) = isolated_workspace.take()
                         && let Err(cleanup_error) = cleanup_isolated_worktree(&workspace).await
                     {
@@ -621,7 +653,23 @@ async fn handle_spawn_agent(
                             "failed to clean isolated worktree after assignment reuse"
                         );
                     }
-                    return reusable_spawn_result(coordinator, *assignment_id).await;
+                    let (read_scope, write_scope) = &requested_scopes;
+                    let requested_handles = reuse_request_handles(
+                        matches!(fork_mode, Some(SpawnAgentForkMode::TaskCapsule)),
+                        &repo_root,
+                        read_scope,
+                        write_scope,
+                        relevant_handles,
+                    )
+                    .await?;
+                    let result = reusable_spawn_result(
+                        &session.services.agent_control,
+                        *assignment_id,
+                        requested_handles.as_deref(),
+                    )
+                    .await?;
+                    emit_admission_reuse_metric(&turn.session_telemetry);
+                    return Ok(result);
                 }
                 emit_admission_rejection_metric(&turn.session_telemetry, &error);
                 if let Some(workspace) = isolated_workspace.take()
@@ -1037,6 +1085,11 @@ fn emit_admission_rejection_metric(session_telemetry: &SessionTelemetry, error: 
             AdmissionRejectionReason::IsolatedIntegratorUnavailable => {
                 ("isolated_integrator_unavailable", None, 0)
             }
+            AdmissionRejectionReason::ExternalWorkspaceWriter => (
+                "external_workspace_writer",
+                Some("external_write_overlap"),
+                1,
+            ),
         },
         _ => ("other", None, 0),
     };
@@ -1073,18 +1126,50 @@ fn emit_admission_reuse_metric(session_telemetry: &SessionTelemetry) {
     );
 }
 
+/// `requested_handles` are the canonical capsule handles a fresh launch of the
+/// request would attach; `None` when that launch would ignore handles.
 async fn reusable_spawn_result(
-    coordinator: &crate::agent::task_coordinator::AgentTaskCoordinator,
+    control: &crate::agent::AgentControl,
     assignment_id: AssignmentId,
+    requested_handles: Option<&[TaskCapsuleHandle]>,
 ) -> Result<SpawnAgentResult, FunctionCallError> {
-    let task = coordinator
-        .get_agent_task(assignment_id, None)
-        .await
-        .map_err(typed_task_store_error)?;
+    let coordinator = control.task_coordinator();
     let binding = coordinator
         .get_agent_task_binding(assignment_id)
         .await
         .map_err(typed_task_store_error)?;
+    let producer = binding
+        .as_ref()
+        .and_then(|binding| binding.thread_id.as_deref())
+        .and_then(|thread| ThreadId::from_string(thread).ok());
+    let producer_running = match producer {
+        Some(thread) => control.has_running_agent(thread).await,
+        None => false,
+    };
+    // Recheck durable authority after the asynchronous liveness observation,
+    // never return an earlier Active snapshot for a superseded attempt.
+    let task = coordinator
+        .get_agent_task(assignment_id, None)
+        .await
+        .map_err(typed_task_store_error)?;
+    if !producer_running
+        || binding
+            .as_ref()
+            .is_none_or(|binding| binding.attempt_id != task.current_attempt.attempt_id)
+        || task.current_attempt.state != codex_agent_task_store::AttemptState::Active
+        || task.receipt.is_some()
+    {
+        return Err(FunctionCallError::RespondToModel(format!(
+            "spawn_agent: matching assignment {assignment_id} has no verified running producer. Resume or reconcile/abandon that assignment before requesting a replacement. No investigation was reused and no duplicate was started."
+        )));
+    }
+    if let Some(requested) = requested_handles
+        && !capsule_handles_match(task.assignment.task_capsule.as_deref(), requested)
+    {
+        return Err(FunctionCallError::RespondToModel(format!(
+            "spawn_agent: matching assignment {assignment_id} was launched with different relevant_handles. Wait for that assignment or request a distinct investigation. No investigation was reused and no duplicate was started."
+        )));
+    }
     let task_name = binding
         .as_ref()
         .map(|binding| binding.agent_path.clone())
@@ -1299,6 +1384,18 @@ async fn capture_workspace_overlay(
     cancellation_token: &CancellationToken,
     terminal_tasks: &TaskTracker,
 ) -> Result<WorkspaceOverlay, FunctionCallError> {
+    let mut index_command = Command::new(codex_git_utils::git_executable_async().await);
+    index_command.arg("-C").arg(repo_root).args(["ls-files", "--stage", "-z"]);
+    let index = run_worktree_git(index_command, None, cancellation_token, terminal_tasks)
+        .await.map_err(|error| FunctionCallError::RespondToModel(format!("spawn_agent: snapshot index capture failed: {error}")))?;
+    if !index.status.success() {
+        return Err(FunctionCallError::RespondToModel("spawn_agent: could not inspect snapshot index".into()));
+    }
+    if index.stdout.split(|byte| *byte == 0).any(|entry| entry.starts_with(b"160000 ")) {
+        return Err(FunctionCallError::RespondToModel(
+            "spawn_agent: unsupported_snapshot_submodule: isolated snapshots do not materialize submodules; use a shared workspace or an explicitly prepared checkout".into(),
+        ));
+    }
     let mut head_command = Command::new(codex_git_utils::git_executable_async().await);
     head_command
         .arg("-C")
@@ -1324,7 +1421,7 @@ async fn capture_workspace_overlay(
     diff_command
         .arg("-C")
         .arg(repo_root)
-        .args(["diff", "--binary", "--no-ext-diff", &head, "--"]);
+        .args(["diff", "--binary", "--no-ext-diff", "--no-textconv", "--src-prefix=a/", "--dst-prefix=b/", &head, "--"]);
     let mut untracked_command = Command::new(codex_git_utils::git_executable_async().await);
     untracked_command.arg("-C").arg(repo_root).args([
         "ls-files",
@@ -1385,22 +1482,55 @@ async fn capture_workspace_overlay(
             String::from_utf8_lossy(&tracked_paths.stderr).trim()
         )));
     }
-    let mut working_files = Vec::new();
-    let mut total_file_bytes = 0u64;
-    // Git patches use clean-filtered content, so applying one alone can change
-    // working bytes (notably LF/CRLF). Reapply captured regular-file bytes after
-    // the patch handles deletes, modes, and tracked symlinks.
-    let paths = untracked
-        .stdout
-        .split(|byte| *byte == 0)
-        .map(|path| (path, false))
-        .chain(
-            tracked_paths
+    let repo_root = repo_root.to_path_buf();
+    let cancellation = cancellation_token.child_token();
+    let _cancel_on_drop = cancellation.clone().drop_guard();
+    // One tracked blocking job per capture, not metadata/open/read jobs for every
+    // file. Observer drops cancel read-only work between files.
+    let working_files = terminal_tasks
+        .spawn_blocking(move || {
+            let paths = untracked
                 .stdout
                 .split(|byte| *byte == 0)
-                .map(|path| (path, true)),
-        );
+                .map(|path| (path, false))
+                .chain(
+                    tracked_paths
+                        .stdout
+                        .split(|byte| *byte == 0)
+                        .map(|path| (path, true)),
+                );
+            capture_working_file_snapshot(&repo_root, paths, &cancellation)
+        })
+        .await
+        .map_err(|error| {
+            FunctionCallError::RespondToModel(format!(
+                "spawn_agent: working file snapshot worker failed: {error}"
+            ))
+        })??;
+    Ok(WorkspaceOverlay {
+        head,
+        tracked_diff: diff.stdout,
+        working_files,
+    })
+}
+
+fn capture_working_file_snapshot<'a>(
+    repo_root: &Path,
+    paths: impl IntoIterator<Item = (&'a [u8], bool)>,
+    cancellation_token: &CancellationToken,
+) -> Result<Vec<(PathBuf, Vec<u8>)>, FunctionCallError> {
+    use std::io::Read;
+
+    let mut working_files = Vec::new();
+    let mut total_file_bytes = 0u64;
+    // Git patches handle deletes, modes and tracked symlinks. Preserve the
+    // original regular-file bytes, including under clean filters/CRLF settings.
     for (raw_path, tracked) in paths {
+        if cancellation_token.is_cancelled() {
+            return Err(FunctionCallError::RespondToModel(
+                "spawn_agent: working file snapshot cancelled".to_string(),
+            ));
+        }
         if raw_path.is_empty() {
             continue;
         }
@@ -1410,14 +1540,12 @@ async fn capture_workspace_overlay(
             )
         })?);
         let source = repo_root.join(&path);
-        let metadata = tokio::fs::symlink_metadata(&source)
-            .await
-            .map_err(|error| {
-                FunctionCallError::RespondToModel(format!(
-                    "spawn_agent: could not inspect working file {}: {error}",
-                    path.display()
-                ))
-            })?;
+        let metadata = std::fs::symlink_metadata(&source).map_err(|error| {
+            FunctionCallError::RespondToModel(format!(
+                "spawn_agent: could not inspect working file {}: {error}",
+                path.display()
+            ))
+        })?;
         if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
             if tracked {
                 continue;
@@ -1447,7 +1575,7 @@ async fn capture_workspace_overlay(
                 "spawn_agent: working files exceed the isolated snapshot limit of {MAX_OVERLAY_SNAPSHOT_TOTAL_BYTES} bytes"
             )));
         }
-        let file = tokio::fs::File::open(&source).await.map_err(|error| {
+        let file = std::fs::File::open(&source).map_err(|error| {
             FunctionCallError::RespondToModel(format!(
                 "spawn_agent: could not snapshot working file {}: {error}",
                 path.display()
@@ -1456,7 +1584,6 @@ async fn capture_workspace_overlay(
         let mut bytes = Vec::with_capacity(usize::try_from(metadata.len()).unwrap_or(0));
         file.take(MAX_OVERLAY_SNAPSHOT_FILE_BYTES + 1)
             .read_to_end(&mut bytes)
-            .await
             .map_err(|error| {
                 FunctionCallError::RespondToModel(format!(
                     "spawn_agent: could not snapshot working file {}: {error}",
@@ -1472,11 +1599,7 @@ async fn capture_workspace_overlay(
         working_files.push((path, bytes));
     }
     working_files.sort_by(|left, right| left.0.cmp(&right.0));
-    Ok(WorkspaceOverlay {
-        head,
-        tracked_diff: diff.stdout,
-        working_files,
-    })
+    Ok(working_files)
 }
 
 #[cfg(unix)]
@@ -1551,8 +1674,8 @@ async fn run_worktree_git(
                     Ok::<(), std::io::Error>(())
                 };
                 let (_, _, _, status) = tokio::try_join!(write_input,
-                    stdout.read_to_end(&mut stdout_bytes),
-                    stderr.read_to_end(&mut stderr_bytes), child.wait())?;
+                    read_worktree_output(&mut stdout, &mut stdout_bytes, MAX_WORKTREE_GIT_STDOUT_BYTES),
+                    read_worktree_output(&mut stderr, &mut stderr_bytes, MAX_WORKTREE_GIT_STDERR_BYTES), child.wait())?;
                 Ok(status)
             };
             tokio::select! {
@@ -1573,6 +1696,18 @@ async fn run_worktree_git(
         }
         result.map(|status| std::process::Output {status, stdout: stdout_bytes, stderr: stderr_bytes})
     }).await.map_err(std::io::Error::other)?
+}
+
+async fn read_worktree_output(
+    reader: &mut (impl tokio::io::AsyncRead + Unpin),
+    bytes: &mut Vec<u8>,
+    limit: u64,
+) -> std::io::Result<()> {
+    reader.take(limit + 1).read_to_end(bytes).await?;
+    if bytes.len() as u64 > limit {
+        return Err(std::io::Error::other("snapshot_git_output_limit: Git output exceeded its independent byte budget"));
+    }
+    Ok(())
 }
 
 async fn await_spawn_or_cancel<T>(
@@ -1678,6 +1813,9 @@ impl CoreToolRuntime for Handler {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SpawnAgentArgs {
+    /// Other agent APIs call this task text `prompt` or `instructions`; the
+    /// published schema lists both aliases. Supplying two spellings is rejected.
+    #[serde(alias = "prompt", alias = "instructions")]
     message: Option<String>,
     assignment: Option<TypedAssignmentArgs>,
     task_name: String,
@@ -1808,29 +1946,51 @@ impl TypedAssignmentArgs {
     }
 }
 
+/// Durable role for the compatibility message shape, which carries no explicit
+/// contract. Only Explorer is a read-only role that such a message can satisfy:
+/// a successful Architect receipt must seal an ArchitectureContractV1, and
+/// reviewers and verifiers need a target relation. Every other agent_type,
+/// including absent, custom, and unknown names, keeps the Worker claim.
+fn legacy_message_role(agent_type: Option<&str>) -> AgentRole {
+    match parse_typed_role(agent_type) {
+        Ok(AgentRole::Explorer) => AgentRole::Explorer,
+        _ => AgentRole::Worker,
+    }
+}
+
 fn legacy_message_draft(
     root_session_id: String,
     message: &str,
     parent_assignment_id: Option<AssignmentId>,
+    role: AgentRole,
 ) -> AssignmentDraft {
+    // The claim covers the whole repository. Only a Worker claims it for
+    // writing; a read-only role reads it and keeps an empty write scope, so it
+    // never becomes a conflicting writer during integration planning.
+    let repository = vec![RepoScope {
+        path: ".".to_string(),
+        recursive: true,
+    }];
+    let (read_scope, write_scope) = if role == AgentRole::Worker {
+        (Vec::new(), repository)
+    } else {
+        (repository, Vec::new())
+    };
     AssignmentDraft {
         root_session_id,
         admission_origin: AssignmentAdmissionOrigin::LegacyMessage {
             parent_assignment_id,
         },
-        role: AgentRole::Worker,
-        capability_profile: AgentRole::Worker.capability_profile(),
+        role,
+        capability_profile: role.capability_profile(),
         objective: message.to_string(),
         acceptance_criteria: vec![AcceptanceCriterion {
             evidence_policy: None,
             id: "legacy-message-result".to_string(),
             text: "Return a final response for the requested task to the parent agent.".to_string(),
         }],
-        read_scope: Vec::new(),
-        write_scope: vec![RepoScope {
-            path: ".".to_string(),
-            recursive: true,
-        }],
+        read_scope,
+        write_scope,
         stop_condition: "Stop after reporting the requested result to the parent agent."
             .to_string(),
         dependencies: Vec::new(),
@@ -1854,83 +2014,10 @@ async fn construct_and_attach_task_capsule(
     let scopes = assignment
         .read_scope
         .iter()
-        .chain(assignment.write_scope.iter())
+        .chain(&assignment.write_scope)
+        .cloned()
         .collect::<Vec<_>>();
-    let mut normalized_handles = Vec::with_capacity(handles.len());
-    let mut file_handles = HashSet::new();
-    let mut symbol_handles = HashSet::new();
-
-    let normalization_root = repo_root.to_path_buf();
-    let handles = tokio::task::spawn_blocking(move || {
-        handles
-            .into_iter()
-            .map(|handle| {
-                let path = normalize_repo_path(&normalization_root, handle.path())?;
-                Ok((handle, path))
-            })
-            .collect::<Result<Vec<_>, StoreError>>()
-    })
-    .await
-    .map_err(|error| {
-        StoreError::CorruptData(format!("task capsule handle normalization failed: {error}"))
-    })??;
-    for (handle, path) in handles {
-        if !scopes.iter().any(|scope| scope.covers_path(&path)) {
-            return Err(StoreError::InvalidTaskCapsule(format!(
-                "relevant handle {path:?} is outside the assignment read/write scope"
-            )));
-        }
-        let existed = match tokio::fs::metadata(repo_root.join(&path)).await {
-            Ok(metadata) if metadata.is_dir() => {
-                return Err(StoreError::InvalidTaskCapsule(format!(
-                    "relevant handle {path:?} resolves to a directory"
-                )));
-            }
-            Ok(metadata) if !metadata.is_file() => {
-                return Err(StoreError::InvalidTaskCapsule(format!(
-                    "relevant handle {path:?} is not a regular file"
-                )));
-            }
-            Ok(_) => true,
-            Err(error) if error.kind() == ErrorKind::NotFound => false,
-            Err(error) => return Err(StoreError::Io(error)),
-        };
-
-        let path_key = path.to_ascii_lowercase();
-        match handle {
-            RelevantHandle::File { .. } => {
-                if !file_handles.insert(path_key) {
-                    return Err(StoreError::InvalidTaskCapsule(format!(
-                        "duplicate file handle for {path:?}"
-                    )));
-                }
-                normalized_handles.push(TaskCapsuleHandle::File {
-                    path,
-                    existed,
-                    content_hash: None,
-                });
-            }
-            RelevantHandle::Symbol { symbol, .. } => {
-                let symbol = symbol.trim().to_string();
-                if symbol.is_empty() {
-                    return Err(StoreError::InvalidTaskCapsule(format!(
-                        "symbol handle for {path:?} has an empty locator"
-                    )));
-                }
-                if !symbol_handles.insert((path_key, symbol.clone())) {
-                    return Err(StoreError::InvalidTaskCapsule(format!(
-                        "duplicate symbol handle for {path:?} and locator {symbol:?}"
-                    )));
-                }
-                normalized_handles.push(TaskCapsuleHandle::Symbol {
-                    path,
-                    symbol,
-                    existed,
-                    content_hash: None,
-                });
-            }
-        }
-    }
+    let normalized_handles = normalize_relevant_handles(repo_root, &scopes, handles).await?;
 
     let capsule = TaskCapsuleV1 {
         schema_version: 1,
@@ -1971,6 +2058,165 @@ async fn construct_and_attach_task_capsule(
         )
         .await?;
     Ok(canonical_payload)
+}
+
+/// Normalize relevant handles exactly as a TaskCapsule launch attaches them:
+/// covered by the assignment scopes, regular files only, and unique under the
+/// store's canonical path identity rather than independent case folding.
+async fn normalize_relevant_handles(
+    repo_root: &Path,
+    scopes: &[RepoScope],
+    handles: Vec<RelevantHandle>,
+) -> Result<Vec<TaskCapsuleHandle>, StoreError> {
+    let mut normalized_handles = Vec::with_capacity(handles.len());
+    let mut file_handles = HashSet::new();
+    let mut symbol_handles = HashSet::new();
+
+    let normalization_root = repo_root.to_path_buf();
+    let handles = tokio::task::spawn_blocking(move || {
+        let handles = handles
+            .into_iter()
+            .map(|handle| {
+                let path = normalize_repo_path(&normalization_root, handle.path())?;
+                Ok((handle, path))
+            })
+            .collect::<Result<Vec<_>, StoreError>>()?;
+        let paths = handles
+            .iter()
+            .map(|(_, path)| path.clone())
+            .collect::<Vec<_>>();
+        let keys = repo_path_identity_keys(&normalization_root, &paths)?;
+        Ok::<_, StoreError>(
+            handles
+                .into_iter()
+                .zip(keys)
+                .map(|((handle, path), key)| (handle, path, key))
+                .collect::<Vec<_>>(),
+        )
+    })
+    .await
+    .map_err(|error| {
+        StoreError::CorruptData(format!("task capsule handle normalization failed: {error}"))
+    })??;
+    for (handle, path, path_key) in handles {
+        if !scopes.iter().any(|scope| scope.covers_path(&path)) {
+            return Err(StoreError::InvalidTaskCapsule(format!(
+                "relevant handle {path:?} is outside the assignment read/write scope"
+            )));
+        }
+        let existed = match tokio::fs::metadata(repo_root.join(&path)).await {
+            Ok(metadata) if metadata.is_dir() => {
+                return Err(StoreError::InvalidTaskCapsule(format!(
+                    "relevant handle {path:?} resolves to a directory"
+                )));
+            }
+            Ok(metadata) if !metadata.is_file() => {
+                return Err(StoreError::InvalidTaskCapsule(format!(
+                    "relevant handle {path:?} is not a regular file"
+                )));
+            }
+            Ok(_) => true,
+            Err(error) if error.kind() == ErrorKind::NotFound => false,
+            Err(error) => return Err(StoreError::Io(error)),
+        };
+
+        match handle {
+            RelevantHandle::File { .. } => {
+                if !file_handles.insert(path_key) {
+                    return Err(StoreError::InvalidTaskCapsule(format!(
+                        "duplicate file handle for {path:?}"
+                    )));
+                }
+                normalized_handles.push(TaskCapsuleHandle::File {
+                    path,
+                    existed,
+                    content_hash: None,
+                });
+            }
+            RelevantHandle::Symbol { symbol, .. } => {
+                let symbol = symbol.trim().to_string();
+                if symbol.is_empty() {
+                    return Err(StoreError::InvalidTaskCapsule(format!(
+                        "symbol handle for {path:?} has an empty locator"
+                    )));
+                }
+                if !symbol_handles.insert((path_key, symbol.clone())) {
+                    return Err(StoreError::InvalidTaskCapsule(format!(
+                        "duplicate symbol handle for {path:?} and locator {symbol:?}"
+                    )));
+                }
+                normalized_handles.push(TaskCapsuleHandle::Symbol {
+                    path,
+                    symbol,
+                    existed,
+                    content_hash: None,
+                });
+            }
+        }
+    }
+    Ok(normalized_handles)
+}
+
+/// Validate a reuse request's handles before any reuse, exactly as its fresh
+/// launch would, and return them for the equivalence check. `None` when the
+/// launch forks history instead of a TaskCapsule and so ignores handles.
+async fn reuse_request_handles(
+    uses_task_capsule: bool,
+    repo_root: &Path,
+    read_scope: &[RepoScope],
+    write_scope: &[RepoScope],
+    handles: Vec<RelevantHandle>,
+) -> Result<Option<Vec<TaskCapsuleHandle>>, FunctionCallError> {
+    if !uses_task_capsule {
+        return Ok(None);
+    }
+    let root = repo_root.to_path_buf();
+    let read_scope = read_scope.to_vec();
+    let write_scope = write_scope.to_vec();
+    // Read and write scopes normalize separately, as admission normalizes them.
+    let scopes = tokio::task::spawn_blocking(move || {
+        let mut scopes = normalize_repo_scopes(&root, &read_scope)?;
+        scopes.extend(normalize_repo_scopes(&root, &write_scope)?);
+        Ok::<_, StoreError>(scopes)
+    })
+    .await
+    .map_err(|error| {
+        typed_task_store_error(StoreError::CorruptData(format!(
+            "task capsule scope normalization failed: {error}"
+        )))
+    })?
+    .map_err(typed_task_store_error)?;
+    normalize_relevant_handles(repo_root, &scopes, handles)
+        .await
+        .map(Some)
+        .map_err(typed_task_store_error)
+}
+
+/// Reuse equivalence includes the canonical handle set (file, or symbol
+/// locator, per path). Existence and content observations are launch-time
+/// state, not identity. A producer launched without a capsule has no handles;
+/// an unreadable capsule never matches.
+fn capsule_handles_match(existing_capsule: Option<&str>, requested: &[TaskCapsuleHandle]) -> bool {
+    let existing = match existing_capsule {
+        None => Vec::new(),
+        Some(payload) => match serde_json::from_str::<TaskCapsuleV1>(payload) {
+            Ok(capsule) => capsule.relevant_handles,
+            Err(_) => return false,
+        },
+    };
+    capsule_handle_identities(&existing) == capsule_handle_identities(requested)
+}
+
+fn capsule_handle_identities(handles: &[TaskCapsuleHandle]) -> BTreeSet<(&str, Option<&str>)> {
+    handles
+        .iter()
+        .map(|handle| match handle {
+            TaskCapsuleHandle::File { path, .. } => (path.as_str(), None),
+            TaskCapsuleHandle::Symbol { path, symbol, .. } => {
+                (path.as_str(), Some(symbol.as_str()))
+            }
+        })
+        .collect()
 }
 
 fn parse_typed_role(agent_type: Option<&str>) -> Result<AgentRole, FunctionCallError> {
@@ -2022,8 +2268,17 @@ fn typed_assignment_message(assignment: &Assignment, attempt: &Attempt) -> Strin
 }
 
 fn typed_task_store_error(error: StoreError) -> FunctionCallError {
+    let storage_failure = task_store_failure_kind(&error).is_some();
     let detail = task_store_error_detail("spawn_agent", error);
-    FunctionCallError::RespondToModel(format!("spawn_agent: {detail}"))
+    FunctionCallError::RespondToModel(if storage_failure {
+        // Name the next action once: a vague failure cost a generation per
+        // retry and per re-planned batch of spawns in the audited sessions.
+        format!(
+            "spawn_agent: no new agent was returned: {detail}. Report that delegation was unavailable. Continue locally only if the user's requirements permit solo work; required delegation remains an unmet obligation. Do not claim subagents were used or automatically replay the spawn."
+        )
+    } else {
+        format!("spawn_agent: {detail}")
+    })
 }
 
 #[derive(Debug, Serialize)]
@@ -2087,6 +2342,62 @@ mod tests {
         );
     }
 
+    #[test]
+    fn storage_failures_preserve_required_delegation() {
+        let FunctionCallError::RespondToModel(storage) =
+            typed_task_store_error(StoreError::CorruptData("legacy row".to_string()))
+        else {
+            panic!("store failure must remain a tool response");
+        };
+        assert!(
+            storage.starts_with("spawn_agent: no new agent was returned: "),
+            "{storage}"
+        );
+        assert!(storage.contains("not expected to succeed"), "{storage}");
+        assert!(
+            storage.contains("required delegation remains an unmet obligation"),
+            "{storage}"
+        );
+        // A rejection of the call itself stays specific and does not tell the
+        // model to abandon delegation.
+        let FunctionCallError::RespondToModel(rejection) =
+            typed_task_store_error(StoreError::InvalidScope("outside".to_string()))
+        else {
+            panic!("validation rejection must remain a tool response");
+        };
+        assert_eq!(rejection, "spawn_agent: invalid repository scope: outside");
+    }
+
+    #[test]
+    fn transient_store_failures_do_not_claim_permanent_unavailability() {
+        let FunctionCallError::RespondToModel(message) =
+            typed_task_store_error(StoreError::Sql(sqlx::Error::PoolTimedOut))
+        else {
+            panic!("storage failure must be a tool response");
+        };
+        assert!(message.contains("temporarily unavailable"));
+        assert!(message.contains("inspect retained assignment state"));
+        assert!(!message.contains("not expected to succeed"));
+        assert!(message.contains("required delegation remains an unmet obligation"));
+    }
+
+    #[test]
+    fn task_text_aliases_parse_as_message_and_conflicting_spellings_fail() {
+        for alias in ["message", "prompt", "instructions"] {
+            let mut arguments = serde_json::json!({"task_name": "worker"});
+            arguments[alias] = serde_json::json!("inspect the repo");
+            let args: SpawnAgentArgs = parse_arguments(&arguments.to_string())
+                .unwrap_or_else(|error| panic!("{alias}: {error:?}"));
+            assert_eq!(args.message.as_deref(), Some("inspect the repo"), "{alias}");
+        }
+        let duplicate = serde_json::json!({
+            "task_name": "worker",
+            "message": "inspect the repo",
+            "prompt": "inspect another repo",
+        });
+        assert!(parse_arguments::<SpawnAgentArgs>(&duplicate.to_string()).is_err());
+    }
+
     fn typed_assignment() -> TypedAssignmentArgs {
         TypedAssignmentArgs {
             objective: "inspect the bounded path".to_string(),
@@ -2126,7 +2437,26 @@ mod tests {
 
     #[test]
     fn legacy_message_is_converted_to_a_repository_wide_worker_claim() {
-        let draft = legacy_message_draft("root-session".to_string(), "inspect the repo", None);
+        // Only Explorer is a read-only role a contract-less message can satisfy.
+        for agent_type in [
+            None,
+            Some("worker"),
+            Some("architect"),
+            Some("verifier"),
+            Some("kd4_explorer"),
+        ] {
+            assert_eq!(
+                legacy_message_role(agent_type),
+                AgentRole::Worker,
+                "{agent_type:?}"
+            );
+        }
+        let draft = legacy_message_draft(
+            "root-session".to_string(),
+            "inspect the repo",
+            None,
+            legacy_message_role(None),
+        );
         assert_eq!(draft.role, AgentRole::Worker);
         assert_eq!(draft.objective, "inspect the repo");
         assert_eq!(
@@ -2137,6 +2467,77 @@ mod tests {
             }]
         );
         assert_eq!(draft.workspace_strategy, WorkspaceStrategy::Shared);
+    }
+
+    #[tokio::test]
+    async fn legacy_explorer_message_is_a_read_only_explorer_claim_end_to_end() {
+        let (session, turn) = crate::session::tests::make_session_and_context().await;
+        let coordinator = session.services.agent_control.task_coordinator();
+        let home = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        let state = codex_state::StateRuntime::init(home.path().into(), "test".into())
+            .await
+            .unwrap();
+        coordinator
+            .initialize(Arc::clone(&state), "root".into())
+            .await
+            .unwrap();
+        let role = legacy_message_role(Some(" explorer "));
+        assert_eq!(role, AgentRole::Explorer);
+        let explorer = coordinator
+            .create_admitted_assignment(
+                repo.path(),
+                legacy_message_draft("root".into(), "inspect the repo", None, role),
+                false,
+                "/root/explorer".into(),
+                "explorer".into(),
+            )
+            .await
+            .expect("selective admission accepts the read-only legacy claim");
+        assert_eq!(explorer.assignment.role, AgentRole::Explorer);
+        assert_eq!(
+            explorer.assignment.capability_profile,
+            codex_agent_task_store::CapabilityProfile::ReadSearch
+        );
+        assert!(explorer.assignment.write_scope.is_empty());
+        assert!(!explorer.assignment.read_scope.is_empty());
+        assert_eq!(explorer.integration_plan, IntegrationPlan::SingleWriter);
+        // The read-only claim is not a conflicting writer for later work.
+        let worker = coordinator
+            .create_admitted_assignment(
+                repo.path(),
+                legacy_message_draft(
+                    "root".into(),
+                    "edit the repo",
+                    None,
+                    legacy_message_role(None),
+                ),
+                false,
+                "/root/worker".into(),
+                "worker".into(),
+            )
+            .await
+            .expect("repository-wide worker admission");
+        assert_eq!(worker.integration_plan, IntegrationPlan::SingleWriter);
+        // The host seals the turn outcome without an Architect contract, and a
+        // plain-message follow-up turn opens the next attempt.
+        let store = coordinator.store().unwrap();
+        store
+            .record_legacy_agent_outcome(
+                explorer.attempt.attempt_id,
+                codex_agent_task_store::AgentStatusClaim::Completed,
+                "reported the findings".into(),
+            )
+            .await
+            .expect("host outcome for the read-only legacy claim");
+        let follow_up = store
+            .begin_legacy_agent_turn(explorer.assignment.assignment_id)
+            .await
+            .expect("follow-up turn for a legacy explorer");
+        assert_ne!(follow_up.attempt_id, explorer.attempt.attempt_id);
+        drop(turn);
+        store.close().await;
+        state.close().await;
     }
 
     #[test]
@@ -2285,6 +2686,143 @@ mod tests {
             Ok(Some(SpawnAgentForkMode::TaskCapsule))
         ));
     }
+
+    fn file_handle(path: &str) -> RelevantHandle {
+        RelevantHandle::File {
+            path: path.to_string(),
+        }
+    }
+
+    fn capsule_file(path: &str, existed: bool) -> TaskCapsuleHandle {
+        TaskCapsuleHandle::File {
+            path: path.to_string(),
+            existed,
+            content_hash: None,
+        }
+    }
+
+    fn source_scope() -> Vec<RepoScope> {
+        vec![RepoScope {
+            path: "src".to_string(),
+            recursive: true,
+        }]
+    }
+
+    #[tokio::test]
+    async fn capsule_handles_dedupe_by_store_identity_not_ascii_case() {
+        let repo = tempfile::tempdir().expect("repository");
+        let source = repo.path().join("src");
+        std::fs::create_dir(&source).expect("source directory");
+        std::fs::write(source.join("Owner.rs"), "upper").expect("upper owner");
+        // Independent oracle: exclusive creation of the alias collides exactly
+        // when this directory ignores case; otherwise both files now exist.
+        let ignores_case = match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(source.join("owner.rs"))
+        {
+            Ok(_) => false,
+            Err(error) if error.kind() == ErrorKind::AlreadyExists => true,
+            Err(error) => panic!("case alias oracle failed: {error}"),
+        };
+        // Existing case-distinct files, then paths that do not exist yet.
+        for pair in [["src/Owner.rs", "src/owner.rs"], ["src/New.rs", "src/new.rs"]] {
+            let result = normalize_relevant_handles(
+                repo.path(),
+                &source_scope(),
+                pair.into_iter().map(file_handle).collect(),
+            )
+            .await;
+            if ignores_case {
+                let duplicate = matches!(
+                    &result,
+                    Err(StoreError::InvalidTaskCapsule(message))
+                        if message.contains("duplicate file handle")
+                );
+                assert!(duplicate, "{pair:?}: {result:?}");
+            } else {
+                let handles = result.expect("case-distinct handles name distinct files");
+                assert_eq!(handles.len(), 2, "{pair:?}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn reuse_validates_handles_as_a_fresh_capsule_launch_would() {
+        let repo = tempfile::tempdir().expect("repository");
+        std::fs::create_dir(repo.path().join("src")).expect("source directory");
+        std::fs::write(repo.path().join("src/lib.rs"), "source").expect("source file");
+        let outside = vec![file_handle("docs/notes.md")];
+        let rejected =
+            reuse_request_handles(true, repo.path(), &source_scope(), &[], outside.clone()).await;
+        let outside_scope = matches!(
+            &rejected,
+            Err(FunctionCallError::RespondToModel(message))
+                if message.contains("outside the assignment")
+        );
+        assert!(outside_scope, "{rejected:?}");
+        // History forks ignore handles, so neither a launch nor reuse checks them.
+        assert_eq!(
+            reuse_request_handles(false, repo.path(), &source_scope(), &[], outside).await,
+            Ok(None)
+        );
+        let accepted = reuse_request_handles(
+            true,
+            repo.path(),
+            &source_scope(),
+            &[],
+            vec![file_handle("src/lib.rs")],
+        )
+        .await
+        .expect("a covered handle validates");
+        assert_eq!(accepted, Some(vec![capsule_file("src/lib.rs", true)]));
+    }
+
+    #[test]
+    fn reuse_equivalence_includes_canonical_capsule_handles() {
+        let symbol = TaskCapsuleHandle::Symbol {
+            path: "src/lib.rs".to_string(),
+            symbol: "parse".to_string(),
+            existed: true,
+            content_hash: None,
+        };
+        let launched = serde_json::to_string(&TaskCapsuleV1 {
+            schema_version: 1,
+            assignment_id: AssignmentId::new(),
+            attempt_id: codex_agent_task_store::AttemptId::new(),
+            role: AgentRole::Explorer,
+            capability_profile: AgentRole::Explorer.capability_profile(),
+            requirements: Vec::new(),
+            objective: "inspect the parser".to_string(),
+            read_scope: source_scope(),
+            write_scope: Vec::new(),
+            stop_condition: String::new(),
+            dependencies: Vec::new(),
+            risk_hints: Vec::new(),
+            contract_claims: Vec::new(),
+            workspace_strategy: None,
+            relation: None,
+            architecture_contract_ref: None,
+            integration_plan: IntegrationPlan::SingleWriter,
+            relevant_handles: vec![capsule_file("src/lib.rs", true), symbol.clone()],
+            workspace_epoch: 0,
+            workspace_manifest_hash: String::new(),
+            prohibited_changes: Vec::new(),
+            required_evidence: Vec::new(),
+        })
+        .expect("capsule serializes");
+        let launched = Some(launched.as_str());
+        // Existence observed at launch is state, not identity; order is irrelevant.
+        assert!(capsule_handles_match(
+            launched,
+            &[symbol.clone(), capsule_file("src/lib.rs", false)]
+        ));
+        assert!(!capsule_handles_match(launched, &[capsule_file("src/lib.rs", true)]));
+        assert!(!capsule_handles_match(launched, &[capsule_file("src/main.rs", true), symbol]));
+        assert!(capsule_handles_match(None, &[]));
+        assert!(!capsule_handles_match(None, &[capsule_file("src/lib.rs", true)]));
+        assert!(!capsule_handles_match(Some("not a capsule"), &[]));
+    }
 }
 
 #[cfg(test)]
@@ -2341,6 +2879,105 @@ mod output_schema_tests {
 #[cfg(test)]
 mod snapshot_tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn audit142_stderr_overflow_stops_and_reaps_the_owned_process() {
+        let tasks = TaskTracker::new();
+        let mut command = Command::new("powershell.exe");
+        command.args(["-NoProfile", "-NonInteractive", "-Command", "[Console]::Error.Write(('x' * 1048577)); Start-Sleep -Seconds 30"]);
+        let result = tokio::time::timeout(Duration::from_secs(5), run_worktree_git(command, None, &CancellationToken::new(), &tasks)).await.expect("overflow must not wait for the blocked process");
+        assert!(result.unwrap_err().to_string().contains("snapshot_git_output_limit"));
+        tasks.close(); tasks.wait().await;
+    }
+
+    fn fixture_git(repo: &Path, args: &[&str]) {
+        let output = std::process::Command::new("git").current_dir(repo)
+            .args(["-c", "commit.gpgsign=false", "-c", "core.hooksPath=unused-hooks"])
+            .args(args).output().unwrap();
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    }
+
+    fn snapshot_fixture() -> tempfile::TempDir {
+        let repo = tempfile::tempdir().unwrap();
+        fixture_git(repo.path(), &["init", "-q"]);
+        fixture_git(repo.path(), &["config", "core.autocrlf", "false"]);
+        std::fs::create_dir(repo.path().join("src")).unwrap();
+        std::fs::write(repo.path().join("file.txt"), b"HELLO\n").unwrap();
+        std::fs::write(repo.path().join("src/file.txt"), b"HELLO\n").unwrap();
+        fixture_git(repo.path(), &["add", "."]);
+        fixture_git(repo.path(), &["-c", "user.name=Snapshot", "-c", "user.email=snapshot@example.invalid", "commit", "-qm", "fixture"]);
+        repo
+    }
+
+    #[tokio::test]
+    async fn audit142_snapshot_protocol_ignores_prefix_and_textconv_settings() {
+        for (prefix, textconv) in [(true, false), (false, true), (true, true), (false, false)] {
+            let repo = snapshot_fixture();
+            let home = tempfile::tempdir().unwrap();
+            if prefix { fixture_git(repo.path(), &["config", "diff.noprefix", "true"]); }
+            if textconv {
+                std::fs::write(repo.path().join(".gitattributes"), "*.txt diff=render\n").unwrap();
+                fixture_git(repo.path(), &["config", "diff.render.textconv", "sed -e s/HELLO/RENDERED/g -e s/WORLD/CONVERTED/g"]);
+            }
+            std::fs::write(repo.path().join("src/file.txt"), b"WORLD\n").unwrap();
+            let tasks = TaskTracker::new();
+            let workspace = create_isolated_worktree(repo.path(), home.path(), "controlled", &CancellationToken::new(), &tasks).await.unwrap();
+            assert_eq!(std::fs::read(workspace.path.join("file.txt")).unwrap(), b"HELLO\n");
+            assert_eq!(std::fs::read(workspace.path.join("src/file.txt")).unwrap(), b"WORLD\n");
+            cleanup_isolated_worktree(&workspace).await.unwrap();
+            tasks.close(); tasks.wait().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn audit142_submodule_snapshot_is_explicitly_unsupported() {
+        let repo = snapshot_fixture();
+        let home = tempfile::tempdir().unwrap();
+        let output = std::process::Command::new("git").current_dir(repo.path())
+            .args(["rev-parse", "HEAD"]).output().unwrap();
+        let head = String::from_utf8(output.stdout).unwrap();
+        fixture_git(repo.path(), &["update-index", "--add", "--cacheinfo", &format!("160000,{},module", head.trim())]);
+        let tasks = TaskTracker::new();
+        let result = create_isolated_worktree(repo.path(), home.path(), "submodule", &CancellationToken::new(), &tasks).await;
+        assert!(matches!(result, Err(FunctionCallError::RespondToModel(ref message)) if message.contains("unsupported_snapshot_submodule")));
+        tasks.close(); tasks.wait().await;
+    }
+
+    #[tokio::test]
+    async fn audit142_large_tracked_deletion_is_bounded_before_accepting_a_patch() {
+        let repo = snapshot_fixture();
+        let bytes = vec![b'x'; MAX_WORKTREE_GIT_STDOUT_BYTES as usize + 1024];
+        std::fs::write(repo.path().join("large.txt"), bytes).unwrap();
+        fixture_git(repo.path(), &["add", "large.txt"]);
+        fixture_git(repo.path(), &["-c", "user.name=Snapshot", "-c", "user.email=snapshot@example.invalid", "commit", "-qm", "large"]);
+        let tasks = TaskTracker::new();
+        let token = CancellationToken::new();
+        assert!(capture_workspace_overlay(repo.path(), &token, &tasks).await.unwrap().tracked_diff.is_empty());
+        std::fs::remove_file(repo.path().join("large.txt")).unwrap();
+        let result = capture_workspace_overlay(repo.path(), &token, &tasks).await;
+        assert!(matches!(result, Err(FunctionCallError::RespondToModel(ref message)) if message.contains("snapshot_git_output_limit")));
+        tasks.close(); tasks.wait().await;
+    }
+
+    #[test]
+    fn working_file_snapshot_stops_between_files_when_cancelled() {
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::write(repo.path().join("first"), b"exact bytes\n").unwrap();
+        let cancellation = CancellationToken::new();
+        let paths = [b"first".as_slice(), b"missing".as_slice()]
+            .into_iter()
+            .enumerate()
+            .map(|(index, path)| {
+                if index == 1 {
+                    cancellation.cancel();
+                }
+                (path, false)
+            });
+        let error = capture_working_file_snapshot(repo.path(), paths, &cancellation)
+            .expect_err("cancellation must stop before inspecting the missing second file");
+        assert!(error.to_string().contains("snapshot cancelled"));
+    }
 
     #[tokio::test]
     async fn parallel_snapshot_preserves_tracked_and_untracked_bytes() {

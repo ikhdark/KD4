@@ -8,6 +8,7 @@ use crate::context::world_state::EnvironmentsState;
 use crate::context::world_state::PluginsInstructionsState;
 use crate::context::world_state::SubagentsState;
 use crate::context::world_state::WorldState;
+use crate::context::world_state::WorldStateSnapshot;
 use codex_extension_api::WorldStateContributionInput;
 use futures::StreamExt;
 use futures::stream::FuturesOrdered;
@@ -105,13 +106,19 @@ impl Session {
         if turn_context.model_info.include_apps_usage_instructions || tracked("apps_instructions") {
             let apps_available =
                 if turn_context.config.include_apps_instructions && turn_context.apps_enabled() {
-                    let tools = step_context.mcp_tools().await;
-                    connectors::with_app_enabled_state(
-                        connectors::accessible_connectors_from_mcp_tools(tools),
-                        &turn_context.config,
-                    )
-                    .into_iter()
-                    .any(|connector| connector.is_accessible && connector.is_enabled)
+                    if step_context.mcp_tool_snapshot().await.temporarily_unavailable {
+                        // A timed-out capture advertises no tools by construction; it
+                        // is no evidence that Apps disappeared, so keep the delivered state.
+                        apps_availability_for_unavailable_capture(previous_world_state.as_ref())
+                    } else {
+                        let tools = step_context.mcp_tools().await;
+                        connectors::with_app_enabled_state(
+                            connectors::accessible_connectors_from_mcp_tools(tools),
+                            &turn_context.config,
+                        )
+                        .into_iter()
+                        .any(|connector| connector.is_accessible && connector.is_enabled)
+                    }
                 } else {
                     false
                 };
@@ -208,5 +215,65 @@ impl Session {
             }
         }
         world_state
+    }
+}
+
+/// Apps availability for a step whose MCP capture timed out. The placeholder
+/// catalog is empty, so reuse the delivered state rather than retracting
+/// guidance; a session that never received the guidance stays unavailable.
+fn apps_availability_for_unavailable_capture(previous: Option<&WorldStateSnapshot>) -> bool {
+    previous
+        .and_then(|state| state.section("apps_instructions"))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+}
+
+#[cfg(test)]
+mod apps_capture_tests {
+    use super::apps_availability_for_unavailable_capture;
+    use crate::context::AppsInstructionsUnavailable;
+    use crate::context::ContextualUserFragment;
+    use crate::context::world_state::AppsInstructionsState;
+    use crate::context::world_state::WorldState;
+    use crate::context::world_state::WorldStateSnapshot;
+    use pretty_assertions::assert_eq;
+
+    fn delivered(available: bool) -> WorldStateSnapshot {
+        let mut state = WorldState::default();
+        state.add_section(AppsInstructionsState::new(available));
+        state.snapshot()
+    }
+
+    #[test]
+    fn timed_out_capture_keeps_delivered_apps_guidance() {
+        let delivered = delivered(/*available*/ true);
+        let preserved = apps_availability_for_unavailable_capture(Some(&delivered));
+        assert!(preserved);
+        let mut current = WorldState::default();
+        current.add_section(AppsInstructionsState::new(preserved));
+        assert!(
+            current.render_diff(&delivered).is_empty(),
+            "a timed-out MCP capture must not retract delivered Apps guidance"
+        );
+    }
+
+    #[test]
+    fn observed_apps_loss_still_retracts_guidance() {
+        // A coherent capture without accessible connectors remains authoritative.
+        let mut current = WorldState::default();
+        current.add_section(AppsInstructionsState::new(/*available*/ false));
+        assert_eq!(
+            current
+                .render_diff(&delivered(/*available*/ true))
+                .into_iter()
+                .map(|fragment| fragment.render())
+                .collect::<Vec<_>>(),
+            vec![AppsInstructionsUnavailable.render()]
+        );
+        // A timeout never invents guidance that was not delivered.
+        assert!(!apps_availability_for_unavailable_capture(Some(&delivered(
+            /*available*/ false
+        ))));
+        assert!(!apps_availability_for_unavailable_capture(None));
     }
 }

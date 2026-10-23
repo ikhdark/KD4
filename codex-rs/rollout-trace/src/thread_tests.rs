@@ -27,6 +27,59 @@ use crate::RolloutStatus;
 use crate::replay_bundle;
 
 #[test]
+fn trace_admission_skips_deltas_and_preserves_recorded_boundaries() -> anyhow::Result<()> {
+    let temp = TempDir::new()?;
+    let trace = ThreadTraceContext::start_root_in_root_for_test(
+        temp.path(),
+        minimal_metadata(ThreadId::new()),
+    )?;
+    let delta = EventMsg::AgentMessageContentDelta(
+        codex_protocol::protocol::AgentMessageContentDeltaEvent {
+            thread_id: "thread".into(),
+            turn_id: "turn".into(),
+            item_id: "item".into(),
+            delta: "text".into(),
+        },
+    );
+    let started = EventMsg::TurnStarted(codex_protocol::protocol::TurnStartedEvent {
+        turn_id: "turn".into(),
+        trace_id: None,
+        started_at: None,
+        model_context_window: None,
+        collaboration_mode_kind: Default::default(),
+    });
+    let tool = EventMsg::PatchApplyBegin(codex_protocol::protocol::PatchApplyBeginEvent {
+        environment: None,
+        call_id: "call".into(),
+        turn_id: "turn".into(),
+        auto_approved: true,
+        changes: Default::default(),
+    });
+    let bundle = single_bundle_dir(temp.path())?;
+    let before = fs::read(bundle.join("trace.jsonl"))?;
+    for (event, protocol, runtime, tool_call) in [
+        (&delta, false, false, false),
+        (&started, true, true, false),
+        (&tool, false, true, true),
+        (&EventMsg::ShutdownComplete, true, false, false),
+    ] {
+        assert_eq!(trace.should_record_protocol_event(event), protocol);
+        assert_eq!(trace.should_record_runtime_event("turn", event), runtime);
+        assert_eq!(trace.should_record_tool_call_event(event), tool_call);
+        let disabled = ThreadTraceContext::disabled();
+        assert!(!disabled.should_record_protocol_event(event));
+        assert!(!disabled.should_record_runtime_event("turn", event));
+        assert!(!disabled.should_record_tool_call_event(event));
+    }
+    assert_eq!(
+        fs::read(bundle.join("trace.jsonl"))?,
+        before,
+        "admission must not write"
+    );
+    Ok(())
+}
+
+#[test]
 fn create_in_root_writes_replayable_lifecycle_events() -> anyhow::Result<()> {
     let temp = TempDir::new()?;
     let thread_id = ThreadId::new();

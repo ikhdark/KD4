@@ -64,6 +64,7 @@ impl Handler {
             payload,
             call_id,
             cancellation_token,
+            source,
             ..
         } = invocation;
         let turn = Arc::clone(&step_context.turn);
@@ -180,7 +181,17 @@ impl Handler {
                 futures.push(wait_for_final_status(session.clone(), id, rx));
             }
         }
-        let deadline = timeout_ms.map(|ms| Instant::now() + Duration::from_millis(ms as u64));
+        let explicit_deadline =
+            timeout_ms.map(|ms| Instant::now() + Duration::from_millis(ms as u64));
+        // A nested Code Mode call must return before its wrapper deadline drops
+        // it; report a normal timed-out wait instead of a transport failure.
+        let deadline = [
+            explicit_deadline,
+            crate::unified_exec::nested_poll_bound(source.nested_deadline()),
+        ]
+        .into_iter()
+        .flatten()
+        .min();
         let completion = loop {
             if (args.return_when == WaitReturnWhen::First && !partial_statuses.is_empty())
                 || partial_statuses.len() == receiver_thread_ids.len()

@@ -344,10 +344,15 @@ impl HostState {
             }
         }
         let Ok(permit) = Arc::clone(&self.request_permits).try_acquire_owned() else {
-            self.respond(
-                request_id,
-                Err("code-mode host has too many in-flight requests".to_string()),
-            );
+            // A refused close leaves storage owned, and the client fails every
+            // session on the connection for any other close error. Report it as
+            // pending so the client observes the same close again.
+            let error = if matches!(request, HostRequest::ShutdownSession { .. }) {
+                codex_code_mode_protocol::host::SESSION_SHUTDOWN_PENDING.to_string()
+            } else {
+                "code-mode host has too many in-flight requests".to_string()
+            };
+            self.respond(request_id, Err(error));
             self.finish_request(request_id);
             return Ok(());
         };

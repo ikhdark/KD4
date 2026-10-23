@@ -662,7 +662,7 @@ class NamedRunnerLanePreflightTest(unittest.TestCase):
                 run.assert_not_called()
             self.assertFalse((repo / "codex-rs" / "target").exists())
 
-    def test_preflight_preserves_valid_arguments_without_loading_metadata(self):
+    def test_preflight_preserves_valid_arguments_without_loading_cargo_metadata(self):
         from scripts.build import rust_test_runner
 
         runner = REPO_ROOT / "scripts" / "build" / "rust_test_runner.py"
@@ -683,19 +683,21 @@ class NamedRunnerLanePreflightTest(unittest.TestCase):
                 "excluded",
             ],
             ["run-target", "app_server_lib", "--command-timeout-seconds=30"],
-            ["run-gate", "example", "--profile", "fast"],
+            ["run-gate", "core-retry-output", "--profile", "fast"],
         ):
             command = [sys.executable, str(runner), *arguments]
             original = list(command)
             with (
                 self.subTest(arguments=arguments),
                 mock.patch.object(rust_test_runner, "load_metadata") as metadata,
-                mock.patch.object(rust_test_runner.Manifest, "load") as manifest,
+                mock.patch.object(
+                    rust_test_runner.Manifest, "load", wraps=rust_test_runner.Manifest.load
+                ) as manifest,
             ):
                 rust_build_status._guard_named_runner_args(command)
             self.assertEqual(command, original)
             metadata.assert_not_called()
-            manifest.assert_not_called()
+            manifest.assert_called_once()
 
     def test_opaque_foreign_and_help_commands_remain_with_their_owners(self):
         from scripts.build import rust_test_runner
@@ -1047,8 +1049,11 @@ class BuildToolingStorageTest(unittest.TestCase):
             target = repo / "codex-rs" / "target" / "lanes" / "unit"
 
             def child(
-                command, *, env, check, stdout, stderr, prepare_sccache, creationflags
+                command, *, env, check, stdout, stderr, prepare_sccache, creationflags,
+                on_spawn, on_spawn_error,
             ):
+                self.assertTrue(callable(on_spawn_error))
+                on_spawn(None)
                 self.assertEqual(
                     creationflags, getattr(subprocess, "BELOW_NORMAL_PRIORITY_CLASS", 0)
                 )
@@ -2142,7 +2147,11 @@ class BuildToolingStorageTest(unittest.TestCase):
                         stderr,
                         prepare_sccache,
                         creationflags,
+                        on_spawn,
+                        on_spawn_error,
                     ):
+                        self.assertTrue(callable(on_spawn_error))
+                        on_spawn(None)
                         self.assertEqual(
                             creationflags,
                             getattr(subprocess, "BELOW_NORMAL_PRIORITY_CLASS", 0),
@@ -2261,18 +2270,20 @@ class BuildToolingStorageTest(unittest.TestCase):
     def test_rust_build_doctor_reports_cache_linker_and_contention(self) -> None:
         fixture = tempfile.TemporaryDirectory()
         self.addCleanup(fixture.cleanup)
+        repo = Path(fixture.name)
+        (repo / "codex-rs/target/lanes/ui").mkdir(parents=True)
         report = rust_build_status.build_doctor_report(
-            repo_root=Path(fixture.name),
+            repo_root=repo,
             processes=[
                 rust_build_status.RustProcess(
                     pid=42,
                     name="cargo.exe",
-                    command_line="cargo nextest run -p codex-core",
+                    command_line=f'cargo nextest run -p codex-core --target-dir "{repo / "codex-rs/target"}"',
                 ),
                 rust_build_status.RustProcess(
                     pid=43,
                     name="rustc.exe",
-                    command_line="rustc --out-dir codex-rs\\target\\lanes\\ui\\debug",
+                    command_line=f'rustc --out-dir "{repo / "codex-rs/target/lanes/ui/debug"}"',
                 ),
             ],
             tool_lookup=lambda name: (
@@ -2490,7 +2501,7 @@ function Get-CimInstance {
             process = rust_build_status.RustProcess(
                 pid=7,
                 name="pwsh.exe",
-                command_line="pwsh just cargo-lane ui cargo check",
+                command_line=f'pwsh -File "{Path(temp_dir) / "scripts/build/cargo-lane.ps1"}" -Lane ui cargo check',
             )
             snapshot = rust_build_status.BuildStatusSnapshot.collect(
                 repo_root=Path(temp_dir),
@@ -3427,11 +3438,7 @@ function Get-CimInstance {
                     command_line=command_line,
                 )
                 self.assertEqual(
-                    rust_build_status.lane_name_for_process(process), expected
-                )
-                self.assertEqual(
-                    rust_build_status.shared_target_rust_processes([process]),
-                    [process] if expected is None else [],
+                    rust_build_status._lane_name_from_command_line(process.command_line), expected
                 )
 
         pattern_script = REPO_ROOT / "scripts" / "build" / "cargo-lane-patterns.ps1"
@@ -3472,7 +3479,9 @@ function Get-CimInstance {
         cargo_lane_text = (
             REPO_ROOT / "scripts" / "build" / "cargo-lane.ps1"
         ).read_text(encoding="utf-8")
-        self.assertIn("Get-CargoLaneNamesFromCommandLines", cargo_lane_text)
+        self.assertNotIn("Get-CargoLaneNamesFromCommandLines", cargo_lane_text)
+        self.assertIn("Test-CargoLockBusy -TargetDir $lane.FullName", cargo_lane_text)
+        self.assertIn("Test-LaneActiveLockBusy -TargetDir $lane.FullName", cargo_lane_text)
         self.assertNotIn("watch-lane", cargo_lane_text)
         self.assertNotIn("release-lane", cargo_lane_text)
 
@@ -3603,7 +3612,7 @@ function Get-CimInstance {
                         pid=7,
                         name="cargo.exe",
                         # The invocation's casing differs from the on-disk lane.
-                        command_line=r"cargo build --target-dir C:\r\target\lanes\UI",
+                        command_line=f'cargo build --target-dir "{lane_root / "UI"}"',
                     )
                 ],
             )
@@ -3715,7 +3724,7 @@ class LaneFamilyRunnerTest(unittest.TestCase):
             wait_option="--warm-wait-seconds",
         )
         code, run, direct = self.main(
-            ["--target-dir", str(self.lane), "run-gate", "demo"], run_result=busy
+            ["--target-dir", str(self.lane), "run-gate", "core-retry-output"], run_result=busy
         )
         self.assertEqual(code, rust_build_status.RUST_ADMISSION_BUSY_EXIT_CODE)
         run.assert_called_once()

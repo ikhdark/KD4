@@ -84,7 +84,7 @@ pub(super) fn tool_callback(
         throw_type_error(scope, "runtime state unavailable");
         return;
     };
-    let id = format!("tool-{}", state.next_tool_call_id);
+    let id = format!("{}:tool-{}", state.tool_call_id, state.next_tool_call_id);
     state.next_tool_call_id = state.next_tool_call_id.saturating_add(1);
     let event_tx = state.event_tx.clone();
     state
@@ -801,6 +801,17 @@ fn tool_timeout_ms(
         ));
     }
     Ok(timeout_ms as u64)
+}
+
+pub(super) fn monotonic_now_callback(
+    scope: &mut v8::PinScope<'_, '_>,
+    _args: v8::FunctionCallbackArguments,
+    mut retval: v8::ReturnValue<v8::Value>,
+) {
+    let elapsed = scope.get_slot::<RuntimeState>().map_or(0.0, |state| {
+        state.monotonic_origin.elapsed().as_secs_f64() * 1_000.0
+    });
+    retval.set(v8::Number::new(scope, elapsed).into());
 }
 
 pub(super) fn set_timeout_callback(

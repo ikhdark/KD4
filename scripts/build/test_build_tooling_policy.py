@@ -2184,6 +2184,7 @@ function Get-Command($Name) {
                 "core-tests",
                 "--warm-wait-seconds",
                 "0",
+                "--allow-cold-overflow",
                 "--",
                 "just",
                 "_core-gate-reserved",

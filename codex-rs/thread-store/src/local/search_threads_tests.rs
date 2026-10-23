@@ -379,3 +379,39 @@ async fn search_threads_uses_physical_cursor_even_when_header_time_is_unrepresen
     );
     assert_eq!(std::fs::read(&second_path).unwrap(), second_original);
 }
+
+#[tokio::test]
+async fn search_threads_omits_metadata_only_matches() {
+    let home = TempDir::new().expect("temp dir");
+    write_session_file(home.path(), "2025-01-03T12-30-00", Uuid::from_u128(603))
+        .expect("matching rollout");
+    let store = LocalThreadStore::new(test_config(home.path()), None);
+    let params = SearchThreadsParams {
+        page_size: 10,
+        cursor: None,
+        sort_key: ThreadSortKey::CreatedAt,
+        sort_direction: SortDirection::Desc,
+        allowed_sources: Vec::new(),
+        archived: false,
+        // Only the session metadata names its originator.
+        search_term: "test_originator".to_string(),
+    };
+
+    let page = store
+        .search_threads(params.clone())
+        .await
+        .expect("metadata-only search");
+    assert!(page.items.is_empty());
+    assert!(page.next_cursor.is_none());
+
+    // Positive control: conversation text in the same rollout is a match.
+    let page = store
+        .search_threads(SearchThreadsParams {
+            search_term: "Hello from user".to_string(),
+            ..params
+        })
+        .await
+        .expect("conversation search");
+    assert_eq!(page.items.len(), 1);
+    assert_eq!(page.items[0].snippet, "Hello from user");
+}

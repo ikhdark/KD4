@@ -6,6 +6,10 @@ use tokio::time::MissedTickBehavior;
 const AGENT_JOB_RUNNER_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
 const AGENT_JOB_RUNNER_LEASE_TIMEOUT_SECONDS: i64 = 30;
 
+// Shared by ordinary settlement and restart recovery. Non-null bytes alone are
+// not a report. A retained current-attempt binding may not name another worker.
+const VALID_RETAINED_REPORT: &str = "status = 'running' AND attempt_count > 0 AND reported_at IS NOT NULL AND CASE WHEN json_valid(result_json) THEN json_type(result_json) = 'object' ELSE 0 END AND NOT EXISTS (SELECT 1 FROM agent_jobs WHERE id = agent_job_items.job_id AND status = 'cancelled') AND NOT EXISTS (SELECT 1 FROM agent_job_attempts a WHERE a.job_id = agent_job_items.job_id AND a.item_id = agent_job_items.item_id AND a.attempt_count = agent_job_items.attempt_count AND agent_job_items.assigned_thread_id IS NOT NULL AND a.thread_id <> agent_job_items.assigned_thread_id)";
+
 pub(super) async fn register_agent_job_runner_instance(
     pool: &SqlitePool,
     runner_instance_id: &str,
@@ -246,22 +250,22 @@ WHERE
             if updated.rows_affected() == 0 {
                 continue;
             }
-            sqlx::query(
+            QueryBuilder::<Sqlite>::new(format!(
                 r#"
 UPDATE agent_job_items
 SET
-    status = ?,
+    status = CASE WHEN ({VALID_RETAINED_REPORT}) AND NOT EXISTS (SELECT 1 FROM agent_jobs WHERE id = agent_job_items.job_id AND status = 'cancelled') THEN 'completed' ELSE 'failed' END,
     assigned_thread_id = NULL,
     updated_at = ?,
     completed_at = ?,
-    last_error = ?
+    last_error = CASE WHEN ({VALID_RETAINED_REPORT}) AND NOT EXISTS (SELECT 1 FROM agent_jobs WHERE id = agent_job_items.job_id AND status = 'cancelled') THEN NULL ELSE ? END
 WHERE job_id = ? AND (status = ? OR (status = ? AND EXISTS (
     SELECT 1 FROM agent_jobs WHERE id = agent_job_items.job_id AND status = 'failed'
     AND last_error = ?
 )))
                 "#,
-            )
-            .bind(AgentJobItemStatus::Failed.as_str())
+            ))
+            .build()
             .bind(now)
             .bind(now)
             .bind(Self::AGENT_JOB_RESTART_ERROR)
@@ -365,8 +369,58 @@ WHERE job_id = ? AND (status = ? OR (status = ? AND EXISTS (
     }
 
     pub async fn agent_job_export_is_published(&self, job_id: &str) -> anyhow::Result<bool> {
-        Ok(sqlx::query_scalar::<_, i64>("SELECT EXISTS(SELECT 1 FROM agent_job_recovery_exports WHERE job_id = ? AND revision = published_revision)")
-            .bind(job_id).fetch_one(self.pool.as_ref()).await? != 0)
+        let receipt: Option<(String, String)> = sqlx::query_as("SELECT p.destination, p.sha256 FROM agent_job_publications p JOIN agent_job_recovery_exports e ON e.job_id = p.job_id WHERE p.job_id = ? AND p.revision = e.revision AND e.revision = e.published_revision AND p.sha256 IS NOT NULL")
+            .bind(job_id).fetch_optional(self.pool.as_ref()).await?;
+        let Some((path, digest)) = receipt else { return Ok(false); };
+        use sha2::Digest;
+        use tokio::io::AsyncReadExt;
+        let mut file = match tokio::fs::File::open(path).await {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(error.into()),
+        };
+        let mut hash = sha2::Sha256::new();
+        let mut buffer = [0_u8; 64 * 1024];
+        loop {
+            let read = file.read(&mut buffer).await?;
+            if read == 0 { break; }
+            hash.update(&buffer[..read]);
+        }
+        let actual_digest = hash
+            .finalize()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        Ok(actual_digest == digest)
+    }
+
+    /// Call while owning the filesystem destination lock; database authority
+    /// additionally prevents another job in this ledger from claiming it.
+    pub async fn reserve_agent_job_destination(&self, job_id: &str, destination: &str) -> anyhow::Result<()> {
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        sqlx::query("INSERT INTO agent_job_publications (destination, job_id) VALUES (?, ?) ON CONFLICT(destination) DO NOTHING")
+            .bind(destination).bind(job_id).execute(&mut *tx).await?;
+        let owner: String = sqlx::query_scalar("SELECT job_id FROM agent_job_publications WHERE destination = ?")
+            .bind(destination).fetch_one(&mut *tx).await?;
+        anyhow::ensure!(owner == job_id, "csv_destination_conflict: destination belongs to another job; choose a distinct output path");
+        tx.commit().await?;
+        Ok(())
+    }
+
+    pub async fn acknowledge_agent_job_artifact(&self, job_id: &str, revision: i64, destination: &str, digest: &str) -> anyhow::Result<()> {
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let updated = sqlx::query("UPDATE agent_job_publications SET revision = ?, sha256 = ? WHERE destination = ? AND job_id = ?")
+            .bind(revision).bind(digest).bind(destination).bind(job_id).execute(&mut *tx).await?;
+        anyhow::ensure!(updated.rows_affected() == 1, "csv_destination_conflict: publication owner changed");
+        sqlx::query("UPDATE agent_job_recovery_exports SET published_revision = MAX(published_revision, ?) WHERE job_id = ? AND revision >= ?")
+            .bind(revision).bind(job_id).bind(revision).execute(&mut *tx).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    pub async fn agent_job_artifact_digest(&self, job_id: &str) -> anyhow::Result<Option<String>> {
+        Ok(sqlx::query_scalar::<_, Option<String>>("SELECT p.sha256 FROM agent_job_publications p JOIN agent_job_recovery_exports e ON e.job_id = p.job_id WHERE p.job_id = ? AND p.revision = e.revision AND e.published_revision = e.revision")
+            .bind(job_id).fetch_optional(self.pool.as_ref()).await?.flatten())
     }
 
     pub async fn agent_job_is_owned_running(&self, job_id: &str) -> anyhow::Result<bool> {
@@ -400,7 +454,8 @@ WHERE job_id = ? AND (status = ? OR (status = ? AND EXISTS (
         reason: &str,
     ) -> anyhow::Result<bool> {
         let now = Utc::now().timestamp();
-        let result = sqlx::query("UPDATE agent_job_items SET status = CASE WHEN result_json IS NOT NULL THEN 'completed' ELSE 'failed' END, completed_at = ?, updated_at = ?, last_error = CASE WHEN result_json IS NOT NULL THEN NULL ELSE ? END, assigned_thread_id = NULL WHERE job_id = ? AND item_id = ? AND status = 'running' AND assigned_thread_id IS ?")
+        let result = QueryBuilder::<Sqlite>::new(format!("UPDATE agent_job_items SET status = CASE WHEN ({VALID_RETAINED_REPORT}) AND NOT EXISTS (SELECT 1 FROM agent_jobs WHERE id = agent_job_items.job_id AND status = 'cancelled') THEN 'completed' ELSE 'failed' END, completed_at = ?, updated_at = ?, last_error = CASE WHEN ({VALID_RETAINED_REPORT}) THEN NULL ELSE ? END, assigned_thread_id = NULL WHERE job_id = ? AND item_id = ? AND status = 'running' AND assigned_thread_id IS ?"))
+            .build()
             .bind(now).bind(now).bind(reason).bind(job_id).bind(item_id).bind(thread_id).execute(self.pool.as_ref()).await?;
         if result.rows_affected() > 0 {
             self.notify_agent_job_change();
@@ -840,9 +895,30 @@ WHERE job_id = ? AND item_id = ? AND status = ?
         cancel_job: bool,
         cancellation_reason: &str,
     ) -> anyhow::Result<bool> {
+        Ok(self.report_agent_job_item_result_with_receipt(job_id, item_id, reporting_thread_id,
+            result_json, cancel_job, cancellation_reason).await?.is_some())
+    }
+
+    pub async fn report_agent_job_item_result_with_receipt(
+        &self,
+        job_id: &str,
+        item_id: &str,
+        reporting_thread_id: &str,
+        result_json: &Value,
+        cancel_job: bool,
+        cancellation_reason: &str,
+    ) -> anyhow::Result<Option<&'static str>> {
+        anyhow::ensure!(result_json.is_object(), "result must be a JSON object");
         let now = Utc::now().timestamp();
         let serialized = serde_json::to_string(result_json)?;
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let replay: i64 = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM agent_job_report_receipts r JOIN agent_job_items i USING (job_id, item_id) WHERE r.job_id = ? AND r.item_id = ? AND r.thread_id = ? AND r.result_json = ? AND r.cancel_job = ? AND r.cancellation_reason = ? AND i.attempt_count = r.attempt_count AND i.status = 'completed' AND i.result_json = r.result_json AND i.reported_at = r.reported_at)")
+            .bind(job_id).bind(item_id).bind(reporting_thread_id).bind(&serialized)
+            .bind(i64::from(cancel_job)).bind(cancellation_reason).fetch_one(&mut *tx).await?;
+        if replay != 0 {
+            tx.commit().await?;
+            return Ok(Some("accepted_replay"));
+        }
         let result = sqlx::query(
             r#"
 UPDATE agent_job_items
@@ -867,7 +943,7 @@ WHERE
             "#,
         )
         .bind(AgentJobItemStatus::Completed.as_str())
-        .bind(serialized)
+        .bind(&serialized)
         .bind(now)
         .bind(now)
         .bind(now)
@@ -880,8 +956,12 @@ WHERE
         .await?;
         if result.rows_affected() == 0 {
             tx.commit().await?;
-            return Ok(false);
+            return Ok(None);
         }
+
+        sqlx::query("INSERT INTO agent_job_report_receipts (job_id, item_id, attempt_count, thread_id, result_json, cancel_job, cancellation_reason, reported_at) SELECT job_id, item_id, attempt_count, ?, ?, ?, ?, ? FROM agent_job_items WHERE job_id = ? AND item_id = ?")
+            .bind(reporting_thread_id).bind(&serialized).bind(i64::from(cancel_job))
+            .bind(cancellation_reason).bind(now).bind(job_id).bind(item_id).execute(&mut *tx).await?;
 
         if cancel_job {
             let cancellation = sqlx::query(
@@ -901,13 +981,13 @@ WHERE id = ? AND status = ?
             .await?;
             if cancellation.rows_affected() == 0 {
                 tx.rollback().await?;
-                return Ok(false);
+                return Ok(None);
             }
         }
 
         tx.commit().await?;
         self.notify_agent_job_change();
-        Ok(true)
+        Ok(Some("accepted_new"))
     }
 
     pub async fn mark_agent_job_item_completed(
@@ -916,8 +996,8 @@ WHERE id = ? AND status = ?
         item_id: &str,
     ) -> anyhow::Result<bool> {
         let now = Utc::now().timestamp();
-        let result = sqlx::query(
-            r#"
+        let result = QueryBuilder::<Sqlite>::new(
+            format!(r#"
 UPDATE agent_job_items
 SET
     status = ?,
@@ -928,9 +1008,10 @@ WHERE
     job_id = ?
     AND item_id = ?
     AND status = ?
-    AND result_json IS NOT NULL
-            "#,
+    AND ({VALID_RETAINED_REPORT})
+            "#),
         )
+        .build()
         .bind(AgentJobItemStatus::Completed.as_str())
         .bind(now)
         .bind(now)
@@ -988,6 +1069,8 @@ WHERE
     }
 
     pub async fn get_agent_job_progress(&self, job_id: &str) -> anyhow::Result<AgentJobProgress> {
+        // Counts used by final delivery must not certify impossible completions.
+        self.list_agent_job_items(job_id, Some(AgentJobItemStatus::Completed), None).await?;
         let row = sqlx::query(
             r#"
 SELECT
@@ -1030,6 +1113,108 @@ mod tests {
     use crate::runtime::test_support::unique_temp_dir;
     use pretty_assertions::assert_eq;
     use serde_json::json;
+
+    #[tokio::test]
+    async fn audit142_invalid_completed_rows_block_counts_and_export() -> anyhow::Result<()> {
+        for corruption in ["result_json = NULL", "reported_at = NULL", "attempt_count = 0", "result_json = '[]'", "result_json = '{'"] {
+            let runtime = StateRuntime::init(unique_temp_dir(), "test-provider".into()).await?;
+            let (job, item, thread) = create_running_single_item_job(&runtime).await?;
+            assert!(runtime.report_agent_job_item_result(&job, &item, &thread, &json!({"ok":true})).await?);
+            assert_eq!(runtime.get_agent_job_progress(&job).await?.completed_items, 1);
+            QueryBuilder::<Sqlite>::new("UPDATE agent_job_items SET ")
+                .push(corruption)
+                .push(" WHERE job_id = ? AND item_id = ?")
+                .build()
+                .bind(&job).bind(&item).execute(runtime.pool.as_ref()).await?;
+            assert!(runtime.get_agent_job_progress(&job).await.is_err(), "{corruption}");
+            assert!(runtime.agent_job_export_snapshot(&job).await.is_err(), "{corruption}");
+            let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agent_job_items WHERE job_id = ?")
+                .bind(&job).fetch_one(runtime.pool.as_ref()).await?;
+            assert_eq!(count, 1, "invalid evidence must not be silently omitted");
+            runtime.close().await;
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn audit142_exact_report_replay_returns_original_acceptance_without_effects() -> anyhow::Result<()> {
+        let runtime = StateRuntime::init(unique_temp_dir(), "test-provider".into()).await?;
+        let (job, item, thread) = create_running_single_item_job(&runtime).await?;
+        let result = json!({"ok":true});
+        assert_eq!(runtime.report_agent_job_item_result_with_receipt(&job, &item, &thread, &result, false, "").await?, Some("accepted_new"));
+        let before = runtime.get_agent_job_item(&job, &item).await?;
+        let revision = runtime.agent_job_export_snapshot(&job).await?.0;
+        assert_eq!(runtime.report_agent_job_item_result_with_receipt(&job, &item, &thread, &result, false, "").await?, Some("accepted_replay"));
+        for (worker, payload, stop) in [("other", result.clone(), false), (thread.as_str(), json!({"ok":false}), false), (thread.as_str(), result.clone(), true)] {
+            assert_eq!(runtime.report_agent_job_item_result_with_receipt(&job, &item, worker, &payload, stop, "").await?, None);
+        }
+        assert_eq!(runtime.get_agent_job_item(&job, &item).await?, before);
+        assert_eq!(runtime.agent_job_export_snapshot(&job).await?.0, revision);
+        runtime.close().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn audit142_restart_and_ordinary_settlement_agree_on_legacy_report() -> anyhow::Result<()> {
+        for reported in [true, false] {
+            for restart in [true, false] {
+                let home = unique_temp_dir();
+                let owner = StateRuntime::init(home.clone(), "test-provider".into()).await?;
+                let (job, item, thread) = create_running_single_item_job(&owner).await?;
+                if reported {
+                    sqlx::query("UPDATE agent_job_items SET result_json = '{\"legacy\":true}', reported_at = updated_at WHERE job_id = ?")
+                        .bind(&job).execute(owner.pool.as_ref()).await?;
+                }
+                let runtime = if restart {
+                    owner.close().await;
+                    let observer = StateRuntime::init(home, "test-provider".into()).await?;
+                    observer.reconcile_orphaned_agent_jobs_after_restart().await?;
+                    observer
+                } else {
+                    owner.settle_agent_job_item_for_thread(&job, &item, Some(&thread), "orphan").await?;
+                    owner
+                };
+                let item = runtime.get_agent_job_item(&job, &item).await?.unwrap();
+                assert_eq!(item.status, if reported { AgentJobItemStatus::Completed } else { AgentJobItemStatus::Failed });
+                if reported {
+                    assert_eq!(item.result_json, Some(json!({"legacy":true})));
+                    assert!(item.last_error.is_none());
+                }
+                runtime.close().await;
+            }
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn audit142_publication_is_bound_to_one_destination_owner_and_exact_bytes() -> anyhow::Result<()> {
+        let home = tempfile::tempdir()?;
+        let runtime = StateRuntime::init(home.path().to_path_buf(), "test-provider".into()).await?;
+        let (job, _, _) = create_running_single_item_job(&runtime).await?;
+        runtime.create_agent_job(&AgentJobCreateParams {
+            id: "other".into(), name: "other".into(), instruction: "work".into(), auto_export: true,
+            max_runtime_seconds: None, output_schema_json: None, input_headers: Vec::new(),
+            input_csv_path: "in".into(), output_csv_path: "out".into(),
+        }, &[]).await?;
+        let path = home.path().join("shared.csv");
+        let destination = path.to_string_lossy().into_owned();
+        runtime.reserve_agent_job_destination(&job, &destination).await?;
+        let revision = runtime.agent_job_export_snapshot(&job).await?.0;
+        std::fs::write(&path, b"A")?;
+        // SHA-256 of the literal bytes b"A", independently computed for this fixture.
+        let digest = "559aead08264d5795d3909718cdd05abd49572e84fe55590eef31a88a08fdffd";
+        runtime.acknowledge_agent_job_artifact(&job, revision, &destination, &digest).await?;
+        assert!(runtime.agent_job_export_is_published(&job).await?);
+        assert!(runtime.reserve_agent_job_destination("other", &destination).await.is_err());
+        assert_eq!(std::fs::read(&path)?, b"A");
+        std::fs::write(&path, b"external change")?;
+        assert!(!runtime.agent_job_export_is_published(&job).await?);
+        std::fs::remove_file(&path)?;
+        assert!(!runtime.agent_job_export_is_published(&job).await?);
+        runtime.reserve_agent_job_destination("other", &home.path().join("other.csv").to_string_lossy()).await?;
+        runtime.close().await;
+        Ok(())
+    }
 
     async fn create_running_single_item_job(
         runtime: &StateRuntime,

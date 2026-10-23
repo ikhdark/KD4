@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use futures::StreamExt;
 
 use codex_core_skills::HostSkillsSnapshot;
 use codex_core_skills::injection::InjectedHostSkillPrompts;
@@ -38,6 +39,7 @@ use crate::provider::SkillReadRequest;
 use crate::render::MAX_SELECTED_PROMPT_BYTES;
 use crate::render::available_skills_fragment;
 use crate::render::main_prompt_fragment;
+use crate::render::selected_prompt_budgets;
 use crate::selection::collect_explicit_skill_mentions;
 use crate::sources::SkillProviders;
 use crate::state::EmittedTurnWarnings;
@@ -367,8 +369,42 @@ where
                 source_scope: None,
             };
             let mut omitted_instructions = false;
-            let mut remaining_prompt_bytes = MAX_SELECTED_PROMPT_BYTES - unavailable.render().len();
-            for (index, entry) in selected_entries.iter().enumerate() {
+            let mut remaining_prompt_bytes = MAX_SELECTED_PROMPT_BYTES;
+            // At most four provider reads are polled together. No detached tasks:
+            // dropping this contribution cancels the entire pending read set.
+            // Ordered admission preserves instruction priority and error identity.
+            let mut selected_reads = Vec::with_capacity(selected_entries.len());
+            let mut complete_costs = Vec::with_capacity(selected_entries.len());
+            let mut reads = futures::stream::iter(0..selected_entries.len())
+                .map(|index: usize| {
+                    let entry = &selected_entries[index];
+                    let snapshot = host_snapshot.clone();
+                    let state = &thread_state;
+                    async move {
+                        (entry, self.read_main_prompt(entry, snapshot, session_store, state).await)
+                    }
+                })
+                .buffered(4);
+            while let Some((entry, read)) = reads.next().await {
+                let contents = match &read {
+                    Ok(read) => read.contents.as_str().to_string(),
+                    Err(message) => format!("Instructions were not loaded. {message}"),
+                };
+                complete_costs.push(SkillInstructions {
+                    name: entry.name.clone(),
+                    path: entry.main_prompt.as_str().to_string(),
+                    contents,
+                    source_scope: entry.source_scope,
+                }.render().len());
+                selected_reads.push(read);
+            }
+            if complete_costs.iter().copied().try_fold(0usize, usize::checked_add)
+                .is_none_or(|total| total > MAX_SELECTED_PROMPT_BYTES)
+            {
+                remaining_prompt_bytes -= unavailable.render().len();
+            }
+            let budgets = selected_prompt_budgets(&complete_costs, remaining_prompt_bytes);
+            for ((entry, read), budget) in selected_entries.iter().zip(selected_reads).zip(budgets) {
                 let host_metadata = host_snapshot.as_ref().and_then(|snapshot| {
                     (entry.authority.kind == SkillSourceKind::Host)
                         .then(|| {
@@ -398,11 +434,7 @@ where
                 if entry.authority.kind == SkillSourceKind::Host {
                     injected_host_skill_prompts.suppress_path(entry.main_prompt.as_str());
                 }
-                let budget = remaining_prompt_bytes / (selected_entries.len() - index);
-                match self
-                    .read_main_prompt(entry, host_snapshot.clone(), session_store, &thread_state)
-                    .await
-                {
+                match read {
                     Ok(read_result) => {
                         let Some((fragment, truncated)) =
                             main_prompt_fragment(read_result.contents.as_str(), entry, budget)

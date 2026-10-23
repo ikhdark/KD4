@@ -499,8 +499,7 @@ pub(super) async fn run_exec_like_with_exit_code(
 
     let repository_root = resolve_repository_root(args.exec_params.cwd.as_path());
     let is_validation = args.validation_launch;
-    run_exec_like_with_exit_code_inner(args, is_validation, inspection_command, repository_root)
-        .await
+    run_exec_like_with_exit_code_inner(args, is_validation, repository_root).await
 }
 
 pub(crate) fn validation_environment_hash(env: &HashMap<String, String>) -> String {
@@ -528,23 +527,24 @@ fn restore_retained_validation_attempt(
     }
 }
 
+/// Only validation launches take the workspace validation gate, as in unified
+/// exec. Other commands neither wait behind nor block another session's
+/// validation, and their refusal must not read as pending validation.
 pub(crate) fn workspace_operation_root_if_needed(
     is_validation: bool,
-    inspection_command: bool,
     repository_root: std::path::PathBuf,
 ) -> Option<std::path::PathBuf> {
-    (is_validation || !inspection_command).then_some(repository_root)
+    is_validation.then_some(repository_root)
 }
 
 async fn run_exec_like_with_exit_code_inner(
     args: RunExecLikeArgs,
     is_validation: bool,
-    inspection_command: bool,
     repository_root: std::path::PathBuf,
 ) -> Result<RunExecLikeResult, FunctionCallError> {
     let RunExecLikeArgs {
         max_output_tokens,
-        validation: _,
+        validation: command_validation,
         tool_name,
         exec_params,
         stall_timeout_ms,
@@ -808,7 +808,7 @@ async fn run_exec_like_with_exit_code_inner(
     };
 
     let workspace_operation_root =
-        workspace_operation_root_if_needed(is_validation, inspection_command, repository_root);
+        workspace_operation_root_if_needed(is_validation, repository_root);
     let req = ShellRequest {
         command: exec_params.command.clone(),
         command_for_approval: safety_command,
@@ -829,6 +829,9 @@ async fn run_exec_like_with_exit_code_inner(
         justification: exec_params.justification.clone(),
         exec_approval_requirement,
         validation_launch,
+        validation_proof: command_validation
+            .as_ref()
+            .is_some_and(|validation| validation.signal()["proof"] == true),
         workspace_operation_root,
     };
     let mut orchestrator = ToolOrchestrator::new();

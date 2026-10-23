@@ -16,8 +16,8 @@ Example combining operations:
 *** Update File: src/app.py
 *** Move to: src/main.py
 @@ def greet():
--print("Hi")
-+print("Hello, world!")
+-    print("Hi")
++    print("Hello, world!")
 *** Delete File: obsolete.txt
 *** End Patch
 ```
@@ -27,7 +27,7 @@ Rules:
 - Prefer paths relative to the selected working directory. Absolute paths are supported, subject to the same filesystem permissions.
 - Each source or move destination may occur only once per patch, including path aliases; put edits to a renamed file in its source Update File hunk. Order chunks from top to bottom.
 - Use exact current bytes on removed lines, including indentation, trailing whitespace, and Unicode punctuation. Normalization is allowed only for unchanged context, whose original bytes are preserved.
-- Add File replaces an existing file, and Move to replaces its destination.
+- Add File is create-only and refuses an occupied path. Use Update File with a current codex-range source hash for a whole-file replacement. Move to replaces its destination.
 - Moves write text then remove the source; they are not atomic renames and do not carry source permissions to new destinations.
 - Use only this grammar. Do not include unified-diff headers such as `diff --git`, `---`, or `+++`.
 - Updates preserve the file's line endings and final-newline state; added files use LF.

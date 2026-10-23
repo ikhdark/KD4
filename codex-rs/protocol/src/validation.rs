@@ -23,16 +23,7 @@ impl<'de> Deserialize<'de> for ValidationCommandContext {
         }
 
         let raw = Raw::deserialize(deserializer)?;
-        if raw.covered_paths.is_empty()
-            || raw
-                .covered_paths
-                .iter()
-                .any(|value| value.trim().is_empty())
-        {
-            return Err(serde::de::Error::custom(
-                "validation covered_paths must contain non-empty paths",
-            ));
-        }
+        validate_covered_paths(&raw.covered_paths).map_err(serde::de::Error::custom)?;
         Ok(Self {
             covered_paths: raw.covered_paths,
         })
@@ -137,6 +128,10 @@ fn validate_direct_validation_values(
     if argv.first().is_none_or(|value| value.trim().is_empty()) {
         return Err("validation argv must contain a non-empty executable".to_string());
     }
+    validate_covered_paths(covered_paths)
+}
+
+fn validate_covered_paths(covered_paths: &[String]) -> Result<(), String> {
     if covered_paths.is_empty() || covered_paths.iter().any(|value| value.trim().is_empty()) {
         return Err("validation covered_paths must contain non-empty paths".to_string());
     }
@@ -301,6 +296,9 @@ mod tests {
             json!(["src", "src"]),
             json!(["src", "SRC"]),
         ] {
+            assert!(serde_json::from_value::<ValidationCommandContext>(json!({
+                "covered_paths": covered_paths.clone()
+            })).is_err());
             assert!(
                 serde_json::from_value::<ValidationResult>(json!({
                     "argv": ["cargo", "test"],

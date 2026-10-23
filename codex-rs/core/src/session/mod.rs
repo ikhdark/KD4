@@ -3022,6 +3022,27 @@ impl Session {
         persist: bool,
         publication_receipt: Option<&mut Option<EventMsg>>,
     ) -> PreparedEventDispatch {
+        let visible_candidate = match &msg {
+            EventMsg::AgentMessageContentDelta(event) => !event.delta.is_empty(),
+            EventMsg::ReasoningContentDelta(event) => !event.delta.is_empty(),
+            EventMsg::ReasoningRawContentDelta(event) => self.show_raw_agent_reasoning() && !event.delta.is_empty(),
+            EventMsg::AgentMessage(event) => !event.message.is_empty(),
+            EventMsg::ItemStarted(event) => match &event.item {
+                codex_protocol::items::TurnItem::AgentMessage(message) => message.content.iter().any(|part| match part {
+                    codex_protocol::items::AgentMessageContent::Text { text } => !text.is_empty(),
+                }),
+                codex_protocol::items::TurnItem::Reasoning(reasoning) => reasoning.summary_text.iter().any(|text| !text.is_empty()),
+                _ => false,
+            },
+            EventMsg::ItemCompleted(event) => match &event.item {
+                codex_protocol::items::TurnItem::AgentMessage(message) => message.content.iter().any(|part| match part {
+                    codex_protocol::items::AgentMessageContent::Text { text } => !text.is_empty(),
+                }),
+                codex_protocol::items::TurnItem::Reasoning(reasoning) => reasoning.summary_text.iter().any(|text| !text.is_empty()),
+                _ => false,
+            },
+            _ => false,
+        };
         let post_dispatch = PreparedEventDispatch::new(&msg, self.show_raw_agent_reasoning());
         if let EventMsg::Error(error) = &msg
             && error.affects_turn_status()
@@ -3032,7 +3053,11 @@ impl Session {
                 .await
                 .replace(error.clone());
         }
-        if self.services.rollout_thread_trace.is_enabled() {
+        if self
+            .services
+            .rollout_thread_trace
+            .should_record_runtime_event(&turn_context.sub_id, &msg)
+        {
             let trace = self.services.rollout_thread_trace.clone();
             let turn_id = turn_context.sub_id.clone();
             let trace_msg = msg.clone();
@@ -3046,8 +3071,17 @@ impl Session {
             id: turn_context.sub_id.clone(),
             msg,
         };
-        self.send_event_raw_with_receipt(event, persist, publication_receipt)
-            .await;
+        if visible_candidate {
+            let mut local_receipt = None;
+            let receipt = publication_receipt.unwrap_or(&mut local_receipt);
+            self.send_event_raw_with_receipt(event, persist, Some(&mut *receipt)).await;
+            if let Some(published) = receipt.as_ref() {
+                turn_context.record_first_visible_publication();
+                turn_context.turn_timing_state.record_assistant_text_publication(published);
+            }
+        } else {
+            self.send_event_raw_with_receipt(event, persist, publication_receipt).await;
+        }
         post_dispatch
     }
 
@@ -3064,7 +3098,11 @@ impl Session {
             None => true,
         };
         for legacy in post_dispatch.legacy_events {
-            if self.services.rollout_thread_trace.is_enabled() {
+            if self
+                .services
+                .rollout_thread_trace
+                .should_record_tool_call_event(&legacy)
+            {
                 let trace = self.services.rollout_thread_trace.clone();
                 let turn_id = turn_context.sub_id.clone();
                 let trace_msg = legacy.clone();
@@ -3203,15 +3241,16 @@ impl Session {
                         status = durable_status;
                         self.update_agent_status(&turn_context.sub_id, msg, status.clone());
                     }
+                    task_coordinator.emit_terminal_metrics_from_snapshot(
+                        &task,
+                        &turn_context.session_telemetry,
+                    );
                 }
                 Err(error) => {
                     warn!(%assignment_id, %error, "failed to load durable typed-agent outcome for parent notification");
                     return false;
                 }
             }
-            task_coordinator
-                .maybe_emit_terminal_metrics(assignment_id, &turn_context.session_telemetry)
-                .await;
         }
 
         let delivered = self
@@ -3233,7 +3272,7 @@ impl Session {
                 .get()
                 .and_then(Option::as_ref)
             && let Err(error) = task_coordinator
-                .acknowledge_terminal_outcome(binding.attempt_id)
+                .acknowledge_terminal_outcome(binding.attempt_id, &turn_context.sub_id)
                 .await
         {
             warn!(%error, "terminal reconciliation acknowledgment remains pending");
@@ -3401,7 +3440,11 @@ impl Session {
         {
             error!("failed to queue rollout activity event: {error:#}");
         }
-        if self.services.rollout_thread_trace.is_enabled() {
+        if self
+            .services
+            .rollout_thread_trace
+            .should_record_protocol_event(&event.msg)
+        {
             let trace = self.services.rollout_thread_trace.clone();
             let trace_msg = event.msg.clone();
             let _ = run_trace_recording(&self.terminal_tasks, move || {
@@ -3453,6 +3496,14 @@ impl Session {
             self.update_agent_status(&event.id, &event.msg, status);
         }
         let published_msg = publication_receipt.as_ref().map(|_| event.msg.clone());
+        let publishes_visible_content = match &event.msg {
+            EventMsg::AgentMessageContentDelta(delta) => !delta.delta.is_empty(),
+            EventMsg::ReasoningContentDelta(delta) => !delta.delta.is_empty(),
+            EventMsg::ReasoningRawContentDelta(delta) => !delta.delta.is_empty(),
+            EventMsg::AgentMessage(message) => !message.message.is_empty(),
+            _ => false,
+        };
+        let publication_turn_id = publishes_visible_content.then(|| event.id.clone());
         if let Some(metrics) = codex_otel::global() {
             let _ = metrics.histogram(
                 "codex.event_channel.occupancy",
@@ -3471,6 +3522,12 @@ impl Session {
                 // existing finalizer owner. A later post-dispatch panic must not publish again.
                 if let (Some(receipt), Some(msg)) = (publication_receipt, published_msg) {
                     *receipt = Some(msg);
+                }
+                if let Some(turn_id) = publication_turn_id {
+                    tracing::info!(event.name = "codex.model_output_published", %turn_id,
+                        endpoint = "post_filter_session_channel_acceptance", client_visible = false,
+                        at_unix_ms = chrono::Utc::now().timestamp_millis(), clock = "unix_wall_ms",
+                        "visible-content publication is separate from provider arrival and client rendering");
                 }
             }
             Err(e) => debug!("dropping event because channel is closed: {e}"),
@@ -3511,17 +3568,32 @@ impl Session {
         turn_context: &TurnContext,
         item: TurnItem,
     ) {
+        self.emit_turn_item_completed_with_legacy_events(turn_context, item, true)
+            .await;
+    }
+
+    /// Closing a failed compaction attempt is not a legacy ContextCompacted success.
+    pub(crate) async fn emit_turn_item_completed_with_legacy_events(
+        &self,
+        turn_context: &TurnContext,
+        item: TurnItem,
+        emit_legacy: bool,
+    ) {
         record_turn_ttfm_metric(turn_context, &item);
-        self.send_event(
-            turn_context,
-            EventMsg::ItemCompleted(ItemCompletedEvent {
-                thread_id: self.thread_id,
-                turn_id: turn_context.sub_id.clone(),
-                item,
-                completed_at_ms: now_unix_timestamp_ms(),
-            }),
-        )
-        .await;
+        let event = EventMsg::ItemCompleted(ItemCompletedEvent {
+            thread_id: self.thread_id,
+            turn_id: turn_context.sub_id.clone(),
+            item,
+            completed_at_ms: now_unix_timestamp_ms(),
+        });
+        let mut dispatch = self
+            .send_event_before_post_dispatch(turn_context, event, true, None)
+            .await;
+        if !emit_legacy {
+            dispatch.legacy_events.clear();
+        }
+        self.finish_prepared_event_dispatch(turn_context, dispatch)
+            .await;
     }
 
     /// Adds an execpolicy amendment to both the in-memory and on-disk policies so future
@@ -5244,7 +5316,7 @@ impl Session {
             // retain task admission (which shutdown also needs).
             drop(task_start_permit);
             if let Some(event) = token_count {
-                session.send_event(turn_context.as_ref(), EventMsg::TokenCount(event)).await;
+                session.send_token_count(turn_context.as_ref(), event).await;
             }
             Ok(())
         }).await.map_err(std::io::Error::other)?
@@ -5903,10 +5975,19 @@ impl Session {
                 .map(|provenance| provenance.fragment_digests.as_slice())
         });
         let mut retained_contributions = Vec::new();
-        let thread = self.poll_thread_context_contributors(estimate).await;
-        let turn = self
-            .poll_turn_context_contributors(turn_context, estimate)
-            .await;
+        let (thread, turn) = if estimate {
+            // Estimates are read-only by contract; poll both deadlines together.
+            // Contribution methods can share mutable extension state and retain
+            // their historical thread-before-turn ordering below.
+            tokio::join!(
+                self.poll_thread_context_contributors(true),
+                self.poll_turn_context_contributors(turn_context, true),
+            )
+        } else {
+            let thread = self.poll_thread_context_contributors(false).await;
+            let turn = self.poll_turn_context_contributors(turn_context, false).await;
+            (thread, turn)
+        };
         for (scope, batches) in [("thread", thread), ("turn", turn)] {
             for (producer, batch) in batches.into_iter().enumerate() {
                 let prefix = format!("turn-contributor:{scope}:{producer}:");
@@ -6729,8 +6810,12 @@ impl Session {
         self.state
             .lock()
             .await
-            .tool_history_state()
+            .tool_history_state_ref()
             .reusable_artifact_for_origin(call_id, bytes, sha256)
+    }
+
+    pub(crate) async fn source_snapshot_backing(&self, bytes: u64, sha256: &str) -> Option<String> {
+        self.state.lock().await.tool_history_state_ref().source_snapshot_backing(bytes, sha256)
     }
 
     pub(crate) async fn bind_source_inspection_origin(
@@ -6776,7 +6861,7 @@ impl Session {
         self.state
             .lock()
             .await
-            .tool_history_state()
+            .tool_history_state_ref()
             .completed_source_inspection(artifact_id, bytes, sha256, attempt_id)
     }
 
@@ -7395,6 +7480,32 @@ impl Session {
         result
     }
 
+    pub(crate) async fn settle_observed_model_usage(&self, turn_context: &TurnContext) -> u64 {
+        let mut state = self.state.lock().await;
+        let receipts = turn_context.turn_timing_state.claim_unsettled_model_usage();
+        let count = receipts.len() as u64;
+        if count == 0 { return 0; }
+        let mut info = state.token_info().unwrap_or_else(|| TokenUsageInfo {
+            total_token_usage: TokenUsage::empty_ledger(),
+            last_token_usage: TokenUsage::default(),
+            estimated_context_tokens: None,
+            model_context_window: turn_context.model_context_window(),
+        });
+        for usage in receipts {
+            turn_context.record_current_turn_usage(&usage);
+            info.total_token_usage.add_assign(&usage);
+            self.services.agent_control.task_coordinator().record_task_usage_for_source(
+                &turn_context.session_source,
+                crate::agent::task_metrics::TokenClassTotals::from_usage(&usage), 1,
+            );
+        }
+        // Billable abandoned/compactor usage cannot replace active context.
+        // There is no await between claiming receipts and committing totals.
+        state.set_token_info(Some(info));
+        turn_context.turn_timing_state.mark_model_responses_accounted(count);
+        count
+    }
+
     pub(crate) async fn record_missing_model_usage(&self, turn_context: &TurnContext, count: u64) {
         if count == 0 {
             return;
@@ -7405,6 +7516,7 @@ impl Session {
             reported_receipts: Some(0),
             ..Default::default()
         });
+        turn_context.record_current_turn_usage(&missing);
         {
             let mut state = self.state.lock().await;
             let mut info = state.token_info().unwrap_or_else(|| TokenUsageInfo {
@@ -7441,11 +7553,22 @@ impl Session {
     ) -> CodexResult<()> {
         if let Some(token_usage) = token_usage {
             // Release the timing lock before acquiring session state.
-            let calibration = turn_context
-                .turn_timing_state
-                .prompt_token_calibration_sample(&turn_context.model_info.slug, token_usage);
+            let prepared_basis = turn_context.extension_data
+                .get::<crate::client_common::PromptCalibrationBasis>();
+            let calibration = prepared_basis.as_ref().and_then(|basis| {
+                turn_context.turn_timing_state.prompt_token_calibration_with_estimator(
+                    &turn_context.model_info.slug, token_usage, basis.local_tokens,
+                )
+            });
             let token_info = {
                 let mut state = self.state.lock().await;
+                // Claim only after acquiring the accounting owner lock.
+                let delivered = update_context.then(|| turn_context.extension_data
+                    .get::<crate::client_common::ResponseAttemptIdentity>()).flatten();
+                if !turn_context.turn_timing_state.claim_current_model_usage(token_usage, delivered.as_deref()) {
+                    return Ok(());
+                }
+                turn_context.record_current_turn_usage(token_usage);
                 if update_context {
                     if let Some(basis) = turn_context
                         .extension_data
@@ -7488,8 +7611,11 @@ impl Session {
                     });
                     info.total_token_usage.add_assign(token_usage);
                     state.set_token_info(Some(info));
+                    // It is still the latest request: publish it as such so
+                    // per-request readers do not repeat the prior receipt.
+                    state.record_compaction_receipt(token_usage);
                 }
-                state.token_info()
+                state.published_token_info()
             };
             // Settle counts before extension callbacks can suspend or be cancelled.
             self.services
@@ -7570,8 +7696,7 @@ impl Session {
 
     pub(crate) async fn recompute_token_usage(&self, turn_context: &TurnContext) {
         if let Some(event) = self.recompute_token_usage_state(turn_context).await {
-            self.send_event(turn_context, EventMsg::TokenCount(event))
-                .await;
+            self.send_token_count(turn_context, event).await;
         }
     }
 
@@ -7600,9 +7725,7 @@ impl Session {
             // so concurrent appends cannot disappear behind a newer model anchor.
             info.estimated_context_tokens = Some(estimated_total_tokens.max(0));
 
-            if let Some(model_context_window) = turn_context.model_context_window() {
-                info.model_context_window = Some(model_context_window);
-            }
+            info.model_context_window = turn_context.model_context_window();
 
             state.set_token_info(Some(info));
         }
@@ -7648,12 +7771,31 @@ impl Session {
     }
 
     pub(crate) async fn send_token_count_event(&self, turn_context: &TurnContext) {
-        let (info, rate_limits) = {
+        let (mut info, rate_limits) = {
             let state = self.state.lock().await;
             state.token_info_and_rate_limits()
         };
-        let event = EventMsg::TokenCount(TokenCountEvent { info, rate_limits });
-        self.send_event(turn_context, event).await;
+        if let Some(info) = info.as_mut() {
+            // Settings can change without a new usage receipt. Advertise the
+            // active model's capacity, including an explicitly unknown value.
+            info.model_context_window = turn_context.model_context_window();
+        }
+        self.send_token_count(turn_context, TokenCountEvent { info, rate_limits }).await;
+    }
+
+    /// Publishes usage and rate limits unless they exactly repeat the last
+    /// publication. Unchanged rate-limit refreshes, transport fallbacks, and
+    /// lifecycle steps that change neither would otherwise persist duplicate
+    /// records that per-request readers cannot tell from new requests.
+    async fn send_token_count(&self, turn_context: &TurnContext, event: TokenCountEvent) {
+        if self.state.lock().await.repeats_published_token_count(&event) {
+            return;
+        }
+        let published = event.clone();
+        self.send_event(turn_context, EventMsg::TokenCount(event)).await;
+        // Record only after dispatch, so a cancelled send cannot suppress a
+        // later identical publication.
+        self.state.lock().await.record_published_token_count(&published);
     }
 
     pub(crate) async fn set_total_tokens_full(&self, turn_context: &TurnContext) {

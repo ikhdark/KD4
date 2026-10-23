@@ -384,15 +384,15 @@ async fn steer_interrupts_wait_agent_and_is_sent_in_follow_up_request() {
                 INITIAL_WAIT_CALL_ID,
                 MULTI_AGENT_V2_NAMESPACE,
                 "wait_agent",
-                "{}",
+                r#"{"timeout_ms":0}"#,
             ),
             ev_completed("resp-2"),
         ]),
     )
     .await;
-    // Drain the spawn's accepted event before waiting for steering. ItemStarted
-    // precedes the durable-backlog check, so steering the first wait races with
-    // that legitimate immediate wake.
+    // Acknowledge the spawn's admission before waiting for steering. Admission
+    // is not progress, so this zero-timeout wait consumes it and times out
+    // instead of waking; the child stays in its delayed model request.
     let accepted_follow_up_mock = responses::mount_sse_once_match(
         &server,
         move |request: &wiremock::Request| {
@@ -430,6 +430,8 @@ async fn steer_interrupts_wait_agent_and_is_sent_in_follow_up_request() {
         .with_model("gpt-5.4")
         .with_config(|config| {
             config.multi_agent_v2.tool_namespace = Some(MULTI_AGENT_V2_NAMESPACE.to_string());
+            // Let the acknowledging wait use a zero deadline.
+            config.multi_agent_v2.min_wait_timeout_ms = 0;
             config
                 .features
                 .enable(Feature::Collab)
@@ -513,12 +515,21 @@ async fn steer_interrupts_wait_agent_and_is_sent_in_follow_up_request() {
         .expect("initial wait_agent output");
     let accepted_output =
         serde_json::from_str::<Value>(&accepted_output).expect("parse initial wait_agent output");
-    assert_eq!(accepted_output["timed_out"], json!(false));
-    let typed_deltas = accepted_output["typed_deltas"]
-        .as_array()
-        .expect("typed deltas array");
-    assert_eq!(typed_deltas.len(), 1);
-    assert_eq!(typed_deltas[0]["reason"], json!("accepted"));
+    // The admission was acknowledged (the cursor moved past it) without being
+    // delivered as progress.
+    assert_eq!(accepted_output["timed_out"], json!(true));
+    assert_eq!(accepted_output["typed_deltas"], json!([]));
+    assert!(
+        accepted_output["cursor"]
+            .as_str()
+            .is_some_and(|cursor| !cursor.is_empty())
+    );
+    assert!(
+        accepted_output["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("admission-only")),
+        "{accepted_output}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

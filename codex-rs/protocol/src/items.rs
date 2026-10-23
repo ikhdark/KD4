@@ -411,6 +411,10 @@ pub struct ImageGenerationItem {
 #[derive(Debug, Clone, Deserialize, Serialize, TS, JsonSchema, PartialEq)]
 pub struct FileChangeItem {
     pub id: String,
+    /// Settled committed effects, independent of intended review changes and status.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub effects: Option<FileChangeEffects>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub environment: Option<EnvironmentProvenance>,
@@ -427,6 +431,21 @@ pub struct FileChangeItem {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub stderr: Option<String>,
+}
+
+/// Ordered committed endpoint receipts. `exact=false` means additional effects
+/// may be unknown; an empty list then is not proof that nothing changed.
+#[derive(Debug, Clone, Deserialize, Serialize, TS, JsonSchema, PartialEq)]
+pub struct FileChangeEffects {
+    pub changes: Vec<FileChangeEffect>,
+    pub exact: bool,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, TS, JsonSchema, PartialEq)]
+pub struct FileChangeEffect {
+    pub path: PathUri,
+    pub before: Option<String>,
+    pub after: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, TS, JsonSchema, PartialEq)]

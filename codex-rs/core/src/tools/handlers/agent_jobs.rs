@@ -97,6 +97,7 @@ struct SpawnAgentsOnCsvResult {
     job_id: String,
     status: String,
     output_csv_path: String,
+    output_sha256: Option<String>,
     total_items: usize,
     completed_items: usize,
     failed_items: usize,
@@ -114,6 +115,8 @@ struct AgentJobFailureSummary {
 #[derive(Debug, Serialize)]
 struct ReportAgentJobResultToolResult {
     accepted: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    acknowledgment: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     rejection_reason: Option<&'static str>,
 }
@@ -210,7 +213,7 @@ fn required_state_db(
     session: &Arc<Session>,
 ) -> Result<Arc<codex_state::StateRuntime>, FunctionCallError> {
     session.state_db().ok_or_else(|| {
-        FunctionCallError::Fatal("sqlite state db is unavailable for this session".to_string())
+        FunctionCallError::RespondToModel("csv_backend_unavailable: CSV jobs require persistent session state; ephemeral sessions are unsupported and a failed persistent backend must be restored before retrying".to_string())
     })
 }
 
@@ -421,186 +424,210 @@ async fn run_agent_job_loop(
             break;
         }
 
-        if !cancel_requested && active_items.len() < options.max_concurrency {
-            let slots = options.max_concurrency - active_items.len();
+        if active_items.len() < options.max_concurrency {
+            // Reserve distinct pending rows for this batch before any spawn is
+            // polled. Initializers count against the same worker capacity.
+            let slots = (options.max_concurrency - active_items.len()).min(8);
             let pending_items = db
                 .list_agent_job_items(
-                    job_id.as_str(),
+                    &job_id,
                     Some(codex_state::AgentJobItemStatus::Pending),
                     Some(slots),
                 )
                 .await?;
+            let mut spawns = FuturesUnordered::new();
             for item in pending_items {
-                if observe_parent_job_cancellation(
-                    &cancellation_token,
-                    db.as_ref(),
-                    job_id.as_str(),
-                )
-                .await?
-                {
-                    cancel_requested = true;
-                    break;
-                }
-                if !db.agent_job_is_owned_running(job_id.as_str()).await? {
-                    cancel_requested = true;
-                    break;
-                }
                 let prompt = build_worker_prompt(&job, &item)?;
-                let items = vec![UserInput::Text {
-                    text: prompt,
-                    text_elements: Vec::new(),
-                }];
-                let spawn = session.services.agent_control.spawn_agent_with_metadata(
-                    options.spawn_config.clone(),
-                    items,
-                    Some(SessionSource::SubAgent(SubAgentSource::Other(format!(
-                        "agent_job:{job_id}"
-                    )))),
-                    SpawnAgentOptions {
-                        parent_thread_id: Some(session.thread_id),
-                        environments: Some(options.environments.to_selections()),
-                        captured_environments: Some(options.environments.clone()),
-                        agent_job_binding: Some(AgentJobBinding {
-                            state_db: db.clone(),
-                            job_id: job_id.clone(),
-                            item_id: item.item_id.clone(),
-                        }),
-                        ..Default::default()
-                    },
-                );
-                tokio::pin!(spawn);
-                // A spawn that completes while existing workers are serviced is
-                // handed to the post-spawn path below, never dropped.
-                let mut completed_spawn = None;
-                let spawn_result = loop {
-                    if let Some(result) = completed_spawn.take() {
-                        break Some(result);
+                let session = session.clone();
+                let db = db.clone();
+                let job_id = job_id.clone();
+                let spawn_config = options.spawn_config.clone();
+                let environments = options.environments.clone();
+                let cancellation = cancellation_token.clone();
+                spawns.push(async move {
+                    if cancellation.is_cancelled() {
+                        return (item.item_id, Err(CodexErr::TurnAborted));
                     }
+                    match db.agent_job_is_owned_running(&job_id).await {
+                        Ok(true) => {}
+                        Ok(false) => return (item.item_id, Err(CodexErr::TurnAborted)),
+                        Err(error) => {
+                            return (
+                                item.item_id,
+                                Err(CodexErr::Fatal(format!(
+                                    "failed to check agent job ownership before spawn: {error}"
+                                ))),
+                            );
+                        }
+                    }
+                    if cancellation.is_cancelled() {
+                        return (item.item_id, Err(CodexErr::TurnAborted));
+                    }
+                    let result = session
+                        .services
+                        .agent_control
+                        .spawn_agent_with_metadata(
+                            spawn_config,
+                            vec![UserInput::Text {
+                                text: prompt,
+                                text_elements: Vec::new(),
+                            }],
+                            Some(SessionSource::SubAgent(SubAgentSource::Other(format!(
+                                "agent_job:{job_id}"
+                            )))),
+                            SpawnAgentOptions {
+                                parent_thread_id: Some(session.thread_id),
+                                environments: Some(environments.to_selections()),
+                                captured_environments: Some(environments),
+                                agent_job_binding: Some(AgentJobBinding {
+                                    state_db: db,
+                                    job_id,
+                                    item_id: item.item_id.clone(),
+                                    runtime_timeout: Some(runtime_timeout),
+                                }),
+                                ..Default::default()
+                            },
+                        )
+                        .await;
+                    (item.item_id, result)
+                });
+            }
+            let mut failed_spawns = std::collections::VecDeque::new();
+            while !spawns.is_empty() || !failed_spawns.is_empty() {
+                let completion = if spawns.is_empty() {
+                    failed_spawns.pop_front()
+                } else {
                     tokio::select! {
-                        result = &mut spawn => break Some(result),
+                        completion = spawns.next() => completion,
                         _ = wait_for_status_change(
                             active_items, &mut job_changes, &mut capacity_changes,
                             &cancellation_token, runtime_timeout,
                         ) => {
-                            // Initialization of another child must not suspend
-                            // the deadlines/status servicing of existing workers,
-                            // and that servicing must not suspend the spawn: it can
-                            // be parked inside a state-DB write transaction whose
-                            // SQLite lock the servicing writes would otherwise wait
-                            // on until busy_timeout fails them.
-                            let still_runnable = {
+                            let mut completed = Vec::new();
+                            let runnable = {
                                 let service = service_active_items_during_spawn(
-                                    session.clone(), db.clone(), job_id.as_str(),
+                                    session.clone(), db.clone(), &job_id,
                                     &cancellation_token, active_items, runtime_timeout,
                                 );
                                 tokio::pin!(service);
                                 loop {
+                                    // Continue polling every initializer while servicing
+                                    // workers: either side can need a DB lock held by the
+                                    // other. Retain every completed spawn until handoff.
                                     tokio::select! {
-                                        result = &mut spawn, if completed_spawn.is_none() => {
-                                            completed_spawn = Some(result);
+                                        Some(result) = spawns.next(), if !spawns.is_empty() => {
+                                            completed.push(result);
                                         }
-                                        still_runnable = &mut service => break still_runnable,
+                                        result = &mut service => break result,
                                     }
                                 }
                             };
-                            match still_runnable {
-                                Ok(true) => {}
-                                // Drops a spawn still in flight (its cleanup owner
-                                // rolls it back); a committed one is recorded below
-                                // and terminated by the stop path.
-                                Ok(false) => break completed_spawn.take(),
-                                Err(error) => {
-                                    if let Some(Ok(spawned_agent)) = completed_spawn.take() {
-                                        // Keep the committed worker visible to the
-                                        // caller's error cleanup.
-                                        active_items.insert(
-                                            spawned_agent.thread_id,
-                                            ActiveJobItem {
-                                                item_id: item.item_id.clone(),
-                                                started_at: Instant::now(),
-                                                status_rx: None,
-                                            },
-                                        );
+                            let mut subscribe = Vec::new();
+                            for (item_id, result) in completed {
+                                match result {
+                                    Ok(agent) => {
+                                        active_items.insert(agent.thread_id, ActiveJobItem {
+                                            item_id, started_at: agent.execution_started_at, status_rx: None,
+                                        });
+                                        subscribe.push(agent.thread_id);
+                                        progressed = true;
                                     }
-                                    return Err(error);
+                                    Err(error) => failed_spawns.push_back((item_id, Err(error))),
                                 }
                             }
-                        }
-                    }
-                };
-                let Some(spawn_result) = spawn_result else {
-                    cancel_requested = true;
-                    break;
-                };
-                let thread_id = match spawn_result {
-                    Ok(spawned_agent) => spawned_agent.thread_id,
-                    Err(CodexErr::AgentLimitReached { .. }) => {
-                        if observe_parent_job_cancellation(
-                            &cancellation_token,
-                            db.as_ref(),
-                            job_id.as_str(),
-                        )
-                        .await?
-                        {
-                            cancel_requested = true;
-                            break;
-                        }
-                        break;
-                    }
-                    Err(err) => {
-                        let error_message = format!("failed to spawn worker: {err}");
-                        let job_cancelled = observe_parent_job_cancellation(
-                            &cancellation_token,
-                            db.as_ref(),
-                            job_id.as_str(),
-                        )
-                        .await?
-                            || !db.agent_job_is_owned_running(job_id.as_str()).await?;
-                        if job_cancelled {
-                            cancel_requested = true;
-                            break;
-                        }
-                        let marked_failed = db
-                            .mark_agent_job_item_spawn_failed(
-                                job_id.as_str(),
-                                item.item_id.as_str(),
-                                error_message.as_str(),
-                            )
-                            .await?;
-                        if !marked_failed {
-                            if !db.agent_job_is_owned_running(job_id.as_str()).await? {
+                            // Register successes before either the error or stop path.
+                            // Dropping unfinished spawn futures retains their existing
+                            // PendingSpawnCleanup rollback owners, including after bind.
+                            if !runnable? {
                                 cancel_requested = true;
                                 break;
                             }
-                            return Err(anyhow::anyhow!(
-                                "{error_message}; item was no longer pending or bound to the worker"
-                            ));
+                            for thread_id in subscribe {
+                                if let Some(item) = active_items.get_mut(&thread_id) {
+                                    item.status_rx = session.services.agent_control
+                                        .subscribe_status(thread_id).await.ok();
+                                }
+                            }
+                            continue;
                         }
-                        progressed = true;
-                        continue;
                     }
                 };
-                active_items.insert(
-                    thread_id,
-                    ActiveJobItem {
-                        item_id: item.item_id.clone(),
-                        started_at: Instant::now(),
-                        status_rx: session
+                let Some((item_id, spawn_result)) = completion else {
+                    break;
+                };
+                // A sibling initializer may own a database transaction until
+                // its future is polled again. Do not suspend that owner while
+                // settling a failed row; drain the bounded batch first. The
+                // service branch above continues checking cancellation and
+                // worker deadlines while polling every remaining initializer.
+                if spawn_result.is_err() && !spawns.is_empty() {
+                    failed_spawns.push_back((item_id, spawn_result));
+                    continue;
+                }
+                match spawn_result {
+                    Ok(agent) => {
+                        let thread_id = agent.thread_id;
+                        // No await between spawn completion and cleanup ownership.
+                        active_items.insert(
+                            thread_id,
+                            ActiveJobItem {
+                                item_id,
+                                started_at: agent.execution_started_at,
+                                status_rx: None,
+                            },
+                        );
+                        progressed = true;
+                        let status_rx = session
                             .services
                             .agent_control
                             .subscribe_status(thread_id)
                             .await
-                            .ok(),
-                    },
-                );
-                progressed = true;
-                if observe_parent_job_cancellation(
-                    &cancellation_token,
-                    db.as_ref(),
-                    job_id.as_str(),
-                )
-                .await?
-                    || !db.agent_job_is_owned_running(job_id.as_str()).await?
+                            .ok();
+                        if let Some(item) = active_items.get_mut(&thread_id) {
+                            item.status_rx = status_rx;
+                        }
+                    }
+                    Err(CodexErr::AgentLimitReached { .. }) => {
+                        // Other admitted initializers still need to be consumed.
+                        // Leave this row pending until the capacity notification.
+                    }
+                    Err(error) => {
+                        if observe_parent_job_cancellation(
+                            &cancellation_token,
+                            db.as_ref(),
+                            &job_id,
+                        )
+                        .await?
+                            || !db.agent_job_is_owned_running(&job_id).await?
+                        {
+                            cancel_requested = true;
+                            break;
+                        }
+                        let message = format!("failed to spawn worker: {error}");
+                        if !db
+                            .mark_agent_job_item_spawn_failed(&job_id, &item_id, &message)
+                            .await?
+                        {
+                            if !db.agent_job_is_owned_running(&job_id).await? {
+                                cancel_requested = true;
+                                break;
+                            }
+                            anyhow::bail!(
+                                "{message}; item was no longer pending or bound to the worker"
+                            );
+                        }
+                        progressed = true;
+                    }
+                }
+                // While initializers remain, only the concurrent service
+                // branch may await database work. A completed sibling must
+                // not stop polling an initializer that holds its write lock.
+                if !spawns.is_empty() {
+                    continue;
+                }
+                if observe_parent_job_cancellation(&cancellation_token, db.as_ref(), &job_id)
+                    .await?
+                    || !db.agent_job_is_owned_running(&job_id).await?
                 {
                     cancel_requested = true;
                     break;
@@ -644,17 +671,15 @@ async fn run_agent_job_loop(
             continue;
         }
 
-        for (thread_id, item_id) in finished {
-            finalize_finished_item(
-                session.clone(),
-                db.clone(),
-                job_id.as_str(),
-                item_id.as_str(),
-                thread_id,
-            )
-            .await?;
-            active_items.remove(&thread_id);
-        }
+        settle_active_job_workers(
+            session.clone(),
+            db.clone(),
+            &job_id,
+            active_items,
+            finished,
+            "worker finished without calling report_agent_job_result",
+        )
+        .await?;
     }
 
     if observe_parent_job_cancellation(&cancellation_token, db.as_ref(), job_id.as_str()).await? {
@@ -723,13 +748,27 @@ async fn export_job_csv_snapshot(
         let output_path = PathBuf::from(&job.output_csv_path);
         let (write_path, lock) = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
             let paths = codex_file_system::resolve_symlink_write_paths(&output_path)?;
-            let lock = codex_file_system::try_acquire_atomic_write_lock(&paths.write_path)?
+            // Normalize parent aliases (and existing filename casing) before
+            // both locking and durable ownership. Do not fold case: Windows
+            // directories can be case-sensitive.
+            let parent = paths.write_path.parent().ok_or_else(|| anyhow::anyhow!("CSV destination has no parent"))?;
+            std::fs::create_dir_all(parent)?;
+            let filename = paths.write_path.file_name().ok_or_else(|| anyhow::anyhow!("CSV destination has no filename"))?;
+            let write_path = std::fs::canonicalize(parent)?.join(filename);
+            let write_path = match std::fs::canonicalize(&write_path) {
+                Ok(path) => path,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => write_path,
+                Err(error) => return Err(error.into()),
+            };
+            let lock = codex_file_system::try_acquire_atomic_write_lock(&write_path)?
                 .ok_or_else(|| {
                     anyhow::anyhow!("CSV publication is busy; export remains pending")
                 })?;
-            Ok((paths.write_path, lock))
+            Ok((write_path, lock))
         })
         .await??;
+        let destination = write_path.to_string_lossy().into_owned();
+        db.reserve_agent_job_destination(&job.id, &destination).await?;
         // Snapshot selection occurs AFTER destination ownership, not before.
         if db.agent_job_export_is_published(&job.id).await?
             && tokio::fs::try_exists(&write_path).await?
@@ -739,8 +778,10 @@ async fn export_job_csv_snapshot(
         let (revision, items) = db.agent_job_export_snapshot(&job.id).await?;
         let csv = render_job_csv(&job.input_headers, &items)
             .map_err(|err| anyhow::anyhow!("failed to render job csv for auto-export: {err}"))?;
+        let digest = <sha2::Sha256 as sha2::Digest>::digest(csv.as_bytes());
+        let digest = hex::encode(digest);
         write_job_csv_atomically(write_path, csv).await?;
-        db.acknowledge_agent_job_export(&job.id, revision).await?;
+        db.acknowledge_agent_job_artifact(&job.id, revision, &destination, &digest).await?;
         drop(lock);
         Ok(())
     })
@@ -807,7 +848,6 @@ pub(crate) fn start_orphaned_agent_job_reconciler(db: Arc<codex_state::StateRunt
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(ORPHANED_AGENT_JOB_RECONCILIATION_INTERVAL);
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        interval.tick().await;
         loop {
             interval.tick().await;
             let Some(db) = weak_db.upgrade() else {
@@ -852,6 +892,7 @@ async fn recover_running_items(
             /*limit*/ None,
         )
         .await?;
+    let mut finished = Vec::new();
     for item in running_items {
         let Some(assigned_thread_id) = item.assigned_thread_id.clone() else {
             db.settle_agent_job_item_for_thread(
@@ -891,37 +932,40 @@ async fn recover_running_items(
                     .ok(),
             },
         );
-        if is_item_stale(&item, runtime_timeout) {
-            shutdown_agent_job_worker(&session, thread_id).await?;
-            let error_message = format!("worker exceeded max runtime of {runtime_timeout:?}");
-            db.settle_agent_job_item_for_thread(
-                job_id,
-                item.item_id.as_str(),
-                Some(assigned_thread_id.as_str()),
-                error_message.as_str(),
-            )
-            .await?;
-            active_items.remove(&thread_id);
-        } else if is_final(&session.services.agent_control.get_status(thread_id).await) {
-            finalize_finished_item(
-                session.clone(),
-                db.clone(),
-                job_id,
-                item.item_id.as_str(),
-                thread_id,
-            )
-            .await?;
-            active_items.remove(&thread_id);
+        if !is_item_stale(&item, runtime_timeout)
+            && is_final(&session.services.agent_control.get_status(thread_id).await)
+        {
+            finished.push((thread_id, item.item_id));
         }
     }
+    reap_stale_active_items(
+        session.clone(),
+        db.clone(),
+        job_id,
+        active_items,
+        runtime_timeout,
+    )
+    .await?;
+    settle_active_job_workers(
+        session,
+        db,
+        job_id,
+        active_items,
+        finished,
+        "worker finished without calling report_agent_job_result",
+    )
+    .await?;
+
     Ok(())
 }
 
 async fn shutdown_agent_job_worker(session: &Session, thread_id: ThreadId) -> anyhow::Result<()> {
+    // A settled bulk worker is logically closed: retire its persisted parent
+    // edge with the tree shutdown so root resume never restores it as a cold agent.
     match session
         .services
         .agent_control
-        .shutdown_agent_tree(thread_id)
+        .close_agent(thread_id)
         .await
     {
         Ok(_) | Err(CodexErr::ThreadNotFound(_)) => Ok(()),
@@ -985,6 +1029,33 @@ async fn terminate_agent_job_workers(
             Err(error) => errors.push(format!("failed to load running items: {error}")),
         }
     }
+    if let Err(error) = settle_active_job_workers(
+        session,
+        db,
+        job_id,
+        active_items,
+        workers.into_iter().collect(),
+        reason,
+    )
+    .await
+    {
+        errors.push(error.to_string());
+    }
+    if !errors.is_empty() {
+        anyhow::bail!(errors.join("; "));
+    }
+    Ok(())
+}
+
+async fn settle_active_job_workers(
+    session: Arc<Session>,
+    db: Arc<codex_state::StateRuntime>,
+    job_id: &str,
+    active_items: &mut HashMap<ThreadId, ActiveJobItem>,
+    workers: Vec<(ThreadId, String)>,
+    reason: &str,
+) -> anyhow::Result<()> {
+    let mut errors = Vec::new();
     // Register the entire set before awaiting acknowledgments. One blocked
     // shutdown must not abandon the unvisited workers when an observer ends.
     let mut cleanup = futures::stream::iter(workers)
@@ -1123,10 +1194,16 @@ async fn service_active_items_during_spawn(
         runtime_timeout,
     )
     .await?;
-    for (thread_id, item_id) in find_finished_threads(session.clone(), active_items).await {
-        finalize_finished_item(session.clone(), db.clone(), job_id, &item_id, thread_id).await?;
-        active_items.remove(&thread_id);
-    }
+    let finished = find_finished_threads(session.clone(), active_items).await;
+    settle_active_job_workers(
+        session,
+        db,
+        job_id,
+        active_items,
+        finished,
+        "worker finished without calling report_agent_job_result",
+    )
+    .await?;
     Ok(true)
 }
 
@@ -1146,21 +1223,19 @@ async fn reap_stale_active_items(
     if stale.is_empty() {
         return Ok(false);
     }
-    for (thread_id, item_id) in stale {
-        shutdown_agent_job_worker(&session, thread_id).await?;
-        let error_message = format!("worker exceeded max runtime of {runtime_timeout:?}");
-        db.settle_agent_job_item_for_thread(
-            job_id,
-            item_id.as_str(),
-            Some(thread_id.to_string().as_str()),
-            error_message.as_str(),
-        )
-        .await?;
-        active_items.remove(&thread_id);
-    }
+    settle_active_job_workers(
+        session,
+        db,
+        job_id,
+        active_items,
+        stale,
+        &format!("worker exceeded max runtime of {runtime_timeout:?}"),
+    )
+    .await?;
     Ok(true)
 }
 
+#[cfg(test)]
 async fn finalize_finished_item(
     session: Arc<Session>,
     db: Arc<codex_state::StateRuntime>,

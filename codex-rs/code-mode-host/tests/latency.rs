@@ -97,6 +97,7 @@ fn request(source: &str) -> ExecuteRequest {
             description: "".into(),
             kind: CodeModeToolKind::Function,
             input_schema: None,
+            namespace_description: None,
             default_timeout_ms: None,
             output_schema: None,
         }]

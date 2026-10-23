@@ -898,6 +898,21 @@ fn update_plan_schema_is_the_simple_checklist_contract() {
         ]
     );
     let validator = jsonschema::validator_for(&tool["parameters"]).unwrap();
+    let linked_blocker = serde_json::json!({
+        "set": [{"step_id": "known-step", "status": "pending"}],
+        "acceptance": {"provider-access": {
+            "text": "Use the required provider", "origin": {"turn_id": "turn", "sha256": "hash"},
+            "requirement": {"kind": "validation", "environment_id": "local", "path": "consumer.rs", "test_execution": false},
+            "plan_requirement_ids": ["known-step"], "blocker": "Provider unavailable"
+        }}
+    });
+    assert!(validator.is_valid(&linked_blocker));
+    let mut invalid_link = linked_blocker.clone();
+    invalid_link["acceptance"]["provider-access"]["plan_requirement_ids"] = serde_json::json!([7]);
+    assert!(!validator.is_valid(&invalid_link));
+    invalid_link["acceptance"]["provider-access"]["plan_requirement_ids"] =
+        serde_json::json!(vec!["known-step"; 129]);
+    assert!(!validator.is_valid(&invalid_link));
     assert!(validator.is_valid(&serde_json::json!({"plan": []})));
     assert!(validator.is_valid(&serde_json::json!({"expected_revision": "revision", "set": [{"index": 0, "status": "completed"}]})));
     assert!(
@@ -1576,12 +1591,14 @@ async fn registered_plan_rejects_multiple_active_steps_without_mutation_or_event
         };
         assert_eq!(output.success, Some(expected_success));
         if !expected_success {
+            let text = output.body.to_text().expect("error text");
+            assert!(text.contains("at most one in_progress"), "{text}");
+            // The rejection names each conflicting step so one retry can fix it.
             assert!(
-                output
-                    .body
-                    .to_text()
-                    .expect("error text")
-                    .contains("at most one in_progress")
+                text.contains(
+                    r#"2 steps in_progress: index 0 "Implement the fix"; index 1 "Verify the fix""#
+                ),
+                "{text}"
             );
         }
         assert_eq!(
@@ -1702,4 +1719,138 @@ async fn cancellation_after_plan_commit_boundary_waits_for_session_update() {
         .await
         .expect("plan should commit before cancellation response");
     assert_eq!(stored.plan, plan_update.plan);
+}
+
+#[tokio::test]
+async fn audit149x_workflow_links_assignments_from_the_shared_root_session_not_the_caller_thread()
+-> anyhow::Result<()> {
+    let temp = tempfile::tempdir()?;
+    let repo = temp.path().join("repo");
+    std::fs::create_dir_all(&repo)?;
+    std::fs::write(repo.join("tracked.txt"), "workflow link fixture\n")?;
+    let step = "Delegate the inspection";
+    let step_id = crate::plan_store::plan_step_id(step);
+    for (scope, linked) in [
+        ("shared-root", true),
+        ("caller-thread", false),
+        ("foreign-root", false),
+    ] {
+        // Like every spawned agent, the fixture's shared tree session differs
+        // from its own thread.
+        let (session, turn, _events) = make_session_and_context_with_rx().await;
+        let shared_root = session.services.agent_control.session_id().to_string();
+        assert_ne!(shared_root, session.thread_id.to_string());
+        let assignment_root = match scope {
+            "shared-root" => shared_root,
+            "caller-thread" => session.thread_id.to_string(),
+            _ => "foreign-root".to_string(),
+        };
+        let coordinator = session.services.agent_control.task_coordinator();
+        coordinator
+            .initialize(
+                codex_state::StateRuntime::init(
+                    temp.path().join(format!("task-home-{scope}")),
+                    "test-provider".into(),
+                )
+                .await?,
+                assignment_root.clone(),
+            )
+            .await?;
+        let (assignment, _attempt) = coordinator
+            .create_assignment(
+                &repo,
+                codex_agent_task_store::AssignmentDraft {
+                    root_session_id: assignment_root,
+                    admission_origin: codex_agent_task_store::AssignmentAdmissionOrigin::Typed,
+                    role: codex_agent_task_store::AgentRole::Worker,
+                    capability_profile:
+                        codex_agent_task_store::CapabilityProfile::ScopedSourceWrite,
+                    objective: "inspect the linked source".into(),
+                    acceptance_criteria: vec![codex_agent_task_store::AcceptanceCriterion {
+                        evidence_policy: None,
+                        id: "inspect".into(),
+                        text: "inspect tracked.txt".into(),
+                    }],
+                    read_scope: vec![codex_agent_task_store::RepoScope {
+                        path: "tracked.txt".into(),
+                        recursive: false,
+                    }],
+                    write_scope: vec![codex_agent_task_store::RepoScope {
+                        path: "tracked.txt".into(),
+                        recursive: false,
+                    }],
+                    stop_condition: "inspection recorded".into(),
+                    dependencies: Vec::new(),
+                    risk_hints: Vec::new(),
+                    required_evidence: vec!["inspect:tracked.txt".into()],
+                    prohibited_changes: Vec::new(),
+                    contract_claims: Vec::new(),
+                    workspace_strategy: codex_agent_task_store::WorkspaceStrategy::Shared,
+                    relation: None,
+                    architecture_contract_ref: None,
+                },
+            )
+            .await?;
+        PlanHandler
+            .handle(ToolInvocation {
+                session: Arc::clone(&session),
+                step_context: StepContext::for_test(Arc::clone(&turn)),
+                cancellation_token: CancellationToken::new(),
+                tracker: Arc::new(Mutex::new(TurnDiffTracker::new())),
+                call_id: format!("audit149x-plan-{scope}"),
+                tool_name: ToolName::plain("update_plan"),
+                source: ToolCallSource::Direct,
+                payload: ToolPayload::Function {
+                    arguments: plan_arguments(step, StepStatus::Pending),
+                },
+            })
+            .await
+            .expect("the checklist step is created");
+        let result = PlanHandler
+            .handle(ToolInvocation {
+                session: Arc::clone(&session),
+                step_context: StepContext::for_test(Arc::clone(&turn)),
+                cancellation_token: CancellationToken::new(),
+                tracker: Arc::new(Mutex::new(TurnDiffTracker::new())),
+                call_id: format!("audit149x-link-{scope}"),
+                tool_name: ToolName::plain("update_plan"),
+                source: ToolCallSource::Direct,
+                payload: ToolPayload::Function {
+                    arguments: serde_json::json!({
+                        "set": [{"step_id": step_id.clone(), "status": StepStatus::InProgress}],
+                        "workflow": {step_id.clone(): assignment.assignment_id},
+                    })
+                    .to_string(),
+                },
+            })
+            .await;
+        let (_, lineage) = session
+            .services
+            .plan_store
+            .snapshot_with_lineage()
+            .await
+            .expect("the checklist exists");
+        if linked {
+            assert!(result.is_ok(), "{scope}: {:?}", result.err());
+            assert_eq!(
+                lineage.workflow.get(&step_id).map(|node| node.assignment_id),
+                Some(assignment.assignment_id),
+                "{scope}"
+            );
+        } else {
+            assert!(
+                matches!(
+                    result,
+                    Err(FunctionCallError::RespondToModel(message))
+                        if message.contains("must belong to this root session")
+                ),
+                "{scope}"
+            );
+            assert!(
+                lineage.workflow.is_empty(),
+                "{scope}: a rejected link must not change the workflow"
+            );
+        }
+    }
+    Ok(())
 }

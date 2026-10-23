@@ -219,16 +219,12 @@ pub(super) async fn search_threads(
         let page = selected.page;
         for item in page.items {
             let logical_path = codex_rollout::plain_rollout_path(item.path.as_path());
-            let Some(snippet) = (match remaining_rollouts.remove(logical_path.as_path()) {
-                Some(Some(snippet)) => Some(snippet),
-                Some(None) => query
-                    .first_content_match_snippet(item.path.as_path())
-                    .await
-                    .map_err(|err| ThreadStoreError::Internal {
-                        message: format!("failed to read rollout search match: {err}"),
-                    })?,
-                None => None,
-            }) else {
+            // Content search already inspected each snippetless candidate to its
+            // end: the match is metadata-only, and rereading cannot find one.
+            let Some(snippet) = remaining_rollouts
+                .remove(logical_path.as_path())
+                .flatten()
+            else {
                 continue;
             };
             let metadata = item

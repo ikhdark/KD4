@@ -51,6 +51,7 @@ pub(crate) struct ResponsesStreamRetryState {
     /// reconnect does not shrink the provider budget, and per-request so a
     /// server restarting repeatedly cannot reconnect without bound.
     reconnected_after_close: bool,
+    repaired_explicit_rejection: bool,
 }
 
 impl Default for ResponsesStreamRetryState {
@@ -60,6 +61,7 @@ impl Default for ResponsesStreamRetryState {
             connection_retries: 0,
             connection_retry_delay: INITIAL_CONNECTION_RETRY_DELAY,
             reconnected_after_close: false,
+            repaired_explicit_rejection: false,
         }
     }
 }
@@ -77,6 +79,7 @@ pub(crate) async fn handle_retryable_response_stream_error(
     request: ResponsesStreamRequest,
     cancellation_token: &CancellationToken,
 ) -> Result<(), CodexErr> {
+    let preconnect_failed = client_session.take_preconnect_failure_credit();
     // Do not mutate the session-wide transport choice or announce another
     // attempt after the turn owner has already cancelled this request.
     if cancellation_token.is_cancelled() {
@@ -86,6 +89,21 @@ pub(crate) async fn handle_retryable_response_stream_error(
         return Err(err);
     }
     let retry_after = err.retry_after();
+
+    if matches!(&err, CodexErr::WebsocketRejected { .. }) {
+        if retry_state.repaired_explicit_rejection {
+            return Err(err);
+        }
+        retry_state.repaired_explicit_rejection = true;
+        // Both typed rejections prove no sampling was accepted. Retire the
+        // chain/socket so the next request carries full authoritative input.
+        client_session.replace_websocket_after_reconnectable_close();
+        if let Some(advice) = retry_after {
+            let _retry_timing_guard = turn_context.turn_timing_state.begin_retry_backoff();
+            wait_for_retry_deadline(advice.deadline(), cancellation_token).await?;
+        }
+        return Ok(());
+    }
 
     // A server that closed mid-response with "connect again" is not a reason to
     // abandon WebSockets for the session: rebuild the stream once first. Placed
@@ -114,13 +132,27 @@ pub(crate) async fn handle_retryable_response_stream_error(
         &turn_context.session_source,
         turn_context.provider.info(),
     );
+    // The ordinary dial already ran immediately. Account for a matching failed
+    // speculative dial once, without inserting a backoff before transient
+    // recovery or granting another retry window after persistent failure.
+    if preconnect_failed && max_retries > 0 {
+        if wait_for_connection_recovery {
+            retry_state.connection_retries = retry_state.connection_retries.saturating_add(1);
+        } else {
+            retry_state.retries = retry_state.retries.saturating_add(1);
+        }
+    }
     // Connection recovery has its own retry counter. It must still reach the
     // HTTPS fallback when the WebSocket endpoint remains unavailable.
     let retry_budget_exhausted = retry_state.retries >= max_retries
         || (wait_for_connection_recovery && retry_state.connection_retries >= max_retries);
-    // Each new model request resets the retry budget. Switch on the first stream-read
-    // failure so intermittent WebSocket drops cannot keep replaying work at "1/N" indefinitely.
-    if (matches!(err, CodexErr::ResponseStreamFailed(_)) || retry_budget_exhausted)
+    // ConnectionFailed is pre-dispatch: try healthy HTTPS before spending a
+    // whole provider retry window on blocked upgrades. Stream-read failures
+    // retain their existing first-failure fallback and bounded replay policy.
+    if (matches!(
+        err,
+        CodexErr::ConnectionFailed(_) | CodexErr::ResponseStreamFailed(_)
+    ) || retry_budget_exhausted)
         && should_switch_fallback_transport(&err)
         && client_session
             .try_switch_fallback_transport_after_error(&turn_context.session_telemetry, &err)
@@ -247,7 +279,7 @@ fn next_connection_retry_delay(delay: Duration) -> Duration {
     delay.saturating_mul(2).min(MAX_CONNECTION_RETRY_DELAY)
 }
 
-/// Recovery identity captured before an attempt. Do not derive Debug: API keys
+/// Recovery identity resolved for the dispatched attempt. Do not derive Debug: API keys
 /// are compared only in memory and must never appear in retry diagnostics.
 #[derive(Clone, PartialEq, Eq)]
 pub(crate) enum AccountChangeIdentity {
@@ -402,10 +434,29 @@ pub(crate) async fn wait_for_account_change(
                 return Ok(reset_at.is_some());
             }
             _ = reload.tick() => {
-                // A login by another process changes only the stored credentials.
-                // External auth resolves its source on every request instead.
-                if !auth_manager.has_external_auth() {
-                    auth_manager.reload().await;
+                // The source owner enforces external TTL and generation checks.
+                // Keep one refresh alive without masking cancellation, reset or
+                // an account switch published while metadata resolution stalls.
+                let refresh = auth_manager.reload();
+                tokio::pin!(refresh);
+                loop {
+                    tokio::select! {
+                        biased;
+                        _ = cancellation_token.cancelled() => return Err(CodexErr::TurnAborted),
+                        _ = tokio::time::sleep_until(reset_at.unwrap_or(deadline)) => {
+                            return Ok(reset_at.is_some());
+                        }
+                        changed = auth_changes.changed() => {
+                            if changed.is_err() { return Ok(false); }
+                            if !turn_context.provider.missing_required_credentials()
+                                && (matches!(reason, AccountChangeWait::MissingCredentials)
+                                    || current_account().is_some_and(|account| Some(account) != failed_account))
+                            {
+                                return Ok(true);
+                            }
+                        }
+                        _ = &mut refresh => break,
+                    }
                 }
             }
         }

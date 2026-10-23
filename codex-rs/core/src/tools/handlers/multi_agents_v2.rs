@@ -46,24 +46,88 @@ mod spawn;
 mod task;
 pub(crate) mod wait;
 
+/// The kind of a host-side storage failure, or `None` when the store rejected
+/// the call itself (scope, state, or argument validation).
+fn task_store_failure_kind(error: &codex_agent_task_store::StoreError) -> Option<&'static str> {
+    use codex_agent_task_store::StoreError;
+
+    match error {
+        StoreError::Io(_) => Some("storage I/O"),
+        StoreError::Sql(_) => Some("database"),
+        StoreError::Migration(_) => Some("schema migration"),
+        StoreError::Json(_) => Some("persisted record decoding"),
+        StoreError::CorruptData(_) => Some("persisted state consistency"),
+        _ => None,
+    }
+}
+
 fn task_store_error_detail(
     tool_name: &'static str,
     error: codex_agent_task_store::StoreError,
 ) -> String {
-    use codex_agent_task_store::StoreError;
-
-    match error {
-        error @ (StoreError::Io(_)
-        | StoreError::Sql(_)
-        | StoreError::Migration(_)
-        | StoreError::Json(_)
-        | StoreError::CorruptData(_)) => {
-            // Keep storage details out of tool output, but retain the cause for diagnosis.
-            tracing::error!(tool_name, error = %error, "typed task store operation failed");
-            "the typed task store is unavailable or contains invalid persisted state".to_string()
+    let Some(kind) = task_store_failure_kind(&error) else {
+        return error.to_string();
+    };
+    // Keep storage details out of tool output, but retain the cause for diagnosis.
+    let diagnostic_id = uuid::Uuid::now_v7().to_string();
+    tracing::error!(tool_name, diagnostic_id, error = %error, "typed task store operation failed");
+    let reason_code = match &error {
+        codex_agent_task_store::StoreError::Migration(sqlx::migrate::MigrateError::VersionMissing(_) | sqlx::migrate::MigrateError::VersionMismatch(_)) => "incompatible_schema",
+        codex_agent_task_store::StoreError::Migration(_) => "schema_migration_failed",
+        codex_agent_task_store::StoreError::Json(_) | codex_agent_task_store::StoreError::CorruptData(_) => "persisted_integrity",
+        codex_agent_task_store::StoreError::Io(error) if error.kind() == std::io::ErrorKind::PermissionDenied => "storage_permission_denied",
+        codex_agent_task_store::StoreError::Io(_) => "storage_io",
+        codex_agent_task_store::StoreError::Sql(_) if error.is_retryable() => "storage_contention",
+        codex_agent_task_store::StoreError::Sql(sqlx::Error::Database(database)) => {
+            match database.code().and_then(|code| code.parse::<i32>().ok()).map(|code| code & 0xff) {
+                Some(3 | 8 | 23) => "storage_permission_denied",
+                Some(10) => "storage_io",
+                Some(11 | 26) => "persisted_integrity",
+                Some(19) => "storage_constraint_conflict",
+                _ => "storage_database",
+            }
         }
-        error => error.to_string(),
+        _ => "storage_database",
+    };
+    let recovery = serde_json::json!({
+        "reason_code": reason_code, "retryable": error.is_retryable(),
+        "affected_scope": "requested_task_store_operation",
+        "next_safe_action": if error.is_retryable() { "inspect_committed_assignment_then_bounded_retry" }
+            else if reason_code == "incompatible_schema" { "use_compatible_runtime_preserve_database" }
+            else { "retain_obligation_and_repair_affected_state_using_host_diagnostic" },
+        "diagnostic_id": diagnostic_id,
+    });
+    if error.is_retryable() {
+        return format!(
+            "the typed task store is temporarily unavailable ({kind} failure; the cause is in the host log). This is not caused by the call's arguments. Recovery may succeed after availability changes; inspect retained assignment state before any retry, because a storage error does not prove that a mutation did not commit; recovery={recovery}"
+        );
     }
+    // Say plainly that this is not the caller's mistake and will not clear on
+    // a retry; a bare "unavailable" sent models into retry and re-plan rounds.
+    format!(
+        "the typed task store is unavailable or contains invalid persisted state ({kind} failure; the cause is in the host log). This is not caused by the call's arguments, and repeating the call is not expected to succeed; recovery={recovery}"
+    )
+}
+
+/// A whole-call store failure behind the handler's context. Storage causes get
+/// the same redacted recovery classification as spawn and task tools.
+fn task_store_context_error(
+    tool_name: &'static str,
+    context: &str,
+    error: codex_agent_task_store::StoreError,
+) -> FunctionCallError {
+    FunctionCallError::RespondToModel(format!(
+        "{context}: {}",
+        task_store_error_detail(tool_name, error)
+    ))
+}
+
+fn assignment_local_failure(error: &codex_agent_task_store::StoreError) -> bool {
+    matches!(error, codex_agent_task_store::StoreError::Io(_)
+        | codex_agent_task_store::StoreError::Json(_)
+        | codex_agent_task_store::StoreError::CorruptData(_)
+        | codex_agent_task_store::StoreError::AssignmentNotFound(_)
+        | codex_agent_task_store::StoreError::AttemptNotFound(_))
 }
 
 pub(crate) async fn emit_sub_agent_activity(
@@ -112,6 +176,54 @@ mod store_error_tests {
     use std::sync::Mutex;
     use tracing_test::internal::MockWriter;
 
+    #[test]
+    fn audit142_storage_recovery_metadata_preserves_safe_categories() {
+        for (error, code, retryable) in [
+            (StoreError::Io(std::io::Error::from(std::io::ErrorKind::PermissionDenied)), "storage_permission_denied", false),
+            (StoreError::Io(std::io::Error::from(std::io::ErrorKind::WouldBlock)), "storage_io", true),
+            (StoreError::Migration(sqlx::migrate::MigrateError::VersionMissing(99)), "incompatible_schema", false),
+            (StoreError::CorruptData("private path must be redacted".into()), "persisted_integrity", false),
+        ] {
+            let text = task_store_error_detail("spawn_agent", error);
+            let metadata: JsonValue = serde_json::from_str(text.split_once("recovery=").unwrap().1).unwrap();
+            assert_eq!(metadata["reason_code"], code);
+            assert_eq!(metadata["retryable"], retryable);
+            assert!(metadata["diagnostic_id"].as_str().is_some_and(|id| !id.is_empty()));
+            assert!(!text.contains("private path must be redacted"));
+        }
+    }
+
+    #[test]
+    fn audit142_list_and_wait_store_failures_keep_context_and_redact_storage_detail() {
+        for tool_name in ["list_agents", "wait_agent"] {
+            assert_error_reporting(tool_name, |error| {
+                task_store_context_error(tool_name, tool_name, error)
+            });
+        }
+        let context = "wait_agent could not initialize durable typed-task progress";
+        let FunctionCallError::RespondToModel(detail) = task_store_context_error(
+            "wait_agent",
+            context,
+            StoreError::CorruptData("connect task database: C:/private/agent_tasks.sqlite".into()),
+        ) else {
+            panic!("store failure must remain a tool response");
+        };
+        assert!(
+            detail.starts_with(&format!("{context}: the typed task store is unavailable")),
+            "{detail}"
+        );
+        assert!(!detail.contains("C:/private"), "{detail}");
+        // A retired cursor is the caller's input, so its text passes through.
+        let watermark = StoreError::InvalidWakeWatermark("retired-cursor".into());
+        let expected = format!("{context}: {watermark}");
+        let FunctionCallError::RespondToModel(detail) =
+            task_store_context_error("wait_agent", context, watermark)
+        else {
+            panic!("validation rejection must remain a tool response");
+        };
+        assert_eq!(detail, expected);
+    }
+
     pub(super) fn assert_error_reporting(
         tool_name: &'static str,
         convert: impl Fn(StoreError) -> FunctionCallError,
@@ -134,15 +246,20 @@ mod store_error_tests {
         for error in errors {
             buffer.lock().unwrap().clear();
             let cause = error.to_string();
+            let kind = task_store_failure_kind(&error).expect("storage failure kind");
             let FunctionCallError::RespondToModel(detail) = convert(error) else {
                 panic!("store failure must remain a tool response");
             };
-            assert_eq!(
-                detail,
-                format!(
-                    "{tool_name}: the typed task store is unavailable or contains invalid persisted state"
-                )
+            assert!(detail.starts_with(&format!("{tool_name}: ")), "{detail}");
+            // The model learns the failure class and that a retry will not
+            // help, never the storage details behind it.
+            assert!(
+                detail.contains(&format!(
+                    "the typed task store is unavailable or contains invalid persisted state ({kind} failure; the cause is in the host log). This is not caused by the call's arguments, and repeating the call is not expected to succeed"
+                )),
+                "{detail}"
             );
+            assert!(!detail.contains(&cause), "{detail}");
             let logs = String::from_utf8(buffer.lock().unwrap().clone()).unwrap();
             assert_eq!(logs.matches("typed task store operation failed").count(), 1);
             assert!(logs.contains("ERROR"), "{logs}");

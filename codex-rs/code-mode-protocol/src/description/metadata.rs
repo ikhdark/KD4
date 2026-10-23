@@ -22,6 +22,9 @@ pub struct ToolDefinition {
     pub tool_name: ToolName,
     /// Immutable rendered contract, shared by per-cell timeout overlays.
     pub description: std::sync::Arc<str>,
+    /// Explicit producer-owned shared guidance, never inferred from prose.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub namespace_description: Option<std::sync::Arc<str>>,
     pub kind: CodeModeToolKind,
     pub input_schema: Option<JsonValue>,
     pub output_schema: Option<JsonValue>,
@@ -66,6 +69,20 @@ pub fn augment_tool_definition(mut definition: ToolDefinition) -> ToolDefinition
     definition
 }
 
+/// Stable historical dispatch alias. Keep it callable even when a catalog
+/// presents a shorter collision-checked name to the model.
+pub fn legacy_code_mode_identifier(tool_name: &ToolName) -> String {
+    use sha2::Digest;
+    let raw = tool_name.namespace.as_deref().map_or_else(
+        || tool_name.name.clone(), |namespace| format!("{namespace}__{}", tool_name.name),
+    );
+    let normalized = normalize_code_mode_identifier(&raw);
+    if tool_name.namespace.is_none() && normalized == raw { return raw; }
+    #[expect(clippy::expect_used, reason = "ToolName serializes only String and Option<String>; retain historical exact identity bytes")]
+    let identity = serde_json::to_vec(tool_name).expect("tool identity serializes");
+    format!("{normalized}__{}", hex::encode(sha2::Sha256::digest(identity)))
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct EnabledToolMetadata {
     pub tool_name: ToolName,
@@ -73,6 +90,8 @@ pub struct EnabledToolMetadata {
     #[serde(skip)]
     pub default_timeout_ms: Option<u64>,
     pub description: std::sync::Arc<str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub namespace_description: Option<std::sync::Arc<str>>,
     pub kind: CodeModeToolKind,
 }
 
@@ -144,6 +163,9 @@ fn render_tool_types(definition: &ToolDefinition) -> RenderedToolTypes {
 
 fn render_code_mode_sample_for_definition(definition: &ToolDefinition) -> String {
     let mut description = definition.description.trim().to_string();
+    if let Some(guidance) = definition.namespace_description.as_deref().map(str::trim).filter(|text| !text.is_empty()) {
+        description = format!("{guidance}\n\n{description}");
+    }
     let input_name = match definition.kind {
         CodeModeToolKind::Function => "args",
         CodeModeToolKind::Freeform => "input",
@@ -235,12 +257,21 @@ pub fn render_code_mode_tool_bundle(definitions: &[ToolDefinition]) -> String {
         .collect::<Vec<_>>();
     let aliases = hoist_shared_fragments(&fragment_refs, &mut type_refs);
     let mut output = String::new();
+    let mut shared = std::collections::BTreeSet::new();
     for definition in definitions {
-        if !definition.description.trim().is_empty() {
+        let guidance = definition.namespace_description.as_deref().map(str::trim).filter(|text| !text.is_empty());
+        if let Some(guidance) = guidance
+            && shared.insert((definition.tool_name.namespace.as_deref(), guidance))
+        {
+            output.push_str(&format!("### Namespace {} instructions\n{guidance}\n\n", definition.tool_name.namespace.as_deref().unwrap_or("shared")));
+        }
+        let local = guidance.and_then(|guidance| definition.description.strip_prefix(guidance))
+            .and_then(|rest| rest.strip_prefix("\n\n")).unwrap_or(&definition.description);
+        if !local.trim().is_empty() {
             output.push_str(&format!(
                 "### {}\n{}\n\n",
                 definition.name,
-                definition.description.trim()
+                local.trim()
             ));
         }
     }
@@ -344,6 +375,7 @@ mod tests {
                 kind: CodeModeToolKind::Function,
                 input_schema: Some(input),
                 output_schema: Some(output),
+                namespace_description: None,
                 default_timeout_ms: None,
             };
             let bundle = render_code_mode_tool_bundle(std::slice::from_ref(&definition));
@@ -396,6 +428,7 @@ mod tests {
                         kind: CodeModeToolKind::Function,
                         input_schema: (!output).then(|| schema.clone()),
                         output_schema: output.then(|| schema.clone()),
+                        namespace_description: None,
                         default_timeout_ms: None,
                     };
                     let label = if output {
@@ -454,6 +487,7 @@ mod tests {
             kind: CodeModeToolKind::Function,
             input_schema: Some(schema),
             output_schema: None,
+            namespace_description: None,
             default_timeout_ms: None,
         };
         let rendered = augment_tool_definition(definition.clone());
@@ -516,6 +550,7 @@ mod tests {
                     kind: CodeModeToolKind::Function,
                     input_schema: (!output).then(|| schema.clone()),
                     output_schema: output.then(|| schema.clone()),
+                    namespace_description: None,
                     default_timeout_ms: None,
                 };
                 assert!(
@@ -564,6 +599,7 @@ mod tests {
                 "additionalProperties": false
             })),
             output_schema: None,
+            namespace_description: None,
             default_timeout_ms: None,
         }).collect::<Vec<_>>();
         let bundle = render_code_mode_tool_bundle(&definitions);
@@ -599,6 +635,7 @@ mod tests {
             kind: CodeModeToolKind::Function,
             input_schema: Some(schema.clone()),
             output_schema: Some(schema),
+            namespace_description: None,
             default_timeout_ms: None,
         }
     }
@@ -729,6 +766,7 @@ mod tests {
                 kind: CodeModeToolKind::Function,
                 input_schema: None,
                 output_schema: Some(envelope.clone()),
+                namespace_description: None,
                 default_timeout_ms: None,
             };
             let augmented = augment_tool_definition(definition.clone());
@@ -769,6 +807,7 @@ mod tests {
                 kind: CodeModeToolKind::Function,
                 input_schema: None,
                 output_schema: Some(schema.clone()),
+                namespace_description: None,
                 default_timeout_ms: None,
             };
             // Exercise serialization before the definition is augmented.

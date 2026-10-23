@@ -10,6 +10,10 @@ use codex_protocol::protocol::RolloutItem;
 
 pub fn is_user_turn_boundary(item: &ResponseItem) -> bool {
     match item {
+        // This durable namespace is reserved at provider ingress and assigned
+        // only by trusted context producers. Text alone is not provenance.
+        ResponseItem::Message { id: Some(id), .. }
+            if id.as_str().starts_with("msg_sctx_") => false,
         ResponseItem::AgentMessage { .. } => true,
         ResponseItem::Message {
             id, role, content, ..

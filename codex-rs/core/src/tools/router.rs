@@ -442,14 +442,21 @@ impl ToolRouter {
         } else {
             let mut visible = self.model_visible_specs();
             for tool in self.registry.manifest_entries() {
-                if tool.exposure() != crate::tools::registry::ToolExposure::Deferred {
+                if tool.exposure() != crate::tools::registry::ToolExposure::Deferred
+                    || !activated.contains(tool.tool_name())
+                {
                     continue;
                 }
+                #[cfg(test)]
+                DEFERRED_SCHEMA_MATERIALIZATIONS.with(|count| count.set(count.get() + 1));
                 let Some(spec) = filter_activated_deferred_spec(tool.spec(), activated) else {
                     continue;
                 };
                 merge_visible_tool_spec(&mut visible, spec);
             }
+            // Registration keeps full namespace guidance for lazy resolution; an
+            // activated namespace joins the final projection and shares its budget.
+            apply_visible_namespace_description_budget(&mut visible);
             Arc::new(ToolSchemaArtifact::new(visible))
         };
         if !activated.is_empty()
@@ -905,6 +912,26 @@ fn merge_visible_tool_spec(visible: &mut Vec<ToolSpec>, spec: ToolSpec) {
     }
 }
 
+/// Apply the shared namespace-description budget to an activated projection,
+/// as `spec_plan::merge_into_namespaces` does for the base projection.
+fn apply_visible_namespace_description_budget(visible: &mut [ToolSpec]) {
+    let mut descriptions = visible
+        .iter()
+        .filter_map(|spec| match spec {
+            ToolSpec::Namespace(namespace) => Some(namespace.description.clone()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    super::spec_plan::apply_fair_description_budget(&mut descriptions);
+    let namespaces = visible.iter_mut().filter_map(|spec| match spec {
+        ToolSpec::Namespace(namespace) => Some(namespace),
+        _ => None,
+    });
+    for (namespace, description) in namespaces.zip(descriptions) {
+        namespace.description = description;
+    }
+}
+
 fn authorize_independent_review_tool_call(
     session_source: &SessionSource,
     class: TypedToolClass,
@@ -1055,3 +1082,8 @@ pub(crate) fn extension_tool_surface_revision(session: &Session) -> u64 {
 #[cfg(test)]
 #[path = "router_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+std::thread_local! {
+    static DEFERRED_SCHEMA_MATERIALIZATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}

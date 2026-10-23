@@ -25,7 +25,7 @@ fn run(f: impl Future<Output = Result<()>> + Send + 'static) -> Result<()> {
 fn ordinary_completion_repairs_missing_answer_and_bounds_repair() -> Result<()> {
     run(async {
         crate::test_harness::require_network!();
-        for kind in ["empty", "reasoning", "commentary", "repeated-empty"] {
+        for kind in ["empty", "reasoning", "commentary", "repeated-empty", "tool-repair"] {
             let server = responses::start_mock_server().await;
             let mut missing = vec![responses::ev_response_created("missing")];
             if kind == "commentary" {
@@ -40,7 +40,15 @@ fn ordinary_completion_repairs_missing_answer_and_bounds_repair() -> Result<()> 
                 ));
             }
             missing.push(responses::ev_completed("missing"));
-            let repair = if kind == "repeated-empty" {
+            let repair = if kind == "tool-repair" {
+                responses::sse(vec![
+                    responses::ev_apply_patch_custom_tool_call(
+                        "must-not-execute",
+                        "*** Begin Patch\n*** Add File: duplicate-effect.txt\n+unexpected\n*** End Patch",
+                    ),
+                    responses::ev_completed("repair"),
+                ])
+            } else if kind == "repeated-empty" {
                 responses::sse(vec![
                     responses::ev_response_created("repair"),
                     responses::ev_completed("repair"),
@@ -88,7 +96,9 @@ fn ordinary_completion_repairs_missing_answer_and_bounds_repair() -> Result<()> 
                 "{kind}: one repair, not silent success or an unbounded loop"
             );
             assert!(requests.requests()[2].body_contains_text(MISSING_ANSWER_REPAIR_DIRECTIVE));
-            if kind == "repeated-empty" {
+            assert_eq!(requests.requests()[2].body_json()["tool_choice"], "none");
+            assert!(!test.workspace_path("duplicate-effect.txt").exists());
+            if matches!(kind, "repeated-empty" | "tool-repair") {
                 assert!(
                     completion.error.is_some(),
                     "missing answer must surface failure"

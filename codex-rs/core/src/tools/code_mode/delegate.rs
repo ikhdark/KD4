@@ -28,6 +28,29 @@ use crate::tools::parallel::ToolCallRuntime;
 const MAX_PENDING_CONTINUATIONS_PER_CELL: usize = 64;
 const MAX_QUEUED_DISPATCHES: usize = 128;
 
+/// One terminal observation per dequeued invocation, including gate refusal,
+/// cancellation, task abort and unwinding before a child starts.
+struct NestedDispatchObservation {
+    turn_id: String,
+    cell_id: String,
+    call_id: String,
+    tool_name: String,
+    enqueued_at: Instant,
+    phase: &'static str,
+    outcome: &'static str,
+}
+
+impl Drop for NestedDispatchObservation {
+    fn drop(&mut self) {
+        info!(event.name = "codex.code_mode_nested_tool.attempt_terminal",
+            turn_id = %self.turn_id, runtime_cell_id = %self.cell_id,
+            runtime_tool_call_id = %self.call_id, tool_name = %self.tool_name,
+            phase = self.phase, transport_outcome = self.outcome,
+            total_ms = duration_ms(self.enqueued_at.elapsed()),
+            "nested dispatch attempt reached its terminal boundary");
+    }
+}
+
 struct CellDispatchState {
     ready: watch::Sender<bool>,
     user_intent_epoch: u64,
@@ -300,6 +323,15 @@ impl CodeModeDispatchBroker {
                             let cell_id = invocation.cell_id.clone();
                             let runtime_tool_call_id = invocation.runtime_tool_call_id.clone();
                             let tool_name = invocation.tool_name.clone();
+                            let mut observation = NestedDispatchObservation {
+                                turn_id: host.exec.turn.sub_id.clone(),
+                                cell_id: cell_id.to_string(),
+                                call_id: runtime_tool_call_id.clone(),
+                                tool_name: tool_name.to_string(),
+                                enqueued_at,
+                                phase: "readiness_gate",
+                                outcome: "abandoned",
+                            };
                             info!(
                                 event.name = "codex.code_mode_nested_tool.dispatch",
                                 turn_id = %host.exec.turn.sub_id,
@@ -318,6 +350,7 @@ impl CodeModeDispatchBroker {
                             )
                             .await;
                             if !ready {
+                                observation.outcome = "gate_cancelled";
                                 let _ = response_tx
                                     .send(Err("code mode nested tool call cancelled".to_string()));
                                 return;
@@ -329,12 +362,15 @@ impl CodeModeDispatchBroker {
                                 .and_then(|cell| cell.environment_scope.as_ref())
                                 .is_none_or(|scope| scope == &environment_scope);
                             if !scope_matches {
+                                observation.phase = "environment_gate";
+                                observation.outcome = "scope_refused";
                                 let _ = response_tx.send(Err(
                                     "code mode cell environment selection changed; start a new cell for the current scope".to_string(),
                                 ));
                                 return;
                             }
                             let child_started_at = Instant::now();
+                            observation.phase = "child_execution";
                             info!(
                                 event.name = "codex.code_mode_nested_tool.child_start",
                                 turn_id = %host.exec.turn.sub_id,
@@ -373,10 +409,11 @@ impl CodeModeDispatchBroker {
                             };
                             let child_completed_at = Instant::now();
                             let status = if response.is_ok() {
-                                "completed"
+                                "transport_completed"
                             } else {
-                                "failed"
+                                "transport_failed"
                             };
+                            observation.outcome = status;
                             info!(
                                 event.name = "codex.code_mode_nested_tool.child_end",
                                 turn_id = %host.exec.turn.sub_id,
@@ -391,6 +428,7 @@ impl CodeModeDispatchBroker {
                             );
                             let delivery_started_at = Instant::now();
                             let response_delivered = response_tx.send(response).is_ok();
+                            observation.phase = "response_enqueue";
                             let delivered_at = Instant::now();
                             info!(
                                 event.name = "codex.code_mode_nested_tool",
@@ -408,14 +446,14 @@ impl CodeModeDispatchBroker {
                                 child_runtime_ms = duration_ms(
                                     child_completed_at.saturating_duration_since(child_started_at),
                                 ),
-                                wrapper_delivery_ms = duration_ms(
+                                wrapper_enqueue_ms = duration_ms(
                                     delivered_at.saturating_duration_since(delivery_started_at),
                                 ),
                                 total_ms = duration_ms(
                                     delivered_at.saturating_duration_since(enqueued_at),
                                 ),
-                                response_delivered,
-                                "code mode nested tool completed"
+                                response_enqueued = response_delivered,
+                                "code mode nested tool transport completed"
                             );
                         });
                     }

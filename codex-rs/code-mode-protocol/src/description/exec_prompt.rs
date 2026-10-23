@@ -1,26 +1,27 @@
 const DEFERRED_NESTED_TOOLS_GUIDANCE: &str =
     "Some deferred nested tools may be omitted from this description.";
 const LAZY_NESTED_TOOL_SCHEMA_GUIDANCE: &str = r#"Stable built-in contracts may follow; external and omitted contracts remain lazy. Omission is not deactivation: resolve known exact names locally; calls still pass current authorization."#;
-pub(crate) const EXEC_DESCRIPTION_TEMPLATE: &str = r#"Run raw JavaScript, not JSON/Markdown; no Node/filesystem/network.
+pub(crate) const EXEC_DESCRIPTION_TEMPLATE: &str = r#"Run raw JavaScript, not JSON/Markdown; no browser/Node globals or filesystem/network.
 - Nested tools live on the global `tools` object: `const r = await tools.exec_command({cmd:"..."}); text(r.output);`. `console.log(...)` aliases `text(...)`.
 - Edit with `apply_patch`: nested if registered, otherwise direct (`*** Begin Patch` envelope); never pipe a patch through a shell wrapper.
 - `exec_command` waits for the command to finish; one still running after the default wait returns a live `session_id` (see `await_command`). `r.output` is the combined display text and `r.exit_code` the exit status; the host reports failed commands itself. For exact parsing (for example `JSON.parse`), use `r.stdout`, present when `r.streams_complete` is true.
-- Await all work: unawaited work is discarded, and an uncaught rejection ends the cell. Use `Promise.allSettled` for independent fallible calls.
+- Await all work: unawaited work is discarded, and an uncaught rejection ends the cell. Earlier effects survive failure; recover receipts, never replay them. Use `Promise.allSettled` for independent fallible calls. Batch independent reads and searches as one `text(await Promise.allSettled([tools.read_file({path:"a.rs"}), tools.exec_command({cmd:"rg -n x src"})]))`: one failed read cannot skip siblings. Run builds and other commands that may write outside such batches: they hold the workspace exclusively, so queued siblings may not run.
 - Nested calls use a host-configured default deadline; override it with the documented `{ timeout_ms }` option when needed. Expiry cancels the nested call and may return only an error, without a live handle. On expiry, check the outcome before retrying uncertain effects.
-- First-line `// @exec: {"deliver": true}` delivers the cell's printed text as the final answer without another model call when everything in the cell succeeded; close any open plan in that cell, then print only the finished answer.
+- First-line `// @exec: {"deliver": true}` makes all printed text the final answer, with no model call, when everything in the cell succeeded; close open plans first. It shows only at cell end, so put long reports in a normal final message.
 - Output defaults to 10000 tokens per cell; first-line `// @exec: {"max_output_tokens": 40000}` raises it (ceiling 40000). A truncated result names the `read_tool_output` call that returns the rest.
 - JS bindings reset per exec; `store(key, value)`/`load(key)` keep JSON values for the session. `listKeys({after?, limit?})` pages stored keys (`limit` 1-64, default 32; continue from `next_after`); `deleteStored(key)` removes one. First-line `// @exec: {"persist":true}` also keeps completed values across a host restart.
 - To call a tool not described here, filter `ALL_TOOL_NAMES` or `ALL_TOOLS` locally, then use `resolve_tool(name)` and call it in the same cell; resolution retains the full contract when required. Do not infer arguments from a name.
+- `ALL_TOOLS` may factor shared namespace rules into one entry's `namespace_instructions`; `namespace_instructions_ref` names that entry. Follow those rules or use `resolve_tool(name)`, which expands the complete shared and operation-specific contract, before calling a selected tool.
 
 Optional helpers:
 - `await read_files(paths, {full?, concurrency?})`: read 1–32 paths; returns `{path,status,value?,reason?}` per path. `value` contains `{initial,pages,file_complete}`. Default `full:false` keeps the initial selection; for already-required full reading, `full:true` recovers the retained snapshot within bounded limits. Check every status and `file_complete` before claiming full byte coverage, not semantic review.
-- `await search_files(pattern, {path?, glob?, lines?, max_per_file?, ignore_case?, fixed?, hidden?, no_ignore?})`: ripgrep without a shell, returning `{files:[{path,count,lines?}], match_count, complete}` sorted by path; `lines` adds up to `max_per_file` (default 10) `{line,text}` per file.
-- `await await_command(r)`: wait until a command that returned a live `session_id` exits; resolves to `{terminal, observations}` and throws on failure with that object on the error's `.evidence`.
-- `await run_graph([{id, deps?, run: async (deps) => value, accept: async (value) => boolean}], {concurrency?, targets?})`: cell-local DAG (1–256 nodes, concurrency 1–16, default 4) returning `{[id]: {status, value}}`. If a node fails, its dependents are skipped and it throws with `.results` after all started work settles.
+- `await search_files(pattern, {path?, glob?, lines?, max_per_file?, ignore_case?, fixed?, hidden?, no_ignore?})`: ripgrep without a shell, returning `{files:[{path,count,lines?}], match_count, complete, errors?, hint?}` sorted by path; `lines` adds up to `max_per_file` (default 10) `{line,text}` per file; `hint` names existing paths near ones rg could not open.
+- `await await_command(r)`: wait until a command that returned a live `session_id` exits (no-output notices do not end the wait); resolves to `{terminal, observations}` and throws on failure with that object on the error's `.evidence`.
+- `await run_graph([{id, deps?, run: async (deps) => value, accept?: async (value) => boolean}], {concurrency?, targets?})`: cell-local DAG (1–256 nodes, concurrency 1–16, default 4) returning `{[id]: {status, value}}`. Without `accept`, command results must exit 0. A failed node skips its dependents; it throws with `.results` after all started work settles.
 - `notify(value)` queues a model-visible message without yielding; `image(value, detail?)` emits an image from a `data:` URI, a `view_image` result or an MCP `{ type: "image" }` block.
 - `setTimeout(callback: () => void, delayMs?: number)` returns an ID; `clearTimeout(timeoutId?: number)` cancels it. Await a promise resolved by the callback to wait."#;
 const WAIT_DESCRIPTION_TEMPLATE: &str = r#"- `exec` buffers output while its awaited continuation runs. Use `wait` only after `exec` returns a genuinely live `Script running with cell ID ...` result, such as an explicit `yield_control()` or input interruption; a completed cell never needs `wait`.
-- `max_tokens` limits how much new output this wait call returns. Model projections default to 10000 tokens; explicit requests are capped at 40000 tokens.
+- `max_tokens` sets the cell's output budget for this and later results; omit it to keep the current budget (initially the exec budget). Model projections default to 10000 tokens; explicit requests are capped at 40000 tokens.
 - `wait` buffers output until an explicit yield, input activity, final completion or termination, or 10 minutes without output or a nested-call completion. An idle handoff leaves the cell running; inspect before waiting again.
 - New user steering, internal completions, or agent messages with `trigger_turn: true` interrupt a held wait without terminating a still-valid cell.
 - If the cell has already finished, `wait` returns the completed result and closes the cell."#;
@@ -129,6 +130,18 @@ mod tests {
     }
 
     #[test]
+    fn wait_budget_guidance_matches_the_sticky_cell_budget() {
+        // An explicit wait budget replaces the cell's budget for its later
+        // results and nested reads, so per-call wording understates its reach.
+        let wait = super::build_wait_tool_description();
+        assert!(wait.contains("sets the cell's output budget for this and later results"));
+        assert!(wait.contains("omit it to keep the current budget"));
+        assert!(!wait.contains("this wait call"));
+        assert!(wait.contains("default to 10000 tokens"));
+        assert!(wait.contains("capped at 40000 tokens"));
+    }
+
+    #[test]
     fn direct_patch_inventory_keeps_the_direct_route_explicit() {
         let nested = build_exec_tool_description(false, false, &[]);
         assert!(!nested.contains("Direct-only tools omitted"));
@@ -150,7 +163,11 @@ mod tests {
                     build_exec_tool_description(code_mode_only, has_deferred_tools, &[]);
                 for required in [
                     "unawaited work is discarded, and an uncaught rejection ends the cell.",
+                    "Earlier effects survive failure; recover receipts, never replay them.",
+                    "no browser/Node globals",
                     "Use `Promise.allSettled` for independent fallible calls.",
+                    "Batch independent reads and searches as one `text(await Promise.allSettled([",
+                    "Run builds and other commands that may write outside such batches",
                     "one still running after the default wait returns a live `session_id`",
                     "the host reports failed commands itself",
                     "use `r.stdout`, present when `r.streams_complete` is true.",

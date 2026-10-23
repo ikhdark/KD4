@@ -424,6 +424,7 @@ fn turn_recovery_preserves_in_progress_items_until_terminal_evidence() {
             duration_ms: None,
         },
         ThreadItem::FileChange {
+            effects: None,
             environment: None,
             id: "patch".into(),
             changes: Vec::new(),

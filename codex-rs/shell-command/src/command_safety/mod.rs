@@ -5,6 +5,7 @@ pub mod is_safe_command;
 
 pub(crate) mod windows_safe_commands;
 pub use powershell_parser::PowershellDirectArgvCandidate;
+pub use powershell_parser::PowershellAnalysisScope;
 pub(crate) use powershell_parser::PowershellResolutionState;
 pub(crate) use powershell_parser::is_trusted_powershell_host;
 pub use powershell_parser::powershell_command_has_syntax_error;

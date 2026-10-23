@@ -9,7 +9,7 @@ use codex_tools::ToolProjectionSection;
 use serde::Serialize;
 use serde_json::json;
 
-#[derive(Debug, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 pub(crate) struct CodeItem {
     pub id: String,
     pub kind: &'static str,
@@ -49,7 +49,7 @@ pub(crate) fn parse(
     parse_with_completeness(path, source, sha256, deadline).map(|(items, _)| items)
 }
 
-fn parse_with_completeness(
+pub(super) fn parse_with_completeness(
     path: &str,
     source: &str,
     sha256: &str,

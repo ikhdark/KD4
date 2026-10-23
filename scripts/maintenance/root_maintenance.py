@@ -5,7 +5,8 @@ test-python rejects empty test selections in both text and JSON presentation.
 Both modes require a complete child report; a setup skip that leaves selected
 tests unstarted is unverified, not passing validation. Method skips stay explicit.
 --json emits one aggregate result across the scripts and Harbor interpreters;
-test-body hashes are observations, not reusable validation proof.
+both formats omit source-body observations unless --source-observations is set.
+Those hashes are observations, not reusable validation proof.
 audit-scripts --oracles adds static Python assertion advisories (also with
 --quick). Oracle findings never become hard failures, even with --strict.
 """
@@ -462,6 +463,10 @@ SCRIPT_TEST_MODULES: dict[str, tuple[str, ...]] = {
     "scripts/build/rust_test_runner.py": (
         f"{REPORT_REGRESSIONS}.test_nextest_progress_counter_and_binary_identity",
         "scripts.build.test_rust_test_admission",
+        "scripts.build.test_rust_test_runner_receipt_boundaries",
+        "scripts.build.test_audit141_queries",
+        "scripts.build.test_rust_test_runner_audit141",
+        "scripts.build.test_nextest_evidence_scanner",
         "scripts.build.test_rust_test_runner_failure_diagnostics",
         "scripts.build.test_validation_metrics",
         "scripts.build.test_validation_scheduling",
@@ -1418,7 +1423,7 @@ def _emit_python_test_report(environments, errors, *, json_output=True) -> int:
 
 
 def _run_python_tests_json(
-    ordinary_targets, harbor_targets, *, json_output=True
+    ordinary_targets, harbor_targets, *, json_output=True, source_observations=False
 ) -> int:
     from scripts.maintenance.unittest_json import validate_report
 
@@ -1439,7 +1444,7 @@ def _run_python_tests_json(
                     *prefix,
                     "-B",
                     str(SCRIPTS_ROOT / "maintenance" / "unittest_json.py"),
-                    *([] if json_output else ["--execution-only"]),
+                    *([] if source_observations else ["--execution-only"]),
                     "--coalesce-selectors",
                     *selection_args,
                 ]
@@ -1473,7 +1478,9 @@ def _run_python_tests_json(
     return _emit_python_test_report(environments, errors, json_output=json_output)
 
 
-def run_python_tests(targets: Sequence[str], *, json_output: bool = False) -> int:
+def run_python_tests(
+    targets: Sequence[str], *, json_output: bool = False, source_observations: bool = False
+) -> int:
     # Harbor's adapter tests need its separately managed, pinned environment.
     # Keep them in full/changed selections without importing Harbor into the
     # lightweight maintenance environment or silently skipping missing tooling.
@@ -1488,6 +1495,7 @@ def run_python_tests(targets: Sequence[str], *, json_output: bool = False) -> in
         ordinary_targets,
         harbor_targets,
         json_output=json_output,
+        source_observations=source_observations,
     )
 
 
@@ -1513,6 +1521,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--json",
         action="store_true",
         help="Emit one structured result across interpreters; reject zero tests. Test diagnostics go to stderr.",
+    )
+    python_test.add_argument(
+        "--source-observations",
+        action="store_true",
+        help="Observe fresh authored test bodies before and after each test; not dependency or replay proof.",
     )
     python_test.add_argument(
         "--module",
@@ -1606,7 +1619,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                     [], ["No focused test route for " + ", ".join(uncovered)]
                 )
             return 2
-        return run_python_tests(targets, json_output=args.json)
+        return run_python_tests(
+            targets, json_output=args.json, source_observations=args.source_observations
+        )
 
     if args.command == "audit-scripts":
         if args.oracle_report is not None and not args.oracles:

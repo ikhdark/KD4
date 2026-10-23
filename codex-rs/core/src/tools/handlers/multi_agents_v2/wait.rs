@@ -142,8 +142,11 @@ impl Handler {
             )
             .await;
 
+        // Nudges sent while an explicit timeout keeps the wait open are reported by
+        // whichever result ends it, including an input-only exit.
+        let mut nudged_assignment_ids: Vec<String> = Vec::new();
         // Close the published item on ordinary validation, store and cancellation errors.
-        let result = async {
+        let mut result: Result<WaitAgentResult, FunctionCallError> = async {
             let explicit_cursor = args.cursor.is_some();
             let parsed_cursor = args
                 .cursor
@@ -160,7 +163,7 @@ impl Handler {
                     tokio::select! {
                         biased;
                         _ = cancellation_token.cancelled() => return Err(FunctionCallError::RespondToModel("wait_agent cancelled".to_string())),
-                        outcome = input.next() => return Ok(boxed_tool_output(input_only_result(&turn, outcome, $cursor, wait_started))),
+                        outcome = input.next() => return Ok(input_only_result(&turn, outcome, $cursor, wait_started)),
                         result = $future => result,
                     }
                 };
@@ -169,7 +172,7 @@ impl Handler {
                 return Err(FunctionCallError::RespondToModel("wait_agent cancelled".to_string()));
             }
             if let Some(outcome) = input.current().await {
-                return Ok(boxed_tool_output(input_only_result(&turn, outcome, parsed_cursor, wait_started)));
+                return Ok(input_only_result(&turn, outcome, parsed_cursor, wait_started));
             }
             let coordinator = session.services.agent_control.task_coordinator();
             // Already-pending input does not need durable task-store state. Avoid
@@ -183,9 +186,11 @@ impl Handler {
                         session.services.agent_control.session_id().to_string(),
                     ), parsed_cursor)
                     .map_err(|error| {
-                        FunctionCallError::RespondToModel(format!(
-                            "wait_agent could not initialize durable typed-task progress: {error}"
-                        ))
+                        task_store_context_error(
+                            "wait_agent",
+                            "wait_agent could not initialize durable typed-task progress",
+                            error,
+                        )
                     })?;
             }
             let store = coordinator.store();
@@ -199,12 +204,19 @@ impl Handler {
                 (false, Some(store), Some(root_session_id)) => before_delivery!(store
                     .automatic_wake_cursor(root_session_id.to_string(), consuming_agent_path.clone()), parsed_cursor)
                     .map_err(|error| {
-                        FunctionCallError::RespondToModel(format!(
-                            "wait_agent could not initialize its automatic cursor: {error}"
-                        ))
+                        task_store_context_error(
+                            "wait_agent",
+                            "wait_agent could not initialize its automatic cursor",
+                            error,
+                        )
                     })?,
                 _ => parsed_cursor,
             };
+            // Admission is not progress. Admission-only pages advance this scan
+            // cursor without ending the wait; `cursor` stays the input-only report
+            // and the compare-and-swap expectation until a result is delivered.
+            let mut scan_cursor = cursor;
+            let mut folded_admission_events = 0_usize;
             let deadline = earliest_deadline(
                 explicit_timeout_ms
                     .map(|timeout_ms| wait_started + Duration::from_millis(timeout_ms as u64)),
@@ -213,22 +225,23 @@ impl Handler {
             let mut maintenance_deadline = Some(wait_started + maintenance_interval);
             let mut unchanged_store_polls = 0_u32;
             let mut drained_event_pages = 0_u32;
-            let mut nudged_assignment_ids = Vec::new();
             let (outcome, wake_read, hydrated_assignments, settled_revision) = 'wait_owner: loop {
                 if let Some(outcome) = input.current().await {
-                    return Ok(boxed_tool_output(input_only_result(&turn, outcome, cursor, wait_started)));
+                    return Ok(input_only_result(&turn, outcome, cursor, wait_started));
                 }
                 {
-                    let current = before_delivery!(read_wake_events(store.as_ref(), root_session_id.as_deref(), cursor), cursor)
+                    let current = before_delivery!(read_wake_events(store.as_ref(), root_session_id.as_deref(), scan_cursor), cursor)
                         .map_err(|error| {
-                            FunctionCallError::RespondToModel(format!(
-                                "wait_agent could not inspect durable progress before waiting: {error}"
-                            ))
+                            task_store_context_error(
+                                "wait_agent",
+                                "wait_agent could not inspect durable progress before waiting",
+                                error,
+                            )
                         })?;
                     if current.updated_agents.is_empty() {
-                        let revision = match store.as_ref() {
-                            Some(store) => before_delivery!(store.task_state_revision(), cursor).ok(),
-                            None => None,
+                        let revision = match (store.as_ref(), root_session_id.as_deref()) {
+                            (Some(store), Some(root)) => before_delivery!(store.task_state_revision_for_root(root), cursor).ok(),
+                            _ => None,
                         };
                         let owners = before_delivery!(hydrate_wait_owner_assignments(
                             coordinator,
@@ -237,7 +250,7 @@ impl Handler {
                             &consuming_agent_path,
                         ), cursor)
                         .map_err(FunctionCallError::RespondToModel)?;
-                        if wait_owner_is_settled(&owners) {
+                        if !owners.failures.is_empty() || !coordinator.unavailable_descendants().is_empty() || wait_owner_is_settled(&owners) {
                             break 'wait_owner (WaitOutcome::MaintenanceActivity, current, owners, revision);
                         }
                     }
@@ -248,7 +261,7 @@ impl Handler {
                     boundary_deadline,
                     store.as_ref(),
                     root_session_id.as_deref(),
-                    cursor,
+                    scan_cursor,
                 );
                 let (mut outcome, mut wake_read) = tokio::select! {
                     biased;
@@ -264,9 +277,11 @@ impl Handler {
                 .map_err(|error| {
                     turn.turn_timing_state
                         .record_internally_drained_waits(drained_event_pages);
-                    FunctionCallError::RespondToModel(format!(
-                        "wait_agent could not read durable typed-task progress: {error}"
-                    ))
+                    task_store_context_error(
+                        "wait_agent",
+                        "wait_agent could not read durable typed-task progress",
+                        error,
+                    )
                 })?;
 
                 if outcome == WaitOutcome::BoundaryElapsed {
@@ -290,7 +305,7 @@ impl Handler {
                             let read = read_wake_events(
                                 store.as_ref(),
                                 root_session_id.as_deref(),
-                                cursor,
+                                scan_cursor,
                             )
                             .await;
                             (nudged, read)
@@ -310,7 +325,12 @@ impl Handler {
                             completed = maintenance => Some(completed),
                         };
                         if let Some((nudged, read)) = completed {
-                            nudged_assignment_ids = nudged;
+                            let fresh_nudge = !nudged.is_empty();
+                            for assignment_id in nudged {
+                                if !nudged_assignment_ids.contains(&assignment_id) {
+                                    nudged_assignment_ids.push(assignment_id);
+                                }
+                            }
                             maintenance_deadline = if maintenance_interval.is_zero() {
                                 None
                             } else {
@@ -318,16 +338,24 @@ impl Handler {
                             };
                             wake_read = read.map_err(|error| {
                                 turn.turn_timing_state.record_internally_drained_waits(drained_event_pages);
-                                FunctionCallError::RespondToModel(format!(
-                                    "wait_agent could not reread durable typed-task progress after maintenance: {error}"
-                                ))
+                                task_store_context_error(
+                                    "wait_agent",
+                                    "wait_agent could not reread durable typed-task progress after maintenance",
+                                    error,
+                                )
                             })?;
                             if wake_read.updated_agents.is_empty() {
                                 unchanged_store_polls = unchanged_store_polls.saturating_add(1);
                             } else {
                                 outcome = WaitOutcome::DurableActivity;
                             }
-                            if outcome == WaitOutcome::BoundaryElapsed && !nudged_assignment_ids.is_empty() {
+                            // A nudge is maintenance, not a deliverable update. A caller
+                            // that gave timeout_ms keeps waiting until its deadline and
+                            // receives the accumulated nudges with that result.
+                            if outcome == WaitOutcome::BoundaryElapsed
+                                && fresh_nudge
+                                && explicit_timeout_ms.is_none()
+                            {
                                 outcome = WaitOutcome::MaintenanceActivity;
                             }
                         } else {
@@ -345,13 +373,13 @@ impl Handler {
                 }
 
                 if let Some(outcome) = input.current().await {
-                    return Ok(boxed_tool_output(input_only_result(&turn, outcome, cursor, wait_started)));
+                    return Ok(input_only_result(&turn, outcome, cursor, wait_started));
                 }
                 if matches!(outcome, WaitOutcome::Steered | WaitOutcome::MailboxActivity | WaitOutcome::DeferredCompletion) {
-                    return Ok(boxed_tool_output(input_only_result(&turn, outcome, cursor, wait_started)));
+                    return Ok(input_only_result(&turn, outcome, cursor, wait_started));
                 }
                 if !wake_read.updated_agents.is_empty() {
-                    prove_durable_forward_progress(cursor, &wake_read).map_err(|message| {
+                    prove_durable_forward_progress(scan_cursor, &wake_read).map_err(|message| {
                         turn.turn_timing_state
                             .record_internally_drained_waits(drained_event_pages);
                         FunctionCallError::RespondToModel(message)
@@ -379,7 +407,7 @@ impl Handler {
                             "wait_agent could not hydrate its first durable event page: {error}"
                         ))
                     })?;
-                let mut drain = WakeEventDrain::new(cursor, first_page.clone(), first_hydration)
+                let mut drain = WakeEventDrain::new(scan_cursor, first_page.clone(), first_hydration)
                     .map_err(FunctionCallError::RespondToModel)?;
                 let mut drain_outcome = outcome;
                 let mut fail_open = false;
@@ -518,7 +546,7 @@ impl Handler {
                                 "wait_agent could not fail open to its first durable event page: {error}"
                             ))
                         })?;
-                    drain = WakeEventDrain::new(cursor, first_page, hydration)
+                    drain = WakeEventDrain::new(scan_cursor, first_page, hydration)
                         .map_err(FunctionCallError::RespondToModel)?;
                 }
 
@@ -527,24 +555,36 @@ impl Handler {
                         "wait_agent durable wake omitted its cursor revision".to_string(),
                     )
                 })?;
-                drained_event_pages =
-                    u32::try_from(drain.internally_drained_pages()).unwrap_or(u32::MAX);
+                drained_event_pages = drained_event_pages.saturating_add(
+                    u32::try_from(drain.internally_drained_pages()).unwrap_or(u32::MAX),
+                );
                 let (wake_read, hydrated_assignments) = drain.finish();
+                if drain_outcome == WaitOutcome::DurableActivity
+                    && hydrated_assignments.failures.is_empty()
+                    && is_admission_only(&wake_read)
+                {
+                    // Acknowledge admission in the scan and keep waiting; the
+                    // count is reported with whichever result ends this wait.
+                    folded_admission_events =
+                        folded_admission_events.saturating_add(wake_read.updated_agents.len());
+                    scan_cursor = wake_read.latest_event_id;
+                    continue;
+                }
                 break (drain_outcome, wake_read, hydrated_assignments, None);
             };
             turn.turn_timing_state
                 .record_internally_drained_waits(drained_event_pages);
             let mut typed_deltas = Vec::with_capacity(wake_read.updated_agents.len());
             if let Some(outcome) = input.current().await {
-                return Ok(boxed_tool_output(input_only_result(&turn, outcome, cursor, wait_started)));
+                return Ok(input_only_result(&turn, outcome, cursor, wait_started));
             }
             // Reuse the settled payload only behind a cross-connection fence.
             // Active/expiring leases are time-dependent and are never cached.
             let reusable = hydrated_assignments.tasks.values().all(|task| {
                 !matches!(task.workspace_status.lease_state,
                     Some(codex_agent_task_store::LeaseState::Active | codex_agent_task_store::LeaseState::Expired))
-            }) && match (settled_revision, store.as_ref()) {
-                (Some(before), Some(store)) => before_delivery!(store.task_state_revision(), cursor).ok() == Some(before),
+            }) && match (settled_revision, store.as_ref(), root_session_id.as_deref()) {
+                (Some(before), Some(store), Some(root)) => before_delivery!(store.task_state_revision_for_root(root), cursor).ok() == Some(before),
                 _ => false,
             };
             let refreshed_owner_assignments;
@@ -563,15 +603,17 @@ impl Handler {
                 )
             })?;
             for event in &wake_read.updated_agents {
-                let task = &hydrated_assignments
-                    .tasks
-                    .get(&event.assignment_id)
-                    .ok_or_else(|| {
+                let Some(task) = hydrated_assignments.tasks.get(&event.assignment_id) else {
+                    if hydrated_assignments.failures.contains_key(&event.assignment_id) {
+                        continue;
+                    }
+                    return Err(
                         FunctionCallError::RespondToModel(format!(
                             "wait_agent lost hydrated assignment {}",
                             event.assignment_id
                         ))
-                    })?;
+                    );
+                };
                 coordinator.record_first_meaningful_progress_once(
                     event.attempt_id,
                     event.reason,
@@ -603,6 +645,18 @@ impl Handler {
                     "nudge_sent_at": task.workspace_status.nudge_sent_at,
                 }));
             }
+            let mut failures = hydrated_assignments.failures.clone();
+            failures.extend(owner_assignments.failures.clone());
+            for (assignment_id, error) in failures {
+                typed_deltas.push(json!({"assignment_id": assignment_id, "health": "unavailable",
+                    "obligation_resolved": false, "receipt": durable_receipt_pointer(assignment_id.to_string(), false),
+                    "error": error}));
+            }
+            let unresolved_descendants = coordinator.unavailable_descendants();
+            for (thread_id, error) in &unresolved_descendants {
+                typed_deltas.push(json!({"thread_id": thread_id, "health": "unavailable",
+                    "obligation_resolved": false, "error": error}));
+            }
             let mut result = WaitAgentResult::from_outcome(
                 outcome,
                 wake_read
@@ -610,14 +664,26 @@ impl Handler {
                     .map(|event_id| event_id.to_string()),
                 typed_deltas,
                 wake_read.truncated_count,
-                nudged_assignment_ids,
+                std::mem::take(&mut nudged_assignment_ids),
             );
-            result.authoritative_wait_signal = authoritative_wait_signal(
+            if outcome == WaitOutcome::MaintenanceActivity
+                && result.nudged_assignment_ids.is_empty()
+                && result.typed_deltas.is_empty()
+                && wait_owner_is_settled(owner_assignments)
+            {
+                result.message = SETTLED_OWNER_MESSAGE.to_string();
+            }
+            if folded_admission_events > 0 {
+                result
+                    .message
+                    .push_str(&admission_fold_note(folded_admission_events));
+            }
+            result.authoritative_wait_signal = unresolved_descendants.is_empty().then(|| authoritative_wait_signal(
                 root_session_id.as_deref(),
                 &consuming_agent_path,
                 &owner_states,
                 Some(&result.message),
-            );
+            )).flatten();
             if drained_event_pages > 0 {
                 let resource_identity_hash = sha256_text(&format!(
                     "agent-event-wait\0{}\0{}",
@@ -684,7 +750,7 @@ impl Handler {
             if !explicit_cursor
                 && let (Some(store), Some(root)) = (store.as_ref(), root_session_id.as_deref())
             {
-                result.previous_delivery = before_delivery!(store.automatic_wake_delivery(root.to_string(), consuming_agent_path.clone()), cursor).map_err(|error| FunctionCallError::RespondToModel(format!("wait_agent could not recover its prior delivery: {error}")))?
+                result.previous_delivery = before_delivery!(store.automatic_wake_delivery(root.to_string(), consuming_agent_path.clone()), cursor).map_err(|error| task_store_context_error("wait_agent", "wait_agent could not recover its prior delivery", error))?
                     .map(|value| serde_json::from_str(&value)).transpose()
                     .map_err(|error| FunctionCallError::RespondToModel(format!("wait_agent prior delivery is invalid: {error}")))?;
                 if let Some(next) = result.cursor.as_deref().map(WakeEventId::parse).transpose()
@@ -705,15 +771,45 @@ impl Handler {
                     let artifact_id = artifact.artifact_id().ok_or_else(|| FunctionCallError::RespondToModel("wait_agent retained delivery has no identity".to_string()))?;
                     let receipt = json!({"cursor": result.cursor, "artifact_id": artifact_id, "thread_id": session.thread_id, "recovery_tool": "read_tool_output"});
                     let published = store.publish_automatic_wake_delivery(root.to_string(), consuming_agent_path.clone(), cursor, next, receipt.to_string())
-                        .await.map_err(|error| FunctionCallError::RespondToModel(format!("wait_agent could not publish its retained delivery: {error}")))?;
+                        .await.map_err(|error| task_store_context_error("wait_agent", "wait_agent could not publish its retained delivery", error))?;
                     if !published {
                         return Err(FunctionCallError::RespondToModel("wait_agent concurrent consumer advanced the cursor; call wait_agent again to recover its retained delivery".to_string()));
                     }
                 }
             }
-            Ok(boxed_tool_output(result))
+            Ok(result)
         }
         .await;
+
+        let mut receivers = WaitReceivers::default();
+        if let Ok(result) = &mut result {
+            // Only an input-only exit leaves nudges here; a delivered result took them.
+            if !nudged_assignment_ids.is_empty() && result.nudged_assignment_ids.is_empty() {
+                result
+                    .message
+                    .push_str(&nudge_sentence(&nudged_assignment_ids));
+                result.nudged_assignment_ids = std::mem::take(&mut nudged_assignment_ids);
+            }
+            // Mail stays queued for the next request; name who it is from.
+            let mut mailbox_authors = Vec::new();
+            if result.mailbox_wake {
+                for author in session.input_queue.pending_mailbox_authors().await {
+                    if !mailbox_authors.contains(&author) {
+                        mailbox_authors.push(author);
+                    }
+                }
+            }
+            if !mailbox_authors.is_empty() {
+                let authors = mailbox_authors
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>();
+                result.message = result
+                    .message
+                    .replacen(MAILBOX_WAKE_MESSAGE, &mailbox_wake_message(&authors), 1);
+            }
+            receivers = wait_receivers(&session, result, &mailbox_authors).await;
+        }
 
         session
             .emit_turn_item_completed(
@@ -727,17 +823,17 @@ impl Handler {
                         CollabAgentToolCallStatus::Failed
                     },
                     sender_thread_id: session.thread_id,
-                    receiver_thread_ids: Vec::new(),
-                    receiver_agents: Vec::new(),
+                    receiver_thread_ids: receivers.thread_ids,
+                    receiver_agents: receivers.agents,
                     prompt: None,
                     model: None,
                     reasoning_effort: None,
-                    agents_states: HashMap::new(),
+                    agents_states: receivers.states,
                 }),
             )
             .await;
 
-        result
+        result.map(boxed_tool_output)
     }
 }
 
@@ -757,6 +853,7 @@ fn sha256_text(value: &str) -> String {
 struct HydratedAssignments {
     revisions: BTreeMap<AssignmentId, String>,
     tasks: BTreeMap<AssignmentId, AgentTask>,
+    failures: BTreeMap<AssignmentId, String>,
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -874,6 +971,7 @@ impl WakeEventDrain {
         self.hydrated_assignments
             .tasks
             .extend(hydrated_assignments.tasks);
+        self.hydrated_assignments.failures.extend(hydrated_assignments.failures);
         self.combined.reason = page.reason.or(self.combined.reason);
         self.combined.updated_agents.extend(page.updated_agents);
         self.combined.latest_event_id = page.latest_event_id;
@@ -888,7 +986,7 @@ impl WakeEventDrain {
     }
 
     fn should_continue(&self) -> bool {
-        self.combined.remaining_count > 0
+        self.hydrated_assignments.failures.is_empty() && self.combined.remaining_count > 0
             && self.page_count < MAX_WAKE_EVENT_DRAIN_PAGES
             && self.combined.updated_agents.len() < MAX_WAKE_EVENTS_PER_ROOT
             && !self
@@ -999,10 +1097,21 @@ async fn hydrate_assignments(
         #[cfg(test)]
         let _ = TEST_OWNER_HYDRATIONS
             .try_with(|count| count.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
-        let task = coordinator
+        let task = match coordinator
             .get_agent_task(*assignment_id, Some(0))
             .await
-            .map_err(|error| format!("assignment {assignment_id}: {error}"))?;
+        {
+            Ok(task) => task,
+            Err(error) if assignment_local_failure(&error) => {
+                // Stable sentinel is not task evidence. Keep this obligation
+                // visible on every owner read, including after cursor advance.
+                let revision = sha256_text(&format!("unavailable:{assignment_id}"));
+                hydrated.revisions.insert(*assignment_id, revision);
+                hydrated.failures.insert(*assignment_id, task_store_error_detail("wait_agent", error));
+                continue;
+            }
+            Err(error) => return Err(task_store_error_detail("wait_agent", error)),
+        };
         let revision = agent_task_revision(&task)
             .map_err(|error| format!("assignment {assignment_id} revision: {error}"))?;
         hydrated.revisions.insert(*assignment_id, revision);
@@ -1028,7 +1137,12 @@ async fn hydrate_wait_owner_assignments(
     let assignment_ids = store
         .list_agent_task_bindings(root_session_id.to_string(), None)
         .await
-        .map_err(|error| format!("wait_agent could not list its durable task owners: {error}"))?
+        .map_err(|error| {
+            format!(
+                "wait_agent could not list its durable task owners: {}",
+                task_store_error_detail("wait_agent", error)
+            )
+        })?
         .into_iter()
         .filter(|binding| binding.agent_path.starts_with(&descendant_prefix))
         .map(|binding| binding.assignment_id)
@@ -1037,7 +1151,7 @@ async fn hydrate_wait_owner_assignments(
 }
 
 fn wait_owner_is_settled(assignments: &HydratedAssignments) -> bool {
-    !assignments.tasks.is_empty()
+    assignments.failures.is_empty() && !assignments.tasks.is_empty()
         && assignments.tasks.values().all(|task| {
             task.current_attempt.state.is_terminal()
                 && (task.current_attempt.state != AttemptState::Completed
@@ -1521,7 +1635,8 @@ mod tests {
         };
         let output: WaitAgentResult = serde_json::from_str(&text)?;
         assert!(!output.timed_out);
-        assert_eq!(output.message, "Wait maintenance produced a state change.");
+        // A settled owner set says so instead of reporting a vague state change.
+        assert_eq!(output.message, SETTLED_OWNER_MESSAGE);
         assert!(output.typed_deltas.is_empty());
         assert!(output.nudged_assignment_ids.is_empty());
         Ok(())
@@ -1873,6 +1988,7 @@ mod tests {
                 .map(|(assignment_id, revision)| (*assignment_id, (*revision).to_string()))
                 .collect(),
             tasks: BTreeMap::new(),
+            failures: BTreeMap::new(),
         }
     }
 
@@ -2480,6 +2596,120 @@ pub(crate) struct WaitAgentResult {
     pub(crate) deterministic_continuation_receipts: Vec<TurnTimingDeterministicContinuationReceipt>,
     #[serde(skip)]
     pub(crate) authoritative_wait_signal: Option<JsonValue>,
+    /// Mail ended this wait; the handler names its authors before returning.
+    #[serde(skip)]
+    pub(crate) mailbox_wake: bool,
+}
+
+/// Every message names its outcome kind. Mail is delivered with the next
+/// request, so a mailbox wake is never a statement that agent work finished.
+const MAILBOX_WAKE_MESSAGE: &str =
+    "Wait woke on mailbox activity: new agent messages arrive with your next request.";
+
+const SETTLED_OWNER_MESSAGE: &str = "Wait found no pending owned agent work: every assignment this wait owns has settled, so another wait returns immediately.";
+
+fn mailbox_wake_message(authors: &[String]) -> String {
+    format!(
+        "Wait woke on mailbox activity: messages from {} arrive with your next request.",
+        crate::session::turn_execution::bounded_path_list(authors)
+    )
+}
+
+fn nudge_sentence(nudged_assignment_ids: &[String]) -> String {
+    format!(
+        " Sent the one allowed no-progress nudge to assignments [{}].",
+        nudged_assignment_ids.join(", ")
+    )
+}
+
+fn admission_fold_note(count: usize) -> String {
+    format!(
+        " Skipped {count} admission-only (accepted) event(s) without waking; admission is not progress."
+    )
+}
+
+/// Admission, including a legacy follow-up's new attempt, is lifecycle
+/// bookkeeping rather than progress (`ObservationKind::is_meaningful_progress`).
+/// A page that lost events to retention still carries a deliverable signal.
+fn is_admission_only(wake_read: &WakeRead) -> bool {
+    wake_read.lost_to_retention_count == 0
+        && !wake_read.updated_agents.is_empty()
+        && wake_read
+            .updated_agents
+            .iter()
+            .all(|event| event.reason == codex_agent_task_store::ObservationKind::Accepted)
+}
+
+#[derive(Default)]
+struct WaitReceivers {
+    thread_ids: Vec<codex_protocol::ThreadId>,
+    agents: Vec<codex_protocol::protocol::CollabAgentRef>,
+    states: HashMap<codex_protocol::ThreadId, AgentStatus>,
+}
+
+/// Agents whose durable deltas or mailbox messages this wait delivered, in
+/// delivery order, with their current runtime states (as V1 wait reports).
+async fn wait_receivers(
+    session: &crate::session::session::Session,
+    result: &WaitAgentResult,
+    mailbox_authors: &[AgentPath],
+) -> WaitReceivers {
+    let agent_control = &session.services.agent_control;
+    let coordinator = agent_control.task_coordinator();
+    let mut thread_ids = Vec::new();
+    let mut seen_threads = HashSet::new();
+    let mut seen_assignments = BTreeSet::new();
+    for delta in &result.typed_deltas {
+        let thread_id = if let Some(thread_id) = delta.get("thread_id").and_then(JsonValue::as_str)
+        {
+            codex_protocol::ThreadId::from_string(thread_id).ok()
+        } else if let Some(assignment_id) = delta
+            .get("assignment_id")
+            .and_then(JsonValue::as_str)
+            .and_then(|value| AssignmentId::parse(value).ok())
+        {
+            if !seen_assignments.insert(assignment_id) {
+                continue;
+            }
+            coordinator
+                .get_agent_task_binding(assignment_id)
+                .await
+                .ok()
+                .flatten()
+                .and_then(|binding| binding.thread_id)
+                .and_then(|value| codex_protocol::ThreadId::from_string(&value).ok())
+        } else {
+            None
+        };
+        if let Some(thread_id) = thread_id
+            && seen_threads.insert(thread_id)
+        {
+            thread_ids.push(thread_id);
+        }
+    }
+    for author in mailbox_authors {
+        if let Some(thread_id) = agent_control.get_agent_id_for_path(author)
+            && seen_threads.insert(thread_id)
+        {
+            thread_ids.push(thread_id);
+        }
+    }
+    let mut receivers = WaitReceivers::default();
+    for thread_id in thread_ids {
+        let metadata = agent_control
+            .get_agent_metadata(thread_id)
+            .unwrap_or_default();
+        receivers.agents.push(codex_protocol::protocol::CollabAgentRef {
+            thread_id,
+            agent_nickname: metadata.agent_nickname,
+            agent_role: metadata.agent_role,
+        });
+        receivers
+            .states
+            .insert(thread_id, agent_control.get_status(thread_id).await);
+        receivers.thread_ids.push(thread_id);
+    }
+    receivers
 }
 
 impl WaitAgentResult {
@@ -2491,7 +2721,7 @@ impl WaitAgentResult {
         nudged_assignment_ids: Vec<String>,
     ) -> Self {
         let mut message = match outcome {
-            WaitOutcome::MailboxActivity => "Wait completed.",
+            WaitOutcome::MailboxActivity => MAILBOX_WAKE_MESSAGE,
             WaitOutcome::DeferredCompletion => {
                 "A deferred MCP result is waiting in your next response."
             }
@@ -2503,10 +2733,7 @@ impl WaitAgentResult {
         }
         .to_string();
         if !nudged_assignment_ids.is_empty() {
-            message.push_str(&format!(
-                " Sent the one allowed no-progress nudge to assignments [{}].",
-                nudged_assignment_ids.join(", ")
-            ));
+            message.push_str(&nudge_sentence(&nudged_assignment_ids));
         }
         Self {
             message,
@@ -2518,6 +2745,7 @@ impl WaitAgentResult {
             nudged_assignment_ids,
             deterministic_continuation_receipts: Vec::new(),
             authoritative_wait_signal: None,
+            mailbox_wake: outcome == WaitOutcome::MailboxActivity,
         }
     }
 }
@@ -2537,6 +2765,10 @@ struct AuthoritativeWaitState {
 fn authoritative_wait_states(
     assignments: &HydratedAssignments,
 ) -> Option<Vec<AuthoritativeWaitState>> {
+    if !assignments.failures.is_empty() {
+        // Suppress automatic terminal delivery, not healthy sibling progress.
+        return Some(Vec::new());
+    }
     assignments
         .tasks
         .iter()
@@ -2768,6 +3000,16 @@ async fn nudge_stalled_assignments(
         };
         let status = session.services.agent_control.get_status(thread_id).await;
         if !runtime_status_allows_nonproductive_recovery(&status) {
+            if let Ok(path) = AgentPath::try_from(binding.agent_path.as_str())
+                && let Err(error) = session
+                    .services
+                    .agent_control
+                    .task_coordinator()
+                    .seal_missing_receipt_for_attempt(&path, thread_id, &status, binding.attempt_id)
+                    .await
+            {
+                tracing::warn!(%error, "terminal receipt recovery remains pending");
+            }
             continue;
         }
         if session
@@ -3046,6 +3288,33 @@ mod multi_agent_regressions {
     use super::*;
     use codex_agent_task_store::*;
 
+    #[tokio::test]
+    async fn audit142_wait_returns_healthy_sibling_and_retains_corrupt_obligation() -> anyhow::Result<()> {
+        let repo = tempfile::tempdir()?;
+        let (session, turn) = crate::session::tests::make_session_and_context().await;
+        let coordinator = session.services.agent_control.task_coordinator();
+        let state_home = repo.path().join("state");
+        coordinator.initialize_for_workspace_coordination(None, state_home.clone(), turn.config.model_provider_id.clone(), session.services.agent_control.session_id().to_string()).await?;
+        let (bad, _) = add_task(&session, repo.path(), "bad").await;
+        let (good, _) = add_task(&session, repo.path(), "good").await;
+        let pool = sqlx::sqlite::SqlitePoolOptions::new().max_connections(1).connect_with(
+            sqlx::sqlite::SqliteConnectOptions::new().filename(state_home.join("agent-task-coordination/agent_tasks.sqlite"))
+        ).await?;
+        sqlx::query("UPDATE assignments SET body_json = '{' WHERE assignment_id = ?").bind(bad.assignment_id.to_string()).execute(&pool).await?;
+        let ids = BTreeSet::from([bad.assignment_id, good.assignment_id]);
+        let hydrated = hydrate_assignments(coordinator, &ids).await.map_err(anyhow::Error::msg)?;
+        assert!(hydrated.tasks.contains_key(&good.assignment_id));
+        assert!(hydrated.failures.contains_key(&bad.assignment_id));
+        assert!(!wait_owner_is_settled(&hydrated));
+        assert!(authoritative_wait_states(&hydrated).unwrap().is_empty());
+        let (output, signal) = run_registered_wait(Arc::new(session), Arc::new(turn), None, Arc::new(std::sync::atomic::AtomicUsize::new(0))).await?;
+        assert!(signal.is_none());
+        let deltas = output["typed_deltas"].as_array().unwrap();
+        assert!(deltas.iter().any(|delta| delta["assignment_id"] == good.assignment_id.to_string()));
+        assert!(deltas.iter().any(|delta| delta["assignment_id"] == bad.assignment_id.to_string() && delta["health"] == "unavailable" && delta["obligation_resolved"] == false));
+        Ok(())
+    }
+
     async fn add_task(
         session: &crate::session::session::Session,
         repo: &std::path::Path,
@@ -3258,6 +3527,78 @@ mod multi_agent_regressions {
             1,
             "unchanged settled owners must not be fully hydrated twice"
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn admission_only_progress_does_not_end_a_timed_wait() -> anyhow::Result<()> {
+        use crate::session::step_context::StepContext;
+        use crate::tools::context::ToolCallSource;
+        use crate::turn_diff_tracker::TurnDiffTracker;
+
+        let repo = tempfile::tempdir()?;
+        let (session, mut turn) = crate::session::tests::make_session_and_context().await;
+        Arc::make_mut(&mut turn.config)
+            .multi_agent_v2
+            .min_wait_timeout_ms = 0;
+        let coordinator = session.services.agent_control.task_coordinator();
+        let root = session.services.agent_control.session_id().to_string();
+        coordinator
+            .initialize_for_workspace_coordination(
+                None,
+                repo.path().join("state"),
+                turn.config.model_provider_id.clone(),
+                root.clone(),
+            )
+            .await?;
+        let (assignment, _) = add_task(&session, repo.path(), "admitted").await;
+        let store = coordinator.store().unwrap();
+        let admission = store.read_wake_events(root.clone(), None).await?;
+        assert!(is_admission_only(&admission), "{admission:?}");
+        assert!(
+            admission
+                .updated_agents
+                .iter()
+                .all(|event| event.assignment_id == assignment.assignment_id)
+        );
+        let consumer = turn
+            .session_source
+            .get_agent_path()
+            .unwrap_or_else(AgentPath::root)
+            .to_string();
+        let payload = ToolPayload::Function {
+            arguments: json!({"timeout_ms": 0}).to_string(),
+        };
+        let output = tokio::time::timeout(
+            Duration::from_secs(5),
+            Handler::default().handle_call(ToolInvocation {
+                session: Arc::new(session),
+                step_context: StepContext::for_test(Arc::new(turn)),
+                cancellation_token: CancellationToken::new(),
+                tracker: Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new())),
+                call_id: "admission-only".into(),
+                tool_name: ToolName::plain("wait_agent"),
+                source: ToolCallSource::Direct,
+                payload: payload.clone(),
+            }),
+        )
+        .await
+        .expect("a zero timeout bounds the wait")
+        .expect("an admission-only timeout is a normal result");
+        let result = output.code_mode_result(&payload);
+        // The accepted event alone must not end the wait as durable progress.
+        assert_eq!(result["timed_out"], true, "{result}");
+        assert_eq!(result["typed_deltas"], json!([]));
+        assert!(
+            result["message"].as_str().is_some_and(|message| {
+                message.starts_with("Wait timed out.") && message.contains("admission-only")
+            }),
+            "{result}"
+        );
+        // The acknowledged admission is consumed, so the next wait cannot wake on it.
+        let acknowledged = admission.latest_event_id;
+        assert_eq!(result["cursor"], json!(acknowledged.map(|id| id.to_string())));
+        assert_eq!(store.automatic_wake_cursor(root, consumer).await?, acknowledged);
         Ok(())
     }
 }

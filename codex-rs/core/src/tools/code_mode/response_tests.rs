@@ -79,6 +79,7 @@ impl ToolExecutor<ToolInvocation> for PacketTestTool {
                 // is never inferred from the display chunk alone.
                 let process_output = (!process_running).then(|| {
                     Arc::new(crate::unified_exec::ProcessOutputSnapshot {
+                        process_duration: None,
                         aggregated_output: b"COMPILER_DIAGNOSTIC".to_vec(),
                         stdout: b"COMPILER_DIAGNOSTIC".to_vec(),
                         stderr: Vec::new(),
@@ -2278,6 +2279,66 @@ async fn explicit_exec_budget_above_the_default_is_honored_to_the_ceiling() {
 }
 
 #[tokio::test]
+async fn truncated_cell_delivery_counts_in_cell_recovery_retruncation() {
+    let (session, turn) = crate::session::tests::make_session_and_context().await;
+    let exec = super::ExecContext {
+        session: Arc::new(session),
+        turn: Arc::new(turn),
+    };
+    let body = "recovered evidence line\n".repeat(5_000);
+    assert!(
+        codex_utils_string::approx_token_count(&body)
+            > codex_code_mode::DEFAULT_MAX_OUTPUT_TOKENS_PER_EXEC_CALL
+    );
+    // Only a delivery that both carried recovered evidence and exceeded the
+    // cell's visible budget truncated that evidence again.
+    for (label, recovered, truncated, text) in [
+        ("recovered-truncated", true, true, body.clone()),
+        (
+            "recovered-fits",
+            true,
+            false,
+            "short recovered summary".to_string(),
+        ),
+        ("unrecovered-truncated", false, true, body.clone()),
+    ] {
+        let cell = CellId::new(label.to_string());
+        let service = &exec.session.services.code_mode_service;
+        service.record_cell_parent_call_id(&cell, "outer-exec");
+        if recovered {
+            service.record_packet_tool_output_recovery(cell.as_str());
+        }
+        let output = super::handle_runtime_response(
+            &exec,
+            RuntimeResponse::Result {
+                output_loss: None,
+                cell_id: cell.clone(),
+                content_items: vec![RuntimeContentItem::InputText { text }],
+                error_text: None,
+            },
+            None,
+            Instant::now(),
+        )
+        .unwrap();
+        assert_eq!(
+            output
+                .essential_inline
+                .contains_key(super::VISIBLE_OUTPUT_TRUNCATED_KEY),
+            truncated,
+            "{label}"
+        );
+        service.finish_cell_dispatch(&cell);
+    }
+    let counters = exec
+        .turn
+        .turn_timing_state
+        .complete_snapshot()
+        .protocol_timing()
+        .counters;
+    assert_eq!(counters.tool_output_recovery_retruncation_count, 1);
+}
+
+#[tokio::test]
 async fn packet_composition_budgets_required_diagnostics_and_preserves_canonical_failure() {
     use crate::tools::context::RequiredToolTerminalCause;
     use crate::tools::context::ToolPayload;
@@ -3351,4 +3412,93 @@ async fn terminal_retention_observation_expires_without_cancelling_the_writer() 
     service.flush_packet_retention(&cell).await;
     assert!(completed.load(std::sync::atomic::Ordering::Acquire));
     assert!(service.observe_packet_retention(&cell, true, &token).await);
+}
+
+#[tokio::test]
+async fn terminal_packet_names_nested_calls_that_have_not_settled() {
+    let (session, turn) = crate::session::tests::make_session_and_context().await;
+    let exec = super::ExecContext {
+        session: Arc::new(session),
+        turn: Arc::new(turn),
+    };
+    let service = &exec.session.services.code_mode_service;
+    let cell = CellId::new("unsettled-terminal".to_string());
+    service.record_cell_parent_call_id(&cell, "outer-exec");
+    // Admitted, then the script stopped waiting (deadline or cancellation).
+    let pending = service.admit_packet_call(&cell, 0).unwrap();
+    service.record_packet_call_identity(&cell, pending, "exec-unsettled-call", "apply_patch");
+    let respond = |yielded: bool| {
+        let content_items = vec![RuntimeContentItem::InputText {
+            text: "script answer".into(),
+        }];
+        let response = if yielded {
+            RuntimeResponse::Yielded {
+                cell_id: cell.clone(),
+                content_items,
+            }
+        } else {
+            RuntimeResponse::Result {
+                cell_id: cell.clone(),
+                content_items,
+                error_text: None,
+                output_loss: None,
+            }
+        };
+        super::code_mode_text_content(
+            &super::handle_runtime_response(&exec, response, Some(1_000), Instant::now())
+                .unwrap()
+                .body,
+        )
+    };
+    // Negative control: a live yield still owns its outstanding calls.
+    let live = respond(true);
+    assert!(!live.contains("unsettled_nested_calls"), "{live}");
+    // A finished script is not the outcome of the call it stopped waiting for.
+    let terminal = respond(false);
+    assert!(terminal.contains("script answer"), "{terminal}");
+    assert!(terminal.contains("unsettled_nested_calls"), "{terminal}");
+    assert!(terminal.contains("exec-unsettled-call"), "{terminal}");
+    assert!(terminal.contains("apply_patch"), "{terminal}");
+    // Negative control: once the call settles, nothing is reported unsettled.
+    service.complete_packet_call(&cell, pending, Vec::new(), None, None);
+    let settled = respond(false);
+    assert!(!settled.contains("unsettled_nested_calls"), "{settled}");
+    service.finish_cell_dispatch(&cell);
+}
+
+#[tokio::test]
+async fn delivery_waits_for_admitted_nested_calls_to_settle() {
+    let (session, turn) = crate::session::tests::make_session_and_context().await;
+    let service = &session.services.code_mode_service;
+    let cell = CellId::new("deliver-unsettled".to_string());
+    service.record_cell_parent_call_id(&cell, "outer-exec");
+    let (_activity, receiver) =
+        tokio::sync::watch::channel(crate::session::InputQueueActivity::InternalCompletion);
+    let response = RuntimeResponse::Result {
+        cell_id: cell.clone(),
+        content_items: vec![RuntimeContentItem::InputText {
+            text: "final answer".into(),
+        }],
+        error_text: None,
+        output_loss: None,
+    };
+    // A caught deadline left this call settling when the script finished.
+    let pending = service.admit_packet_call(&cell, 0).unwrap();
+    service.record_delivery_intent(&cell, &turn, receiver.clone());
+    assert_eq!(
+        service
+            .delivery_for_response(&cell, &turn, &response)
+            .unwrap_err(),
+        serde_json::json!({"category": "nested_work_unsettled"})
+    );
+    // Negative control: a settled, successful call does not block delivery.
+    service.complete_packet_call(&cell, pending, Vec::new(), None, None);
+    service.record_delivery_intent(&cell, &turn, receiver);
+    assert_eq!(
+        service
+            .delivery_for_response(&cell, &turn, &response)
+            .unwrap(),
+        Some("final answer".to_string())
+    );
+    service.finish_cell_dispatch(&cell);
 }

@@ -66,6 +66,7 @@ pub(crate) use prompt_provenance::PromptContextBreakdown;
 pub(crate) use prompt_provenance::PromptContextCategory;
 pub(crate) use prompt_provenance::PromptContextMeasurement;
 pub(crate) use prompt_provenance::PromptProvenanceSidecar;
+pub(crate) use prompt_provenance::content_aware_serialized_tokens;
 pub(crate) use recommended_plugins_instructions::RecommendedPluginsInstructions;
 pub(crate) use subagent_notification::SubagentNotification;
 pub(crate) use task_capsule::TaskCapsuleFragment;

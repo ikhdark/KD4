@@ -32,6 +32,140 @@ const WORKSPACE_ID_SECOND_ALLOWED: &str = "123e4567-e89b-42d3-a456-426614174001"
 const WORKSPACE_ID_DISALLOWED: &str = "123e4567-e89b-42d3-a456-426614174002";
 
 #[tokio::test]
+async fn refresh_response_deadline_covers_headers_and_partial_body() -> anyhow::Result<()> {
+    use tokio::io::AsyncReadExt;
+    use tokio::io::AsyncWriteExt;
+
+    for partial_body in [false, true] {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let issuer = format!("http://{}", listener.local_addr()?);
+        let (release, released) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = tokio::time::timeout(Duration::from_secs(2), listener.accept())
+                .await
+                .map_err(std::io::Error::other)??;
+            let mut request = Vec::new();
+            let mut bytes = [0; 1024];
+            while !request.windows(4).any(|part| part == b"\r\n\r\n") {
+                let count = socket.read(&mut bytes).await?;
+                if count == 0 {
+                    return Err(std::io::Error::other("request closed before headers"));
+                }
+                request.extend_from_slice(&bytes[..count]);
+            }
+            if partial_body {
+                socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 100\r\n\r\n{\"access_token\":\"").await?;
+            }
+            let _ = released.await;
+            Ok::<_, std::io::Error>(())
+        });
+        let context = OAuthContext {
+            issuer,
+            client_id: "deadline-test".into(),
+        };
+        let route = crate::test_support::transport_default_auth_route_config();
+        let client = create_client()?;
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            request_chatgpt_token_refresh(
+                "refresh".into(),
+                &client,
+                &route,
+                Some(&context),
+                Duration::from_millis(100),
+            ),
+        )
+        .await;
+        // Release and join before asserting, including the failing baseline.
+        let _ = release.send(());
+        server.await??;
+        assert!(
+            matches!(result, Ok(Err(RefreshTokenError::Transient(_)))),
+            "partial_body={partial_body}: response must time out as a transient error"
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+#[serial(codex_auth_env)]
+async fn transient_proactive_refresh_is_shared_only_by_queued_unexpired_callers()
+-> anyhow::Result<()> {
+    let _access_token_guard = remove_access_token_env_var();
+    for seconds_until_expiry in [120, -60] {
+        let home = tempdir()?;
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/oauth/token"))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&server)
+            .await;
+        write_auth_file(
+            AuthFileParams {
+                openai_api_key: None,
+                chatgpt_plan_type: Some("pro".into()),
+                chatgpt_account_id: Some(WORKSPACE_ID_ALLOWED.into()),
+            },
+            home.path(),
+        )?;
+        let storage = FileAuthStorage::new(home.path().into());
+        let mut stored = storage.load()?.unwrap();
+        let expiration = Utc::now().timestamp() + seconds_until_expiry;
+        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(json!({"exp": expiration}).to_string());
+        let access_token = format!("e30.{payload}.signature");
+        stored.tokens.as_mut().unwrap().access_token = access_token.clone();
+        stored.tokens.as_mut().unwrap().account_id = Some(WORKSPACE_ID_ALLOWED.into());
+        stored.oauth_context = Some(OAuthContext {
+            issuer: server.uri(),
+            client_id: "queued-test".into(),
+        });
+        storage.save(&stored)?;
+        let manager = AuthManager::shared(
+            home.path().into(),
+            false,
+            AuthCredentialsStoreMode::File,
+            None,
+            None,
+            AuthKeyringBackendKind::Direct,
+            crate::test_support::transport_default_auth_route_config(),
+        )
+        .await;
+        let permit = manager.refresh_lock.acquire().await?;
+        let mut pending = (0..5).map(|_| Box::pin(manager.auth())).collect::<Vec<_>>();
+        std::future::poll_fn(|cx| {
+            for auth in &mut pending {
+                assert!(auth.as_mut().poll(cx).is_pending());
+            }
+            std::task::Poll::Ready(())
+        })
+        .await;
+        drop(pending.remove(0));
+        drop(permit);
+        for auth in pending {
+            assert_eq!(auth.await.unwrap().get_token()?, access_token);
+        }
+        let expected = if seconds_until_expiry > 0 { 1 } else { 4 };
+        assert_eq!(server.received_requests().await.unwrap().len(), expected);
+        // This is attempt sharing, not a cooldown for independent requests.
+        assert_eq!(manager.auth().await.unwrap().get_token()?, access_token);
+        assert_eq!(
+            server.received_requests().await.unwrap().len(),
+            expected + 1
+        );
+        assert!(matches!(
+            manager.refresh_token().await,
+            Err(RefreshTokenError::Transient(_))
+        ));
+        assert_eq!(
+            server.received_requests().await.unwrap().len(),
+            expected + 2
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
 #[serial(codex_auth_env)]
 async fn rotated_credentials_retry_local_commit_without_rotating_predecessor_again()
 -> anyhow::Result<()> {

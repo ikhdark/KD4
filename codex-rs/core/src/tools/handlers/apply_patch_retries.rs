@@ -67,12 +67,13 @@ enum Amendment {
     Chunk(usize, usize, UpdateFileChunk),
 }
 
+/// A retry header opens the patch body, after an optional `*** Begin Patch`.
 pub(super) fn is_retry(input: &str) -> bool {
     input
         .trim()
         .lines()
-        .nth(1)
-        .is_some_and(|line| line.starts_with(RETRY_HEADER))
+        .take(2)
+        .any(|line| line.starts_with(RETRY_HEADER))
 }
 
 pub(super) fn validate_retry(input: &str) -> Result<(), String> {
@@ -86,13 +87,18 @@ fn parse_retry(input: &str) -> Result<(String, Vec<Amendment>), String> {
     // Keep patch payload bytes: `.lines()` would strip literal trailing CRs
     // before the ordinary patch parser has a chance to decode them.
     let lines = input.trim().split('\n').collect::<Vec<_>>();
-    if lines.first().map(|line| line.trim_end_matches('\r')) != Some("*** Begin Patch")
-        || lines.last() != Some(&"*** End Patch")
-    {
-        return Err("retry requires *** Begin Patch and *** End Patch".into());
+    // The opening line is optional: the retry header identifies the body. The
+    // closing line is required, so a truncated retry is never applied.
+    let header = usize::from(
+        lines.first().map(|line| line.trim_end_matches('\r')) == Some("*** Begin Patch"),
+    );
+    if lines.len() < header + 2 || lines.last() != Some(&"*** End Patch") {
+        return Err(
+            "retry requires *** Retry Patch: <patch_id> and a final *** End Patch line".into(),
+        );
     }
     let id = lines
-        .get(1)
+        .get(header)
         .and_then(|line| line.strip_prefix(RETRY_HEADER))
         .map(|id| id.trim_end_matches('\r'))
         .filter(|id| uuid::Uuid::parse_str(id).is_ok())
@@ -100,7 +106,7 @@ fn parse_retry(input: &str) -> Result<(String, Vec<Amendment>), String> {
         .to_string();
     let mut amendments = Vec::new();
     let mut seen = BTreeSet::<(usize, Option<usize>)>::new();
-    let mut i = 2;
+    let mut i = header + 1;
     while i < lines.len() - 1 {
         let (chunk, indexes) = if let Some(value) = lines[i].strip_prefix("*** Replace Chunk: ") {
             (true, value)
@@ -321,29 +327,17 @@ impl RetainedPatches {
         if count >= args.hunks.len() {
             return None;
         }
-        for (hunk, applied) in args.hunks.iter().zip(committed.changes()) {
-            if hunk.resolve_path(cwd).ok()?.to_path_buf() != applied.path {
-                return None;
-            }
-            let matches = matches!(
-                (hunk, &applied.change),
-                (
-                    Hunk::AddFile { .. },
-                    codex_apply_patch::AppliedPatchFileChange::Add { .. }
-                ) | (
-                    Hunk::DeleteFile { .. },
-                    codex_apply_patch::AppliedPatchFileChange::Delete { .. }
-                ) | (
-                    Hunk::UpdateFile { .. },
-                    codex_apply_patch::AppliedPatchFileChange::Update { .. }
-                )
-            );
-            if !matches {
-                return None;
-            }
+        let mut excluded = BTreeSet::new();
+        for applied in committed.changes() {
+            let mut candidates = args.hunks.iter().enumerate()
+                .filter(|(_, hunk)| applied.matches_hunk(hunk, cwd));
+            let (index, _) = candidates.next()?;
+            // Ambiguous repeated operations and split moves remain withheld.
+            if candidates.next().is_some() || !excluded.insert(index) { return None; }
         }
-        let remaining = &args.hunks[count..];
-        let patch = render_patch(remaining, args.environment_id.as_deref());
+        let origins = (0..args.hunks.len()).filter(|index| !excluded.contains(index)).collect::<Vec<_>>();
+        let remaining = origins.iter().map(|index| args.hunks[*index].clone()).collect::<Vec<_>>();
+        let patch = render_patch(&remaining, args.environment_id.as_deref());
         if patch.len() > MAX_RETAINED_BYTES {
             return None;
         }
@@ -363,7 +357,7 @@ impl RetainedPatches {
                     Hunk::UpdateFile { chunks, .. } => chunks.len(),
                     _ => 0,
                 };
-                serde_json::json!({"hunk": index + 1, "path": hunk.path(), "chunks": chunks})
+                serde_json::json!({"hunk": index + 1, "original_hunk": origins[index] + 1, "path": hunk.path(), "chunks": chunks})
             })
             .collect::<Vec<_>>();
         self.bytes += patch.len();
@@ -377,10 +371,13 @@ impl RetainedPatches {
                 hook_recovery: None,
             },
         );
+        let instruction = format!(
+            "Retry with this apply_patch input, keeping its first and last lines:\n*** Begin Patch\n*** Retry Patch: {id}\n*** Replace Chunk: <hunk> <chunk>\n<the corrected @@ chunk>\n*** End Patch\nTo replace a whole hunk, use *** Replace Hunk: <hunk> and its corrected file hunk. Omit unchanged contents. Indexes refer to remaining_hunks. The receipt is single-use and session-local; all source context and permissions are checked again."
+        );
         Some(serde_json::json!({
             "patch_id": id, "committed_hunks_excluded": count, "remaining_hunks": hunks,
             "observed_source": observed_source,
-            "instruction": "Use apply_patch with *** Retry Patch: <patch_id>, then *** Replace Chunk: <hunk> <chunk> and its corrected @@ chunk, or *** Replace Hunk: <hunk> and its corrected file hunk. Omit unchanged contents. Indexes refer to remaining_hunks. The receipt is single-use and session-local; all source context and permissions are checked again."
+            "instruction": instruction
         }))
     }
 }
@@ -488,6 +485,50 @@ mod tests {
                 .hunks,
             prepared.args.hunks
         );
+    }
+
+    #[test]
+    fn retry_may_omit_its_opening_line_but_not_its_closing_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = PathUri::from_host_native_path(dir.path()).unwrap();
+        let patch = "*** Begin Patch\n*** Update File: a\n@@\n-old\n+new\n*** End Patch";
+        let mut store = RetainedPatches::default();
+        let receipt = store
+            .retain(
+                patch,
+                "local",
+                "test-instance",
+                &cwd,
+                &Default::default(),
+                None,
+            )
+            .unwrap();
+        let id = receipt["patch_id"].as_str().unwrap();
+        // The instruction shows the complete input for this receipt.
+        let instruction = receipt["instruction"].as_str().unwrap();
+        assert!(
+            instruction.contains(&format!("*** Begin Patch\n*** Retry Patch: {id}\n")),
+            "{instruction}"
+        );
+        assert!(instruction.contains("\n*** End Patch\n"), "{instruction}");
+
+        let amendment =
+            format!("*** Retry Patch: {id}\n*** Replace Chunk: 1 1\n@@\n-current\n+new");
+        assert!(is_retry(&amendment));
+        let wrapped = store
+            .prepare(&format!("*** Begin Patch\n{amendment}\n*** End Patch"))
+            .unwrap();
+        let unwrapped = store
+            .prepare(&format!("{amendment}\n*** End Patch"))
+            .unwrap();
+        assert_eq!(unwrapped.id, id);
+        assert_eq!(unwrapped.args.hunks, wrapped.args.hunks);
+        assert_eq!(unwrapped.args.patch, wrapped.args.patch);
+        // A retry cut off before its closing line is never applied.
+        let Err(error) = store.prepare(&amendment) else {
+            panic!("a retry without *** End Patch was accepted");
+        };
+        assert!(error.contains("final *** End Patch"), "{error}");
     }
 
     #[test]
@@ -737,3 +778,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "apply_patch_retries_audit147_tests.rs"]
+mod audit147_tests;

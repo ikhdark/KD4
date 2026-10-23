@@ -1008,6 +1008,7 @@ fn file_change_completion_maps_change_kinds() {
     let collected = processor.collect_thread_events(ServerNotification::ItemCompleted(
         ItemCompletedNotification {
             item: ThreadItem::FileChange {
+                effects: None,
                 environment: None,
                 id: "patch-1".to_string(),
                 changes: vec![
@@ -1042,6 +1043,7 @@ fn file_change_completion_maps_change_kinds() {
                 item: ExecThreadItem {
                     id: "item_0".to_string(),
                     details: ThreadItemDetails::FileChange(FileChangeItem {
+                        effects: None,
                         changes: vec![
                             ExecFileUpdateChange {
                                 path: "a/added.txt".to_string(),
@@ -1072,6 +1074,7 @@ fn file_change_declined_preserves_status_and_wire_shape() {
     let collected = processor.collect_thread_events(ServerNotification::ItemCompleted(
         ItemCompletedNotification {
             item: ThreadItem::FileChange {
+                effects: None,
                 environment: None,
                 id: "patch-2".to_string(),
                 changes: vec![ApiFileUpdateChange {
@@ -1094,6 +1097,7 @@ fn file_change_declined_preserves_status_and_wire_shape() {
                 item: ExecThreadItem {
                     id: "item_0".to_string(),
                     details: ThreadItemDetails::FileChange(FileChangeItem {
+                        effects: None,
                         changes: vec![ExecFileUpdateChange {
                             path: "file.txt".to_string(),
                             kind: PatchChangeKind::Update,

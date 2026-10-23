@@ -18,6 +18,7 @@ fn indexed_aliases_preserve_ambiguous_and_dotted_namespace_behavior() {
             tool_name: ToolName::new(namespace.map(str::to_owned), name),
             description: "".into(),
             kind: CodeModeToolKind::Function,
+            namespace_description: None,
             default_timeout_ms: None,
         })
         .collect(),
@@ -71,6 +72,7 @@ async fn callables_preserve_aliases_metadata_and_mutable_tools() {
             kind: CodeModeToolKind::Function,
             input_schema: None,
             output_schema: None,
+            namespace_description: None,
             default_timeout_ms: None,
         })
         .collect();
@@ -150,6 +152,7 @@ fn critical_path_catalog_lookup_benchmark() {
                 tool_name: ToolName::new(Some(format!("ns{i}")), "read"),
                 description: "description".into(),
                 kind: CodeModeToolKind::Function,
+                namespace_description: None,
                 default_timeout_ms: None,
             })
             .collect(),
@@ -184,6 +187,7 @@ async fn critical_path_sparse_catalog_cell_benchmark() {
             kind: CodeModeToolKind::Function,
             input_schema: None,
             output_schema: None,
+            namespace_description: None,
             default_timeout_ms: None,
         })
         .collect();

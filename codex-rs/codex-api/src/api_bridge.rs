@@ -25,6 +25,9 @@ pub fn map_api_error(err: ApiError) -> CodexErr {
         ApiError::QuotaExceeded => CodexErr::QuotaExceeded,
         ApiError::UsageNotIncluded => CodexErr::UsageNotIncluded,
         ApiError::Retryable { message, delay } => CodexErr::Stream(message, delay),
+        ApiError::WebsocketRejected { reason, message, delay } => CodexErr::WebsocketRejected {
+            reason, message, retry_after: delay,
+        },
         ApiError::IncompleteResponse(response) => CodexErr::IncompleteResponse(response),
         ApiError::TerminalResponse {
             source,
@@ -37,10 +40,10 @@ pub fn map_api_error(err: ApiError) -> CodexErr {
         },
         ApiError::ProviderFailure { code, message } => CodexErr::ProviderFailure { code, message },
         ApiError::Stream(message) => {
-            // Provider silence is recoverable by waiting, and a close that
-            // invites a reconnect is recoverable by rebuilding the transport; a
-            // broken stream is neither. Classify before the message is moved
-            // into the error.
+            // A close that invites a reconnect is recoverable by rebuilding the
+            // transport. Provider silence is only classified: post-dispatch
+            // stalls still spend the bounded retry budget. Classify before the
+            // message is moved into the error.
             let idle_timeout = crate::error::is_stream_idle_timeout_message(&message);
             let reconnectable_close = crate::error::is_reconnectable_close_message(&message);
             // The marker carried the close code past the frame; it is routing
@@ -106,8 +109,10 @@ pub fn map_api_error(err: ApiError) -> CodexErr {
                     })
                 {
                     CodexErr::InternalServerError { retry_after }
-                } else if status == http::StatusCode::TOO_MANY_REQUESTS {
-                    if let Ok(err) = serde_json::from_str::<UsageErrorResponse>(&body_text) {
+                } else {
+                    if status == http::StatusCode::TOO_MANY_REQUESTS
+                        && let Ok(err) = serde_json::from_str::<UsageErrorResponse>(&body_text)
+                    {
                         if err.error.error_type.as_deref() == Some("usage_limit_reached") {
                             let limit_id = extract_header(headers.as_ref(), ACTIVE_LIMIT_HEADER);
                             let rate_limits = headers.as_ref().and_then(|map| {
@@ -136,12 +141,10 @@ pub fn map_api_error(err: ApiError) -> CodexErr {
                         }
                     }
 
-                    CodexErr::RetryLimit(RetryLimitReachedError {
-                        retry_after,
-                        status,
-                        request_id: extract_request_tracking_id(headers.as_ref()),
-                    })
-                } else {
+                    // Any other 429 is throttling that no lower layer retried: the
+                    // non-idempotent transport policy never replays an HTTP status.
+                    // Keep it a retryable unexpected status so the turn owner can
+                    // honor Retry-After instead of reporting an exhausted budget.
                     map_unexpected_response(UnexpectedResponseError {
                         retry_after,
                         status,
@@ -211,10 +214,6 @@ const CLOUDFLARE_BLOCKED_MESSAGE: &str = "Access blocked by Cloudflare";
 #[cfg(test)]
 #[path = "api_bridge_tests.rs"]
 mod tests;
-
-fn extract_request_tracking_id(headers: Option<&HeaderMap>) -> Option<String> {
-    extract_request_id(headers).or_else(|| extract_header(headers, CF_RAY_HEADER))
-}
 
 fn api_error_user_message(status: http::StatusCode, body: &str) -> Option<String> {
     if is_cloudflare_access_block(status, body) {

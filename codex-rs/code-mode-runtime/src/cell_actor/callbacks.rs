@@ -107,11 +107,11 @@ pub(super) fn spawn_tool<H: CellHost>(
     tasks.spawn(async move {
         let mut invocation = invocation;
         let id = invocation.id.clone();
-        let tool_name = invocation.name.name.clone();
-        let timeout_tool_name = match &invocation.name.namespace {
-            Some(namespace) => format!("{namespace}__{tool_name}"),
-            None => tool_name.clone(),
+        let tool_name = match &invocation.name.namespace {
+            Some(namespace) => format!("{namespace}__{}", invocation.name.name),
+            None => invocation.name.name.clone(),
         };
+        let timeout_tool_name = tool_name.clone();
         let timeout = invocation.timeout;
         let timeout_cancellation = cancellation.clone();
         // Publish the same instant the wrapper enforces, so every stage before
@@ -145,8 +145,8 @@ pub(super) fn spawn_tool<H: CellHost>(
         .await;
         let wrapper_received_at = std::time::Instant::now();
         let outcome = match &callback {
-            Ok(Ok(_)) => "completed",
-            Ok(Err(_)) => "failed",
+            Ok(Ok(_)) => "transport_completed",
+            Ok(Err(_)) => "transport_failed",
             Err(_) => "panicked",
         };
         info!(
@@ -188,10 +188,10 @@ pub(super) fn spawn_tool<H: CellHost>(
             runtime_tool_call_id = %id,
             tool_name = %tool_name,
             outcome,
-            wrapper_to_delivery_ms = u64::try_from(wrapper_received_at.elapsed().as_millis())
+            wrapper_to_enqueue_ms = u64::try_from(wrapper_received_at.elapsed().as_millis())
                 .unwrap_or(u64::MAX),
             delivered,
-            "code mode nested tool result delivered to runtime"
+            "code mode nested tool result enqueued for runtime"
         );
         if let Some(failure_reason) = failure_reason {
             report_task_failure(task_failure_handler.as_ref(), failure_reason);

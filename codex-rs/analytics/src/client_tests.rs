@@ -847,6 +847,9 @@ fn tool_item_notifications_are_queued_without_output_payloads() {
             assert_eq!(queued["params"]["threadId"], "thread");
             assert_eq!(queued["params"]["turnId"], "turn");
             assert_eq!(queued["params"]["item"]["id"], item_id.as_str());
+            if queued["params"]["item"]["type"] == "fileChange" {
+                assert!(queued["params"]["item"].get("effects").is_none());
+            }
             // Each source item carries about a megabyte of output payload.
             assert!(
                 queued.to_string().len() < 2048,

@@ -2492,6 +2492,14 @@ pub(crate) fn tool_items_with_output_payloads() -> Vec<ThreadItem> {
         ThreadItem::FileChange {
             id: "file-change-1".to_string(),
             environment: None,
+            effects: Some(serde_json::from_value(json!({
+                "exact": true,
+                "changes": [{
+                    "path": "file:///tmp/private.rs",
+                    "before": payload,
+                    "after": payload,
+                }],
+            })).expect("file change effects fixture")),
             changes: vec![
                 FileUpdateChange {
                     path: "src/added.rs".to_string(),
@@ -4260,6 +4268,7 @@ async fn turn_delivery_fact_emits_explicit_aggregate_outcomes() {
                     turn_id: "turn-2".to_string(),
                     target_count: 4,
                     success_count: 2,
+                    filtered_count: 0,
                     failure_count: 1,
                     timeout_count: 1,
                     shutdown_cancelled_count: 1,
@@ -4286,6 +4295,7 @@ async fn turn_delivery_fact_emits_explicit_aggregate_outcomes() {
                 "turn_id": "turn-2",
                 "target_count": 4,
                 "success_count": 2,
+                "filtered_count": 0,
                 "failure_count": 1,
                 "timeout_count": 1,
                 "shutdown_cancelled_count": 1,
@@ -4709,6 +4719,7 @@ async fn turn_event_counts_completed_tool_items() {
         sample_command_execution_item(CommandExecutionStatus::Completed, Some(0), Some(1)),
         ThreadItem::FileChange {
             environment: None,
+            effects: None,
             id: "file-change-1".to_string(),
             changes: Vec::new(),
             status: PatchApplyStatus::Completed,

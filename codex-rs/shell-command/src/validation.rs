@@ -1,5 +1,9 @@
 //! Pure command recognition. Classification is not proof that a command ran.
 
+#[cfg(test)]
+#[path = "validation_audit148_tests.rs"]
+mod audit148_tests;
+
 use serde::Deserialize;
 use serde::Serialize;
 
@@ -19,7 +23,7 @@ pub struct ValidationCommandDescriptor {
     pub mode: ValidationExecutionMode,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ValidationExecutionMode {
     Execution,
@@ -33,7 +37,11 @@ pub enum ValidationExecutionMode {
 
 impl ValidationExecutionMode {
     pub fn can_prove_validation(self) -> bool {
-        matches!(self, Self::Execution | Self::Checking)
+        // Compilation proves a static check, never test-body execution.
+        matches!(
+            self,
+            Self::Execution | Self::Checking | Self::CompilationOnly
+        )
     }
 }
 
@@ -59,9 +67,17 @@ pub struct RepositoryRunner {
     pub allow_extra_args: bool,
     #[serde(default)]
     pub receipt_runner: Option<String>,
+    /// Authenticates non-execution admission reports, not test receipts.
+    #[serde(default)]
+    pub admission_runner: Option<String>,
     /// Classify child argv; passthrough wrappers cannot authenticate receipts.
     #[serde(default)]
     pub passthrough_after: Option<String>,
+    /// Positional transport prefix, including recipe and lane arguments.
+    #[serde(default)]
+    pub passthrough_args: Option<usize>,
+    #[serde(default)]
+    pub execution_mode: Option<ValidationExecutionMode>,
 }
 
 impl RepositoryRunner {
@@ -74,6 +90,11 @@ impl RepositoryRunner {
         } else {
             args
         };
+        if self.passthrough_args.is_some()
+            && (self.receipt_runner.is_some() || self.passthrough_after.is_some())
+        {
+            return false;
+        }
         let args = if let Some(separator) = &self.passthrough_after {
             if separator.is_empty() || self.receipt_runner.is_some() {
                 return false;
@@ -85,7 +106,7 @@ impl RepositoryRunner {
         } else {
             args
         };
-        if (self.operations.is_empty() && self.passthrough_after.is_none())
+        if (self.operations.is_empty() && self.passthrough_after.is_none() && self.passthrough_args.is_none())
             || !self
                 .programs
                 .iter()
@@ -695,7 +716,27 @@ fn classify_argv_at_depth(
         return ValidationClassification::Opaque;
     }
     let binary = normalized_program_name(program);
+    if binary == "just" {
+        // A nonvariadic recipe owns only its declared prefix. Later recipes
+        // cannot change the earlier recipe's execution mode or receipt owner.
+        for runner in runners.iter().filter(|runner| !runner.allow_extra_args) {
+            if let Some(prefix) = runner.prefixes.iter().find(|prefix| {
+                args.len() > prefix.len() && runner.matches(program, &args[..prefix.len()])
+            }) {
+                return combine_validation_classifications([
+                    classify_argv_at_depth(program, &args[..prefix.len()], depth + 1, runners),
+                    classify_argv_at_depth(program, &args[prefix.len()..], depth + 1, runners),
+                ]);
+            }
+        }
+    }
     if let Some(runner) = runners.iter().find(|runner| runner.matches(program, args)) {
+        if let Some(skip) = runner.passthrough_args {
+            let Some((program, arguments)) = args.get(skip..).and_then(|args| args.split_first()) else {
+                return ValidationClassification::Opaque;
+            };
+            return classify_argv_at_depth(program, arguments, depth + 1, runners);
+        }
         if let Some(separator) = &runner.passthrough_after {
             let nested = args
                 .iter()
@@ -706,7 +747,15 @@ fn classify_argv_at_depth(
             };
             return classify_argv_at_depth(program, arguments, depth + 1, runners);
         }
-        return classification_from_operations(runner.operations.clone(), false, &binary, args);
+        let mut classification = classification_from_operations(runner.operations.clone(), false, &binary, args);
+        if let Some(mode) = runner.execution_mode
+            && let ValidationClassification::Validation { leaves, .. } = &mut classification
+        {
+            for leaf in leaves {
+                leaf.mode = mode;
+            }
+        }
+        return classification;
     }
 
     if matches!(binary.as_str(), "npm" | "pnpm" | "yarn")
@@ -734,7 +783,7 @@ fn classify_argv_at_depth(
         return classify_argv_at_depth(program, &args[2..], depth + 1, runners);
     }
 
-    if matches!(binary.as_str(), "env" | "command" | "time" | "rustup") {
+    if matches!(binary.as_str(), "env" | "command" | "time" | "exec" | "rustup") {
         let index = match decode_execution_wrapper(&binary, args) {
             ExecutionWrapper::Child(index) => index,
             ExecutionWrapper::NonExecution => return ValidationClassification::NonValidation,
@@ -803,15 +852,132 @@ fn classification_from_operations(
     }
 }
 
+const LIBTEST_VALUE_OPTIONS: &[&str] = &["--skip", "--logfile", "--format", "--color", "--test-threads", "--shuffle-seed"];
+const CARGO_VALUE_OPTIONS: &[&str] = &["-p", "--package", "--exclude", "--test", "--bin", "--bench", "--example", "--target", "--target-dir", "--manifest-path", "--features", "-F", "--profile", "--config", "--color", "--message-format", "-j", "--jobs", "-E", "--filterset", "--skip", "--run-ignored", "--retries", "--test-threads", "--partition", "--status-level", "--final-status-level", "--success-output", "--failure-output", "--no-tests", "--binaries-metadata", "--cargo-metadata"];
+
+fn option_flags<'a>(args: &'a [String], value_options: &[&str]) -> Vec<&'a str> {
+    let mut flags = Vec::new();
+    let mut index = 0;
+    while let Some(arg) = args.get(index) {
+        let (flag, inline) = arg.split_once('=').map_or((arg.as_str(), false), |(flag, _)| (flag, true));
+        flags.push(flag);
+        index += if !inline && value_options.contains(&flag) { 2 } else { 1 };
+    }
+    flags
+}
+
+/// Resolve only an interpreter's actual script operand, never `-c` program data.
+pub fn python_script_index(args: &[String]) -> Option<usize> {
+    let mut index = 0;
+    while let Some(arg) = args.get(index) {
+        if arg == "--" {
+            return args.get(index + 1).map(|_| index + 1);
+        }
+        if !arg.starts_with('-') {
+            return Some(index);
+        }
+        if matches!(arg.as_str(), "-W" | "-X" | "--check-hash-based-pycs") {
+            index += 2;
+        } else if arg.strip_prefix('-').is_some_and(|flags| !flags.is_empty() && flags.chars().all(|flag| "bBdEiIOPqsSuvx".contains(flag)))
+            || arg.starts_with("-W") || arg.starts_with("-X") || arg.starts_with("--check-hash-based-pycs=")
+        {
+            index += 1;
+        } else {
+            return None;
+        }
+    }
+    None
+}
+
+/// Public KD4 lane recipes own exactly a recipe and lane before the child argv.
+pub fn just_lane_child(args: &[String]) -> Option<&[String]> {
+    matches!(args.first()?.as_str(), "cargo-lane" | "cargo-lane-isolated-home")
+        .then(|| args.get(2..)).flatten().filter(|args| !args.is_empty())
+}
+
 fn execution_mode(
     binary: &str,
     args: &[String],
     operation: ValidationOperation,
 ) -> ValidationExecutionMode {
     use ValidationExecutionMode as Mode;
+    if binary == "cargo"
+        && let Ok(Some(index)) = cargo_subcommand_index(args)
+        && matches!(args[index].as_str(), "test" | "t" | "bench" | "nextest")
+    {
+        let tail = &args[index + 1..];
+        if args[index] == "nextest" && tail.first().is_some_and(|arg| arg == "list") {
+            return Mode::Listing;
+        }
+        let separator = tail.iter().position(|arg| arg == "--").unwrap_or(tail.len());
+        let flags = option_flags(&tail[..separator], CARGO_VALUE_OPTIONS);
+        let harness = tail.get(separator + 1..).unwrap_or_default();
+        let harness_flags = option_flags(harness, LIBTEST_VALUE_OPTIONS);
+        if flags.iter().any(|flag| matches!(*flag, "--help" | "-h" | "--version"))
+            || harness_flags.iter().any(|flag| matches!(*flag, "--list" | "--help" | "-h"))
+        {
+            return Mode::Listing;
+        }
+        if flags.contains(&"--no-run") {
+            return Mode::CompilationOnly;
+        }
+        return Mode::Execution;
+    }
+    if binary == "pytest" || is_python_launcher(binary)
+        && args.windows(2).any(|pair| pair[0] == "-m" && pair[1] == "pytest")
+    {
+        let flags = option_flags(args, &["-k", "-m", "--override-ini", "-o", "--confcutdir", "--rootdir", "--basetemp", "--ignore", "--ignore-glob", "--deselect", "--import-mode", "--tb", "--capture"]);
+        if flags.contains(&"--setup-only") {
+            // Fixture setup is side-effectful runtime work, not compilation.
+            return Mode::Unknown;
+        }
+        if flags.iter().any(|flag| matches!(*flag,
+            "--collect-only" | "--collectonly" | "--co" | "--setup-plan"
+            | "--fixtures" | "--funcargs" | "--fixtures-per-test" | "--help" | "-h" | "--version"))
+        {
+            return Mode::Listing;
+        }
+        return Mode::Execution;
+    }
+    if binary == "npm" {
+        let options = args.iter().take_while(|arg| arg.as_str() != "--").map(String::as_str).collect::<Vec<_>>();
+        if options.iter().any(|arg| matches!(*arg, "--help" | "-h" | "--version" | "-v")) {
+            return Mode::Listing;
+        }
+        if options.iter().any(|arg| *arg == "--if-present" || *arg == "--if-present=true") {
+            return Mode::Unknown;
+        }
+        // npm's --dry-run does not prevent a test script from executing.
+        return if matches!(operation, ValidationOperation::Check | ValidationOperation::Lint) {
+            Mode::Checking
+        } else {
+            Mode::Execution
+        };
+    }
     let has = |flags: &[&str]| args.iter().any(|arg| flags.contains(&arg.as_str()));
     if is_python_launcher(binary) && python_interactive(args) {
         return Mode::Unknown;
+    }
+    if binary == "just"
+        && has(&[
+            "--show",
+            "-s",
+            "--dump",
+            "--evaluate",
+            "--variables",
+            "--groups",
+            "--usage",
+        ])
+    {
+        return Mode::Listing;
+    }
+    if binary == "make" && has(&["--question", "-q"]) || binary == "task" && has(&["--status"]) {
+        return Mode::DryRun;
+    }
+    // Forwarding wrappers retain the lint operation, so mutation flags must
+    // not depend on the outer executable being Cargo.
+    if operation == ValidationOperation::Lint && has(&["--fix", "--write"]) {
+        return Mode::Mutation;
     }
     if binary == "npm"
         && args
@@ -1202,8 +1368,17 @@ fn recognize_operations(binary: &str, args: &[String]) -> (Vec<ValidationOperati
             jvm_test_operation(binary, args).into_iter().collect(),
             false,
         ),
-        "npm" | "pnpm" | "yarn" => (node_operations(binary, args), false),
-        "just" | "make" | "task" => wrapper_operations(binary, args),
+        "npm" | "pnpm" | "yarn" => {
+            let operations = node_operations(binary, args);
+            // Script names describe intent, not their repository-owned bodies.
+            let opaque = !operations.is_empty();
+            (operations, opaque)
+        }
+        "just" | "make" | "task" => {
+            let (operations, unclassified) = wrapper_operations(binary, args);
+            let opaque = unclassified || !operations.is_empty();
+            (operations, opaque)
+        }
         _ => (Vec::new(), false),
     }
 }
@@ -1238,7 +1413,14 @@ fn cargo_operations(args: &[String]) -> (Vec<ValidationOperation>, bool) {
     } else {
         cargo_operation(&subcommand)
     };
-    (operation.into_iter().collect(), false)
+    let mut operations = operation.into_iter().collect::<Vec<_>>();
+    if subcommand == "bench"
+        && let Some(separator) = args.iter().position(|arg| arg == "--")
+        && option_flags(&args[separator + 1..], LIBTEST_VALUE_OPTIONS).contains(&"--test")
+    {
+        operations.push(ValidationOperation::Test);
+    }
+    (operations, false)
 }
 
 fn cargo_subcommand_index(args: &[String]) -> Result<Option<usize>, ()> {
@@ -1293,7 +1475,7 @@ fn cargo_subcommand_index(args: &[String]) -> Result<Option<usize>, ()> {
 fn cargo_operation(argument: &str) -> Option<ValidationOperation> {
     match argument.to_ascii_lowercase().as_str() {
         "test" | "t" => Some(ValidationOperation::Test),
-        "check" => Some(ValidationOperation::Check),
+        "check" | "c" => Some(ValidationOperation::Check),
         "clippy" | "fmt" => Some(ValidationOperation::Lint),
         "bench" => Some(ValidationOperation::Bench),
         "fuzz" => Some(ValidationOperation::Fuzz),
@@ -1757,6 +1939,76 @@ pub fn script_prefers_long_observation_wait(script: &str) -> bool {
 mod tests {
     use super::*;
 
+    #[test]
+    fn audit148_script_names_do_not_authenticate_checks() {
+        for (program, args) in [
+            ("npm", vec!["run", "lint"]),
+            ("make", vec!["check"]),
+            ("just", vec!["check"]),
+        ] {
+            assert!(matches!(
+                argv(program, &args),
+                ValidationClassification::Validation {
+                    exit_code_is_authoritative: false,
+                    has_unclassified_targets: true,
+                    ..
+                }
+            ));
+        }
+        assert!(matches!(
+            repository_argv("just", &["check-lane", "codex-core", "--tests"]),
+            ValidationClassification::Validation {
+                exit_code_is_authoritative: true,
+                has_unclassified_targets: false,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn audit148_inspection_mutation_and_compilation_modes_are_distinct() {
+        for (program, args, expected) in [
+            (
+                "just",
+                vec!["--show", "check"],
+                ValidationExecutionMode::Listing,
+            ),
+            (
+                "make",
+                vec!["--question", "check"],
+                ValidationExecutionMode::DryRun,
+            ),
+            (
+                "just",
+                vec!["clippy-lane", "codex-core", "--fix"],
+                ValidationExecutionMode::Mutation,
+            ),
+            (
+                "just",
+                vec!["clippy-lane", "codex-core"],
+                ValidationExecutionMode::Checking,
+            ),
+            (
+                "cargo",
+                vec!["test", "--no-run"],
+                ValidationExecutionMode::CompilationOnly,
+            ),
+        ] {
+            let classification = if program == "just" {
+                repository_argv(program, &args)
+            } else {
+                argv(program, &args)
+            };
+            let ValidationClassification::Validation { leaves, .. } = classification else {
+                panic!("missing operation: {program} {args:?}");
+            };
+            assert_eq!(leaves[0].mode, expected, "{program} {args:?}");
+        }
+        assert!(ValidationExecutionMode::CompilationOnly.can_prove_validation());
+        assert!(!ValidationExecutionMode::Listing.can_prove_validation());
+        assert!(!ValidationExecutionMode::Mutation.can_prove_validation());
+    }
+
     fn argv(program: &str, args: &[&str]) -> ValidationClassification {
         classify_argv(
             program,
@@ -2056,23 +2308,28 @@ mod tests {
         use ValidationOperation::Check;
         use ValidationOperation::Lint;
         use ValidationOperation::Test;
-        for (invocation, operation) in [
-            (argv("cargo", &["test", "--all-features"]), Test),
-            (argv("pytest", &["-q"]), Test),
-            (argv("python", &["-m", "unittest", "discover"]), Test),
-            (argv("dotnet", &["test", "--no-restore"]), Test),
-            (argv("go", &["test", "./..."]), Test),
+        for (invocation, operation, untrusted_script) in [
+            (argv("cargo", &["test", "--all-features"]), Test, false),
+            (argv("pytest", &["-q"]), Test, false),
+            (argv("python", &["-m", "unittest", "discover"]), Test, false),
+            (argv("dotnet", &["test", "--no-restore"]), Test, false),
+            (argv("go", &["test", "./..."]), Test, false),
             (
                 argv("npm", &["run", "test:unit", "--", "--watch=false"]),
                 Test,
+                true,
             ),
-            (argv("pnpm", &["run", "lint"]), Lint),
-            (argv("yarn", &["test"]), Test),
-            (argv("mvn", &["test", "-Dgroups=unit"]), Test),
-            (argv("gradlew", &[":module:test", "--continue"]), Test),
-            (argv("just", &["lint", "--unstable"]), Lint),
-            (argv("make", &["tests"]), Test),
-            (argv("task", &["check"]), Check),
+            (argv("pnpm", &["run", "lint"]), Lint, true),
+            (argv("yarn", &["test"]), Test, true),
+            (argv("mvn", &["test", "-Dgroups=unit"]), Test, false),
+            (
+                argv("gradlew", &[":module:test", "--continue"]),
+                Test,
+                false,
+            ),
+            (argv("just", &["lint", "--unstable"]), Lint, true),
+            (argv("make", &["tests"]), Test, true),
+            (argv("task", &["check"]), Check, true),
         ] {
             let mode = match operation {
                 Test => ValidationExecutionMode::Execution,
@@ -2083,8 +2340,8 @@ mod tests {
                 invocation,
                 ValidationClassification::Validation {
                     leaves: vec![ValidationCommandDescriptor { operation, mode }],
-                    has_unclassified_targets: false,
-                    exit_code_is_authoritative: true,
+                    has_unclassified_targets: untrusted_script,
+                    exit_code_is_authoritative: !untrusted_script,
                 }
             );
         }

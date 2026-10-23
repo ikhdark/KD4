@@ -149,6 +149,13 @@ impl InferenceTraceContext {
 }
 
 impl InferenceTraceAttempt {
+    /// Records known capture loss without scheduling work or touching storage.
+    pub fn note_capture_loss(&self) {
+        if let InferenceTraceAttemptState::Enabled(attempt) = &self.state {
+            attempt.context.writer.note_capture_gap();
+        }
+    }
+
     /// A write view sharing exactly-once termination, with the original
     /// producer's observation rather than the eventual writer timestamp.
     pub fn at_occurrence(&self, occurrence: crate::TraceOccurrence) -> Self {

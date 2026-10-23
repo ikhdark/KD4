@@ -10,6 +10,7 @@ pub mod validation;
 
 pub use command_safety::is_dangerous_command;
 pub use command_safety::is_safe_command;
+pub use command_safety::PowershellAnalysisScope;
 pub use command_safety::powershell_command_has_syntax_error;
 pub use command_safety::powershell_command_syntax_error;
 pub use command_safety::prewarm_powershell_parser;

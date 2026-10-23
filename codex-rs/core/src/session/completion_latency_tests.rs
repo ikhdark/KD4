@@ -57,11 +57,13 @@ fn completion_audit_emergency_report_compacts_only_without_headroom() -> Result<
                     config.model_auto_compact_token_limit = Some(90_000);
                 })
                 .build(&server)
-                .await?;
+                .await
+                .unwrap_or_else(|error| panic!("emergency-report fixture failed: {error:#}"));
             let start = std::time::Instant::now();
             let completed = test
                 .submit_turn_and_capture_completion("Continue the unfinished task.")
-                .await?;
+                .await
+                .unwrap_or_else(|error| panic!("emergency-report turn failed: {error:#}"));
             let wall_ms = start.elapsed().as_secs_f64() * 1000.0;
             let sent = requests.requests();
             eprintln!(

@@ -1,4 +1,5 @@
 use sha2::Digest;
+use sha2::Sha256;
 use std::sync::Arc;
 use std::sync::Condvar;
 use std::sync::Mutex;
@@ -29,6 +30,8 @@ use codex_protocol::protocol::TurnTimingToolCallSource;
 use codex_protocol::protocol::TurnTimingToolLifecycleEvent;
 use pretty_assertions::assert_eq;
 
+use super::CANONICAL_SECTION_ITEM_VISITS;
+use super::CanonicalInputSection;
 use super::ClockSample;
 use super::ContinuationCause;
 use super::InteractiveWaitKind;
@@ -49,6 +52,87 @@ use crate::ResponseEvent;
 use crate::tools::tool_dispatch_trace::ToolDispatchTimingSnapshot;
 
 const NS_PER_MS: u128 = 1_000_000;
+
+#[test]
+fn assistant_text_publication_excludes_reasoning_empty_messages_and_completion_time() {
+    use codex_protocol::items::AgentMessageContent;
+    use codex_protocol::protocol::AgentMessageContentDeltaEvent;
+    use codex_protocol::protocol::AgentMessageEvent;
+    use codex_protocol::protocol::EventMsg;
+    let (clock, state) = timing();
+    state.mark_turn_started();
+    clock.set_ms(50);
+    state.record_visible_output_publication(); // reasoning is visible, not assistant text
+    state.record_assistant_text_publication(&EventMsg::AgentMessage(AgentMessageEvent {
+        message: String::new(), phase: None,
+    }));
+    assert_eq!(state.state().milestones.first_assistant_text_ns, None);
+    clock.set_ms(1_000);
+    state.record_assistant_text_publication(&EventMsg::AgentMessageContentDelta(
+        AgentMessageContentDeltaEvent {
+            thread_id: "thread".into(), turn_id: "turn".into(),
+            item_id: "answer".into(), delta: "hello".into(),
+        },
+    ));
+    clock.set_ms(10_000);
+    state.record_ttfm_for_turn_item(&TurnItem::AgentMessage(AgentMessageItem {
+        id: "answer".into(), content: vec![AgentMessageContent::Text { text: "hello".into() }],
+        phase: None,
+    }));
+    let milestones = state.complete_snapshot().protocol_timing().milestones;
+    assert_eq!(milestones.first_visible_output_ms, Some(50));
+    assert_eq!(milestones.first_assistant_text_ms, Some(1_000));
+    assert_eq!(milestones.first_assistant_text_item_id.as_deref(), Some("answer"));
+    assert_eq!(milestones.first_assistant_text_phase, None);
+    assert_eq!(milestones.first_agent_message_ms, Some(10_000));
+}
+
+#[test]
+fn assistant_text_publication_has_a_nonstreaming_fallback() {
+    use codex_protocol::items::AgentMessageContent;
+    use codex_protocol::models::MessagePhase;
+    use codex_protocol::protocol::EventMsg;
+    use codex_protocol::protocol::ItemCompletedEvent;
+    let (clock, state) = timing();
+    state.mark_turn_started();
+    let mut event = ItemCompletedEvent {
+        thread_id: codex_protocol::ThreadId::new(), turn_id: "turn".into(),
+        item: TurnItem::AgentMessage(AgentMessageItem {
+            id: "answer".into(), content: Vec::new(), phase: Some(MessagePhase::FinalAnswer),
+        }), completed_at_ms: 0,
+    };
+    clock.set_ms(10);
+    state.record_assistant_text_publication(&EventMsg::ItemCompleted(event.clone()));
+    assert_eq!(state.state().milestones.first_assistant_text_ns, None);
+    let TurnItem::AgentMessage(message) = &mut event.item else { unreachable!() };
+    message.content.push(AgentMessageContent::Text { text: "answer".into() });
+    clock.set_ms(30);
+    state.record_assistant_text_publication(&EventMsg::ItemCompleted(event));
+    let milestones = state.complete_snapshot().protocol_timing().milestones;
+    assert_eq!(milestones.first_assistant_text_ms, Some(30));
+    assert_eq!(milestones.first_assistant_text_phase, Some(MessagePhase::FinalAnswer));
+}
+
+#[test]
+fn truncation_continuation_wire_name_is_descriptive_and_accepts_historical_spelling() {
+    let (_clock, state) = timing();
+    state.record_tool_output_projection_facts(800, 200, 400, 100, false, false, true, 2, true);
+    let mut pending = Some(ContinuationCause::ToolResult);
+    state.begin_model_generation(&mut pending, &SessionSource::Cli);
+    // This can be the ordinary generation that delivers the requested answer:
+    // no recovery read or extra generation has been established.
+    let counters = state.complete_snapshot().protocol_timing().counters;
+    let mut value = serde_json::to_value(&counters).unwrap();
+    assert_eq!(value["continuationAfterTruncationCount"], 1);
+    assert!(value.get("truncationInducedContinuationCount").is_none());
+    assert_eq!(counters.attributable_recovery_generation_count, 0);
+    let fields = value.as_object_mut().unwrap();
+    let count = fields.remove("continuationAfterTruncationCount").unwrap();
+    fields.insert("truncationInducedContinuationCount".into(), count);
+    let historical: codex_protocol::protocol::TurnTimingCounters =
+        serde_json::from_value(value).unwrap();
+    assert_eq!(historical.truncation_induced_continuation_count, 1);
+}
 
 #[test]
 fn accepted_final_tail_excludes_commentary_and_counts_canonical_unicode_once() {
@@ -1168,6 +1252,7 @@ fn first_useful_action_and_first_model_output_are_distinct_milestones() {
         state.record_response_event_milestones(&ResponseEvent::OutputTextDelta("done".to_string())),
         Some(Duration::from_millis(20))
     );
+    state.record_visible_output_publication();
 
     let snapshot = state.complete_snapshot();
     assert_eq!(snapshot.time_to_first_token_ms, Some(20));
@@ -2390,7 +2475,7 @@ fn decision_latency_records_dispatch_actionable_output_and_completion() {
     });
 
     let timing = state.complete_snapshot().protocol_timing();
-    assert_eq!(timing.schema_version, 34);
+    assert_eq!(timing.schema_version, 35);
     assert_eq!(timing.model_requests.len(), 2);
     assert_eq!(timing.model_requests[0].dispatch_ms, Some(20));
     assert_eq!(timing.model_requests[0].first_model_output_ms, Some(25));
@@ -2790,6 +2875,34 @@ fn typed_deterministic_generation_records_exact_disposition_and_nonprogress() {
     assert_eq!(
         timing.observational_nonprogress_latency.decision_latency_ns,
         15 * NS_PER_MS as u64
+    );
+}
+
+#[test]
+fn surfaced_wait_result_is_final_answer_progress_not_nonprogress() {
+    let (_clock, state) = timing();
+    state.mark_turn_started();
+    let mut pending = None;
+    state.begin_model_generation_with_metadata(
+        &mut pending,
+        &SessionSource::Cli,
+        Some(TurnTimingGenerationPurpose::Wait),
+        TurnTimingGenerationDisposition::DecisionBearing,
+        Some("trusted-state".to_string()),
+    );
+    drop(state.begin_model_request_wait());
+    state.mark_model_request_dispatched();
+    state.record_generation_outcome(Vec::new(), Some("wait".to_string()), false, true);
+    state.record_surfaced_final_answer();
+    let timing = state.complete_snapshot().protocol_timing();
+    assert!(!timing.model_requests[0].unchanged_relevant_state);
+    assert_eq!(
+        timing.observational_nonprogress_tokens.logical_generations,
+        0
+    );
+    assert_eq!(
+        timing.observational_nonprogress_latency.logical_generations,
+        0
     );
 }
 
@@ -3298,7 +3411,7 @@ fn exclusive_ledger_partitions_every_nanosecond_and_subtracts_only_interactive_o
     clock.set_ms(140);
 
     let profile = state.complete_snapshot().profile;
-    assert_eq!(profile.schema_version, 34);
+    assert_eq!(profile.schema_version, 35);
     assert!(profile.profile_valid);
     assert!(profile.classification_complete);
     assert_eq!(profile.inclusive_duration_ns, 140 * NS_PER_MS);
@@ -4544,14 +4657,16 @@ fn ttft_observes_content_not_headers_or_later_visible_text() {
     }
     assert_eq!(state.state().milestones.first_model_content_ns, None);
     clock.set_ms(5);
-    state.record_response_event_milestones(&ResponseEvent::ToolCallInputDelta {
+    let ttft = state.record_response_event_milestones(&ResponseEvent::ToolCallInputDelta {
         call_id: Some("call".into()),
         item_id: "call-item".into(),
         delta: "{\"path\":".into(),
     });
+    assert_eq!(ttft, Some(Duration::from_millis(5)));
     assert_eq!(state.state().milestones.first_visible_output_ns, None);
     clock.set_ms(17);
     state.record_response_event_milestones(&ResponseEvent::OutputTextDelta("done".into()));
+    state.record_visible_output_publication();
     let snapshot = state.complete_snapshot();
     assert_eq!(snapshot.time_to_first_token_ms, Some(5));
     assert_eq!(
@@ -4649,4 +4764,337 @@ fn timeline_cap_preserves_scalar_accounting_but_discloses_lost_coverage() {
     assert_eq!(timeline.intervals.len(), 8_192);
     assert!(timeline.dropped_intervals > 0);
     assert!(!timeline.coverage_complete);
+}
+
+#[test]
+fn timeline_overflow_preserves_bounded_coarse_tail() {
+    let clock = Arc::new(FakeClock::new(0, 0));
+    let state = Arc::new(TurnTimingState::with_clock(clock.clone()));
+    state.mark_turn_started();
+    for index in 0..10_000_u128 {
+        let runtime = state.begin_tool_execution();
+        clock.set_ms(index * 2_000 + 1_000);
+        drop(runtime);
+        clock.set_ms(index * 2_000 + 2_000);
+    }
+    let timing = state.complete_snapshot().protocol_timing();
+    assert!(timing.profile_valid);
+    assert_eq!(timing.inclusive_duration_ns, 20_000_000_000_000);
+    let timeline = serde_json::to_value(timing.activity_timeline.unwrap()).unwrap();
+    assert_eq!(timeline["coverageIncludingCoarseComplete"], true);
+    let coarse = timeline["coarseIntervals"]
+        .as_array()
+        .expect("overflow must retain bounded coarse coverage, not discard the tail");
+    assert!(!coarse.is_empty());
+    assert!(coarse.len() <= 128);
+    let fine = timeline["intervals"].as_array().unwrap();
+    let mut end = fine.last().unwrap()["endNs"].as_u64().unwrap();
+    let mut tool_ns = fine
+        .iter()
+        .filter(|interval| interval["toolActive"] == true)
+        .map(|interval| interval["endNs"].as_u64().unwrap() - interval["startNs"].as_u64().unwrap())
+        .sum::<u64>();
+    for summary in coarse {
+        assert_eq!(summary["startNs"].as_u64(), Some(end));
+        end = summary["endNs"].as_u64().unwrap();
+        let exclusive_ns = summary["exclusiveNs"].as_object().unwrap();
+        assert_eq!(
+            exclusive_ns
+                .values()
+                .map(|value| value.as_u64().unwrap())
+                .sum::<u64>(),
+            end - summary["startNs"].as_u64().unwrap()
+        );
+        tool_ns += summary["unionsNs"]["toolActive"].as_u64().unwrap_or(0);
+    }
+    assert_eq!(end, timing.inclusive_duration_ns);
+    assert_eq!(tool_ns, timing.unions.tool_active_union_ns);
+    assert_eq!(tool_ns, 10_000_000_000_000);
+}
+
+#[test]
+fn initial_turn_boundaries_are_observed_once_without_reclassifying_time() {
+    let (clock, state) = timing();
+    state.mark_turn_started();
+    clock.set_ms(20);
+    state.mark_turn_worker_started();
+    clock.set_ms(200);
+    let mut preparation = None;
+    state.begin_request_preparation(&mut preparation);
+    clock.set_ms(210);
+    let request = state.begin_model_request_wait();
+    state.mark_model_request_dispatched();
+    drop(preparation.take());
+    drop(request);
+    clock.set_ms(300);
+    state.begin_request_preparation(&mut preparation);
+    drop(preparation);
+    let timing = state.complete_snapshot().protocol_timing();
+    assert_eq!(timing.milestones.turn_worker_started_ms, Some(20));
+    assert_eq!(
+        timing.milestones.first_request_preparation_started_ms,
+        Some(200)
+    );
+    assert_eq!(timing.model_requests[0].dispatch_ms, Some(210));
+    assert_eq!(timing.exclusive.orchestration_ns, 300_000_000);
+    assert!(timing.profile_valid);
+}
+
+#[test]
+fn response_queue_receipts_are_attempt_bound_and_survive_late_completion() {
+    let (_, state) = timing();
+    state.mark_turn_started();
+    let request = state.begin_model_request_wait();
+    state.record_model_attempt_identity("sampling", "physical");
+    state.mark_model_request_dispatched();
+    drop(request);
+    let before = state.complete_snapshot().protocol_timing();
+    let receipt = codex_protocol::timing::ResponseQueueTiming {
+        enqueued_events: 2,
+        dequeued_events: 1,
+        queue_residence_ns: 5_000_000,
+        ..Default::default()
+    };
+    state.record_response_queue_timing("sampling", "other", "api_to_mapper", receipt.clone());
+    state.record_response_queue_timing("sampling", "physical", "unknown_stage", receipt.clone());
+    state.record_response_queue_timing("sampling", "physical", "api_to_mapper", receipt.clone());
+    let after = state.complete_snapshot().protocol_timing();
+    assert_eq!(before.inclusive_duration_ns, after.inclusive_duration_ns);
+    assert_eq!(before.exclusive, after.exclusive);
+    assert_eq!(
+        after.model_requests[0]
+            .response_queue_timing_by_attempt
+            .len(),
+        1
+    );
+    let stages = &after.model_requests[0].response_queue_timing_by_attempt["physical"];
+    assert_eq!(stages.len(), 1);
+    assert_eq!(stages["api_to_mapper"], receipt);
+    assert!(!stages["api_to_mapper"].terminal_received);
+    assert!(after.model_requests[0].token_usage.is_none());
+}
+
+#[test]
+fn response_queue_receipts_follow_the_physical_attempt_retention_bound() {
+    let (_, state) = timing();
+    state.mark_turn_started();
+    let request = state.begin_model_request_wait();
+    for index in 0..=MAX_MODEL_REQUEST_PHYSICAL_ATTEMPT_IDS {
+        let identity = format!("physical-{index}");
+        state.record_model_attempt_identity("sampling", &identity);
+        state.record_response_queue_timing(
+            "sampling",
+            &identity,
+            "api_to_mapper",
+            codex_protocol::timing::ResponseQueueTiming::default(),
+        );
+    }
+    drop(request);
+    let timing = state.complete_snapshot().protocol_timing();
+    let receipts = &timing.model_requests[0].response_queue_timing_by_attempt;
+    assert_eq!(receipts.len(), MAX_MODEL_REQUEST_PHYSICAL_ATTEMPT_IDS);
+    assert!(!receipts.contains_key("physical-0"));
+    assert!(timing.model_request_history_truncated.unwrap());
+}
+
+#[test]
+fn audit143_done_only_content_and_post_filter_publication_are_independent() {
+    let (clock, state) = timing();
+    state.mark_turn_started();
+    clock.set_ms(4);
+    let done = ResponseEvent::ReasoningSummaryDone {
+        item_id: "reason".into(), text: "thinking".into(), summary_index: 0,
+    };
+    assert_eq!(state.record_response_event_milestones(&done), Some(Duration::from_millis(4)));
+    assert_eq!(state.state().milestones.first_visible_output_ns, None);
+    clock.set_ms(40);
+    state.record_visible_output_publication();
+    assert_eq!(state.record_response_event_milestones(&done), None);
+    let timing = state.complete_snapshot().protocol_timing();
+    assert_eq!(timing.milestones.first_model_output_ms, Some(4));
+    assert_eq!(timing.milestones.first_visible_output_ms, Some(40));
+}
+
+#[test]
+fn audit143_registered_coordination_is_not_domain_work() {
+    for name in ["spawn_agent", "send_message", "list_agents", "followup_task", "interrupt_agent", "close_agent", "resume_agent"] {
+        assert!(matches!(super::tool_action_class(name), super::ToolActionClass::Infrastructure));
+        assert!(matches!(super::tool_action_class(&format!("functions.{name}")), super::ToolActionClass::Infrastructure));
+    }
+    assert!(matches!(super::tool_action_class("external.spawn_agent"), super::ToolActionClass::Domain));
+    assert!(matches!(super::tool_action_class("read_file"), super::ToolActionClass::Domain));
+}
+
+#[test]
+fn audit143_http_retry_keeps_registered_diagnostic_owner() {
+    let (_clock, state) = timing();
+    state.mark_turn_started();
+    drop(state.begin_model_request_wait());
+    state.record_model_attempt_identity("request", "attempt");
+    state.record_model_attempt_identity("request", "attempt:http-1");
+    state.record_model_request_cache_identity("request", "attempt", true, None);
+    state.record_model_request_token_categories("request", "unknown", Default::default());
+    assert!(state.state().model_requests[0].request_token_categories.is_none());
+    state.record_model_request_token_categories("request", "attempt", codex_protocol::protocol::TurnTimingRequestTokenCategories {
+        logical_total: 100, ..Default::default()
+    });
+    let timing = state.complete_snapshot().protocol_timing();
+    assert_eq!(timing.model_requests[0].physical_attempt_ids.len(), 2);
+    assert_eq!(timing.model_requests[0].request_token_categories.as_ref().unwrap().logical_total, 100);
+    assert_eq!(timing.model_requests[0].request_diagnostics_status,
+        codex_protocol::protocol::TurnTimingRequestDiagnosticsStatus::Complete);
+    assert!(timing.model_requests[0].token_usage.is_none());
+}
+
+#[test]
+fn audit143_known_provider_terminal_excludes_buffered_local_drain() {
+    let (clock, state) = timing();
+    state.mark_turn_started();
+    let request = state.begin_model_request_wait();
+    state.record_model_attempt_identity("request", "attempt");
+    state.mark_model_request_dispatched();
+    let event = ResponseEvent::OutputTextDelta("queued".into());
+    let processing = state.begin_model_stream_processing(&event);
+    clock.set_ms(10);
+    state.record_provider_terminal("wrong", "attempt");
+    assert!(state.state().activity.provider_model_active());
+    state.record_provider_terminal("request", "attempt");
+    assert!(!state.state().activity.provider_model_active());
+    clock.set_ms(100);
+    drop(processing);
+    drop(request);
+    let snapshot = state.complete_snapshot();
+    assert_eq!(snapshot.protocol_timing().activity_timeline.as_ref().unwrap().tail_unknown, false);
+    assert_eq!(snapshot.profile.inclusive_duration_ns, 100 * NS_PER_MS);
+    assert_eq!(snapshot.profile.unions.model_active_ns, 10 * NS_PER_MS);
+    assert_eq!(snapshot.profile.unions.model_stream_processing_ns, 100 * NS_PER_MS);
+    assert_eq!(snapshot.profile.exclusive.model_only_ns, 10 * NS_PER_MS);
+    assert_eq!(snapshot.profile.exclusive.orchestration_ns, 90 * NS_PER_MS);
+    assert!(!state.state().activity.provider_model_active());
+}
+
+#[test]
+fn audit143_opaque_checkpoints_are_retained_output_not_actionable_work() {
+    for item in [ResponseItem::Compaction { id: None, encrypted_content: "opaque".into(), internal_chat_message_metadata_passthrough: None },
+        ResponseItem::ContextCompaction { id: None, encrypted_content: Some("opaque".into()), internal_chat_message_metadata_passthrough: None }] {
+        assert!(super::response_item_records_model_output(&item));
+        assert!(!super::response_item_records_actionable_output(&item));
+        assert!(!super::response_event_records_actionable_output(&ResponseEvent::OutputItemDone(item)));
+    }
+}
+#[test]
+fn audit150_calibration_does_not_wait_for_optional_diagnostics() {
+    let timing = Arc::new(TurnTimingState::default());
+    timing.mark_turn_started();
+    let wait = timing.begin_model_request_wait();
+    timing.mark_model_request_dispatched();
+    timing.record_model_attempt_identity("calibration", "physical");
+    timing.record_model_estimator_model("calibration", "physical", "model");
+    let usage = TokenUsage { input_tokens:8000, output_tokens:100, total_tokens:8100,
+        coverage:Some(codex_protocol::protocol::TokenUsageCoverage::fully_reported()), ..Default::default() };
+    timing.record_model_attempt_token_usage("calibration", "physical", &usage);
+    assert_eq!(timing.prompt_token_calibration_with_estimator("model", &usage, 64_000), None,
+        "an incomplete response must not train the estimator");
+    timing.record_response_event_milestones(&ResponseEvent::Completed {
+        response_id: "calibration-response".into(), token_usage: Some(usage.clone()), end_turn: Some(true),
+    });
+    drop(wait);
+    assert_eq!(timing.prompt_token_calibration_with_estimator("model", &usage, 64_000), Some((64_000,8000)));
+    assert_eq!(timing.prompt_token_calibration_with_estimator("other-model", &usage, 64_000), None);
+    assert_eq!(timing.prompt_token_calibration_with_estimator("model", &TokenUsage::missing_receipt(), 64_000), None);
+    timing.record_model_attempt_identity("calibration", "retry");
+    assert_eq!(timing.prompt_token_calibration_with_estimator("model", &usage, 64_000), None);
+}
+
+#[test]
+fn audit150_canonical_section_hashes_match_cold_hashing_after_append_and_replacement() {
+    CANONICAL_SECTION_ITEM_VISITS.with(|count| count.set(0));
+    let mut cache = None;
+    let mut items = Vec::new();
+    for index in 0..20 {
+        items.push(serde_json::json!({"type":"message","content":format!("large stable body {index} {}", "x".repeat(4096))}));
+        let input = serde_json::to_string(&items).unwrap();
+        let raw: &serde_json::value::RawValue = serde_json::from_str(&input).unwrap();
+        let expected = hex::encode(Sha256::digest(serde_json::to_value(&items).unwrap().to_string().as_bytes()));
+        assert_eq!(CanonicalInputSection::hash(&mut cache, raw), Some(expected));
+        assert_eq!(cache.as_ref().unwrap().raw_items.len(), index + 1);
+    }
+    assert_eq!(CANONICAL_SECTION_ITEM_VISITS.with(std::cell::Cell::get),20);
+    items[0]["content"] = "changed prefix".into();
+    let input = serde_json::to_string(&items).unwrap();
+    let raw: &serde_json::value::RawValue = serde_json::from_str(&input).unwrap();
+    let expected = hex::encode(Sha256::digest(input.as_bytes()));
+    assert_eq!(CanonicalInputSection::hash(&mut cache, raw), Some(expected));
+    assert_eq!(CANONICAL_SECTION_ITEM_VISITS.with(std::cell::Cell::get),40);
+}
+
+#[test]
+fn audit143_checkpoint_clock_and_state_share_the_transition_lock() {
+    let clock = Arc::new(CoordinatedClock::default());
+    let state = Arc::new(TurnTimingState::with_clock(clock.clone()));
+    state.mark_turn_started();
+    let checkpoint_state = Arc::clone(&state);
+    let checkpoint = std::thread::spawn(move || checkpoint_state.sampling_checkpoint());
+    clock.wait_for_first_parallel_sample();
+    let transition_state = Arc::clone(&state);
+    let transition = std::thread::spawn(move || transition_state.record_tool_gate_admitted("later"));
+    let sampled_before_release = clock.second_parallel_sample_before_release();
+    clock.release_first_parallel_sample();
+    let checkpoint = checkpoint.join().expect("checkpoint completes");
+    transition.join().expect("transition completes");
+    assert!(!sampled_before_release, "a transition must not cross the checkpoint's state/time cutoff");
+    assert_eq!(checkpoint.observed_at_unix_ms, 10);
+    assert!(checkpoint.tail_unknown);
+    assert!(state.state().completed_snapshot.is_none(), "checkpoint must not finish the live turn");
+    assert!(state.complete_snapshot().profile.profile_valid);
+}
+
+#[test]
+fn audit143_logical_diagnostics_survive_physical_detail_eviction() {
+    let (_clock, state) = timing();
+    state.mark_turn_started();
+    drop(state.begin_model_request_wait());
+    state.record_model_attempt_identity("request", "owner");
+    for index in 0..MAX_MODEL_REQUEST_PHYSICAL_ATTEMPT_IDS {
+        state.record_model_attempt_identity("request", &format!("owner:http-{index}"));
+    }
+    assert!(!state.state().model_requests[0].physical_attempt_ids.iter().any(|id| id == "owner"));
+    state.record_model_request_cache_identity("request", "owner", true, None);
+    state.record_model_request_token_categories("request", "owner", Default::default());
+    let snapshot = state.complete_snapshot().protocol_timing();
+    assert_eq!(snapshot.model_requests[0].request_diagnostics_status,
+        codex_protocol::protocol::TurnTimingRequestDiagnosticsStatus::Complete);
+    assert!(snapshot.model_requests[0].token_usage.is_none());
+}
+
+#[test]
+fn audit143_hosted_calls_are_not_actionable_but_client_calls_are() {
+    let tool_search = |execution: &str| ResponseItem::ToolSearchCall {
+        id: None,
+        call_id: Some("search".into()),
+        status: None,
+        execution: execution.to_string(),
+        arguments: serde_json::json!({"query": "files"}),
+        internal_chat_message_metadata_passthrough: None,
+    };
+    let hosted = [
+        ResponseItem::WebSearchCall {
+            id: None,
+            status: Some("completed".into()),
+            action: None,
+            internal_chat_message_metadata_passthrough: None,
+        },
+        tool_search("server"),
+    ];
+    for item in hosted {
+        // Provider-side work is model output, but gives the client nothing to execute.
+        assert!(super::response_item_records_model_output(&item));
+        assert!(!super::response_event_records_actionable_output(
+            &ResponseEvent::OutputItemDone(item)
+        ));
+    }
+    // Negative control: the same tool search executed by the client is actionable.
+    assert!(super::response_event_records_actionable_output(
+        &ResponseEvent::OutputItemDone(tool_search("client"))
+    ));
 }

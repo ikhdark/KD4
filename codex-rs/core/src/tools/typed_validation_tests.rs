@@ -28,15 +28,18 @@ impl ToolExecutor<ToolInvocation> for NativeValidationResult {
             if self.case == "unknown_obligation" {
                 argv[2] = "different_case".into();
             }
+            if self.case == "compilation_only" {
+                argv[2] = "--no-run".into();
+            }
             let mut validation = crate::validation::resolve_command_validation(
                 &codex_command_analysis::command_shape::CommandInvocation::Argv {
                     program: argv[0].clone(),
                     args: argv[1..].to_vec(),
                 },
                 Some(invocation.step_context.turn.cwd().as_path()),
-                Some(codex_protocol::validation::ValidationCommandContext {
-                    covered_paths: vec!["src".into()],
-                }),
+                // Public schemas reject caller-authored validation coverage.
+                // Exercise the actual schema-valid absence of that declaration.
+                None,
             )
             .await
             .unwrap();
@@ -65,6 +68,18 @@ impl ToolExecutor<ToolInvocation> for NativeValidationResult {
             if self.case == "zero_tests" {
                 receipt["executed_tests"] = json!(0);
                 receipt["completed_tests"] = json!({});
+            }
+            if self.case == "python_producer" {
+                validation.receipt_runner = Some("root_maintenance.unittest".into());
+                receipt = json!({
+                    "schema_version":1, "runner":"root_maintenance.unittest", "complete":true,
+                    "successful":true, "tests_run":1, "errors":[], "reusable_validation_receipt":false,
+                    "environments":[{"environment":"scripts", "exit_code":0, "report":{
+                        "complete":true, "successful":true, "errors":[], "tests_run":1,
+                        "selection":{"names":["fixture.actual"], "selected_count":1, "duplicates":[], "unrun":[]},
+                        "tests":[{"name":"fixture.actual", "started":true, "body_started":true, "outcome":"success"}]
+                    }}]
+                });
             }
             if self.case == "busy" {
                 receipt = json!({
@@ -97,7 +112,16 @@ impl ToolExecutor<ToolInvocation> for NativeValidationResult {
             }
             let running = self.case == "running";
             Ok(Box::new(ExecCommandToolOutput {
-                process_output: None,
+                process_output: (self.origin == "running" && !running).then(|| {
+                    Arc::new(crate::unified_exec::ProcessOutputSnapshot {
+                        process_duration: Some(Duration::from_secs(125)),
+                        aggregated_output: receipt.to_string().into_bytes(),
+                        stdout: Vec::new(),
+                        stderr: Vec::new(),
+                        aggregated_output_is_exact: true,
+                        streams_are_exact: true,
+                    })
+                }),
                 error: None,
                 validation: Some(validation),
                 event_call_id: self.origin.clone(),
@@ -141,6 +165,7 @@ impl CoreToolRuntime for NativeValidationResult {}
 #[tokio::test]
 async fn native_results_reach_owned_task_evidence_without_preseeded_calls() {
     let (session, turn) = crate::session::tests::make_session_and_context().await;
+    let session = Arc::new(session);
     let coordinator = session.services.agent_control.task_coordinator();
     let home = tempfile::tempdir().unwrap();
     let state = codex_state::StateRuntime::init(home.path().into(), "test".into())
@@ -166,7 +191,10 @@ async fn native_results_reach_owned_task_evidence_without_preseeded_calls() {
                 stop_condition: "report evidence".into(),
                 dependencies: Vec::new(),
                 risk_hints: Vec::new(),
-                required_evidence: vec!["cargo test focused_case".into()],
+                required_evidence: vec![
+                    "cargo test focused_case".into(),
+                    "cargo test --no-run".into(),
+                ],
                 prohibited_changes: Vec::new(),
                 contract_claims: Vec::new(),
                 workspace_strategy: WorkspaceStrategy::Shared,
@@ -188,7 +216,6 @@ async fn native_results_reach_owned_task_evidence_without_preseeded_calls() {
     };
     turn.agent_task_binding.set(Some(binding)).unwrap();
     let store = coordinator.store().unwrap();
-    let session = Arc::new(session);
     let step = StepContext::for_test(Arc::new(turn));
     assert!(
         store
@@ -203,6 +230,8 @@ async fn native_results_reach_owned_task_evidence_without_preseeded_calls() {
     ));
     for (case, expected) in [
         ("success", Some(ValidationCallStatus::Succeeded)),
+        ("compilation_only", Some(ValidationCallStatus::Succeeded)),
+        ("python_producer", Some(ValidationCallStatus::Succeeded)),
         ("git_unchanged_end", Some(ValidationCallStatus::Succeeded)),
         ("nested_workdir", Some(ValidationCallStatus::Succeeded)),
         ("malformed", Some(ValidationCallStatus::NotExecuted)),
@@ -246,11 +275,20 @@ async fn native_results_reach_owned_task_evidence_without_preseeded_calls() {
             .await
             .unwrap();
         assert_eq!(call.as_ref().map(|call| call.status), expected, "{case}");
+        if case == "failed" {
+            let failure = call.as_ref().unwrap();
+            assert!(failure.evidence.output_summary.as_ref().is_some_and(|summary| !summary.is_empty()));
+            assert_eq!(failure.evidence.validation_result.as_ref().unwrap()["failureExcerpt"], json!(failure.evidence.output_summary));
+        }
         if expected == Some(ValidationCallStatus::Succeeded) {
+            let call = call.unwrap();
             assert_eq!(
-                call.unwrap().verified_evidence_kind(),
+                call.verified_evidence_kind(),
                 Some(CriterionEvidenceKind::ValidationExecution)
             );
+            let result = call.evidence.validation_result.unwrap();
+            assert_eq!(result["kind"], "native_command_execution_v1");
+            assert!(result.get("coveredPaths").is_none());
             assert!(
                 serde_json::to_string(&output.response())
                     .unwrap()
@@ -287,7 +325,7 @@ async fn native_results_reach_owned_task_evidence_without_preseeded_calls() {
         .unwrap();
     assert_eq!(
         task.validation_calls.len(),
-        9,
+        11,
         "polls settle the original record, never add a second execution"
     );
     assert_eq!(
@@ -298,4 +336,40 @@ async fn native_results_reach_owned_task_evidence_without_preseeded_calls() {
             .status,
         ValidationCallStatus::Succeeded
     );
+    let polled = task
+        .validation_calls
+        .iter()
+        .find(|call| call.call_id.ends_with(":running"))
+        .unwrap();
+    assert_eq!(
+        polled.evidence.validation_result.as_ref().unwrap()["durationMs"],
+        125_000
+    );
+
+    // Inject storage failure only: the producer still has to capture the
+    // native launch. No validation call or launch observation is preseeded.
+    let retry_id = format!("command:{}:retrying", session.thread_id);
+    let mut delivery = crate::tools::typed_validation::DeliveryState::default();
+    delivery.fail_next_write = true;
+    coordinator.native_validation_deliveries.lock().unwrap().insert(
+        retry_id.clone(), Arc::new(tokio::sync::Mutex::new(delivery)),
+    );
+    let mut launch = poll.clone();
+    launch.call_id = "retry-launch".into();
+    launch.tool_name = ToolName::plain("exec_command");
+    let output = handle_any_tool(&NativeValidationResult {
+        case: "running", origin: "retrying".into(),
+    }, launch).await.unwrap();
+    assert!(serde_json::to_string(&output.response()).unwrap().contains("was not recorded"));
+    assert!(store.get_validation_call(retry_id.clone()).await.unwrap().is_none());
+    // Consuming the original process's terminal observation repairs delivery,
+    // not execution. A foreign poll above remained unable to invent a launch.
+    handle_any_tool(&NativeValidationResult {
+        case: "success", origin: "retrying".into(),
+    }, poll.clone()).await.unwrap();
+    let repaired = store.get_validation_call(retry_id.clone()).await.unwrap().unwrap();
+    assert_eq!(repaired.status, ValidationCallStatus::Succeeded);
+    assert!(repaired.evidence.validation_result.as_ref().unwrap()["durationMs"].is_null(),
+        "unavailable cumulative timing must not become the final poll duration");
+    assert!(!coordinator.native_validation_deliveries.lock().unwrap().contains_key(&retry_id));
 }

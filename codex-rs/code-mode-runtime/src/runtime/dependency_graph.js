@@ -10,6 +10,18 @@ Object.defineProperty(globalThis, "run_graph", {
         "run_graph concurrency must be an integer from 1 to 16",
       );
     }
+    // Without `accept`, a command result (or each one in an array) must have
+    // exited 0; other values pass. Resolution alone never certifies a command.
+    const isCommand = (value) =>
+      value !== null &&
+      typeof value === "object" &&
+      ["exit_code", "execution_state", "process_exited"].some(
+        (key) => key in value,
+      );
+    const commandsSucceeded = (value) =>
+      (Array.isArray(value) ? value : [value]).every(
+        (item) => !isCommand(item) || item.exit_code === 0,
+      );
     // Capture definitions before running callbacks. Reject the entire graph
     // before starting any effect, including errors in disconnected components.
     const graph = new Map();
@@ -21,7 +33,7 @@ Object.defineProperty(globalThis, "run_graph", {
         node.id.length > 256 ||
         graph.has(node.id) ||
         typeof node.run !== "function" ||
-        typeof node.accept !== "function" ||
+        (node.accept !== undefined && typeof node.accept !== "function") ||
         (node.deps !== undefined && !Array.isArray(node.deps)) ||
         (node.requires !== undefined && !Array.isArray(node.requires)) ||
         (node.step_id !== undefined &&
@@ -29,9 +41,29 @@ Object.defineProperty(globalThis, "run_graph", {
             !node.step_id.trim() ||
             node.step_id.length > 256))
       ) {
-        throw new TypeError(
-          "run_graph nodes require unique IDs, deps, run and accept callbacks",
-        );
+        // Name the first offending node and field. The graph is rejected
+        // either way, so reading the definition again starts no work.
+        const id = node?.id;
+        const label =
+          typeof id === "string" && id.trim() && id.length <= 256
+            ? ` ${JSON.stringify(id)}`
+            : "";
+        let problem =
+          "step_id must be a nonempty string of at most 256 characters";
+        if (!node) problem = "expected {id, deps?, run, accept?}";
+        else if (!label)
+          problem = "id must be a nonempty string of at most 256 characters";
+        else if (graph.has(id)) problem = "id repeats an earlier node";
+        else if (typeof node.run !== "function")
+          problem = "run must be a function, async (deps) => value";
+        else if (node.accept !== undefined && typeof node.accept !== "function")
+          problem =
+            "accept must be a function, async (value) => boolean, or omitted";
+        else if (node.deps !== undefined && !Array.isArray(node.deps))
+          problem = "deps must be an array of node IDs";
+        else if (node.requires !== undefined && !Array.isArray(node.requires))
+          problem = "requires must be an array of tool names";
+        throw new TypeError(`run_graph node ${graph.size}${label}: ${problem}`);
       }
       const deps = [...(node.deps ?? [])];
       if (
@@ -87,7 +119,7 @@ Object.defineProperty(globalThis, "run_graph", {
         deps,
         requires,
         run: node.run,
-        accept: node.accept,
+        accept: node.accept ?? commandsSucceeded,
         step_id: node.step_id,
         estimated_ms,
         claims,
@@ -244,8 +276,8 @@ Object.defineProperty(globalThis, "run_graph", {
         for (const dep of node.deps) dependencies[dep] = results[dep].value;
         value = await node.run(Object.freeze(dependencies));
         produced = true;
-        // Promise resolution is not tool success. The caller must explicitly
-        // establish the node's behavioral postcondition (including exit codes).
+        // Promise resolution is not tool success. `accept` establishes the
+        // node's behavioral postcondition; by default, command exit codes.
         if ((await node.accept(value)) !== true) {
           results[id] = {
             status: "rejected",

@@ -104,12 +104,49 @@ pub fn write_schema_fixtures_with_options(
     // Replacement of the two owned subtrees is not a two-directory transaction.
     for label in ["typescript", "json"] {
         let destination = schema_root.join(label);
-        if destination.exists() {
-            std::fs::remove_dir_all(&destination)
-                .with_context(|| format!("failed to remove {}", destination.display()))?;
+        let previous = staging.path().join(format!("previous-{label}"));
+        if let Err(error) = publish_fixture_subtree(
+            &staging.path().join(label),
+            &destination,
+            &previous,
+            |from, to| std::fs::rename(from, to),
+        ) {
+            // A failed Windows rename must not delete either the replacement
+            // or an old subtree whose rollback was also blocked.
+            let recovery = staging.keep();
+            return Err(error).with_context(|| {
+                format!(
+                    "schema publication failed; recovery data retained at {}",
+                    recovery.display()
+                )
+            });
         }
-        std::fs::rename(staging.path().join(label), &destination)
-            .with_context(|| format!("failed to publish {}", destination.display()))?;
+    }
+    Ok(())
+}
+
+fn publish_fixture_subtree(
+    source: &Path,
+    destination: &Path,
+    previous: &Path,
+    mut rename: impl FnMut(&Path, &Path) -> std::io::Result<()>,
+) -> Result<()> {
+    let had_previous = destination.exists();
+    if had_previous {
+        rename(destination, previous)
+            .with_context(|| format!("failed to preserve {}", destination.display()))?;
+    }
+    if let Err(error) = rename(source, destination) {
+        if had_previous {
+            rename(previous, destination).with_context(|| {
+                format!(
+                    "failed to restore {}; previous data remains at {}; publish error: {error}",
+                    destination.display(),
+                    previous.display()
+                )
+            })?;
+        }
+        return Err(error).with_context(|| format!("failed to publish {}", destination.display()));
     }
     Ok(())
 }
@@ -353,6 +390,65 @@ impl TypeVisitor for TypeScriptFixtureCollector<'_> {
 mod tests {
     use super::*;
     use pretty_assertions::assert_eq;
+
+    #[test]
+    fn fixture_publication_failure_preserves_previous_and_staged_data() -> Result<()> {
+        for fail_at in [1, 2, 3] {
+            let dir = tempfile::tempdir()?;
+            let source = dir.path().join("staged");
+            let destination = dir.path().join("json");
+            let previous = dir.path().join("previous-json");
+            std::fs::create_dir(&source)?;
+            std::fs::create_dir(&destination)?;
+            std::fs::write(source.join("new"), "replacement")?;
+            std::fs::write(destination.join("old"), "user changes")?;
+            let mut calls = 0;
+            let result = publish_fixture_subtree(&source, &destination, &previous, |from, to| {
+                calls += 1;
+                if calls == fail_at || (fail_at == 3 && calls == 2) {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "injected",
+                    ));
+                }
+                std::fs::rename(from, to)
+            });
+            assert!(result.is_err());
+            let retained = if fail_at == 3 {
+                &previous
+            } else {
+                &destination
+            };
+            assert_eq!(
+                std::fs::read_to_string(retained.join("old"))?,
+                "user changes"
+            );
+            assert_eq!(std::fs::read_to_string(source.join("new"))?, "replacement");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn fixture_publication_success_keeps_previous_until_generation_commit() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let source = dir.path().join("staged");
+        let destination = dir.path().join("json");
+        let previous = dir.path().join("previous-json");
+        std::fs::create_dir(&source)?;
+        std::fs::create_dir(&destination)?;
+        std::fs::write(source.join("new"), "replacement")?;
+        std::fs::write(destination.join("old"), "previous")?;
+        publish_fixture_subtree(&source, &destination, &previous, |from, to| {
+            std::fs::rename(from, to)
+        })?;
+        assert_eq!(
+            std::fs::read_to_string(destination.join("new"))?,
+            "replacement"
+        );
+        assert_eq!(std::fs::read_to_string(previous.join("old"))?, "previous");
+        assert!(!source.exists());
+        Ok(())
+    }
 
     fn read_normalized(value: Value) -> Vec<u8> {
         let dir = tempfile::tempdir().unwrap();

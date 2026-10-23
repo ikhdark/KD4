@@ -16,6 +16,71 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
+#[tokio::test]
+async fn audit147_owned_operation_receipt_survives_discontinuity_without_claiming_integration() {
+    let root = tempfile::tempdir().unwrap();
+    let mut tracker = tracker_for(root.path());
+    let first = apply_patch_in(
+        root.path(),
+        "*** Begin Patch\n*** Add File: owned\n+first\n*** End Patch",
+    )
+    .await;
+    tracker.track_delta_for_call(LOCAL_ENVIRONMENT_ID, &first, Some("first-call"));
+    std::fs::write(root.path().join("owned"), "foreign\n").unwrap();
+    let second = apply_patch_in(
+        root.path(),
+        "*** Begin Patch\n*** Update File: owned\n@@\n-foreign\n+second\n*** End Patch",
+    )
+    .await;
+    tracker.track_delta_for_call(LOCAL_ENVIRONMENT_ID, &second, Some("second-call"));
+    assert!(tracker.exact_unified_diff().is_err());
+    let mut call = invocation(root.path(), tracker, "owned-operation").await;
+    call.payload = ToolPayload::Function {
+        arguments: json!({"name":"owned-operation", "operation":2}).to_string(),
+    };
+    let payload = call.payload.clone();
+    let output = SaveTurnDiffHandler.handle(call).await.unwrap();
+    let result = output.code_mode_result(&payload);
+    assert_eq!(result["scope"], "historical_committed_operation");
+    assert_eq!(result["current_source_verified"], false);
+    assert_eq!(result["coherent_snapshot_verified"], false);
+    assert_eq!(result["files"], 1);
+    let receipt: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(result["path"].as_str().unwrap()).unwrap()).unwrap();
+    assert_eq!(receipt["call_id"], "second-call");
+    assert_eq!(receipt["integrated_net_diff"], false);
+    assert_eq!(receipt["changes"][0]["before"], "foreign\n");
+    assert_eq!(receipt["changes"][0]["after"], "second\n");
+    assert_eq!(
+        std::fs::read_to_string(root.path().join("owned")).unwrap(),
+        "second\n"
+    );
+}
+
+#[tokio::test]
+async fn audit147_existing_diff_artifact_is_never_replaced() {
+    let root = tempfile::tempdir().unwrap();
+    let directory = root.path().join(".codex/gitdiff");
+    std::fs::create_dir_all(&directory).unwrap();
+    let destination = directory.join("shared.patch");
+    std::fs::write(&destination, "another session's patch\n").unwrap();
+    let mut tracker = tracker_for(root.path());
+    let delta = apply_patch_in(
+        root.path(),
+        "*** Begin Patch\n*** Add File: owned.txt\n+owned\n*** End Patch",
+    )
+    .await;
+    tracker.track_delta(LOCAL_ENVIRONMENT_ID, &delta);
+    let result = SaveTurnDiffHandler
+        .handle(invocation(root.path(), tracker, "shared").await)
+        .await;
+    assert!(result.is_err(), "an occupied artifact name must be refused");
+    assert_eq!(
+        std::fs::read_to_string(destination).unwrap(),
+        "another session's patch\n"
+    );
+}
+
 async fn apply_patch_in(root: &Path, patch: &str) -> codex_apply_patch::AppliedPatchDelta {
     let cwd = PathUri::from_host_native_path(root).expect("absolute tempdir path");
     let (mut stdout, mut stderr) = (Vec::new(), Vec::new());

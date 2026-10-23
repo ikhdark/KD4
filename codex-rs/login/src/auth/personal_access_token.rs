@@ -84,6 +84,7 @@ async fn hydrate_personal_access_token(
     let response = client
         .get(endpoint)
         .bearer_auth(access_token)
+        .timeout(std::time::Duration::from_secs(15))
         .send()
         .await
         .map_err(|err| {

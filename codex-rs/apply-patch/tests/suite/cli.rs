@@ -144,9 +144,27 @@ fn test_apply_patch_cli_disambiguates_with_exact_context_and_eof() -> anyhow::Re
 }
 
 #[test]
+fn test_apply_patch_cli_applies_repeated_updates_of_one_file_in_sequence() -> anyhow::Result<()> {
+    let tmp = tempdir()?;
+    fs::write(tmp.path().join("a.txt"), "before\n")?;
+    let patch = "*** Begin Patch\n*** Add File: prefix.txt\n+written\n*** Update File: a.txt\n@@\n-before\n+after\n*** Update File: ./a.txt\n@@\n-after\n+again\n*** End Patch";
+    apply_patch_command()?
+        .arg(patch)
+        .current_dir(tmp.path())
+        .assert()
+        .success()
+        .stderr("");
+    assert_eq!(fs::read_to_string(tmp.path().join("a.txt"))?, "again\n");
+    assert_eq!(
+        fs::read_to_string(tmp.path().join("prefix.txt"))?,
+        "written\n"
+    );
+    Ok(())
+}
+
+#[test]
 fn test_apply_patch_cli_rejects_duplicate_endpoints_before_any_write() -> anyhow::Result<()> {
     for body in [
-        "*** Update File: a.txt\n@@\n-before\n+after\n*** Update File: ./a.txt\n@@\n-after\n+again\n",
         "*** Add File: new.txt\n+first\n*** Add File: ./new.txt\n+second\n",
         "*** Update File: a.txt\n*** Move to: b.txt\n*** Update File: b.txt\n@@\n-before\n+after\n",
     ] {

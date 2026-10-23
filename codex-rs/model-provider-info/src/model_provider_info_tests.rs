@@ -547,3 +547,66 @@ refresh_interval_ms = 0
     assert_eq!(auth.refresh_interval_ms, 0);
     assert_eq!(auth.refresh_interval(), None);
 }
+
+#[test]
+fn test_validate_rejects_zero_timeouts() {
+    for (value, expected) in [
+        (None, Ok(())),
+        (Some(1), Ok(())),
+        (
+            Some(0),
+            Err("provider stream_idle_timeout_ms must be greater than 0".to_string()),
+        ),
+    ] {
+        let provider = ModelProviderInfo {
+            stream_idle_timeout_ms: value,
+            ..ModelProviderInfo::create_openai_provider(/*base_url*/ None)
+        };
+        assert_eq!(
+            provider.validate(),
+            expected,
+            "stream_idle_timeout_ms = {value:?}"
+        );
+    }
+    for (value, expected) in [
+        (None, Ok(())),
+        (Some(1), Ok(())),
+        (
+            Some(0),
+            Err("provider websocket_connect_timeout_ms must be greater than 0".to_string()),
+        ),
+    ] {
+        let provider = ModelProviderInfo {
+            websocket_connect_timeout_ms: value,
+            ..ModelProviderInfo::create_openai_provider(/*base_url*/ None)
+        };
+        assert_eq!(
+            provider.validate(),
+            expected,
+            "websocket_connect_timeout_ms = {value:?}"
+        );
+    }
+}
+
+#[test]
+fn built_in_ollama_defaults_to_ipv4_loopback() {
+    // The experimental CODEX_OSS_ overrides replace both defaults.
+    if std::env::var_os("CODEX_OSS_BASE_URL").is_some()
+        || std::env::var_os("CODEX_OSS_PORT").is_some()
+    {
+        return;
+    }
+    let providers = built_in_model_providers(/*openai_base_url*/ None);
+    assert_eq!(
+        providers
+            .get(OLLAMA_OSS_PROVIDER_ID)
+            .and_then(|provider| provider.base_url.as_deref()),
+        Some("http://127.0.0.1:11434/v1")
+    );
+    assert_eq!(
+        providers
+            .get(LMSTUDIO_OSS_PROVIDER_ID)
+            .and_then(|provider| provider.base_url.as_deref()),
+        Some("http://localhost:1234/v1")
+    );
+}

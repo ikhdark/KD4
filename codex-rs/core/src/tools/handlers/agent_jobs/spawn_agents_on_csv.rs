@@ -414,10 +414,14 @@ async fn handle_owned(
             })?;
     }
     let delivery_owner = format!("agent-job:{job_id}");
+    let output_sha256 = db.agent_job_artifact_digest(&job_id).await.map_err(|error| {
+        FunctionCallError::RespondToModel(format!("failed to load publication provenance: {error}"))
+    })?;
     let content = serde_json::to_string(&SpawnAgentsOnCsvResult {
         job_id,
         status: job.status.as_str().to_string(),
         output_csv_path: job.output_csv_path,
+        output_sha256,
         total_items: progress.total_items,
         completed_items: progress.completed_items,
         failed_items: progress.failed_items,

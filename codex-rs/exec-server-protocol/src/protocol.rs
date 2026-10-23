@@ -99,6 +99,9 @@ pub struct InitializeResponse {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct EnvironmentInfo {
+    /// Server incarnation, shared by connections and aliases, never approval authority.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resource_id: Option<String>,
     /// Operating system reported by the exec server. New servers emit `windows`.
     /// Missing values are retained for compatibility with legacy Windows servers.
     #[serde(default)]
@@ -112,7 +115,10 @@ pub struct EnvironmentInfo {
 impl EnvironmentInfo {
     /// Returns information about the current local exec-server process.
     pub fn local() -> Self {
+        static RESOURCE_ID: std::sync::LazyLock<String> =
+            std::sync::LazyLock::new(|| codex_protocol::ThreadId::new().to_string());
         Self {
+            resource_id: Some(RESOURCE_ID.clone()),
             operating_system: Some("windows".to_string()),
             shell: codex_shell_command::shell_detect::default_user_shell().into(),
             cwd: std::env::current_dir()
@@ -804,6 +810,7 @@ mod tests {
         assert_eq!(
             info,
             EnvironmentInfo {
+                resource_id: None,
                 operating_system: None,
                 shell: ShellInfo {
                     name: "zsh".to_string(),

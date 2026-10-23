@@ -71,12 +71,12 @@ impl ToolExecutor<ToolInvocation> for ListFilesHandler {
         ));
         depth.minimum = Some(0.into());
         let mut entries = JsonSchema::integer(Some(
-            "Maximum entries examined, including directories; default 2000, clamped to 50000 (returned in effective_walk_options).".into(),
+            "Maximum entries examined, including directories; with include patterns, maximum matching files returned instead while up to 50000 entries are examined. Default 2000, clamped to 50000 (returned in effective_walk_options).".into(),
         ));
         entries.minimum = Some(1.into());
         ToolSpec::Function(ResponsesApiTool {
             name: "list_files".into(),
-            description: "List files and directories through the selected environment's sandboxed filesystem without shell quoting. Start at a narrow path. File include/exclude filters do not prune directories; exclude_directories omits and prunes matching directories. Patterns match case-sensitive basenames at every depth: * is zero or more Unicode characters, ? is one; other characters are literal. At most 64 patterns total, each 1–256 UTF-8 bytes without path separators. Entry paths are relative to the environment cwd (absolute when outside it) and can be passed to read_file or list_files. Directory symlinks and dangling links are omitted from entries and never followed; hidden directories are listed but not traversed unless include_hidden is true. For an unfiltered audit omit all filters and set include_hidden=true; gitignore is never applied. complete refers only to this requested scope. Check truncated, errors, unexplored cutoff reasons, and effective_walk_options before claiming coverage. Directories are mutable, not stable pages. Recover large output with read_tool_output; repeat list_files for current state.".into(),
+            description: "List files and directories through the selected environment's sandboxed filesystem without shell quoting. Start at a narrow path. File include/exclude filters do not prune directories; with include patterns, entries are only matching files and directories are traversed without being listed. exclude_directories omits and prunes matching directories. Patterns match case-sensitive basenames at every depth: * is zero or more Unicode characters, ? is one; other characters are literal. At most 64 patterns total, each 1–256 UTF-8 bytes without path separators. Entry paths are relative to the environment cwd (absolute when outside it) and can be passed to read_file or list_files. Directory symlinks and dangling links are omitted from entries and never followed; hidden directories are listed (except with include patterns) but not traversed unless include_hidden is true. For an unfiltered audit omit all filters and set include_hidden=true; gitignore is never applied. complete refers only to this requested scope. Check truncated, errors, unexplored cutoff reasons, and effective_walk_options before claiming coverage. Directories are mutable, not stable pages. Recover large output with read_tool_output; repeat list_files for current state.".into(),
             strict: false,
             defer_loading: None,
             parameters: JsonSchema::object(BTreeMap::from([
@@ -84,9 +84,9 @@ impl ToolExecutor<ToolInvocation> for ListFilesHandler {
                 ("environment_id".into(), JsonSchema::string(Some("Omit to use the primary environment.".into()))),
                 ("max_depth".into(), depth),
                 ("max_entries".into(), entries),
-                ("max_directories".into(), JsonSchema { minimum: Some(1.into()), ..JsonSchema::integer(Some("Maximum directories traversed, including the root. Default min(max_entries,10000), clamped to 10000.".into())) }),
+                ("max_directories".into(), JsonSchema { minimum: Some(1.into()), ..JsonSchema::integer(Some("Maximum directories traversed, including the root. Default min(max_entries,10000), or 10000 with include patterns; clamped to 10000.".into())) }),
                 ("include_hidden".into(), JsonSchema::boolean(Some("Traverse hidden directories; default false.".into()))),
-                ("include".into(), JsonSchema::array(JsonSchema::string(None), Some("File basename patterns; empty or omitted includes all files. Directories remain visible and traversable.".into()))),
+                ("include".into(), JsonSchema::array(JsonSchema::string(None), Some("File basename patterns; empty or omitted includes all files. When set, only matching files are listed; directories are still traversed.".into()))),
                 ("exclude".into(), JsonSchema::array(JsonSchema::string(None), Some("File basename patterns omitted from results; exclusion wins over inclusion.".into()))),
                 ("exclude_directories".into(), JsonSchema::array(JsonSchema::string(None), Some("Directory basename patterns omitted and never traversed, e.g. [\"node_modules\",\"target\"]. The explicitly selected root is never excluded.".into()))),
             ]), Some(vec!["path".into()]), Some(false.into())),
@@ -108,7 +108,16 @@ impl ToolExecutor<ToolInvocation> for ListFilesHandler {
             let args: ListFilesArgs = parse_arguments(arguments)?;
             let max_depth = args.max_depth.unwrap_or(8).min(MAX_DEPTH);
             let max_entries = args.max_entries.unwrap_or(2000).min(MAX_ENTRIES);
-            let max_directories = args.max_directories.unwrap_or(max_entries).min(10_000);
+            // Unfiltered walks list every traversed directory as an entry. Include
+            // patterns list only matching files, so entries do not bound traversal.
+            let max_directories = args
+                .max_directories
+                .unwrap_or(if args.include.is_empty() {
+                    max_entries
+                } else {
+                    10_000
+                })
+                .min(10_000);
             let filters = WalkFilters {
                 include: args.include,
                 exclude: args.exclude,

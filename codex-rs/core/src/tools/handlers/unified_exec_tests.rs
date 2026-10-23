@@ -28,6 +28,79 @@ use tokio::sync::Mutex;
 const TEST_TRUNCATION_POLICY: TruncationPolicy = TruncationPolicy::Tokens(10_000);
 
 #[tokio::test]
+async fn scoped_exec_environment_reaches_child_without_leaking_to_next_command() {
+    let python = which::which("python")
+        .or_else(|_| which::which("python3"))
+        .unwrap();
+    let key = "CODEX_SCOPED_EXEC_REGRESSION";
+    let inherited = std::env::var(key).ok();
+    let handler = ExecCommandHandler::default();
+    let base = invocation_for_payload_without_sandbox(
+        "exec_command",
+        "scoped-env-base",
+        ToolPayload::Function {
+            arguments: "{}".into(),
+        },
+    )
+    .await;
+    for (index, value) in [Some("first"), Some("second"), None]
+        .into_iter()
+        .enumerate()
+    {
+        let mut arguments = serde_json::json!({
+            "program": python, "args": ["-c", format!("import json,os; print(json.dumps(os.environ.get('{key}')))")],
+            "yield_time_ms": 30000,
+        });
+        if let Some(value) = value {
+            arguments["env"] = serde_json::json!({key: value});
+        }
+        let payload = ToolPayload::Function {
+            arguments: arguments.to_string(),
+        };
+        let output = handler
+            .handle(ToolInvocation {
+                session: Arc::clone(&base.session),
+                step_context: Arc::clone(&base.step_context),
+                tracker: Arc::clone(&base.tracker),
+                cancellation_token: tokio_util::sync::CancellationToken::new(),
+                call_id: format!("scoped-env-{index}"),
+                tool_name: codex_tools::ToolName::plain("exec_command"),
+                source: ToolCallSource::Direct,
+                payload: payload.clone(),
+            })
+            .await
+            .unwrap();
+        let result = output.code_mode_result(&payload);
+        assert_eq!(result["exit_code"], 0, "{result}");
+        let observed: Option<String> =
+            serde_json::from_str(result["stdout"].as_str().unwrap()).unwrap();
+        assert_eq!(observed.as_deref(), value.or(inherited.as_deref()));
+    }
+    assert_eq!(
+        std::env::var(key).ok(),
+        inherited,
+        "command overrides must never mutate the harness environment"
+    );
+}
+
+#[test]
+fn scoped_exec_environment_rejects_invalid_names_and_values() {
+    for (key, value) in [
+        ("", "value"),
+        ("A=B", "value"),
+        ("A\0B", "value"),
+        ("NAME", "a\0b"),
+    ] {
+        let arguments =
+            serde_json::json!({"program": "cargo", "args": ["--version"], "env": {key: value}});
+        assert!(
+            serde_json::from_value::<ExecCommandArgs>(arguments).is_err(),
+            "invalid environment entry {key:?} must fail before launch"
+        );
+    }
+}
+
+#[tokio::test]
 async fn structured_rg_miss_reuses_exact_streams_without_a_new_root() {
     use codex_utils_pty::process_observation::ProcessObservationContext;
     use codex_utils_pty::process_observation::ProcessStartRecorder;
@@ -159,8 +232,27 @@ fn exec_command_boundary_normalizes_unambiguous_legacy_forms() {
     }
 }
 
+async fn decoded_with_observation_policy(arguments: serde_json::Value) -> ExecCommandArgs {
+    let mut decoded: ExecCommandArgs = parse_arguments(&arguments.to_string()).unwrap();
+    let invocation = decoded.command_invocation().clone();
+    let long_running = crate::tools::run_blocking_command_analysis(move || {
+        crate::validation::prefers_long_observation_wait(&invocation)
+    }).await.unwrap();
+    decoded.apply_validation_observation_policy(long_running);
+    decoded
+}
+
 #[test]
-fn exec_command_boundary_uses_validation_wait_unless_explicitly_overridden() {
+fn exec_command_deserialization_is_structural_before_native_analysis() {
+    let decoded: ExecCommandArgs = parse_arguments(
+        r#"{"script_body":"cargo build; Write-Output done"}"#,
+    ).unwrap();
+    assert_eq!(decoded.yield_time_ms, default_exec_yield_time_ms());
+    assert_eq!(decoded.stall_timeout_ms, Some(crate::exec::DEFAULT_COMMAND_STALL_TIMEOUT_MS));
+}
+
+#[tokio::test]
+async fn exec_command_analysis_uses_validation_wait_unless_explicitly_overridden() {
     for (command, expected) in [
         ("rg --files", 2_000),
         ("cargo nextest run -p codex-core", 30_000),
@@ -179,8 +271,7 @@ fn exec_command_boundary_uses_validation_wait_unless_explicitly_overridden() {
         ("just core-gate tool-output-recovery", 2_000),
         ("uv run pytest -q", 30_000),
     ] {
-        let decoded: ExecCommandArgs =
-            parse_arguments(&serde_json::json!({"cmd": command}).to_string()).unwrap();
+        let decoded = decoded_with_observation_policy(serde_json::json!({"cmd": command})).await;
         assert_eq!(decoded.yield_time_ms, expected, "{command}");
         let explicit: ExecCommandArgs =
             parse_arguments(&serde_json::json!({"cmd": command, "yield_time_ms": 500}).to_string())
@@ -189,8 +280,8 @@ fn exec_command_boundary_uses_validation_wait_unless_explicitly_overridden() {
     }
 }
 
-#[test]
-fn nested_exec_observation_window_preserves_explicit_and_interactive_handoffs() {
+#[tokio::test]
+async fn nested_exec_observation_window_preserves_explicit_and_interactive_handoffs() {
     for command in ["just ci", "make verify", "npm run e2e"] {
         for (extra, wait, stall) in [
             (serde_json::json!({}), 30_000, None),
@@ -215,7 +306,7 @@ fn nested_exec_observation_window_preserves_explicit_and_interactive_handoffs() 
     ] {
         for tty in [false, true] {
             let mut arguments = serde_json::json!({"cmd": command, "tty": tty});
-            let decoded: ExecCommandArgs = parse_arguments(&arguments.to_string()).unwrap();
+            let decoded = decoded_with_observation_policy(arguments.clone()).await;
             assert_eq!(decoded.observation_yield_time_ms(false), direct_default);
             assert_eq!(
                 decoded.observation_yield_time_ms(true),
@@ -256,8 +347,8 @@ fn exec_command_boundary_reports_ignored_deadlines_and_fields() {
     }
 }
 
-#[test]
-fn stall_timeout_exec_command_defaults_and_overrides() {
+#[tokio::test]
+async fn stall_timeout_exec_command_defaults_and_overrides() {
     for (requested, expected) in [
         (None, Some(60_000)),
         (Some(0), None),
@@ -285,8 +376,7 @@ fn stall_timeout_exec_command_defaults_and_overrides() {
         "python -m pytest library | ForEach-Object { $_ | ConvertFrom-Json }; exit $LASTEXITCODE",
         "cargo test -p codex-core | ForEach-Object { $_ }",
     ] {
-        let decoded: ExecCommandArgs =
-            parse_arguments(&serde_json::json!({"cmd": command}).to_string()).unwrap();
+        let decoded = decoded_with_observation_policy(serde_json::json!({"cmd": command})).await;
         assert_eq!(decoded.stall_timeout_ms, None, "{command}");
         let decoded: ExecCommandArgs = parse_arguments(
             &serde_json::json!({"cmd": command, "stall_timeout_ms": 123}).to_string(),
@@ -302,14 +392,14 @@ fn stall_timeout_exec_command_defaults_and_overrides() {
     assert_eq!(decoded.stall_timeout_ms, Some(60_000));
 }
 
-#[test]
-fn publishing_exec_command_preserves_explicit_observation_and_stall_overrides() {
+#[tokio::test]
+async fn publishing_exec_command_preserves_explicit_observation_and_stall_overrides() {
     for command in [
         serde_json::json!({"cmd": "just publish-local-codex-final"}),
         serde_json::json!({"script_body": "cd repo; just publish-local-codex-final -Verbose"}),
         serde_json::json!({"program": "just.exe", "args": ["--justfile", "justfile", "publish-local-codex-final"]}),
     ] {
-        let decoded: ExecCommandArgs = parse_arguments(&command.to_string()).unwrap();
+        let decoded = decoded_with_observation_policy(command.clone()).await;
         assert_eq!(decoded.stall_timeout_ms, None);
         assert_eq!(
             decoded.yield_time_ms,
@@ -2462,6 +2552,7 @@ async fn native_rg_advisories_respect_restricted_read_policy() {
             let mut output = ExecCommandToolOutput {
                 output_ranges: None,
                 process_output: Some(Arc::new(crate::unified_exec::ProcessOutputSnapshot {
+                    process_duration: None,
                     aggregated_output: raw_output.clone(),
                     stdout: raw_output.clone(),
                     stderr: Vec::new(),

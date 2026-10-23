@@ -38,7 +38,7 @@ use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::TokenUsage;
 use codex_protocol::protocol::TurnStartedEvent;
 use codex_protocol::protocol::WarningEvent;
-use codex_rollout_trace::CompactionCheckpointTracePayload;
+#[cfg(test)]
 use codex_rollout_trace::CompactionTraceContext;
 use codex_rollout_trace::InferenceTraceContext;
 use futures::StreamExt;
@@ -48,6 +48,10 @@ use tokio_util::sync::CancellationToken;
 mod attempt;
 use attempt::RemoteCompactV2Attempt;
 use attempt::run_remote_compact_v2_attempt;
+
+#[path = "compact_remote_v2_trace.rs"]
+mod trace;
+use trace::AsyncCompactionTraceContext;
 
 // Compact attempts can run much longer than normal turns, so keep the per-transport
 // retry budget smaller than the general Responses stream retry budget.
@@ -130,14 +134,71 @@ pub(crate) async fn run_remote_compact_task(
         CompactionPhase::StandaloneTurn,
     );
     let world_state = Arc::new(sess.build_world_state_for_step(step_context.as_ref()).await);
-    run_remote_compact_task_inner(
+    let initial_context_injection = InitialContextInjection::AtStart(world_state);
+    let result = run_remote_compact_task_inner(
         &sess,
         &step_context,
         /*fallback_step_context*/ None,
         /*client_session*/ None,
-        InitialContextInjection::AtStart(world_state),
+        initial_context_injection.clone(),
         compaction_metadata,
-        /*emit_error_event*/ true,
+        // A recoverable rejection must not mark a continuing manual turn failed.
+        /*emit_error_event*/
+        false,
+        cancellation_token,
+    )
+    .await;
+    let error = match result {
+        Ok(()) => return Ok(()),
+        Err(error @ CodexErr::TurnAborted) => return Err(error),
+        Err(error) => error,
+    };
+    if !crate::compact_model_fallback::should_retry_with_local_compaction(&error) {
+        sess.send_event(
+            &turn_context,
+            EventMsg::Error(
+                error.to_error_event(Some("Error running remote compact task".to_string())),
+            ),
+        )
+        .await;
+        return Err(error);
+    }
+    if let Some(advice) = error.retry_after() {
+        let _retry_timing_guard = turn_context.turn_timing_state.begin_retry_backoff();
+        crate::responses_retry::wait_for_retry_deadline(advice.deadline(), cancellation_token)
+            .await?;
+    }
+    if cancellation_token.is_cancelled() {
+        return Err(CodexErr::TurnAborted);
+    }
+    sess.send_event(
+        &turn_context,
+        EventMsg::Warning(WarningEvent {
+            message: format!("Remote compaction failed: {error}. Compacting locally instead."),
+        }),
+    )
+    .await;
+    crate::tasks::emit_compact_metric(
+        &sess.services.session_telemetry,
+        "local",
+        /*manual*/ true,
+    );
+    let input = vec![codex_protocol::user_input::UserInput::Text {
+        text: turn_context
+            .config
+            .compact_prompt
+            .as_deref()
+            .unwrap_or(crate::compact::SUMMARIZATION_PROMPT)
+            .to_string(),
+        text_elements: Vec::new(),
+    }];
+    // The existing local compactor owns source recovery and atomic publication.
+    // Try it once; storage, credentials and cancellation never enter this route.
+    crate::compact::run_compact_task_with_initial_context(
+        sess,
+        turn_context,
+        input,
+        initial_context_injection,
         cancellation_token,
     )
     .await
@@ -186,9 +247,8 @@ async fn run_remote_compact_task_inner(
             .await;
         return Err(error);
     }
-    let context_compaction_item = ContextCompactionItem::new();
-    let compaction_id = context_compaction_item.id.clone();
-    let compaction_item = TurnItem::ContextCompaction(context_compaction_item);
+    let mut context_compaction_item = ContextCompactionItem::new();
+    let compaction_item = TurnItem::ContextCompaction(context_compaction_item.clone());
     sess.emit_turn_item_started(turn_context, &compaction_item)
         .await;
     let result = run_remote_compact_task_inner_impl(
@@ -199,12 +259,16 @@ async fn run_remote_compact_task_inner(
         initial_context_injection,
         compaction_metadata,
         &mut analytics_details,
-        &compaction_id,
+        &mut context_compaction_item,
         cancellation_token,
     )
     .await;
-    sess.emit_turn_item_completed(turn_context, compaction_item)
-        .await;
+    sess.emit_turn_item_completed_with_legacy_events(
+        turn_context,
+        TurnItem::ContextCompaction(context_compaction_item),
+        result.is_ok(),
+    )
+    .await;
     let status = compaction_status_from_result(&result);
     let codex_error = result.as_ref().err();
     if result.is_ok() && run_post_compact_hook_gate(sess, turn_context, trigger, None).await {
@@ -241,17 +305,22 @@ async fn run_remote_compact_task_inner_impl(
     initial_context_injection: InitialContextInjection,
     compaction_metadata: CompactionTurnMetadata,
     analytics_details: &mut CompactionAnalyticsDetails,
-    compaction_id: &str,
+    compaction_item: &mut ContextCompactionItem,
     cancellation_token: &CancellationToken,
 ) -> CodexResult<()> {
     let turn_context = &step_context.turn;
-    let compaction_trace = sess.services.rollout_thread_trace.compaction_trace_context(
-        turn_context.sub_id.as_str(),
-        compaction_id,
-        turn_context.model_info.slug.as_str(),
-        turn_context.provider.info().name.as_str(),
+    let compaction_trace = AsyncCompactionTraceContext::new(
+        &sess.terminal_tasks,
+        sess.services.rollout_thread_trace.compaction_trace_context(
+            turn_context.sub_id.as_str(),
+            &compaction_item.id,
+            turn_context.model_info.slug.as_str(),
+            turn_context.provider.info().name.as_str(),
+        ),
     );
 
+    // Each attempt discounts its own trimming from this pre-compaction baseline.
+    let active_context_tokens_before = analytics_details.active_context_tokens_before;
     let attempt = run_remote_compact_v2_attempt(
         sess,
         step_context,
@@ -280,13 +349,15 @@ async fn run_remote_compact_task_inner_impl(
                 .await?;
             }
             let fallback_turn_context = &fallback_step_context.turn;
-            let fallback_compaction_trace =
+            let fallback_compaction_trace = compaction_trace.with_context(
                 sess.services.rollout_thread_trace.compaction_trace_context(
                     fallback_turn_context.sub_id.as_str(),
-                    compaction_id,
+                    &compaction_item.id,
                     fallback_turn_context.model_info.slug.as_str(),
                     fallback_turn_context.provider.info().name.as_str(),
-                );
+                ),
+            );
+            analytics_details.active_context_tokens_before = active_context_tokens_before;
             let fallback_result = run_remote_compact_v2_attempt(
                 sess,
                 fallback_step_context,
@@ -319,25 +390,27 @@ async fn run_remote_compact_task_inner_impl(
     };
     let RemoteCompactV2Attempt {
         trace_input_history,
-        retention_input,
+        retained_input,
         compaction_output,
         token_usage,
         owned_client_session: _owned_client_session,
+        ..
     } = attempt;
     if let Some(token_usage) = token_usage.as_ref() {
-        analytics_details.active_context_tokens_before = Some(token_usage.input_tokens);
-        analytics_details.compaction_summary_tokens = Some(token_usage.output_tokens);
-        analytics_details.cached_input_tokens = Some(token_usage.cached_input_tokens);
+        analytics_details.record_compaction_receipt(token_usage);
     }
-    let (retained_input, retained_images) =
-        prepare_v2_retained_input(sess, &retention_input).await?;
+    let retained_images = retained_input.retained_images;
+    let omitted_images = retained_input.omitted_images;
+    let omitted_text = retained_input.omitted_text;
+    // The common installer refreshes a plan fallback only when its actual
+    // rendered initial context lacks authoritative task state.
     analytics_details.retained_image_count = Some(retained_images);
     let (new_history, world_state_baseline, fragment_digests) =
         process_compacted_history_with_retained_input(
             sess.as_ref(),
             compaction_turn_context.as_ref(),
             vec![compaction_output],
-            retained_input,
+            retained_input.items,
             &initial_context_injection,
         )
         .await?;
@@ -363,17 +436,9 @@ async fn run_remote_compact_task_inner_impl(
     if let (Some(trace_input_history), Some(replacement_history)) =
         (trace_input_history, trace_replacement_history)
     {
-        let compaction_trace = compaction_trace.clone();
-        let _ = crate::tools::tool_dispatch_trace::run_trace_recording(
-            &sess.terminal_tasks,
-            move || {
-                compaction_trace.record_installed(&CompactionCheckpointTracePayload {
-                    input_history: &trace_input_history,
-                    replacement_history: &replacement_history,
-                });
-            },
-        )
-        .await;
+        compaction_trace
+            .record_installed(trace_input_history, replacement_history)
+            .await;
     }
     if let Some(client_session) = client_session {
         // Refreshed instructions and local recovery/pin metadata were not part of
@@ -382,6 +447,12 @@ async fn run_remote_compact_task_inner_impl(
         client_session.invalidate_provider_history_inheritance("installed remote checkpoint");
     }
     sess.recompute_token_usage(compaction_turn_context).await;
+
+    compaction_item.tokens_before = analytics_details.active_context_tokens_before;
+    compaction_item.tokens_after = Some(sess.get_total_token_usage().await);
+    compaction_item.retained_image_count = Some(retained_images);
+    compaction_item.omitted_image_count = Some(omitted_images);
+    compaction_item.omitted_text = Some(omitted_text);
 
     Ok(())
 }
@@ -399,28 +470,13 @@ struct RemoteCompactionV2TraceRequest<'a> {
     parallel_tool_calls: bool,
 }
 
-/// Only this non-cloneable owner closes an abandoned trace. Enrichment clones
-/// share the terminal flag but dropping them cannot cancel the live request.
-struct RemoteCompactionTraceOwner(Option<codex_rollout_trace::CompactionTraceAttempt>);
-
-impl Drop for RemoteCompactionTraceOwner {
-    fn drop(&mut self) {
-        if let Some(attempt) = self.0.take().filter(|attempt| !attempt.is_terminal())
-            && let Ok(runtime) = tokio::runtime::Handle::try_current()
-        {
-            let attempt = attempt.at_occurrence(codex_rollout_trace::TraceOccurrence::now());
-            runtime.spawn_blocking(move || attempt.record_cancelled("compaction owner dropped"));
-        }
-    }
-}
-
 async fn run_remote_compaction_request_v2(
     sess: &Session,
     turn_context: &TurnContext,
     client_session: &mut ModelClientSession,
     prompt: &Prompt,
     responses_metadata: &CodexResponsesMetadata,
-    compaction_trace: &CompactionTraceContext,
+    compaction_trace: &AsyncCompactionTraceContext,
     cancellation_token: &CancellationToken,
 ) -> CodexResult<RemoteCompactionV2Output> {
     client_session.set_turn_timing(Arc::clone(&turn_context.turn_timing_state));
@@ -431,36 +487,23 @@ async fn run_remote_compaction_request_v2(
         .stream_max_retries()
         .min(MAX_REMOTE_COMPACTION_V2_STREAM_RETRIES);
     let mut retry_state = ResponsesStreamRetryState::default();
-    let mut progress_timeouts = 0_u32;
     turn_context.turn_timing_state.begin_compaction_generation();
     loop {
         let attempt_started = tokio::time::Instant::now();
-        let trace_attempt = if compaction_trace.is_enabled() {
-            let occurrence = codex_rollout_trace::TraceOccurrence::now();
-            let compaction_trace = compaction_trace.clone();
-            let model = turn_context.model_info.slug.clone();
-            let instructions = prompt.base_instructions.text.clone();
-            let input = Arc::clone(&prompt.input);
-            let parallel_tool_calls = prompt.parallel_tool_calls;
-            crate::tools::tool_dispatch_trace::run_trace_recording(
-                &sess.terminal_tasks,
-                move || {
-                    compaction_trace.start_attempt_at(
-                        &RemoteCompactionV2TraceRequest {
-                            model: &model,
-                            instructions: &instructions,
-                            input: &input,
-                            parallel_tool_calls,
-                        },
-                        occurrence,
-                    )
-                },
-            )
-            .await
+        let trace_owner = if compaction_trace.is_enabled() {
+            tokio::select! {
+                biased;
+                _ = cancellation_token.cancelled() => return Err(CodexErr::TurnAborted),
+                owner = compaction_trace.start_attempt(
+                    turn_context.model_info.slug.clone(),
+                    prompt.base_instructions.text.clone(),
+                    Arc::clone(&prompt.input),
+                    prompt.parallel_tool_calls,
+                ) => owner,
+            }
         } else {
             None
         };
-        let mut trace_owner = RemoteCompactionTraceOwner(trace_attempt);
         let model_request_timing_guard = turn_context.turn_timing_state.begin_model_request_wait();
         let inference_trace_context = InferenceTraceContext::disabled();
         let service_tier =
@@ -472,7 +515,7 @@ async fn run_remote_compaction_request_v2(
                 &turn_context.model_info,
                 &turn_context.session_telemetry,
                 turn_context.request_reasoning_effort(),
-                turn_context.reasoning_summary,
+                codex_protocol::config_types::ReasoningSummary::None,
                 service_tier,
                 responses_metadata,
                 &inference_trace_context,
@@ -496,45 +539,27 @@ async fn run_remote_compaction_request_v2(
         // Transfer terminal ownership before optional persistence. A forced
         // drop while the terminal write is queued must not race it with a
         // fabricated physical cancellation.
-        if let Some(trace_attempt) = trace_owner.0.take() {
-            let trace_attempt =
-                trace_attempt.at_occurrence(codex_rollout_trace::TraceOccurrence::now());
+        if let Some(trace_owner) = trace_owner {
             let cancelled = matches!(&result, Err(CodexErr::TurnAborted));
             let trace_result = result
                 .as_ref()
                 .map(|output| vec![output.compaction_output.clone()])
                 .map_err(ToString::to_string);
-            crate::tools::tool_dispatch_trace::run_trace_recording(
-                &sess.terminal_tasks,
-                move || {
-                    if cancelled {
-                        trace_attempt.record_cancelled("compaction cancelled");
-                    } else {
-                        trace_attempt.record_result_with_receipt(
-                            trace_result.as_deref(),
-                            terminal_receipt.as_ref(),
-                        );
-                    }
-                },
-            )
-            .await;
+            trace_owner.record_result(trace_result, terminal_receipt, cancelled);
         }
 
         match result {
             Ok(compaction_output) => return Ok(compaction_output),
             Err(err) if !err.is_retryable() => return Err(err),
             Err(err) => {
-                // An attempt that used the whole progress budget produced nothing.
-                // The identical request usually fails the same way again, and transport
-                // fallback would otherwise allow up to six such attempts; allow one.
+                // Do not restart a fully consumed progress budget. The caller
+                // owns exact-output retirement/local compaction recovery; short
+                // transient failures still use the transport retry policy below.
                 if prompt
                     .stream_progress_timeout
                     .is_some_and(|timeout| attempt_started.elapsed() >= timeout)
                 {
-                    progress_timeouts += 1;
-                    if progress_timeouts > 1 {
-                        return Err(err);
-                    }
+                    return Err(err);
                 }
                 handle_retryable_response_stream_error(
                     &mut retry_state,
@@ -673,6 +698,11 @@ async fn collect_compaction_output_with_receipt(
                 completed_token_usage = token_usage;
                 break;
             }
+            ResponseEvent::RateLimits(snapshot) => {
+                if let Some((sess, turn)) = accounting_context {
+                    sess.update_rate_limits(turn, snapshot).await;
+                }
+            }
             _ => {}
         }
     }
@@ -706,29 +736,49 @@ async fn collect_compaction_output_with_receipt(
     })
 }
 
+#[cfg(test)]
+tokio::task_local! {
+    static RETENTION_PREPARATIONS: std::cell::Cell<usize>;
+}
+
+async fn prepare_v2_retained_input_source(
+    sess: &Session,
+    prompt_input: &[ResponseItem],
+) -> CodexResult<crate::compact::TaskInputCheckpoint> {
+    #[cfg(test)]
+    let _ = RETENTION_PREPARATIONS.try_with(|count| count.set(count.get() + 1));
+    let mut retained = crate::compact::build_task_input_checkpoint_with_details(prompt_input);
+    let omission_receipt_ids =
+        crate::compact::new_omission_receipt_ids(&retained.items, prompt_input);
+    if let Some(text) = crate::compact::persist_task_compaction_text_recovery(
+        sess,
+        prompt_input,
+        retained.needs_source_recovery(),
+    )
+    .await?
+    {
+        crate::compact::bind_omission_receipts_to_recovery(
+            &mut retained.items,
+            &text,
+            &omission_receipt_ids,
+        );
+        retained
+            .items
+            .push(crate::compact::compaction_context_message(text));
+    }
+    Ok(retained)
+}
+
+#[cfg(test)]
 async fn prepare_v2_retained_input(
     sess: &Session,
     prompt_input: &[ResponseItem],
 ) -> CodexResult<(Vec<ResponseItem>, usize)> {
-    let (mut retained_input, retained_images, omitted_text) =
-        crate::compact::build_task_input_checkpoint(prompt_input);
-    let omission_receipt_ids =
-        crate::compact::new_omission_receipt_ids(&retained_input, prompt_input);
-    if let Some(text) =
-        crate::compact::persist_task_compaction_text_recovery(sess, prompt_input, omitted_text)
-            .await?
-    {
-        crate::compact::bind_omission_receipts_to_recovery(
-            &mut retained_input,
-            &text,
-            &omission_receipt_ids,
-        );
-        retained_input.push(crate::compact::compaction_context_message(text));
-    }
+    let mut retained = prepare_v2_retained_input_source(sess, prompt_input).await?;
     if let Some(plan) = crate::compact::retained_plan_context(sess).await? {
-        retained_input.push(plan);
+        retained.items.push(plan);
     }
-    Ok((retained_input, retained_images))
+    Ok((retained.items, retained.retained_images))
 }
 
 #[cfg(test)]
@@ -902,7 +952,7 @@ mod tests {
                 &mut client,
                 &Prompt::default(),
                 &metadata,
-                &CompactionTraceContext::disabled(),
+                &AsyncCompactionTraceContext::disabled(),
                 &CancellationToken::new(),
             )
             .await?;
@@ -988,7 +1038,7 @@ mod tests {
             &mut client,
             &Prompt::default(),
             &metadata,
-            &CompactionTraceContext::disabled(),
+            &AsyncCompactionTraceContext::disabled(),
             &CancellationToken::new(),
         )
         .await;
@@ -1021,7 +1071,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn remote_compaction_reattempts_a_progress_timeout_once() -> anyhow::Result<()> {
+    async fn remote_compaction_returns_first_exhausted_progress_budget_to_recovery() -> anyhow::Result<()> {
         use crate::test_harness::streaming_sse::StreamingSseChunk;
         use crate::test_harness::streaming_sse::start_streaming_sse_server;
 
@@ -1073,7 +1123,7 @@ mod tests {
             &mut client,
             &prompt,
             &metadata,
-            &CompactionTraceContext::disabled(),
+            &AsyncCompactionTraceContext::disabled(),
             &CancellationToken::new(),
         )
         .await;
@@ -1087,8 +1137,9 @@ mod tests {
                 .contains("idle timeout waiting for SSE after 200ms"),
             "{error}"
         );
-        // The stream retry budget alone would allow three requests.
-        assert_eq!(server.requests().await.len(), 2);
+        // A fresh long timeout is not a transport retry. Preserve the first
+        // error for the caller's existing retirement/local fallback.
+        assert_eq!(server.requests().await.len(), 1);
         drop(gates);
         server.shutdown().await;
         Ok(())
@@ -1213,6 +1264,8 @@ mod tests {
             turn_context.model_info.slug.clone(),
             turn_context.provider.info().name.clone(),
         );
+        let compaction_trace =
+            AsyncCompactionTraceContext::new(&session.terminal_tasks, compaction_trace);
 
         let prompt = Prompt {
             input: vec![
@@ -1288,22 +1341,24 @@ mod tests {
             &cancellation,
         ));
         assert!(futures::poll!(request.as_mut()).is_pending());
-        // A single-thread async runtime must continue while the real writer is
-        // busy, and the upstream request must wait for its trace start record.
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        // Optional tracing must not hold dispatch or the model result behind
+        // storage. Persistence remains ordered and owned by the session drain.
+        let output = tokio::time::timeout(Duration::from_secs(1), request.as_mut())
+            .await
+            .expect("compaction must finish while optional trace storage is blocked")?;
         assert!(
             !timed_out.load(std::sync::atomic::Ordering::SeqCst),
             "trace lock contention must not block the async runtime thread"
         );
-        assert!(
-            request_log.requests().is_empty(),
-            "upstream requests must follow the persisted trace start"
-        );
+        assert_eq!(request_log.requests().len(), 2);
         release_tx
             .send(())
             .expect("release writer after independent async progress");
         holding_writer.join().expect("trace writer thread joins")?;
-        let output = request.await?;
+        drop(request);
+        drop(compaction_trace);
+        session.terminal_tasks.close();
+        session.terminal_tasks.wait().await;
         assert!(
             matches!(output.compaction_output, ResponseItem::Compaction { encrypted_content, .. }
             if encrypted_content == "encrypted replacement context")
@@ -2040,6 +2095,60 @@ mod tests {
                 if message.contains(&format!("got {count} from {count} output items"))));
         }
     }
+
+    #[tokio::test]
+    async fn audit146x_rejected_remote_checkpoints_allow_model_and_format_fallback() {
+        use crate::compact_model_fallback::is_compaction_contract_violation;
+        use crate::compact_model_fallback::should_retry_with_current_model;
+        use crate::compact_model_fallback::should_retry_with_local_compaction;
+        let checkpoint = |content: &str| -> CodexResult<ResponseEvent> {
+            Ok(ResponseEvent::OutputItemDone(ResponseItem::Compaction {
+                id: None,
+                encrypted_content: content.to_string(),
+                internal_chat_message_metadata_passthrough: None,
+            }))
+        };
+        let completed = || -> CodexResult<ResponseEvent> {
+            Ok(ResponseEvent::Completed {
+                response_id: "rejected".into(),
+                token_usage: None,
+                end_turn: Some(true),
+            })
+        };
+        for events in [
+            vec![completed()],
+            vec![checkpoint("first"), checkpoint("second"), completed()],
+            vec![checkpoint(""), completed()],
+        ] {
+            let Err(error) = collect_compaction_output(
+                response_stream(events),
+                None,
+                None,
+                &CancellationToken::new(),
+            )
+            .await
+            else {
+                panic!("rejected checkpoint output must fail");
+            };
+            assert!(is_compaction_contract_violation(&error), "{error}");
+            assert!(should_retry_with_current_model(&error), "{error}");
+            assert!(should_retry_with_local_compaction(&error), "{error}");
+        }
+        // Negative control: a stream that closes before completion keeps its
+        // transport classification instead of becoming a rejected checkpoint.
+        let Err(error) = collect_compaction_output(
+            response_stream(vec![checkpoint("opaque")]),
+            None,
+            None,
+            &CancellationToken::new(),
+        )
+        .await
+        else {
+            panic!("an incomplete stream must fail");
+        };
+        assert!(matches!(error, CodexErr::Stream(..)), "{error}");
+        assert!(!is_compaction_contract_violation(&error));
+    }
 }
 #[cfg(test)]
 mod ctxaudit_usage_tests {
@@ -2112,3 +2221,11 @@ mod ctxaudit_usage_tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "compact_remote_v2_audit146_tests.rs"]
+mod audit146_tests;
+
+#[cfg(test)]
+#[path = "compact_remote_v2_manual_tests.rs"]
+mod manual_tests;

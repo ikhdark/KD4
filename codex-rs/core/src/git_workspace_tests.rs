@@ -21,6 +21,43 @@ use crate::environment_selection::TurnEnvironmentSnapshot;
 use crate::session::turn_context::TurnEnvironment;
 use crate::shell_snapshot::ShellSnapshot;
 
+#[test]
+fn audit151_metadata_work_is_shared_only_while_active_and_separates_revisions() {
+    tokio::runtime::Builder::new_current_thread().enable_all().max_blocking_threads(1).build().unwrap().block_on(async {
+    let (_temp, repo) = create_clean_git_repo().await;
+    let root = repo.as_path();
+    std::fs::write(root.join("dirty.txt"), vec![b'a'; 1024 * 1024]).unwrap();
+    let (status, _) = workspace_generation_status(root).await.unwrap();
+    let config = workspace_generation_git_output(root, &["config", "--null", "--list", "--show-origin"]).await.unwrap();
+    let paths = || vec![WorkspaceGenerationPath { path: "dirty.txt".into(), deleted: false }];
+    let (release, blocked) = std::sync::mpsc::channel();
+    let blocker = tokio::task::spawn_blocking(move || blocked.recv().unwrap());
+    let mut first = Box::pin(shared_workspace_metadata(root.to_path_buf(), paths(), &status, &config));
+    let mut second = Box::pin(shared_workspace_metadata(root.to_path_buf(), paths(), &status, &config));
+    assert!(futures::poll!(first.as_mut()).is_pending());
+    assert!(futures::poll!(second.as_mut()).is_pending());
+    release.send(()).unwrap();
+    blocker.await.unwrap();
+    let (first, second) = tokio::join!(first, second);
+    let first = first.unwrap();
+    let second = second.unwrap();
+    assert!(Arc::ptr_eq(&first, &second), "one producer owns the shared hash pass");
+    std::fs::write(root.join("dirty.txt"), vec![b'b'; 1024 * 1024]).unwrap();
+    let changed = shared_workspace_metadata(root.to_path_buf(), paths(), &status, &config).await.unwrap();
+    assert_ne!(first.manifest, changed.manifest, "completed captures are never cached by the shared service");
+    let (release, blocked) = std::sync::mpsc::channel();
+    let blocker = tokio::task::spawn_blocking(move || blocked.recv().unwrap());
+    let mut cancelled = Box::pin(shared_workspace_metadata(root.to_path_buf(), paths(), &status, &config));
+    let mut survivor = Box::pin(shared_workspace_metadata(root.to_path_buf(), paths(), &status, &config));
+    assert!(futures::poll!(cancelled.as_mut()).is_pending());
+    assert!(futures::poll!(survivor.as_mut()).is_pending());
+    drop(cancelled);
+    release.send(()).unwrap();
+    blocker.await.unwrap();
+    assert!(survivor.await.is_some(), "one cancelled owner cannot cancel another's capture");
+    });
+}
+
 #[tokio::test]
 async fn verified_capture_path_deltas_preserve_unrelated_dirty_files() {
     let (_temp, repo) = create_clean_git_repo().await;
@@ -178,6 +215,30 @@ async fn batched_ignore_classification_preserves_tracked_descendants_and_start_c
             .is_empty()
     );
     assert_eq!(recorder.snapshot().auxiliary_root_starts_observed, 2);
+}
+
+#[tokio::test]
+async fn batched_ignore_classification_stops_after_a_failed_git_query() {
+    use codex_utils_pty::process_observation::ProcessObservationContext;
+    use codex_utils_pty::process_observation::ProcessStartRecorder;
+    let (_temp, repo) = create_clean_git_repo().await;
+    // Force several argument batches without relying on a slow subprocess.
+    let paths = (0..280)
+        .map(|index| {
+            repo.join(format!("ignored-{index:04}-{}", "x".repeat(64)))
+                .to_path_buf()
+        })
+        .collect::<Vec<_>>();
+    std::fs::write(repo.join(".git/index"), b"invalid index").unwrap();
+    let recorder = Arc::new(ProcessStartRecorder::default());
+    let excluded =
+        ProcessObservationContext::new(Arc::clone(&recorder), "failed-ignore".into())
+            .scope(git_ignored_paths(repo.as_path(), &paths))
+            .await;
+    assert!(excluded.is_empty());
+    // Unknown paths must remain changed, and one failure must not be retried
+    // once per remaining batch while the watcher holds its write gate.
+    assert_eq!(recorder.snapshot().auxiliary_root_starts_observed, 1);
 }
 
 #[tokio::test]
@@ -2919,6 +2980,7 @@ async fn remote_workspace_evidence_tracks_content_deletions_and_capture_failures
         let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
         let mut pending_read = None;
         let mut released_reads = false;
+        let mut started_paths = BTreeSet::new();
         while let Some(frame) = socket.next().await {
             let frame = frame.unwrap();
             if frame.is_close() {
@@ -2943,11 +3005,19 @@ async fn remote_workspace_evidence_tracks_content_deletions_and_capture_failures
                         socket.send(Message::Text(json!({"id": request["id"], "error": {"code": if current == 3 { -32000 } else { -32004 }, "message": "fixture metadata failure"}}).to_string().into())).await.unwrap();
                         continue;
                     }
-                    let file = path.ends_with("/tracked.txt") || path.ends_with("/extra.txt");
+                    let file = path.ends_with(".txt");
                     // Gate only the first per-file metadata request. Another
                     // file chain must be able to start before it is released.
                     if current == 0 && file && !released_reads {
-                        if let Some(id) = pending_read.take() {
+                        let first_observation = started_paths.insert(path.to_string());
+                        if pending_read.is_none() {
+                            pending_read = Some(request["id"].clone());
+                            continue;
+                        }
+                        // Eight ordered results stall here forever: only an
+                        // unordered refill admits this ninth independent path.
+                        if first_observation && started_paths.len() == 9 {
+                            let id = pending_read.take().unwrap();
                             server_overlapped_reads.store(true, Ordering::SeqCst);
                             socket
                                 .send(Message::Text(
@@ -2961,9 +3031,6 @@ async fn remote_workspace_evidence_tracks_content_deletions_and_capture_failures
                                 .await
                                 .unwrap();
                             released_reads = true;
-                        } else {
-                            pending_read = Some(request["id"].clone());
-                            continue;
                         }
                     }
                     json!({"isDirectory": !file, "isFile": file, "isSymlink": false, "size": if file { 3 } else { 0 }, "createdAtMs": 0, "modifiedAtMs": 0})
@@ -2981,7 +3048,10 @@ async fn remote_workspace_evidence_tracks_content_deletions_and_capture_failures
                     } else {
                         "# branch.oid abc123\0# branch.head main\0? tracked.txt\0"
                     };
-                    let status = format!("{status}? extra.txt\0");
+                    let extra = (0..8)
+                        .map(|i| format!("? extra{i}.txt\0"))
+                        .collect::<String>();
+                    let status = format!("{status}{extra}");
                     let chunks = if request["params"]["afterSeq"].is_null() {
                         json!([{"seq": 1, "stream": "stdout", "chunk": base64::engine::general_purpose::STANDARD.encode(&status)}])
                     } else {
@@ -3026,15 +3096,18 @@ async fn remote_workspace_evidence_tracks_content_deletions_and_capture_failures
     // A valid host directory must not supply the identity for this remote root.
     let host = TempDir::new().unwrap();
     let cache = GitWorkspaceCache::with_noop_watcher_for_tests();
-    let first = cache
-        .workspace_evidence_for_environment(&selected, host.path(), host.path())
-        .await
-        .identity
-        .unwrap();
+    let first = tokio::time::timeout(
+        Duration::from_secs(5),
+        cache.workspace_evidence_for_environment(&selected, host.path(), host.path()),
+    )
+    .await
+    .expect("the ninth remote path must start before the blocked first path finishes")
+    .identity
+    .unwrap();
     assert!(!first.unavailable);
     assert!(
         overlapped_reads.load(Ordering::SeqCst),
-        "independent remote read chains must overlap"
+        "completed chains must admit the ninth path before the first chain finishes"
     );
     assert!(
         first

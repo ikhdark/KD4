@@ -37,6 +37,11 @@ use super::wait_spec::create_wait_tool;
 // Give it time to commit the terminal response and retained output afterward;
 // matching that inner deadline races cleanup and discards recoverable evidence.
 const INTERRUPTED_CELL_TERMINATION_GRACE: Duration = Duration::from_secs(5);
+// Bounds the detached termination observer for runtimes without their own
+// deadline. It must outlast the remote host's ten-second terminate deadline:
+// that request settles itself, and dropping it while the host still owes an
+// acknowledgment fails the shared host connection closed for every thread.
+const DETACHED_TERMINATION_OBSERVATION_LIMIT: Duration = Duration::from_secs(60);
 // Most cells preempted by already-queued mail finish well inside a second,
 // which is far less than the model request needed to wait for them again.
 const MAILBOX_PREEMPTION_GRACE: Duration = Duration::from_secs(1);
@@ -271,11 +276,18 @@ impl CodeModeWaitHandler {
                 }
                 // The response is already captured. Cancellation releases only
                 // this delivery gate, not the result or unrelated UI leases.
+                let dialog_wait_started = Instant::now();
                 tokio::select! {
                     biased;
                     _ = cancellation_token.cancelled() => {}
                     _ = exec.session.services.elicitations.wait_until_clear() => {}
                 }
+                tracing::info!(event.name = "codex.code_mode.dialog_delivery_gate",
+                    turn_id = %exec.turn.sub_id, runtime_cell_id = %cell_id,
+                    tool_call_id = %call_id,
+                    dialog_wait_ms = u64::try_from(dialog_wait_started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                    cancelled = cancellation_token.is_cancelled(),
+                    scope = "session_wide", "captured cell response finished dialog delivery gate");
                 if let codex_code_mode::WaitOutcome::LiveCell(response) = &wait_response {
                     let owner = exec
                         .session
@@ -337,17 +349,26 @@ pub(super) async fn terminate_interrupted_cell(
     exec: &ExecContext,
     cell_id: &codex_code_mode::CellId,
 ) -> Result<codex_code_mode::WaitOutcome, String> {
-    let termination = tokio::time::timeout(
-        INTERRUPTED_CELL_TERMINATION_GRACE,
-        exec.session
-            .services
-            .code_mode_service
-            .terminate(cell_id.clone()),
-    )
-    .await;
-    match termination {
-        Ok(Ok(response)) => Ok(response),
-        Ok(Err(error)) => {
+    // The grace bounds only how long this caller observes termination. The
+    // request runs detached: dropping an accepted remote terminate marks the
+    // shared host connection dead, so a termination finishing after the grace
+    // would otherwise replace the host and its stored values for every thread.
+    let session = Arc::clone(&exec.session);
+    let detached_cell_id = cell_id.clone();
+    let mut termination = tokio::spawn(async move {
+        tokio::time::timeout(
+            DETACHED_TERMINATION_OBSERVATION_LIMIT,
+            session
+                .services
+                .code_mode_service
+                .terminate(detached_cell_id),
+        )
+        .await
+        .unwrap_or_else(|_| Err("code-mode cell termination observation expired".to_string()))
+    });
+    match tokio::time::timeout(INTERRUPTED_CELL_TERMINATION_GRACE, &mut termination).await {
+        Ok(Ok(Ok(response))) => Ok(response),
+        Ok(Ok(Err(error))) => {
             warn!(
                 turn_id = %exec.turn.sub_id,
                 runtime_cell_id = %cell_id,
@@ -355,6 +376,17 @@ pub(super) async fn terminate_interrupted_cell(
                 "failed to terminate interrupted code mode cell"
             );
             Err(error)
+        }
+        Ok(Err(join_error)) => {
+            warn!(
+                turn_id = %exec.turn.sub_id,
+                runtime_cell_id = %cell_id,
+                error = %join_error,
+                "interrupted code mode cell termination task failed"
+            );
+            Err(format!(
+                "code-mode cell {cell_id} cancellation cleanup failed; effects and buffered output are unknown"
+            ))
         }
         Err(_) => {
             warn!(
@@ -456,14 +488,25 @@ where
             _ = tokio::time::sleep(MAILBOX_PREEMPTION_GRACE) => Ok(steered(activity)),
         };
     }
+    let observation = wait_once();
+    tokio::pin!(observation);
     tokio::select! {
         biased;
         _ = cancellation_token.cancelled() => Err(cancelled()),
         // A decision delivered in the same wakeup as new input wins; the input
         // stays queued for the next sampling request.
-        result = wait_once() => decided(result),
+        result = &mut observation => decided(result),
         activity = &mut input_activity => {
-            Ok(steered(activity))
+            if activity != InputQueueActivity::Mailbox {
+                return Ok(steered(activity));
+            }
+            tokio::select! {
+                biased;
+                _ = cancellation_token.cancelled() => Err(cancelled()),
+                result = &mut observation => decided(result),
+                _ = &mut steering_activity => Ok(steered(InputQueueActivity::Steer)),
+                _ = tokio::time::sleep(MAILBOX_PREEMPTION_GRACE) => Ok(steered(activity)),
+            }
         }
     }
 }
@@ -665,6 +708,110 @@ mod tests {
             cell_id: cell_id.clone(),
             content_items: Vec::new(),
         })
+    }
+
+    /// Acknowledges termination only after `delay`, recording that the
+    /// termination request was still observed when it completed.
+    struct DelayedTerminationSession {
+        delay: Duration,
+        completed: Arc<AtomicBool>,
+    }
+
+    impl codex_code_mode::CodeModeSession for DelayedTerminationSession {
+        fn execute<'a>(
+            &'a self,
+            _request: codex_code_mode::ExecuteRequest,
+        ) -> codex_code_mode::CodeModeSessionResultFuture<'a, codex_code_mode::StartedCell>
+        {
+            panic!("the test only terminates cells");
+        }
+
+        fn wait<'a>(
+            &'a self,
+            _request: codex_code_mode::WaitRequest,
+        ) -> codex_code_mode::CodeModeSessionResultFuture<'a, codex_code_mode::WaitOutcome>
+        {
+            panic!("the test only terminates cells");
+        }
+
+        fn terminate<'a>(
+            &'a self,
+            cell_id: codex_code_mode::CellId,
+        ) -> codex_code_mode::CodeModeSessionResultFuture<'a, codex_code_mode::WaitOutcome>
+        {
+            Box::pin(async move {
+                tokio::time::sleep(self.delay).await;
+                self.completed.store(true, Ordering::Release);
+                Ok(codex_code_mode::WaitOutcome::LiveCell(
+                    codex_code_mode::RuntimeResponse::Terminated {
+                        cell_id,
+                        content_items: Vec::new(),
+                    },
+                ))
+            })
+        }
+
+        fn shutdown<'a>(&'a self) -> codex_code_mode::CodeModeSessionResultFuture<'a, ()> {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    struct DelayedTerminationProvider(Arc<DelayedTerminationSession>);
+
+    impl codex_code_mode::CodeModeSessionProvider for DelayedTerminationProvider {
+        fn create_session<'a>(
+            &'a self,
+            _delegate: Arc<dyn codex_code_mode::CodeModeSessionDelegate>,
+        ) -> codex_code_mode::CodeModeSessionProviderFuture<'a> {
+            Box::pin(
+                async move { Ok(Arc::clone(&self.0) as Arc<dyn codex_code_mode::CodeModeSession>) },
+            )
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn interrupted_cell_termination_outlives_the_observation_grace() {
+        // A remote terminate dropped before the host acknowledges it kills the
+        // host shared by every thread, so stopping observation must not cancel it.
+        for (delay, acknowledged_within_grace) in [
+            (Duration::from_secs(1), true),
+            (INTERRUPTED_CELL_TERMINATION_GRACE + Duration::from_secs(3), false),
+        ] {
+            let completed = Arc::new(AtomicBool::new(false));
+            let runtime = Arc::new(DelayedTerminationSession {
+                delay,
+                completed: Arc::clone(&completed),
+            });
+            let (mut session, turn) = crate::session::tests::make_session_and_context().await;
+            session.services.code_mode_service =
+                super::super::CodeModeService::new(Arc::new(DelayedTerminationProvider(runtime)));
+            let exec = ExecContext {
+                session: Arc::new(session),
+                turn: Arc::new(turn),
+            };
+            let cell_id = codex_code_mode::CellId::new("interrupted-cell".to_string());
+
+            let result = terminate_interrupted_cell(&exec, &cell_id).await;
+
+            if acknowledged_within_grace {
+                assert!(matches!(
+                    result,
+                    Ok(codex_code_mode::WaitOutcome::LiveCell(
+                        codex_code_mode::RuntimeResponse::Terminated { .. }
+                    ))
+                ));
+                assert!(completed.load(Ordering::Acquire));
+            } else {
+                let error = result.expect_err("the caller stops observing at the grace");
+                assert!(error.contains("cancellation cleanup timed out"), "{error}");
+                assert!(!completed.load(Ordering::Acquire));
+                tokio::time::sleep(delay).await;
+                assert!(
+                    completed.load(Ordering::Acquire),
+                    "the termination request must stay observed after the caller returns"
+                );
+            }
+        }
     }
 
     #[tokio::test]
@@ -1543,5 +1690,50 @@ mod tests {
 
         assert_eq!(first.state_revision, same.state_revision);
         assert_ne!(first.state_revision, other.state_revision);
+    }
+}
+
+#[cfg(test)]
+mod audit143_tests {
+    use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn late_mail_uses_one_observer_and_grace_remains_cancellable() {
+        for mode in [0, 1, 2, 3] {
+            let cancellation = tokio_util::sync::CancellationToken::new();
+            let canceller = cancellation.clone();
+            let observations = std::cell::Cell::new(0);
+            let started = tokio::time::Instant::now();
+            let held = hold_until_state_change(
+                || {
+                    observations.set(observations.get() + 1);
+                    async {
+                        if mode != 0 {
+                            return std::future::pending().await;
+                        }
+                        tokio::time::sleep(Duration::from_millis(40)).await;
+                        Ok(codex_code_mode::WaitOutcome::LiveCell(codex_code_mode::RuntimeResponse::ExplicitYield {
+                            cell_id: codex_code_mode::CellId::new("audit143".into()), content_items: Vec::new(),
+                        }))
+                    }
+                },
+                &cancellation,
+                async { tokio::time::sleep(Duration::from_millis(10)).await; InputQueueActivity::Mailbox },
+                async {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    if mode == 2 { return; }
+                    if mode == 3 { canceller.cancel(); }
+                    std::future::pending::<()>().await;
+                },
+                "cancelled",
+            ).await;
+            assert_eq!(observations.get(), 1);
+            match mode {
+                0 => { assert!(matches!(held.unwrap().exit, OwnerHeldCodeModeExit::Runtime(_))); assert_eq!(started.elapsed(), Duration::from_millis(40)); }
+                1 => { assert!(matches!(held.unwrap().exit, OwnerHeldCodeModeExit::InputActivity(InputQueueActivity::Mailbox))); assert_eq!(started.elapsed(), Duration::from_millis(10) + MAILBOX_PREEMPTION_GRACE); }
+                2 => { assert!(matches!(held.unwrap().exit, OwnerHeldCodeModeExit::InputActivity(InputQueueActivity::Steer))); assert_eq!(started.elapsed(), Duration::from_millis(20)); }
+                _ => { assert!(held.is_err()); assert_eq!(started.elapsed(), Duration::from_millis(20)); }
+            }
+        }
     }
 }

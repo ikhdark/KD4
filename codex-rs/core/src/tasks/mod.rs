@@ -371,6 +371,10 @@ struct TerminalFinalization {
     turn_state: Arc<tokio::sync::Mutex<TurnState>>,
     coordinator: Arc<TurnTerminalCoordinator>,
     outcome: TurnTerminalOutcome,
+    /// Abort reason reported for `outcome`, resolved once when it claimed the
+    /// terminal. The tool cancellation cause, history marker, lifecycle
+    /// observers and terminal event all read it, so they cannot disagree.
+    abort_reason: Option<TurnAbortReason>,
     permit: Option<TurnTerminalPermit>,
     worker_failure_reported: bool,
     selected_terminal_event: Option<EventMsg>,
@@ -665,6 +669,7 @@ impl Session {
                         // Do not let a fast worker finish before its RunningTask and terminal
                         // coordinator are visible under the active-turn lock.
                         let _ = start_rx.await;
+                        ctx.turn_timing_state.mark_turn_worker_started();
                         session
                             .emit_turn_start_lifecycle(ctx.as_ref(), &lifecycle_token_usage)
                             .await;
@@ -1014,6 +1019,17 @@ impl Session {
             };
 
             let (task, turn_state, permit, coordinator) = scheduling;
+            // Shutdown cancels running turns through the interrupt path, and a
+            // worker can observe that cancellation before the shutdown abort
+            // claims the terminal. Report either as the shutdown it was.
+            let abort_reason = match outcome.abort_reason() {
+                Some(TurnAbortReason::Interrupted)
+                    if self.shutting_down.load(Ordering::Acquire) =>
+                {
+                    Some(TurnAbortReason::SessionShutdown)
+                }
+                reason => reason,
+            };
             let finalizer_span = task.task_span.clone();
             let terminal_turn_id = coordinator.turn_id().to_string();
             let finalizer_coordinator = Arc::clone(&coordinator);
@@ -1025,6 +1041,7 @@ impl Session {
                         turn_state,
                         coordinator: finalizer_coordinator,
                         outcome,
+                        abort_reason,
                         permit: Some(permit),
                         worker_failure_reported: false,
                         selected_terminal_event: None,
@@ -1217,7 +1234,7 @@ impl Session {
         // A panic after an observer accepted its callback must not replay that callback.
         finalization.terminal_lifecycle_dispatched = true;
         let turn_context = &finalization.task.turn_context;
-        if let Some(reason) = finalization.outcome.abort_reason() {
+        if let Some(reason) = finalization.abort_reason.clone() {
             self.emit_turn_abort_lifecycle(reason, turn_context.extension_data.as_ref())
                 .await;
         } else {
@@ -1296,7 +1313,7 @@ impl Session {
             // Record the reason before signalling, so a tool woken by this
             // cancellation reports the turn's own abort rather than defaulting
             // to a user interrupt.
-            if let Some(reason) = finalization.outcome.abort_reason() {
+            if let Some(reason) = finalization.abort_reason.clone() {
                 let _ = turn_context
                     .cancellation_cause
                     .set(CancellationCause::TurnAborted { reason });
@@ -1331,6 +1348,7 @@ impl Session {
 
         // Settle request counts before abort/lifecycle observers can close the
         // actor's metric scope. No persistence or extension callback is awaited.
+        let recovered_usage = self.settle_observed_model_usage(turn_context.as_ref()).await;
         let unaccounted = turn_context
             .turn_timing_state
             .unaccounted_model_request_count();
@@ -1343,7 +1361,7 @@ impl Session {
                 .abort(Arc::clone(self), Arc::clone(&turn_context))
                 .await;
         }
-        if unaccounted != 0 {
+        if unaccounted != 0 || recovered_usage != 0 {
             self.send_token_count_event(turn_context.as_ref()).await;
         }
 
@@ -1379,19 +1397,19 @@ impl Session {
         }
         turn_context.turn_timing_state.begin_finalization();
 
-        let abort_reason = finalization.outcome.abort_reason();
+        let abort_reason = finalization.abort_reason.clone();
         self.emit_worker_join_failure_before_terminal(finalization, turn_context.as_ref())
             .await;
 
-        let history_marker = if abort_reason == Some(TurnAbortReason::Interrupted) {
+        let history_marker = if matches!(
+            abort_reason,
+            Some(TurnAbortReason::Interrupted | TurnAbortReason::SessionShutdown)
+        ) {
             let mode = InterruptedTurnHistoryMarker::from_config_and_version(
                 turn_context.config.as_ref(),
                 turn_context.multi_agent_version,
             );
-            if self
-                .shutting_down
-                .load(std::sync::atomic::Ordering::Acquire)
-            {
+            if abort_reason == Some(TurnAbortReason::SessionShutdown) {
                 let history = self.clone_history().await;
                 let plan = self.services.plan_store.snapshot().await;
                 let guidance = crate::context::TurnAborted::shutdown_guidance(
@@ -1400,7 +1418,19 @@ impl Session {
                 );
                 turn_boundary_history_marker(mode, &guidance, &guidance)
             } else {
-                interrupted_turn_history_marker(mode)
+                let history = self.clone_history().await;
+                let plan = self.services.plan_store.snapshot().await;
+                let user_guidance = crate::context::TurnAborted::interrupted_guidance(
+                    history.raw_items(),
+                    plan.as_ref(),
+                    false,
+                );
+                let developer_guidance = crate::context::TurnAborted::interrupted_guidance(
+                    history.raw_items(),
+                    plan.as_ref(),
+                    true,
+                );
+                turn_boundary_history_marker(mode, &user_guidance, &developer_guidance)
             }
         } else {
             None
@@ -1444,15 +1474,16 @@ impl Session {
                     .await
             };
 
-        if abort_reason == Some(TurnAbortReason::Interrupted) {
+        // Interrupt hooks have always observed shutdown aborts; keep that.
+        if matches!(
+            abort_reason,
+            Some(TurnAbortReason::Interrupted | TurnAbortReason::SessionShutdown)
+        ) {
             run_turn_interrupt_hooks(self, &turn_context).await;
         }
         self.dispatch_terminal_lifecycle(finalization).await;
 
-        let (turn_tool_calls, token_usage_at_turn_start) = {
-            let state = finalization.turn_state.lock().await;
-            (state.tool_calls, state.token_usage_at_turn_start.clone())
-        };
+        let turn_tool_calls = finalization.turn_state.lock().await.tool_calls;
 
         let repaired_tool_timings = turn_context
             .turn_timing_state
@@ -1578,6 +1609,10 @@ impl Session {
                 },
             });
         }
+        if let Some(disposition) = turn_context.extension_data.get::<codex_protocol::protocol::TurnTaskDisposition>() {
+            timing.completion_assessment.get_or_insert_with(Default::default)
+                .task_disposition = Some((*disposition).clone());
+        }
         if !unsaved_records.is_empty() {
             timing
                 .completion_assessment
@@ -1636,8 +1671,7 @@ impl Session {
 
         // Freeze accounting while this turn still owns the active slot. Deferred
         // reporting must never attribute a newer turn's tokens to this one.
-        let total_token_usage = self.total_token_usage().await.unwrap_or_default();
-        let turn_token_usage = total_token_usage.difference(&token_usage_at_turn_start);
+        let turn_token_usage = turn_context.current_turn_usage();
         // The analytics turn event is emitted when `turn/completed` is observed and
         // rejects later facts, so usage must be queued before terminal publication.
         self.services
@@ -1813,7 +1847,7 @@ impl Session {
                 .get_or_insert_with(Default::default)
                 .validation_uncertainty = Some(snapshot);
         }
-        let event = if let Some(reason) = finalization.outcome.abort_reason() {
+        let event = if let Some(reason) = finalization.abort_reason.clone() {
             EventMsg::TurnAborted(TurnAbortedEvent {
                 turn_id: Some(turn_context.sub_id.clone()),
                 reason,

@@ -317,6 +317,13 @@ fn exec_command_tool_matches_expected_spec() {
             )),
         ),
         (
+            "env".to_string(),
+            JsonSchema {
+                description: Some("Environment overrides scoped to this command only; values are literal strings, never shell-expanded. Use with standalone program/args when shell assignments prevent command admission. Does not change the session or global environment.".to_string()),
+                ..JsonSchema::object(BTreeMap::new(), None, Some(JsonSchema::string(None).into()))
+            },
+        ),
+        (
             "workdir".to_string(),
             JsonSchema::string(Some(
                     "Working directory for the command. Defaults to the turn cwd."
@@ -917,6 +924,7 @@ fn command_output_schema_rejects_ambiguous_lifecycle_and_accepts_runtime_results
             output_ranges: None,
             process_output: Some(std::sync::Arc::new(
                 crate::unified_exec::ProcessOutputSnapshot {
+                    process_duration: None,
                     aggregated_output: b"evidence".to_vec(),
                     stdout: b"{}".to_vec(),
                     stderr: if search_no_match {

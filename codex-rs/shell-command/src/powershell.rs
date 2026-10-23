@@ -72,6 +72,84 @@ pub fn prefix_powershell_script_with_utf8(command: &[String]) -> Vec<String> {
     command
 }
 
+/// Clears a stale native exit code before the command runs.
+pub const NATIVE_EXIT_CODE_PROLOGUE: &str = "$global:LASTEXITCODE = $null\n";
+
+/// Reports the command's own native exit code. A command that failed without
+/// one (not found, cmdlet error) still exits 1, and success still exits 0.
+pub const NATIVE_EXIT_CODE_EPILOGUE: &str = "\n$codexCommandSucceeded = $?; $codexNativeExitCode = $global:LASTEXITCODE\nif (-not $codexCommandSucceeded) { if ($codexNativeExitCode -is [int] -and $codexNativeExitCode -ne 0) { exit $codexNativeExitCode }; exit 1 }";
+
+/// `pwsh -Command` reports every failing native exit code as 1, which hides codes
+/// such as a validation runner's 75 ("busy, pending"). When the original script is
+/// one plain command line ending the spawned script, keep that command's exit code.
+/// Apply only at launch, after approval and classification saw the original script.
+/// Returns `None` when the script does not qualify or does not end `command`.
+pub fn preserve_powershell_native_exit_code(
+    command: &[String],
+    original_script: &str,
+) -> Option<Vec<String>> {
+    if !is_plain_powershell_command_line(original_script) {
+        return None;
+    }
+    let extracted = extract_powershell_command_details(command)?;
+    let preamble = extracted.script.strip_suffix(original_script)?;
+    let script = format!(
+        "{preamble}{NATIVE_EXIT_CODE_PROLOGUE}{original_script}{NATIVE_EXIT_CODE_EPILOGUE}"
+    );
+    let mut command = command.to_vec();
+    command[extracted.script_index] = format!(
+        "{}{}",
+        &command[extracted.script_index][..extracted.script_offset],
+        script
+    );
+    Some(command)
+}
+
+/// One command invocation of bare words and literal single-quoted strings: no
+/// expansion, grouping, operators, redirection, comments or statement breaks,
+/// and no preamble keyword whose placement rules a prologue would break.
+fn is_plain_powershell_command_line(script: &str) -> bool {
+    let script = script.trim();
+    let first_word = script
+        .split(|ch: char| !ch.is_alphanumeric())
+        .next()
+        .unwrap_or_default();
+    if script.is_empty()
+        || script.starts_with('\u{feff}')
+        || [
+            "using",
+            "param",
+            "dynamicparam",
+            "begin",
+            "process",
+            "end",
+            "clean",
+        ]
+        .iter()
+        .any(|word| first_word.eq_ignore_ascii_case(word))
+    {
+        return false;
+    }
+    let mut in_single_quote = false;
+    for ch in script.chars() {
+        if in_single_quote {
+            match ch {
+                '\'' => in_single_quote = false,
+                '\n' | '\r' => return false,
+                _ => {}
+            }
+            continue;
+        }
+        match ch {
+            '\'' => in_single_quote = true,
+            '"' | '`' | '$' | ';' | '|' | '&' | '<' | '>' | '(' | ')' | '{' | '}' | '@' | '#'
+            | ',' | '[' | ']' | '\n' | '\r' => return false,
+            _ => {}
+        }
+    }
+    !in_single_quote
+}
+
 struct ExtractedPowershellCommand<'a> {
     shell: &'a str,
     script: &'a str,
@@ -410,6 +488,8 @@ mod tests {
 
     use std::fs;
 
+    use super::NATIVE_EXIT_CODE_EPILOGUE;
+    use super::NATIVE_EXIT_CODE_PROLOGUE;
     use super::UTF8_OUTPUT_PREFIX;
     use super::extract_powershell_command;
 
@@ -417,6 +497,7 @@ mod tests {
 
     use super::parse_powershell_command_into_plain_commands;
     use super::prefix_powershell_script_with_utf8;
+    use super::preserve_powershell_native_exit_code;
 
     use super::prove_noprofile_powershell_command_as_direct_argv;
 
@@ -460,6 +541,76 @@ mod tests {
                 Some(("pwsh", expected.as_str()))
             );
             assert_eq!(prefix_powershell_script_with_utf8(&prefixed), prefixed);
+        }
+    }
+
+    #[test]
+    fn native_exit_code_preservation_wraps_only_plain_command_lines() {
+        let launch = |script: &str| {
+            prefix_powershell_script_with_utf8(&[
+                "pwsh".to_string(),
+                "-NoProfile".to_string(),
+                "-Command".to_string(),
+                script.to_string(),
+            ])
+        };
+        let script = "just core-test-fast core_lib -E 'test(a; b)'";
+        let wrapped = preserve_powershell_native_exit_code(&launch(script), script)
+            .expect("plain command line");
+        assert_eq!(
+            wrapped[3],
+            format!(
+                "{UTF8_OUTPUT_PREFIX}{NATIVE_EXIT_CODE_PROLOGUE}{script}{NATIVE_EXIT_CODE_EPILOGUE}"
+            )
+        );
+        for script in [
+            "cargo test | Select-Object -First 5",
+            "cargo test; exit 0",
+            "cargo test\ncargo check",
+            "cargo test 2>&1",
+            "cargo test --manifest-path $root",
+            "Write-Output \"quoted\"",
+            "param($x) cargo test",
+            "cargo test 'unterminated",
+            "# cargo test",
+        ] {
+            assert_eq!(
+                preserve_powershell_native_exit_code(&launch(script), script),
+                None,
+                "{script}"
+            );
+        }
+        assert_eq!(
+            preserve_powershell_native_exit_code(&launch("cargo check"), "cargo test"),
+            None
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn preserved_native_exit_codes_reach_the_process_status() {
+        use std::process::Command;
+
+        let host = super::try_find_powershell_executable_blocking().expect("Windows PowerShell");
+        for (script, expected) in [
+            ("cmd /d /c exit 75", 75),
+            ("cmd /d /c exit 0", 0),
+            ("codex-missing-command-for-exit-code-test", 1),
+        ] {
+            let command = prefix_powershell_script_with_utf8(&[
+                host.as_path().to_string_lossy().into_owned(),
+                "-NoProfile".to_string(),
+                "-NonInteractive".to_string(),
+                "-Command".to_string(),
+                script.to_string(),
+            ]);
+            let command = preserve_powershell_native_exit_code(&command, script)
+                .expect("plain command line");
+            let output = Command::new(&command[0])
+                .args(&command[1..])
+                .output()
+                .expect("run PowerShell");
+            assert_eq!(output.status.code(), Some(expected), "{script}: {output:?}");
         }
     }
 

@@ -36,6 +36,10 @@ use tracing::instrument;
 use unicode_segmentation::UnicodeSegmentation;
 
 const MAX_TOOL_SEARCH_HANDLER_CACHE: usize = 4;
+#[cfg(test)]
+thread_local! {
+    static NAMESPACE_MEMBER_INDEX_BUILDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
 const MAX_TOOL_SEARCH_RESULT_CACHE: usize = 32;
 const MAX_TOOL_SEARCH_CACHE_ENTRY_BYTES: usize = 256 * 1024;
 // Tool-search outputs stay in model-visible history. Keep ordinary serialized
@@ -64,6 +68,8 @@ pub struct ToolSearchHandler {
     search_infos: Arc<[ToolSearchInfo]>,
     name_indexes: Arc<[ToolSearchNameIndex]>,
     exact_name_index: Arc<HashMap<String, Vec<ToolSearchDocumentId>>>,
+    folded_name_index: Arc<HashMap<String, Vec<String>>>,
+    namespace_member_indexes: Arc<HashMap<ToolSearchDocumentId, (Vec<ToolSearchInfo>, ToolSearchIndex)>>,
     spec: ToolSpec,
     search_index: Arc<ToolSearchIndex>,
     result_cache: Arc<Mutex<VecDeque<ToolSearchCacheEntry>>>,
@@ -849,11 +855,37 @@ impl ToolSearchHandler {
         }
         let spec = create_tool_search_tool(TOOL_SEARCH_DEFAULT_LIMIT);
         let search_index = Arc::new(ToolSearchIndex::new(&search_infos));
+        let mut folded_name_index = HashMap::<String, Vec<String>>::new();
+        for name in exact_name_index.keys() {
+            folded_name_index.entry(name.to_lowercase()).or_default().push(name.clone());
+        }
+        for names in folded_name_index.values_mut() {
+            names.sort();
+        }
+        let namespace_member_indexes = search_infos.iter().enumerate().filter_map(|(id, info)| {
+            let LoadableToolSpec::Namespace(namespace) = info.entry.output.as_ref() else { return None; };
+            #[cfg(test)]
+            NAMESPACE_MEMBER_INDEX_BUILDS.with(|count| count.set(count.get() + 1));
+            let members = namespace.tools.iter().map(|member| {
+                let ResponsesApiNamespaceTool::Function(tool) = member;
+                let mut member = info.clone();
+                member.entry.search_text = codex_tools::namespace_member_search_text(
+                    &namespace.name, &namespace.description, tool);
+                member
+            }).collect::<Vec<_>>();
+            let index = ToolSearchIndex::new_with_callable_texts(&members, namespace.tools.iter().map(|member| {
+                let ResponsesApiNamespaceTool::Function(tool) = member;
+                codex_tools::ToolSearchEntry::callable_function_search_text(tool)
+            }));
+            Some((ToolSearchDocumentId(id), (members, index)))
+        }).collect();
 
         Self {
             search_infos,
             name_indexes,
             exact_name_index: Arc::new(exact_name_index),
+            folded_name_index: Arc::new(folded_name_index),
+            namespace_member_indexes: Arc::new(namespace_member_indexes),
             spec,
             search_index,
             result_cache: Arc::new(Mutex::new(VecDeque::new())),
@@ -1087,14 +1119,8 @@ impl ToolSearchHandler {
         let mut key = validate_tool_search_query(query, limit)?;
         if !self.exact_name_index.contains_key(&key.query) {
             let folded = key.query.to_lowercase();
-            let mut alternatives = self
-                .exact_name_index
-                .keys()
-                .filter(|name| name.to_lowercase() == folded)
-                .cloned()
-                .collect::<Vec<_>>();
-            alternatives.sort();
-            match alternatives.as_slice() {
+            let alternatives = self.folded_name_index.get(&folded).map(Vec::as_slice).unwrap_or_default();
+            match alternatives {
                 [name] => key.query = name.clone(),
                 // Preserve exact identities within batches and mixed queries;
                 // lowercasing them can select a different callable.
@@ -1117,6 +1143,7 @@ impl ToolSearchHandler {
     fn identity_query_terms(&self, query: &str) -> Vec<String> {
         query
             .split_whitespace()
+            .filter(|term| !term.starts_with('+'))
             .flat_map(|term| {
                 if self.exact_name_index.contains_key(term) {
                     vec![term.to_string()]
@@ -1217,6 +1244,7 @@ impl ToolSearchHandler {
         } else {
             key.query
                 .split_whitespace()
+                .filter(|term| !term.starts_with('+'))
                 .filter(|term| !self.exact_name_index.contains_key(*term))
                 .flat_map(|term| ToolSearchTokenizer.tokenize(term))
                 .filter(|term| term.contains('_') && !self.exact_name_index.contains_key(term))
@@ -1252,7 +1280,7 @@ impl ToolSearchHandler {
             )));
         }
         if self.search_infos.is_empty() {
-            return Ok(Arc::new(ToolSearchResult {
+            return Ok(self.finish_search(key, ToolSearchResult {
                 unmatched_identifiers: missing_names,
                 ..Default::default()
             }));
@@ -1294,11 +1322,13 @@ impl ToolSearchHandler {
         let identity_terms = self.identity_query_terms(&key.query);
         let exact_terms = if self.exact_name_index.contains_key(&key.query) {
             vec![key.query.as_str()]
-        } else {
+        } else if explicit_multi_name || partial_name_lookup {
             explicit_names
                 .into_iter()
                 .chain(identity_terms.iter().map(String::as_str))
                 .collect()
+        } else {
+            Vec::new()
         };
         let exact_matches = exact_terms
             .into_iter()
@@ -1334,9 +1364,7 @@ impl ToolSearchHandler {
                 key.source.as_deref(),
             )?;
             result.unmatched_identifiers = missing_names;
-            let result = Arc::new(result);
-            self.cache_search_result(key, &result);
-            return Ok(result);
+            return Ok(self.finish_search(key, result));
         }
         if exact_matches.len() == 1 && limit == 1 {
             let mut result = self.search_output_tools(
@@ -1347,9 +1375,7 @@ impl ToolSearchHandler {
             )?;
             if result.omitted_result_count == 0 && !result.tools.is_empty() {
                 result.unmatched_identifiers = missing_names;
-                let result = Arc::new(result);
-                self.cache_search_result(key, &result);
-                return Ok(result);
+                return Ok(self.finish_search(key, result));
             }
         }
         let exact_match_count = exact_matches.len();
@@ -1389,42 +1415,6 @@ impl ToolSearchHandler {
         let mut result =
             self.search_output_tools(selection, Some(&key.query), limit, key.source.as_deref())?;
         result.unmatched_identifiers = missing_names;
-        // Derive ambiguity before the caller's result limit can hide alternatives.
-        // Only the complete query is an exact-name lookup; a multi-name request
-        // must not be mislabeled as a collision.
-        let names = self
-            .exact_name_index
-            .get(&key.query)
-            .into_iter()
-            .flatten()
-            .filter(|id| matches_source(id.info(&self.search_infos), key.source.as_deref()))
-            .flat_map(|id| {
-                let selected = id
-                    .name_index(&self.name_indexes)
-                    .output_names_for(&key.query);
-                loadable_tool_names(id.info(&self.search_infos).entry.output.as_ref())
-                    .into_iter()
-                    .filter(move |name| selected.is_some_and(|names| names.contains(&name.name)))
-            })
-            .collect::<std::collections::BTreeSet<_>>();
-        if names.len() > 1 {
-            let mut bytes = 0;
-            let alternatives = names
-                .iter()
-                .take(8)
-                .map(ToString::to_string)
-                .take_while(|name| {
-                    bytes += name.len();
-                    bytes <= 2048
-                })
-                .collect::<Vec<_>>();
-            result.exact_name_ambiguity = Some(serde_json::json!({
-                "match_count": names.len(),
-                "omitted_alternative_count": names.len() - alternatives.len(),
-                "qualified_alternatives": alternatives,
-            }));
-        }
-        let result = Arc::new(result);
         if let (Some(candidate_source_count), Some(result_source_count)) =
             (candidate_source_count, result_source_count)
         {
@@ -1441,14 +1431,49 @@ impl ToolSearchHandler {
                 output_tool_count = result.tools.len(),
                 output_source_count = loadable_tool_spec_diversity_count(&result.tools),
                 omitted_result_count = result.omitted_result_count,
-                "tool search completed"
+                "tool search ranking completed"
             );
         }
         // The inventory and presentation budget are immutable for this handler.
         // Cache partial receipts as well as complete ones; activation is repeated
         // for each invocation, so a cache hit cannot suppress capability delivery.
+        Ok(self.finish_search(key, result))
+    }
+
+    fn finish_search(&self, key: ToolSearchQueryKey, mut result: ToolSearchResult) -> Arc<ToolSearchResult> {
+        // Resolve every named identity from the full inventory, not the limited
+        // result page. Separate unambiguous batch members from true collisions.
+        let mut ambiguous = std::collections::BTreeSet::new();
+        let terms = if self.exact_name_index.contains_key(&key.query) {
+            vec![key.query.as_str()]
+        } else { key.query.split_whitespace().filter(|term| !term.starts_with('+')).collect() };
+        for term in terms {
+            let names = self.exact_name_index.get(term).into_iter().flatten()
+                .filter(|id| matches_source(id.info(&self.search_infos), key.source.as_deref()))
+                .flat_map(|id| {
+                    let selected = id.name_index(&self.name_indexes).output_names_for(term);
+                    loadable_tool_names(id.info(&self.search_infos).entry.output.as_ref()).into_iter()
+                        .filter(move |name| selected.is_some_and(|names| names.contains(&name.name)))
+                }).collect::<std::collections::BTreeSet<_>>();
+            if names.len() > 1 { ambiguous.extend(names); }
+        }
+        if !ambiguous.is_empty() {
+            let mut bytes = 0;
+            let alternatives = ambiguous.iter().take(8).map(ToString::to_string).take_while(|name| {
+                bytes += name.len(); bytes <= 2048
+            }).collect::<Vec<_>>();
+            result.exact_name_ambiguity = Some(serde_json::json!({
+                "match_count": ambiguous.len(), "omitted_alternative_count": ambiguous.len() - alternatives.len(),
+                "qualified_alternatives": alternatives,
+            }));
+        }
+        let result = Arc::new(result);
+        tracing::trace!(normalized_query_bytes = key.query.len(), effective_limit = key.limit,
+            cache_hit = false, output_tool_count = result.tools.len(),
+            output_source_count = loadable_tool_spec_diversity_count(&result.tools),
+            omitted_result_count = result.omitted_result_count, "tool search completed");
         self.cache_search_result(key, &result);
-        Ok(result)
+        result
     }
 
     fn search_output_tools(
@@ -1477,9 +1502,13 @@ impl ToolSearchHandler {
         for result_id in results {
             let result = &result_id.info(&self.search_infos).entry;
             let relevant = exact_query.is_none_or(|query| {
+                let identity_list = query.split_whitespace().all(|term| {
+                    self.exact_name_index.contains_key(term)
+                        || (term.contains('_') && !term.starts_with('+'))
+                });
                 std::iter::once(query)
-                    .chain(query.split_whitespace())
-                    .chain(identity_terms.iter().map(String::as_str))
+                    .chain(query.split_whitespace().filter(|_| identity_list))
+                    .chain(identity_terms.iter().map(String::as_str).filter(|_| identity_list))
                     .any(|term| {
                         self.exact_name_index
                             .get(term)
@@ -1541,34 +1570,12 @@ impl ToolSearchHandler {
                         // Rank callable descriptions before applying the callable
                         // limit. Share the authoritative output Arc; do not clone
                         // every schema merely to build ranking documents.
-                        let members = namespace
-                            .tools
-                            .iter()
-                            .map(|member| {
-                                let ResponsesApiNamespaceTool::Function(tool) = member;
-                                let mut info = result_id.info(&self.search_infos).clone();
-                                info.entry.search_text = codex_tools::namespace_member_search_text(
-                                    &namespace.name,
-                                    &namespace.description,
-                                    tool,
-                                );
-                                info
-                            })
-                            .collect::<Vec<_>>();
-                        // Each ranking document represents one callable, not
-                        // the namespace Arc shared by these lightweight entries.
-                        let index = ToolSearchIndex::new_with_callable_texts(
-                            &members,
-                            namespace.tools.iter().map(|member| {
-                                let ResponsesApiNamespaceTool::Function(tool) = member;
-                                codex_tools::ToolSearchEntry::callable_function_search_text(tool)
-                            }),
-                        );
+                        let (members, index) = &self.namespace_member_indexes[&result_id];
                         index
                             .top_matches(
                                 query,
                                 members.len(),
-                                &members,
+                                members,
                                 source.map(|_| namespace.name.as_str()),
                                 &[],
                             )
@@ -1860,7 +1867,11 @@ fn validate_tool_search_query(
     let query = normalize_tool_search_query(&terms.join(" "));
     if query.is_empty() {
         return Err(FunctionCallError::RespondToModel(
-            "query must not be empty".to_string(),
+            if source.is_some() {
+                "A source scope needs a capability term or exact tool name, for example `spawn_agent source:agents`. In Code Mode, filter ALL_TOOL_NAMES locally to inspect names without a search. No search ran."
+            } else {
+                "query must not be empty"
+            }.to_string(),
         ));
     }
 
@@ -3561,6 +3572,36 @@ text('one-cell-complete');
     }
 
     #[test]
+    fn required_snake_case_metadata_is_not_a_missing_callable() {
+        let handler = ToolSearchHandler::new(vec![search_info("lookup customer_id", None, "crm", "lookup_customer")]);
+        let result = handler.search("+customer_id", 1).unwrap();
+        assert!(result.unmatched_identifiers.is_empty());
+        assert!(!result.activation_tools.is_empty());
+    }
+
+    #[test]
+    fn partial_name_batch_preserves_all_ambiguity_before_limit() {
+        let handler = ToolSearchHandler::new(vec![
+            search_info("find event", None, "calendar", "find_event"),
+            search_info("find event", None, "events", "find_event"),
+        ]);
+        let result = handler.search("find_event missing_name", 1).unwrap();
+        assert_eq!(result.unmatched_identifiers, ["missing_name"]);
+        assert_eq!(result.exact_name_ambiguity.as_ref().unwrap()["match_count"], 2);
+    }
+
+    #[test]
+    fn capability_queries_reuse_inventory_folded_aliases() {
+        let handler = ToolSearchHandler::new(vec![search_info("archive messages", None, "mail", "archive_messages")]);
+        let index = Arc::clone(&handler.folded_name_index);
+        let first = handler.search("archive messages", 1).unwrap();
+        let repeated = handler.search("archive messages", 1).unwrap();
+        assert!(Arc::ptr_eq(&first, &repeated));
+        assert!(Arc::ptr_eq(&index, &handler.folded_name_index));
+        assert_eq!(index["archive_messages"], ["archive_messages"]);
+    }
+
+    #[test]
     fn weak_matches_return_names_without_activation_and_exact_names_still_activate() {
         let handler = ToolSearchHandler::new(vec![
             search_info(
@@ -3590,6 +3631,23 @@ text('one-cell-complete');
             ),]
         );
         assert!(exact.unactivated_matches.is_empty());
+    }
+
+    #[test]
+    fn audit150_common_verb_does_not_override_a_semantic_query() {
+        let handler = ToolSearchHandler::new(vec![
+            search_info("Search contacts by name", Some("contacts"), "contacts", "search"),
+            search_info("Search invoice records by identifier", Some("finance"), "finance", "find_records"),
+        ]);
+        for (query, expected) in [("search invoice", "mcp__finance"),
+            ("search", "mcp__contacts"), ("mcp__finance.find_records", "mcp__finance")]
+        {
+            let result = handler.search(query, 1).unwrap();
+            let [LoadableToolSpec::Namespace(namespace)] = result.tools.as_slice() else { panic!("{query}"); };
+            assert_eq!(namespace.name, expected, "{query}");
+            assert_eq!(result.activation_tools, vec![ToolName::namespaced(expected,
+                if expected == "mcp__contacts" { "search" } else { "find_records" })]);
+        }
     }
 
     #[test]
@@ -4242,6 +4300,25 @@ text('one-cell-complete');
         let result = handler.search("export archived invoices", 1).unwrap();
         assert_eq!(result.activation_tools.len(), 1);
         assert!(result.activation_tools[0].name.ends_with("export_archive"));
+    }
+
+    #[test]
+    fn distinct_capability_queries_reuse_one_namespace_member_index() {
+        let mut info = search_info("messages", None, "mail", "archive_messages");
+        let LoadableToolSpec::Namespace(namespace) = Arc::make_mut(&mut info.entry.output) else { panic!("namespace"); };
+        let ResponsesApiNamespaceTool::Function(template) = namespace.tools[0].clone();
+        namespace.tools = ["archive_messages", "list_messages"].into_iter().map(|name| {
+            ResponsesApiNamespaceTool::Function(ResponsesApiTool {
+                name: name.into(), description: name.replace('_', " "), ..template.clone()
+            })
+        }).collect();
+        NAMESPACE_MEMBER_INDEX_BUILDS.with(|count| count.set(0));
+        let handler = ToolSearchHandler::new(vec![info]);
+        let archive = handler.search("archive messages", 1).unwrap();
+        let list = handler.search("list messages", 1).unwrap();
+        assert_eq!(archive.activation_tools[0].name, "archive_messages");
+        assert_eq!(list.activation_tools[0].name, "list_messages");
+        NAMESPACE_MEMBER_INDEX_BUILDS.with(|count| assert_eq!(count.get(), 1));
     }
 
     #[tokio::test]
@@ -5020,6 +5097,30 @@ text('one-cell-complete');
                 .unwrap()
                 .activation_tools
                 .is_empty()
+        );
+    }
+
+    #[test]
+    fn scope_only_search_names_a_same_cell_repair_without_broadening_scope() {
+        for query in ["source:agents", "+source:agents"] {
+            let error = validate_tool_search_query(query, 8)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains("capability term or exact tool name"),
+                "{error}"
+            );
+            assert!(error.contains("ALL_TOOL_NAMES"), "{error}");
+            assert!(error.contains("No search ran"), "{error}");
+        }
+        let valid = validate_tool_search_query("spawn_agent +source:agents", 8).unwrap();
+        assert_eq!(valid.query, "spawn_agent");
+        assert_eq!(valid.source.as_deref(), Some("agents"));
+        assert!(
+            validate_tool_search_query("", 8)
+                .unwrap_err()
+                .to_string()
+                .contains("query must not be empty")
         );
     }
 

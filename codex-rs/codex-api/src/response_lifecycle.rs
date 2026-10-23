@@ -43,6 +43,8 @@ pub(super) struct ResponseLifecycle {
     connection: ConnectionResponseHistory,
     saw_unidentified_item: bool,
     completed_id: Option<String>,
+    finalized_summaries: HashMap<i64, String>,
+    finalized_summary_bytes: usize,
 }
 
 struct ItemIdentity {
@@ -131,6 +133,7 @@ impl ResponseLifecycle {
         &mut self,
         mut event: ResponsesStreamEvent<'_>,
         wire_bytes: usize,
+        completion_usage: Option<codex_protocol::protocol::TokenUsage>,
     ) -> Result<Option<ResponseEvent>, ResponsesEventError> {
         let mut identity = ItemIdentity::from_event(&event);
         let supplied_response_id = event
@@ -261,6 +264,25 @@ impl ResponseLifecycle {
             }
             _ => {}
         }
+        if event.kind == "response.reasoning_summary_text.done"
+            && let (Some(index), Some(text), Some(_)) =
+                (event.summary_index, event.text.as_ref(), event.item_id.as_ref())
+        {
+            if let Some(previous) = self.finalized_summaries.get(&index) {
+                return if previous == text {
+                    Ok(None)
+                } else {
+                    Err(invalid("conflicting reasoning summary finalization"))
+                };
+            }
+            if self.finalized_summaries.len() >= MAX_ITEMS
+                || text.len() > MAX_RETAINED_WIRE_BYTES.saturating_sub(self.finalized_summary_bytes)
+            {
+                return Err(invalid("reasoning summary finalization budget exceeded"));
+            }
+            self.finalized_summary_bytes += text.len();
+            self.finalized_summaries.insert(index, text.clone());
+        }
         if event.kind == "response.output_item.done"
             && let (Some(active), Some(done)) = (&self.active, identity.as_mut())
             && active.matches(done)
@@ -277,9 +299,11 @@ impl ResponseLifecycle {
             }
             done.output_index = done.output_index.or(active.output_index);
         }
-        let result = super::process_responses_event(event)?;
+        let result = super::process_responses_event(event, completion_usage)?;
         match &result {
             Some(ResponseEvent::OutputItemAdded(_)) => {
+                self.finalized_summaries.clear();
+                self.finalized_summary_bytes = 0;
                 self.active = identity;
                 self.active_wire_bytes = wire_bytes;
             }
@@ -574,5 +598,27 @@ mod tests {
             json!({"type":"response.completed","response":{"id":"r"}}),
         )
         .unwrap();
+    }
+}
+
+#[cfg(test)]
+mod audit143_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn repeated_summary_finality_is_not_progress_and_conflicting_finality_fails() {
+        for text in ["", "thinking"] {
+            let mut stream = super::super::ResponsesEventInterpreter::new(&super::super::ResponsesStreamMetadata::default(), None);
+            let added = json!({"type":"response.output_item.added", "item":{"type":"reasoning","id":"r","summary":[]}});
+            stream.process_payload(&added.to_string()).unwrap().for_each(drop);
+            let done = json!({"type":"response.reasoning_summary_text.done","item_id":"r","summary_index":0,"text":text});
+            assert_eq!(stream.process_payload(&done.to_string()).unwrap().count(), 1);
+            assert_eq!(stream.process_payload(&done.to_string()).unwrap().count(), 0);
+            let next = json!({"type":"response.reasoning_summary_text.done","item_id":"r","summary_index":1,"text":text});
+            assert_eq!(stream.process_payload(&next.to_string()).unwrap().count(), 1);
+            let conflict = json!({"type":"response.reasoning_summary_text.done","item_id":"r","summary_index":0,"text":"different"});
+            assert!(stream.process_payload(&conflict.to_string()).is_err());
+        }
     }
 }

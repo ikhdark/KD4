@@ -38,6 +38,98 @@ def ps_single_quote(value: str | Path) -> str:
     return "'" + str(value).replace("'", "''") + "'"
 
 
+class Audit151AdmissionTests(unittest.TestCase):
+    def test_family_capacity_reports_actual_overflow_lanes(self):
+        with tempfile.TemporaryDirectory() as directory, contextlib.ExitStack() as owners:
+            repo = Path(directory)
+            root = rust_build_status.initialize_cargo_lanes_root(repo, repo / "codex-rs/target/lanes")
+            busy = [root / "core-tests-2", root / "core-tests-3"]
+            for lane in busy:
+                lane.mkdir()
+                handle = rust_build_status._try_acquire_binary_file_lock(lane / ".lane-active.lock")
+                self.assertIsNotNone(handle)
+                owners.callback(handle.close)
+                owners.callback(rust_build_status._release_binary_file_lock, handle)
+            with self.assertRaises(rust_build_status.RustAdmissionBusy) as caught:
+                with rust_build_status.reserve_cargo_lane(repo_root=repo, requested_lane="core-tests", command=["cargo", "check"], max_active_lanes=2):
+                    self.fail("family at capacity cannot admit another build")
+            report = caught.exception.report()
+            self.assertEqual(report["resource_kind"], "lane_family")
+            self.assertEqual({entry["target_dir"] for entry in report["blocking_lanes"]}, {str(lane.resolve()) for lane in busy})
+            self.assertEqual(report["exit_code"], 75)
+            self.assertEqual(report["validation_status"], "pending")
+            self.assertFalse(report["executed"])
+            self.assertFalse(report["queued"])
+
+    def test_profiles_distinguish_cargo_artifacts_from_execution_policy(self):
+        cases = [
+            (["cargo", "nextest", "run", "-p", "widget"], "widget", []),
+            (["cargo", "nextest", "run", "-p", "widget", "--profile", "release"], "widget", []),
+            (["cargo", "nextest", "run", "-p", "widget", "--cargo-profile=release"], "widget-release", ["--profile", "release"]),
+            (["cargo", "run", "-p", "widget", "--", "--release"], "widget", []),
+            (["cargo", "build", "-p", "widget", "--release"], "widget-release", ["--profile", "release"]),
+            (["cargo", "+stable", "nextest", "run", "-p", "widget", "--profile=release"], "widget", ["+stable"]),
+            (["rustup", "run", "stable", "cargo", "nextest", "run", "-p", "widget", "--profile", "release"], "widget", []),
+            (["cargo", "watch", "-qxcheck -p widget --release"], "widget-release", ["--profile", "release"]),
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            for command, family, options in cases:
+                with self.subTest(command=command):
+                    self.assertEqual(rust_build_status._auto_lane_base(command), family)
+                    self.assertEqual(rust_build_status.cargo_build_context(Path(directory), command, {"PATH": ""})["options"], options)
+
+    def test_process_scope_does_not_infer_ownership_from_lane_basename_or_quoted_text(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            root = rust_build_status.initialize_cargo_lanes_root(repo, repo / "codex-rs/target/lanes")
+            lane = root / "core-tests"
+            lane.mkdir()
+            foreign = rust_build_status.RustProcess(1, "cargo.exe", r"cargo.exe check --target-dir C:\another-checkout\codex-rs\target\lanes\core-tests")
+            query = rust_build_status.RustProcess(2, "powershell.exe", 'powershell.exe -Command "rg cargo.exe target/lanes/core-tests README.md"')
+            self.assertFalse(query.classification.is_rust)
+            with mock.patch.dict(os.environ, {"CODEX_CARGO_LANE_ACTIVE_NAMES": ""}):
+                snapshot = rust_build_status.BuildStatusSnapshot.collect(repo_root=repo, processes=[foreign, query])
+                self.assertNotIn("core-tests", snapshot.active_lanes)
+                self.assertIn(lane, snapshot.stale_lanes)
+                own = rust_build_status.RustProcess(3, "cargo", f'cargo check --target-dir "{lane}"')
+                snapshot = rust_build_status.BuildStatusSnapshot.collect(repo_root=repo, processes=[own])
+                self.assertIn("core-tests", snapshot.active_lanes)
+                relative = rust_build_status.RustProcess(4, "cargo", "cargo check --target-dir target/lanes/core-tests")
+                snapshot = rust_build_status.BuildStatusSnapshot.collect(repo_root=repo, processes=[relative])
+                self.assertNotIn("core-tests", snapshot.active_lanes)
+                self.assertIsNotNone(snapshot.process_scan_error)
+
+    def test_launch_generations_deduplicate_and_recover_without_erasing_a_successor(self):
+        import concurrent.futures
+        import threading
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            barrier = threading.Barrier(8)
+            def claim(_):
+                barrier.wait()
+                return rust_build_status._maintenance_launch_lease(root)
+            with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+                claims = list(pool.map(claim, range(8)))
+            owners = [claim for claim in claims if isinstance(claim, str)]
+            self.assertEqual(len(owners), 1)
+            first = owners[0]
+            self.assertFalse(rust_build_status._maintenance_launch_lease(root, release="not-the-owner"))
+            self.assertIsNone(rust_build_status._maintenance_launch_lease(root))
+            self.assertTrue(rust_build_status._maintenance_launch_lease(root, release=first))
+            second = rust_build_status._maintenance_launch_lease(root)
+            self.assertIsInstance(second, str)
+            self.assertFalse(rust_build_status._maintenance_launch_lease(root, release=first))
+            path = root / ".maintenance-launch.json"
+            path.write_text("{torn", encoding="utf-8")
+            os.utime(path, (time.time() - 61, time.time() - 61))
+            self.assertIsInstance(rust_build_status._maintenance_launch_lease(root), str)
+            for invalid in ({"generation": [], "expires_at": 1e300}, {"generation": "owner", "expires_at": "forever"}, {"generation": "owner", "expires_at": float("inf")}):
+                path.write_text(json.dumps(invalid), encoding="utf-8")
+                self.assertIsNone(rust_build_status._maintenance_launch_lease(root))
+                os.utime(path, (time.time() - 61, time.time() - 61))
+                self.assertIsInstance(rust_build_status._maintenance_launch_lease(root), str)
+
+
 class CargoLaneTest(unittest.TestCase):
     def isolated_home(self, local, lane):
         identity = str(REPO_ROOT.resolve()).rstrip("\\/").lower()
@@ -406,6 +498,7 @@ Set-PSBreakpoint -Script {ps_single_quote(SCRIPT)} -Line {line} -Action {{ $glob
             "cargo-lane-patterns.ps1",
             "cargo_lane_patterns.json",
             "cargo-lane-trash-cleanup.ps1",
+            "cargo-lane-launch-lease.ps1",
             "rust_tool_env.py",
         ):
             shutil.copyfile(SCRIPT.parent / name, scripts / name)
@@ -477,9 +570,9 @@ Set-PSBreakpoint -Script {ps_single_quote(SCRIPT)} -Line {line} -Action {{ $glob
             release.touch()
             deadline = time.monotonic() + 10
             while time.monotonic() < deadline:
-                if (lanes / ".gc-stamp").exists() and not (
+                if (lanes / ".gc-stamp").exists() and not rust_build_status._cargo_lock_file_is_busy(
                     lanes / ".cargo-lane-trash-cleanup.lock"
-                ).exists():
+                ):
                     break
                 time.sleep(0.05)
             # Lock release precedes PowerShell process exit. Wait for the actual
@@ -500,7 +593,7 @@ Set-PSBreakpoint -Script {ps_single_quote(SCRIPT)} -Line {line} -Action {{ $glob
             self.assertEqual(wait.returncode, 0, wait.stderr)
             if completed:
                 self.assertTrue((lanes / ".gc-stamp").exists())
-                self.assertFalse((lanes / ".cargo-lane-trash-cleanup.lock").exists())
+                self.assertFalse(rust_build_status._cargo_lock_file_is_busy(lanes / ".cargo-lane-trash-cleanup.lock"))
 
     def test_shared_target_argument_corpus(self):
         target = self.temp_root / "target with spaces"
@@ -2803,13 +2896,13 @@ Set-PSBreakpoint -Script {ps_single_quote(SCRIPT)} -Line {line} -Action {{
         while time.time() < deadline:
             if (
                 not list(self.lanes_root.glob("*.trash-*"))
-                and not (self.lanes_root / ".cargo-lane-trash-cleanup.lock").exists()
+                and not rust_build_status._cargo_lock_file_is_busy(self.lanes_root / ".cargo-lane-trash-cleanup.lock")
             ):
                 break
             time.sleep(0.2)
 
         self.assertFalse(list(self.lanes_root.glob("*.trash-*")))
-        self.assertFalse((self.lanes_root / ".cargo-lane-trash-cleanup.lock").exists())
+        self.assertFalse(rust_build_status._cargo_lock_file_is_busy(self.lanes_root / ".cargo-lane-trash-cleanup.lock"))
 
     def test_failed_gc_does_not_advance_stamp(self) -> None:
         fake_bin = self.fake_python("exit /b 7\r\n")

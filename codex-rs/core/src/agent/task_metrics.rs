@@ -225,6 +225,15 @@ impl TokenClassTotals {
     }
 
     fn classes(self) -> [(&'static str, Option<u64>); 5] {
+        let non_cached_input = (|| {
+            let usage = codex_protocol::protocol::TokenUsage {
+                input_tokens: i64::try_from(self.input).ok()?,
+                cached_input_tokens: i64::try_from(self.cached_input).ok()?,
+                coverage: self.coverage,
+                ..Default::default()
+            };
+            u64::try_from(usage.known_non_cached_input()?).ok()
+        })();
         [
             ("input", self.known(self.input, |c| c.input_tokens)),
             (
@@ -233,9 +242,7 @@ impl TokenClassTotals {
             ),
             (
                 "uncached_input",
-                self.known(self.input, |c| c.input_tokens)
-                    .zip(self.known(self.cached_input, |c| c.cached_input_tokens))
-                    .map(|(input, cached)| input.saturating_sub(cached)),
+                non_cached_input,
             ),
             ("output", self.known(self.output, |c| c.output_tokens)),
             (

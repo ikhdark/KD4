@@ -192,3 +192,23 @@ fn mcp_registration_preserves_payload_reference_root_in_code_mode() {
     );
     assert!(!definitions[0].description.contains("unresolved $ref"));
 }
+#[test]
+fn audit150_lossy_mcp_projection_retains_the_authoritative_contract() {
+    let original = serde_json::json!({"type":"object",
+        "properties":{"mode":{"type":"string"},"token":{"type":"string"}},
+        "if":{"properties":{"mode":{"const":"archive"}}},
+        "then":{"required":["token"]}});
+    let parsed = parse_mcp_tool(&mcp_tool("archive", "Archive records", original.clone())).unwrap();
+    assert!(parsed.description.contains("permissive projection"));
+    assert!(parsed.description.contains(&original.to_string()));
+    let definitions = crate::collect_code_mode_tool_definitions(&[
+        crate::ToolSpec::Function(crate::ResponsesApiTool {
+            name:parsed.name, description:parsed.description, strict:false, defer_loading:Some(true),
+            parameters:parsed.input_schema, output_schema:parsed.output_schema,
+        })
+    ]);
+    assert!(definitions[0].description.contains(&original.to_string()));
+    let supported = parse_mcp_tool(&mcp_tool("plain", "Plain tool",
+        serde_json::json!({"type":"object","properties":{"token":{"type":"string"}}}))).unwrap();
+    assert_eq!(supported.description, "Plain tool");
+}

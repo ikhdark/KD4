@@ -577,9 +577,25 @@ struct RuntimeConfig {
 #[derive(Default)]
 pub(crate) struct EnabledToolCatalog {
     tools: Vec<EnabledToolMetadata>,
+    presentation_names: Vec<String>,
     by_global_name: HashMap<String, usize>,
     by_requested_name: HashMap<String, Option<usize>>,
     input_bytes: usize,
+}
+
+fn admit_short_aliases(
+    candidates: &[Option<String>], registered: &HashMap<String, usize>,
+    requested: &HashMap<String, Option<usize>>,
+) -> Vec<Option<String>> {
+    let mut counts = HashMap::new();
+    for candidate in candidates.iter().flatten() {
+        *counts.entry(candidate.as_str()).or_insert(0usize) += 1;
+    }
+    candidates.iter().enumerate().map(|(index, candidate)| {
+        candidate.as_ref().filter(|name| counts.get(name.as_str()) == Some(&1)
+            && registered.get(name.as_str()).is_none_or(|owner| *owner == index)
+            && requested.get(name.as_str()).is_none_or(|owner| *owner == Some(index))).cloned()
+    }).collect()
 }
 
 impl EnabledToolCatalog {
@@ -593,6 +609,7 @@ impl EnabledToolCatalog {
                     global_name: normalize_code_mode_identifier(&definition.name),
                     tool_name: definition.tool_name.clone(),
                     description: Arc::clone(&definition.description),
+                    namespace_description: definition.namespace_description.clone(),
                     kind: definition.kind,
                     default_timeout_ms: definition
                         .default_timeout_ms
@@ -606,7 +623,7 @@ impl EnabledToolCatalog {
         self.input_bytes
     }
 
-    fn new(tools: Vec<EnabledToolMetadata>) -> Result<Self, String> {
+    fn new(mut tools: Vec<EnabledToolMetadata>) -> Result<Self, String> {
         let mut by_global_name: HashMap<String, usize> = HashMap::with_capacity(tools.len());
         for (index, tool) in tools.iter().enumerate() {
             if let Some(existing_index) = by_global_name.get(&tool.global_name) {
@@ -637,6 +654,64 @@ impl EnabledToolCatalog {
                     .or_insert(Some(index));
             }
         }
+        let namespace_roots = tools.iter().flat_map(|tool| {
+            tool.tool_name.namespace.as_deref().into_iter().chain(
+                tool.global_name.split_once("__").filter(|(_, member)| !member.contains("__"))
+                    .map(|(namespace, _)| namespace),
+            )
+        }).map(str::to_owned).collect::<HashSet<_>>();
+        let candidates = tools.iter().map(|tool| {
+            if tool.tool_name.namespace.is_none()
+                && normalize_code_mode_identifier(&tool.tool_name.name) == tool.tool_name.name
+            { return None; }
+            // Only shorten our historical generated alias, never arbitrary
+            // registration names. A digest prefix is presentation, not identity.
+            if tool.global_name != codex_code_mode_protocol::legacy_code_mode_identifier(&tool.tool_name) {
+                return None;
+            }
+            let (prefix, digest) = tool.global_name.rsplit_once("__")?;
+            (digest.len() == 64).then(|| format!("{}__{}", &prefix[..prefix.len().min(24)], &digest[..12]))
+                .filter(|alias| !namespace_roots.contains(alias))
+        }).collect::<Vec<_>>();
+        let short_aliases = admit_short_aliases(&candidates, &by_global_name, &by_requested_name);
+        for (index, alias) in short_aliases.iter().enumerate() {
+            if let Some(alias) = alias { by_requested_name.insert(alias.clone(), Some(index)); }
+        }
+        let mut presentation_names = Vec::with_capacity(tools.len());
+        for (index, tool) in tools.iter_mut().enumerate() {
+            let mut presentation = tool.global_name.clone();
+            if let Some(namespace) = &tool.tool_name.namespace {
+                let member = &tool.tool_name.name;
+                let safe = |name: &str| !name.is_empty()
+                    && normalize_code_mode_identifier(name) == name;
+                let qualified = format!("{namespace}.{member}");
+                if safe(namespace) && safe(member)
+                    && short_aliases[index].as_ref().is_none_or(|alias| qualified.len() <= alias.len())
+                    && !by_global_name.contains_key(namespace)
+                    && by_requested_name.get(&qualified) == Some(&Some(index))
+                {
+                    // Rewrite only the generated declaration, not tool prose or
+                    // canonical identity. Unknown contract layouts fail closed.
+                    let needle = format!("declare const tools: {{ {}(", tool.global_name);
+                    if let Some((before, rest)) = tool.description.rsplit_once(&needle)
+                        && let Some((body, after)) = rest.rsplit_once(" };")
+                    {
+                        tool.description = format!("{before}declare const tools: {{ {namespace}: {{ {member}({body} }} }};{after}").into();
+                        presentation = qualified;
+                    }
+                }
+            }
+            if presentation == tool.global_name
+                && let Some(short) = &short_aliases[index]
+            {
+                let needle = format!("declare const tools: {{ {}(", tool.global_name);
+                if let Some((before, rest)) = tool.description.rsplit_once(&needle) {
+                    tool.description = format!("{before}declare const tools: {{ {short}({rest}").into();
+                    presentation = short.clone();
+                }
+            }
+            presentation_names.push(presentation);
+        }
         let alias_bytes = by_requested_name.keys().fold(
             by_requested_name
                 .capacity()
@@ -650,9 +725,13 @@ impl EnabledToolCatalog {
                 .saturating_add(tool.tool_name.name.len())
                 .saturating_add(tool.tool_name.namespace.as_ref().map_or(0, String::len))
                 .saturating_add(tool.description.len())
+                .saturating_add(tool.namespace_description.as_ref().map_or(0, |description| description.len()))
         });
+        let input_bytes = presentation_names.iter().fold(input_bytes, |bytes, name|
+            bytes.saturating_add(std::mem::size_of::<String>()).saturating_add(name.len()));
         Ok(Self {
             tools,
+            presentation_names,
             by_global_name,
             by_requested_name,
             input_bytes,
@@ -661,6 +740,10 @@ impl EnabledToolCatalog {
 
     fn get(&self, index: usize) -> Option<&EnabledToolMetadata> {
         self.tools.get(index)
+    }
+
+    fn presentation_name(&self, index: usize) -> &str {
+        &self.presentation_names[index]
     }
 
     fn index_of(&self, global_name: &str) -> Option<usize> {
@@ -726,6 +809,7 @@ impl EnabledToolCatalog {
 
 pub(super) struct RuntimeState {
     event_tx: mpsc::UnboundedSender<RuntimeEvent>,
+    monotonic_origin: std::time::Instant,
     pending_tool_calls: HashMap<String, (v8::Global<v8::PromiseResolver>, ToolName)>,
     output_projector: Option<v8::Global<v8::Function>>,
     pending_notifications: HashMap<String, v8::Global<v8::PromiseResolver>>,
@@ -889,6 +973,7 @@ fn run_runtime(
         .fold(0usize, |total, stored| total.saturating_add(stored.bytes));
     scope.set_slot(RuntimeState {
         event_tx: event_tx.clone(),
+        monotonic_origin: std::time::Instant::now(),
         pending_tool_calls: HashMap::new(),
         output_projector: Some(projector),
         pending_notifications: HashMap::new(),
@@ -974,6 +1059,9 @@ fn run_runtime(
                 });
             }
             RuntimeCommand::ToolResponse { id, result } => {
+                tracing::info!(event.name = "codex.code_mode_nested_tool.runtime_receive",
+                    runtime_tool_call_id = %id, transport_outcome = "completed",
+                    endpoint = "runtime_command_received", "runtime received nested result");
                 if let Err(error_text) =
                     module_loader::resolve_tool_response(scope, &id, Ok(result))
                 {
@@ -982,6 +1070,9 @@ fn run_runtime(
                 }
             }
             RuntimeCommand::ToolError { id, error_text } => {
+                tracing::info!(event.name = "codex.code_mode_nested_tool.runtime_receive",
+                    runtime_tool_call_id = %id, transport_outcome = "failed",
+                    endpoint = "runtime_command_received", "runtime received nested error");
                 if let Err(runtime_error) =
                     module_loader::resolve_tool_response(scope, &id, Err(error_text))
                 {
@@ -1172,6 +1263,7 @@ mod tests {
         let metadata = |global_name: &str, description: &str| EnabledToolMetadata {
             tool_name: ToolName::plain(global_name),
             global_name: global_name.to_string(),
+            namespace_description: None,
             default_timeout_ms: None,
             description: description.into(),
             kind: CodeModeToolKind::Function,
@@ -1223,6 +1315,7 @@ mod tests {
             global_name: global_name.into(),
             tool_name,
             description: "".into(),
+            namespace_description: None,
             default_timeout_ms: None,
             kind: CodeModeToolKind::Function,
         };
@@ -1804,3 +1897,28 @@ text(JSON.stringify([coded]));"#,
 
 #[cfg(test)]
 mod regression_tests;
+#[cfg(test)]
+mod audit150_presentation_tests {
+    use super::*;
+    use codex_code_mode_protocol::CodeModeToolKind;
+    use codex_protocol::ToolName;
+    #[test]
+    fn safe_qualified_presentation_preserves_canonical_resolution_and_collision_fallback() {
+        let metadata = || EnabledToolMetadata { tool_name:ToolName::namespaced("archive","search"),
+            global_name:"mcp__opaque_provider__archive__search".into(),
+            description:"Search records\n\nexec tool declaration:\n```ts\ndeclare const tools: { mcp__opaque_provider__archive__search(args: {query: string}): Promise<unknown>; };\n```".into(),
+            namespace_description: None,
+            default_timeout_ms:None,kind:CodeModeToolKind::Function };
+        let catalog=EnabledToolCatalog::new(vec![metadata()]).unwrap();
+        assert_eq!(catalog.presentation_name(0),"archive.search");
+        assert_eq!(catalog.resolve_requested_name("archive.search"),Some(0));
+        assert_eq!(catalog.resolve_requested_name("mcp__opaque_provider__archive__search"),Some(0));
+        assert!(catalog.tools[0].description.contains("archive: { search(args:"));
+        assert!(!catalog.tools[0].description.contains("mcp__opaque_provider__archive__search("));
+        let mut shadow=metadata();
+        shadow.tool_name=ToolName::plain("archive");shadow.global_name="archive".into();
+        let colliding=EnabledToolCatalog::new(vec![metadata(),shadow]).unwrap();
+        assert_eq!(colliding.presentation_name(0),"mcp__opaque_provider__archive__search");
+        assert!(colliding.tools[0].description.contains("mcp__opaque_provider__archive__search("));
+    }
+}

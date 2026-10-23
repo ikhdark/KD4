@@ -858,6 +858,68 @@ fn assert_reconstruction_gap(item: &RolloutItem, count: usize) {
     assert!(text.len() < 1024);
 }
 
+/// Unreadable payload bodies are counted apart from malformed records.
+fn assert_payload_reconstruction_gap(item: &RolloutItem, count: usize) {
+    let RolloutItem::ResponseItem(ResponseItem::Message { role, content, .. }) = item else {
+        panic!("expected a model-visible reconstruction gap");
+    };
+    assert_eq!(role, "developer");
+    let [codex_protocol::models::ContentItem::InputText { text }] = content.as_slice() else {
+        panic!("expected bounded gap text");
+    };
+    assert!(text.starts_with("<rollout_reconstruction_gap>"));
+    assert!(text.contains(&format!(
+        "{count} unreadable rollout records were skipped. Integrity: malformed_records=0, trailing_partial_records=0, unresolved_payload_artifacts={count}, complete=false."
+    )));
+    assert!(!text.contains("malformed rollout records"));
+    assert!(text.len() < 1024);
+}
+
+#[tokio::test]
+async fn reconstruction_gap_counts_unresolved_payloads_apart_from_malformed_records()
+-> std::io::Result<()> {
+    for missing_payload in [false, true] {
+        let home = TempDir::new()?;
+        let uuid = Uuid::new_v4();
+        let path = write_session_file(home.path(), "2025-01-03T12-00-00", uuid)?;
+        let mut file = fs::OpenOptions::new().append(true).open(&path)?;
+        writeln!(file, "corrupt interior result")?;
+        if missing_payload {
+            let reference = serde_json::json!({
+                "timestamp": "2025-01-03T12:00:01Z",
+                "type": "rollout_payload_artifact",
+                "payload": {"sha256": "0".repeat(64), "bytes": 2, "item_type": "event_msg"},
+            });
+            writeln!(file, "{reference}")?;
+        }
+        drop(file);
+        let (items, _, errors) = RolloutRecorder::load_rollout_items(&path).await?;
+        let (recorder, resumed) = RolloutRecorder::resume_and_load(
+            &test_config(home.path()),
+            path,
+            ThreadId::from_string(&uuid.to_string()).expect("thread id"),
+        )
+        .await?;
+        recorder.shutdown().await?;
+        assert_eq!(errors, if missing_payload { 2 } else { 1 });
+        for notice in [items.last().unwrap(), resumed.last().unwrap()] {
+            let notice = serde_json::to_string(notice)?;
+            if missing_payload {
+                assert!(notice.contains(
+                    "2 unreadable rollout records were skipped. Integrity: malformed_records=1, trailing_partial_records=0, unresolved_payload_artifacts=1, complete=false. Unresolved payload artifacts"
+                ));
+            } else {
+                // Negative control: a gap without payload failures keeps its wording.
+                assert!(notice.contains(
+                    "1 malformed rollout records were skipped. Integrity: malformed_records=1, trailing_partial_records=0, complete=false. A trailing"
+                ));
+                assert!(!notice.contains("unresolved_payload_artifacts"));
+            }
+        }
+    }
+    Ok(())
+}
+
 #[tokio::test]
 async fn resume_integrity_distinguishes_interior_corruption_from_partial_tail()
 -> std::io::Result<()> {
@@ -3456,7 +3518,7 @@ async fn damaged_payloads_preserve_later_records_and_filename_thread_identity()
             serde_json::to_value(vec![later.clone()])?
         );
         assert_eq!(items.len(), 2);
-        assert_reconstruction_gap(items.last().unwrap(), 1);
+        assert_payload_reconstruction_gap(items.last().unwrap(), 1);
         assert_eq!(thread, Some(id));
         assert_eq!(errors, 1);
         assert!(matches!(

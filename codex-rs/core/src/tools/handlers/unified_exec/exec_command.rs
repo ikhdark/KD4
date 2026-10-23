@@ -89,6 +89,8 @@ async fn get_command_async(
 #[derive(Debug, Deserialize)]
 struct ExecCommandHookArgs {
     #[serde(default)]
+    env: std::collections::HashMap<String, String>,
+    #[serde(default)]
     cmd: Option<String>,
     #[serde(default)]
     kind: Option<String>,
@@ -115,11 +117,12 @@ impl ExecCommandHookArgs {
 }
 
 pub(super) fn exec_command_hook_input(arguments: &str) -> Option<serde_json::Value> {
-    parse_arguments::<ExecCommandHookArgs>(arguments)
-        .ok()?
-        .command_invocation()
-        .ok()
-        .map(|invocation| invocation.hook_input())
+    let args = parse_arguments::<ExecCommandHookArgs>(arguments).ok()?;
+    let mut input = args.command_invocation().ok()?.hook_input();
+    if !args.env.is_empty() {
+        input["env"] = serde_json::to_value(args.env).ok()?;
+    }
+    Some(input)
 }
 
 #[derive(Clone, Copy)]
@@ -268,25 +271,31 @@ pub(super) async fn attach_hidden_rg_directory_advisory(
         return;
     };
     let directory = cwd.to_path_buf();
-    let Ok(candidates) = crate::tools::run_blocking_command_analysis(move || {
-        crate::tools::handlers::command_search::skipped_hidden_rg_directories(&script, &directory)
+    let cancellation = CancellationToken::new();
+    let _cancel_on_drop = cancellation.clone().drop_guard();
+    let Ok(Some(visible)) = tokio::time::timeout(Duration::from_millis(25), async {
+        let candidates = crate::tools::run_blocking_command_analysis(move || {
+            crate::tools::handlers::command_search::skipped_hidden_rg_directories_with_cancellation(
+                &script, &directory, cancellation,
+            )
+        })
+        .await
+        .ok()?;
+        if candidates.is_empty() {
+            return None;
+        }
+        let root = workspace.resolve_workspace_root(cwd).await.ok()??;
+        let ignored = crate::git_workspace::git_ignored_paths(&root, &candidates).await;
+        Some(candidates
+            .into_iter()
+            .filter(|path| !ignored.contains(path))
+            .map(|path| path.display().to_string())
+            .collect::<Vec<_>>())
     })
     .await
     else {
         return;
     };
-    if candidates.is_empty() {
-        return;
-    }
-    let Ok(Some(root)) = workspace.resolve_workspace_root(cwd).await else {
-        return;
-    };
-    let ignored = crate::git_workspace::git_ignored_paths(&root, &candidates).await;
-    let visible: Vec<_> = candidates
-        .into_iter()
-        .filter(|path| !ignored.contains(path))
-        .map(|path| path.display().to_string())
-        .collect();
     if visible.is_empty() {
         return;
     }
@@ -333,7 +342,16 @@ impl ToolExecutor<ToolInvocation> for ExecCommandHandler {
     }
 
     fn handle(&self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'_> {
-        Box::pin(self.handle_call(invocation))
+        Box::pin(async move {
+            let started = std::time::Instant::now();
+            let result = codex_shell_command::PowershellAnalysisScope::default()
+                .scope(self.handle_call(invocation)).await;
+            tracing::info!(event.name = "codex.unified_exec.handler_elapsed", tool = "exec_command",
+                end_to_end_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                transport_success = result.is_ok(), endpoint = "handler_return",
+                "handler elapsed includes setup and finalization; distinct from observation wall_time");
+            result
+        })
     }
 }
 
@@ -366,7 +384,7 @@ impl ExecCommandHandler {
 
         let manager: &UnifiedExecProcessManager = &session.services.unified_exec_manager;
         let nested = matches!(source, ToolCallSource::CodeMode { .. });
-        let context = UnifiedExecContext::with_tracker(
+        let mut context = UnifiedExecContext::with_tracker(
             session.clone(),
             turn.clone(),
             call_id.clone(),
@@ -436,6 +454,7 @@ impl ExecCommandHandler {
                 parse_arguments(&arguments)?
             }
         };
+        context.env_overrides.clone_from(&args.env);
         let environment_is_remote = environment.is_remote();
         if environment_is_remote && !args.command_invocation().is_argv() {
             if turn_environment.shell.is_none() {
@@ -535,7 +554,7 @@ impl ExecCommandHandler {
         } else {
             original_resolved_command
         };
-        let validation_analysis = crate::validation::resolve_command_validation_with_shell(
+        let validation_analysis = crate::validation::resolve_command_launch_analysis_with_shell(
             &command_invocation,
             resolved_command.preflight_shell_type,
             if environment_is_remote {
@@ -604,10 +623,10 @@ impl ExecCommandHandler {
         });
         // Pure launch analyses share inputs but not results. Join them before
         // applying observation/approval policy; no process starts in this phase.
-        let (mut validation, search_narrowing, inspection_command) =
+        let ((mut validation, long_running), search_narrowing, inspection_command) =
             tokio::join!(validation_analysis, search_analysis, safety_analysis);
         args.apply_validation_observation_policy(
-            validation
+            long_running || validation
                 .as_ref()
                 .is_some_and(crate::validation::CommandValidation::is_validation),
         );
@@ -627,7 +646,7 @@ impl ExecCommandHandler {
         })?;
         validate_independent_review_shell(
             &turn.session_source,
-            inspection_command,
+            inspection_command && args.env.is_empty(),
             args.sandbox_permissions.requests_sandbox_override(),
             args.additional_permissions.is_some(),
         )
@@ -1383,6 +1402,19 @@ fn exec_command_error_output(
     error: &UnifiedExecError,
     repair: &str,
 ) -> Result<Box<dyn crate::tools::context::ToolOutput>, FunctionCallError> {
-    let message = format!("exec_command failed for `{command_for_display}`: {error}{repair}");
+    // Lead with the reason and bound the echoed command: a long script echoed
+    // first pushed the reason past the nested-result bound, so the model saw
+    // only the command it had just written.
+    const COMMAND_PREVIEW_CHARS: usize = 200;
+    let command = if command_for_display.chars().count() > COMMAND_PREVIEW_CHARS {
+        let preview = command_for_display
+            .chars()
+            .take(COMMAND_PREVIEW_CHARS)
+            .collect::<String>();
+        format!("`{preview}...` ({} bytes)", command_for_display.len())
+    } else {
+        format!("`{command_for_display}`")
+    };
+    let message = format!("exec_command failed: {error}{repair}\ncommand: {command}");
     Err(FunctionCallError::RespondToModel(message))
 }

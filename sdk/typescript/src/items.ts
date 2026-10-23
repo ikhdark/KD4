@@ -61,10 +61,26 @@ export type FileUpdateChange = {
 /** The status of a file change. */
 export type PatchApplyStatus = "in_progress" | "completed" | "failed" | "declined";
 
+/** A committed executor-qualified endpoint, not an intended review change. */
+export type FileChangeEffect = {
+  /** Canonical file URI in the selected execution environment. */
+  path: string;
+  before: string | null;
+  after: string | null;
+};
+
+export type FileChangeEffects = {
+  changes: FileChangeEffect[];
+  /** False means additional effects may be unknown, even when changes is empty. */
+  exact: boolean;
+};
+
 /** A set of file changes by the agent, from application start through completion. */
 export type FileChangeItem = {
   id: string;
   type: "file_change";
+  /** Settled effects; absent on in-progress or legacy items. */
+  effects?: FileChangeEffects;
   /** Individual file changes that comprise the patch. */
   changes: FileUpdateChange[];
   /** Whether the patch is running, succeeded, failed, or was declined. */

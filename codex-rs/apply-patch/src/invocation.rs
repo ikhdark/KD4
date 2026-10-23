@@ -145,13 +145,21 @@ fn maybe_parse_apply_patch(argv: &[String], cwd: &PathUri) -> MaybeApplyPatch {
 /// Callers can acquire that workspace's mutation guard before filesystem verification.
 /// Non-patch commands and invalid paths return `None`; verification reports their errors.
 pub fn apply_patch_command_cwd(argv: &[String], cwd: &PathUri) -> Option<PathUri> {
+    apply_patch_command_scope(argv, cwd).map(|(patch_cwd, _hunks)| patch_cwd)
+}
+
+/// Like [`apply_patch_command_cwd`], and also returns the parsed hunks, whose
+/// paths are relative to that directory, so callers can claim the patch's own
+/// endpoints rather than the whole workspace before verification.
+pub fn apply_patch_command_scope(argv: &[String], cwd: &PathUri) -> Option<(PathUri, Vec<Hunk>)> {
     let MaybeApplyPatch::Body(args) = maybe_parse_apply_patch(argv, cwd) else {
         return None;
     };
-    match args.workdir {
-        Some(dir) => cwd.join(&dir).ok(),
-        None => Some(cwd.clone()),
-    }
+    let patch_cwd = match args.workdir {
+        Some(dir) => cwd.join(&dir).ok()?,
+        None => cwd.clone(),
+    };
+    Some((patch_cwd, args.hunks))
 }
 
 /// `cwd` must identify an absolute environment-native path so relative patch paths can be
@@ -267,20 +275,35 @@ async fn try_verify_apply_patch_args(
         .into());
     }
 
-    validate_mutation_endpoints(&hunks, &effective_cwd, fs, sandbox).await?;
+    let previous_updates = validate_mutation_endpoints(&hunks, &effective_cwd, fs, sandbox).await?;
     // Preflight has already read every delete and update source and derived
     // each update, so the proposed changes reuse that snapshot.
-    let prepared = crate::preflight_hunks(&hunks, &effective_cwd, fs, sandbox).await?;
+    let prepared =
+        crate::preflight_hunks(&hunks, &previous_updates, &effective_cwd, fs, sandbox).await?;
+    let destination_preimages =
+        crate::capture_destination_preimages(&hunks, &effective_cwd, fs, sandbox).await?;
 
     let mut changes = HashMap::new();
-    for (hunk, prepared) in hunks.into_iter().zip(prepared) {
-        let path = hunk.resolve_path(&effective_cwd)?;
+    // Repeated updates of one file propose one change under the first hunk's
+    // path, from the source it read to the last hunk's result.
+    let mut first_updates = HashMap::new();
+    for (index, (hunk, prepared)) in hunks.into_iter().zip(prepared).enumerate() {
+        let mut path = hunk.resolve_path(&effective_cwd)?;
         let change = match (hunk, prepared) {
             (Hunk::AddFile { contents, .. }, _) => ApplyPatchFileChange::Add { content: contents },
             (Hunk::DeleteFile { .. }, Some(prepared)) => ApplyPatchFileChange::Delete {
                 content: prepared.original_contents,
             },
-            (Hunk::UpdateFile { move_path, .. }, Some(prepared)) => {
+            (Hunk::UpdateFile { move_path, .. }, Some(mut prepared)) => {
+                let first = crate::first_update(&previous_updates, index);
+                if first != index {
+                    if let Some((first_path, source)) = first_updates.get(&first) {
+                        path = PathUri::clone(first_path);
+                        prepared.original_contents = String::clone(source);
+                    }
+                } else if previous_updates.contains(&Some(index)) {
+                    first_updates.insert(index, (path.clone(), prepared.original_contents.clone()));
+                }
                 let ApplyPatchFileUpdate {
                     unified_diff,
                     content: new_content,
@@ -305,19 +328,23 @@ async fn try_verify_apply_patch_args(
     }
     Ok(ApplyPatchAction {
         changes,
+        destination_preimages,
         patch,
         cwd: effective_cwd,
     })
 }
 
 /// Check the complete endpoint set before either verified or standalone writes.
+/// Repeated `Update File` hunks without a move edit one file in sequence: for
+/// each hunk, the result names the earlier hunk whose result it edits.
 pub(crate) async fn validate_mutation_endpoints(
     hunks: &[Hunk],
     cwd: &PathUri,
     fs: &dyn ExecutorFileSystem,
     sandbox: Option<&codex_exec_server::FileSystemSandboxContext>,
-) -> Result<(), ApplyPatchError> {
+) -> Result<Vec<Option<usize>>, ApplyPatchError> {
     let mut mutation_endpoints = HashMap::new();
+    let mut previous_updates = vec![None; hunks.len()];
     for (hunk_index, hunk) in hunks.iter().enumerate() {
         let source_path = hunk.resolve_path(cwd)?;
         let move_path = match hunk {
@@ -327,12 +354,23 @@ pub(crate) async fn validate_mutation_endpoints(
             } => Some(cwd.join(&move_path.to_string_lossy())?),
             _ => None,
         };
+        let in_place = matches!(
+            hunk,
+            Hunk::UpdateFile {
+                move_path: None,
+                ..
+            }
+        );
 
         for path in std::iter::once(source_path).chain(move_path) {
             let identity = mutation_endpoint_identity(fs, &path, sandbox).await?;
-            if let Some((previous_path, previous_hunk)) =
-                mutation_endpoints.insert(identity, (path.clone(), hunk_index + 1))
+            if let Some((previous_path, previous_hunk, previous_in_place)) =
+                mutation_endpoints.insert(identity, (path.clone(), hunk_index + 1, in_place))
             {
+                if in_place && previous_in_place {
+                    previous_updates[hunk_index] = Some(previous_hunk - 1);
+                    continue;
+                }
                 let same_move = if previous_hunk == hunk_index + 1 {
                     "move source and destination identify the same path; "
                 } else {
@@ -349,7 +387,7 @@ pub(crate) async fn validate_mutation_endpoints(
         }
     }
 
-    Ok(())
+    Ok(previous_updates)
 }
 
 /// Resolve existing endpoints through links and resolve the closest existing
@@ -680,6 +718,40 @@ mod tests {
         );
         assert_eq!(
             apply_patch_command_cwd(&["apply_patch".to_string(), "invalid".to_string()], &cwd),
+            None
+        );
+    }
+
+    /// Audit 151: an intercepted patch exposes its own endpoints, relative to
+    /// the patch directory, without reading the filesystem.
+    #[test]
+    fn test_patch_command_scope_returns_hunks_relative_to_the_patch_cwd() {
+        let root = tempdir().unwrap();
+        let cwd = PathUri::from_host_native_path(root.path()).unwrap();
+        let patch =
+            wrap_patch("*** Add File: new.txt\n+hello\n*** Update File: old.txt\n@@\n-a\n+b");
+        let (patch_cwd, hunks) = apply_patch_command_scope(
+            &args_bash(&format!(
+                "cd child && apply_patch <<'PATCH'\n{patch}\nPATCH"
+            )),
+            &cwd,
+        )
+        .unwrap();
+        assert_eq!(patch_cwd, cwd.join("child").unwrap());
+        assert_eq!(
+            hunks
+                .iter()
+                .map(|hunk| match hunk {
+                    Hunk::AddFile { path, .. }
+                    | Hunk::DeleteFile { path }
+                    | Hunk::UpdateFile { path, .. } => path.clone(),
+                })
+                .collect::<Vec<_>>(),
+            vec![PathBuf::from("new.txt"), PathBuf::from("old.txt")]
+        );
+        assert!(!root.path().join("child").exists());
+        assert_eq!(
+            apply_patch_command_scope(&args_bash("echo hello"), &cwd),
             None
         );
     }
@@ -1189,6 +1261,7 @@ mod tests {
         assert_eq!(
             result,
             MaybeApplyPatchVerified::Body(ApplyPatchAction {
+                destination_preimages: HashMap::new(),
                 changes: HashMap::from([(
                     PathUri::from_host_native_path(session_dir.path().join(relative_path))
                         .expect("absolute test path"),
@@ -1457,6 +1530,47 @@ mod tests {
         .await;
 
         assert_duplicate_path_error(result, &cwd.join("same.txt").unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_verify_reports_repeated_updates_of_one_file_as_one_change() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("a.txt"), "before\nkeep\n").unwrap();
+        let cwd = PathUri::from_host_native_path(dir.path()).expect("absolute test path");
+        let patch = wrap_patch(
+            "*** Update File: a.txt\n@@\n-before\n+after\n*** Update File: ./a.txt\n@@\n-after\n+again",
+        );
+
+        let result = verify_apply_patch_args(
+            parse_patch(&patch).unwrap(),
+            &cwd,
+            LOCAL_FS.as_ref(),
+            /*sandbox*/ None,
+        )
+        .await;
+
+        let MaybeApplyPatchVerified::Body(action) = result else {
+            panic!("{result:?}")
+        };
+        assert_eq!(action.changes().len(), 1);
+        let Some(ApplyPatchFileChange::Update {
+            unified_diff,
+            move_path: None,
+            new_content,
+        }) = action.changes().get(&cwd.join("a.txt").unwrap())
+        else {
+            panic!("{:?}", action.changes())
+        };
+        assert_eq!(new_content, "again\nkeep\n");
+        assert!(
+            unified_diff.contains("-before") && unified_diff.contains("+again"),
+            "{unified_diff}"
+        );
+        assert!(!unified_diff.contains("after"), "{unified_diff}");
+        assert_eq!(
+            fs::read_to_string(dir.path().join("a.txt")).unwrap(),
+            "before\nkeep\n"
+        );
     }
 
     #[tokio::test]

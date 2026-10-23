@@ -10052,7 +10052,9 @@ async fn submission_loop_channel_close_aborts_active_turn_before_thread_stop_lif
                     input.thread_store.level_id()
                 );
                 assert_eq!(self.expected_turn_id, input.turn_store.level_id());
-                assert_eq!(TurnAbortReason::Interrupted, input.reason);
+                // Channel close tears the session down; extensions observe the
+                // same shutdown reason as the persisted terminal event.
+                assert_eq!(TurnAbortReason::SessionShutdown, input.reason);
                 self.calls
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -10095,6 +10097,70 @@ async fn submission_loop_channel_close_aborts_active_turn_before_thread_stop_lif
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     );
+}
+
+#[tokio::test]
+async fn shutdown_cancels_queued_user_input_as_session_shutdown() {
+    let (session, turn_context, events) = make_session_and_context_with_rx().await;
+    // Holding turn-start admission keeps the queued input's preparation
+    // pending, so Shutdown cancels it through the queued-submission path.
+    let admission = session
+        .task_start_gate
+        .acquire()
+        .await
+        .expect("task-start gate is open");
+    let (tx_sub, rx_sub) = async_channel::bounded(4);
+    let loop_handle = tokio::spawn(submission_loop(
+        Arc::clone(&session),
+        Arc::clone(&turn_context.config),
+        rx_sub,
+    ));
+    for (id, op) in [
+        (
+            "queued-input",
+            Op::UserInput {
+                items: vec![UserInput::Text {
+                    text: "queued".into(),
+                    text_elements: Vec::new(),
+                }],
+                final_output_json_schema: None,
+                responsesapi_client_metadata: None,
+                additional_context: Default::default(),
+                thread_settings: Default::default(),
+            },
+        ),
+        ("shutdown", Op::Shutdown),
+    ] {
+        tx_sub
+            .send(QueuedSubmission {
+                submission: Submission {
+                    id: id.to_string(),
+                    op,
+                    client_user_message_id: None,
+                    trace: None,
+                },
+                mailbox_admission: None,
+                preparation_permit: None,
+            })
+            .await
+            .expect("submission loop accepts the submission");
+    }
+    let aborted = timeout(StdDuration::from_secs(5), async {
+        loop {
+            if let EventMsg::TurnAborted(aborted) = events.recv().await.expect("event").msg {
+                break aborted;
+            }
+        }
+    })
+    .await
+    .expect("shutdown cancels the queued input");
+    assert_eq!(aborted.turn_id.as_deref(), Some("queued-input"));
+    assert_eq!(aborted.reason, TurnAbortReason::SessionShutdown);
+    drop(admission);
+    timeout(StdDuration::from_secs(15), loop_handle)
+        .await
+        .expect("submission loop finishes shutdown")
+        .expect("submission loop joins");
 }
 
 #[tokio::test]
@@ -10708,6 +10774,7 @@ where
         request_scaffold_cache: Default::default(),
         turn_config_cache: Default::default(),
         queued_tool_manifest_hash: Default::default(),
+        persisted_freshness_notice_digests: Default::default(),
         terminal_tasks: tokio_util::task::TaskTracker::new(),
         persistence_tasks: tokio_util::task::TaskTracker::new(),
         persistence_retirement_result: Default::default(),
@@ -13464,6 +13531,80 @@ async fn build_initial_context_polls_context_contributors_concurrently_and_appli
             crate::stable_context::turn_contribution_text(2, "concurrent turn second"),
         ]
     );
+}
+
+#[tokio::test]
+async fn context_estimates_overlap_scopes_but_contributions_remain_sequential() {
+    struct Contributor {
+        gate: Semaphore,
+        phase: std::sync::atomic::AtomicUsize,
+    }
+    impl codex_extension_api::ContextContributor for Contributor {
+        fn estimate_thread_context<'a>(
+            &'a self,
+            _: &'a codex_extension_api::ExtensionData,
+            _: &'a codex_extension_api::ExtensionData,
+        ) -> codex_extension_api::ExtensionFuture<'a, Vec<codex_extension_api::PromptFragment>> {
+            Box::pin(async move {
+                self.gate.acquire().await.expect("gate remains open").forget();
+                vec![codex_extension_api::PromptFragment::developer_policy("estimate thread")]
+            })
+        }
+
+        fn estimate_turn_context<'a>(
+            &'a self,
+            _: codex_extension_api::TurnContextContributionInput<'a>,
+        ) -> codex_extension_api::ExtensionFuture<'a, Vec<codex_extension_api::PromptFragment>> {
+            Box::pin(async move {
+                self.gate.add_permits(1);
+                vec![codex_extension_api::PromptFragment::developer_policy("estimate turn")]
+            })
+        }
+
+        fn contribute_thread_context<'a>(
+            &'a self,
+            _: &'a codex_extension_api::ExtensionData,
+            _: &'a codex_extension_api::ExtensionData,
+        ) -> codex_extension_api::ExtensionFuture<'a, Vec<codex_extension_api::PromptFragment>> {
+            Box::pin(async move {
+                tokio::task::yield_now().await;
+                assert_eq!(self.phase.swap(1, std::sync::atomic::Ordering::SeqCst), 0);
+                vec![codex_extension_api::PromptFragment::developer_policy("contribute thread")]
+            })
+        }
+
+        fn contribute_turn_context<'a>(
+            &'a self,
+            _: codex_extension_api::TurnContextContributionInput<'a>,
+        ) -> codex_extension_api::ExtensionFuture<'a, Vec<codex_extension_api::PromptFragment>> {
+            Box::pin(async move {
+                assert_eq!(self.phase.swap(2, std::sync::atomic::Ordering::SeqCst), 1);
+                vec![codex_extension_api::PromptFragment::developer_policy("contribute turn")]
+            })
+        }
+    }
+
+    let (mut session, turn_context) = make_session_and_context().await;
+    let contributor = Arc::new(Contributor {
+        gate: Semaphore::new(0),
+        phase: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let mut builder = codex_extension_api::ExtensionRegistryBuilder::new();
+    builder.prompt_contributor(contributor.clone());
+    session.services.extensions = Arc::new(builder.build());
+    for (estimate, prefix) in [(true, "estimate"), (false, "contribute")] {
+        let candidate = timeout(
+            Duration::from_secs(5),
+            session.build_context_candidate(&turn_context, &WorldState::default(), estimate, None, None),
+        )
+        .await
+        .expect("both scopes must complete without the contributor timeout");
+        assert_eq!(developer_input_texts(&candidate.turn_context_items), vec![
+            crate::stable_context::turn_contribution_text(1, &format!("{prefix} thread")),
+            crate::stable_context::turn_contribution_text(0, &format!("{prefix} turn")),
+        ]);
+    }
+    assert_eq!(contributor.phase.load(std::sync::atomic::Ordering::SeqCst), 2);
 }
 
 #[tokio::test]
@@ -22118,6 +22259,29 @@ async fn dispatched_without_terminal_usage_settles_unknown_once_in_owning_sessio
 }
 
 #[tokio::test]
+async fn current_turn_usage_is_known_after_restoring_a_legacy_ledger() {
+    let (session, turn) = make_session_and_context().await;
+    session.state.lock().await.set_token_info(Some(TokenUsageInfo {
+        total_token_usage: TokenUsage { input_tokens: 500, total_tokens: 500, ..Default::default() },
+        last_token_usage: TokenUsage::default(),
+        estimated_context_tokens: None,
+        model_context_window: Some(200_000),
+    }));
+    let usage = TokenUsage {
+        input_tokens: 100, cached_input_tokens: 40, output_tokens: 20, total_tokens: 120,
+        coverage: Some(codex_protocol::protocol::TokenUsageCoverage::fully_reported()),
+        ..Default::default()
+    };
+    session.record_token_usage_info(&turn, Some(&usage)).await.unwrap();
+    assert_eq!(session.token_usage_info().await.unwrap().total_token_usage.known_input(), None);
+    assert_eq!(turn.current_turn_usage(), usage);
+    session.record_missing_model_usage(&turn, 1).await;
+    assert_eq!(turn.current_turn_usage().known_total(), None);
+    let (_, next_turn) = make_session_and_context().await;
+    assert_eq!(next_turn.current_turn_usage(), TokenUsage::empty_ledger());
+}
+
+#[tokio::test]
 async fn missing_latest_receipt_preserves_subtotal_but_not_stale_last_usage() {
     let (session, turn) = make_session_and_context().await;
     let usage = TokenUsage {
@@ -22150,4 +22314,93 @@ async fn missing_latest_receipt_preserves_subtotal_but_not_stale_last_usage() {
     assert_eq!(public.total.input_tokens, 100);
     assert_eq!(public.total.coverage.unwrap().reported_receipts, Some(1));
     assert_eq!(public.last.coverage.unwrap().reported_receipts, Some(0));
+}
+#[tokio::test]
+async fn audit150_abandoned_observed_receipts_settle_once_without_changing_active_context() {
+    let (session, turn) = make_session_and_context().await;
+    let timing = &turn.turn_timing_state;
+    let wait = timing.begin_model_request_wait();
+    timing.mark_model_request_dispatched();
+    timing.record_model_attempt_identity("receipt-request", "physical-1");
+    let usage = TokenUsage { input_tokens:1000, cached_input_tokens:800, output_tokens:100,
+        reasoning_output_tokens:40, total_tokens:1100,
+        coverage:Some(codex_protocol::protocol::TokenUsageCoverage::fully_reported()) };
+    timing.record_model_attempt_token_usage("receipt-request", "physical-1", &usage);
+    drop(wait);
+    let before = session.token_usage_info().await.map(|info| info.context_tokens());
+    assert_eq!(session.settle_observed_model_usage(&turn).await, 1);
+    assert_eq!(session.settle_observed_model_usage(&turn).await, 0);
+    let info = session.token_usage_info().await.unwrap();
+    assert_eq!(info.total_token_usage, usage);
+    assert_eq!(info.last_token_usage, TokenUsage::default());
+    assert_eq!(info.estimated_context_tokens, None);
+    assert!(before.is_none_or(|tokens| tokens == info.context_tokens()));
+    // A late delivered duplicate cannot add this receipt again.
+    session.record_token_usage_info(&turn, Some(&usage)).await.unwrap();
+    assert_eq!(session.token_usage_info().await.unwrap().total_token_usage, usage);
+}
+
+#[tokio::test]
+async fn audit143_code_mode_dispatch_and_cancellation_progress_with_full_presentation_queue() -> anyhow::Result<()> {
+    use crate::session::step_context::StepContext;
+    use crate::tools::context::ToolDispatchState;
+    use crate::tools::context::ToolPayload;
+    use crate::tools::router::{ToolCall, ToolCallSource, ToolRouter, ToolRouterParams};
+    let (mut session, mut turn, _) = make_session_and_context_with_rx().await;
+    let (tx, events) = async_channel::bounded(1);
+    Arc::get_mut(&mut session).expect("unique fixture session").tx_event = tx;
+    Arc::get_mut(&mut turn).expect("unique fixture turn").model_info.tool_mode =
+        Some(codex_protocol::openai_models::ToolMode::CodeMode);
+    session.tx_event.send(Event { id: "sentinel".into(),
+        msg: EventMsg::Warning(WarningEvent { message: "occupied".into() }) }).await?;
+    let step = StepContext::for_test(Arc::clone(&turn));
+    let router = ToolRouter::try_from_context(&step, ToolRouterParams {
+        mcp_tools: None, deferred_mcp_tools: None, tool_suggest_candidates: None,
+        extension_tool_executors: Vec::new(), dynamic_tools: &[], exposure_identity: Default::default(),
+    }, &Default::default()).map_err(anyhow::Error::msg)?;
+    let cancellation = CancellationToken::new();
+    let mut pending = tokio::spawn({
+        let session = Arc::clone(&session);
+        let cancellation = cancellation.clone();
+        async move {
+            let dispatch = Arc::new(ToolDispatchState::new());
+            assert!(dispatch.try_admit());
+            router.dispatch_tool_call_with_terminal_outcome(session, step, cancellation,
+                Arc::new(tokio::sync::Mutex::new(crate::turn_diff_tracker::TurnDiffTracker::new())),
+                ToolCall { tool_name: codex_tools::ToolName::plain("exec"), call_id: "pressure".into(),
+                    payload: ToolPayload::Custom { input: "await new Promise(resolve => setTimeout(resolve, 60_000));".into() } },
+                ToolCallSource::Direct, dispatch).await.map(|result| result.result.log_preview())
+        }
+    });
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while !session.services.code_mode_service.has_waitable_cells_for_test() {
+            assert!(!pending.is_finished(), "exec must reach its dispatch gate");
+            tokio::task::yield_now().await;
+        }
+    }).await.expect("presentation acceptance must not gate dispatch readiness");
+    assert_eq!(events.len(), 1);
+    assert_eq!(events.recv().await?.id, "sentinel");
+    cancellation.cancel();
+    let mut lifecycle = Vec::new();
+    let mut observe = |event: Event| match event.msg {
+        EventMsg::ItemStarted(event) if matches!(event.item, TurnItem::DynamicToolCall(_)) => lifecycle.push("started"),
+        EventMsg::ItemCompleted(event) if matches!(event.item, TurnItem::DynamicToolCall(_)) => lifecycle.push("completed"),
+        _ => {}
+    };
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            tokio::select! {
+                biased;
+                event = events.recv() => observe(event.expect("presentation channel stays open")),
+                result = &mut pending => { result.expect("exec task joins").expect("cancelled cell is delivered"); break; }
+            }
+        }
+    }).await.expect("cancellation must drain required lifecycle publication");
+    while let Ok(event) = events.try_recv() { observe(event); }
+    assert_eq!(lifecycle, ["started", "completed"]);
+    assert!(!session.services.code_mode_service.has_waitable_cells_for_test());
+    session.terminal_tasks.close();
+    session.terminal_tasks.wait().await;
+    session.services.code_mode_service.shutdown().await.map_err(anyhow::Error::msg)?;
+    Ok(())
 }

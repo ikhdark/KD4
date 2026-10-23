@@ -80,8 +80,19 @@ pub(crate) fn convert_apply_patch_to_protocol(
     let mut result = HashMap::with_capacity(action.changes().len());
     for (path, change) in action.changes() {
         let protocol_change = match change {
-            ApplyPatchFileChange::Add { content, .. } => FileChange::Add {
-                content: content.clone(),
+            // Add File replaces an existing file. Approval and history show the
+            // verified content it displaces; application refuses if that changed.
+            ApplyPatchFileChange::Add { content, .. } => match action.destination_preimage(path) {
+                Some(existing) => FileChange::Update {
+                    unified_diff: similar::TextDiff::from_lines(existing, content.as_str())
+                        .unified_diff()
+                        .context_radius(1)
+                        .to_string(),
+                    move_path: None,
+                },
+                None => FileChange::Add {
+                    content: content.clone(),
+                },
             },
             ApplyPatchFileChange::Delete { content } => FileChange::Delete {
                 content: content.clone(),

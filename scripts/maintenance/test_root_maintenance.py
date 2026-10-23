@@ -182,6 +182,7 @@ class RootMaintenanceTest(unittest.TestCase):
                     "options": {"-B": 0, "-u": 0},
                     "allow_extra_args": True,
                     "operations": ["test"],
+                    "receipt_runner": "root_maintenance.unittest",
                 },
                 {
                     "programs": ["node"],
@@ -194,6 +195,7 @@ class RootMaintenanceTest(unittest.TestCase):
                     ],
                     "allow_extra_args": True,
                     "operations": ["test"],
+                    "receipt_runner": "root_maintenance.unittest",
                 },
             ],
         )
@@ -654,7 +656,9 @@ class RootMaintenanceTest(unittest.TestCase):
                     ),
                     expected,
                 )
-                run.assert_called_once_with([ordinary], [harbor], json_output=False)
+                run.assert_called_once_with(
+                    [ordinary], [harbor], json_output=False, source_observations=False
+                )
 
     def test_script_audit_uses_shared_test_environment_routing(self):
         maintenance = load_root_maintenance_module()
@@ -877,7 +881,7 @@ class StructuredMaintenanceTest(unittest.TestCase):
         )
         return module
 
-    def run_json(self, targets, *, missing_harbor=False):
+    def run_json(self, targets, *, missing_harbor=False, source_observations=False):
         original = self.owner._run_json_worker
         commands = []
 
@@ -903,10 +907,33 @@ class StructuredMaintenanceTest(unittest.TestCase):
                 [
                     "test-python",
                     "--json",
+                    *(["--source-observations"] if source_observations else []),
                     *(arg for target in targets for arg in ("--module", target)),
                 ]
             )
         return code, json.loads(self.output.getvalue()), commands
+
+    def test_json_source_observations_are_opt_in_and_keep_execution_evidence(self):
+        target = self.write_test("test_observation")
+        for observe in (False, True):
+            with self.subTest(observe=observe):
+                self.output.seek(0)
+                self.output.truncate()
+                code, report, commands = self.run_json(
+                    [target], source_observations=observe
+                )
+                self.assertEqual(code, 0)
+                self.assertTrue(report["complete"])
+                self.assertTrue(report["successful"])
+                self.assertEqual(report["tests_run"], 1)
+                self.assertEqual("--execution-only" in commands[0], not observe)
+                record = report["environments"][0]["report"]["tests"][0]
+                self.assertTrue(record["body_started"])
+                for key in ("content_before", "content_after"):
+                    if observe:
+                        self.assertEqual(len(record[key]["sha256"]), 64)
+                    else:
+                        self.assertIsNone(record[key])
 
     def test_json_mode_aggregates_real_workers_and_preserves_failure_details(self):
         ordinary = self.write_test("test_ordinary", "self.fail('assertion λ detail')")

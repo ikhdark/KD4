@@ -126,7 +126,7 @@ fn completed_poll_lifecycle_wall_clock() -> Result<()> {
                 ),
             )
             .await??;
-            let wall_ms = started.elapsed().as_secs_f64() * 1000.0;
+            let run_turn_ms = started.elapsed().as_secs_f64() * 1000.0;
             drop(slow_storage);
             assert_eq!(
                 result.last_agent_message.as_deref(),
@@ -181,6 +181,7 @@ fn completed_poll_lifecycle_wall_clock() -> Result<()> {
             assert_eq!(notice["historical_authenticity"], "authenticated");
             assert_eq!(notice["valid_for_current_workspace"], false);
             session.flush_tool_history_persistence().await?;
+            let wall_ms = started.elapsed().as_secs_f64() * 1000.0;
             let timing = turn.turn_timing_state.complete_snapshot().protocol_timing();
             let captures = session
                 .services
@@ -194,13 +195,14 @@ fn completed_poll_lifecycle_wall_clock() -> Result<()> {
             eprintln!(
                 "COMPLETED_POLL_LIFECYCLE {}",
                 serde_json::json!({
-                    "sample":sample, "wall_ms":wall_ms,
+                    "sample":sample, "wall_ms":wall_ms, "run_turn_ms":run_turn_ms,
                     "workspace_captures":captures,
                     "model_requests":sent.len(), "tool_calls":timing.tool_calls,
                     "input_bytes":sent.iter().map(|request| serde_json::to_vec(&request.input()).unwrap().len()).sum::<usize>(),
                     "exact_receipt":true, "exact_answer":true,
                     "provider":"loopback-scripted", "injected_capture_delay_ms":3000,
-                    "scope":"run_turn through authenticated poll, continuation and final answer",
+                    "required_persistence_included":true, "startup_included":false,
+                    "scope":"run_turn through authenticated poll, continuation, final answer and required tool-history persistence; excludes outer publication/delivery",
                 })
             );
         }
@@ -377,7 +379,7 @@ fn request_lifecycle_wall_clock() -> Result<()> {
                         ),
                     )
                     .await??;
-                    let wall_ms = started.elapsed().as_secs_f64() * 1000.0;
+                    let run_turn_ms = started.elapsed().as_secs_f64() * 1000.0;
                     let captures = session
                         .services
                         .git_workspace
@@ -424,13 +426,15 @@ fn request_lifecycle_wall_clock() -> Result<()> {
                         );
                     }
                     session.flush_tool_history_persistence().await?;
+                    let wall_ms = started.elapsed().as_secs_f64() * 1000.0;
                     eprintln!(
                         "REQUEST_LIFECYCLE {}",
                         serde_json::json!({
                             "workspace_evidence": workspace_evidence, "path_watches": path_watches, "sources_changed": sources_changed,
-                            "sample": sample, "wall_ms": wall_ms, "workspace_captures": captures,
+                            "sample": sample, "wall_ms": wall_ms, "run_turn_ms": run_turn_ms, "workspace_captures": captures,
                             "model_requests": sent.len(), "tool_calls": 1, "exact_answer": true,
-                            "provider": "loopback-scripted", "scope": "run_turn through tool continuation and final answer",
+                            "provider": "loopback-scripted", "required_persistence_included": true, "startup_included": false,
+                            "scope": "run_turn through tool continuation, final answer and required tool-history persistence; excludes outer publication/delivery",
                         })
                     );
                     assert_eq!(
@@ -641,7 +645,7 @@ fn request_preparation_large_failure_history_wall_clock() -> Result<()> {
                 ),
             )
             .await??;
-            let wall_ms = started.elapsed().as_secs_f64() * 1000.0;
+            let run_turn_ms = started.elapsed().as_secs_f64() * 1000.0;
             let sent = requests.requests();
             let mut errors = Vec::new();
             while let Ok(event) = events.try_recv() {
@@ -686,12 +690,14 @@ fn request_preparation_large_failure_history_wall_clock() -> Result<()> {
                         .is_some_and(|text| text.contains("Plan updated"))
             }));
             session.flush_tool_history_persistence().await?;
+            let wall_ms = started.elapsed().as_secs_f64() * 1000.0;
             eprintln!(
                 "REQUEST_FAILURE_HISTORY {}",
                 serde_json::json!({
-                    "sample": sample, "wall_ms": wall_ms, "history_bytes": payload.len() * 32,
+                    "sample": sample, "wall_ms": wall_ms, "run_turn_ms": run_turn_ms, "history_bytes": payload.len() * 32,
                     "model_requests": sent.len(), "tool_calls": 1, "exact_failures": true,
-                    "provider": "loopback-scripted", "scope": "run_turn through tool continuation and final answer",
+                    "provider": "loopback-scripted", "required_persistence_included": true, "startup_included": false,
+                    "scope": "run_turn through tool continuation, final answer and required tool-history persistence; excludes outer publication/delivery",
                 })
             );
         }

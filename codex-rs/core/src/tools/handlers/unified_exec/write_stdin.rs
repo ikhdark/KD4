@@ -79,15 +79,27 @@ impl ToolExecutor<ToolInvocation> for WriteStdinHandler {
     }
 
     fn handle(&self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'_> {
-        Box::pin(self.handle_call(invocation))
+        Box::pin(async move {
+            let started = std::time::Instant::now();
+            let result = self.handle_call(invocation).await;
+            tracing::info!(event.name = "codex.unified_exec.handler_elapsed", tool = "write_stdin",
+                end_to_end_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                transport_success = result.is_ok(), endpoint = "handler_return",
+                "handler elapsed includes queueing and finalization; distinct from observation wall_time");
+            result
+        })
     }
 }
 
 fn completed_process_output(
-    result: serde_json::Value,
+    mut result: serde_json::Value,
 ) -> Box<dyn crate::tools::context::ToolOutput> {
+    let retained_signal = result.as_object_mut().and_then(|result| result.remove("_sampling_request_signal"));
     let success = result["success"].as_bool().unwrap_or(false);
     let output = codex_tools::JsonToolOutput::with_success(result, Some(success));
+    if let Some(signal) = retained_signal {
+        return boxed_tool_output(output.with_sampling_request_signal(signal));
+    }
     if success {
         boxed_tool_output(output)
     } else {
@@ -95,6 +107,21 @@ fn completed_process_output(
             "outcome": "failure",
             "failure": {"fingerprint": "unified_exec.completed_process_recovery"}
         })))
+    }
+}
+
+#[cfg(test)]
+mod audit149_recovery_tests {
+    use super::*;
+
+    #[test]
+    fn recovered_signal_reaches_settlement_without_leaking_internal_metadata() {
+        let signal = serde_json::json!({"outcome":"success","command_validation":{"validation":true,"proof":true,"tests":false}});
+        let output = completed_process_output(serde_json::json!({"success":true,"exit_code":0,"_sampling_request_signal":signal}));
+        assert_eq!(output.sampling_request_signal(),Some(signal));
+        let response = output.to_response_item("recovered",&ToolPayload::Function { arguments:"{}".into() });
+        let codex_protocol::models::ResponseInputItem::FunctionCallOutput { output, .. } = response else { panic!("function result") };
+        assert!(!serde_json::to_string(&output).unwrap().contains("_sampling_request_signal"));
     }
 }
 
@@ -179,6 +206,8 @@ impl WriteStdinHandler {
             args.yield_time_ms,
             matches!(source, ToolCallSource::CodeMode { .. }),
         );
+        let passive_wait_started = std::time::Instant::now();
+        let mut observed_wall_time = std::time::Duration::ZERO;
         let response = loop {
             let request = WriteStdinRequest {
                 process_id: args.session_id,
@@ -191,7 +220,7 @@ impl WriteStdinHandler {
                 nested_deadline: source.nested_deadline(),
             };
             let manager = &session.services.unified_exec_manager;
-            let response = if wait_for_output {
+            let mut response = if wait_for_output {
                 manager
                     .write_stdin_until_output(request)
                     .or_cancel(&cancellation_token)
@@ -204,6 +233,10 @@ impl WriteStdinHandler {
             } else {
                 manager.write_stdin(request).await
             };
+            if let Ok(output) = &mut response {
+                observed_wall_time = observed_wall_time.saturating_add(output.wall_time);
+                output.wall_time = observed_wall_time;
+            }
             if !wait_for_output
                 || response.as_ref().map_or(true, |output| {
                     output.process_exited
@@ -282,6 +315,12 @@ impl WriteStdinHandler {
                 )));
             }
         };
+
+        if wait_for_output {
+            // A passive wait may span several manager observation windows.
+            // Report the entire owner wait, never just its final window.
+            response.wall_time = passive_wait_started.elapsed();
+        }
 
         if let Some(running) = session
             .services

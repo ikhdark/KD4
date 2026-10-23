@@ -1619,6 +1619,48 @@
         }
       ]
     },
+    "FileChangeEffect": {
+      "properties": {
+        "after": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "before": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "path": {
+          "$ref": "#/definitions/PathUri"
+        }
+      },
+      "required": [
+        "path"
+      ],
+      "type": "object"
+    },
+    "FileChangeEffects": {
+      "description": "Ordered committed endpoint receipts. `exact=false` means additional effects may be unknown; an empty list then is not proof that nothing changed.",
+      "properties": {
+        "changes": {
+          "items": {
+            "$ref": "#/definitions/FileChangeEffect"
+          },
+          "type": "array"
+        },
+        "exact": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "changes",
+        "exact"
+      ],
+      "type": "object"
+    },
     "FileUpdateChange": {
       "properties": {
         "diff": {
@@ -3288,6 +3330,54 @@
         }
       ]
     },
+    "ResponseQueueTiming": {
+      "description": "Observed host queue costs, NOT provider compute or additive wall-clock time. Sums include only enqueued/dequeued events; cancellation can censor a send or leave events queued. Terminal receipt is independent of provider usage.",
+      "properties": {
+        "dequeuedEvents": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "enqueueWaitNs": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "enqueuedEvents": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "maxEnqueueWaitNs": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "maxQueueResidenceNs": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "queueResidenceNs": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "terminalReceived": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "dequeuedEvents",
+        "enqueueWaitNs",
+        "enqueuedEvents",
+        "maxEnqueueWaitNs",
+        "maxQueueResidenceNs",
+        "queueResidenceNs",
+        "terminalReceived"
+      ],
+      "type": "object"
+    },
     "SandboxPolicy": {
       "oneOf": [
         {
@@ -4310,6 +4400,16 @@
                 "$ref": "#/definitions/FileUpdateChange"
               },
               "type": "array"
+            },
+            "effects": {
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/FileChangeEffects"
+                },
+                {
+                  "type": "null"
+                }
+              ]
             },
             "environment": {
               "anyOf": [
@@ -5617,6 +5717,17 @@
           },
           "type": "array"
         },
+        "taskDisposition": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/TurnTaskDisposition"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Versioned declared-scope verdict, independent of diagnostic severity. Missing on older records means unavailable, never inferred complete."
+        },
         "validationUncertainty": {
           "anyOf": [
             {
@@ -5991,6 +6102,68 @@
       ],
       "type": "string"
     },
+    "TurnTaskDisposition": {
+      "description": "Host assessment of a finite declared contract, not all natural-language intent.",
+      "properties": {
+        "artifact_state": {
+          "type": "string"
+        },
+        "authority": {
+          "type": "string"
+        },
+        "evidence_refs": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "input_revision": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "mutation_revision": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "plan_revision": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "request_state": {
+          "type": "string"
+        },
+        "schema_version": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "terminal_action": {
+          "type": "string"
+        },
+        "unmet_obligations": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "artifact_state",
+        "authority",
+        "evidence_refs",
+        "mutation_revision",
+        "request_state",
+        "schema_version",
+        "terminal_action",
+        "unmet_obligations"
+      ],
+      "type": "object"
+    },
     "TurnTiming": {
       "description": "Immutable wall-clock profile captured at the core terminal boundary.\n\n`exclusive` is the canonical elapsed-time partition. Values in `unions` and `local` may overlap and must not be added to that partition.",
       "properties": {
@@ -6312,6 +6485,45 @@
       ],
       "type": "object"
     },
+    "TurnTimingActivitySummary": {
+      "properties": {
+        "endNs": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "exclusiveNs": {
+          "additionalProperties": {
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "description": "Canonical exclusive phase names to durations; sums to end minus start.",
+          "type": "object"
+        },
+        "startNs": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "unionsNs": {
+          "additionalProperties": {
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "description": "Union durations named after interval flags, plus modelProcessOverlap and modelToolOverlap. Missing keys are measured zero, not unknown. Values overlap and must not be added to the exclusive partition.",
+          "type": "object"
+        }
+      },
+      "required": [
+        "endNs",
+        "exclusiveNs",
+        "startNs",
+        "unionsNs"
+      ],
+      "type": "object"
+    },
     "TurnTimingAttemptKind": {
       "enum": [
         "primary",
@@ -6372,6 +6584,13 @@
           "type": "integer"
         },
         "clockRegressionCount": {
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "continuationAfterTruncationCount": {
+          "default": 0,
+          "description": "Tool-result generations immediately following provider-visible output that actually omitted or truncated canonical tool information. Temporal succession only: this does not establish an extra generation caused by truncation. Historical causal spelling is accepted on input.",
           "format": "uint32",
           "minimum": 0.0,
           "type": "integer"
@@ -6737,13 +6956,6 @@
         },
         "toolRouterReuseCount": {
           "default": 0,
-          "format": "uint32",
-          "minimum": 0.0,
-          "type": "integer"
-        },
-        "truncationInducedContinuationCount": {
-          "default": 0,
-          "description": "Tool-result generations immediately following provider-visible output that actually omitted or truncated canonical tool information.",
           "format": "uint32",
           "minimum": 0.0,
           "type": "integer"
@@ -7385,6 +7597,33 @@
             "null"
           ]
         },
+        "firstAssistantTextItemId": {
+          "description": "Item identity when supplied by the published event.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "firstAssistantTextMs": {
+          "description": "First nonempty assistant text accepted by the post-filter host queue; reasoning, completed messages and native paint are separate milestones.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "firstAssistantTextPhase": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/MessagePhase"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Phase when supplied by the published event; absent is unknown."
+        },
         "firstDomainActionMs": {
           "default": null,
           "description": "Time from turn start until the first authorized domain-work handler is entered.",
@@ -7407,6 +7646,15 @@
         },
         "firstModelOutputMs": {
           "default": null,
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "firstRequestPreparationStartedMs": {
+          "description": "First ordinary request-preparation entry before any provider dispatch. The preceding span includes initial turn setup, not provider work.",
           "format": "uint64",
           "minimum": 0.0,
           "type": [
@@ -7506,6 +7754,15 @@
         },
         "firstVisibleOutputMs": {
           "default": null,
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "turnWorkerStartedMs": {
+          "description": "Worker entry after the task-installation barrier, from turn start. Absent is unknown; it must not be reconstructed from wall timestamps.",
           "format": "uint64",
           "minimum": 0.0,
           "type": [
@@ -7741,6 +7998,16 @@
             "type": "string"
           },
           "description": "Provider response IDs retained so offline replay preserves websocket continuation requests rather than inventing new response identities.",
+          "type": "object"
+        },
+        "responseQueueTimingByAttempt": {
+          "additionalProperties": {
+            "additionalProperties": {
+              "$ref": "#/definitions/ResponseQueueTiming"
+            },
+            "type": "object"
+          },
+          "description": "Host queue observations by physical attempt, then api_to_mapper or mapper_to_turn stage. Missing stages are unknown, not zero. Queue sums overlap provider work and each other; never subtract them from model wait to invent provider computation time.",
           "type": "object"
         },
         "samplingRequestId": {
@@ -8221,8 +8488,22 @@
             "null"
           ]
         },
+        "coarseIntervals": {
+          "description": "Complete, bounded suffix summaries after exact interval retention fills. Order inside a summary is unknown. Checkpoints carry the entire current suffix, replacing (not appending to) the preceding coarse snapshot.",
+          "items": {
+            "$ref": "#/definitions/TurnTimingActivitySummary"
+          },
+          "type": "array"
+        },
         "coverageComplete": {
           "type": "boolean"
+        },
+        "coverageIncludingCoarseComplete": {
+          "description": "Complete elapsed coverage including coarse summaries, not exact ordering. Absent for legacy records; independent of exact `coverage_complete`.",
+          "type": [
+            "boolean",
+            "null"
+          ]
         },
         "droppedIntervals": {
           "format": "uint64",

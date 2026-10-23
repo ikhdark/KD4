@@ -62,6 +62,11 @@ pub(crate) async fn process_compacted_history_with_retained_input(
     // cacheable prompt prefix while still leaving the summary or compaction item last.
     let (initial_context, world_state_baseline, fragment_digests) =
         build_compaction_initial_context(sess, turn_context, initial_context_injection).await;
+    if !crate::compact::has_authoritative_task_state_context(&initial_context)
+        && let Some(plan) = crate::compact::retained_plan_context(sess).await?
+    {
+        retained_input.push(plan);
+    }
 
     // Only provider output is subject to the consumed-transcript filter. Local
     // task context has already been selected against its own retention budget.

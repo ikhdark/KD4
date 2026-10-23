@@ -43,6 +43,7 @@ pub fn build_file_change_approval_request_item(
     payload: &ApplyPatchApprovalRequestEvent,
 ) -> ThreadItem {
     ThreadItem::FileChange {
+        effects: None,
         environment: None,
         id: payload.call_id.clone(),
         changes: convert_patch_changes(&payload.changes),
@@ -52,6 +53,7 @@ pub fn build_file_change_approval_request_item(
 
 pub fn build_file_change_begin_item(payload: &PatchApplyBeginEvent) -> ThreadItem {
     ThreadItem::FileChange {
+        effects: None,
         environment: payload.environment.clone(),
         id: payload.call_id.clone(),
         changes: convert_patch_changes(&payload.changes),
@@ -61,6 +63,7 @@ pub fn build_file_change_begin_item(payload: &PatchApplyBeginEvent) -> ThreadIte
 
 pub fn build_file_change_end_item(payload: &PatchApplyEndEvent) -> ThreadItem {
     ThreadItem::FileChange {
+        effects: None,
         environment: payload.environment.clone(),
         id: payload.call_id.clone(),
         changes: convert_patch_changes(&payload.changes),

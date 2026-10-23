@@ -36,6 +36,12 @@ pub enum ApiError {
         message: String,
         delay: Option<RetryAfter>,
     },
+    #[error("websocket request rejected: {message}")]
+    WebsocketRejected {
+        reason: codex_protocol::error::WebsocketRecoveryReason,
+        message: String,
+        delay: Option<RetryAfter>,
+    },
     #[error("rate limit: {0}")]
     RateLimit(String),
     #[error("invalid request: {message}")]

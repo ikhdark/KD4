@@ -3963,6 +3963,7 @@ async fn thread_resume_replays_pending_file_change_request_approval() -> Result<
     assert!(!environment.owner_id.is_empty());
     let expected_file_change = ThreadItem::FileChange {
         environment: Some(environment.clone()),
+        effects: None,
         id: "patch-call".to_string(),
         changes: vec![codex_app_server_protocol::FileUpdateChange {
             path: expected_readme_path.to_string_lossy().into_owned(),

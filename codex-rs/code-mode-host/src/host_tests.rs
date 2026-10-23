@@ -607,6 +607,7 @@ async fn admitted_delegate_burst_survives_a_stalled_client_reader() {
             kind: WireToolKind::Function,
             input_schema: None,
             output_schema: None,
+            namespace_description: None,
             default_timeout_ms: None,
         };
         for id in 0..CELLS {
@@ -1191,6 +1192,72 @@ async fn active_cell_limit_rejects_execute_without_disconnecting() {
     );
     assert!(!peer.is_disconnected());
     state.disconnect().await;
+}
+
+#[tokio::test]
+async fn saturated_admission_defers_session_close_instead_of_failing_the_connection() {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let (outgoing_tx, mut outgoing_rx) = mpsc::channel(16);
+        let peer = Arc::new(HostPeer::new(outgoing_tx));
+        let state = Arc::new(HostState {
+            catalogs: Mutex::new(HashMap::new()),
+            sessions: Mutex::new(HashMap::new()),
+            seen_session_ids: Mutex::new(SeenSessionIds::default()),
+            requests: Mutex::new(RequestRegistry::default()),
+            request_tasks: TaskTracker::new(),
+            request_permits: Arc::new(Semaphore::new(/*permits*/ 0)),
+            active_cell_permits: Arc::new(Semaphore::new(MAX_ACTIVE_CELLS)),
+            closing: AtomicBool::new(false),
+            peer: Arc::clone(&peer),
+        });
+        let session = session_id("saturated-close");
+        state.open_session(session.clone()).expect("open session");
+
+        // The client fails every session on the connection for a close error
+        // other than pending, so admission pressure must not produce one.
+        state
+            .spawn_request(
+                request_id(/*value*/ 1),
+                HostRequest::ShutdownSession {
+                    session_id: session.clone(),
+                },
+            )
+            .expect("spawn shutdown request");
+        assert_eq!(
+            decode_frame(outgoing_rx.recv().await.expect("shutdown response")).await,
+            HostToClient::Response {
+                id: request_id(/*value*/ 1),
+                result: WireResult::Err {
+                    message: codex_code_mode_protocol::host::SESSION_SHUTDOWN_PENDING.to_string(),
+                },
+            }
+        );
+        assert!(state.session(&session).is_ok(), "nothing was closed");
+
+        // Data-plane requests keep the ordinary admission error.
+        state
+            .spawn_request(
+                request_id(/*value*/ 2),
+                HostRequest::Execute {
+                    session_id: session.clone(),
+                    request: execute_request("text('never admitted');"),
+                },
+            )
+            .expect("spawn execute request");
+        assert_eq!(
+            decode_frame(outgoing_rx.recv().await.expect("execute response")).await,
+            HostToClient::Response {
+                id: request_id(/*value*/ 2),
+                result: WireResult::Err {
+                    message: "code-mode host has too many in-flight requests".to_string(),
+                },
+            }
+        );
+        assert!(!peer.is_disconnected());
+        state.disconnect().await;
+    })
+    .await
+    .expect("saturated admission lifecycle");
 }
 
 #[tokio::test]

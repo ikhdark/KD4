@@ -88,8 +88,8 @@ pub async fn handle(
     }
     let reporting_thread_id = session.thread_id.to_string();
     let stop = args.stop.unwrap_or(false);
-    let accepted = db
-        .report_agent_job_item_result_and_maybe_cancel(
+    let acknowledgment = db
+        .report_agent_job_item_result_with_receipt(
             args.job_id.as_str(),
             args.item_id.as_str(),
             reporting_thread_id.as_str(),
@@ -105,9 +105,11 @@ pub async fn handle(
                 "failed to record agent job result for {job_id} / {item_id}: {err}"
             ))
         })?;
+    let accepted = acknowledgment.is_some();
     let content =
         serde_json::to_string(&ReportAgentJobResultToolResult {
             accepted,
+            acknowledgment,
             rejection_reason: (!accepted).then_some("No running item owned by this worker accepted the report. The job or assignment may have ended or changed, or a report may already exist. Do not automatically replay; inspect the job or report the submission blocker."),
         }).map_err(|err| {
             FunctionCallError::Fatal(format!(

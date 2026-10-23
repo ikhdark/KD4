@@ -810,7 +810,7 @@ impl RolloutLineReader {
             return Ok(None);
         };
         self.last_line_terminated = terminated;
-        if !line.contains("rollout_payload_artifact") {
+        if !crate::payload_artifact::may_be_reference(&line) {
             return Ok(Some(line));
         }
         let path = self.path.clone();

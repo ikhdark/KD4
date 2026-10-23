@@ -70,13 +70,15 @@ fn filtered_walk_preserves_requested_file_coverage_and_prunes_only_explicit_dire
     assert_eq!(outcome.applied_filters, Some(opts.filters));
     assert!(!outcome.truncated);
     assert!(outcome.errors.is_empty());
+    // Include patterns return matching files only; `.hidden` is traversed
+    // (see the reads below) but not listed.
     assert_eq!(
         outcome
             .entries
             .iter()
             .map(|entry| entry.path.clone())
             .collect::<Vec<_>>(),
-        [".hidden", "a.rs", "λ.rs", ".hidden/c.rs"].map(|name| root().join(name).unwrap())
+        ["a.rs", "λ.rs", ".hidden/c.rs"].map(|name| root().join(name).unwrap())
     );
     assert_eq!(
         fs.limits
@@ -108,8 +110,110 @@ fn filters_do_not_hide_budget_cutoffs_or_exclude_the_selected_root() {
         assert_eq!(outcome.truncated, limited);
         assert_eq!(fs.limits.lock().unwrap().len(), 1);
         if limited {
-            assert_eq!(outcome.unexplored[0].reason, "entry_limit");
+            // Include patterns spend max_entries only on matches, so a producer
+            // cutoff here is the separate raw-examination bound.
+            assert_eq!(outcome.unexplored[0].reason, "examination_limit");
         }
+    }
+}
+
+#[test]
+fn include_filters_traverse_unlisted_directories_and_spend_max_entries_only_on_matches() {
+    let file = |name: &str| WalkEntry {
+        path: root().join(name).unwrap(),
+        kind: WalkEntryKind::File,
+    };
+    let directory = |name: &str| WalkEntry {
+        path: root().join(name).unwrap(),
+        kind: WalkEntryKind::Directory,
+    };
+    let include = WalkFilters {
+        include: vec!["*.md".into()],
+        ..Default::default()
+    };
+    let exclude = WalkFilters {
+        exclude: vec!["*.txt".into()],
+        ..Default::default()
+    };
+    for (filters, max_entries, expected_entries, expected_unexplored, read_limits) in [
+        // Seven misses must not exhaust a two-match budget. Reads stay bounded
+        // by the walk's hard maximum (50,000) rather than by max_entries.
+        (
+            include.clone(),
+            2,
+            vec![file("dir/AGENTS.md"), file("dir/dir/notes.md")],
+            vec![],
+            [50_000, 49_996, 49_993],
+        ),
+        // A match beyond max_entries is a reported cutoff, not a silent drop.
+        (
+            include,
+            1,
+            vec![file("dir/AGENTS.md")],
+            vec![WalkStop {
+                path: root().join("dir/dir").unwrap(),
+                reason: "entry_limit".into(),
+                effective_limit: 1,
+                partially_examined: true,
+            }],
+            [50_000, 49_996, 49_993],
+        ),
+        // Exclude-only filters still list directories and charge every
+        // examined entry against max_entries.
+        (
+            exclude,
+            20,
+            vec![
+                directory("dir"),
+                file("dir/AGENTS.md"),
+                directory("dir/dir"),
+                file("dir/dir/notes.md"),
+            ],
+            vec![],
+            [20, 16, 13],
+        ),
+    ] {
+        let fs = TestFileSystem {
+            batches: Mutex::new(VecDeque::from([
+                ReadDirectoryOutcome {
+                    entries: ["dir", "a.txt", "b.txt", "c.txt"]
+                        .into_iter()
+                        .map(entry)
+                        .collect(),
+                    entries_examined: 4,
+                    limit_reached: false,
+                },
+                ReadDirectoryOutcome {
+                    entries: ["x.txt", "dir", "AGENTS.md"]
+                        .into_iter()
+                        .map(entry)
+                        .collect(),
+                    entries_examined: 3,
+                    limit_reached: false,
+                },
+                ReadDirectoryOutcome {
+                    entries: ["y.txt", "notes.md"].into_iter().map(entry).collect(),
+                    entries_examined: 2,
+                    limit_reached: false,
+                },
+            ])),
+            ..Default::default()
+        };
+        let mut opts = options(max_entries);
+        opts.filters = filters;
+        let outcome = block_on(fs.walk(&root(), opts, None)).unwrap();
+        assert_eq!(outcome.entries, expected_entries);
+        assert!(outcome.errors.is_empty());
+        assert_eq!(outcome.truncated, !expected_unexplored.is_empty());
+        assert_eq!(outcome.unexplored, expected_unexplored);
+        assert_eq!(
+            *fs.limits.lock().unwrap(),
+            [
+                (root(), read_limits[0]),
+                (root().join("dir").unwrap(), read_limits[1]),
+                (root().join("dir/dir").unwrap(), read_limits[2]),
+            ]
+        );
     }
 }
 

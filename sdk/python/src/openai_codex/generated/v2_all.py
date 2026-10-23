@@ -3368,6 +3368,19 @@ class OtherResponseItem(BaseModel):
     type: Annotated[Literal["other"], Field(title="OtherResponseItemType")]
 
 
+class ResponseQueueTiming(BaseModel):
+    model_config = ConfigDict(
+        populate_by_name=True,
+    )
+    dequeued_events: Annotated[int, Field(alias="dequeuedEvents", ge=0)]
+    enqueue_wait_ns: Annotated[int, Field(alias="enqueueWaitNs", ge=0)]
+    enqueued_events: Annotated[int, Field(alias="enqueuedEvents", ge=0)]
+    max_enqueue_wait_ns: Annotated[int, Field(alias="maxEnqueueWaitNs", ge=0)]
+    max_queue_residence_ns: Annotated[int, Field(alias="maxQueueResidenceNs", ge=0)]
+    queue_residence_ns: Annotated[int, Field(alias="queueResidenceNs", ge=0)]
+    terminal_received: Annotated[bool, Field(alias="terminalReceived")]
+
+
 class SearchResponsesApiWebSearchAction(BaseModel):
     model_config = ConfigDict(
         populate_by_name=True,
@@ -4925,6 +4938,22 @@ class TurnSteerResponse(BaseModel):
     turn_id: Annotated[str, Field(alias="turnId")]
 
 
+class TurnTaskDisposition(BaseModel):
+    model_config = ConfigDict(
+        populate_by_name=True,
+    )
+    artifact_state: str
+    authority: str
+    evidence_refs: list[str]
+    input_revision: str | None = None
+    mutation_revision: Annotated[int, Field(ge=0)]
+    plan_revision: str | None = None
+    request_state: str
+    schema_version: Annotated[int, Field(ge=0)]
+    terminal_action: str
+    unmet_obligations: list[str]
+
+
 class TurnTimingActivityInterval(BaseModel):
     model_config = ConfigDict(
         populate_by_name=True,
@@ -4949,6 +4978,28 @@ class TurnTimingActivityInterval(BaseModel):
     ]
     start_ns: Annotated[int, Field(alias="startNs", ge=0)]
     tool_active: Annotated[bool, Field(alias="toolActive")]
+
+
+class TurnTimingActivitySummary(BaseModel):
+    model_config = ConfigDict(
+        populate_by_name=True,
+    )
+    end_ns: Annotated[int, Field(alias="endNs", ge=0)]
+    exclusive_ns: Annotated[
+        dict[str, int],
+        Field(
+            alias="exclusiveNs",
+            description="Canonical exclusive phase names to durations; sums to end minus start.",
+        ),
+    ]
+    start_ns: Annotated[int, Field(alias="startNs", ge=0)]
+    unions_ns: Annotated[
+        dict[str, int],
+        Field(
+            alias="unionsNs",
+            description="Union durations named after interval flags, plus modelProcessOverlap and modelToolOverlap. Missing keys are measured zero, not unknown. Values overlap and must not be added to the exclusive partition.",
+        ),
+    ]
 
 
 class TurnTimingAttemptKind(Enum):
@@ -5228,6 +5279,28 @@ class TurnTimingMilestones(BaseModel):
         int | None, Field(alias="firstActionableOutputMs", ge=0)
     ] = None
     first_agent_message_ms: Annotated[int | None, Field(alias="firstAgentMessageMs", ge=0)] = None
+    first_assistant_text_item_id: Annotated[
+        str | None,
+        Field(
+            alias="firstAssistantTextItemId",
+            description="Item identity when supplied by the published event.",
+        ),
+    ] = None
+    first_assistant_text_ms: Annotated[
+        int | None,
+        Field(
+            alias="firstAssistantTextMs",
+            description="First nonempty assistant text accepted by the post-filter host queue; reasoning, completed messages and native paint are separate milestones.",
+            ge=0,
+        ),
+    ] = None
+    first_assistant_text_phase: Annotated[
+        MessagePhase | None,
+        Field(
+            alias="firstAssistantTextPhase",
+            description="Phase when supplied by the published event; absent is unknown.",
+        ),
+    ] = None
     first_domain_action_ms: Annotated[
         int | None,
         Field(
@@ -5245,6 +5318,14 @@ class TurnTimingMilestones(BaseModel):
         ),
     ] = None
     first_model_output_ms: Annotated[int | None, Field(alias="firstModelOutputMs", ge=0)] = None
+    first_request_preparation_started_ms: Annotated[
+        int | None,
+        Field(
+            alias="firstRequestPreparationStartedMs",
+            description="First ordinary request-preparation entry before any provider dispatch. The preceding span includes initial turn setup, not provider work.",
+            ge=0,
+        ),
+    ] = None
     first_successful_domain_action_ms: Annotated[
         int | None,
         Field(
@@ -5318,6 +5399,14 @@ class TurnTimingMilestones(BaseModel):
         ),
     ] = None
     first_visible_output_ms: Annotated[int | None, Field(alias="firstVisibleOutputMs", ge=0)] = None
+    turn_worker_started_ms: Annotated[
+        int | None,
+        Field(
+            alias="turnWorkerStartedMs",
+            description="Worker entry after the task-installation barrier, from turn start. Absent is unknown; it must not be reconstructed from wall timestamps.",
+            ge=0,
+        ),
+    ] = None
     user_input_recorded_ms: Annotated[
         int | None,
         Field(
@@ -5424,7 +5513,21 @@ class TurnTimingTimeline(BaseModel):
             description="Absent for clocks without proven alignment (including legacy records).",
         ),
     ] = None
+    coarse_intervals: Annotated[
+        list[TurnTimingActivitySummary] | None,
+        Field(
+            alias="coarseIntervals",
+            description="Complete, bounded suffix summaries after exact interval retention fills. Order inside a summary is unknown. Checkpoints carry the entire current suffix, replacing (not appending to) the preceding coarse snapshot.",
+        ),
+    ] = None
     coverage_complete: Annotated[bool, Field(alias="coverageComplete")]
+    coverage_including_coarse_complete: Annotated[
+        bool | None,
+        Field(
+            alias="coverageIncludingCoarseComplete",
+            description="Complete elapsed coverage including coarse summaries, not exact ordering. Absent for legacy records; independent of exact `coverage_complete`.",
+        ),
+    ] = None
     dropped_intervals: Annotated[int, Field(alias="droppedIntervals", ge=0)]
     duration_ns: Annotated[int, Field(alias="durationNs", ge=0)]
     intervals: list[TurnTimingActivityInterval]
@@ -7101,6 +7204,23 @@ class ExternalAgentConfigImportTypeResult(BaseModel):
     successes: list[ExternalAgentConfigImportItemTypeSuccess]
 
 
+class FileChangeEffect(BaseModel):
+    model_config = ConfigDict(
+        populate_by_name=True,
+    )
+    after: str | None = None
+    before: str | None = None
+    path: PathUri
+
+
+class FileChangeEffects(BaseModel):
+    model_config = ConfigDict(
+        populate_by_name=True,
+    )
+    changes: list[FileChangeEffect]
+    exact: bool
+
+
 class SpecialFileSystemPathForAbsolutePathBuf(BaseModel):
     model_config = ConfigDict(
         populate_by_name=True,
@@ -8320,6 +8440,7 @@ class FileChangeThreadItem(BaseModel):
         populate_by_name=True,
     )
     changes: list[FileUpdateChange]
+    effects: FileChangeEffects | None = None
     environment: EnvironmentProvenance | None = None
     id: str
     status: PatchApplyStatus
@@ -8691,6 +8812,13 @@ class TurnCompletionAssessment(BaseModel):
     )
     advisories: list[str]
     failed_checks: Annotated[list[str], Field(alias="failedChecks")]
+    task_disposition: Annotated[
+        TurnTaskDisposition | None,
+        Field(
+            alias="taskDisposition",
+            description="Versioned declared-scope verdict, independent of diagnostic severity. Missing on older records means unavailable, never inferred complete.",
+        ),
+    ] = None
     validation_uncertainty: Annotated[
         TurnValidationUncertainty | None,
         Field(
@@ -8862,6 +8990,14 @@ class TurnTimingCounters(BaseModel):
         ),
     ] = 0
     clock_regression_count: Annotated[int, Field(alias="clockRegressionCount", ge=0)]
+    continuation_after_truncation_count: Annotated[
+        int | None,
+        Field(
+            alias="continuationAfterTruncationCount",
+            description="Tool-result generations immediately following provider-visible output that actually omitted or truncated canonical tool information. Temporal succession only: this does not establish an extra generation caused by truncation. Historical causal spelling is accepted on input.",
+            ge=0,
+        ),
+    ] = 0
     executed_validation_count: Annotated[
         int | None,
         Field(
@@ -9076,14 +9212,6 @@ class TurnTimingCounters(BaseModel):
         int | None, Field(alias="toolRouterRebuildCount", ge=0)
     ] = 0
     tool_router_reuse_count: Annotated[int | None, Field(alias="toolRouterReuseCount", ge=0)] = 0
-    truncation_induced_continuation_count: Annotated[
-        int | None,
-        Field(
-            alias="truncationInducedContinuationCount",
-            description="Tool-result generations immediately following provider-visible output that actually omitted or truncated canonical tool information.",
-            ge=0,
-        ),
-    ] = 0
     user_input_wait_count: Annotated[int, Field(alias="userInputWaitCount", ge=0)]
     wait_generations_with_same_revision_count: Annotated[
         int | None,
@@ -10397,6 +10525,13 @@ class TurnTimingModelRequest(BaseModel):
         Field(
             alias="responseIdByAttempt",
             description="Provider response IDs retained so offline replay preserves websocket continuation requests rather than inventing new response identities.",
+        ),
+    ] = None
+    response_queue_timing_by_attempt: Annotated[
+        dict[str, dict[str, ResponseQueueTiming]] | None,
+        Field(
+            alias="responseQueueTimingByAttempt",
+            description="Host queue observations by physical attempt, then api_to_mapper or mapper_to_turn stage. Missing stages are unknown, not zero. Queue sums overlap provider work and each other; never subtract them from model wait to invent provider computation time.",
         ),
     ] = None
     sampling_request_id: Annotated[

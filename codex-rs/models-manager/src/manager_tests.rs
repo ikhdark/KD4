@@ -159,6 +159,38 @@ async fn initial_refresh_still_gates_cold_expired_changed_identity_and_online_co
     }
 }
 
+#[tokio::test]
+async fn eligible_disk_catalog_precedes_initial_refresh_gate() {
+    let home = tempdir().unwrap();
+    let models = vec![remote_model("disk-before-gate", "Disk", 1)];
+    let endpoint = TestModelsEndpoint::new(vec![models.clone()]);
+    let writer = openai_manager_for_tests(home.path().into(), endpoint.clone());
+    writer
+        .refresh_available_models(RefreshStrategy::Online, &DEFAULT_HTTP_CLIENT_FACTORY)
+        .await
+        .unwrap();
+    assert_eq!(endpoint.fetch_count(), 1);
+
+    for strategy in [RefreshStrategy::Offline, RefreshStrategy::OnlineIfUncached] {
+        let endpoint = TestModelsEndpoint::new(vec![]);
+        let reader = openai_manager_for_tests(home.path().into(), endpoint.clone());
+        reader
+            .model_catalog_activity
+            .arm_initial_refresh(Instant::now());
+        let catalog = timeout(
+            Duration::from_secs(1),
+            ModelsManager::raw_model_catalog(&reader, strategy, DEFAULT_HTTP_CLIENT_FACTORY),
+        )
+        .await
+        .expect("fresh disk data must not wait for the initial network refresh")
+        .unwrap();
+        assert_models_contain(&catalog.models, &models);
+        assert!(!*reader.model_catalog_activity.initial_refresh_ready.borrow());
+        assert_eq!(endpoint.fetch_count(), 0);
+        reader.model_catalog_activity.finish_initial_refresh();
+    }
+}
+
 #[test]
 fn catalog_permutations_preserve_defaults_and_quarantine_duplicate_slugs() {
     let a = remote_model("stable-a", "A", 1);

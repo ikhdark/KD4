@@ -1150,7 +1150,7 @@ impl RmcpClient {
     /// near expiry share one token-endpoint call inside their timeouts.
     async fn persist_oauth_tokens(&self) {
         if let Some(runtime) = self.oauth_persistor().await
-            && let Err(error) = runtime.persist_if_needed().await
+            && let Err(error) = runtime.observe_after_operation().await
         {
             warn!("failed to persist OAuth tokens: {error}");
         }

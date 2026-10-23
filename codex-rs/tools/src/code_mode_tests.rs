@@ -118,6 +118,7 @@ declare const tools: { apply_patch(input: string, options?: { timeout_ms?: numbe
                 .into(),
             kind: codex_code_mode::CodeModeToolKind::Freeform,
             input_schema: None,
+            namespace_description: None,
             default_timeout_ms: None,
             output_schema: None,
         })
@@ -331,4 +332,25 @@ fn catalog_growth_does_not_reassign_callable_aliases() {
         assert_eq!(expanded.name, singleton[0].name);
     }
     assert_eq!(all[0].name, "read_file");
+}
+#[test]
+fn namespace_bundle_shares_explicit_guidance_and_keeps_every_member_contract() {
+    let guidance = "Shared authorization: never cross connector account boundaries.".repeat(30);
+    let spec = ToolSpec::Namespace(ResponsesApiNamespace {
+        name: "connector".into(), description: guidance.clone(),
+        tools: (0..30).map(|index| ResponsesApiNamespaceTool::Function(ResponsesApiTool {
+            name: format!("operation_{index}"), description: format!("Member restriction {index}"),
+            strict: false, defer_loading: None, parameters: JsonSchema::default(), output_schema: None,
+        })).collect(),
+    });
+    let definitions = collect_code_mode_tool_definitions([&spec]);
+    assert_eq!(definitions.len(), 30);
+    for (index, definition) in definitions.iter().enumerate() {
+        assert_eq!(definition.namespace_description.as_deref(), Some(guidance.as_str()));
+        assert_eq!(definition.description.matches(&guidance).count(), 1);
+        assert!(definition.description.contains("Member restriction"), "{index}");
+    }
+    let bundle = codex_code_mode::render_code_mode_tool_bundle(&definitions);
+    assert_eq!(bundle.matches(&guidance).count(), 1);
+    for index in 0..30 { assert!(bundle.contains(&format!("Member restriction {index}"))); }
 }

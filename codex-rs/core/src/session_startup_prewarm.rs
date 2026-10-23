@@ -12,10 +12,8 @@ use tracing::warn;
 use crate::client::ModelClientSession;
 use crate::config::Config;
 use crate::responses_metadata::CodexResponsesMetadata;
-use crate::responses_metadata::CodexResponsesRequestKind;
 use crate::session::INITIAL_SUBMIT_ID;
 use crate::session::session::Session;
-use crate::session::turn::build_prompt;
 use crate::session::turn::built_tools;
 use crate::startup_timing::StartupPhase;
 use crate::startup_timing::StartupTimingState;
@@ -27,7 +25,6 @@ use codex_otel::SessionTelemetry;
 use codex_protocol::dynamic_tools::DynamicToolSpec;
 use codex_protocol::error::CodexErr;
 use codex_protocol::error::Result as CodexResult;
-use codex_protocol::models::BaseInstructions;
 
 const CODE_MODE_PREWARM_PHASE: &str = "code_mode_prewarm";
 
@@ -113,6 +110,12 @@ impl SessionStartupPrewarmHandle {
     pub(crate) async fn abort(self) {
         self.task.abort();
         let _ = self.task.await;
+    }
+
+    /// Whether first-turn handoff can still claim this transport. `resolve` cuts off an
+    /// unfinished prewarm, so a turn must not rely on it to supply the first socket.
+    pub(crate) fn is_finished(&self) -> bool {
+        self.task.is_finished()
     }
 
     #[instrument(name = "startup_prewarm.resolve", level = "trace", skip_all)]
@@ -671,11 +674,36 @@ mod tests {
 
         assert!(preconnected_session.is_none());
     }
+
+    #[tokio::test]
+    async fn audit143_only_a_finished_prewarm_can_own_the_first_turn_transport() {
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let prewarm = SessionStartupPrewarmHandle::new(
+            tokio::spawn(async move {
+                let _ = release_rx.await;
+                Ok(None)
+            }),
+            Instant::now(),
+        );
+        // First-turn handoff aborts this prewarm, so the turn must preconnect itself.
+        assert!(!prewarm.is_finished());
+
+        drop(release_tx);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !prewarm.is_finished() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("released prewarm finishes");
+        // Negative control: a finished prewarm is claimable without waiting.
+        assert!(prewarm.is_finished());
+    }
 }
 
 async fn schedule_startup_prewarm_inner(
     session: Arc<Session>,
-    base_instructions: String,
+    _base_instructions: String,
     startup_transport: Option<SessionStartupTransportHandle>,
 ) -> CodexResult<Option<ModelClientSession>> {
     let _preparation = session
@@ -740,57 +768,8 @@ async fn schedule_startup_prewarm_inner(
     if !session.services.model_client.startup_websocket_enabled() {
         return Ok(None);
     }
-    let build_prompt_started_at = Instant::now();
-    let startup_prompt = build_prompt(
-        Vec::new(),
-        startup_router.as_ref(),
-        startup_turn_context.as_ref(),
-        BaseInstructions {
-            text: base_instructions,
-        },
-    );
-    startup_turn_context.session_telemetry.record_startup_phase(
-        "startup_prewarm_build_prompt",
-        build_prompt_started_at.elapsed(),
-        /*status*/ None,
-    );
-    let window_id = session.current_window_id().await;
-    let responses_metadata = startup_turn_context
-        .turn_metadata_state
-        .to_responses_metadata(
-            session.installation_id.clone(),
-            window_id,
-            CodexResponsesRequestKind::Prewarm,
-        );
-    // The transport task is already running. Build the tools and prompt while
-    // it connects, and join it only at the first point that needs the session.
-    let mut client_session = resolve_startup_transport(startup_transport)
-        .await
-        .unwrap_or_else(|| session.services.model_client.new_speculative_session());
-    let websocket_warmup_started_at = Instant::now();
-    drop(_preparation);
-    let _prewarm_request = session
-        .startup_timing
-        .begin_phase(StartupPhase::PrewarmRequest);
-    let request_effort = crate::client::request_effort_for_model(
-        &startup_turn_context.model_info,
-        startup_turn_context.configured_reasoning_effort.clone(),
-    );
-    client_session
-        .prewarm_websocket(
-            &startup_prompt,
-            &startup_turn_context.model_info,
-            &startup_turn_context.session_telemetry,
-            request_effort,
-            startup_turn_context.reasoning_summary,
-            startup_turn_context.config.service_tier.clone(),
-            &responses_metadata,
-        )
-        .await?;
-    startup_turn_context.session_telemetry.record_startup_phase(
-        "startup_prewarm_websocket_warmup",
-        websocket_warmup_started_at.elapsed(),
-        /*status*/ None,
-    );
-    Ok(Some(client_session))
+    // Startup is handshake-only. An optional generate=false request would
+    // hold a ready socket until its response drained and force first-turn
+    // handoff to discard it. Never transfer a socket with in-flight output.
+    Ok(resolve_startup_transport(startup_transport).await)
 }

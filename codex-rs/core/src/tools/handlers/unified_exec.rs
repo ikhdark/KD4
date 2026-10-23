@@ -49,6 +49,7 @@ async fn preserve_durability_failure_output(
 #[serde(try_from = "RawExecCommandArgs")]
 pub(crate) struct ExecCommandArgs {
     command: CommandInvocation,
+    env: std::collections::HashMap<String, String>,
     shell: Option<String>,
     login: Option<bool>,
     tty: bool,
@@ -69,6 +70,8 @@ pub(crate) struct ExecCommandArgs {
 
 #[derive(Debug, Deserialize)]
 struct RawExecCommandArgs {
+    #[serde(default)]
+    env: std::collections::HashMap<String, String>,
     #[serde(default)]
     cmd: Option<String>,
     #[serde(default)]
@@ -118,6 +121,17 @@ impl TryFrom<RawExecCommandArgs> for ExecCommandArgs {
     type Error = String;
 
     fn try_from(raw: RawExecCommandArgs) -> Result<Self, Self::Error> {
+        let mut names = std::collections::BTreeSet::new();
+        for (name, value) in &raw.env {
+            if name.is_empty() || name.contains(['=', '\0']) || value.contains('\0') {
+                return Err("Invalid command environment: names must be nonempty and contain neither '=' nor NUL; values must not contain NUL.".into());
+            }
+            if cfg!(windows) && !names.insert(name.to_ascii_uppercase()) {
+                return Err(
+                    "Command environment contains case-insensitive duplicate names.".into(),
+                );
+            }
+        }
         let mut argument_notices = raw
             .extra
             .keys()
@@ -143,14 +157,11 @@ impl TryFrom<RawExecCommandArgs> for ExecCommandArgs {
         // that shared surface without retaining either value internally.
         let _compatibility_only_fields = (&raw.environment_id, &raw.workdir);
 
-        let long_running = crate::validation::prefers_long_observation_wait(&command);
-        let requested_yield_time_ms = raw.yield_time_ms.unwrap_or_else(|| {
-            if long_running {
-                i128::from(crate::unified_exec::MAX_YIELD_TIME_MS)
-            } else {
-                i128::from(default_exec_yield_time_ms())
-            }
-        });
+        // Native PowerShell parsing can wait on IPC. Deserialization also runs
+        // during synchronous Code Mode preflight, so only decode structure here.
+        let requested_yield_time_ms = raw
+            .yield_time_ms
+            .unwrap_or_else(|| i128::from(default_exec_yield_time_ms()));
         let yield_time_ms = requested_yield_time_ms.clamp(
             i128::from(crate::unified_exec::MIN_YIELD_TIME_MS),
             i128::from(crate::unified_exec::MAX_INITIAL_YIELD_TIME_MS),
@@ -163,6 +174,7 @@ impl TryFrom<RawExecCommandArgs> for ExecCommandArgs {
         }
         Ok(Self {
             command,
+            env: raw.env,
             shell: raw.shell,
             login: raw.login,
             tty: raw.tty,
@@ -170,9 +182,7 @@ impl TryFrom<RawExecCommandArgs> for ExecCommandArgs {
             yield_time_requested: raw.yield_time_ms.is_some(),
             stall_timeout_ms: raw
                 .stall_timeout_ms
-                .or_else(|| {
-                    (!long_running).then_some(crate::exec::DEFAULT_COMMAND_STALL_TIMEOUT_MS)
-                })
+                .or(Some(crate::exec::DEFAULT_COMMAND_STALL_TIMEOUT_MS))
                 .filter(|timeout| *timeout != 0),
             stall_timeout_requested: raw.stall_timeout_ms.is_some(),
             max_output_tokens: raw.max_output_tokens,

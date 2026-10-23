@@ -128,6 +128,13 @@ impl AcceptanceCriterion {
             }
             return Ok(());
         }
+        if policy.kind == CriterionEvidenceRequirement::ValidationExecution
+            && policy.freshness == EvidenceFreshness::Current
+        {
+            return Err(StoreError::InvalidAssignment(
+                "current validation_execution requires trusted execution input binding, which is unavailable; another run cannot satisfy it. Declare historical only when the requirement actually concerns a recorded execution, or use current source_inspection for source acquisition".into(),
+            ));
+        }
         let requirement = policy
             .required_evidence
             .as_deref()
@@ -274,6 +281,7 @@ pub enum AdmissionRejectionReason {
     /// Seal-time fingerprints cannot certify the inputs a producer observed.
     ReusableSealedInvestigation,
     IsolatedIntegratorUnavailable,
+    ExternalWorkspaceWriter,
 }
 
 impl std::fmt::Display for AdmissionRejectionReason {
@@ -282,6 +290,7 @@ impl std::fmt::Display for AdmissionRejectionReason {
             Self::DuplicateExplorerInvestigation => "duplicate_explorer_investigation",
             Self::ReusableSealedInvestigation => "reusable_sealed_investigation",
             Self::IsolatedIntegratorUnavailable => "isolated_integrator_unavailable",
+            Self::ExternalWorkspaceWriter => "external_workspace_writer",
         };
         formatter.write_str(value)
     }
@@ -306,6 +315,12 @@ pub struct AdmittedAssignment {
     pub integration_plan: IntegrationPlan,
 }
 
+/// Canonical execution identity shared by assignment admission and producers.
+pub fn required_command_argv(requirement: &str) -> Option<Vec<String>> {
+    serde_json::from_str::<Vec<String>>(requirement).ok().or_else(|| shlex::split(requirement))
+        .filter(|argv| argv.first().is_some_and(|program| !program.trim().is_empty()))
+}
+
 impl AssignmentDraft {
     pub fn normalize(self, repo_root: &Path) -> StoreResult<Assignment> {
         validate_nonempty("root_session_id", &self.root_session_id)?;
@@ -328,16 +343,6 @@ impl AssignmentDraft {
             validate_nonempty("criterion id", &criterion.id)?;
             validate_nonempty("criterion text", &criterion.text)?;
             criterion.validate_evidence_policy()?;
-            if let Some(required) = criterion
-                .evidence_policy
-                .as_ref()
-                .and_then(|policy| policy.required_evidence.as_ref())
-                && !self.required_evidence.contains(required)
-            {
-                return Err(StoreError::InvalidAssignment(
-                    "criterion policy must bind an assignment required_evidence entry".into(),
-                ));
-            }
             if !criterion_ids.insert(criterion.id.as_str()) {
                 return Err(StoreError::InvalidAssignment(format!(
                     "duplicate acceptance criterion id {}",
@@ -345,6 +350,7 @@ impl AssignmentDraft {
                 )));
             }
         }
+        validate_criterion_bindings(&self.acceptance_criteria, &self.required_evidence)?;
         let mut dependency_ids = HashSet::new();
         for dependency in &self.dependencies {
             if !dependency_ids.insert(*dependency) {
@@ -371,15 +377,6 @@ impl AssignmentDraft {
                     "architecture contract reference has an unsupported version or empty hash"
                         .to_string(),
                 ));
-            }
-        }
-        let mut required_evidence = HashSet::new();
-        for requirement in &self.required_evidence {
-            validate_nonempty("required evidence", requirement)?;
-            if !required_evidence.insert(requirement.as_str()) {
-                return Err(StoreError::InvalidAssignment(format!(
-                    "duplicate required evidence {requirement}"
-                )));
             }
         }
         let mut contract_claims = HashSet::new();
@@ -481,7 +478,10 @@ pub struct Assignment {
 
 impl Assignment {
     pub fn primary_investigation_identity(&self) -> Option<PrimaryInvestigationIdentity> {
-        if self.role != AgentRole::Explorer {
+        // Dependency IDs alone cannot prove that two producers admitted the
+        // same dependency receipt/version. Until those inputs are in the key,
+        // dependent investigations must not suppress fresh work.
+        if self.role != AgentRole::Explorer || !self.dependencies.is_empty() {
             return None;
         }
         let mut scopes = self.read_scope.clone();
@@ -498,8 +498,25 @@ impl Assignment {
                 .cmp(&right.id)
                 .then_with(|| left.text.cmp(&right.text))
         });
-        let canonical =
-            serde_json::to_vec(&(scopes, claims, self.objective.trim(), criteria)).ok()?;
+        let mut dependencies = self.dependencies.clone();
+        dependencies.sort();
+        let mut prohibited = self.prohibited_changes.clone();
+        prohibited.sort();
+        let mut risks = self.risk_hints.clone();
+        risks.sort();
+        let canonical = serde_json::to_vec(&(
+            scopes,
+            claims,
+            self.objective.trim(),
+            criteria,
+            dependencies,
+            self.stop_condition.trim(),
+            prohibited,
+            risks,
+            &self.relation,
+            &self.architecture_contract_ref,
+        ))
+        .ok()?;
         Some(PrimaryInvestigationIdentity(hex::encode(Sha256::digest(
             &canonical,
         ))))
@@ -635,6 +652,52 @@ pub struct AttemptAmendment {
     pub objective: Option<String>,
     pub acceptance_criteria: Option<Vec<AcceptanceCriterion>>,
     pub stop_condition: Option<String>,
+}
+
+/// Admission and correction must describe proof the owner can actually acquire.
+pub(crate) fn validate_criterion_bindings(
+    criteria: &[AcceptanceCriterion],
+    required_evidence: &[String],
+) -> StoreResult<()> {
+    let mut authored = HashSet::new();
+    let mut commands = HashSet::new();
+    for requirement in required_evidence {
+        validate_nonempty("required evidence", requirement)?;
+        if !authored.insert(requirement) {
+            return Err(StoreError::InvalidAssignment(format!("duplicate required evidence {requirement}")));
+        }
+        if let Some(argv) = required_command_argv(requirement)
+            && !commands.insert(argv)
+        {
+            return Err(StoreError::InvalidAssignment(format!(
+                "equivalent required command {requirement}; use one authored required_evidence entry for each exact argv"
+            )));
+        }
+    }
+    let mut current_paths = HashSet::new();
+    for criterion in criteria {
+        let Some(policy) = &criterion.evidence_policy else {
+            continue;
+        };
+        if let Some(required) = &policy.required_evidence {
+            if !required_evidence.contains(required) {
+                return Err(StoreError::InvalidAssignment(
+                    "criterion policy must bind an assignment required_evidence entry".into(),
+                ));
+            }
+            if policy.kind == CriterionEvidenceRequirement::SourceInspection
+                && policy.freshness == EvidenceFreshness::Current
+            {
+                current_paths.insert(required);
+            }
+        }
+    }
+    if current_paths.len() > 64 {
+        return Err(StoreError::InvalidAssignment(
+            "at most 64 distinct Current source inspection paths are supported; split the assignment".into(),
+        ));
+    }
+    Ok(())
 }
 
 /// Current specification, distinct from the immutable original assignment.

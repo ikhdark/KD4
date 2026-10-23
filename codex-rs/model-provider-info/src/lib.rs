@@ -183,6 +183,21 @@ pub struct ModelProviderAwsAuthInfo {
 
 impl ModelProviderInfo {
     pub fn validate(&self) -> std::result::Result<(), String> {
+        // Zero does not disable these bounds: a zero header deadline fails every
+        // request before the provider can answer, and a zero connect budget never
+        // opens a WebSocket.
+        for (field, value) in [
+            ("stream_idle_timeout_ms", self.stream_idle_timeout_ms),
+            (
+                "websocket_connect_timeout_ms",
+                self.websocket_connect_timeout_ms,
+            ),
+        ] {
+            if value == Some(0) {
+                return Err(format!("provider {field} must be greater than 0"));
+            }
+        }
+
         if self.aws.is_some() {
             if self.supports_websockets {
                 // TODO(celia-oai): Support AWS SigV4 signing for WebSocket
@@ -507,7 +522,11 @@ pub fn built_in_model_providers(
         ),
         (
             OLLAMA_OSS_PROVIDER_ID,
-            create_oss_provider(DEFAULT_OLLAMA_PORT, WireApi::Responses),
+            create_oss_provider_for_host(
+                OLLAMA_DEFAULT_HOST,
+                DEFAULT_OLLAMA_PORT,
+                WireApi::Responses,
+            ),
         ),
         (
             LMSTUDIO_OSS_PROVIDER_ID,
@@ -567,11 +586,24 @@ pub fn merge_configured_model_providers(
     Ok(model_providers)
 }
 
+/// Ollama listens on the IPv4 loopback by default (`OLLAMA_HOST=127.0.0.1:11434`).
+/// Dialing `localhost` instead resolves `::1` first on Windows, so every new
+/// connection waits out the 300 ms Happy Eyeballs fallback to IPv4.
+const OLLAMA_DEFAULT_HOST: &str = "127.0.0.1";
+
 pub fn create_oss_provider(default_provider_port: u16, wire_api: WireApi) -> ModelProviderInfo {
+    create_oss_provider_for_host("localhost", default_provider_port, wire_api)
+}
+
+fn create_oss_provider_for_host(
+    default_host: &str,
+    default_provider_port: u16,
+    wire_api: WireApi,
+) -> ModelProviderInfo {
     // These CODEX_OSS_ environment variables are experimental: we may
     // switch to reading values from config.toml instead.
     let default_codex_oss_base_url = format!(
-        "http://localhost:{codex_oss_port}/v1",
+        "http://{default_host}:{codex_oss_port}/v1",
         codex_oss_port = std::env::var("CODEX_OSS_PORT")
             .ok()
             .filter(|value| !value.trim().is_empty())

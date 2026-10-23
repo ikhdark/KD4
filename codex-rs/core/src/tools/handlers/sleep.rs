@@ -81,6 +81,7 @@ impl ToolExecutor<ToolInvocation> for SleepHandler {
                 step_context,
                 call_id,
                 payload,
+                source,
                 ..
             } = invocation;
             let turn = Arc::clone(&step_context.turn);
@@ -97,6 +98,13 @@ impl ToolExecutor<ToolInvocation> for SleepHandler {
             }
 
             let started = Instant::now();
+            let requested = Duration::from_millis(args.duration_ms);
+            // A nested Code Mode call must return before its wrapper deadline
+            // drops it. Stop there and report the remainder instead.
+            let sleep_duration = crate::unified_exec::nested_poll_bound(source.nested_deadline())
+                .map(|bound| bound.saturating_duration_since(tokio::time::Instant::now()))
+                .map_or(requested, |allowed| allowed.min(requested));
+            let stopped_at_deadline = sleep_duration < requested;
             let item = TurnItem::Sleep(SleepItem {
                 id: call_id,
                 duration_ms: args.duration_ms,
@@ -116,7 +124,7 @@ impl ToolExecutor<ToolInvocation> for SleepHandler {
                 let sleep = session
                     .services
                     .time_provider
-                    .sleep(session.thread_id, Duration::from_millis(args.duration_ms));
+                    .sleep(session.thread_id, sleep_duration);
                 tokio::pin!(sleep);
                 tokio::select! {
                     result = &mut sleep => result
@@ -142,9 +150,14 @@ impl ToolExecutor<ToolInvocation> for SleepHandler {
             let interrupted = sleep_result?;
 
             let message = if interrupted {
-                "Sleep interrupted by new input."
+                "Sleep interrupted by new input.".to_string()
+            } else if stopped_at_deadline {
+                format!(
+                    "Sleep stopped at the Code Mode nested-call deadline with {} ms of the requested duration remaining; sleep again for the rest, or pass a larger {{ timeout_ms }} call option.",
+                    requested.saturating_sub(started.elapsed()).as_millis()
+                )
             } else {
-                "Sleep completed."
+                "Sleep completed.".to_string()
             };
             let wall_time_seconds = started.elapsed().as_secs_f64();
             Ok(boxed_tool_output(FunctionToolOutput::from_text(
@@ -241,5 +254,61 @@ mod tests {
             !validator.is_valid(&serde_json::json!({ "duration_ms": MAX_SLEEP_DURATION_MS + 1 }))
         );
         assert!(!validator.is_valid(&serde_json::json!({ "duration_ms": 1.5 })));
+    }
+
+    #[tokio::test]
+    async fn nested_sleep_returns_before_its_deadline() {
+        use crate::session::step_context::StepContext;
+        use crate::session::tests::make_session_and_context;
+        use crate::tools::context::ToolCallSource;
+        use crate::tools::context::ToolOutput;
+        use crate::turn_diff_tracker::TurnDiffTracker;
+        use serde_json::json;
+        use tokio::sync::Mutex;
+        use tokio_util::sync::CancellationToken;
+
+        let (session, turn) = make_session_and_context().await;
+        let session = Arc::new(session);
+        let step_context = StepContext::for_test(Arc::new(turn));
+        let payload = |duration_ms: u64| ToolPayload::Function {
+            arguments: json!({ "duration_ms": duration_ms }).to_string(),
+        };
+        let invocation = |duration_ms: u64, source: ToolCallSource| ToolInvocation {
+            session: Arc::clone(&session),
+            step_context: Arc::clone(&step_context),
+            cancellation_token: CancellationToken::new(),
+            tracker: Arc::new(Mutex::new(TurnDiffTracker::new())),
+            call_id: "nested-sleep".to_string(),
+            tool_name: ToolName::namespaced("clock", "sleep"),
+            source,
+            payload: payload(duration_ms),
+        };
+        // An exhausted wrapper budget must end the sleep as a normal result
+        // that names the stop, not leave the call for the wrapper to drop.
+        let nested = invocation(
+            120_000,
+            ToolCallSource::CodeMode {
+                cell_id: "sleep-cell".to_string(),
+                parent_call_id: None,
+                runtime_tool_call_id: "sleep-call".to_string(),
+                nested_deadline: Some(std::time::Instant::now()),
+                cancellation_cause: None,
+            },
+        );
+        let output = tokio::time::timeout(Duration::from_secs(5), SleepHandler.handle(nested))
+            .await
+            .expect("a nested sleep must return before its wrapper deadline")
+            .expect("stopping at the deadline is a normal result");
+        let text = output.code_mode_result(&payload(120_000)).to_string();
+        assert!(text.contains("nested-call deadline"), "{text}");
+        // Negative control: a direct sleep is not shortened or relabelled.
+        let direct = invocation(1, ToolCallSource::Direct);
+        let output = tokio::time::timeout(Duration::from_secs(5), SleepHandler.handle(direct))
+            .await
+            .expect("a 1 ms sleep returns")
+            .expect("sleep succeeds");
+        let text = output.code_mode_result(&payload(1)).to_string();
+        assert!(text.contains("Sleep completed."), "{text}");
+        assert!(!text.contains("nested-call deadline"), "{text}");
     }
 }

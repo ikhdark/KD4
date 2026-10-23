@@ -22,6 +22,184 @@ use crate::tools::registry::PostToolUsePayload;
 use crate::tools::registry::PreToolUsePayload;
 use crate::turn_diff_tracker::TurnDiffTracker;
 
+#[tokio::test]
+async fn audit147_real_patch_handler_admits_disjoint_updates_and_cancels_overlap() {
+    let workspace = TempDir::new().unwrap();
+    for name in ["a", "b"] {
+        std::fs::write(workspace.path().join(name), "old\n").unwrap();
+    }
+    let (session, mut turn) = make_session_and_context().await;
+    turn.permission_profile = PermissionProfile::Disabled;
+    let environment = TurnEnvironment::new(
+        codex_exec_server::LOCAL_ENVIRONMENT_ID.into(),
+        Arc::new(codex_exec_server::Environment::default_for_tests()),
+        PathUri::from_host_native_path(workspace.path()).unwrap(),
+        None,
+    );
+    turn.environments.turn_environments = vec![environment.clone()];
+    let step_context = StepContext::for_test(Arc::new(turn));
+    let session = Arc::new(session);
+    let call = |name: &str| ToolInvocation {
+        session: Arc::clone(&session),
+        step_context: Arc::clone(&step_context),
+        cancellation_token: tokio_util::sync::CancellationToken::new(),
+        tracker: Arc::new(Mutex::new(TurnDiffTracker::new())),
+        call_id: format!("audit147-{name}"),
+        tool_name: ToolName::plain("apply_patch"),
+        source: crate::tools::context::ToolCallSource::Direct,
+        payload: ToolPayload::Custom {
+            input: format!(
+                "*** Begin Patch\n*** Update File: {name}\n@@\n-old\n+owned\n*** End Patch"
+            ),
+        },
+    };
+    let paths = [PathBuf::from("a")];
+    let held = crate::workspace_operation_gate::acquire_patch_additions_with_timeout(
+        &environment.environment,
+        environment.cwd(),
+        Some(&paths),
+    )
+    .await
+    .unwrap();
+    let handler = ApplyPatchHandler::default();
+    let result = tokio::time::timeout(Duration::from_secs(5), handler.handle_call(call("b")))
+        .await
+        .expect("disjoint update must finish before the peer lease is released")
+        .unwrap();
+    assert!(result.success_for_logging());
+    assert_eq!(
+        std::fs::read_to_string(workspace.path().join("b")).unwrap(),
+        "owned\n"
+    );
+    let overlap = call("a");
+    let cancellation = overlap.cancellation_token.clone();
+    let pending = handler.handle_call(overlap);
+    tokio::pin!(pending);
+    assert!(futures::poll!(&mut pending).is_pending());
+    cancellation.cancel();
+    assert!(
+        tokio::time::timeout(Duration::from_secs(2), pending)
+            .await
+            .unwrap()
+            .is_err()
+    );
+    assert_eq!(
+        std::fs::read_to_string(workspace.path().join("a")).unwrap(),
+        "old\n"
+    );
+    drop(held);
+    assert!(
+        handler
+            .handle_call(call("a"))
+            .await
+            .unwrap()
+            .success_for_logging()
+    );
+    assert_eq!(
+        std::fs::read_to_string(workspace.path().join("a")).unwrap(),
+        "owned\n"
+    );
+}
+
+/// Audit 151: a shell-intercepted patch claims only its own endpoints, like the
+/// apply_patch tool, so a peer's disjoint patch (or its pending approval) does
+/// not hold it; an overlapping intercepted patch still waits.
+#[tokio::test]
+async fn audit151_intercepted_patch_claims_only_its_own_endpoints() {
+    let workspace = TempDir::new().unwrap();
+    for name in ["a", "b"] {
+        std::fs::write(workspace.path().join(name), "old\n").unwrap();
+    }
+    let (session, mut turn) = make_session_and_context().await;
+    turn.permission_profile = PermissionProfile::Disabled;
+    let environment = TurnEnvironment::new(
+        codex_exec_server::LOCAL_ENVIRONMENT_ID.into(),
+        Arc::new(codex_exec_server::Environment::default_for_tests()),
+        PathUri::from_host_native_path(workspace.path()).unwrap(),
+        None,
+    );
+    turn.environments.turn_environments = vec![environment.clone()];
+    let (session, turn) = (Arc::new(session), Arc::new(turn));
+    let fs = environment.environment.get_filesystem();
+    let patch = |name: &str| {
+        vec![
+            "apply_patch".to_string(),
+            format!("*** Begin Patch\n*** Update File: {name}\n@@\n-old\n+owned\n*** End Patch"),
+        ]
+    };
+    let paths = [PathBuf::from("a")];
+    let peer = crate::workspace_operation_gate::acquire_patch_additions_with_timeout(
+        &environment.environment,
+        environment.cwd(),
+        Some(&paths),
+    )
+    .await
+    .unwrap();
+
+    let disjoint = patch("b");
+    let result = tokio::time::timeout(
+        Duration::from_secs(5),
+        intercept_apply_patch(
+            /*is_validation*/ false,
+            &disjoint,
+            environment.cwd(),
+            fs.as_ref(),
+            environment.clone(),
+            Arc::clone(&session),
+            Arc::clone(&turn),
+            /*tracker*/ None,
+            "audit151-disjoint",
+            "shell",
+            tokio_util::sync::CancellationToken::new(),
+        ),
+    )
+    .await
+    .expect("a disjoint intercepted patch must not wait for the peer's claim");
+    assert!(
+        matches!(result, Ok(Some(_))),
+        "the disjoint intercepted patch must apply"
+    );
+    assert_eq!(
+        std::fs::read_to_string(workspace.path().join("b")).unwrap(),
+        "owned\n"
+    );
+
+    let overlap = patch("a");
+    let cancellation = tokio_util::sync::CancellationToken::new();
+    let pending = intercept_apply_patch(
+        /*is_validation*/ false,
+        &overlap,
+        environment.cwd(),
+        fs.as_ref(),
+        environment.clone(),
+        Arc::clone(&session),
+        Arc::clone(&turn),
+        /*tracker*/ None,
+        "audit151-overlap",
+        "shell",
+        cancellation.clone(),
+    );
+    tokio::pin!(pending);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), pending.as_mut())
+            .await
+            .is_err(),
+        "an overlapping intercepted patch must wait for the peer's claim"
+    );
+    cancellation.cancel();
+    assert!(
+        tokio::time::timeout(Duration::from_secs(2), pending)
+            .await
+            .unwrap()
+            .is_err()
+    );
+    assert_eq!(
+        std::fs::read_to_string(workspace.path().join("a")).unwrap(),
+        "old\n"
+    );
+    drop(peer);
+}
+
 fn sample_patch() -> &'static str {
     r#"*** Begin Patch
 *** Add File: hello.txt
@@ -245,6 +423,127 @@ async fn multi_conflict_preflight_still_reports_observed_source_for_retry() {
     // The typed diagnostic survives aggregation too.
     assert_eq!(failed["diagnostics"][0]["hunk_ordinal"], 1);
     assert!(failed["diagnostics"][0]["current_content_sha256"].is_string());
+}
+
+/// A context mismatch says whether the file still has the content of the
+/// session's latest read_file snapshot, so a miscopied context is not taken for
+/// another writer's edit or the reverse. Without a snapshot, or for a hunk that
+/// edits an earlier hunk's in-memory result, there is nothing to compare.
+#[tokio::test]
+async fn context_mismatch_compares_the_file_with_its_latest_read_snapshot() {
+    let workspace = TempDir::new().unwrap();
+    let path = workspace.path().join("a.txt");
+    let read = "alpha\nbeta\n";
+    std::fs::write(&path, read).unwrap();
+    let (session, mut turn) = make_session_and_context().await;
+    turn.permission_profile = PermissionProfile::Disabled;
+    turn.environments.turn_environments = vec![TurnEnvironment::new(
+        codex_exec_server::LOCAL_ENVIRONMENT_ID.into(),
+        Arc::new(codex_exec_server::Environment::default_for_tests()),
+        PathUri::from_host_native_path(workspace.path()).unwrap(),
+        None,
+    )];
+    let session = Arc::new(session);
+    let turn = Arc::new(turn);
+    let apply = |call_id: &str, hunks: &str| {
+        let call = ToolInvocation {
+            session: Arc::clone(&session),
+            step_context: StepContext::for_test(Arc::clone(&turn)),
+            cancellation_token: tokio_util::sync::CancellationToken::new(),
+            tracker: Arc::new(Mutex::new(TurnDiffTracker::new())),
+            call_id: call_id.into(),
+            tool_name: ToolName::plain("apply_patch"),
+            source: crate::tools::context::ToolCallSource::Direct,
+            payload: ToolPayload::Custom {
+                input: format!("*** Begin Patch\n{hunks}\n*** End Patch"),
+            },
+        };
+        async move {
+            ApplyPatchHandler::default()
+                .handle(call.clone())
+                .await
+                .unwrap()
+                .code_mode_result(&call.payload)
+        }
+    };
+    let unchanged = "is unchanged since this session's latest read_file snapshot";
+    let changed = "changed after this session's latest read_file snapshot";
+    let stale = "*** Update File: a.txt\n@@\n-missing\n+x";
+
+    let failed = apply("before-read", stale).await;
+    let text = failed["text"].as_str().unwrap();
+    assert!(
+        !text.contains(unchanged) && !text.contains(changed),
+        "{text}"
+    );
+    assert!(
+        failed["diagnostics"][0]
+            .get("edits_result_of_hunk")
+            .is_none()
+    );
+
+    let snapshot = json!({
+        "path": &path, "environment_id": codex_exec_server::LOCAL_ENVIRONMENT_ID,
+        "canonical_uri": PathUri::from_host_native_path(&path).unwrap().to_string(),
+        "source_sha256": crate::tool_history::sha256(read.as_bytes()),
+        "canonical_bytes": read.len(),
+    })
+    .to_string();
+    session
+        .register_tool_history_candidate(crate::tool_history::ToolHistoryCandidate {
+            call_id: "read-a".into(),
+            tool_identity: "read_file".into(),
+            semantic_class: "tool_output".into(),
+            successful: true,
+            source_dependencies: std::collections::BTreeSet::new(),
+            source_dependencies_current: true,
+            artifact_id: "read-a-artifact".into(),
+            artifact_bytes: snapshot.len() as u64,
+            artifact_sha256: crate::tool_history::sha256(snapshot.as_bytes()),
+            original_output_sha256: crate::tool_history::sha256(snapshot.as_bytes()),
+            original_tokens: 10,
+            preserved_non_text_tokens: Some(0),
+            bounded_model_output: snapshot,
+            complete: true,
+            projection_eligible: true,
+            proof_identity: None,
+            supersession_identity: None,
+            consumed_by_generation: None,
+            derived: crate::tool_history::ToolHistoryCandidateDerived::default(),
+        })
+        .await;
+    let failed = apply("after-read", stale).await;
+    let text = failed["text"].as_str().unwrap();
+    assert!(
+        text.contains(unchanged) && !text.contains(changed),
+        "{text}"
+    );
+
+    // Another writer edits the file after the read.
+    std::fs::write(&path, "alpha\nBETA\n").unwrap();
+    let failed = apply("after-write", stale).await;
+    let text = failed["text"].as_str().unwrap();
+    assert!(
+        text.contains(changed) && !text.contains(unchanged),
+        "{text}"
+    );
+
+    let failed = apply(
+        "chained",
+        "*** Update File: a.txt\n@@\n-alpha\n+ALPHA\n*** Update File: a.txt\n@@\n-missing\n+x",
+    )
+    .await;
+    let text = failed["text"].as_str().unwrap();
+    assert!(
+        text.contains("This hunk edits the result of hunk 1"),
+        "{text}"
+    );
+    assert!(
+        !text.contains(unchanged) && !text.contains(changed),
+        "{text}"
+    );
+    assert_eq!(failed["diagnostics"][0]["edits_result_of_hunk"], 1);
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "alpha\nBETA\n");
 }
 
 #[tokio::test]
@@ -499,6 +798,112 @@ fn retained_retry_streaming_accepts_fragmented_amendments_without_false_file_eve
         );
     }
     assert!(consumer.finish_update_on_complete().unwrap().is_none());
+}
+
+#[test]
+fn retry_without_opening_line_streams_without_file_events() {
+    let retry = "*** Retry Patch: 01900000-0000-7000-8000-000000000001\n*** Replace Chunk: 1 2\n@@\n-old\n+new\n*** End Patch";
+    let mut consumer = ApplyPatchArgumentDiffConsumer::default();
+    for character in retry.chars() {
+        assert!(
+            consumer
+                .push_delta("retry".into(), &character.to_string())
+                .is_none()
+        );
+    }
+    assert!(consumer.finish_update_on_complete().unwrap().is_none());
+}
+
+#[tokio::test]
+async fn retry_without_opening_line_applies_once_complete() {
+    let workspace = TempDir::new().unwrap();
+    std::fs::write(workspace.path().join("a.txt"), "current\n").unwrap();
+    let (session, mut turn) = make_session_and_context().await;
+    turn.permission_profile = PermissionProfile::Disabled;
+    turn.environments.turn_environments = vec![TurnEnvironment::new(
+        codex_exec_server::LOCAL_ENVIRONMENT_ID.into(),
+        Arc::new(codex_exec_server::Environment::default_for_tests()),
+        PathUri::from_host_native_path(workspace.path()).unwrap(),
+        None,
+    )];
+    let mut call = ToolInvocation {
+        session: Arc::new(session),
+        step_context: StepContext::for_test(Arc::new(turn)),
+        cancellation_token: tokio_util::sync::CancellationToken::new(),
+        tracker: Arc::new(Mutex::new(TurnDiffTracker::new())),
+        call_id: "stale".into(),
+        tool_name: ToolName::plain("apply_patch"),
+        source: crate::tools::context::ToolCallSource::Direct,
+        payload: ToolPayload::Custom {
+            input: "*** Begin Patch\n*** Update File: a.txt\n@@\n-stale\n+new\n*** End Patch"
+                .into(),
+        },
+    };
+    let handler = ApplyPatchHandler::default();
+    let failed = handler
+        .handle(call.clone())
+        .await
+        .unwrap()
+        .code_mode_result(&call.payload);
+    let id = failed["retry"]["patch_id"].as_str().unwrap().to_string();
+    let amendment = format!("*** Retry Patch: {id}\n*** Replace Chunk: 1 1\n@@\n-current\n+new");
+
+    // Cut off before its closing line, the retry is rejected and the receipt
+    // stays live.
+    call.call_id = "truncated".into();
+    call.payload = ToolPayload::Custom {
+        input: amendment.clone(),
+    };
+    let truncated = handler
+        .handle(call.clone())
+        .await
+        .unwrap()
+        .code_mode_result(&call.payload);
+    assert_eq!(truncated["success"], false);
+    assert!(
+        truncated["text"]
+            .as_str()
+            .unwrap()
+            .contains("final *** End Patch"),
+        "{truncated}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(workspace.path().join("a.txt")).unwrap(),
+        "current\n"
+    );
+
+    call.call_id = "unwrapped".into();
+    call.payload = ToolPayload::Custom {
+        input: format!("{amendment}\n*** End Patch"),
+    };
+    let applied = handler
+        .handle(call.clone())
+        .await
+        .unwrap()
+        .code_mode_result(&call.payload);
+    assert_eq!(applied["success"], true, "{applied}");
+    assert_eq!(
+        std::fs::read_to_string(workspace.path().join("a.txt")).unwrap(),
+        "new\n"
+    );
+}
+
+#[test]
+fn repeated_update_previews_keep_every_hunk() {
+    let parsed = codex_apply_patch::parse_patch(
+        "*** Begin Patch\n*** Update File: a.txt\n@@\n-one\n+ONE\n*** Update File: a.txt\n@@\n-two\n+TWO\n*** End Patch",
+    )
+    .unwrap();
+    let changes = convert_apply_patch_hunks_to_protocol(&parsed.hunks);
+    assert_eq!(changes.len(), 1);
+    let Some(FileChange::Update {
+        unified_diff,
+        move_path: None,
+    }) = changes.get(&PathBuf::from("a.txt"))
+    else {
+        panic!("{changes:?}");
+    };
+    assert_eq!(unified_diff, "@@\n-one\n+ONE\n@@\n-two\n+TWO\n");
 }
 
 #[tokio::test]
@@ -1972,4 +2377,32 @@ fn write_permissions_for_paths_keep_dirs_outside_workspace_root() {
             .and_then(|(_read, write)| write),
         Some(vec![expected_outside])
     );
+}
+
+#[test]
+fn audit147_intercepted_failure_carries_canonical_recovery_text() {
+    let failed = || ApplyPatchToolOutput {
+        text: "apply_patch failed: context changed".to_string(),
+        success: false,
+        changes: Vec::new(),
+        changes_exact: false,
+        environment_id: None,
+        retry: Some(json!({ "patch_id": "audit147-receipt" })),
+        diagnostics: Vec::new(),
+        concurrent_sessions: None,
+    };
+    for offered in [true, false] {
+        let FunctionCallError::RespondToModel(text) = intercepted_patch_failure(failed(), offered)
+        else {
+            panic!("an intercepted patch failure must be model-visible");
+        };
+        assert!(
+            text.starts_with("apply_patch failed: context changed"),
+            "{text}"
+        );
+        // The exactness warning reaches the model on every route.
+        assert!(text.contains("changes_exact=false"), "{text}");
+        // Only a model offered the apply_patch tool can redeem a receipt.
+        assert_eq!(text.contains("audit147-receipt"), offered, "{text}");
+    }
 }

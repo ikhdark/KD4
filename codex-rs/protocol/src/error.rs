@@ -61,6 +61,12 @@ pub enum CodexErr {
     /// Optionally includes the original server deadline before retrying the turn.
     #[error("stream disconnected before completion: {0}")]
     Stream(String, Option<RetryAfter>),
+    #[error("websocket request rejected: {message}")]
+    WebsocketRejected {
+        reason: WebsocketRecoveryReason,
+        message: String,
+        retry_after: Option<RetryAfter>,
+    },
     #[error("{0}")]
     IncompleteResponse(Box<IncompleteResponse>),
     /// Terminal provider accounting is independent of the outcome's retry class.
@@ -199,6 +205,7 @@ impl CodexErr {
         match self {
             Self::TerminalResponse { source, .. } => source.retry_after(),
             Self::Stream(_, advice)
+            | Self::WebsocketRejected { retry_after: advice, .. }
             | Self::ServerOverloaded {
                 retry_after: advice,
             }
@@ -227,6 +234,7 @@ impl CodexErr {
         }
         let slot = match &mut self {
             Self::Stream(_, slot)
+            | Self::WebsocketRejected { retry_after: slot, .. }
             | Self::ServerOverloaded { retry_after: slot }
             | Self::InternalServerError { retry_after: slot } => slot,
             Self::UnexpectedStatus(error) | Self::RegionRestricted(error) => &mut error.retry_after,
@@ -269,6 +277,7 @@ impl CodexErr {
                 error.status == StatusCode::TOO_MANY_REQUESTS || error.status.is_server_error()
             }
             CodexErr::Stream(..)
+            | CodexErr::WebsocketRejected { .. }
             | CodexErr::Timeout
             | CodexErr::RequestTimeout
             | CodexErr::ResponseStreamFailed(_)
@@ -301,6 +310,13 @@ impl CodexErr {
             CodexErr::RetryLimit(_) => CodexErrorInfo::ResponseTooManyFailedAttempts {
                 http_status_code: self.http_status_code_value(),
             },
+            // Throttling is retryable, so it reaches a client only after the
+            // turn owner spent its retry budget on it.
+            CodexErr::UnexpectedStatus(error) if error.status == StatusCode::TOO_MANY_REQUESTS => {
+                CodexErrorInfo::ResponseTooManyFailedAttempts {
+                    http_status_code: self.http_status_code_value(),
+                }
+            }
             CodexErr::ConnectionFailed(_) => CodexErrorInfo::HttpConnectionFailed {
                 http_status_code: self.http_status_code_value(),
             },
@@ -370,15 +386,23 @@ impl std::fmt::Display for ConnectionFailedError {
     }
 }
 
+/// Explicit provider rejection proves the request was not accepted for sampling.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WebsocketRecoveryReason {
+    PreviousResponseNotFound,
+    ConnectionLimitReached,
+}
+
 #[derive(Debug, Default)]
 pub struct ResponseStreamFailed {
     pub message: String,
     pub status: Option<StatusCode>,
     pub request_id: Option<String>,
-    /// The provider went silent on an otherwise healthy transport, rather than
-    /// the stream breaking. This is recoverable by waiting (sleep/wake, VPN
-    /// churn), so retry routing sends it to the connection-recovery loop
-    /// instead of charging the small, bounded provider retry budget.
+    /// The provider went silent (an idle or model-progress timeout) rather
+    /// than the stream breaking. Classification only: a post-dispatch stall is
+    /// not evidence of an offline connection, so retry routing charges it to
+    /// the bounded provider retry budget. Connection-recovery waits apply only
+    /// to `ConnectionFailed`.
     pub idle_timeout: bool,
     /// The provider closed the stream with a code that invites another
     /// connection (load shedding, a node restart) rather than rejecting this

@@ -31,6 +31,7 @@ use codex_shell_command::escape_powershell_single_quoted as powershell_single_qu
 use codex_shell_command::powershell::ProvenPowershellDirectArgv;
 use codex_shell_command::powershell::extract_powershell_command;
 use codex_shell_command::powershell::prefix_powershell_script_with_utf8;
+use codex_shell_command::powershell::preserve_powershell_native_exit_code;
 use codex_shell_command::powershell::prove_noprofile_powershell_command_as_direct_argv;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_path_uri::PathUri;
@@ -114,10 +115,16 @@ pub(crate) async fn prepare_shell_command(input: ShellCommandPreparation<'_>) ->
         false
     };
     if approved_direct_command {
-        command
-    } else {
-        prefix_powershell_script_with_utf8(&command)
+        return command;
     }
+    let command = prefix_powershell_script_with_utf8(&command);
+    // A snapshot wrapper ends with the approval script; an unwrapped launch
+    // ends with its own script.
+    [input.command_for_approval, input.command]
+        .into_iter()
+        .filter_map(|candidate| extract_powershell_command(candidate).map(|(_, script)| script))
+        .find_map(|script| preserve_powershell_native_exit_code(&command, script))
+        .unwrap_or(command)
 }
 
 /// Shared helper to construct sandbox transform inputs from a tokenized command line and native

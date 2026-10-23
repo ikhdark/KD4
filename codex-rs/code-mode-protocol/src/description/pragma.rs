@@ -33,12 +33,15 @@ pub fn parse_exec_source(input: &str) -> Result<ParsedExecSource<'_>, String> {
         );
     }
 
-    let (first_line, rest) = match input.split_once('\n') {
+    // Leading blank lines and a byte-order mark are not source, so the pragma
+    // is still the first line. Otherwise an incidental leading newline turned
+    // the directive into an ordinary comment and silently dropped its options.
+    let source = input.trim_start_matches(|c: char| c.is_whitespace() || c == '\u{feff}');
+    let (first_line, rest) = match source.split_once('\n') {
         Some(parts) => parts,
-        None => (input, ""),
+        None => (source, ""),
     };
-    let trimmed = first_line.trim_start();
-    let Some(pragma) = trimmed.strip_prefix(CODE_MODE_PRAGMA_PREFIX) else {
+    let Some(pragma) = first_line.strip_prefix(CODE_MODE_PRAGMA_PREFIX) else {
         return Ok(ParsedExecSource {
             code: input,
             max_output_tokens: None,
@@ -46,12 +49,6 @@ pub fn parse_exec_source(input: &str) -> Result<ParsedExecSource<'_>, String> {
             persist: false,
         });
     };
-
-    if rest.trim().is_empty() {
-        return Err(
-            "exec pragma must be followed by JavaScript source on subsequent lines".to_string(),
-        );
-    }
 
     let directive = pragma.trim();
     if directive.is_empty() {
@@ -96,6 +93,13 @@ pub fn parse_exec_source(input: &str) -> Result<ParsedExecSource<'_>, String> {
     }) {
         return Err(
             "exec pragma field `max_output_tokens` must be a non-negative safe integer".to_string(),
+        );
+    }
+    // An empty body is meaningful only for delivery: once a refused answer's
+    // evidence is recovered, a deliver cell that prints nothing delivers it.
+    if rest.trim().is_empty() && !pragma.deliver {
+        return Err(
+            "exec pragma must be followed by JavaScript source on subsequent lines".to_string(),
         );
     }
 
@@ -223,6 +227,50 @@ mod tests {
     }
 
     #[test]
+    fn leading_blank_lines_and_byte_order_mark_do_not_hide_the_pragma() {
+        for source in [
+            "\n// @exec: {\"max_output_tokens\":7,\"persist\":true}\ntext('kept');",
+            "\r\n  \r\n// @exec: {\"max_output_tokens\":7,\"persist\":true}\r\ntext('kept');",
+            "\u{feff}// @exec: {\"max_output_tokens\":7,\"persist\":true}\ntext('kept');",
+            "\u{feff}\n\t// @exec: {\"max_output_tokens\":7,\"persist\":true}\ntext('kept');",
+        ] {
+            assert_eq!(
+                parse_exec_source(source),
+                Ok(ParsedExecSource {
+                    code: "text('kept');",
+                    max_output_tokens: Some(7),
+                    deliver: false,
+                    persist: true,
+                }),
+                "{source:?}"
+            );
+        }
+        // The directive is validated rather than silently ignored.
+        assert_eq!(
+            parse_exec_source("\n// @exec: {\"timeout_ms\":1}\ntext('must not run')").unwrap_err(),
+            "exec pragma only supports `max_output_tokens`, `deliver`, and `persist`; got `timeout_ms`"
+        );
+        // A directive after source is still code, and source without a
+        // directive is returned unchanged, leading blank lines included.
+        for source in [
+            "text('first');\n// @exec: {\"max_output_tokens\":7}\ntext('second');",
+            "\n\ntext('plain');",
+            "\u{feff}text('plain');",
+        ] {
+            assert_eq!(
+                parse_exec_source(source),
+                Ok(ParsedExecSource {
+                    code: source,
+                    max_output_tokens: None,
+                    deliver: false,
+                    persist: false,
+                }),
+                "{source:?}"
+            );
+        }
+    }
+
+    #[test]
     fn delivery_requires_an_explicit_boolean_and_preserves_the_script() {
         for deliver in [false, true] {
             let source = format!("// @exec: {{\"deliver\":{deliver}}}\ntext('answer');");
@@ -243,6 +291,42 @@ mod tests {
                 "// @exec: {\"deliver\":true,\"deliver\":true}\ntext('must not execute');"
             )
             .is_err()
+        );
+    }
+
+    #[test]
+    fn a_deliver_pragma_alone_is_the_empty_cell_that_delivers_a_retained_answer() {
+        // A delivery refused for pending recovery keeps its answer, and "a
+        // deliver cell that prints nothing delivers it unchanged". Sessions
+        // 5596, 99f1 and cfbb sent exactly the first input below for that
+        // cell, got a parse error, and spent a round trip resending `void 0;`.
+        for source in [
+            "// @exec: {\"deliver\": true}\n",
+            "// @exec: {\"deliver\": true}",
+            "// @exec: {\"deliver\":true,\"persist\":true}\r\n  \n",
+        ] {
+            let parsed = parse_exec_source(source).expect(source);
+            assert!(parsed.deliver, "{source:?}");
+            assert!(parsed.code.trim().is_empty(), "{source:?}");
+        }
+        // Without delivery an empty body has no use, so it stays an error.
+        for source in [
+            "// @exec: {}\n",
+            "// @exec: {\"deliver\":false}\n",
+            "// @exec: {\"persist\":true}",
+        ] {
+            assert_eq!(
+                parse_exec_source(source).unwrap_err(),
+                "exec pragma must be followed by JavaScript source on subsequent lines",
+                "{source:?}"
+            );
+        }
+        // The directive itself is still validated.
+        let error = parse_exec_source("// @exec: {\"deliver\": tru}\n").unwrap_err();
+        assert!(error.starts_with("exec pragma must be valid JSON"), "{error}");
+        assert_eq!(
+            parse_exec_source("// @exec: {\"deliver\":true,\"budget\":1}\n").unwrap_err(),
+            "exec pragma only supports `max_output_tokens`, `deliver`, and `persist`; got `budget`"
         );
     }
 }

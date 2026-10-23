@@ -88,5 +88,7 @@ attributableRecoveryGenerationCount: number,
 /**
  * Tool-result generations immediately following provider-visible output
  * that actually omitted or truncated canonical tool information.
+ * Temporal succession only: this does not establish an extra generation
+ * caused by truncation. Historical causal spelling is accepted on input.
  */
-truncationInducedContinuationCount: number, invalidTransitionCount: number, clockRegressionCount: number, saturationCount: number, };
+continuationAfterTruncationCount: number, invalidTransitionCount: number, clockRegressionCount: number, saturationCount: number, };

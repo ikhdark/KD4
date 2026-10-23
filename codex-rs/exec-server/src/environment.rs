@@ -662,6 +662,23 @@ impl Environment {
         &self.approval_scope_id
     }
 
+    /// Coordination identity, independent of permission/approval instances.
+    /// Reconnecting to a different server incarnation changes this identity.
+    pub fn coordination_resource_id(&self) -> String {
+        if !self.is_remote() {
+            return "local".to_string();
+        }
+        if let Some(id) = self.cached_runtime().and_then(|runtime| runtime.info.resource_id) {
+            return format!("exec-server:{id}");
+        }
+        // Legacy servers still coordinate aliases of the same configured URL.
+        // Unknown transports stay instance-qualified rather than merging hosts.
+        self.exec_server_url.as_ref().map_or_else(
+            || format!("unknown:{}", self.approval_scope_id),
+            |url| format!("exec-url:{url}"),
+        )
+    }
+
     /// Returns the remote exec-server URL when this environment is remote.
     pub fn exec_server_url(&self) -> Option<&str> {
         self.exec_server_url.as_deref()
@@ -765,6 +782,15 @@ impl Environment {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn audit151_remote_coordination_does_not_share_approval_authority() {
+        let first = super::Environment::remote_inner("ws://same-executor".to_string(), None);
+        let alias = super::Environment::remote_inner("ws://same-executor".to_string(), None);
+        let other = super::Environment::remote_inner("ws://another-executor".to_string(), None);
+        assert_eq!(first.coordination_resource_id(), alias.coordination_resource_id());
+        assert_ne!(first.approval_scope_id(), alias.approval_scope_id());
+        assert_ne!(first.coordination_resource_id(), other.coordination_resource_id());
+    }
     use std::collections::HashMap;
     use std::sync::Arc;
     use std::time::Duration;

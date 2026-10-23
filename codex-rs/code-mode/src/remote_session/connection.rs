@@ -186,7 +186,11 @@ impl Connection {
                 let mut lines = BufReader::new(stderr).lines();
                 loop {
                     match lines.next_line().await {
-                        Ok(Some(line)) => debug!("code-mode host stderr: {line}"),
+                        Ok(Some(line)) => tracing::info!(
+                            event.name = "codex.code_mode_host.observation",
+                            host_event = %line,
+                            "code-mode host stderr observation"
+                        ),
                         Ok(None) => break,
                         Err(err) => {
                             warn!("failed to read code-mode host stderr: {err}");
@@ -919,9 +923,11 @@ mod tests {
             cancellation: CancellationToken::new(),
         };
         let cell_id = CellId::new("held-cell".to_string());
-        // Core's terminate_interrupted_cell observes termination for five
-        // seconds, less than this connection's ten-second control deadline.
-        // Withhold the host acknowledgment while retaining a live transport.
+        // Core's terminate_interrupted_cell stops observing after five seconds
+        // but leaves the request running in a detached task. Any caller that
+        // drops it before this connection's ten-second control deadline must
+        // still fail closed. Withhold the host acknowledgment while retaining
+        // a live transport.
         let response_tx = {
             let observer = tokio::time::timeout(
                 Duration::from_secs(5),
@@ -944,7 +950,7 @@ mod tests {
                 "the outer observer reports uncertainty, not termination"
             );
             response_tx
-        }; // Drop the timed-out control future, as the core caller does.
+        }; // Drop the timed-out control future, as an abandoning caller would.
         tokio::time::advance(TERMINATE_TIMEOUT).await;
         tokio::task::yield_now().await;
 

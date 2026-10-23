@@ -17,6 +17,7 @@ pub use metadata::EnabledToolMetadata;
 pub use metadata::ToolDefinition;
 pub use metadata::augment_tool_definition;
 pub use metadata::is_code_mode_nested_tool;
+pub use metadata::legacy_code_mode_identifier;
 pub use metadata::normalize_code_mode_identifier;
 pub use metadata::render_code_mode_sample;
 pub use metadata::render_code_mode_tool_bundle;
@@ -85,6 +86,7 @@ mod tests {
                 "required": ["city"],
                 "additionalProperties": false
             })),
+            namespace_description: None,
             default_timeout_ms: None,
             output_schema: Some(json!({
                 "type": "object",
@@ -139,6 +141,7 @@ mod tests {
                 "properties": {"selectors": {"type": "array", "items": {"$ref": "#/$defs/selector"}}},
                 "required": ["selectors"]
             })),
+            namespace_description: None,
             default_timeout_ms: None,
             output_schema: Some(json!({
                 "$defs": {"selector": selector},
@@ -205,6 +208,7 @@ mod tests {
                 }},
                 "required": ["only"]
             })),
+            namespace_description: None,
             default_timeout_ms: None,
             output_schema: None,
         };
@@ -247,6 +251,7 @@ mod tests {
             description: "Look up an address.".into(),
             kind: CodeModeToolKind::Function,
             input_schema: Some(schema.clone()),
+            namespace_description: None,
             default_timeout_ms: None,
             output_schema: Some(schema),
         };
@@ -286,6 +291,7 @@ mod tests {
                 },
                 "required": ["weather"]
             })),
+            namespace_description: None,
             default_timeout_ms: None,
             output_schema: Some(json!({
                 "type": "object",
@@ -437,6 +443,7 @@ mod tests {
                 "required": ["description", "path"],
                 "additionalProperties": false
             })),
+            namespace_description: None,
             default_timeout_ms: None,
             output_schema: None,
         };
@@ -534,6 +541,7 @@ mod tests {
             description: "Sample tool.".into(),
             kind: CodeModeToolKind::Function,
             input_schema: Some(schema),
+            namespace_description: None,
             default_timeout_ms: None,
             output_schema: None,
         };
@@ -674,6 +682,7 @@ mod tests {
             description: "Receipt.".into(),
             kind: CodeModeToolKind::Function,
             input_schema: None,
+            namespace_description: None,
             default_timeout_ms: None,
             output_schema: Some(json!({
                 "$defs": {"Payload": {"type": "object", "properties": {"answer": {"type": "string"}}, "required": ["answer"]}},
@@ -816,6 +825,7 @@ mod tests {
                 description: "Direct tool.".into(),
                 kind: CodeModeToolKind::Function,
                 input_schema: Some(json!({"type": "string"})),
+                namespace_description: None,
                 default_timeout_ms: None,
                 output_schema: None,
             };

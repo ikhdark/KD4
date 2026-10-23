@@ -95,3 +95,34 @@ async fn convert_apply_patch_maps_update_variant() {
         );
     }
 }
+
+#[tokio::test]
+async fn audit147_add_over_existing_file_is_projected_as_its_replacement() {
+    for existing in [Some("old\n"), None] {
+        let tmp = tempdir().expect("tmp");
+        let path = tmp.path().join("target.txt");
+        if let Some(content) = existing {
+            std::fs::write(&path, content).expect("write existing file");
+        }
+        let action = parse_verified_patch(
+            tmp.path(),
+            "*** Begin Patch\n*** Add File: target.txt\n+new\n*** End Patch",
+        )
+        .await;
+
+        let got = convert_apply_patch_to_protocol(&action);
+
+        // Approval and history must show the content an Add replaces; adding an
+        // absent file stays a plain addition.
+        let expected = match existing {
+            Some(_) => FileChange::Update {
+                unified_diff: "@@ -1 +1 @@\n-old\n+new\n".to_string(),
+                move_path: None,
+            },
+            None => FileChange::Add {
+                content: "new\n".to_string(),
+            },
+        };
+        assert_eq!(got, HashMap::from([(path, expected)]));
+    }
+}

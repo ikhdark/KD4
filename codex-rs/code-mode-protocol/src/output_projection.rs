@@ -195,15 +195,25 @@ pub fn model_visible_tool_result(tool: &ToolName, raw: &Value) -> Option<Value> 
     {
         let retained = content
             .iter()
-            .filter(|item| {
-                // Annotations and other fields are independent evidence, even on a mirror.
-                !(item.as_object().is_some_and(|item| item.len() == 2)
-                    && item["type"] == "text"
+            .filter_map(|item| {
+                let mirror = item["type"] == "text"
                     && item["text"].as_str().is_some_and(|text| {
                         serde_json::from_str::<Value>(text).is_ok_and(|value| value == *structured)
-                    }))
+                    });
+                if !mirror {
+                    return Some(item.clone());
+                }
+                if item.as_object().is_some_and(|item| item.len() == 2) {
+                    return None;
+                }
+                // Replace only the redundant body. Annotations, position and
+                // provider metadata are independent evidence and survive.
+                let mut reference = item.clone();
+                reference["text"] = Value::String(
+                    "[Exact JSON mirror omitted; see structuredContent.]".to_string(),
+                );
+                Some(reference)
             })
-            .cloned()
             .collect::<Vec<_>>();
         projected.insert("content".to_string(), Value::Array(retained));
     }
@@ -779,7 +789,7 @@ mod tests {
     }
 
     #[test]
-    fn mcp_removes_only_unannotated_exact_mirrors() {
+    fn mcp_compacts_exact_mirrors_without_losing_annotations() {
         let raw = json!({"structuredContent":{"a":1,"b":2},"isError":true,"_meta":{"id":7},
             "content":[{"type":"text","text":"{\"b\":2, \"a\":1}"},
                 {"type":"text","text":"caption"}, {"type":"text","text":"{\"a\":1}"},
@@ -787,6 +797,8 @@ mod tests {
                 {"type":"text","text":"{\"a\":1,\"b\":2}","annotations":{"priority":1}}]});
         let mut expected = raw.clone();
         expected["content"].as_array_mut().unwrap().remove(0);
+        expected["content"][3]["text"] =
+            json!("[Exact JSON mirror omitted; see structuredContent.]");
         assert_eq!(
             model_visible_tool_result(&ToolName::namespaced("server", "tool"), &raw),
             Some(expected)

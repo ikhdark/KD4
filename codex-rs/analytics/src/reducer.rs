@@ -2157,6 +2157,7 @@ pub(crate) fn analytics_tool_item(item: &ThreadItem) -> Option<ThreadItem> {
             ..
         } => ThreadItem::FileChange {
             environment: None,
+            effects: None,
             id: id.clone(),
             changes: changes
                 .iter()

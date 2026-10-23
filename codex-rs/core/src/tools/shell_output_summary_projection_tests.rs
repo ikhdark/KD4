@@ -132,6 +132,7 @@ fn verified10_compiler_recovery_uses_canonical_crlf_and_unicode_bytes() {
         let output = ExecCommandToolOutput {
             output_ranges: None,
             process_output: Some(Arc::new(ProcessOutputSnapshot {
+                process_duration: None,
                 aggregated_output: raw.as_bytes().to_vec(),
                 stdout: stdout.as_bytes().to_vec(),
                 stderr: stderr.as_bytes().to_vec(),
@@ -377,6 +378,7 @@ fn rustc_stderr_diagnostics_keep_constraints_through_both_output_paths() {
     let mut unified = ExecCommandToolOutput {
         output_ranges: None,
         process_output: Some(Arc::new(ProcessOutputSnapshot {
+            process_duration: None,
             aggregated_output: stderr.as_bytes().to_vec(),
             stdout: Vec::new(),
             stderr: stderr.as_bytes().to_vec(),
@@ -443,6 +445,7 @@ fn unified_exec_compiler_streams_do_not_replay_prior_poll_output() {
     let mut output = ExecCommandToolOutput {
         output_ranges: None,
         process_output: Some(Arc::new(ProcessOutputSnapshot {
+            process_duration: None,
             aggregated_output: mixed.as_bytes().to_vec(),
             stdout: stdout.into_bytes(),
             stderr: stderr.as_bytes().to_vec(),

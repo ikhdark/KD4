@@ -93,6 +93,7 @@ pub enum AgentIdentityAuthPolicy {
 }
 
 const AGENT_IDENTITY_BOOTSTRAP_FAILURE_COOLDOWN: Duration = Duration::from_secs(60 * 60);
+const CHATGPT_TOKEN_REFRESH_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Debug)]
 struct CachedAgentIdentityBootstrapFailure {
@@ -1589,6 +1590,7 @@ async fn request_chatgpt_token_refresh(
     _client: &HttpClient,
     auth_route_config: &AuthRouteConfig,
     context: Option<&OAuthContext>,
+    timeout: Duration,
 ) -> Result<RefreshResponse, RefreshTokenError> {
     let client = crate::default_client::create_default_auth_client_pool(auth_route_config);
     let refresh_request = RefreshRequest {
@@ -1606,6 +1608,9 @@ async fn request_chatgpt_token_refresh(
     // Use shared client factory to include standard headers
     let response = client
         .post(endpoint.as_str())
+        // Bound route resolution, headers and the entire response body. Do not
+        // wrap persistence: a received rotating token must still be committed.
+        .timeout(timeout)
         .header("Content-Type", "application/json")
         .json(&refresh_request)
         .send()
@@ -2099,6 +2104,7 @@ pub struct AuthManager {
     chatgpt_base_url: Option<String>,
     agent_identity_authapi_base_url: Option<String>,
     refresh_lock: Semaphore,
+    proactive_refresh_generation: AtomicU64,
     pending_rotation: Mutex<Option<(ChatgptAuth, AuthDotJson, RefreshResponse)>>,
     agent_identity_lock: Semaphore,
     agent_identity_bootstrap_cooldown: Mutex<AgentIdentityBootstrapCooldown>,
@@ -2233,6 +2239,7 @@ impl AuthManager {
             chatgpt_base_url,
             agent_identity_authapi_base_url,
             refresh_lock: Semaphore::new(/*permits*/ 1),
+            proactive_refresh_generation: AtomicU64::new(0),
             pending_rotation: Mutex::new(None),
             agent_identity_lock: Semaphore::new(/*permits*/ 1),
             agent_identity_bootstrap_cooldown: Mutex::default(),
@@ -2265,6 +2272,7 @@ impl AuthManager {
             chatgpt_base_url: None,
             agent_identity_authapi_base_url: default_agent_identity_authapi_base_url(),
             refresh_lock: Semaphore::new(/*permits*/ 1),
+            proactive_refresh_generation: AtomicU64::new(0),
             pending_rotation: Mutex::new(None),
             agent_identity_lock: Semaphore::new(/*permits*/ 1),
             agent_identity_bootstrap_cooldown: Mutex::default(),
@@ -2296,6 +2304,7 @@ impl AuthManager {
             chatgpt_base_url: None,
             agent_identity_authapi_base_url: default_agent_identity_authapi_base_url(),
             refresh_lock: Semaphore::new(/*permits*/ 1),
+            proactive_refresh_generation: AtomicU64::new(0),
             pending_rotation: Mutex::new(None),
             agent_identity_lock: Semaphore::new(/*permits*/ 1),
             agent_identity_bootstrap_cooldown: Mutex::default(),
@@ -2335,6 +2344,7 @@ impl AuthManager {
                     .to_string(),
             ),
             refresh_lock: Semaphore::new(/*permits*/ 1),
+            proactive_refresh_generation: AtomicU64::new(0),
             pending_rotation: Mutex::new(None),
             agent_identity_lock: Semaphore::new(/*permits*/ 1),
             agent_identity_bootstrap_cooldown: Mutex::default(),
@@ -2364,6 +2374,7 @@ impl AuthManager {
             chatgpt_base_url: None,
             agent_identity_authapi_base_url: default_agent_identity_authapi_base_url(),
             refresh_lock: Semaphore::new(/*permits*/ 1),
+            proactive_refresh_generation: AtomicU64::new(0),
             pending_rotation: Mutex::new(None),
             agent_identity_lock: Semaphore::new(/*permits*/ 1),
             agent_identity_bootstrap_cooldown: Mutex::default(),
@@ -3064,6 +3075,8 @@ impl AuthManager {
     }
 
     async fn refresh_token_internal(&self, proactive: bool) -> Result<(), RefreshTokenError> {
+        let generation = self.proactive_refresh_generation.load(Ordering::Acquire);
+        let auth_revision = *self.auth_change_tx.borrow();
         let _refresh_guard = self.refresh_lock.acquire().await.map_err(|_| {
             RefreshTokenError::Permanent(RefreshTokenFailedError::new(
                 RefreshTokenFailedReason::Other,
@@ -3075,6 +3088,21 @@ impl AuthManager {
             return Ok(());
         }
         let auth_before_reload = self.auth_cached();
+        if proactive
+            && self.proactive_refresh_generation.load(Ordering::Acquire) != generation
+            && *self.auth_change_tx.borrow() == auth_revision
+            && auth_before_reload
+                .as_ref()
+                .and_then(CodexAuth::get_current_auth_json)
+                .and_then(|auth| auth.tokens)
+                .and_then(|tokens| parse_jwt_expiration(&tokens.access_token).ok().flatten())
+                .is_some_and(|expires_at| expires_at > Utc::now())
+        {
+            // A transient attempt completed while this caller was queued for
+            // these exact credentials. Share its valid-token fallback, not a
+            // cooldown: later calls, expired tokens and explicit recovery retry.
+            return Ok(());
+        }
         // A queued proactive caller may have observed an expired token before
         // another caller refreshed it. Recheck under the same refresh lock to
         // avoid repeating storage reads, client construction, and token rotation.
@@ -3096,7 +3124,7 @@ impl AuthManager {
             .as_ref()
             .and_then(CodexAuth::get_account_id);
 
-        match self
+        let result = match self
             .reload_if_account_id_matches(expected_account_id.as_deref())
             .await
         {
@@ -3105,13 +3133,19 @@ impl AuthManager {
                 Ok(())
             }
             ReloadOutcome::ReloadedNoChange => self.refresh_token_from_authority_impl().await,
-            ReloadOutcome::Skipped => {
-                Err(RefreshTokenError::Permanent(RefreshTokenFailedError::new(
-                    RefreshTokenFailedReason::Other,
-                    REFRESH_TOKEN_ACCOUNT_MISMATCH_MESSAGE.to_string(),
-                )))
-            }
+            ReloadOutcome::Skipped => Err(RefreshTokenError::Permanent(RefreshTokenFailedError::new(
+                RefreshTokenFailedReason::Other,
+                REFRESH_TOKEN_ACCOUNT_MISMATCH_MESSAGE.to_string(),
+            ))),
+        };
+        if proactive
+            && matches!(&result, Err(RefreshTokenError::Transient(_)))
+            && *self.auth_change_tx.borrow() == auth_revision
+        {
+            self.proactive_refresh_generation
+                .fetch_add(1, Ordering::Release);
         }
+        result
     }
 
     /// Attempt to refresh the current auth token from the authority that issued
@@ -3417,6 +3451,7 @@ impl AuthManager {
             auth.client(),
             &self.auth_route_config,
             expected.oauth_context.as_ref(),
+            CHATGPT_TOKEN_REFRESH_TIMEOUT,
         )
         .await?;
 

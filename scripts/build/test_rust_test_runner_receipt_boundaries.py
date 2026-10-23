@@ -1279,6 +1279,29 @@ class NextestReceiptBoundariesTest(RunnerTestCase):
             )
         self.assertEqual(path.read_bytes(), raw.encode())
 
+    def test_bounded_string_spans_preserve_chunked_escapes_and_encoded_limits(self):
+        payload = nextest_run_payload([("alpha", "ok")])
+        events = [json.loads(line) for line in payload.splitlines()]
+        terminal = next(event for event in events if event.get("event") == "ok" and event.get("type") == "test")
+        terminal["stdout"] = "x" * 8191 + "λ\\\"" * 30000
+        raw = "\n".join(json.dumps(event) for event in events)
+        # Split every JSON escape at each possible boundary; the oracle comes
+        # from the authored native frames, not another parser implementation.
+        escape = raw.index("\\u03bb")
+        for split in range(escape, escape + 7):
+            with self.subTest(split=split):
+                projected = "\n".join(rust_test_runner._nextest_json_lines([raw[:split], raw[split:]]))
+                result = subprocess.CompletedProcess([], 0, projected, "")
+                self.assertEqual(list(rust_test_runner._nextest_results(result)), [("PASS", "codex-core", "alpha")])
+                projected_event = next(json.loads(line) for line in projected.splitlines() if '"stdout"' in line)
+                self.assertIsNone(projected_event["stdout"])
+        # The encoded token includes both quotes; escaped characters consume
+        # their encoded length, not their decoded scalar count.
+        for count, oversized in ((10922, False), (10923, True)):
+            encoded = '{"name":"' + "\\u0061" * count + '"}'
+            value = json.loads(next(iter(rust_test_runner._nextest_json_lines([encoded]))))["name"]
+            self.assertEqual(value, None if oversized else "a" * count)
+
     def test_oversized_invalid_json_cannot_be_repaired_into_proof(self):
         header = nextest_run_payload([]).splitlines()[0]
         for invalid in ("\\q", "\t", "\\u12xz"):

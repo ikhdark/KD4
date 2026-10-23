@@ -1,6 +1,7 @@
 use crate::ToolDefinition;
 use crate::ToolOutputSchema;
 use crate::json_schema::parse_mcp_input_schema;
+use crate::json_schema::parse_owned_tool_input_schema;
 use serde_json::Value as JsonValue;
 use serde_json::json;
 
@@ -20,10 +21,20 @@ pub fn parse_mcp_tool(tool: &rmcp::model::Tool) -> Result<ToolDefinition, serde_
         );
     }
 
+    let lossy = parse_owned_tool_input_schema(serialized_input_schema.clone()).is_err();
+    let original_schema = lossy.then(|| serialized_input_schema.to_string());
     let input_schema = parse_mcp_input_schema(serialized_input_schema)?;
+    let mut description: String = tool.description.clone().map(Into::into).unwrap_or_default();
+    if let Some(original_schema) = original_schema {
+        // Reuse the recoverable description contract in native discovery and
+        // code mode. Unsupported assertions must not enter the provider's API
+        // schema, but the full validator's requirements must remain available.
+        description.push_str("\nThe parameter schema is a permissive projection. The following original JSON Schema is authoritative and is validated before dispatch:\n");
+        description.push_str(&original_schema);
+    }
     Ok(ToolDefinition {
         name: tool.name.to_string(),
-        description: tool.description.clone().map(Into::into).unwrap_or_default(),
+        description,
         input_schema,
         output_schema: Some(ToolOutputSchema::from_mcp_output_schema(
             tool.output_schema.clone(),

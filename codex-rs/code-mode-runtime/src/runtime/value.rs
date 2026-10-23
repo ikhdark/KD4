@@ -338,8 +338,11 @@ pub(super) fn v8_value_to_json_with_limit(
 ) -> Result<Option<JsonValue>, JsonConversionError> {
     let tc = std::pin::pin!(v8::TryCatch::new(scope));
     let mut tc = tc.init();
-    let Some(stringified) = super::output_projection::json_codec(&mut tc, value, "canonical")
-        .and_then(|value| v8::Local::<v8::String>::try_from(value).ok())
+    let encoded = super::output_projection::bounded_json_codec(&mut tc, value, max_bytes);
+    if encoded.is_some_and(|value| value.is_null()) {
+        return Err(JsonConversionError::TooLarge);
+    }
+    let Some(stringified) = encoded.and_then(|value| v8::Local::<v8::String>::try_from(value).ok())
     else {
         if tc.has_caught() {
             return Err(JsonConversionError::Invalid(
@@ -393,6 +396,11 @@ pub(super) fn value_to_error_text(
     scope: &mut v8::PinScope<'_, '_>,
     value: v8::Local<'_, v8::Value>,
 ) -> String {
+    // Captured before the TryCatch borrows the scope. Used only to repair a
+    // call to a nested tool name that this cell's catalog does not contain.
+    let enabled_tools = scope
+        .get_slot::<super::RuntimeState>()
+        .map(|state| std::sync::Arc::clone(&state.enabled_tools));
     let tc = std::pin::pin!(v8::TryCatch::new(scope));
     let mut tc = tc.init();
     let object = v8::Local::<v8::Object>::try_from(value).ok();
@@ -411,11 +419,34 @@ pub(super) fn value_to_error_text(
     }) {
         text.push_str("\nHint: JavaScript strings use .indexOf(value), not Python's .index(value); a missing match returns -1.");
     }
+    // A guessed tool name is the most common invalid nested call. Name the
+    // catalog's candidates instead of returning a bare TypeError.
+    let missing_tool = text
+        .lines()
+        .next()
+        .and_then(|line| line.strip_prefix("TypeError: tools."))
+        .and_then(|rest| rest.strip_suffix(" is not a function"))
+        .filter(|name| !name.is_empty() && !name.contains(char::is_whitespace))
+        .map(str::to_owned);
+    if let Some(name) = missing_tool
+        && let Some(catalog) = enabled_tools.as_deref()
+    {
+        let diagnostic = catalog.resolution_diagnostic(Some(name.as_str()));
+        text.push_str(&format!(
+            "\nHint: no nested tool named `{name}` is enabled in this cell; it did not run. Resolution: {diagnostic}"
+        ));
+    }
     // Uncaught helper failures must carry their settled receipts through the
     // existing canonical cell-output artifact, not just the small nested-call
     // fallback. Do not run this on successful results or emit extra tool calls.
+    // A run_graph capability preflight carries its missing names instead.
     if let Some(object) = object {
-        for field in ["results", "evidence"] {
+        for field in [
+            "results",
+            "evidence",
+            "missing_capabilities",
+            "omitted_capabilities",
+        ] {
             let Some(key) = v8::String::new(&tc, field) else {
                 continue;
             };

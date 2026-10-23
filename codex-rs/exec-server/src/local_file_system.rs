@@ -865,6 +865,7 @@ impl DirectFileSystem {
         run_cancellable_file_system_task(move |cancel| {
             check_file_system_cancelled(&cancel)?;
             let canonical_root = std::fs::canonicalize(root.as_path())?;
+            let _capture = codex_file_system::guard_patch_read(path.as_path())?;
             let canonical_path = std::fs::canonicalize(path.as_path())?;
             if !canonical_path.starts_with(&canonical_root) {
                 return Err(io::Error::new(
@@ -940,6 +941,7 @@ impl DirectFileSystem {
         // One blocking task. A path that is not a link is its own target, so
         // only links need a second, target-following query.
         let (metadata, is_symlink) = tokio::task::spawn_blocking(move || {
+            let _capture = codex_file_system::guard_patch_read(path.as_path())?;
             let symlink_metadata = std::fs::symlink_metadata(path.as_path())?;
             if symlink_metadata.file_type().is_symlink() {
                 // Preserve a known link entry when only its target is absent.

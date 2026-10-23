@@ -394,6 +394,7 @@ impl ToolEmitter {
                     .emit_turn_item_started(
                         ctx.turn,
                         &TurnItem::FileChange(FileChangeItem {
+                            effects: None,
                             environment: ctx.patch_environment.map(
                                 super::super::session::turn_context::TurnEnvironment::provenance,
                             ),
@@ -940,6 +941,9 @@ async fn emit_exec_end(
 ) -> CodexResult<()> {
     let mut persistence_result = Ok(());
     let native_cwd = exec_input.cwd.to_abs_path().ok();
+    let local_execution = ctx.turn.environments.turn_environments.iter()
+        .find(|environment| environment.environment_id == exec_input.environment_id)
+        .is_some_and(|environment| !environment.environment.is_remote());
     let mut mutation = command_mutation_for_exec(
         exec_input.command,
         native_cwd.as_ref().map(AbsolutePathBuf::as_path),
@@ -1035,7 +1039,7 @@ async fn emit_exec_end(
     }
     let possible_mutation = mutation.may_have_mutated();
     let mutation_paths = mutation.paths();
-    let generation_batch = if possible_mutation
+    let generation_batch = if local_execution && possible_mutation
         && exec_result.status != ExecCommandStatus::Declined
         && observed_workspace_identity.is_none()
     {
@@ -1066,8 +1070,8 @@ async fn emit_exec_end(
     } else {
         observed_workspace_identity
     };
-    if possible_mutation && exec_result.status != ExecCommandStatus::Declined {
-        if let Some(paths) = mutation_paths {
+    if local_execution && possible_mutation && exec_result.status != ExecCommandStatus::Declined {
+        if let (Some(paths), Some(cwd)) = (mutation_paths, native_cwd.as_ref()) {
             let paths = paths
                 .iter()
                 .map(|path| path.to_string_lossy().into_owned())
@@ -1076,9 +1080,7 @@ async fn emit_exec_end(
                 .services
                 .git_workspace
                 .note_host_workspace_mutation_paths(
-                    native_cwd
-                        .as_ref()
-                        .map_or_else(|| std::path::Path::new("."), AbsolutePathBuf::as_path),
+                    cwd.as_path(),
                     &paths,
                 )
                 .await;
@@ -1121,7 +1123,6 @@ async fn emit_exec_end(
             .iter()
             .find(|environment| {
                 environment.environment_id == exec_input.environment_id
-                    && !environment.environment.is_remote()
             })
             .map(|environment| environment.environment.get_filesystem());
         let observed_mutation = match observed_changes.as_ref() {
@@ -1173,7 +1174,7 @@ async fn emit_exec_end(
     } else {
         None
     };
-    if captured_workspace_identity
+    if local_execution && captured_workspace_identity
         && let (Some(tracker), Some(cwd), Some(revision)) = (
             ctx.turn_diff_tracker,
             native_cwd.as_ref(),
@@ -1211,7 +1212,7 @@ async fn emit_exec_end(
             .invalidate_tool_history_source_dependencies(mutation_paths, None)
             .await;
     }
-    if !mutation_deferred && let Some(observed_mutation_revision) = observed_mutation_revision {
+    if local_execution && !mutation_deferred && let Some(observed_mutation_revision) = observed_mutation_revision {
         ctx.session
             .services
             .command_execution
@@ -1257,10 +1258,16 @@ async fn emit_exec_end(
     // diff. Publish that reason next to the command that caused it rather than
     // waiting for the end of the turn; the one-shot latch keeps the turn-end
     // emission from repeating it.
-    let invalidation_warning = match ctx.turn_diff_tracker {
-        Some(tracker) => tracker.lock().await.take_invalidation_warning(),
-        None => None,
+    let (unified_diff, invalidation_warning) = match ctx.turn_diff_tracker {
+        Some(tracker) => {
+            let mut tracker = tracker.lock().await;
+            (tracker.take_unified_diff_if_changed(), tracker.take_invalidation_warning())
+        }
+        None => (None, None),
     };
+    if let Some(unified_diff) = unified_diff {
+        ctx.session.send_event(ctx.turn, EventMsg::TurnDiff(TurnDiffEvent { unified_diff })).await;
+    }
     if let Some(message) = invalidation_warning {
         // Diff-display uncertainty belongs in the UI, not in model history.
         // Source-evidence invalidation above remains authoritative and separate.
@@ -1321,6 +1328,40 @@ fn workspace_identity_capture_required(required: bool, already_captured: bool) -
     required && !already_captured
 }
 
+fn patch_effects(update: &TurnDiffTrackerUpdate<'_>) -> codex_protocol::items::FileChangeEffects {
+    use codex_apply_patch::AppliedPatchFileChange;
+    use codex_protocol::items::FileChangeEffect;
+    let mut changes = Vec::new();
+    if let TurnDiffTrackerUpdate::Track { delta, .. } = update {
+        for change in delta.changes() {
+            let path = change.path_uri().clone();
+            match &change.change {
+                AppliedPatchFileChange::Add { content, overwritten_content } => changes.push(FileChangeEffect {
+                    path, before: overwritten_content.clone(), after: Some(content.clone()),
+                }),
+                AppliedPatchFileChange::Delete { content } => changes.push(FileChangeEffect {
+                    path, before: Some(content.clone()), after: None,
+                }),
+                AppliedPatchFileChange::Update { old_content, new_content, overwritten_move_content, .. } => {
+                    if let Some(destination) = change.move_path_uri() {
+                        changes.push(FileChangeEffect { path: destination.clone(),
+                            before: overwritten_move_content.clone(), after: Some(new_content.clone()) });
+                        changes.push(FileChangeEffect { path, before: Some(old_content.clone()), after: None });
+                    } else {
+                        changes.push(FileChangeEffect { path, before: Some(old_content.clone()), after: Some(new_content.clone()) });
+                    }
+                }
+            }
+        }
+    }
+    let exact = match update {
+        TurnDiffTrackerUpdate::Track { delta, .. } => delta.is_exact(),
+        TurnDiffTrackerUpdate::None => true,
+        TurnDiffTrackerUpdate::Invalidate => false,
+    };
+    codex_protocol::items::FileChangeEffects { changes, exact }
+}
+
 async fn emit_patch_end(
     ctx: ToolEventCtx<'_>,
     changes: HashMap<PathBuf, FileChange>,
@@ -1341,9 +1382,18 @@ async fn emit_patch_end(
     };
     // Remote source observations have no host-watcher freshness proof. Do not
     // invent a host mutation (or broad legacy invalidation) for their writes.
-    if status != PatchApplyStatus::Declined && evidence_cwd.is_some() {
-        let affected_paths = evidence_cwd.as_ref().map(|cwd| {
-            apply_patch_intent_paths(&changes)
+    if status != PatchApplyStatus::Declined && evidence_cwd.is_some()
+        && !matches!(&tracker_update, TurnDiffTrackerUpdate::None)
+    {
+        let affected_paths = match &tracker_update {
+            TurnDiffTrackerUpdate::Track { delta, .. } if delta.is_exact() => evidence_cwd.as_ref().map(|cwd| {
+            delta.changes().iter().flat_map(|change| {
+                let destination = match &change.change {
+                    codex_apply_patch::AppliedPatchFileChange::Update { move_path, .. } => move_path.as_ref(),
+                    _ => None,
+                };
+                std::iter::once(change.path.clone()).chain(destination.cloned())
+            })
                 .into_iter()
                 .map(|path| {
                     if path.is_absolute() {
@@ -1353,7 +1403,9 @@ async fn emit_patch_end(
                     }
                 })
                 .collect::<BTreeSet<_>>()
-        });
+            }),
+            _ => None,
+        };
         let generation_batch = match ctx.turn_diff_tracker {
             Some(tracker) => tracker
                 .lock()
@@ -1401,6 +1453,7 @@ async fn emit_patch_end(
         .emit_turn_item_completed(
             ctx.turn,
             TurnItem::FileChange(FileChangeItem {
+                effects: Some(patch_effects(&tracker_update)),
                 environment: ctx
                     .patch_environment
                     .map(super::super::session::turn_context::TurnEnvironment::provenance),
@@ -1416,26 +1469,7 @@ async fn emit_patch_end(
 
     if let Some(tracker) = ctx.turn_diff_tracker {
         let patch_modes = match &tracker_update {
-            TurnDiffTrackerUpdate::Track {
-                environment_id,
-                delta,
-            } => match evidence_cwd.as_ref() {
-                Some(root) => {
-                    let environment_id = environment_id.as_deref().unwrap_or_default();
-                    let (root, paths) = {
-                        let guard = tracker.lock().await;
-                        (
-                            guard
-                                .patch_mode_root(environment_id)
-                                .unwrap_or(root.as_path())
-                                .to_path_buf(),
-                            guard.missing_mode_paths(environment_id, delta),
-                        )
-                    };
-                    crate::turn_diff_tracker::resolve_patch_index_modes(&root, paths).await
-                }
-                None => HashMap::new(),
-            },
+            TurnDiffTrackerUpdate::Track { delta, .. } => delta.preimage_modes().clone(),
             _ => HashMap::new(),
         };
         let (unified_diff, invalidation_warning, after_capture) = {
@@ -1450,13 +1484,11 @@ async fn emit_patch_end(
                         environment_id.as_deref().unwrap_or_default(),
                         patch_modes,
                     );
-                    if !delta.is_exact() {
-                        guard.record_invalidation_cause(serde_json::json!({
-                            "call_id": ctx.call_id, "tool": "apply_patch",
-                            "mutation_class": "inexact_patch_delta",
-                        }));
-                    }
-                    guard.track_delta(environment_id.as_deref().unwrap_or_default(), delta);
+                    guard.track_delta_for_call(
+                        environment_id.as_deref().unwrap_or_default(),
+                        delta,
+                        Some(ctx.call_id),
+                    );
                     guard.take_unified_diff_if_changed()
                 }
                 TurnDiffTrackerUpdate::Invalidate => {
@@ -2819,6 +2851,162 @@ mod tests {
         assert_eq!(tracker.current_validation_revision(), 2);
     }
 
+    /// Settles a nested compile check that failed with `stderr` the way a code
+    /// cell records it, then adopts the next settlement boundary as the
+    /// completion gate does.
+    async fn settle_nested_compile_failure(
+        control: &mut crate::session::turn_execution::TurnExecutionControl,
+        tracker: &SharedTurnDiffTracker,
+        workspace: &Path,
+        stderr: &str,
+    ) {
+        let tool = codex_tools::ToolName::plain("exec_command");
+        let command = "cargo check --locked -p kda --lib --bins --tests";
+        let payload = codex_tools::ToolPayload::Function {
+            arguments: serde_json::json!({"cmd": command}).to_string(),
+        };
+        let signal = serde_json::json!({"command_validation": {
+            "validation": true, "proof": true, "tests": false,
+            "execution_context": {
+                "command": ["pwsh", "-NonInteractive", "-Command", command],
+                "cwd": workspace, "environment_id": "local", "environment_fingerprint": "kda"
+            }
+        }});
+        let result = serde_json::json!({
+            "exit_code": 101, "execution_state": "exited", "process_exited": true,
+            "streams_complete": true, "stdout": "", "stderr": stderr, "output": stderr,
+            "output_complete": true, "output_reduced": false,
+        });
+        let tracker = tracker.lock().await;
+        let revision = tracker.current_mutation_revision();
+        let baselines = control.baselines(revision);
+        let collector = control.collector(&baselines);
+        collector.record_code_mode_result_for_call(
+            Some("exec-cell/1-tool-1"),
+            crate::session::turn_execution::CodeModeToolResult {
+                cell_id: "cell/1",
+                tool_name: &tool,
+                payload: &payload,
+                source_dependencies: None,
+                outcome_context: codex_tools::ToolOutputOutcomeContext::new(
+                    codex_tools::ToolOutputOutcome::Failure,
+                ),
+                signal: Some(&signal),
+                result: &result,
+                canonical_artifact_required: false,
+            },
+        );
+        let settled = crate::session::turn_execution::SamplingRequestSettledState {
+            mutation_revision: revision,
+            attributed_mutation_revision: tracker.attributed_mutation_revision(),
+            tool_exposure_revision: 0,
+        };
+        control.retain_validation_across_changes(revision, &tracker);
+        control.settle(&baselines, &collector, &settled);
+        // The final answer's own settlement boundary precedes the gate.
+        control.retain_validation_across_changes(revision, &tracker);
+    }
+
+    /// Writer overlap locates concurrent work, not which change broke a consumer.
+    /// Even wholly foreign diagnostics must remain unresolved without a scoped
+    /// explicit blocker; a comment edit cannot excuse our removed API.
+    #[tokio::test]
+    async fn audit149_compile_failure_overlap_is_advisory_not_causal_attribution() {
+        let workspace = tempdir().unwrap();
+        let source = workspace.path().join("src");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::write(source.join("body_ir.rs"), "fn edge() {}\n").unwrap();
+        let (session, mut turn, _events) =
+            make_session_and_context_with_dynamic_tools_and_rx(Vec::new()).await;
+        set_turn_environments(
+            &mut turn,
+            &[(codex_exec_server::LOCAL_ENVIRONMENT_ID, workspace.path())],
+        );
+        let foreign = "   Compiling kda v0.1.0\nerror[E0433]: cannot find type `EdgeKind` in this scope\n    --> src\\body_ir.rs:1181:40\n     |\n1181 |                 if matches!(edge.kind, EdgeKind::True | EdgeKind::False) {\n     |                                        ^^^^^^^^ use of undeclared type `EdgeKind`\n     |\nhelp: consider importing one of these enums\n     |\n  13 + use crate::local_cfg::EdgeKind;\n     |\n\nwarning: unused variable: `manifest_path`\n    --> src\\workspace.rs:4868:9\n     |\n4868 |         manifest_path: Option<&Path>,\n     |         ^^^^^^^^^^^^^\n\nFor more information about an error, try `rustc --explain E0433`.\nerror: could not compile `kda` (lib) due to 1 previous error; 1 warning emitted\n";
+        // This consumer error points back at the turn's own edited definition.
+        let consumer = "error[E0061]: this function takes 0 arguments but 1 argument was supplied\n    --> src\\body_ir.rs:12:5\n     |\n12   |     delete(path);\n     |     ^^^^^^ ----\nnote: function defined here\n    --> src\\atomic_write.rs:1:8\n     |\n1    | pub fn delete() {}\n     |        ^^^^^^\n\nerror: could not compile `kda` (lib) due to 1 previous error\n";
+        for (stderr, own_reference) in [(foreign, false), (consumer, true)] {
+            let home = tempdir().unwrap();
+            std::fs::write(source.join("atomic_write.rs"), "pub fn delete() {}\n").unwrap();
+            let tracker = Arc::new(Mutex::new(TurnDiffTracker::new()));
+            let mut control = crate::session::turn_execution::TurnExecutionControl::new();
+            // This turn's exact patch is its only change.
+            let cwd = PathUri::from_host_native_path(workspace.path()).unwrap();
+            let delta = codex_apply_patch::apply_patch(
+                "*** Begin Patch\n*** Update File: src/atomic_write.rs\n@@\n-pub fn delete() {}\n+pub fn delete() -> bool { true }\n*** End Patch",
+                &cwd,
+                &mut Vec::new(),
+                &mut Vec::new(),
+                LOCAL_FS.as_ref(),
+                /*sandbox*/ None,
+            )
+            .await
+            .unwrap();
+            ToolEmitter::ApplyPatch {
+                changes: HashMap::new(),
+                auto_approved: false,
+                environment_id: Some(codex_exec_server::LOCAL_ENVIRONMENT_ID.into()),
+                captured_environment: None,
+            }
+            .finish(
+                ToolEventCtx::new(session.as_ref(), turn.as_ref(), "own", Some(&tracker)),
+                Ok(ExecToolCallOutput::default()),
+                Some(&delta),
+            )
+            .await
+            .unwrap();
+            settle_nested_compile_failure(&mut control, &tracker, workspace.path(), stderr).await;
+            let revision = tracker.lock().await.current_mutation_revision();
+
+            // Without another writer, an error in an unedited file can be a
+            // consumer this turn broke: it stays repair work.
+            assert_eq!(control.has_external_validation_candidates(), !own_reference);
+            let alone = control.completion_readiness(revision);
+            assert_eq!(alone.validation_work.len(), 1, "{:?}", alone.validation_work);
+            assert!(alone.validation_work[0].starts_with("Resolve current failed validation"));
+
+            // Another live session in this checkout is editing the erroring file.
+            let mut other = crate::live_sessions::LiveSessionTurn::begin(
+                home.path(),
+                "other-session",
+                workspace.path(),
+                "Fix the CFG edges",
+            );
+            other.publish(vec![source.join("body_ir.rs")]).await;
+            let others = crate::live_sessions::others_in_checkout(
+                home.path(),
+                "this-session",
+                workspace.path(),
+            )
+            .await;
+            assert_eq!(others.len(), 1);
+            control.observe_concurrent_writers(&others, workspace.path());
+            let readiness = control.completion_readiness(revision);
+            let assessment =
+                control.completion_assessment_with_changed_paths(revision, None, false);
+            let external = assessment
+                .verification_gaps
+                .iter()
+                .any(|gap| gap.contains("external blocker") && gap.contains("body_ir.rs"));
+            let failed = assessment
+                .validation_uncertainty
+                .as_ref()
+                .unwrap()
+                .failed_checks
+                .len();
+            assert_eq!(failed, 1, "the check did fail; resume keeps that question");
+            assert_eq!(readiness.validation_work.len(), 1, "{readiness:?}");
+            assert!(!assessment.failed_checks.is_empty(), "{assessment:?}");
+            assert!(!external, "{assessment:?}");
+            assert_eq!(
+                assessment.advisories.iter().any(|note| note.contains("concurrent writer overlap")),
+                !own_reference,
+                "overlap is advisory even when the compiler does not point back at our definition"
+            );
+            drop(other);
+        }
+    }
+
     #[tokio::test]
     async fn ignored_patch_then_command_delete_or_overwrite_cannot_export_a_stale_exact_diff() {
         for remove in [true, false] {
@@ -3596,3 +3784,7 @@ mod captured_patch_scope_tests {
         assert!(apply_patch_local_cwd(ctx, Some("remote")).is_none());
     }
 }
+
+#[cfg(test)]
+#[path = "events_audit147_tests.rs"]
+mod audit147_tests;

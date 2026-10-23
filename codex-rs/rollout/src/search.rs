@@ -96,15 +96,30 @@ async fn search_rollout_matches_with_query(
     archived: bool,
     query: &RolloutSearchQuery,
 ) -> io::Result<RolloutSearchMatches> {
-    let root = std::path::absolute(codex_home)?.join(if archived {
+    let home = std::path::absolute(codex_home)?;
+    let root = home.join(if archived {
         ARCHIVED_SESSIONS_SUBDIR
     } else {
         SESSIONS_SUBDIR
     });
+    // Nearly every rollout starts with a payload reference (session metadata
+    // carries the base instructions), and ripgrep cannot see the body behind
+    // it. Search the retained bodies first so only references to matching
+    // bodies become hydration candidates, rather than every rollout.
+    let Some(payload_patterns) = matching_payload_patterns(
+        rg_command,
+        &home.join(super::payload_artifact::PAYLOAD_DIRECTORY),
+        &query.json_search_term,
+    )
+    .await?
+    else {
+        return scan_rollout_matches(root.as_path(), query).await;
+    };
     let Some(plain_matches) = ripgrep_rollout_paths(
         rg_command,
         root.as_path(),
         &query.json_search_term,
+        &payload_patterns,
         &query.text_matcher,
     )
     .await?
@@ -131,17 +146,108 @@ async fn search_rollout_matches_with_query(
     Ok(matches)
 }
 
+/// Above this many matching bodies, every payload reference stays a candidate
+/// instead of one literal per digest, bounding the ripgrep command line.
+const MAX_PAYLOAD_DIGEST_PATTERNS: usize = 128;
+
+/// Literal patterns naming rollout lines whose retained payload body contains
+/// the search term: the digests of matching bodies, or the payload kind itself
+/// when there are too many to name or the body search cannot complete. `None`
+/// when ripgrep cannot run, so the caller keeps its directory-scan fallback.
+async fn matching_payload_patterns(
+    rg_command: &Path,
+    payload_root: &Path,
+    json_search_term: &str,
+) -> io::Result<Option<Vec<String>>> {
+    if !tokio::fs::try_exists(payload_root).await.unwrap_or(false) {
+        return Ok(Some(Vec::new()));
+    }
+    let mut command = Command::new(rg_command);
+    command
+        .arg("--files-with-matches")
+        .arg("--fixed-strings")
+        .arg("--ignore-case")
+        .arg("--no-ignore")
+        .arg("--glob")
+        .arg("*.json")
+        .arg("-e")
+        .arg(json_search_term)
+        .arg("--")
+        .arg(payload_root)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {
+            return Ok(None);
+        }
+        Err(err) => return Err(err),
+    };
+    let mut stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| io::Error::other("ripgrep payload search stdout was not captured"))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| io::Error::other("ripgrep payload search stderr was not captured"))?;
+    let read_paths = async {
+        let mut output = Vec::new();
+        stdout.read_to_end(&mut output).await?;
+        Ok::<_, io::Error>(output)
+    };
+    let drain_stderr = drain_and_check_empty(stderr);
+    let wait_for_exit = child.wait();
+    let (output, stderr_is_empty, status) =
+        tokio::try_join!(read_paths, drain_stderr, wait_for_exit)?;
+    let all_references = vec![super::payload_artifact::KIND.to_string()];
+    if !status.success() && !(status.code() == Some(1) && stderr_is_empty) {
+        // An unreadable body must not hide a match: keep every reference.
+        tracing::warn!(
+            root = %payload_root.display(),
+            "rollout payload search failed; inspecting every payload reference"
+        );
+        return Ok(Some(all_references));
+    }
+    let digests = payload_digests_from_paths(&output);
+    Ok(Some(if digests.len() > MAX_PAYLOAD_DIGEST_PATTERNS {
+        all_references
+    } else {
+        digests
+    }))
+}
+
+/// Digests named by `--files-with-matches` output, one `<sha256>.json` per line.
+fn payload_digests_from_paths(output: &[u8]) -> Vec<String> {
+    let mut digests = output
+        .split(|byte| *byte == b'\n')
+        .filter_map(|line| {
+            let line = line.strip_suffix(b"\r").unwrap_or(line);
+            let name = line.rsplit(|byte| *byte == b'/' || *byte == b'\\').next()?;
+            let digest = name.strip_suffix(b".json")?;
+            (digest.len() == 64 && digest.iter().all(u8::is_ascii_hexdigit))
+                .then(|| String::from_utf8_lossy(digest).to_ascii_lowercase())
+        })
+        .collect::<Vec<_>>();
+    digests.sort_unstable();
+    digests.dedup();
+    digests
+}
+
 async fn ripgrep_rollout_paths(
     rg_command: &Path,
     root: &Path,
     json_search_term: &str,
+    payload_patterns: &[String],
     search_term: &Regex,
 ) -> io::Result<Option<RolloutSearchMatches>> {
     if !tokio::fs::try_exists(root).await.unwrap_or(false) {
         return Ok(Some(HashMap::new()));
     }
 
-    let mut command = rollout_ripgrep_command(rg_command, root, json_search_term);
+    let mut command =
+        rollout_ripgrep_command(rg_command, root, json_search_term, payload_patterns);
     let mut child = match command.spawn() {
         Ok(child) => child,
         Err(err) if err.kind() == io::ErrorKind::NotFound => {
@@ -177,7 +283,12 @@ async fn ripgrep_rollout_paths(
     Ok(Some(matches))
 }
 
-fn rollout_ripgrep_command(rg_command: &Path, root: &Path, json_search_term: &str) -> Command {
+fn rollout_ripgrep_command(
+    rg_command: &Path,
+    root: &Path,
+    json_search_term: &str,
+    payload_patterns: &[String],
+) -> Command {
     let mut command = Command::new(rg_command);
     command
         .arg("--json")
@@ -188,9 +299,12 @@ fn rollout_ripgrep_command(rg_command: &Path, root: &Path, json_search_term: &st
         .arg("--glob")
         .arg("*.jsonl")
         .arg("-e")
-        .arg(json_search_term)
-        .arg("-e")
-        .arg(super::payload_artifact::KIND)
+        .arg(json_search_term);
+    // A reference to a matching body is a candidate; other references are not.
+    for pattern in payload_patterns {
+        command.arg("-e").arg(pattern);
+    }
+    command
         .arg("--")
         .arg(root)
         .stdout(Stdio::piped())
@@ -580,6 +694,7 @@ mod tests {
             Path::new("rg"),
             root,
             &query.json_search_term,
+            &[],
             &query.text_matcher,
         )
         .await
@@ -653,31 +768,119 @@ mod tests {
 
     #[test]
     fn rollout_ripgrep_command_limits_matches_per_file() {
-        let command = rollout_ripgrep_command(Path::new("rg"), Path::new("sessions"), "needle");
-        let args = command
-            .as_std()
-            .get_args()
-            .map(|arg| arg.to_string_lossy().into_owned())
-            .collect::<Vec<_>>();
+        let args = |patterns: &[String]| {
+            rollout_ripgrep_command(Path::new("rg"), Path::new("sessions"), "needle", patterns)
+                .as_std()
+                .get_args()
+                .map(|arg| arg.to_string_lossy().into_owned())
+                .collect::<Vec<_>>()
+        };
+        let digest = "a".repeat(64);
+        let mut expected = vec![
+            "--json",
+            "--max-count=1",
+            "--fixed-strings",
+            "--ignore-case",
+            "--no-ignore",
+            "--glob",
+            "*.jsonl",
+            "-e",
+            "needle",
+            "--",
+            "sessions",
+        ];
+        // Without a matching retained body, a payload reference is not a candidate.
+        assert_eq!(args(&[]), expected);
+        expected.insert(9, digest.as_str());
+        expected.insert(9, "-e");
+        assert_eq!(args(std::slice::from_ref(&digest)), expected);
+    }
 
-        assert_eq!(
-            args,
-            vec![
-                "--json",
-                "--max-count=1",
-                "--fixed-strings",
-                "--ignore-case",
-                "--no-ignore",
-                "--glob",
-                "*.jsonl",
-                "-e",
-                "needle",
-                "-e",
-                "rollout_payload_artifact",
-                "--",
-                "sessions",
-            ]
+    #[test]
+    fn payload_digest_paths_accept_only_named_bodies() {
+        let digest = "a".repeat(64);
+        let output = format!(
+            "C:\\home\\rollout-payloads\\{digest}.json\r\n/home/rollout-payloads/{}.json\n\
+             /home/rollout-payloads/{digest}.json\n/home/rollout-payloads/short.json\n\
+             /home/rollout-payloads/{digest}.json.pending\n",
+            "B".repeat(64)
         );
+        assert_eq!(
+            payload_digests_from_paths(output.as_bytes()),
+            vec![digest, "b".repeat(64)]
+        );
+        assert!(payload_digests_from_paths(b"").is_empty());
+    }
+
+    #[tokio::test]
+    async fn only_references_to_matching_payload_bodies_become_candidates() -> io::Result<()> {
+        let home = tempfile::tempdir()?;
+        let root = home.path().join("sessions");
+        std::fs::create_dir_all(&root)?;
+        let mut paths = Vec::new();
+        for (index, originator) in ["payload-needle", "unrelated-origin"].into_iter().enumerate() {
+            let path = root.join(format!(
+                "rollout-2026-01-01T00-00-0{index}-00000000-0000-0000-0000-00000000000{index}.jsonl"
+            ));
+            let line = serde_json::json!({
+                "timestamp": "2026-01-01T00:00:00Z",
+                "type": "session_meta",
+                "payload": {
+                    "id": format!("00000000-0000-0000-0000-00000000000{index}"),
+                    "timestamp": "2026-01-01T00:00:00Z",
+                    "cwd": home.path(), "originator": originator.repeat(1024),
+                    "cli_version": "test", "source": "cli"
+                }
+            });
+            let reference =
+                super::super::payload_artifact::store_line(&path, &serde_json::to_vec(&line)?)?;
+            std::fs::write(&path, &reference)?;
+            paths.push(path);
+        }
+        assert_ripgrep_runs(&root).await;
+        let payload_root = home
+            .path()
+            .join(super::super::payload_artifact::PAYLOAD_DIRECTORY);
+        let query = RolloutSearchQuery::new("payload-needle")?;
+        let patterns =
+            matching_payload_patterns(Path::new("rg"), &payload_root, &query.json_search_term)
+                .await?
+                .expect("rg runs");
+        assert_eq!(patterns.len(), 1);
+        // Only the rollout whose retained body holds the term needs hydration.
+        let candidates = ripgrep_rollout_paths(
+            Path::new("rg"),
+            &root,
+            &query.json_search_term,
+            &patterns,
+            &query.text_matcher,
+        )
+        .await?
+        .expect("rg runs");
+        assert_eq!(candidates, HashMap::from([(paths[0].clone(), None)]));
+        // Negative control: an absent term names no body, so no reference is a
+        // candidate, where every rollout used to be re-read and hydrated.
+        let absent = RolloutSearchQuery::new("not-present")?;
+        let patterns =
+            matching_payload_patterns(Path::new("rg"), &payload_root, &absent.json_search_term)
+                .await?
+                .expect("rg runs");
+        assert!(patterns.is_empty());
+        let candidates = ripgrep_rollout_paths(
+            Path::new("rg"),
+            &root,
+            &absent.json_search_term,
+            &patterns,
+            &absent.text_matcher,
+        )
+        .await?
+        .expect("rg runs");
+        assert!(candidates.is_empty());
+        assert_eq!(
+            search_rollout_matches(Path::new("rg"), home.path(), false, "payload-needle").await?,
+            HashMap::from([(paths[0].clone(), None)])
+        );
+        Ok(())
     }
 
     #[tokio::test]

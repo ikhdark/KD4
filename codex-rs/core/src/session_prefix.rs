@@ -143,6 +143,13 @@ fn format_inter_agent_completion_message_with_diagnostics(
                 sender,
                 last_agent_message
                     .as_deref()
+                    .and_then(|message| {
+                        match without_protected_prefix(message, protected_host_summary) {
+                            // Host-only text is not an authored report.
+                            "" if !message.is_empty() => None,
+                            report => Some(report),
+                        }
+                    })
                     .unwrap_or("No authored report was delivered."),
                 TYPED_COMPLETION_NEXT_ACTION,
                 receipt,
@@ -184,7 +191,10 @@ fn format_inter_agent_completion_message_with_diagnostics(
             return Some(format_bounded_inter_agent_completion_message(
                 task_name,
                 sender,
-                &format!("Agent errored: {error}"),
+                &format!(
+                    "Agent errored: {}",
+                    without_protected_prefix(error, protected_host_summary)
+                ),
                 ERROR_NEXT_ACTION,
                 receipt,
                 protected_host_summary,
@@ -199,6 +209,19 @@ fn format_inter_agent_completion_message_with_diagnostics(
             .with_receipt(receipt)
             .render(),
     )
+}
+
+/// Status projection places the protected host summary first. Remove only that
+/// exact leading copy so the bounded message reports it once, in protected space.
+fn without_protected_prefix<'a>(text: &'a str, protected_host_summary: Option<&str>) -> &'a str {
+    match protected_host_summary
+        .filter(|summary| !summary.is_empty())
+        .and_then(|summary| text.strip_prefix(summary))
+    {
+        Some("") => "",
+        Some(rest) => rest.strip_prefix("\n\n").unwrap_or(text),
+        None => text,
+    }
 }
 
 fn format_bounded_inter_agent_completion_message(

@@ -24,6 +24,8 @@ const SPAWN_AGENT_V1_FULL_HISTORY_OVERRIDE_GUIDANCE: &str = "Full-history forks 
 const SPAWN_AGENT_V2_FULL_HISTORY_OVERRIDE_GUIDANCE: &str = "Full-history forks (`fork_turns=\"all\"`) are disabled by default and do not accept per-call `agent_type`, `model`, or `reasoning_effort` overrides when enabled; set `fork_turns` to `none` or an integer from 1 through 5 when using those fields.";
 const MAX_MODEL_OVERRIDES_IN_SPAWN_AGENT_DESCRIPTION: usize = 5;
 const MAX_REASONING_EFFORT_CHARS_IN_SPAWN_AGENT_DESCRIPTION: usize = 64;
+/// `message` and the aliases the V2 handler accepts for the same task text.
+const SPAWN_AGENT_V2_MESSAGE_FIELDS: [&str; 3] = ["message", "prompt", "instructions"];
 
 #[derive(Debug, Clone, Default)]
 pub struct SpawnAgentToolOptions {
@@ -143,6 +145,14 @@ pub fn create_spawn_agent_tool_v2(options: SpawnAgentToolOptions) -> ToolSpec {
                 .to_string(),
         )),
     );
+    // Other agent APIs name this task text `prompt` or `instructions`. Rejecting
+    // those spellings failed whole exec cells, so they are published aliases.
+    for alias in &SPAWN_AGENT_V2_MESSAGE_FIELDS[1..] {
+        properties.insert(
+            (*alias).to_string(),
+            JsonSchema::string(Some("Alias for `message`.".to_string())),
+        );
+    }
 
     ToolSpec::Function(ResponsesApiTool {
         name: "spawn_agent".to_string(),
@@ -156,8 +166,9 @@ pub fn create_spawn_agent_tool_v2(options: SpawnAgentToolOptions) -> ToolSpec {
         defer_loading: None,
         parameters: JsonSchema {
             one_of: Some(
-                ["message", "assignment"]
+                SPAWN_AGENT_V2_MESSAGE_FIELDS
                     .into_iter()
+                    .chain(["assignment"])
                     .map(|field| JsonSchema {
                         required: Some(vec![field.to_string()]),
                         ..JsonSchema::object(BTreeMap::new(), None, None)
@@ -167,8 +178,9 @@ pub fn create_spawn_agent_tool_v2(options: SpawnAgentToolOptions) -> ToolSpec {
             // Keep role admission separate from the exclusive input choice: otherwise
             // message + assignment without agent_type could match the message branch.
             any_of: Some(
-                ["message", "agent_type"]
+                SPAWN_AGENT_V2_MESSAGE_FIELDS
                     .into_iter()
+                    .chain(["agent_type"])
                     .map(|field| JsonSchema {
                         required: Some(vec![field.to_string()]),
                         ..JsonSchema::object(BTreeMap::new(), None, None)
@@ -368,18 +380,24 @@ pub fn create_wait_agent_tool_v2(options: WaitAgentTimeoutOptions) -> ToolSpec {
 }
 
 pub fn create_list_agents_tool() -> ToolSpec {
-    let properties = BTreeMap::from([(
+    let mut properties = BTreeMap::from([(
         "path_prefix".to_string(),
         JsonSchema::string(Some(
             "Task-path prefix filter; trailing slashes are ignored. Omit to list all live agents."
                 .to_string(),
         )),
     )]);
+    properties.insert("compact".into(), JsonSchema::boolean(Some(
+        "Omit repeated task-message previews; status, results, failures and required actions remain complete. Default false.".into(),
+    )));
+    properties.insert("since_revision".into(), JsonSchema::string(Some(
+        "Prior display revision for the same root, prefix and compact mode. An exact match returns unchanged:true with empty arrays (retain the previous snapshot); otherwise a full replacement snapshot includes additions and deletions.".into(),
+    )));
 
     ToolSpec::Function(ResponsesApiTool {
         name: "list_agents".to_string(),
         description:
-            "List live agents in the current root thread tree. Optionally filter by task-path prefix."
+            "List live agents in the current root thread tree. For routine polling use compact:true and reuse since_revision to avoid repeating unchanged evidence. These revisions do not certify source freshness or task completion."
                 .to_string(),
         strict: false,
         defer_loading: None,
@@ -596,6 +614,14 @@ fn list_agents_output_schema() -> Value {
                     "additionalProperties": true
                 },
                 "description": "Durable typed-task status including workspace identity and strategy, progress, lease, pending gates, stale reason, and next action."
+            },
+            "unresolved_descendants": {
+                "type": "array",
+                "items": { "type": "array", "items": { "type": "string" }, "minItems": 2, "maxItems": 2 }
+            },
+            "revision": { "type": "string", "description": "Opaque display identity, not a source or acceptance revision." },
+            "unchanged": { "type": "boolean", "description": "If true retain the prior snapshot; empty arrays do not revoke existing failures or agents." },
+            "task_text_recovery": { "type": ["string", "null"]
             }
         },
         "required": ["agents", "typed_tasks"],
@@ -865,7 +891,7 @@ pub(crate) fn criterion_evidence_policy_schema() -> JsonSchema {
     JsonSchema::object(BTreeMap::from([
         ("kind".into(), JsonSchema::string_enum(vec![json!("report_only"), json!("source_inspection"), json!("validation_execution")], Some("Declared assurance, not inferred coverage. Omission of the entire policy leaves a legacy claim unverified.".into()))),
         ("required_evidence".into(), JsonSchema::string(Some("Exact immutable required_evidence entry applicable to this criterion; required except for report_only. Shared observations are allowed only when the declared contract covers each criterion.".into()))),
-        ("freshness".into(), JsonSchema::string_enum(vec![json!("current"), json!("historical")], Some("Defaults to current. Current source acquisition is rehashed; current execution stays unverified without a complete trusted input binding. Historical means only the recorded observation, never final-source correctness.".into()))),
+        ("freshness".into(), JsonSchema::string_enum(vec![json!("current"), json!("historical")], Some("Defaults to current. Current source acquisition is rehashed. Current validation_execution is rejected at assignment/amendment admission because trusted execution input binding is unavailable; another passing run cannot satisfy it. Choose historical only for an explicitly historical execution requirement, never to weaken a current-correctness requirement.".into()))),
     ]), Some(vec!["kind".into()]), Some(false.into()))
 }
 

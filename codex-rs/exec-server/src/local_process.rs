@@ -235,6 +235,7 @@ enum ProcessEntry {
 
 struct Inner {
     notifications: std::sync::RwLock<Option<RpcNotificationSender>>,
+    notification_shutdown: tokio_util::sync::CancellationToken,
     processes: Mutex<HashMap<ProcessId, ProcessEntry>>,
     telemetry: ExecServerTelemetry,
     #[cfg(test)]
@@ -282,6 +283,7 @@ impl LocalProcess {
         Self {
             inner: Arc::new(Inner {
                 notifications: std::sync::RwLock::new(notifications),
+                notification_shutdown: tokio_util::sync::CancellationToken::new(),
                 processes: Mutex::new(HashMap::new()),
                 telemetry,
                 #[cfg(test)]
@@ -292,21 +294,31 @@ impl LocalProcess {
     }
 
     pub(crate) async fn shutdown(&self) {
+        self.inner.notification_shutdown.cancel();
         let remaining = {
             let mut processes = self.inner.processes.lock().await;
             processes
                 .drain()
-                .filter_map(|(_, process)| match process {
+                .filter_map(|(process_id, process)| match process {
                     ProcessEntry::Starting(_) => None,
                     ProcessEntry::Running(process) => {
                         process.termination_requested.store(true, Ordering::Release);
-                        Some(process)
+                        Some((process_id, process))
                     }
                 })
                 .collect::<Vec<_>>()
         };
-        for process in remaining {
-            let _ = process.session.terminate();
+        for (process_id, process) in remaining {
+            match process.session.terminate() {
+                Ok(()) => tracing::info!(%process_id, cleanup_outcome = "termination_requested", "process shutdown cleanup"),
+                Err(error) => {
+                    tracing::error!(%process_id, %error, cleanup_outcome = "unresolved", "process shutdown cleanup failed");
+                    // Retain the failed identity for inspection or a later
+                    // cleanup attempt, without replacing a newer incarnation.
+                    self.inner.processes.lock().await.entry(process_id)
+                        .or_insert(ProcessEntry::Running(process));
+                }
+            }
         }
     }
 
@@ -350,6 +362,9 @@ impl LocalProcess {
         };
         {
             let mut process_map = self.inner.processes.lock().await;
+            if self.inner.notification_shutdown.is_cancelled() {
+                return Err(invalid_request("process backend is shutting down".into()));
+            }
             if process_map.contains_key(&process_id) {
                 return Err(crate::rpc::process_start_refused(format!(
                     "process {process_id} already exists"
@@ -523,6 +538,10 @@ impl LocalProcess {
             );
             reservation.active = false;
         }
+        tokio::spawn(forward_process_notifications(
+            process_id.clone(), events.clone(), events.subscribe(), Arc::downgrade(&self.inner),
+            self.inner.notification_shutdown.clone(),
+        ));
         tokio::spawn(stream_output(
             process_id.clone(),
             if tty {
@@ -842,6 +861,10 @@ impl LocalProcess {
             match process_map.get_mut(&params.process_id) {
                 Some(ProcessEntry::Running(process)) => {
                     if process.exit_code.is_some() {
+                        if !process.closed {
+                            process.termination_requested.store(true, Ordering::Release);
+                            process.session.finish();
+                        }
                         return Ok(TerminateResponse { running: false });
                     }
                     if !process.termination_requested.load(Ordering::Acquire) {
@@ -1166,11 +1189,7 @@ async fn stream_output(
             }
         };
         output_notify.notify_waiters();
-        if let Some(notifications) = notification_sender(&inner) {
-            let _ = notifications
-                .notify(crate::protocol::EXEC_OUTPUT_DELTA_METHOD, &notification)
-                .await;
-        }
+        let _ = notification;
     }
 
     finish_output_stream(process_id, stream, inner).await;
@@ -1203,17 +1222,6 @@ async fn watch_exit(
             output_notify.notify_waiters();
             // Do not let a blocked notification sink extend the observation lease.
             drop(metrics);
-            if let Some(notifications) = notification_sender(&inner) {
-                let _ = notifications
-                    .notify(
-                        crate::protocol::EXEC_FAILED_METHOD,
-                        &crate::protocol::ExecFailedNotification {
-                            process_id,
-                            message,
-                        },
-                    )
-                    .await;
-            }
             // Dropping the observation lease is unknown, not a confirmed exit.
             return;
         }
@@ -1266,13 +1274,7 @@ async fn watch_exit(
         }
     };
     output_notify.notify_waiters();
-    if let Some(notification) = notification
-        && let Some(notifications) = notification_sender(&inner)
-    {
-        let _ = notifications
-            .notify(crate::protocol::EXEC_EXITED_METHOD, &notification)
-            .await;
-    }
+    let _ = notification;
 
     maybe_emit_closed(process_id, Arc::clone(&inner)).await;
 }
@@ -1315,17 +1317,7 @@ async fn finish_output_stream(process_id: ProcessId, stream: ExecOutputStream, i
         // notification every later event, including close, waits forever
         // behind a sequence that was never sent.
         output_notify.notify_waiters();
-        if let Some(notifications) = notification_sender(&inner) {
-            let _ = notifications
-                .notify(
-                    crate::protocol::EXEC_OUTPUT_GAP_METHOD,
-                    &crate::protocol::ExecOutputGapNotification {
-                        process_id: process_id.clone(),
-                        through_seq,
-                    },
-                )
-                .await;
-        }
+        let _ = through_seq;
     }
 
     maybe_emit_closed(process_id, inner).await;
@@ -1436,10 +1428,134 @@ async fn maybe_emit_closed(process_id: ProcessId, inner: Arc<Inner>) {
         }
     });
 
-    if let Some(notifications) = notification_sender(&inner) {
-        let _ = notifications
-            .notify(EXEC_CLOSED_METHOD, &notification)
-            .await;
+    let _ = notification;
+}
+
+// A blocked transport owns only bounded replay, never native draining/closure.
+async fn forward_process_notifications(
+    process_id: ProcessId,
+    events: ExecProcessEventLog,
+    mut receiver: ExecProcessEventReceiver,
+    inner: std::sync::Weak<Inner>,
+    shutdown: tokio_util::sync::CancellationToken,
+) {
+    // Local draining/closure never waits for this sink. Bound the independent
+    // delivery task too, so a live but non-draining RPC connection cannot retain
+    // a finished process's replay log indefinitely.
+    const SEND_TIMEOUT: Duration = Duration::from_secs(30);
+    let mut last_seq = 0;
+    let mut pending = VecDeque::new();
+    loop {
+        let event = if let Some(event) = pending.pop_front() {
+            event
+        } else {
+            let event = tokio::select! {
+                biased;
+                _ = shutdown.cancelled() => return,
+                event = receiver.recv() => event,
+            };
+            match event {
+                Ok(event) => event,
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                    let Some(owner) = inner.upgrade() else { return; };
+                    let processes = tokio::select! {
+                        biased;
+                        _ = shutdown.cancelled() => return,
+                        processes = owner.processes.lock() => processes,
+                    };
+                    let Some(ProcessEntry::Running(process)) = processes.get(&process_id) else { return; };
+                    if !events.same_instance(&process.events) {
+                        return; // Never mix a reused process ID into this stream.
+                    }
+                    receiver = events.subscribe();
+                    // The output replay is byte-bounded. Root exit is retained
+                    // separately because later output can evict it from the
+                    // event-count-bounded live log. Restore both in seq order.
+                    let mut replay = process.output.iter().rev()
+                        .filter(|chunk| chunk.seq > last_seq.max(process.last_evicted_seq))
+                        .take(PROCESS_EVENT_CHANNEL_CAPACITY)
+                        .map(|chunk| (chunk.seq, ExecProcessEvent::Output(ProcessOutputChunk {
+                            seq: chunk.seq,
+                            stream: chunk.stream,
+                            chunk: chunk.chunk.clone().into(),
+                        })))
+                        .collect::<Vec<_>>();
+                    let notification_gap = replay.iter().map(|(seq, _)| seq.saturating_sub(1))
+                        .min().unwrap_or(0).max(process.last_evicted_seq);
+                    // A retained exit can be the sequence immediately before
+                    // the replay suffix. Do not advance the gap cursor over it:
+                    // the normal duplicate fence would then discard the exit.
+                    if let (Some(seq), Some(_)) = (process.exit_seq, process.exit_code)
+                        && seq > last_seq && seq <= notification_gap
+                    {
+                        let through_seq = seq.saturating_sub(1);
+                        if through_seq > last_seq {
+                            replay.push((through_seq, ExecProcessEvent::OutputGap { through_seq }));
+                        }
+                    }
+                    if notification_gap > last_seq && process.exit_seq != Some(notification_gap) {
+                        replay.push((notification_gap, ExecProcessEvent::OutputGap {
+                            through_seq: notification_gap,
+                        }));
+                    }
+                    if let (Some(seq), Some(exit_code)) = (process.exit_seq, process.exit_code)
+                        && seq > last_seq
+                    {
+                        replay.push((seq, ExecProcessEvent::Exited {
+                            seq, exit_code,
+                            sandbox_denied: (process.sandbox == SandboxType::None).then_some(false),
+                        }));
+                    }
+                    if process.closed {
+                        let seq = process.next_seq.saturating_sub(1);
+                        let assessment = if process.sandbox_denied { Some(true) }
+                            else if process.sandbox == SandboxType::None { Some(false) }
+                            else { None };
+                        replay.push((seq, ExecProcessEvent::Closed { seq, sandbox_denied: assessment }));
+                    } else if let Some(failure) = &process.failure {
+                        replay.push((process.next_seq, ExecProcessEvent::Failed(failure.clone())));
+                    }
+                    replay.sort_by_key(|(seq, _)| *seq);
+                    pending.extend(replay.into_iter().map(|(_, event)| event));
+                    continue;
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+            }
+        };
+        let seq = event.seq();
+        if seq.is_some_and(|seq| seq <= last_seq) { continue; }
+        let terminal = matches!(&event, ExecProcessEvent::Closed { .. } | ExecProcessEvent::Failed(_));
+        let (method, params) = match event {
+            ExecProcessEvent::Output(chunk) => (crate::protocol::EXEC_OUTPUT_DELTA_METHOD,
+                serde_json::to_value(ExecOutputDeltaNotification { process_id: process_id.clone(),
+                    seq: chunk.seq, stream: chunk.stream, chunk: chunk.chunk })),
+            ExecProcessEvent::OutputGap { through_seq } => (crate::protocol::EXEC_OUTPUT_GAP_METHOD,
+                serde_json::to_value(crate::protocol::ExecOutputGapNotification { process_id: process_id.clone(), through_seq })),
+            ExecProcessEvent::Exited { seq, exit_code, sandbox_denied } => (crate::protocol::EXEC_EXITED_METHOD,
+                serde_json::to_value(ExecExitedNotification { process_id: process_id.clone(), seq, exit_code, sandbox_denied })),
+            ExecProcessEvent::Closed { seq, sandbox_denied } => (EXEC_CLOSED_METHOD,
+                serde_json::to_value(ExecClosedNotification { process_id: process_id.clone(), seq, sandbox_denied })),
+            ExecProcessEvent::Failed(message) => (crate::protocol::EXEC_FAILED_METHOD,
+                serde_json::to_value(crate::protocol::ExecFailedNotification { process_id: process_id.clone(), message })),
+        };
+        let Some(owner) = inner.upgrade() else { return; };
+        let notifications = notification_sender(&owner);
+        drop(owner);
+        let Ok(params) = params else { return; };
+        if let Some(notifications) = notifications {
+            let result = tokio::select! {
+                biased;
+                _ = shutdown.cancelled() => return,
+                result = tokio::time::timeout(SEND_TIMEOUT, notifications.notify(method, &params)) => result,
+            };
+            if !matches!(result, Ok(Ok(()))) {
+                tracing::warn!(%process_id, ?result, last_seq, replay_required = true,
+                    "process notification delivery failed; retained reads remain authoritative");
+                return;
+            }
+        }
+        if let Some(seq) = seq { last_seq = seq; }
+        if terminal { return; }
     }
 }
 
@@ -1464,6 +1580,110 @@ mod tests {
     use pretty_assertions::assert_eq;
     use tokio::sync::oneshot;
     use tokio::time::timeout;
+
+    #[tokio::test]
+    async fn lagged_notification_gap_does_not_discard_retained_exit() {
+        let (notification_tx, mut notification_rx) = mpsc::channel(1);
+        let backend = LocalProcess::with_runtime_paths(
+            Some(RpcNotificationSender::new(notification_tx)),
+            ExecServerTelemetry::default(),
+            None,
+        );
+        let mut process = spawn_test_process(&backend, "lagged-notification-exit").await;
+        let process_id = process.process_id.clone();
+        timeout(Duration::from_secs(3), async {
+            for _ in 0..1000 {
+                process.stdout_tx.send(vec![b'x']).await.unwrap();
+            }
+            loop {
+                let processes = backend.inner.processes.lock().await;
+                if let Some(ProcessEntry::Running(process)) = processes.get(&process_id)
+                    && process.output.len() == 1000
+                {
+                    break;
+                }
+                drop(processes);
+                tokio::task::yield_now().await;
+            }
+            process.exit_tx.take().unwrap().send(7).unwrap();
+            loop {
+                let processes = backend.inner.processes.lock().await;
+                if let Some(ProcessEntry::Running(process)) = processes.get(&process_id)
+                    && process.exit_seq.is_some()
+                {
+                    break;
+                }
+                drop(processes);
+                tokio::task::yield_now().await;
+            }
+            // The bounded suffix now starts immediately after the exit.
+            for _ in 0..PROCESS_EVENT_CHANNEL_CAPACITY {
+                process.stdout_tx.send(vec![b'y']).await.unwrap();
+            }
+            drop(process.stdout_tx);
+            drop(process.stderr_tx);
+            loop {
+                let processes = backend.inner.processes.lock().await;
+                if let Some(ProcessEntry::Running(process)) = processes.get(&process_id)
+                    && process.closed
+                {
+                    break;
+                }
+                drop(processes);
+                tokio::task::yield_now().await;
+            }
+            let mut exit_seen = false;
+            while let Some(message) = notification_rx.recv().await {
+                let crate::rpc::RpcServerOutboundMessage::Notification(notification) = message else {
+                    continue;
+                };
+                if notification.method == crate::protocol::EXEC_EXITED_METHOD {
+                    assert!(!exit_seen, "exit must be delivered exactly once");
+                    assert_eq!(notification.params.as_ref().unwrap()["exitCode"], 7);
+                    exit_seen = true;
+                }
+                if notification.method == EXEC_CLOSED_METHOD {
+                    assert!(exit_seen, "a replay gap must not swallow the retained exit");
+                    break;
+                }
+            }
+            assert!(exit_seen);
+        }).await.expect("lag replay must settle after the sink resumes");
+        backend.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn full_notification_sink_does_not_hold_output_or_native_closure() {
+        let (notification_tx, _notification_rx) = mpsc::channel(1);
+        let backend = LocalProcess::with_runtime_paths(
+            Some(RpcNotificationSender::new(notification_tx)),
+            ExecServerTelemetry::default(),
+            None,
+        );
+        let mut process = spawn_test_process(&backend, "blocked-notification-sink").await;
+        let process_id = process.process_id.clone();
+        timeout(Duration::from_secs(2), async {
+            for _ in 0..1000 {
+                process.stdout_tx.send(vec![b'x']).await.unwrap();
+            }
+            process.exit_tx.take().unwrap().send(0).unwrap();
+            drop(process.stdout_tx);
+            drop(process.stderr_tx);
+            loop {
+                let processes = backend.inner.processes.lock().await;
+                if let Some(ProcessEntry::Running(process)) = processes.get(&process_id)
+                    && process.closed
+                {
+                    assert_eq!(process.exit_code, Some(0));
+                    assert_eq!(process.retained_bytes, 1000);
+                    break;
+                }
+                drop(processes);
+                tokio::task::yield_now().await;
+            }
+        }).await.expect("notification backpressure must not block local custody");
+        backend.shutdown().await;
+    }
 
     #[test]
     fn stdin_retry_window_retires_sequences_but_preserves_opaque_compatibility() {
@@ -2738,6 +2958,37 @@ mod tests {
         backend.shutdown().await;
     }
 
+    #[tokio::test]
+    async fn blocked_notification_sink_does_not_hold_native_output_or_closure() {
+        let (outgoing_tx, _blocked_receiver) = mpsc::channel(1);
+        let backend = LocalProcess::with_runtime_paths(
+            Some(RpcNotificationSender::new(outgoing_tx)), ExecServerTelemetry::default(), None,
+        );
+        let fixture = spawn_test_process(&backend, "blocked-notification-sink").await;
+        let mut observed = {
+            let processes = backend.inner.processes.lock().await;
+            let Some(ProcessEntry::Running(process)) = processes.get(&fixture.process_id) else { panic!("running fixture"); };
+            process.events.subscribe()
+        };
+        let TestProcess { stdout_tx, stderr_tx, exit_tx, exit_watch, .. } = fixture;
+        tokio::time::timeout(Duration::from_secs(2), async {
+            for _ in 0..64 { stdout_tx.send(b"data".to_vec()).await.unwrap(); }
+            exit_tx.unwrap().send(0).unwrap();
+            drop(stdout_tx); drop(stderr_tx);
+            exit_watch.await.unwrap();
+            let mut bytes = 0;
+            loop {
+                match observed.recv().await.unwrap() {
+                    ExecProcessEvent::Output(chunk) => bytes += chunk.chunk.0.len(),
+                    ExecProcessEvent::Closed { .. } => break,
+                    _ => {}
+                }
+            }
+            assert_eq!(bytes, 64 * 4);
+        }).await.expect("local drain and closure must not await a full notification sink");
+        backend.shutdown().await;
+    }
+
     struct TestProcess {
         process_id: ProcessId,
         stdout_tx: mpsc::Sender<Vec<u8>>,
@@ -2810,6 +3061,10 @@ mod tests {
         assert!(previous.is_none());
         drop(processes);
 
+        tokio::spawn(forward_process_notifications(
+            process_id.clone(), events.clone(), events.subscribe(), Arc::downgrade(&backend.inner),
+            backend.inner.notification_shutdown.clone(),
+        ));
         tokio::spawn(stream_output(
             process_id.clone(),
             ExecOutputStream::Stdout,

@@ -3,6 +3,7 @@ param(
     [Parameter(Mandatory = $true)]
     [string]$LanesRoot,
     [switch]$Prune,
+    [string]$LaunchToken = "",
     [int]$MaxPasses = 3,
     [int]$RetryDelaySeconds = 5
 )
@@ -170,6 +171,11 @@ try {
         exit 0
     }
 
+    if ($LaunchToken) {
+        . (Join-Path $PSScriptRoot "cargo-lane-launch-lease.ps1")
+        if (-not (Invoke-CargoMaintenanceLaunchLease -LanesRoot $root -ReleaseToken $LaunchToken)) { exit 0 }
+    }
+
     if ($Prune) {
         # Reuse the synchronous administrative implementation after acquiring
         # the worker lock. Python discovers current owners, not a launch snapshot.
@@ -221,6 +227,6 @@ catch {
 finally {
     if ($null -ne $lockStream) {
         $lockStream.Dispose()
-        Remove-Item -LiteralPath $lockPath -Force -ErrorAction SilentlyContinue
+        # Keep the inode/path: deleting after unlock could erase a successor's lock.
     }
 }

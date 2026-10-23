@@ -98,6 +98,8 @@ pub(crate) struct DeferredDynamicHistoryMeasurement {
     measured_manifest: Arc<OnceLock<StableContextManifest>>,
     #[cfg(test)]
     measurement_count: Arc<AtomicUsize>,
+    #[cfg(test)]
+    serialization_count: Arc<AtomicUsize>,
 }
 
 impl DeferredDynamicHistoryMeasurement {
@@ -108,6 +110,8 @@ impl DeferredDynamicHistoryMeasurement {
             measured_manifest: Arc::new(OnceLock::new()),
             #[cfg(test)]
             measurement_count: Arc::new(AtomicUsize::new(0)),
+            #[cfg(test)]
+            serialization_count: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -119,21 +123,45 @@ impl DeferredDynamicHistoryMeasurement {
         self.measured_manifest
             .get_or_init(|| {
                 #[cfg(test)]
-                self.measurement_count.fetch_add(1, Ordering::Relaxed);
+                self.serialization_count.fetch_add(1, Ordering::Relaxed);
                 let input_bytes = serde_json::to_vec(input).unwrap_or_default();
-                let dynamic_bytes = u64::try_from(input_bytes.len())
-                    .unwrap_or(u64::MAX)
-                    .saturating_sub(self.stable_input_bytes);
-                let dynamic_tokens =
-                    i64::try_from(codex_utils_output_truncation::approx_token_count(
-                        std::str::from_utf8(&input_bytes).unwrap_or_default(),
-                    ))
-                    .unwrap_or(i64::MAX)
-                    .saturating_sub(self.stable_input_tokens)
-                    .max(0);
-                manifest.add_dynamic_history(&input_bytes, dynamic_bytes, dynamic_tokens)
+                self.measure_bytes(&input_bytes, manifest)
             })
             .clone()
+    }
+
+    fn measure_serialized(
+        &self,
+        input_bytes: &[u8],
+        manifest: &StableContextManifest,
+    ) -> StableContextManifest {
+        self.measured_manifest
+            .get_or_init(|| self.measure_bytes(input_bytes, manifest))
+            .clone()
+    }
+
+    fn measure_bytes(
+        &self,
+        input_bytes: &[u8],
+        manifest: &StableContextManifest,
+    ) -> StableContextManifest {
+        #[cfg(test)]
+        self.measurement_count.fetch_add(1, Ordering::Relaxed);
+        let dynamic_bytes = u64::try_from(input_bytes.len())
+            .unwrap_or(u64::MAX)
+            .saturating_sub(self.stable_input_bytes);
+        let dynamic_tokens = i64::try_from(codex_utils_output_truncation::approx_token_count(
+            std::str::from_utf8(input_bytes).unwrap_or_default(),
+        ))
+        .unwrap_or(i64::MAX)
+        .saturating_sub(self.stable_input_tokens)
+        .max(0);
+        manifest.add_dynamic_history(input_bytes, dynamic_bytes, dynamic_tokens)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn serialization_count(&self) -> usize {
+        self.serialization_count.load(Ordering::Relaxed)
     }
 
     #[cfg(test)]
@@ -278,6 +306,20 @@ impl Prompt {
         )
     }
 
+    /// The caller must verify these are the complete serialized bytes of
+    /// `self.input`, not an incremental transport suffix or a fallback input.
+    pub(crate) fn measured_stable_context_manifest_from_serialized_input(
+        &self,
+        input_bytes: &[u8],
+    ) -> StableContextManifest {
+        self.deferred_dynamic_history.as_ref().map_or_else(
+            || self.stable_context_manifest.clone(),
+            |measurement| {
+                measurement.measure_serialized(input_bytes, &self.stable_context_manifest)
+            },
+        )
+    }
+
     #[cfg(test)]
     pub(crate) fn dynamic_history_measurement_count(&self) -> usize {
         self.deferred_dynamic_history
@@ -294,6 +336,31 @@ impl Prompt {
             strip_image_details(Arc::make_mut(&mut input));
         }
         input
+    }
+
+    /// Deduplicate immutable sources before Lite projection can clone them.
+    pub(crate) fn get_formatted_admission_inputs(
+        &self,
+        use_responses_lite: bool,
+    ) -> Vec<Arc<[ResponseItem]>> {
+        let sources = [
+            &self.input,
+            &self.stable_context_fallback_input,
+            &self.tool_history_fallback_input,
+            &self.stable_context_tool_history_fallback_input,
+        ];
+        let mut inputs = Vec::new();
+        for (index, source) in sources.iter().enumerate() {
+            if sources[..index].iter().any(|previous| Arc::ptr_eq(previous, source)) {
+                continue;
+            }
+            let mut input = Arc::clone(source);
+            if use_responses_lite && has_image_details(&input) {
+                strip_image_details(Arc::make_mut(&mut input));
+            }
+            inputs.push(input);
+        }
+        inputs
     }
 
     pub(crate) fn get_formatted_fallback_input_for_request(

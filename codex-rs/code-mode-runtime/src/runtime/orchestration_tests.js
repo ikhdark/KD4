@@ -694,12 +694,12 @@ try {
   }
   // A quiet process, and one that keeps printing, both return control within
   // the budget without losing diagnostics or restarting/terminating the owner.
-  const realNow = Date.now;
+  const realNow = globalThis.__codex_monotonic_now;
   try {
     for (const output of ["", "still running"]) {
       let now = 0,
         boundedPolls = 0;
-      Date.now = () => now;
+      globalThis.__codex_monotonic_now = () => now;
       tools.write_stdin = async (args) => {
         boundedPolls++;
         check(
@@ -731,7 +731,7 @@ try {
     }
     let now = 0,
       waits = [];
-    Date.now = () => now;
+    globalThis.__codex_monotonic_now = () => now;
     tools.write_stdin = async (args) => {
       waits.push(args.yield_time_ms);
       now += Math.min(120_000, args.yield_time_ms);
@@ -743,7 +743,7 @@ try {
         progressing.evidence.observations.length === 4,
       "progress reset the total wait budget",
     );
-    Date.now = () => 0;
+    globalThis.__codex_monotonic_now = () => 0;
     tools.write_stdin = async (args) => {
       check(args.yield_time_ms === 5_000, "explicit wait budget ignored");
       return done;
@@ -761,7 +761,7 @@ try {
       );
     }
   } finally {
-    Date.now = realNow;
+    globalThis.__codex_monotonic_now = realNow;
   }
   // Recovery calls release admission between pages. Neither large file can
   // recover until the queued small read runs; per-file worker leases deadlock.
@@ -828,14 +828,38 @@ try {
       "recovery admission lost fairness, bounds, or deduplication",
     );
   }
+  // Wall-clock jumps in either direction cannot alter the host-clock budget.
+  {
+    const savedClock = globalThis.__codex_monotonic_now;
+    const savedWall = Date.now;
+    try {
+      for (const jump of [-60_000, 60_000]) {
+        let elapsed = 0, polls = 0;
+        globalThis.__codex_monotonic_now = () => elapsed;
+        Date.now = () => elapsed + jump;
+        tools.write_stdin = async (args) => {
+          check(args.session_id === 7 && args.incarnation === "creation-a", "clock jump changed owner");
+          ++polls;
+          elapsed += 5_000;
+          return live("clock-adjusted process");
+        };
+        const stopped = await rejected(() => await_command(live(), {max_wait_ms: 10_000}));
+        check(polls === 2 && elapsed === 10_000 && stopped.message.includes("wait budget reached") &&
+          stopped.evidence.terminal.session_id === 7, "wall clock changed the wait budget or recovery handle");
+      }
+    } finally {
+      globalThis.__codex_monotonic_now = savedClock;
+      Date.now = savedWall;
+    }
+  }
   // Do not spend a fresh native five-second minimum on a sub-minimum remainder.
   {
-    const savedNow = Date.now;
+    const savedNow = globalThis.__codex_monotonic_now;
     try {
       for (const elapsed of [1, 4999, 5000]) {
         let now = 0,
           polls = 0;
-        Date.now = () => now;
+        globalThis.__codex_monotonic_now = () => now;
         tools.write_stdin = async () => {
           ++polls;
           return done;
@@ -858,14 +882,50 @@ try {
         );
       }
     } finally {
-      Date.now = savedNow;
+      globalThis.__codex_monotonic_now = savedNow;
     }
   }
-  // An owner-observed stall stops draining immediately, without killing the
-  // process or losing earlier output. Ordinary quiet packets are not stalls.
+  // The host steady clock reports fractional milliseconds, but write_stdin's
+  // yield_time_ms is an unsigned integer: a fractional remainder must be
+  // floored before dispatch or the native poll rejects the observation.
+  {
+    const savedNow = globalThis.__codex_monotonic_now;
+    try {
+      let now = 100.125;
+      const forwarded = [];
+      globalThis.__codex_monotonic_now = () => now;
+      tools.write_stdin = async (args) => {
+        forwarded.push(args.yield_time_ms);
+        check(
+          Number.isInteger(args.yield_time_ms) && args.yield_time_ms >= 0,
+          "fractional wait budget reached write_stdin",
+        );
+        return done;
+      };
+      const completed = await await_command(live(), {
+        on_progress: () => {
+          now = 100.5;
+          return true;
+        },
+      });
+      check(
+        completed.terminal === done &&
+          completed.observations.length === 2 &&
+          forwarded.join() === "299999",
+        "fractional steady clock broke the command observation",
+      );
+    } finally {
+      globalThis.__codex_monotonic_now = savedNow;
+    }
+  }
+  // An owner-observed stall is reported, not fatal: the wait keeps polling the
+  // same live handle without terminating, writing to, or restarting it, and
+  // the notice stays in the evidence. Silence that lasts ends at the budget.
   {
     const stalled = {
-      ...live(""),
+      ...live(
+        "\n[harness: no output observed for 60000 milliseconds; process exit not observed, termination not requested. Resume this session; do not restart the command.]\n",
+      ),
       session_capabilities: {
         ...live().session_capabilities,
         observation: {
@@ -876,56 +936,101 @@ try {
         },
       },
     };
+    const passive = (args) =>
+      args.session_id === 7 &&
+      args.incarnation === "creation-a" &&
+      args.wait_for_output === false &&
+      args.terminate === undefined &&
+      args.chars === undefined;
+    // A quiet waiter or packet capture that later exits completes the wait,
+    // including from a handle that already carries the sticky notice.
     for (const initialStall of [true, false]) {
       let polls = 0,
         progressCalls = 0;
       tools.write_stdin = async (args) => {
-        check(
-          args.terminate === undefined && args.chars === undefined,
-          "stall changed process lifetime",
-        );
+        check(passive(args), "stall changed process lifetime or owner");
         ++polls;
-        return polls === 1 ? stalled : done;
+        return polls === 1 && !initialStall ? stalled : done;
       };
-      const stopped = await rejected(() =>
-        await_command(initialStall ? stalled : live("completed work"), {
+      const completed = await await_command(
+        initialStall ? stalled : live("completed work"),
+        {
           on_progress: () => {
             ++progressCalls;
             return true;
           },
-        }),
+        },
       );
       check(
-        stopped.message.includes("reported no output") &&
-          polls === (initialStall ? 0 : 1) &&
-          progressCalls === (initialStall ? 0 : 1) &&
-          stopped.evidence.terminal === stalled &&
-          stopped.evidence.observations.length === (initialStall ? 1 : 2),
-        "stall notice was ignored or lost its resumable receipt",
+        completed.terminal === done &&
+          polls === (initialStall ? 1 : 2) &&
+          progressCalls === (initialStall ? 1 : 2) &&
+          completed.observations.length === (initialStall ? 2 : 3) &&
+          completed.observations.includes(stalled),
+        "quiet live process failed the wait or lost its notice",
       );
       if (!initialStall)
         check(
-          stopped.evidence.observations[0].output === "completed work",
+          completed.observations[0].output === "completed work",
           "lost partial work",
         );
-      // After an explicit decision the caller polls the retained handle, then
-      // passes that fresh observation back. No process creation is involved.
+    }
+    const savedNow = globalThis.__codex_monotonic_now;
+    try {
+      // A real hang stays detectable: the notice ends the first poll early,
+      // the rest of the budget is spent on the same handle, and the stop names
+      // the silence while keeping a resumable receipt.
+      let now = 0,
+        polls = 0;
+      globalThis.__codex_monotonic_now = () => now;
       tools.write_stdin = async (args) => {
-        check(
-          args.session_id === stalled.session_id &&
-            args.incarnation === "creation-a",
-          "resume changed owner",
-        );
-        return done;
+        check(passive(args), "hang changed process lifetime or owner");
+        ++polls;
+        now += polls === 1 ? 60_000 : args.yield_time_ms;
+        return stalled;
       };
-      const resumed = await tools.write_stdin({
-        session_id: stalled.session_id,
-        incarnation: "creation-a",
-      });
+      const hung = await rejected(() => await_command(live("started")));
       check(
-        (await await_command(resumed)).terminal === done,
-        "stalled owner could not be resumed",
+        hung.message.includes("wait budget reached with no output observed") &&
+          hung.message.includes("resume the retained handle") &&
+          polls === 2 &&
+          hung.evidence.terminal === stalled &&
+          hung.evidence.observations.length === 3,
+        "silent hang was hidden or lost its resumable receipt",
       );
+      // Repeated notices without elapsed time cannot spin the helper; the
+      // observation bound stops it on the same handle.
+      polls = 0;
+      tools.write_stdin = async (args) => {
+        check(passive(args), "repeated stall changed process lifetime");
+        ++polls;
+        return stalled;
+      };
+      const spun = await rejected(() =>
+        await_command(live("started"), { max_observations: 4 }),
+      );
+      check(
+        spun.message.includes("command observation limit reached") &&
+          polls === 3 &&
+          spun.evidence.terminal === stalled,
+        "repeated stall notices were not bounded",
+      );
+      // A caller that treats silence as its decision point still stops there.
+      polls = 0;
+      const chosen = await rejected(() =>
+        await_command(live("started"), {
+          on_progress: (current) =>
+            current.session_capabilities.observation === undefined,
+        }),
+      );
+      check(
+        chosen.message.includes("command progress needs review") &&
+          polls === 1 &&
+          chosen.evidence.terminal === stalled,
+        "caller-chosen silence decision was bypassed",
+      );
+    } finally {
+      globalThis.__codex_monotonic_now = savedNow;
     }
     let polls = 0;
     tools.write_stdin = async () => {
@@ -1175,6 +1280,41 @@ try {
       "preview fidelity lost",
     );
 
+    for (const prefix of ["x".repeat(400), "😀é".repeat(150)]) {
+      const text = prefix + "NEEDLE" + " tail";
+      reply = () => exited(JSON.stringify({type: "match", data: {
+        path: {text: "late.rs"}, line_number: 1, lines: {text: text + "\r\n"},
+        submatches: [{start: raw(prefix).canonical_range.end,
+          end: raw(prefix + "NEEDLE").canonical_range.end}],
+      }}));
+      const line = (await search_files("NEEDLE", {lines: true})).files[0].lines[0];
+      check(line.text.includes("NEEDLE") && line.text.length <= 240 &&
+        line.omitted_prefix && line.line_byte_start > 0,
+        "late UTF-8 submatch disappeared from its bounded preview");
+    }
+
+    globalThis.ALL_TOOL_NAMES = ["exec_command", "write_stdin"];
+    let polls = 0;
+    reply = () => live("", 77);
+    tools.write_stdin = async (request) => {
+      ++polls;
+      check(request.session_id === 77 && request.incarnation === "creation-a",
+        "search changed its live handle");
+      return exited("late.rs\u00001\n");
+    };
+    check((await search_files("x")).match_count === 1 && polls === 1,
+      "live search was not drained in its owning helper");
+    tools.write_stdin = async () => exited("ok.rs\u00001\n", 2, "partial error");
+    check(!(await search_files("x")).complete,
+      "drained rg error became complete");
+    tools.write_stdin = async () => ({...live("", 77), error: "steering"});
+    check((await rejected(() => search_files("x"))).evidence.cause.evidence.terminal.error === "steering",
+      "search swallowed an observation boundary");
+    tools.write_stdin = async () => live("", 78);
+    check((await rejected(() => search_files("x"))).evidence.cause.message.includes("changed live command handle"),
+      "search followed a different command incarnation");
+    globalThis.ALL_TOOL_NAMES = ["exec_command"];
+
     reply = () => exited("", 1);
     const none = await search_files("absent");
     check(
@@ -1240,6 +1380,20 @@ try {
         partial.errors[0] === "rg: missing: os error 2",
       "partial results lost their errors",
     );
+    // Recorded searches of guessed paths returned only rg's error, while the
+    // host had already named the existing path beside it.
+    const pathHint =
+      "Hint: `rg` could not open these search paths; possible existing paths (not verified replacements) are `missing` -> `missing.rs`.";
+    reply = () => ({
+      ...exited("ok.rs\u00001\n", 2, "rg: missing: os error 2\n"),
+      repair: pathHint,
+    });
+    const hinted = await search_files("x", { path: ["missing", "ok.rs"] });
+    check(
+      hinted.hint === pathHint && hinted.errors[0] === "rg: missing: os error 2",
+      "host path suggestions were dropped",
+    );
+    check(!("hint" in partial), "absent host advisory was invented");
     reply = () =>
       exited(
         "",
@@ -1264,7 +1418,7 @@ try {
           execution_state: "running",
           exit_code: null,
         },
-        "did not finish",
+        "observation needs a decision",
       ],
       [{ ...exited(""), exit_code: null }, "rg failed"],
     ]) {

@@ -6,7 +6,9 @@ mod directory_guard;
 mod find_up;
 
 pub use conditional_mutation::FileMutationOutcome;
+pub use conditional_mutation::guard_patch_read;
 pub use conditional_mutation::mutate_file_if_matches;
+pub use conditional_mutation::try_acquire_patch_capture;
 pub use confined_file::directory_case_sensitive;
 pub use confined_file::open_confined_file;
 pub use confined_file::open_confined_file_with_metadata;
@@ -159,7 +161,9 @@ pub struct WalkOptions {
     pub max_depth: usize,
     /// Maximum number of directories that may be traversed, including the root.
     pub max_directories: usize,
-    /// Maximum number of directory entries that may be examined.
+    /// Maximum number of directory entries that may be examined. With include
+    /// filters it instead bounds the matching files returned; examined entries
+    /// then remain bounded by the walk's hard maximum.
     pub max_entries: usize,
     /// Whether directory symlinks should be followed.
     pub follow_directory_symlinks: bool,
@@ -172,7 +176,8 @@ pub struct WalkOptions {
 
 /// Case-sensitive basename wildcards, independent of platform and gitignore.
 /// `*` matches zero or more Unicode characters; `?` matches one. Everything
-/// else is literal. File filters never prune directories needed for coverage.
+/// else is literal. File filters never prune directories needed for coverage;
+/// with include patterns, directories are traversed but not returned.
 #[derive(Clone, Debug, Default, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct WalkFilters {
@@ -790,29 +795,39 @@ async fn walk_via_directory_reads<F: ExecutorFileSystem + ?Sized>(
     let mut directory_count = 1usize;
     let mut entry_count = 0usize;
     let mut response_bytes = 0usize;
+    // Include patterns ask for matching files only: directories are traversed
+    // for coverage but not returned, and max_entries bounds returned matches
+    // rather than misses. The hard maximum still bounds raw examination, so a
+    // sparse match set cannot make the walk unbounded on a huge tree.
+    let matching_files_only = !options.filters.include.is_empty();
+    let (examination_limit, examination_reason) = if matching_files_only {
+        (MAX_WALK_ENTRIES, "examination_limit")
+    } else {
+        (options.max_entries, "entry_limit")
+    };
 
     while let Some((directory, depth)) = queue.pop_front() {
-        if entry_count == options.max_entries {
+        if entry_count == examination_limit {
             return Ok(finish_stopped_walk(
                 outcome,
                 root,
                 queue,
                 directory,
                 false,
-                "entry_limit",
-                options.max_entries,
+                examination_reason,
+                examination_limit,
             ));
         }
         let read = if options.follow_directory_symlinks {
             file_system.read_directory_bounded_for_walk(
                 &directory,
-                options.max_entries - entry_count,
+                examination_limit - entry_count,
                 sandbox,
             )
         } else {
             file_system.read_directory_bounded_no_follow_for_walk(
                 &directory,
-                options.max_entries - entry_count,
+                examination_limit - entry_count,
                 sandbox,
             )
         };
@@ -846,8 +861,8 @@ async fn walk_via_directory_reads<F: ExecutorFileSystem + ?Sized>(
                 root,
                 directory.clone(),
                 true,
-                "entry_limit",
-                options.max_entries,
+                examination_reason,
+                examination_limit,
             );
         }
         let mut entries = batch.entries;
@@ -993,22 +1008,42 @@ async fn walk_via_directory_reads<F: ExecutorFileSystem + ?Sized>(
             {
                 continue;
             }
-            if !reserve_walk_response_bytes(&mut outcome, &mut response_bytes, path.as_str().len())
-            {
-                return Ok(finish_stopped_walk(
-                    outcome,
-                    root,
-                    queue,
-                    directory.clone(),
-                    true,
-                    "response_bytes",
-                    MAX_WALK_RESPONSE_BYTES,
-                ));
+            // Directories that include patterns do not return are still
+            // traversed below.
+            if kind == WalkEntryKind::File || !matching_files_only {
+                // Misses never reach this budget. Stop at the first match it
+                // cannot hold, leaving this directory partially examined.
+                if matching_files_only && outcome.entries.len() == options.max_entries {
+                    return Ok(finish_stopped_walk(
+                        outcome,
+                        root,
+                        queue,
+                        directory.clone(),
+                        true,
+                        "entry_limit",
+                        options.max_entries,
+                    ));
+                }
+                if !reserve_walk_response_bytes(
+                    &mut outcome,
+                    &mut response_bytes,
+                    path.as_str().len(),
+                ) {
+                    return Ok(finish_stopped_walk(
+                        outcome,
+                        root,
+                        queue,
+                        directory.clone(),
+                        true,
+                        "response_bytes",
+                        MAX_WALK_RESPONSE_BYTES,
+                    ));
+                }
+                outcome.entries.push(WalkEntry {
+                    path: path.clone(),
+                    kind,
+                });
             }
-            outcome.entries.push(WalkEntry {
-                path: path.clone(),
-                kind,
-            });
 
             if kind == WalkEntryKind::Directory {
                 if options.prune_hidden_directories && file_name.starts_with('.') {

@@ -305,6 +305,44 @@ impl PreparedOutputSchema {
 
 /// The context needed for a single turn of the thread.
 #[derive(Debug)]
+struct CurrentTurnTokenUsage(std::sync::Mutex<codex_protocol::protocol::TokenUsage>);
+
+#[derive(Default)]
+struct FirstVisiblePublication(std::sync::atomic::AtomicBool);
+
+impl Default for CurrentTurnTokenUsage {
+    fn default() -> Self {
+        Self(std::sync::Mutex::new(codex_protocol::protocol::TokenUsage::empty_ledger()))
+    }
+}
+
+impl TurnContext {
+    pub(crate) fn record_current_turn_usage(&self, usage: &codex_protocol::protocol::TokenUsage) {
+        let ledger = self.extension_data.get_or_init(CurrentTurnTokenUsage::default);
+        ledger.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner).add_assign(usage);
+    }
+
+    pub(crate) fn current_turn_usage(&self) -> codex_protocol::protocol::TokenUsage {
+        let ledger = self.extension_data.get_or_init(CurrentTurnTokenUsage::default);
+        ledger.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone()
+    }
+
+    pub(crate) fn record_first_visible_publication(&self) {
+        self.turn_timing_state.record_visible_output_publication();
+        let observed = self.extension_data.get_or_init(FirstVisiblePublication::default);
+        if !observed.0.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            tracing::info!(event.name = "codex.visible_output.core_publication",
+                turn_id = %self.sub_id,
+                offset_ms = self.turn_timing_state.monotonic_offset_ms(),
+                endpoint = "post_filter_core_event_queue",
+                client_rendered = false,
+                "first nonempty visible output accepted after session filtering");
+        }
+    }
+}
+
+/// The context needed for a single turn of the thread.
+#[derive(Debug)]
 pub struct TurnContext {
     pub(crate) hook_context_budget: Arc<Mutex<codex_context_fragments::ModelContextBudget>>,
     pub(crate) sub_id: String,
@@ -629,10 +667,16 @@ impl TurnContext {
         let current_epoch = self.sub_id.as_str();
         let current_revisions = Arc::clone(&state.capability_revisions);
         let before = state.activations.len();
+        // Only a changed revision is stale. A capability absent from this
+        // registry (for example a timed-out MCP capture) stays dormant: the
+        // snapshot and activation checks above never advertise an absent tool,
+        // and the same revision becomes visible again once it is re-registered.
         state.activations.retain(|tool_name, activation| {
             activation.root_task_epoch == current_epoch
                 && activation.provenance == tool_name.to_string()
-                && current_revisions.get(tool_name) == Some(&activation.capability_revision)
+                && current_revisions
+                    .get(tool_name)
+                    .is_none_or(|revision| revision == &activation.capability_revision)
         });
         if capability_changed || state.activations.len() != before {
             state.revision = state.revision.saturating_add(1);

@@ -123,6 +123,7 @@ fn execute_request() -> WireExecuteRequest {
                 description: "function tool".into(),
                 kind: WireToolKind::Function,
                 input_schema: Some(json!({ "type": "object" })),
+                namespace_description: None,
                 default_timeout_ms: None,
                 output_schema: None,
             },
@@ -135,6 +136,7 @@ fn execute_request() -> WireExecuteRequest {
                 description: "freeform tool".into(),
                 kind: WireToolKind::Freeform,
                 input_schema: None,
+                namespace_description: None,
                 default_timeout_ms: None,
                 output_schema: Some(json!({ "type": "string" })),
             },
@@ -1027,4 +1029,21 @@ fn notification_acknowledgment_rejects_unknown_fields() {
     });
     assert!(serde_json::from_value::<ClientToHost>(message.clone()).is_err());
     assert!(serde_json::from_str::<ClientToHost>(&message.to_string()).is_err());
+}
+#[test]
+fn namespace_guidance_survives_wire_without_repeating_the_shared_body() {
+    let guidance = "Preserve this namespace authorization and account boundary.";
+    let definition = crate::augment_tool_definition(crate::ToolDefinition {
+        name: "connector_operation".into(),
+        tool_name: codex_protocol::ToolName::namespaced("connector", "operation"),
+        description: "Only the selected record may be changed.".into(),
+        namespace_description: Some(guidance.into()),
+        kind: crate::CodeModeToolKind::Function,
+        input_schema: None, output_schema: None, default_timeout_ms: None,
+    });
+    let wire = super::WireToolDefinition::from(definition.clone());
+    let json = serde_json::to_string(&wire).unwrap();
+    assert_eq!(json.matches(guidance).count(), 1);
+    let received = serde_json::from_str::<super::WireToolDefinition>(&json).unwrap();
+    assert_eq!(crate::ToolDefinition::from(received), definition);
 }

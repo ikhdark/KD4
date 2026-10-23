@@ -41,6 +41,84 @@ pub enum FileMutationOutcome {
     },
 }
 
+// Native readers must not mistake the deliberate capture/publication interval
+// for stable absence. Keep this advisory namespace outside the workspace and
+// never unlink a lock file while another process can still own its inode.
+fn patch_capture_lock_path(path: &Path) -> io::Result<PathBuf> {
+    use std::hash::Hash;
+    use std::hash::Hasher;
+    let parent = std::fs::canonicalize(
+        path.parent()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "missing parent"))?,
+    )?;
+    let name = path
+        .file_name()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "missing file name"))?;
+    let identity = parent.join(name).to_string_lossy().to_lowercase();
+    let mut hash = std::collections::hash_map::DefaultHasher::new();
+    identity.hash(&mut hash);
+    Ok(std::env::temp_dir()
+        .join("codex-patch-capture-v1")
+        // Bound the shared namespace without ever unlinking a live lock.
+        // Collisions conservatively return transient contention, not absence.
+        .join(format!("{:03x}.lock", hash.finish() & 0xfff)))
+}
+
+fn open_patch_capture_file(path: &Path) -> io::Result<File> {
+    let lock_path = patch_capture_lock_path(path)?;
+    std::fs::create_dir_all(
+        lock_path
+            .parent()
+            .ok_or_else(|| io::Error::other("capture lock has no parent"))?,
+    )?;
+    OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(lock_path)
+}
+
+/// Nonblocking capture admission for cooperating native writers. This is not
+/// exclusion against arbitrary editors, nor permission to overwrite a name.
+pub fn try_acquire_patch_capture(path: &Path) -> io::Result<File> {
+    let file = open_patch_capture_file(path)?;
+    fs2::FileExt::try_lock_exclusive(&file).map_err(|error| {
+        if error.raw_os_error() == fs2::lock_contended_error().raw_os_error() {
+            io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "native patch capture is in progress; retry after its owner finishes",
+            )
+        } else {
+            error
+        }
+    })?;
+    Ok(file)
+}
+
+/// Pins native open admission, not a multi-file snapshot. Both readers and
+/// writers create the temp-only lock before admission, closing the first-writer
+/// race. Temp storage failures fail closed; contention is WouldBlock, not absence.
+pub fn guard_patch_read(path: &Path) -> io::Result<Option<File>> {
+    let resolved = crate::atomic_write::resolve_symlink_write_paths(path)?;
+    let file = match open_patch_capture_file(&resolved.write_path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    fs2::FileExt::try_lock_shared(&file).map_err(|error| {
+        if error.raw_os_error() == fs2::lock_contended_error().raw_os_error() {
+            io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "native patch capture is in progress; this read does not establish that the file is absent",
+            )
+        } else {
+            error
+        }
+    })?;
+    Ok(Some(file))
+}
+
 /// Windows guarantee: deny concurrent write/delete opens on the actual old
 /// object, compare under that mandatory share policy, then mutate that handle.
 /// Replacement captures the old object and publishes with NO replace-existing
@@ -53,6 +131,7 @@ pub fn mutate_file_if_matches(
     expected: Option<&[u8]>,
     replacement: Option<&[u8]>,
 ) -> io::Result<FileMutationOutcome> {
+    let _capture = try_acquire_patch_capture(path)?;
     let parent = path
         .parent()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "missing parent"))?;

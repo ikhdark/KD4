@@ -419,7 +419,7 @@ fn structured_compiler_summary_with_streams(
     if stderr.is_some_and(|stderr| stderr.len() > SUMMARY_MAX_BYTES / 4) {
         return None;
     }
-    let mut diagnostics = Vec::new();
+    let mut diagnostics: Vec<serde_json::Value> = Vec::new();
     // A bounded directory of evicted groups, not another diagnostic body.
     // Build selectors only for these few omissions against canonical bytes.
     let mut omitted_groups = Vec::new();
@@ -431,6 +431,7 @@ fn structured_compiler_summary_with_streams(
             return;
         };
         let mut group = serde_json::json!({"source_line":line,
+            "occurrence_count":item["occurrence_count"].as_u64().unwrap_or(1),
             "recovery_selector":recovery_selector(line as usize)});
         if let Some(package) = item["package_id"].as_str().filter(|id| id.len() <= 512) {
             group["package_id"] = package.into();
@@ -472,9 +473,14 @@ fn structured_compiler_summary_with_streams(
     let mut total = 0usize;
     let mut records = 0usize;
     let mut omitted = 0usize;
+    let mut omitted_group_count = 0usize;
     let mut errors = 0usize;
     let mut warnings = 0usize;
     let mut build_success = None;
+    let mut artifact_count = 0usize;
+    let mut build_script_count = 0usize;
+    let mut build_finished_last = false;
+    let mut build_targets = BTreeSet::new();
     for (index, line) in compiler_output.lines().enumerate() {
         if line.trim().is_empty() {
             continue;
@@ -489,6 +495,7 @@ fn structured_compiler_summary_with_streams(
         }
         let mut record: serde_json::Value = serde_json::from_str(line).ok()?;
         records += 1;
+        build_finished_last = record["reason"] == "build-finished";
         // Relative diagnostic spans belong to a Cargo package/target. These
         // already-parsed discriminators must survive removal of the envelope.
         let mut package_id = None;
@@ -505,7 +512,19 @@ fn structured_compiler_summary_with_streams(
                 });
                 object.get_mut("message")?
             }
-            Some("compiler-artifact" | "build-script-executed") => continue,
+            Some("compiler-artifact") => {
+                artifact_count += 1;
+                if let Some(name) = record["target"]["name"].as_str().filter(|name| name.len() <= 256)
+                    && build_targets.len() < 16
+                {
+                    build_targets.insert(name.to_string());
+                }
+                continue;
+            }
+            Some("build-script-executed") => {
+                build_script_count += 1;
+                continue;
+            }
             Some("build-finished") => {
                 // A later success cannot erase an earlier failed build.
                 let success = record["success"].as_bool()?;
@@ -543,6 +562,35 @@ fn structured_compiler_summary_with_streams(
         if let Some(target) = target {
             item["target"] = target;
         }
+        // Factor only identical retained bodies: spans, children and fixes
+        // participate in equality, while each Cargo owner keeps its provenance.
+        if let Some(group) = diagnostics.iter_mut().find(|group| {
+            group["details_omitted"] != true && group["diagnostic"] == item["diagnostic"]
+        }) {
+            let occurrence = |item: &serde_json::Value| serde_json::json!({
+                "source_line": item["source_line"],
+                "package_id": item["package_id"],
+                "target": item["target"],
+                "recovery_selector": recovery_selector(item["source_line"].as_u64().unwrap_or(1) as usize),
+            });
+            let count = group["occurrence_count"].as_u64().unwrap_or(1) + 1;
+            if group.get("occurrences").is_none() {
+                group["occurrences"] = serde_json::json!([occurrence(group)]);
+            }
+            let occurrences = group["occurrences"].as_array_mut()?;
+            if occurrences.len() < 16 {
+                occurrences.push(occurrence(&item));
+            }
+            let omitted_occurrences = count - occurrences.len() as u64;
+            group["occurrence_count"] = count.into();
+            group["unlisted_occurrences"] = omitted_occurrences.into();
+            if omitted_occurrences > 0 {
+                group["occurrence_recovery_selector"] = serde_json::json!({
+                    "kind":"bytes", "start":0, "end":output.len(),
+                });
+            }
+            continue;
+        }
         if item.to_string().len() > SUMMARY_MAX_BYTES / 2
             && compact_compiler_diagnostic(&mut item["diagnostic"])
         {
@@ -553,11 +601,29 @@ fn structured_compiler_summary_with_streams(
         if diagnostics.len() > MAX_DIAGNOSTIC_GROUPS {
             let removed = diagnostics.remove(lowest_priority_index(&diagnostics)?);
             record_omission(&mut omitted_groups, &removed);
-            omitted += 1;
+            omitted += removed["occurrence_count"].as_u64().unwrap_or(1) as usize;
+            omitted_group_count += 1;
         }
     }
     if total == 0 {
-        return None;
+        if !build_finished_last || build_success != Some(true) || exit_code != 0 || timed_out
+            || !text_lines.is_empty() || stderr.is_some_and(|text| !text.is_empty())
+        {
+            return None;
+        }
+        let summary = serde_json::json!({
+            "format": "compiler_build_receipt", "exit_code": exit_code,
+            "build_success": true, "test_execution": "not_established",
+            "records": records, "artifact_count": artifact_count,
+            "build_script_count": build_script_count, "target_sample": build_targets,
+            "target_sample_limit": 16, "original_lines": output.lines().count(),
+            "original_bytes": output.len(), "diagnostic_stream": diagnostic_stream,
+            "projection": "Recognized clean Cargo build records only; not evidence that tests ran. Recover exact records from the retained output.",
+            "recovery_selector": {"kind":"bytes", "start":0, "end":output.len()},
+        }).to_string();
+        return (summary.len() < output.len() && summary.len() <= SUMMARY_MAX_BYTES
+            && token_limit.is_none_or(|limit| !codex_utils_string::approx_token_count_exceeds(&summary, limit)))
+            .then_some(summary);
     }
     loop {
         let mut envelope = serde_json::json!({
@@ -572,11 +638,11 @@ fn structured_compiler_summary_with_streams(
             "error_count": errors,
             "warning_count": warnings,
             "omitted_diagnostics": omitted,
-            "diagnostics_complete": omitted == 0 && diagnostics.iter().all(|item| item["details_omitted"] != true),
+            "diagnostics_complete": omitted == 0 && diagnostics.iter().all(|item| item["details_omitted"] != true && item["unlisted_occurrences"].as_u64().unwrap_or(0) == 0),
             "text_lines": text_lines,
             "diagnostic_stream": diagnostic_stream,
             "stderr": stderr,
-            "projection": "Redundant rendered text, code explanations and build artifacts omitted. details_omitted marks abbreviated prose/excerpts or omitted children without locations or fixes. Omitted whole diagnostics may include locations and fixes; recover them with recovery_selector against the retained aggregate bytes.",
+            "projection": "Redundant rendered text, code explanations and build artifacts omitted. Identical bodies share bounded occurrences; occurrence_count includes unlisted_occurrences, recoverable through occurrence_recovery_selector. details_omitted marks abbreviated prose/excerpts or omitted children without locations or fixes. Omitted whole diagnostics may include locations and fixes; recover them with recovery_selector against the retained aggregate bytes.",
             "recovery_selector": (omitted > 0).then(|| serde_json::json!({"kind":"bytes", "start":0, "end":output.len()})),
             "diagnostics": null,
         });
@@ -596,7 +662,7 @@ fn structured_compiler_summary_with_streams(
             // diagnostic, enlarge the budget, or replace whole-log recovery.
             while !omitted_groups.is_empty() {
                 let extra = serde_json::json!({"omitted_diagnostic_groups":omitted_groups,
-                    "unlisted_omitted_diagnostic_groups":omitted - omitted_groups.len()})
+                    "unlisted_omitted_diagnostic_groups":omitted_group_count - omitted_groups.len()})
                 .to_string();
                 let candidate = format!("{},{}", &summary[..summary.len() - 1], &extra[1..]);
                 if candidate.len() <= SUMMARY_MAX_BYTES
@@ -612,6 +678,20 @@ fn structured_compiler_summary_with_streams(
             return (summary.len() < output.len()).then_some(summary);
         }
         let index = lowest_priority_index(&diagnostics)?;
+        // Optional provenance detail yields before any distinct diagnostic.
+        // Counts and whole-log recovery still describe every original record.
+        if let Some(group) = diagnostics.iter_mut().rev().find(|group| {
+            group["occurrences"].as_array().is_some_and(|items| items.len() > 1)
+        }) {
+            let occurrences = group["occurrences"].as_array_mut()?;
+            occurrences.pop();
+            let retained = occurrences.len() as u64;
+            group["unlisted_occurrences"] = (group["occurrence_count"].as_u64()? - retained).into();
+            group["occurrence_recovery_selector"] = serde_json::json!({
+                "kind":"bytes", "start":0, "end":output.len(),
+            });
+            continue;
+        }
         let item = &mut diagnostics[index];
         // Warnings/notes yield before actionable error detail. Once only errors
         // remain, shed bulky excerpts before evicting their locations and fixes.
@@ -626,7 +706,8 @@ fn structured_compiler_summary_with_streams(
         }
         let removed = diagnostics.remove(index);
         record_omission(&mut omitted_groups, &removed);
-        omitted += 1;
+        omitted += removed["occurrence_count"].as_u64().unwrap_or(1) as usize;
+        omitted_group_count += 1;
     }
 }
 
@@ -1163,6 +1244,39 @@ fn find_ascii_case(line: &str, needle: &str) -> Option<usize> {
 
 pub fn find_ascii_case_bytes(line: &[u8], needle: &[u8]) -> Option<usize> {
     let (&first, _) = needle.split_first()?;
+    if needle.len() > line.len() {
+        return None;
+    }
+    // Keep short keyword probes allocation-free; KMP bounds long near-matches
+    // without folding or copying the (potentially multi-MiB) source buffer.
+    if needle.len() >= 32 {
+        let needle: Vec<_> = needle.iter().map(u8::to_ascii_lowercase).collect();
+        let mut prefix = vec![0; needle.len()];
+        let mut matched = 0;
+        for index in 1..needle.len() {
+            while matched > 0 && needle[index] != needle[matched] {
+                matched = prefix[matched - 1];
+            }
+            if needle[index] == needle[matched] {
+                matched += 1;
+            }
+            prefix[index] = matched;
+        }
+        matched = 0;
+        for (index, byte) in line.iter().enumerate() {
+            let byte = byte.to_ascii_lowercase();
+            while matched > 0 && byte != needle[matched] {
+                matched = prefix[matched - 1];
+            }
+            if byte == needle[matched] {
+                matched += 1;
+                if matched == needle.len() {
+                    return Some(index + 1 - matched);
+                }
+            }
+        }
+        return None;
+    }
     memchr::memchr2_iter(first.to_ascii_lowercase(), first.to_ascii_uppercase(), line).find(
         |&index| {
             line.get(index..index + needle.len())
@@ -1237,7 +1351,7 @@ fn select_lines(output: &str, line_count: usize, failed: bool, validation: bool)
             }
         }
     }
-    let mut groups: Vec<(Option<String>, usize)> = Vec::new();
+    let mut groups: Vec<(Option<String>, usize, usize)> = Vec::new();
     let mut groups_overflowed = false;
     let mut lines = output.lines().enumerate().peekable();
     while let Some((index, line)) = lines.next() {
@@ -1246,7 +1360,7 @@ fn select_lines(output: &str, line_count: usize, failed: bool, validation: bool)
         }
         // Headlines are not block identities. Keep the complete bounded
         // assertion/owner context; unknown or oversized blocks stay distinct.
-        let recognized = ["error:", "error[", "thread '", "FAILED ", "--- FAIL:"]
+        let recognized = ["error:", "error[", "thread '", "FAILED ", "--- FAIL:", "Traceback (most recent call last):"]
             .iter()
             .any(|prefix| line.trim_start().starts_with(prefix));
         let mut bounded = recognized && line.len() <= 4096;
@@ -1255,7 +1369,8 @@ fn select_lines(output: &str, line_count: usize, failed: bool, validation: bool)
         } else {
             String::new()
         };
-        for (offset, (_, next)) in lines.clone().enumerate() {
+        let mut block_end = index + 1;
+        for (offset, (next_index, next)) in lines.clone().enumerate() {
             if !bounded {
                 break;
             }
@@ -1268,25 +1383,26 @@ fn select_lines(output: &str, line_count: usize, failed: bool, validation: bool)
             }
             block.push('\n');
             block.push_str(next);
+            block_end = next_index + 1;
         }
         let identity = bounded.then_some(block);
-        if identity.is_none() || !groups.iter().any(|(text, _)| *text == identity) {
+        if identity.is_none() || !groups.iter().any(|(text, _, _)| *text == identity) {
             if groups.len() == MAX_DIAGNOSTIC_GROUPS {
                 groups_overflowed = true;
                 // Retain the latest distinct group as well as the stable prefix.
                 groups.pop();
             }
-            groups.push((identity, index));
+            groups.push((identity, index, block_end));
         }
     }
     let group_count = groups.len();
     let critical: Vec<usize> = if group_count <= MAX_FOCUS_MATCHES {
-        groups.iter().map(|(_, index)| *index).collect()
+        groups.iter().map(|(_, index, _)| *index).collect()
     } else {
         groups[..MAX_FOCUS_MATCHES / 2]
             .iter()
             .chain(groups[group_count - MAX_FOCUS_MATCHES / 2..].iter())
-            .map(|(_, index)| *index)
+            .map(|(_, index, _)| *index)
             .collect()
     };
     let mut indexes = BTreeSet::new();
@@ -1295,6 +1411,14 @@ fn select_lines(output: &str, line_count: usize, failed: bool, validation: bool)
             index.saturating_sub(FOCUS_CONTEXT_LINES)
                 ..(index + FOCUS_CONTEXT_LINES + 1).min(line_count),
         );
+    }
+    // Preserve the first complete actionable block while keeping the overall
+    // line/byte ceilings authoritative. Longer blocks remain recoverable via
+    // the existing omission ranges rather than growing output without bound.
+    if let Some((Some(_), start, end)) = groups.iter()
+        .find(|(identity, start, end)| identity.is_some() && end - start <= 40)
+    {
+        indexes.extend(*start..*end);
     }
     let mut advisory_slots = MAX_FOCUS_MATCHES - critical.len();
     let mut statuses = VecDeque::new();
@@ -1341,12 +1465,12 @@ fn select_lines(output: &str, line_count: usize, failed: bool, validation: bool)
     // coverage. After overflow this is a lower bound, never a claim of completeness.
     let omitted_groups = groups
         .iter()
-        .filter(|(_, index)| !indexes.contains(index))
+        .filter(|(_, index, _)| !indexes.contains(index))
         .count()
         + usize::from(groups_overflowed);
     let first_omitted_group = groups
         .iter()
-        .map(|(_, index)| *index)
+        .map(|(_, index, _)| *index)
         .filter(|index| !indexes.contains(index))
         .min();
     LineSelection {

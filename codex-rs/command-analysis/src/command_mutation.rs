@@ -11,6 +11,11 @@ pub enum CommandMutation {
     KnownMutation {
         paths: Option<BTreeSet<PathBuf>>,
     },
+    /// Observed tracked paths changed, without proof that this command wrote them.
+    ObservedChanges {
+        declared_paths: BTreeSet<PathBuf>,
+        unattributed_paths: BTreeSet<PathBuf>,
+    },
     /// A workspace snapshot changed, without proof that this command caused it.
     UnattributedWorkspaceChange,
     Uncertain,
@@ -24,7 +29,10 @@ impl CommandMutation {
     pub fn paths(&self) -> Option<&BTreeSet<PathBuf>> {
         match self {
             Self::KnownMutation { paths } => paths.as_ref(),
-            Self::ReadOnly | Self::Uncertain | Self::UnattributedWorkspaceChange => None,
+            Self::ReadOnly
+            | Self::Uncertain
+            | Self::UnattributedWorkspaceChange
+            | Self::ObservedChanges { .. } => None,
         }
     }
 }
@@ -82,19 +90,26 @@ fn is_read_only_format_command(command: &[String], tokens: &[String]) -> bool {
     let Some(program) = tokens.first().map(|token| command_basename(token)) else {
         return false;
     };
+    // Help and version queries print and exit without formatting any operand.
+    // Tokens are lowercased, so `-V` is indistinguishable from verbose `-v`.
+    let is_help_or_version = |arg: &String| matches!(arg.as_str(), "--help" | "-h" | "--version");
     match program {
         "prettier" => {
             !tokens
                 .iter()
                 .any(|arg| matches!(arg.as_str(), "--write" | "-w"))
-                && tokens
-                    .iter()
-                    .any(|arg| matches!(arg.as_str(), "--check" | "-c" | "--list-different" | "-l"))
+                && tokens.iter().any(|arg| {
+                    matches!(arg.as_str(), "--check" | "-c" | "--list-different" | "-l")
+                        || is_help_or_version(arg)
+                })
         }
         // A just recipe is user-defined; its --check argument is not proof of
         // read-only behavior. Let the ordinary workspace observation decide.
         "cargo" | "rustfmt" => {
-            is_format_only_tokens(tokens) && tokens.iter().any(|arg| arg == "--check")
+            is_format_only_tokens(tokens)
+                && tokens
+                    .iter()
+                    .any(|arg| arg == "--check" || is_help_or_version(arg))
         }
         _ => false,
     }
@@ -562,6 +577,11 @@ pub fn command_mutation_paths(command: &[String], cwd: Option<&Path>) -> Option<
 }
 
 fn mutating_command_paths(command: &[String], cwd: Option<&Path>) -> Option<BTreeSet<PathBuf>> {
+    // Windows exec wraps every command as `pwsh -Command <script>`; without
+    // unwrapping, no wrapped mutator could ever report exact paths.
+    if let Some(script_argv) = simple_wrapped_script_argv(command) {
+        return mutating_command_paths(&script_argv, cwd);
+    }
     let program = command.first()?.to_ascii_lowercase();
     let program = command_basename(&program);
     let args = &command[1..];
@@ -583,9 +603,8 @@ fn mutating_command_paths(command: &[String], cwd: Option<&Path>) -> Option<BTre
             let operands = simple_path_operands(args)?;
             (operands.len() >= 2).then(|| operands.into_iter().skip(1).collect())?
         }
-        "rustfmt" | "prettier" if !args.iter().any(|arg| arg == "--check") => {
-            simple_path_operands(args)?
-        }
+        "rustfmt" if !args.iter().any(|arg| arg == "--check") => rustfmt_path_operands(args)?,
+        "prettier" if !args.iter().any(|arg| arg == "--check") => simple_path_operands(args)?,
         _ => return None,
     };
     let paths = operands
@@ -600,6 +619,59 @@ fn mutating_command_paths(command: &[String], cwd: Option<&Path>) -> Option<BTre
         })
         .collect::<Option<BTreeSet<_>>>()?;
     (!paths.is_empty()).then_some(paths)
+}
+
+/// The argv of a shell wrapper whose single script is one plain command: no
+/// quoting, expansion, wildcard, list, redirect or comment syntax, so splitting
+/// on whitespace yields exactly the words the shell passes to the program.
+fn simple_wrapped_script_argv(command: &[String]) -> Option<Vec<String>> {
+    let program = command.first()?.to_ascii_lowercase();
+    let (script_flags, posix): (&[&str], bool) = match command_basename(&program) {
+        "pwsh" | "powershell" => (&["-command", "-c"], false),
+        "cmd" => (&["/c"], false),
+        "bash" | "sh" | "zsh" => (&["-c", "-lc"], true),
+        _ => return None,
+    };
+    let position = command
+        .iter()
+        .position(|arg| script_flags.contains(&arg.to_ascii_lowercase().as_str()))?;
+    let [script] = &command[position.saturating_add(1)..] else {
+        return None;
+    };
+    if script.contains([
+        '\'', '"', '`', '$', '*', '?', '[', ']', '{', '}', '(', ')', '|', '&', ';', '<', '>', '@',
+        '#', ',', '%', '~', '!', '^', '\n', '\r',
+    ]) || (posix && script.contains('\\'))
+    {
+        return None;
+    }
+    let argv = script
+        .split_whitespace()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    // A nested wrapper is not one plain command.
+    (!argv.is_empty() && simple_wrapped_script_argv(&argv).is_none()).then_some(argv)
+}
+
+/// rustfmt operands, skipping the options whose separate value is not a path
+/// it rewrites. Any other option keeps the conservative unknown-path result.
+fn rustfmt_path_operands(args: &[String]) -> Option<Vec<String>> {
+    let mut operands = Vec::new();
+    let mut args = args.iter();
+    while let Some(arg) = args.next() {
+        let name = arg.split_once('=').map_or(arg.as_str(), |(name, _)| name);
+        match name {
+            "--edition" | "--style-edition" | "--config" | "--config-path" | "--color" => {
+                if !arg.contains('=') {
+                    args.next()?;
+                }
+            }
+            "--skip-children" | "--unstable-features" | "-q" | "--quiet" | "-v" | "--verbose" => {}
+            option if option.starts_with('-') => return None,
+            path => operands.push(path.to_string()),
+        }
+    }
+    Some(operands)
 }
 
 fn simple_path_operands(args: &[String]) -> Option<Vec<String>> {

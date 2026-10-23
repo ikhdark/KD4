@@ -772,7 +772,7 @@ async fn shutdown_session_runtime(sess: &Arc<Session>) -> RuntimeShutdown {
     // shutdown observation expires. Accepted writes must not be cancelled.
     let abort = sess.terminal_tasks.spawn({
         let sess = Arc::clone(sess);
-        async move { sess.abort_all_tasks(TurnAbortReason::Interrupted).await }
+        async move { sess.abort_all_tasks(TurnAbortReason::SessionShutdown).await }
     });
     let abort_incomplete = !matches!(
         tokio::time::timeout_at(terminal_deadline, abort).await,
@@ -789,22 +789,40 @@ async fn shutdown_session_runtime(sess: &Arc<Session>) -> RuntimeShutdown {
     if abort_incomplete || terminal_incomplete {
         warn!("timed out waiting for turn terminal finalization during session shutdown");
     }
-    if tokio::time::timeout_at(
-        terminal_deadline,
-        sess.services.turn_environments.finish_shutdown(),
-    )
-    .await
-    .is_err()
-    {
+    // Match unpublished cleanup only after the admission/producer barrier has
+    // actually drained. On uncertain finalization retain the conservative order.
+    let (snapshot, code_mode) = if admission_incomplete || abort_incomplete || terminal_incomplete {
+        let snapshot = tokio::time::timeout_at(
+            terminal_deadline,
+            sess.services.turn_environments.finish_shutdown(),
+        )
+        .await;
+        sess.services
+            .unified_exec_manager
+            .terminate_all_processes()
+            .await;
+        let code_mode = sess.services.code_mode_service.shutdown().await;
+        sess.services.shutdown_mcp_managers().await;
+        (snapshot, code_mode)
+    } else {
+        let (snapshot, _, code_mode, _) = tokio::join!(
+            tokio::time::timeout_at(
+                terminal_deadline,
+                sess.services.turn_environments.finish_shutdown()
+            ),
+            sess.services.unified_exec_manager.terminate_all_processes(),
+            sess.services.code_mode_service.shutdown(),
+            sess.services.shutdown_mcp_managers(),
+        );
+        (snapshot, code_mode)
+    };
+    if snapshot.is_err() {
         warn!("timed out waiting for remote snapshot cleanup during session shutdown");
     }
-    sess.services
-        .unified_exec_manager
-        .terminate_all_processes()
-        .await;
-    if let Err(err) = sess.services.code_mode_service.shutdown().await {
+    if let Err(err) = code_mode {
         warn!("failed to shutdown code mode session: {err}");
     }
+    // Every tool-producing owner above is joined before the final checkpoint.
     let tool_history_flush = tokio::time::timeout(
         TOOL_HISTORY_SHUTDOWN_FLUSH_TIMEOUT,
         sess.flush_tool_history_persistence(),
@@ -819,7 +837,6 @@ async fn shutdown_session_runtime(sess: &Arc<Session>) -> RuntimeShutdown {
                 .to_string(),
         )),
     };
-    sess.services.shutdown_mcp_managers().await;
     let error = persistence_error.or_else(|| {
         (admission_incomplete || abort_incomplete || terminal_incomplete).then(|| CodexErr::Fatal(
             "turn finalization did not complete before the shutdown deadline; accepted history writes remain owned, but durability is unconfirmed".to_string(),
@@ -1055,7 +1072,7 @@ pub(super) async fn submission_loop(
                     rx_sub.close();
                     while let Ok(queued) = rx_sub.try_recv() {
                         let cancellable = matches!(queued.submission.op, Op::UserInput { .. } | Op::Review { .. });
-                        cancel_queued_preparation(&sess, queued.submission.id, cancellable).await;
+                        cancel_queued_preparation(&sess, queued.submission.id, cancellable, TurnAbortReason::SessionShutdown).await;
                     }
                     finish_shutdown(&sess, sub_id, runtime_shutdown).await;
                     shutdown_received = true;
@@ -1071,7 +1088,7 @@ pub(super) async fn submission_loop(
                             dispatch_submission(Arc::clone(&sess), Arc::clone(&config), queued).await;
                         } else {
                             let cancellable = matches!(queued.submission.op, Op::UserInput { .. } | Op::Review { .. });
-                            cancel_queued_preparation(&sess, queued.submission.id, cancellable).await;
+                            cancel_queued_preparation(&sess, queued.submission.id, cancellable, TurnAbortReason::SessionShutdown).await;
                         }
                     }
                 }
@@ -1119,6 +1136,12 @@ pub(super) async fn submission_loop(
         }
         if matches!(queued.submission.op, Op::Interrupt | Op::Shutdown) {
             let shutting_down = matches!(queued.submission.op, Op::Shutdown);
+            // The session flag is not set until the runtime shutdown below runs.
+            let abort_reason = if shutting_down {
+                TurnAbortReason::SessionShutdown
+            } else {
+                TurnAbortReason::Interrupted
+            };
             if (shutting_down
                 || pending
                     .as_ref()
@@ -1126,7 +1149,7 @@ pub(super) async fn submission_loop(
                 && let Some((id, cancellable, preparation)) = pending.take()
             {
                 drop(preparation);
-                cancel_queued_preparation(&sess, id, cancellable).await;
+                cancel_queued_preparation(&sess, id, cancellable, abort_reason.clone()).await;
             }
             let mut retained = std::collections::VecDeque::new();
             while let Some(deferred) = ordered.pop_front() {
@@ -1135,7 +1158,13 @@ pub(super) async fn submission_loop(
                     Op::UserInput { .. } | Op::Review { .. }
                 );
                 if shutting_down || cancellable {
-                    cancel_queued_preparation(&sess, deferred.submission.id, cancellable).await;
+                    cancel_queued_preparation(
+                        &sess,
+                        deferred.submission.id,
+                        cancellable,
+                        abort_reason.clone(),
+                    )
+                    .await;
                 } else {
                     retained.push_back(deferred);
                 }
@@ -1162,17 +1191,24 @@ pub(super) async fn submission_loop(
     while let Ok(queued) = rx_sub.try_recv() {
         ordered.push_back(queued);
     }
-    // Teardown owns preparation as well as installed tasks, including EOF.
+    // Teardown owns preparation as well as installed tasks, including EOF. The
+    // loop exits only for teardown, so these cancellations are shutdowns.
     if let Some((id, cancellable, preparation)) = pending.take() {
         drop(preparation);
-        cancel_queued_preparation(&sess, id, cancellable).await;
+        cancel_queued_preparation(&sess, id, cancellable, TurnAbortReason::SessionShutdown).await;
     }
     for queued in ordered {
         let cancellable = matches!(
             queued.submission.op,
             Op::UserInput { .. } | Op::Review { .. }
         );
-        cancel_queued_preparation(&sess, queued.submission.id, cancellable).await;
+        cancel_queued_preparation(
+            &sess,
+            queued.submission.id,
+            cancellable,
+            TurnAbortReason::SessionShutdown,
+        )
+        .await;
     }
     // If the submission loop exits because the channel closed without an
     // explicit shutdown op, still run session teardown.
@@ -1204,7 +1240,12 @@ pub(super) async fn submission_loop(
     debug!("Agent loop exited");
 }
 
-async fn cancel_queued_preparation(sess: &Session, id: String, emit_aborted: bool) {
+async fn cancel_queued_preparation(
+    sess: &Session,
+    id: String,
+    emit_aborted: bool,
+    reason: TurnAbortReason,
+) {
     let _permit_cleanup = sess
         .services
         .agent_control
@@ -1223,7 +1264,7 @@ async fn cancel_queued_preparation(sess: &Session, id: String, emit_aborted: boo
             id: id.clone(),
             msg: EventMsg::TurnAborted(codex_protocol::protocol::TurnAbortedEvent {
                 turn_id: Some(id),
-                reason: TurnAbortReason::Interrupted,
+                reason,
                 completed_at: None,
                 duration_ms: None,
                 timing: None,

@@ -86,12 +86,26 @@ impl WebSocketConnector {
         .map_err(|error| {
             WebSocketError::Io(std::io::Error::new(
                 std::io::ErrorKind::PermissionDenied,
-                error,
+                DispatchRejected(error),
             ))
         })??;
         Ok((WebSocketConnection { inner }, response))
     }
 }
+
+/// The connection was refused before its first network poll because the request lost its
+/// dispatch authority (for example, an account change). Nothing was sent, so callers can tell
+/// it apart from a socket failure that should count against the transport.
+#[derive(Debug)]
+pub struct DispatchRejected(String);
+
+impl std::fmt::Display for DispatchRejected {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for DispatchRejected {}
 
 /// An established WebSocket independent of its direct, proxy, and TLS transport layers.
 ///
@@ -192,7 +206,8 @@ mod dispatch_tests {
         )
         .await;
         assert!(matches!(result, Err(WebSocketError::Io(error))
-            if error.kind() == std::io::ErrorKind::PermissionDenied));
+            if error.kind() == std::io::ErrorKind::PermissionDenied
+                && error.get_ref().is_some_and(|inner| inner.is::<DispatchRejected>())));
         assert!(matches!(listener.accept(), Err(error)
             if error.kind() == std::io::ErrorKind::WouldBlock));
     }

@@ -18,6 +18,8 @@ workspace = true
 
 [dependencies]
 tracing = { workspace = true }
+tracing-appender = { workspace = true }
+tracing-subscriber = { workspace = true, features = ["fmt"] }
 anyhow = { workspace = true }
 codex-code-mode-protocol = { workspace = true }
 codex-code-mode-runtime = { workspace = true }

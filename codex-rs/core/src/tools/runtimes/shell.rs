@@ -70,6 +70,10 @@ pub struct ShellRequest {
     pub justification: Option<String>,
     pub exec_approval_requirement: ExecApprovalRequirement,
     pub(crate) validation_launch: bool,
+    /// Runner-aware proof capability. A refusal keeps only a validation that a
+    /// later proving rerun can retire pending; call-argument classification
+    /// cannot recognize repository runners.
+    pub(crate) validation_proof: bool,
     pub(crate) workspace_operation_root: Option<PathBuf>,
 }
 
@@ -329,7 +333,10 @@ impl ToolRuntime<ShellRequest, ExecToolCallOutput> for ShellRuntime {
                     )
                     .await
                     .map_err(|reason| {
-                        crate::validation_task::record_admission_refusal(ctx);
+                        crate::validation_task::record_admission_refusal(
+                            ctx,
+                            req.validation_proof,
+                        );
                         ToolError::Rejected(reason)
                     })?,
                 )
@@ -387,7 +394,11 @@ impl ToolRuntime<ShellRequest, ExecToolCallOutput> for ShellRuntime {
                 &env,
             )
             .await
-            .map_err(ToolError::Rejected)?;
+            .map_err(|reason| {
+                // Nothing was launched: required validation remains pending.
+                crate::validation_task::record_admission_refusal(ctx, req.validation_proof);
+                ToolError::Rejected(reason)
+            })?;
         }
 
         let additional_read_roots = shell_snapshot_additional_read_roots(
@@ -419,7 +430,7 @@ impl ToolRuntime<ShellRequest, ExecToolCallOutput> for ShellRuntime {
             .await
             .map_err(ToolError::Codex)?;
         env.windows_sandbox_additional_read_roots = additional_read_roots;
-        crate::validation_task::begin_dispatch(
+        let full_suite_dispatch = crate::validation_task::begin_dispatch(
             ctx,
             &mut env.env,
             !req.turn_environment.environment.is_remote(),
@@ -427,7 +438,7 @@ impl ToolRuntime<ShellRequest, ExecToolCallOutput> for ShellRuntime {
         .await
         .map_err(ToolError::Rejected)?;
         let validation_attempt_started = Arc::new(AtomicBool::new(false));
-        let after_spawn = req.validation_launch.then(|| {
+        let after_spawn = (req.validation_launch || full_suite_dispatch.is_some()).then(|| {
             let validation_attempt_started = Arc::clone(&validation_attempt_started);
             Box::new(move || {
                 validation_attempt_started.store(true, Ordering::Release);
@@ -470,9 +481,18 @@ impl ToolRuntime<ShellRequest, ExecToolCallOutput> for ShellRuntime {
             Ok(out) => out,
             Err(CodexErr::Sandbox(SandboxErr::Timeout { output })) if stalled => *output,
             Err(err) => {
+                let attempt_started = validation_attempt_started.load(Ordering::Acquire);
+                // `exec` reports creation through `after_spawn`. The Windows
+                // sandbox launcher never does, so its failures stay spent.
+                if !attempt_started
+                    && attempt.sandbox != codex_sandboxing::SandboxType::WindowsRestrictedToken
+                    && let Some(dispatch) = full_suite_dispatch
+                {
+                    dispatch.acknowledge_not_spawned().await;
+                }
                 self.remember_validation_attempt_error(
                     req.validation_launch,
-                    validation_attempt_started.load(Ordering::Acquire),
+                    attempt_started,
                     &err,
                 );
                 return Err(ToolError::Codex(err));

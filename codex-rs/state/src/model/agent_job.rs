@@ -221,7 +221,7 @@ impl TryFrom<AgentJobItemRow> for AgentJobItem {
     type Error = anyhow::Error;
 
     fn try_from(value: AgentJobItemRow) -> Result<Self, Self::Error> {
-        Ok(Self {
+        let item = Self {
             job_id: value.job_id,
             item_id: value.item_id,
             row_index: value.row_index,
@@ -246,7 +246,21 @@ impl TryFrom<AgentJobItemRow> for AgentJobItem {
                 .reported_at
                 .map(epoch_seconds_to_datetime)
                 .transpose()?,
-        })
+        };
+        if item.status == AgentJobItemStatus::Completed
+            && (!item.has_report_evidence() || item.completed_at.is_none())
+        {
+            anyhow::bail!("inconsistent_persisted_completion: job {} item {} lacks valid report provenance", item.job_id, item.item_id);
+        }
+        Ok(item)
+    }
+}
+
+impl AgentJobItem {
+    /// Supported legacy reports retain these fields even without a new receipt.
+    pub fn has_report_evidence(&self) -> bool {
+        self.attempt_count > 0 && self.reported_at.is_some()
+            && self.result_json.as_ref().is_some_and(Value::is_object)
     }
 }
 

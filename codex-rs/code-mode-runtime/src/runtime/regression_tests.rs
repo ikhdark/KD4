@@ -127,6 +127,95 @@ fn the_published_contract_states_the_enforced_list_keys_ceiling() {
     );
 }
 
+/// Cells awaited independent reads one statement at a time, so one guessed path
+/// ended the cell before its siblings started; 30 of 91 exact duplicate reads
+/// re-issued such never-started reads after a failed cell. The published batch
+/// example must start every call at once and print each result or error.
+#[tokio::test]
+async fn published_settled_batch_prints_every_sibling_when_one_call_fails() {
+    let description = codex_code_mode_protocol::build_exec_tool_description(true, false, &[]);
+    let example = description
+        .split('`')
+        .find(|part| part.starts_with("text(await Promise.allSettled(["))
+        .expect("the exec contract publishes a settled batch example");
+    let tool = |name: &str| ToolDefinition {
+        name: name.into(),
+        tool_name: ToolName::plain(name),
+        kind: CodeModeToolKind::Function,
+        description: "".into(),
+        input_schema: None,
+        output_schema: None,
+        namespace_description: None,
+        default_timeout_ms: None,
+    };
+    let read = json!({"path":"a.rs","artifact_id":"artifact","canonical_bytes":11,
+        "canonical_sha256":"hash","source_sha256":"hash","complete":true,
+        "results":[{"selector":{"kind":"lines","start":1,"end":1},"status":"ok",
+            "complete":true,"text":"fn found()\n"}]});
+    let command = json!({"exit_code": 0, "output": "src/lib.rs:7:x"});
+    let missing = "unable to read a.rs: The system cannot find the file specified.";
+    // Either sibling may be the failing one, as a guessed path or a failed rg.
+    for read_fails in [true, false] {
+        let (tx, _termination, mut rx) =
+            start_with_tools(example, vec![tool("read_file"), tool("exec_command")]).await;
+        let mut calls = HashMap::new();
+        for _ in 0..2 {
+            let RuntimeEvent::ToolCall { id, name, .. } = next(&mut rx).await else {
+                panic!("both batched calls start before either settles");
+            };
+            calls.insert(name.name.to_string(), id);
+        }
+        let (failing, succeeding, result) = if read_fails {
+            ("read_file", "exec_command", command.clone())
+        } else {
+            ("exec_command", "read_file", read.clone())
+        };
+        tx.send(RuntimeCommand::ToolError {
+            id: calls[failing].clone(),
+            error_text: missing.into(),
+        })
+        .unwrap();
+        tx.send(RuntimeCommand::ToolResponse {
+            id: calls[succeeding].clone(),
+            result,
+        })
+        .unwrap();
+        let printed = text(next(&mut rx).await);
+        assert!(printed.contains("cannot find the file"), "{printed}");
+        if read_fails {
+            assert!(printed.contains("src/lib.rs:7:x"), "{printed}");
+        } else {
+            // A read inside the batch still prints its source body as text.
+            assert!(printed.contains("[source "), "{printed}");
+            assert!(printed.contains("\nfn found()"), "{printed}");
+        }
+        let RuntimeEvent::Result { error_text, .. } = next(&mut rx).await else {
+            panic!("result");
+        };
+        assert_eq!(error_text, None, "one failed sibling must not fail the cell");
+        closed(&mut rx).await;
+    }
+}
+
+/// The exec parser admits a `deliver` pragma with no body, the cell that
+/// delivers a retained answer. Its empty program must complete, printing nothing.
+#[tokio::test]
+async fn an_empty_program_completes_without_output_or_error() {
+    for source in ["", "\r\n  \n"] {
+        let (_tx, _termination, mut rx) = start(source).await;
+        let RuntimeEvent::Result {
+            error_text,
+            output_loss,
+            ..
+        } = next(&mut rx).await
+        else {
+            panic!("an empty program prints nothing before its result");
+        };
+        assert_eq!((error_text, output_loss), (None, None), "{source:?}");
+        closed(&mut rx).await;
+    }
+}
+
 #[tokio::test]
 #[ignore = "narrow storage-recovery wall-clock benchmark"]
 async fn storage_inventory_wall_clock_benchmark() {
@@ -226,6 +315,7 @@ fn affordance_resolver_preserves_all_alias_collisions_without_formatting() {
         tool_name: ToolName::new(namespace.map(str::to_owned), name),
         description: "".into(),
         kind: CodeModeToolKind::Function,
+        namespace_description: None,
         default_timeout_ms: None,
     };
     let catalog = EnabledToolCatalog::new(vec![
@@ -283,6 +373,7 @@ fn critical_path_index_preserves_dotted_names_and_ambiguous_aliases() {
             tool_name: ToolName::new(namespace.map(str::to_owned), name),
             description: "".into(),
             kind: CodeModeToolKind::Function,
+            namespace_description: None,
             default_timeout_ms: None,
         })
         .collect(),
@@ -329,7 +420,7 @@ async fn critical_path_lazy_aliases_preserve_metadata_and_canonical_identity() {
     "#, ToolDefinition {
         name: "ns__read".into(), tool_name: ToolName::new(Some("ns".into()), "read"),
         kind: CodeModeToolKind::Function, description: "description".into(), input_schema: None,
-        output_schema: None, default_timeout_ms: None,
+        output_schema: None, namespace_description: None, default_timeout_ms: None,
     }).await;
     assert_eq!(text(next(&mut rx).await), "lazy alias contracts passed");
     assert!(matches!(
@@ -351,6 +442,7 @@ async fn registered_namespace_aliases_preserve_identity_and_reject_collisions() 
         description: "contract".into(),
         input_schema: None,
         output_schema: None,
+        namespace_description: None,
         default_timeout_ms: None,
     };
     let definitions = vec![
@@ -449,6 +541,7 @@ async fn start(
             description: "".into(),
             input_schema: None,
             output_schema: None,
+            namespace_description: None,
             default_timeout_ms: None,
         },
     )
@@ -528,6 +621,7 @@ async fn rejected_images_do_not_copy_payloads_before_output_admission() {
         description: String::new().into(),
         input_schema: None,
         output_schema: None,
+        namespace_description: None,
         default_timeout_ms: None,
     };
     let (tx, _termination, mut rx) = start_with_output_budget(source, vec![tool], 128).await;
@@ -584,6 +678,7 @@ async fn generated_image_hints_check_remaining_output_before_copying() {
         description: String::new().into(),
         input_schema: None,
         output_schema: None,
+        namespace_description: None,
         default_timeout_ms: None,
     };
     let (tx, _termination, mut rx) = start_with_output_budget(source, vec![tool], 4096).await;
@@ -734,6 +829,31 @@ async fn mechanical_orchestration_preserves_evidence_and_stops_for_decisions() {
 }
 
 #[tokio::test]
+async fn canonical_json_budget_stops_expansion_before_visiting_the_tail() {
+    let (_tx, _termination, mut rx) = start(include_str!("canonical_json_tests.js")).await;
+    assert_eq!(
+        text(next(&mut rx).await),
+        "bounded canonical JSON scenarios passed"
+    );
+    let RuntimeEvent::Result { error_text, .. } = next(&mut rx).await else {
+        panic!("canonical JSON result");
+    };
+    assert_eq!(error_text, None);
+    closed(&mut rx).await;
+}
+
+#[tokio::test]
+async fn text_encoding_globals_follow_the_utf8_encoding_standard() {
+    let (_tx, _termination, mut rx) = start(include_str!("text_encoding_tests.js")).await;
+    assert_eq!(text(next(&mut rx).await), "text encoding scenarios passed");
+    let RuntimeEvent::Result { error_text, .. } = next(&mut rx).await else {
+        panic!("text encoding result");
+    };
+    assert_eq!(error_text, None);
+    closed(&mut rx).await;
+}
+
+#[tokio::test]
 async fn selected_rows_preserve_parent_mutations_getters_proxies_and_to_json() {
     let source = r#"
         const r = await tools.read_file({});
@@ -756,6 +876,7 @@ async fn selected_rows_preserve_parent_mutations_getters_proxies_and_to_json() {
             description: "".into(),
             input_schema: None,
             output_schema: None,
+            namespace_description: None,
             default_timeout_ms: None,
         },
     )
@@ -874,6 +995,7 @@ async fn tool_owned_deadlines_and_projection_recovery_reach_the_live_runtime() {
             tool_name: name,
             kind: CodeModeToolKind::Function,
             description: "".into(),
+            namespace_description: None,
             default_timeout_ms: default_timeout,
             input_schema: Some(json!({"type":"object", "properties":{
                 "payload":{"type":"string", "description":format!("{}critical suffix", "x".repeat(150_000))}
@@ -994,6 +1116,7 @@ async fn unsafe_integers_round_trip_through_nested_tools_and_storage() {
         tool_name: ToolName::plain("sample_tool"),
         kind: CodeModeToolKind::Function,
         description: "".into(),
+        namespace_description: None,
         default_timeout_ms: None,
         input_schema: Some(json!({"type":"object","properties":{
             "values":{"type":"array","items":{"type":"integer"}},
@@ -1067,6 +1190,7 @@ async fn tool_transport_parse_fast_path_preserves_values_and_captured_intrinsics
             tool_name: ToolName::plain("sample_tool"),
             kind: CodeModeToolKind::Function,
             description: "".into(),
+            namespace_description: None,
             default_timeout_ms: None,
             input_schema: None,
             output_schema: None,
@@ -1272,6 +1396,7 @@ async fn actionability_small_command_projection_keeps_dynamic_serialization() {
             description: "".into(),
             input_schema: None,
             output_schema: None,
+            namespace_description: None,
             default_timeout_ms: None,
         },
     )
@@ -1810,6 +1935,7 @@ async fn nested_replacement_proxy_uses_current_serialization_not_trusted_metadat
             description: "".into(),
             input_schema: None,
             output_schema: None,
+            namespace_description: None,
             default_timeout_ms: None,
         },
     )
@@ -1835,5 +1961,157 @@ async fn nested_replacement_proxy_uses_current_serialization_not_trusted_metadat
             ..
         }
     ));
+    closed(&mut rx).await;
+}
+#[tokio::test]
+async fn discovery_shares_namespace_guidance_while_resolution_remains_complete() {
+    let guidance = "Shared authorization applies to every connector operation.".repeat(40);
+    let definitions = (0..30).map(|index| codex_code_mode_protocol::augment_tool_definition(ToolDefinition {
+        name: format!("connector_operation_{index}"),
+        tool_name: ToolName::namespaced("connector", format!("operation_{index}")),
+        description: format!("Member restriction {index}").into(),
+        namespace_description: Some(guidance.clone().into()),
+        kind: CodeModeToolKind::Function,
+        input_schema: None, output_schema: None, default_timeout_ms: None,
+    })).collect::<Vec<_>>();
+    let full_bytes = definitions.iter().map(|definition| definition.description.len()).sum::<usize>();
+    let (_tx, _termination, mut rx) = start_with_tools(r#"
+        const inventory = ALL_TOOLS;
+        for (const operation of inventory) {
+            const shared = inventory.find(entry => entry.name === operation.namespace_instructions_ref);
+            if (!shared || !shared.namespace_instructions) throw Error('missing shared instructions');
+            const resolved = resolve_tool(operation.name);
+            if (!resolved.description.includes(shared.namespace_instructions) ||
+                !resolved.description.includes('Member restriction')) throw Error('incomplete resolved contract');
+        }
+        text(inventory);
+    "#, definitions).await;
+    let rendered = text(next(&mut rx).await);
+    let inventory: JsonValue = serde_json::from_str(&rendered).unwrap();
+    assert_eq!(inventory.as_array().unwrap().len(), 30);
+    assert_eq!(rendered.matches(&guidance).count(), 1);
+    assert!(rendered.len() * 2 < full_bytes, "the repeated shared body must leave discovery output");
+    assert!(matches!(next(&mut rx).await, RuntimeEvent::Result { error_text: None, .. }));
+    closed(&mut rx).await;
+}
+#[test]
+fn forced_short_digest_collisions_and_existing_names_fall_back_without_ambiguity() {
+    let candidates = vec![Some("operation__000000000000".into()), Some("operation__000000000000".into())];
+    assert_eq!(admit_short_aliases(&candidates, &HashMap::new(), &HashMap::new()), vec![None, None]);
+    let one = vec![Some("short_alias".into())];
+    assert_eq!(admit_short_aliases(&one, &HashMap::from([("short_alias".into(), 1)]), &HashMap::new()), vec![None]);
+    assert_eq!(admit_short_aliases(&one, &HashMap::new(), &HashMap::from([("short_alias".into(), None)])), vec![None]);
+    for names in [vec![Some("second".into()), Some("first".into())], vec![Some("first".into()), Some("second".into())]] {
+        assert_eq!(admit_short_aliases(&names, &HashMap::new(), &HashMap::new()), names);
+    }
+}
+
+#[tokio::test]
+async fn generated_short_aliases_dispatch_the_same_identity_and_keep_legacy_callability() {
+    let canonical = ToolName::namespaced("a_very_long_namespace_identity", "an_operation_with_long_name");
+    let legacy = codex_code_mode_protocol::legacy_code_mode_identifier(&canonical);
+    let definition = codex_code_mode_protocol::augment_tool_definition(ToolDefinition {
+        name: legacy.clone(), tool_name: canonical.clone(), description: "Preserve operation restrictions.".into(),
+        namespace_description: None, kind: CodeModeToolKind::Function,
+        input_schema: None, output_schema: None, default_timeout_ms: None,
+    });
+    let source = format!("const legacy = {};{}", serde_json::to_string(&legacy).unwrap(), r#"
+        const metadata = ALL_TOOLS[0];
+        if (metadata.name.length > 38 || metadata.name === legacy) throw Error('verbose default alias');
+        const selected = resolve_tool(metadata.name);
+        if (selected !== tools[metadata.name] || selected !== tools[legacy] ||
+            selected !== resolve_tool('a_very_long_namespace_identity.an_operation_with_long_name')) throw Error('dispatch identity');
+        if (!metadata.description.includes('tools: { ' + metadata.name + '(')) throw Error('stale generated declaration');
+        text(await selected({checked:true}));
+    "#);
+    let (tx, _termination, mut rx) = start_with_tools(&source, vec![definition]).await;
+    let RuntimeEvent::ToolCall { id, name, input, .. } = next(&mut rx).await else { panic!("short alias dispatch") };
+    assert_eq!(name, canonical);
+    assert_eq!(input, Some(json!({"checked":true})));
+    tx.send(RuntimeCommand::ToolResponse { id, result: json!("same identity") }).unwrap();
+    assert_eq!(text(next(&mut rx).await), "same identity");
+    assert!(matches!(next(&mut rx).await, RuntimeEvent::Result { error_text: None, .. }));
+    closed(&mut rx).await;
+}
+
+#[tokio::test]
+async fn uncaught_graph_preflight_names_missing_capabilities() {
+    // The printed-error projection already lists these controls. The uncaught
+    // path must not reduce the preflight to its message alone.
+    let (_tx, _termination, mut rx) = start(
+        r#"
+        await run_graph([{id:"needs", requires:["missing_tool"], run:() => 1}]);
+    "#,
+    )
+    .await;
+    let RuntimeEvent::Result {
+        error_text: Some(error),
+        ..
+    } = next(&mut rx).await
+    else {
+        panic!("preflight failure");
+    };
+    let (_, json) = error
+        .split_once("\nHelper missing_capabilities:\n")
+        .expect("missing capability evidence");
+    let json = json.split_once("\nHelper ").map_or(json, |(head, _)| head);
+    let missing: JsonValue = serde_json::from_str(json).unwrap();
+    assert_eq!(missing, json!([{"node_id": "needs", "tool": "missing_tool"}]));
+    assert!(error.contains("\nHelper omitted_capabilities:\n0"), "{error}");
+    closed(&mut rx).await;
+
+    // Negative control: a failed node whose capability is present keeps its
+    // settled results and reports no capability section.
+    let (_tx, _termination, mut rx) = start(
+        r#"
+        await run_graph([{id:"failed", requires:["sample_tool"],
+          run:() => { throw new Error("node failure"); }}]);
+    "#,
+    )
+    .await;
+    let RuntimeEvent::Result {
+        error_text: Some(error),
+        ..
+    } = next(&mut rx).await
+    else {
+        panic!("node failure");
+    };
+    assert!(error.contains("\nHelper results:\n"), "{error}");
+    assert!(!error.contains("missing_capabilities"), "{error}");
+    closed(&mut rx).await;
+}
+
+#[tokio::test]
+async fn uncaught_missing_tool_call_names_resolution_candidates() {
+    let (_tx, _termination, mut rx) = start("await tools.sample({});").await;
+    let RuntimeEvent::Result {
+        error_text: Some(error),
+        ..
+    } = next(&mut rx).await
+    else {
+        panic!("missing tool call");
+    };
+    assert!(
+        error.starts_with("TypeError: tools.sample is not a function"),
+        "{error}"
+    );
+    let (_, hint) = error
+        .split_once("\nHint: no nested tool named `sample`")
+        .expect("repair hint");
+    assert!(hint.contains("sample_tool"), "{error}");
+    assert!(hint.contains("No tool was invoked"), "{error}");
+    closed(&mut rx).await;
+
+    // Negative control: an unrelated missing method is not a tool lookup.
+    let (_tx, _termination, mut rx) = start("const helper = {}; helper.sample();").await;
+    let RuntimeEvent::Result {
+        error_text: Some(error),
+        ..
+    } = next(&mut rx).await
+    else {
+        panic!("ordinary type error");
+    };
+    assert!(error.contains("is not a function"), "{error}");
+    assert!(!error.contains("Hint: no nested tool"), "{error}");
     closed(&mut rx).await;
 }

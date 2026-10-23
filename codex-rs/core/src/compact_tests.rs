@@ -2138,7 +2138,9 @@ fn generated_compaction_requires_structure_except_explicit_custom_handoffs() {
     assert!(validate_generated_compaction_summary(Some(&complete), "free-form update").is_err());
     assert!(validated_compaction_summary(None, "custom free-form checkpoint", true, true).is_ok());
     assert!(validated_compaction_summary(None, "", true, true).is_err());
-    assert!(validated_compaction_summary(None, &incomplete, true, true).is_err());
+    // Explicit custom prompts own their format, even when a heading overlaps
+    // the default schema. The default-format negative control above remains strict.
+    assert!(validated_compaction_summary(None, &incomplete, true, true).is_ok());
     assert!(
         validate_generated_compaction_summary(
             Some(&complete),
@@ -3016,7 +3018,15 @@ fn incremental_guidance_does_not_repeat_or_override_custom_compact_prompt() {
         text_elements: Vec::new(),
     }];
     select_compaction_input(&mut input, None, None, &sections);
-    assert!(matches!(&input[0], UserInput::Text { text, .. } if text == SUMMARIZATION_PROMPT));
+    assert!(matches!(&input[0], UserInput::Text { text, .. }
+        if text.starts_with(SUMMARIZATION_PROMPT)
+            && text.contains("First-request output budget")));
+    // Each compaction starts from fresh caller input, not the prior request's
+    // already-assembled first-checkpoint budget.
+    input = vec![UserInput::Text {
+        text: SUMMARIZATION_PROMPT.into(),
+        text_elements: Vec::new(),
+    }];
     select_compaction_input(&mut input, Some(&previous), None, &sections);
     assert_eq!(
         input.len(),
@@ -3728,6 +3738,68 @@ fn survivability_user_plan_and_pin_lookalikes_are_not_runtime_envelopes() {
 }
 
 #[test]
+fn compaction_drops_agents_md_line_diffs_with_the_body_they_apply_to() {
+    use crate::context::world_state::AgentsMdState;
+    use crate::context_manager::updates::merge_contextual_fragments;
+    let agents = |rule_40: &str| {
+        let body = (0..300)
+            .map(|index| match index {
+                40 => rule_40.to_string(),
+                _ => format!("Rule {index}: keep the documented owner for subsystem {index}."),
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut world = WorldState::default();
+        world.add_section(AgentsMdState::new(Some(
+            &crate::agents_md::LoadedAgentsMd::from_text_for_testing(body),
+        )));
+        world
+    };
+    let changed = agents("Rule 40: route owner changes through the registry.");
+    let (fragments, accepted) =
+        agents("Rule 40: keep the documented owner for subsystem 40.").render_full_with_snapshot();
+    let mut history = merge_contextual_fragments(fragments);
+    let request = user_message("Update the owner rule, then continue.");
+    history.push(request.clone());
+    // A mid-turn edit arrives as a line diff against the body above.
+    let (update, _) = changed.render_history_diff_with_snapshot(Some(&accepted), &history);
+    let update = merge_contextual_fragments(update);
+    let [ResponseItem::Message { content, .. }] = update.as_slice() else {
+        panic!("expected one update message: {update:?}");
+    };
+    let [ContentItem::InputText { text: diff }] = content.as_slice() else {
+        panic!("expected one line diff: {content:?}");
+    };
+    assert!(AgentsMdState::is_update_text(diff), "{diff}");
+    history.extend(update.clone());
+
+    // Compaction strips the body, so its diff goes too: behind the fresh
+    // initial context, the current body then needs no second copy.
+    let (checkpoint, ..) = build_local_task_input_checkpoint(&history);
+    let (initial, delivered) = changed.render_full_with_snapshot();
+    let replacement = insert_compaction_initial_context(
+        checkpoint.clone(),
+        merge_contextual_fragments(initial),
+        &InitialContextInjection::AtStart(Arc::new(WorldState::default())),
+    );
+    assert!(
+        changed
+            .render_history_diff(Some(&delivered), &replacement)
+            .is_empty(),
+        "a retained diff without its body forces a full resend"
+    );
+    assert_eq!(checkpoint, vec![request.clone()]);
+    assert_eq!(build_task_input_checkpoint(&history).0, vec![request]);
+
+    // The same text from the user is data.
+    let literal = user_message(diff);
+    assert_eq!(
+        task_compaction_items(std::slice::from_ref(&literal)),
+        vec![literal]
+    );
+}
+
+#[test]
 fn survivability_literal_markers_are_data_but_structural_truncation_is_rejected() {
     for literal in [
         "Preserve literal `[truncated]`.",
@@ -4255,4 +4327,104 @@ async fn ctxaudit_rejected_local_compaction_preserves_active_context() {
             prior.total_tokens + 2 * 91_000
         );
     }
+}
+
+#[test]
+fn audit146x_rejected_local_checkpoints_allow_model_and_format_fallback() {
+    use crate::compact_model_fallback::is_compaction_contract_violation;
+    use crate::compact_model_fallback::should_retry_with_current_model;
+    use crate::compact_model_fallback::should_retry_with_local_compaction;
+    let complete = format!(
+        "{GOAL_HEADING}\nfinish recovery\n\n{CURRENT_STATE_HEADING}\nimplementation present\n\n{COMPLETED_WORK_HEADING}\nproducer updated\n\n{UNRESOLVED_WORK_HEADING}\nkeep ambiguity\n\n{EVIDENCE_HEADING}\nfocused evidence\n\n{NEXT_ACTION_HEADING}\nrun focused proof"
+    );
+    // Summarizer-output rejections, produced by the real validators.
+    let rejected = [
+        validated_compaction_summary(None, " ", true, false).map(drop),
+        validate_generated_compaction_summary(None, "Done"),
+        validate_generated_compaction_summary(None, &format!("{complete}\n[truncated]")),
+        validate_generated_compaction_summary(None, &format!("{GOAL_HEADING}\nfinish recovery")),
+        validate_generated_compaction_summary(Some(&complete), &format!("{EVIDENCE_HEADING}\n")),
+        validated_rebased_compaction_summary(
+            &complete,
+            &format!("{EVIDENCE_HEADING}\nnew fact\n\n{NEXT_ACTION_HEADING}\nverify"),
+            &[3],
+        )
+        .map(drop),
+        validated_rebased_compaction_summary(
+            &complete,
+            &format!("{EVIDENCE_HEADING}\n{}", "overflow ".repeat(10_000)),
+            &[],
+        )
+        .map(drop),
+    ];
+    for result in rejected {
+        let Err(error) = result else {
+            panic!("malformed checkpoint output must be rejected");
+        };
+        assert!(is_compaction_contract_violation(&error), "{error}");
+        assert!(should_retry_with_current_model(&error), "{error}");
+        assert!(should_retry_with_local_compaction(&error), "{error}");
+    }
+    // Negative control: a valid checkpoint is accepted, so nothing falls back.
+    assert!(validate_generated_compaction_summary(None, &complete).is_ok());
+}
+
+fn audit150_measured_compaction_details() -> CompactionAnalyticsDetails {
+    // Remote compaction seeds the baseline from the local token measurement.
+    CompactionAnalyticsDetails {
+        active_context_tokens_before: Some(5_000),
+        ..Default::default()
+    }
+}
+
+#[test]
+fn audit150_compaction_receipt_replaces_measured_values_when_fully_reported() {
+    let mut details = audit150_measured_compaction_details();
+    details.record_compaction_receipt(&TokenUsage {
+        input_tokens: 4_200,
+        cached_input_tokens: 3_000,
+        output_tokens: 600,
+        reasoning_output_tokens: 0,
+        total_tokens: 4_800,
+        coverage: Some(codex_protocol::protocol::TokenUsageCoverage::fully_reported()),
+    });
+    assert_eq!(details.active_context_tokens_before, Some(4_200));
+    assert_eq!(details.compaction_summary_tokens, Some(600));
+    assert_eq!(details.cached_input_tokens, Some(3_000));
+}
+
+#[test]
+fn audit150_compaction_receipt_keeps_unreported_components_unknown() {
+    // The provider reported output and total but omitted input_tokens and
+    // input_tokens_details: parse_usage keeps numeric zeros with zero
+    // component coverage, which are unknown rather than measured zeros.
+    let partial = TokenUsage {
+        input_tokens: 0,
+        cached_input_tokens: 0,
+        output_tokens: 600,
+        reasoning_output_tokens: 0,
+        total_tokens: 600,
+        coverage: Some(codex_protocol::protocol::TokenUsageCoverage {
+            receipts: 1,
+            reported_receipts: Some(1),
+            output_tokens: 1,
+            total_tokens: 1,
+            ..Default::default()
+        }),
+    };
+    let mut details = audit150_measured_compaction_details();
+    details.record_compaction_receipt(&partial);
+    assert_eq!(details.active_context_tokens_before, Some(5_000));
+    assert_eq!(details.compaction_summary_tokens, Some(600));
+    assert_eq!(details.cached_input_tokens, None);
+
+    // A legacy receipt without coverage proves no component.
+    let mut legacy = audit150_measured_compaction_details();
+    legacy.record_compaction_receipt(&TokenUsage {
+        coverage: None,
+        ..partial
+    });
+    assert_eq!(legacy.active_context_tokens_before, Some(5_000));
+    assert_eq!(legacy.compaction_summary_tokens, None);
+    assert_eq!(legacy.cached_input_tokens, None);
 }

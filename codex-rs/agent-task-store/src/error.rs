@@ -86,4 +86,24 @@ pub enum StoreError {
     Json(#[from] serde_json::Error),
 }
 
+impl StoreError {
+    /// Availability classification, not permission to replay a committed mutation.
+    pub fn is_retryable(&self) -> bool {
+        match self {
+            Self::Sql(sqlx::Error::PoolTimedOut) => true,
+            Self::Sql(sqlx::Error::Database(error)) => error.code().is_some_and(|code| {
+                code.parse::<i32>()
+                    .is_ok_and(|code| matches!(code & 0xff, 5 | 6))
+            }),
+            Self::Io(error) => matches!(
+                error.kind(),
+                std::io::ErrorKind::Interrupted
+                    | std::io::ErrorKind::WouldBlock
+                    | std::io::ErrorKind::TimedOut
+            ),
+            _ => false,
+        }
+    }
+}
+
 pub type StoreResult<T> = Result<T, StoreError>;

@@ -232,6 +232,86 @@ fn unknown_and_empty_cycles_preserve_soft_advisory_accounting() {
 }
 
 #[test]
+fn delivered_agent_progress_ends_the_soft_no_progress_streak() {
+    // A coordinating parent's evidence is its children's progress. Novel
+    // deliveries and mailbox reports end the streak; empty waits, admission
+    // events and re-read events remain a no-progress loop.
+    let wait = ToolName::plain("wait_agent");
+    let arguments = payload(r#"{"timeout_ms":30000}"#);
+    let event = |event_id: &str, reason: &str| {
+        json!({"event_id": event_id, "assignment_id": "assignment-1", "reason": reason})
+    };
+    for nested in [false, true] {
+        let mut control = TurnExecutionControl::new();
+        let baselines = control.baselines(0);
+        let wait_generation = |control: &mut TurnExecutionControl, deltas: Vec<Value>| {
+            let collector = control.collector(&baselines);
+            let result = json!({
+                "message": "Wait completed.", "timed_out": false, "typed_deltas": deltas
+            });
+            if nested {
+                collector.record_code_mode_result(CodeModeToolResult {
+                    cell_id: "cell",
+                    tool_name: &wait,
+                    payload: &arguments,
+                    source_dependencies: None,
+                    outcome_context: ToolOutputOutcomeContext::new(ToolOutputOutcome::Success),
+                    signal: None,
+                    result: &result,
+                    canonical_artifact_required: false,
+                });
+            } else {
+                let call = collector.register_deterministic_tool_call(&wait, &arguments, "wait");
+                let output = response(&result.to_string());
+                collector.record_direct_wait_owner_result(true, &wait, &arguments, None, &output);
+                collector.record_response_result(
+                    call.ordinal,
+                    ToolOutputOutcomeContext::new(ToolOutputOutcome::Success),
+                    None,
+                    &output,
+                    false,
+                );
+            }
+            control.observe_progress(&baselines, &collector, &settled(0))
+        };
+        assert!(wait_generation(&mut control, Vec::new()).is_empty());
+        assert!(
+            wait_generation(
+                &mut control,
+                vec![event("event-1", "accepted"), event("event-2", "starting")],
+            )
+            .is_empty()
+        );
+        assert_eq!(control.continuations_without_progress, 2, "nested={nested}");
+        // Child progress is not the parent's own source evidence.
+        assert!(wait_generation(&mut control, vec![event("event-3", "tool_call")]).is_empty());
+        assert_eq!(control.continuations_without_progress, 0, "nested={nested}");
+        // An explicit-cursor re-read returns the same event: nothing new.
+        wait_generation(&mut control, vec![event("event-3", "tool_call")]);
+        assert_eq!(control.continuations_without_progress, 1, "nested={nested}");
+        // A child's report or final answer delivered through the mailbox.
+        control.accepted_context_input(false);
+        assert_eq!(control.continuations_without_progress, 0, "nested={nested}");
+        for _ in 0..SOFT_CONVERGENCE_NO_PROGRESS_GENERATIONS - 1 {
+            wait_generation(&mut control, Vec::new());
+        }
+        assert!(control.take_soft_convergence_directive(true).is_none());
+        wait_generation(&mut control, Vec::new());
+        assert_eq!(
+            control.take_soft_convergence_directive(true).as_deref(),
+            Some(SOFT_CONVERGENCE_DIRECTIVE),
+            "nested={nested}"
+        );
+        // Reports end a streak but only new instructions re-arm the intervention.
+        control.accepted_context_input(false);
+        for _ in 0..SOFT_CONVERGENCE_NO_PROGRESS_GENERATIONS {
+            wait_generation(&mut control, Vec::new());
+        }
+        assert!(control.take_soft_convergence_directive(true).is_none());
+    }
+}
+
+#[test]
 fn alternating_cycles_converge_but_new_evidence_and_state_do_not() {
     let mut control = TurnExecutionControl::new();
     let baselines = control.baselines(0);

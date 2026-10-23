@@ -65,6 +65,7 @@ pub(crate) fn set_deterministic_process_ids_for_tests(enabled: bool) {
 
 pub(crate) use errors::UnifiedExecError;
 pub(crate) use process::NoopSpawnLifecycle;
+pub(crate) use process::ObservedSpawnLifecycle;
 pub(crate) use process::ProcessOutputSnapshot;
 pub(crate) use process::UnifiedExecProcess;
 pub(crate) use process_manager::NESTED_POLL_MARGIN;
@@ -88,6 +89,7 @@ pub(crate) struct UnifiedExecContext {
     pub call_id: String,
     pub tracker: Option<SharedTurnDiffTracker>,
     pub source: ToolCallSource,
+    pub env_overrides: std::collections::HashMap<String, String>,
 }
 
 impl UnifiedExecContext {
@@ -99,6 +101,7 @@ impl UnifiedExecContext {
             call_id,
             tracker: None,
             source: ToolCallSource::Direct,
+            env_overrides: Default::default(),
         }
     }
 
@@ -115,7 +118,29 @@ impl UnifiedExecContext {
             call_id,
             tracker: Some(tracker),
             source,
+            env_overrides: Default::default(),
         }
+    }
+
+    pub(crate) fn apply_env_overrides(&self, env: &mut std::collections::HashMap<String, String>) {
+        for (key, value) in &self.env_overrides {
+            if cfg!(windows) {
+                env.retain(|existing, _| !existing.eq_ignore_ascii_case(key));
+            }
+            env.insert(key.clone(), value.clone());
+        }
+    }
+
+    pub(crate) fn explicit_env_overrides(&self) -> std::collections::HashMap<String, String> {
+        let mut env = self
+            .turn
+            .config
+            .permissions
+            .shell_environment_policy
+            .r#set
+            .clone();
+        self.apply_env_overrides(&mut env);
+        env
     }
 }
 

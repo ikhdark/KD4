@@ -39,7 +39,7 @@ pub(super) fn install_globals(scope: &mut v8::PinScope<'_, '_>) -> Result<(), St
         .map(|state| Arc::clone(&state.enabled_tools))
         .unwrap_or_default();
     let tools = build_tools_object(scope, &enabled_tools.tools)?;
-    let all_tool_names = build_all_tool_names_value(scope, &enabled_tools.tools)?;
+    let all_tool_names = build_all_tool_names_value(scope, &enabled_tools)?;
     let resolve_tool = helper_function(scope, "resolve_tool", resolve_tool_callback)?;
     let clear_timeout = helper_function(scope, "clearTimeout", clear_timeout_callback)?;
     let set_timeout = helper_function(scope, "setTimeout", set_timeout_callback)?;
@@ -87,8 +87,19 @@ pub(super) fn install_globals(scope: &mut v8::PinScope<'_, '_>) -> Result<(), St
     set_global(scope, global, "notify", notify.into())?;
     set_global(scope, global, "yield_control", yield_control.into())?;
     set_global(scope, global, "exit", exit.into())?;
+    let monotonic_now = helper_function(
+        scope,
+        "__codex_monotonic_now",
+        super::callbacks::monotonic_now_callback,
+    )?;
+    set_global(scope, global, "__codex_monotonic_now", monotonic_now.into())?;
     install_tool_aliases(scope, global, &enabled_tools)?;
     install_console_shim(scope, global)?;
+    let text_encoding = v8::String::new(scope, include_str!("text_encoding.js"))
+        .ok_or_else(|| "failed to allocate text encoding helpers".to_string())?;
+    v8::Script::compile(scope, text_encoding, None)
+        .and_then(|script| script.run(scope))
+        .ok_or_else(|| "failed to install text encoding helpers".to_string())?;
     let graph_source = v8::String::new(scope, include_str!("dependency_graph.js"))
         .ok_or_else(|| "failed to allocate dependency graph helper".to_string())?;
     v8::Script::compile(scope, graph_source, None)
@@ -170,11 +181,12 @@ fn missing_exec_alias_callback(
 
 fn build_all_tool_names_value<'s>(
     scope: &mut v8::PinScope<'s, '_>,
-    enabled_tools: &[EnabledToolMetadata],
+    catalog: &super::EnabledToolCatalog,
 ) -> Result<v8::Local<'s, v8::Value>, String> {
+    let enabled_tools = &catalog.tools;
     let array = v8::Array::new(scope, enabled_tools.len() as i32);
-    for (index, tool) in enabled_tools.iter().enumerate() {
-        let name = v8::String::new(scope, &tool.global_name)
+    for index in 0..enabled_tools.len() {
+        let name = v8::String::new(scope, catalog.presentation_name(index))
             .ok_or_else(|| "failed to allocate ALL_TOOL_NAMES name".to_string())?;
         if array.set_index(scope, index as u32, name.into()) != Some(true) {
             return Err("failed to append ALL_TOOL_NAMES name".to_string());
@@ -243,6 +255,15 @@ fn build_tools_object<'s>(
             .ok_or_else(|| "failed to allocate tool name".to_string())?;
         let function = tool_function(scope, tool_index)?;
         tools.create_data_property(scope, name.into(), function.into());
+        let presentation = scope.get_slot::<RuntimeState>()
+            .map(|state| state.enabled_tools.presentation_name(tool_index).to_owned());
+        if let Some(presentation) = presentation
+            && !presentation.contains('.') && presentation != tool.global_name
+        {
+            let alias = v8::String::new(scope, &presentation)
+                .ok_or_else(|| "failed to allocate short tool alias".to_string())?;
+            tools.create_data_property(scope, alias.into(), function.into());
+        }
     }
     // Canonical identifiers carry collision-resistant suffixes. Namespace
     // access must use registered identity, not reverse-engineer that suffix.
@@ -319,7 +340,7 @@ fn all_tools_callback(
         .get_slot::<RuntimeState>()
         .map(|state| Arc::clone(&state.enabled_tools))
         .unwrap_or_default();
-    match build_all_tools_value(scope, &enabled_tools.tools) {
+    match build_all_tools_value(scope, &enabled_tools) {
         Ok(value) => retval.set(value),
         Err(error) => throw_type_error(scope, &error),
     }
@@ -341,19 +362,43 @@ fn shared_description<'s>(
 
 fn build_all_tools_value<'s>(
     scope: &mut v8::PinScope<'s, '_>,
-    enabled_tools: &[EnabledToolMetadata],
+    catalog: &super::EnabledToolCatalog,
 ) -> Result<v8::Local<'s, v8::Value>, String> {
+    let enabled_tools = &catalog.tools;
     let array = v8::Array::new(scope, enabled_tools.len() as i32);
     let name_key = v8::String::new(scope, "name")
         .ok_or_else(|| "failed to allocate ALL_TOOLS name key".to_string())?;
     let description_key = v8::String::new(scope, "description")
         .ok_or_else(|| "failed to allocate ALL_TOOLS description key".to_string())?;
+    let guidance_key = v8::String::new(scope, "namespace_instructions")
+        .ok_or_else(|| "failed to allocate namespace instructions key".to_string())?;
+    let guidance_ref_key = v8::String::new(scope, "namespace_instructions_ref")
+        .ok_or_else(|| "failed to allocate namespace instructions reference key".to_string())?;
+    let mut first_guidance = std::collections::BTreeMap::new();
 
     for (index, tool) in enabled_tools.iter().enumerate() {
         let item = v8::Object::new(scope);
-        let name = v8::String::new(scope, &tool.global_name)
+        let name = v8::String::new(scope, catalog.presentation_name(index))
             .ok_or_else(|| "failed to allocate ALL_TOOLS name".to_string())?;
-        let description = shared_description(scope, &tool.description)?;
+        // This boundary is explicit producer metadata, never inferred shared
+        // prose. Full callable metadata and resolve_tool remain self-contained.
+        let guidance = tool.namespace_description.as_deref().map(str::trim).filter(|text| !text.is_empty());
+        let local = guidance.and_then(|guidance| tool.description.strip_prefix(guidance))
+            .and_then(|rest| rest.strip_prefix("\n\n")).unwrap_or(&tool.description);
+        let description = shared_description(scope, local)?;
+        if let Some(guidance) = guidance {
+            let first = *first_guidance.entry((tool.tool_name.namespace.as_deref(), guidance)).or_insert(index);
+            let reference = shared_description(scope, catalog.presentation_name(first))?;
+            if item.set(scope, guidance_ref_key.into(), reference.into()) != Some(true) {
+                return Err("failed to set namespace instructions reference".into());
+            }
+            if first == index {
+                let instructions = shared_description(scope, guidance)?;
+                if item.set(scope, guidance_key.into(), instructions.into()) != Some(true) {
+                    return Err("failed to set namespace instructions".into());
+                }
+            }
+        }
 
         if item.set(scope, name_key.into(), name.into()) != Some(true) {
             return Err("failed to set ALL_TOOLS name".to_string());
@@ -417,7 +462,7 @@ fn tool_function<'s>(
         .get_function(scope)
         .ok_or_else(|| "failed to create tool function".to_string())?;
     let metadata = v8::Object::new(scope);
-    let name = v8::String::new(scope, &tool.global_name)
+    let name = v8::String::new(scope, enabled_tools.presentation_name(tool_index))
         .ok_or_else(|| "failed to allocate tool name".to_string())?;
     function.set_name(name);
     set_global(scope, metadata, "name", name.into())?;

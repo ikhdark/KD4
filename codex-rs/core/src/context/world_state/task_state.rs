@@ -17,6 +17,32 @@ pub(crate) struct TaskStateSnapshot {
     state: Value,
 }
 
+fn task_state_hash(state: &Value) -> String {
+    use sha2::Digest;
+    hex::encode(sha2::Sha256::digest(state.to_string().as_bytes()))
+}
+
+/// RFC 7396 object delta. Arrays/changed leaves are replaced, removed keys are
+/// null, and unchanged evidence entries never repeat in append-only history.
+fn task_state_patch(previous: &Value, current: &Value) -> Value {
+    match (previous.as_object(), current.as_object()) {
+        (Some(previous), Some(current)) => {
+            let mut patch = serde_json::Map::new();
+            for (key, value) in current {
+                if previous.get(key) != Some(value) {
+                    patch.insert(key.clone(), previous.get(key).map_or_else(
+                        || value.clone(), |old| task_state_patch(old, value)));
+                }
+            }
+            for key in previous.keys().filter(|key| !current.contains_key(*key)) {
+                patch.insert(key.clone(), Value::Null);
+            }
+            Value::Object(patch)
+        }
+        _ => current.clone(),
+    }
+}
+
 impl TaskState {
     #[cfg(test)]
     pub(crate) fn new(plan: Option<(UpdatePlanArgs, PlanLineage)>) -> Self {
@@ -131,6 +157,20 @@ impl WorldStateSection for TaskState {
     ) -> Option<Box<dyn ContextualUserFragment>> {
         match previous {
             PreviousSectionState::Known(previous) if previous.state == *self.0 => None,
+            PreviousSectionState::Known(previous) => {
+                let delta = serde_json::json!({
+                    "projection_version": 1,
+                    "projection_kind": "delta",
+                    "base_sha256": task_state_hash(&previous.state),
+                    "state_sha256": task_state_hash(&self.0),
+                    "patch": task_state_patch(&previous.state, &self.0),
+                });
+                if delta.to_string().len() < self.0.to_string().len() {
+                    Some(Box::new(Self(std::sync::Arc::new(delta))))
+                } else {
+                    Some(Box::new(self.clone()))
+                }
+            }
             PreviousSectionState::Absent if self.0["has_plan"] == false => None,
             _ => Some(Box::new(self.clone())),
         }
@@ -151,12 +191,21 @@ impl ContextualUserFragment for TaskState {
     }
 
     fn body(&self) -> std::borrow::Cow<'_, str> {
+        if self.0["projection_kind"] == "delta" {
+            let mut body = "\nTask-state delta v1; apply the RFC 7396 merge patch only to the retained full state identified by base_sha256. Null removes a field; omitted fields remain unchanged. state_sha256 identifies the resulting state. If the baseline is unavailable, recover current owner state with update_plan rather than guessing. This is not completion evidence.\n".to_string();
+            push_xml_escaped_text(&mut body, &self.0.to_string());
+            body.push('\n');
+            return body.into();
+        }
         let mut body = "\nCurrent stored task state; replaces earlier task-state snapshots. This is a checklist and obligation ledger, not proof of completion or permission to narrow the user's request.".to_string();
         if self.0["execution_suspended"] == true {
             body.push_str(" execution_suspended is true: this is retained implementation state, not debt of the current planning deliverable; do not repair or complete it in Plan Mode.");
         }
         body.push('\n');
-        push_xml_escaped_text(&mut body, &self.0.to_string());
+        let mut full = (*self.0).clone();
+        full["projection_version"] = 1.into();
+        full["state_sha256"] = task_state_hash(&self.0).into();
+        push_xml_escaped_text(&mut body, &full.to_string());
         body.push('\n');
         body.into()
     }
@@ -307,5 +356,61 @@ mod tests {
                 .render_diff(PreviousSectionState::Absent)
                 .is_none()
         );
+    }
+}
+#[cfg(test)]
+mod audit150_delta_tests {
+    use super::*;
+    fn merge(target: &mut Value, patch: &Value) {
+        if let Value::Object(fields) = patch {
+            if !target.is_object() { *target = serde_json::json!({}); }
+            for (key, value) in fields {
+                if value.is_null() { target.as_object_mut().unwrap().remove(key); }
+                else { merge(&mut target[key], value); }
+            }
+        } else { *target = patch.clone(); }
+    }
+
+    #[test]
+    fn growing_evidence_reconstructs_owner_state_with_linear_delivery() {
+        let mut current = TaskState(std::sync::Arc::new(serde_json::json!({
+            "has_plan": true, "revision": "plan", "scope_input_revision": "input",
+            "acceptance_evidence": {"turn_id":"turn", "mutation_revision":1, "observations":{}}
+        })));
+        let mut reconstructed = (*current.0).clone();
+        let mut bytes = 0;
+        for index in 0..100 {
+            let previous = current.snapshot();
+            std::sync::Arc::make_mut(&mut current.0)["acceptance_evidence"]["observations"][format!("source:{index}")] =
+                serde_json::json!({"kind":"inspection","environment_id":"local",
+                    "path":format!("/repo/module_{index}.rs"),"ranges":[[0,100]]});
+            let fragment = current.render_diff(PreviousSectionState::Known(&previous)).unwrap();
+            let body = fragment.body();
+            bytes += body.len();
+            let value: Value = serde_json::from_str(body.lines().find(|line| line.starts_with('{')).unwrap()).unwrap();
+            if value["projection_kind"] == "delta" {
+                assert_eq!(value["base_sha256"], task_state_hash(&reconstructed));
+                merge(&mut reconstructed, &value["patch"]);
+            } else {
+                reconstructed = value;
+                reconstructed.as_object_mut().unwrap().remove("projection_version");
+                reconstructed.as_object_mut().unwrap().remove("state_sha256");
+            }
+            assert_eq!(reconstructed, *current.0);
+            assert!(current.render_diff(PreviousSectionState::Known(&current.snapshot())).is_none());
+            if index == 33 || index == 66 {
+                // A reset/unknown delivered baseline reconstructs a complete snapshot.
+                let full = current.render_diff(PreviousSectionState::Unknown).unwrap();
+                assert!(!full.body().contains("\"projection_kind\":\"delta\""));
+                assert!(full.body().contains("source:0"));
+            }
+        }
+        assert!(bytes < 150_000, "{bytes} bytes for 100 one-receipt updates");
+        let old = current.snapshot();
+        std::sync::Arc::make_mut(&mut current.0).as_object_mut().unwrap().remove("acceptance_evidence");
+        let patch = task_state_patch(&old.state, &current.0);
+        merge(&mut reconstructed, &patch);
+        // Explicit invalidation removes old evidence, never leaves stale observations.
+        assert!(reconstructed.get("acceptance_evidence").is_none());
     }
 }

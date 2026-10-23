@@ -339,6 +339,8 @@ pub struct ModelAttemptTelemetry {
     pub relevant_state_fingerprint: Option<String>,
     pub sampling_request_id: String,
     pub attempt_id: String,
+    /// Transport/auth retry ordinal only. Outer sampling recovery is a separate
+    /// episode, not a continuation inferred from this counter.
     pub retry_index: u32,
     pub retry_reason: ModelAttemptRetryReason,
     pub outcome: ModelAttemptOutcome,
@@ -384,14 +386,27 @@ pub struct ModelAttemptTelemetry {
     pub local_reused_bytes: u64,
     pub local_component_reuse_count: u64,
     pub request_construction_us: u64,
+    /// Admission before dispatch: the turn's sampling gate plus its pre-dispatch
+    /// persistence and rollout flush, and any WebSocket dispatch-queue wait. Not
+    /// pure queueing; turn timing attributes the persistence share separately.
     pub queue_us: u64,
+    /// Includes failed safe pre-dispatch HTTP tries and their retry backoff.
     pub connection_setup_us: u64,
+    /// `connection_setup_us` plus dispatch-ready to `stream_established_us`; inherits
+    /// that boundary's transport-specific meaning.
     pub transport_us: Option<u64>,
+    /// The try that actually dispatched; earlier failed safe tries are setup.
     pub dispatch_ready_us: Option<u64>,
+    /// HTTP: response headers received, so it includes the provider's acceptance
+    /// round trip. WebSocket: request frame written; that round trip lands before
+    /// `first_provider_event_us`. Never later than the first provider event.
     pub stream_established_us: Option<u64>,
+    /// First decoded transport body event, not HTTP response headers.
     pub first_provider_event_us: Option<u64>,
     pub first_model_output_us: Option<u64>,
     pub first_actionable_output_us: Option<u64>,
+    /// Pre-filter arrival at the internal response queue. Actual post-filter
+    /// publication is recorded by codex.model_output_published; neither is UI rendering.
     pub first_visible_output_us: Option<u64>,
     pub completed_us: u64,
 }
@@ -606,13 +621,14 @@ impl SessionTelemetry {
         );
     }
 
-    /// Records time to first token as both a metric and a production telemetry event.
+    /// v2: first nonempty decoded model content, not a header or publication.
     pub fn record_turn_ttft(&self, duration: Duration) {
-        self.record_duration(TURN_TTFT_DURATION_METRIC, duration, &[]);
+        self.record_duration(TURN_TTFT_DURATION_METRIC, duration, &[("semantics", "decoded_content_v2")]);
         log_and_trace_event!(
             self,
             common: {
                 event.name = "codex.turn_ttft",
+                semantics_version = 2_u64,
                 duration_ms = %duration.as_millis(),
             },
             log: {},
@@ -713,7 +729,9 @@ impl SessionTelemetry {
         }
     }
 
-    /// Collect a runtime metrics summary if debug snapshots are available.
+    /// Collect unlabeled observation sums, not wall time. `Some(empty)` is a
+    /// successfully collected zero-activity interval; `None` is unavailable.
+    /// Use `snapshot_metrics` for dimensions, lifecycle phases and turn e2e.
     pub fn runtime_metrics_summary(&self) -> Option<RuntimeMetricsSummary> {
         let snapshot = match self.snapshot_metrics() {
             Ok(snapshot) => snapshot,
@@ -721,12 +739,17 @@ impl SessionTelemetry {
                 return None;
             }
         };
+        Some(RuntimeMetricsSummary::from_snapshot(&snapshot))
+    }
+
+    /// One collection interval in two views. The snapshot preserves metric
+    /// names, scopes and attribute points (including lifecycle and e2e), while
+    /// the compact observation sums intentionally discard those dimensions.
+    /// Errors remain explicit instead of looking like a zero-activity interval.
+    pub fn runtime_metrics_diagnostics(&self) -> MetricsResult<(RuntimeMetricsSummary, ResourceMetrics)> {
+        let snapshot = self.snapshot_metrics()?;
         let summary = RuntimeMetricsSummary::from_snapshot(&snapshot);
-        if summary.is_empty() {
-            None
-        } else {
-            Some(summary)
-        }
+        Ok((summary, snapshot))
     }
 
     fn tags_with_metadata<'a>(
@@ -813,18 +836,13 @@ impl SessionTelemetry {
                 token_usage: Some(token_usage),
                 ..
             } => {
-                handle_responses_span.record("gen_ai.usage.input_tokens", token_usage.input_tokens);
-                handle_responses_span.record(
-                    "gen_ai.usage.cache_read.input_tokens",
-                    token_usage.cached_input(),
-                );
-                handle_responses_span
-                    .record("gen_ai.usage.output_tokens", token_usage.output_tokens);
-                handle_responses_span.record(
-                    "codex.usage.reasoning_output_tokens",
-                    token_usage.reasoning_output_tokens,
-                );
-                handle_responses_span.record("codex.usage.total_tokens", token_usage.total_tokens);
+                for (field, value) in completed_usage_span_fields(token_usage) {
+                    // An unreported receipt component stays Empty (unknown),
+                    // never a measured zero such as a 0% cache hit.
+                    if let Some(value) = value {
+                        handle_responses_span.record(field, value);
+                    }
+                }
             }
             _ => {}
         }
@@ -1433,6 +1451,7 @@ impl SessionTelemetry {
                 reasoning_token_count = reasoning_token_count,
                 tool_token_count = %tool_token_count,
                 ttft_ms = ttft_ms,
+                ttft_semantics = "decoded_content_v2",
                 service_tier = self.metadata.service_tier.as_deref(),
                 model_reasoning_effort = self.metadata.model_reasoning_effort.as_deref(),
             },
@@ -1705,6 +1724,17 @@ impl SessionTelemetry {
                 duration,
                 &tags,
             );
+            // An attempted tool whose future was dropped has no result payload.
+            // Give that metric observation its own matching terminal event
+            // rather than manufacturing an ordinary successful/failed result.
+            trace_event!(self,
+                event.name = "codex.tool_abandoned",
+                tool_name = %tool_name,
+                call_id = %call_id,
+                outcome = "abandoned",
+                duration_ms = %duration.as_millis(),
+                result_available = false,
+            );
         });
         let result = f().await;
         let duration = observation.finish();
@@ -1747,6 +1777,8 @@ impl SessionTelemetry {
             duration_ms = %Duration::ZERO.as_millis(),
             success = %false,
             output_length = error.len() as i64,
+            output_utf8_bytes = error.len() as i64,
+            length_unit = "utf8_bytes",
             output_line_count = output_line_count,
             mcp_server = "",
             mcp_server_origin = "",
@@ -1758,6 +1790,8 @@ impl SessionTelemetry {
             duration_ms = %Duration::ZERO.as_millis(),
             success = %false,
             output_length = error.len() as i64,
+            output_utf8_bytes = error.len() as i64,
+            length_unit = "utf8_bytes",
             output_line_count = output_line_count,
             tool_origin = %"builtin",
         );
@@ -1793,6 +1827,8 @@ impl SessionTelemetry {
             success = %success_str,
             arguments_length = arguments.len() as i64,
             output_length = output.len() as i64,
+            output_utf8_bytes = output.len() as i64,
+            length_unit = "utf8_bytes",
             output_line_count = output_line_count,
             mcp_server = %mcp_server,
             mcp_server_origin = %mcp_server_origin,
@@ -1806,6 +1842,8 @@ impl SessionTelemetry {
             success = %success_str,
             arguments_length = arguments.len() as i64,
             output_length = output.len() as i64,
+            output_utf8_bytes = output.len() as i64,
+            length_unit = "utf8_bytes",
             output_line_count = output_line_count,
             tool_origin = if mcp_server.is_empty() { "builtin" } else { "mcp" },
             mcp_tool = !mcp_server.is_empty(),
@@ -1975,6 +2013,164 @@ fn duration_from_ms_value(value: Option<&serde_json::Value>) -> Option<Duration>
     // Keep fractional milliseconds; the runtime summary rounds only after summing a window.
     let clamped = ms.min(u64::MAX as f64);
     Some(Duration::from_secs_f64(clamped / 1000.0))
+}
+
+/// `handle_responses` span attributes for a completed response. Only receipt
+/// components the provider reported are known; `None` leaves the span field
+/// unrecorded, matching the attempt event and turn metrics.
+fn completed_usage_span_fields(
+    token_usage: &codex_protocol::protocol::TokenUsage,
+) -> [(&'static str, Option<i64>); 5] {
+    [
+        ("gen_ai.usage.input_tokens", token_usage.known_input()),
+        (
+            "gen_ai.usage.cache_read.input_tokens",
+            token_usage.known_cached_input(),
+        ),
+        ("gen_ai.usage.output_tokens", token_usage.known_output()),
+        (
+            "codex.usage.reasoning_output_tokens",
+            token_usage.known_reasoning_output(),
+        ),
+        ("codex.usage.total_tokens", token_usage.known_total()),
+    ]
+}
+
+#[cfg(test)]
+mod completed_usage_span_tests {
+    use super::*;
+    use codex_protocol::protocol::TokenUsage;
+    use codex_protocol::protocol::TokenUsageCoverage;
+    use std::collections::BTreeMap;
+    use std::sync::Arc;
+    use std::sync::Mutex;
+    use tracing::field::Field;
+    use tracing::field::Visit;
+    use tracing_subscriber::layer::Context;
+    use tracing_subscriber::layer::SubscriberExt;
+
+    /// Captures integer values recorded onto spans after creation.
+    #[derive(Clone, Default)]
+    struct RecordedFields(Arc<Mutex<BTreeMap<String, i64>>>);
+
+    impl Visit for RecordedFields {
+        fn record_i64(&mut self, field: &Field, value: i64) {
+            self.0
+                .lock()
+                .unwrap()
+                .insert(field.name().to_string(), value);
+        }
+
+        fn record_debug(&mut self, _field: &Field, _value: &dyn std::fmt::Debug) {}
+    }
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for RecordedFields {
+        fn on_record(
+            &self,
+            _span: &tracing::span::Id,
+            values: &tracing::span::Record<'_>,
+            _ctx: Context<'_, S>,
+        ) {
+            values.record(&mut self.clone());
+        }
+    }
+
+    fn telemetry() -> SessionTelemetry {
+        SessionTelemetry::new(
+            ThreadId::new(),
+            "test-model",
+            "test-model",
+            None,
+            None,
+            None,
+            "test".to_string(),
+            false,
+            "test".to_string(),
+            SessionSource::Cli,
+        )
+    }
+
+    /// Runs the real `record_responses` path against a span declaring the same
+    /// usage fields as the sampling loop's `handle_responses` span.
+    fn record_completed(token_usage: TokenUsage) -> BTreeMap<String, i64> {
+        let recorded = RecordedFields::default();
+        let subscriber = tracing_subscriber::registry().with(recorded.clone());
+        let telemetry = telemetry();
+        tracing::subscriber::with_default(subscriber, || {
+            let span = tracing::info_span!(
+                "handle_responses",
+                otel.name = tracing::field::Empty,
+                gen_ai.usage.input_tokens = tracing::field::Empty,
+                gen_ai.usage.cache_read.input_tokens = tracing::field::Empty,
+                gen_ai.usage.output_tokens = tracing::field::Empty,
+                codex.usage.reasoning_output_tokens = tracing::field::Empty,
+                codex.usage.total_tokens = tracing::field::Empty,
+            );
+            telemetry.record_responses(
+                &span,
+                &ResponseEvent::Completed {
+                    response_id: "resp-1".to_string(),
+                    token_usage: Some(token_usage),
+                    end_turn: Some(true),
+                },
+            );
+        });
+        recorded.0.lock().unwrap().clone()
+    }
+
+    fn receipt(coverage: Option<TokenUsageCoverage>) -> TokenUsage {
+        TokenUsage {
+            input_tokens: 1_000,
+            cached_input_tokens: 0,
+            output_tokens: 100,
+            reasoning_output_tokens: 0,
+            total_tokens: 1_100,
+            coverage,
+        }
+    }
+
+    #[test]
+    fn fully_reported_receipt_records_every_usage_field() {
+        let mut usage = receipt(Some(TokenUsageCoverage::fully_reported()));
+        usage.cached_input_tokens = 800;
+        usage.reasoning_output_tokens = 40;
+        let recorded = record_completed(usage);
+        assert_eq!(
+            recorded,
+            BTreeMap::from([
+                ("codex.usage.reasoning_output_tokens".to_string(), 40),
+                ("codex.usage.total_tokens".to_string(), 1_100),
+                ("gen_ai.usage.cache_read.input_tokens".to_string(), 800),
+                ("gen_ai.usage.input_tokens".to_string(), 1_000),
+                ("gen_ai.usage.output_tokens".to_string(), 100),
+            ])
+        );
+    }
+
+    #[test]
+    fn unreported_cache_and_reasoning_details_stay_unrecorded() {
+        // The provider omitted input/output token details: parse_usage keeps
+        // numeric zeros with zero component coverage, which means unknown.
+        let usage = receipt(Some(TokenUsageCoverage {
+            receipts: 1,
+            reported_receipts: Some(1),
+            input_tokens: 1,
+            output_tokens: 1,
+            total_tokens: 1,
+            ..Default::default()
+        }));
+        let recorded = record_completed(usage);
+        assert_eq!(recorded.get("gen_ai.usage.input_tokens"), Some(&1_000));
+        assert_eq!(recorded.get("gen_ai.usage.output_tokens"), Some(&100));
+        assert_eq!(recorded.get("codex.usage.total_tokens"), Some(&1_100));
+        assert_eq!(recorded.get("gen_ai.usage.cache_read.input_tokens"), None);
+        assert_eq!(recorded.get("codex.usage.reasoning_output_tokens"), None);
+    }
+
+    #[test]
+    fn legacy_receipt_without_coverage_records_no_usage() {
+        assert_eq!(record_completed(receipt(None)), BTreeMap::new());
+    }
 }
 
 #[cfg(test)]

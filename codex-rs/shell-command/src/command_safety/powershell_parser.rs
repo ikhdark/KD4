@@ -45,6 +45,70 @@ const POWERSHELL_PARSER_RESPONSE_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_CACHED_SYNTAX_BYTES: usize = 64 * 1024;
 const MAX_CACHED_SYNTAX_ENTRIES: usize = 32;
 
+/// Invocation-local syntax evidence. Never use this to cache executable
+/// resolution: cwd, PATH, PATHEXT and filesystem state remain live inputs.
+#[derive(Clone, Default)]
+pub struct PowershellAnalysisScope {
+    entries: Arc<Mutex<HashMap<(String, String), Arc<ScopedSyntax>>>>,
+}
+
+struct ScopedSyntax {
+    deadline: Instant,
+    outcome: std::sync::OnceLock<PowershellParseOutcome>,
+    unavailable: std::sync::atomic::AtomicBool,
+}
+
+tokio::task_local! {
+    static ACTIVE_ANALYSIS: PowershellAnalysisScope;
+}
+thread_local! {
+    static BLOCKING_ANALYSIS: std::cell::RefCell<Option<PowershellAnalysisScope>> = const { std::cell::RefCell::new(None) };
+}
+
+impl PowershellAnalysisScope {
+    pub fn current() -> Option<Self> {
+        ACTIVE_ANALYSIS.try_with(Clone::clone).ok()
+            .or_else(|| BLOCKING_ANALYSIS.with(|slot| slot.borrow().clone()))
+    }
+
+    pub async fn scope<F: std::future::Future>(self, future: F) -> F::Output {
+        ACTIVE_ANALYSIS.scope(self, future).await
+    }
+
+    pub fn scope_sync<T>(context: Option<Self>, operation: impl FnOnce() -> T) -> T {
+        struct Restore(Option<PowershellAnalysisScope>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                BLOCKING_ANALYSIS.with(|slot| slot.replace(self.0.take()));
+            }
+        }
+        let _restore = Restore(BLOCKING_ANALYSIS.with(|slot| slot.replace(context)));
+        operation()
+    }
+
+    fn syntax_for(
+        &self, executable: &str, script: &str,
+        parse: impl FnOnce(Instant) -> PowershellParseOutcome,
+    ) -> Option<(Arc<ScopedSyntax>, PowershellParseOutcome)> {
+        let key = (executable.to_owned(), script.to_owned());
+        let entry = {
+            let mut entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
+            if !entries.contains_key(&key) && entries.len() >= MAX_CACHED_SYNTAX_ENTRIES {
+                return None; // Fail closed instead of evicting a failure and retrying it.
+            }
+            Arc::clone(entries.entry(key).or_insert_with(|| Arc::new(ScopedSyntax {
+                deadline: Instant::now() + POWERSHELL_PARSER_RESPONSE_TIMEOUT,
+                outcome: std::sync::OnceLock::new(),
+                unavailable: std::sync::atomic::AtomicBool::new(false),
+            })))
+        };
+        // No map lock is held while the one parser owner runs. Other workers
+        // wait for that bounded request rather than starting spare hosts.
+        let outcome = entry.outcome.get_or_init(|| parse(entry.deadline)).clone();
+        Some((entry, outcome))
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 enum PowershellFlavor {
     WindowsPowerShell,
@@ -225,7 +289,36 @@ fn parse_with_powershell_ast_request(
     script: &str,
     resolution: Option<&PowershellResolutionState>,
 ) -> PowershellParseOutcome {
+    if let Some(scope) = PowershellAnalysisScope::current() {
+        let Some((entry, syntax)) = scope.syntax_for(executable, script, |deadline| {
+            parse_with_powershell_ast_before(executable, script, None, deadline)
+        }) else { return PowershellParseOutcome::Failed; };
+        if entry.unavailable.load(std::sync::atomic::Ordering::Acquire) {
+            return PowershellParseOutcome::Failed;
+        }
+        // Non-candidates need no live resolution; never reuse a resolved
+        // application from another caller's cwd or environment.
+        if resolution.is_none() || !matches!(&syntax,
+            PowershellParseOutcome::Analysis(PowershellParseAnalysis { direct_argv: Some(_), .. }))
+        {
+            return syntax;
+        }
+        let resolved = parse_with_powershell_ast_before(executable, script, resolution, entry.deadline);
+        if matches!(&resolved, PowershellParseOutcome::Failed) {
+            entry.unavailable.store(true, std::sync::atomic::Ordering::Release);
+        }
+        return resolved;
+    }
     let deadline = Instant::now() + POWERSHELL_PARSER_RESPONSE_TIMEOUT;
+    parse_with_powershell_ast_before(executable, script, resolution, deadline)
+}
+
+fn parse_with_powershell_ast_before(
+    executable: &str,
+    script: &str,
+    resolution: Option<&PowershellResolutionState>,
+    deadline: Instant,
+) -> PowershellParseOutcome {
     let Some(flavor) = PowershellFlavor::from_requested_executable(executable) else {
         return PowershellParseOutcome::Failed;
     };
@@ -984,6 +1077,52 @@ mod tests {
     use super::*;
     use crate::powershell::try_find_powershell_executable_blocking;
     use pretty_assertions::assert_eq;
+
+    #[test]
+    fn invocation_scope_shares_failed_syntax_but_not_later_invocations_or_repairs() {
+        use std::sync::atomic::AtomicUsize;
+        use std::sync::atomic::Ordering;
+        let scope = PowershellAnalysisScope::default();
+        let calls = AtomicUsize::new(0);
+        let ready = std::sync::Barrier::new(9);
+        std::thread::scope(|threads| {
+            let mut workers = Vec::new();
+            for _ in 0..8 {
+                let scope = scope.clone();
+                let calls = &calls;
+                let ready = &ready;
+                workers.push(threads.spawn(move || {
+                    ready.wait();
+                    let (entry, outcome) = scope.syntax_for("fixture-host", "source", |_| {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        PowershellParseOutcome::Failed
+                    }).unwrap();
+                    assert_eq!(outcome, PowershellParseOutcome::Failed);
+                    PowershellAnalysisScope::scope_sync(Some(scope), || {
+                        assert_eq!(parse_with_powershell_ast("fixture-host", "source"), PowershellParseOutcome::Failed);
+                    });
+                    entry.deadline
+                }));
+            }
+            ready.wait();
+            let deadlines = workers.into_iter().map(|worker| worker.join().unwrap()).collect::<Vec<_>>();
+            assert!(deadlines.iter().all(|deadline| *deadline == deadlines[0]));
+        });
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        for (scope, executable, source) in [
+            (PowershellAnalysisScope::default(), "fixture-host", "source"),
+            (scope.clone(), "fixture-host", "repaired source"),
+            (scope, "other-host", "source"),
+        ] {
+            let (_, outcome) = scope.syntax_for(executable, source, |_| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                PowershellParseOutcome::Unsupported
+            }).unwrap();
+            assert_eq!(outcome, PowershellParseOutcome::Unsupported);
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 4);
+        assert!(PowershellAnalysisScope::current().is_none());
+    }
 
     fn parser_response_with_mode(mode: &str, version: &str) -> PowershellParseOutcome {
         PowershellParserResponse {

@@ -62,7 +62,8 @@ async fn non_unicode_directory_and_replacement_sibling_keep_distinct_walk_target
     let outcome = LOCAL_FS.walk(&root, filtered.clone(), None).await.unwrap();
     assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
     assert!(!outcome.truncated);
-    assert_eq!(outcome.entries.len(), 2);
+    // Include filters traverse the directory without listing it.
+    assert_eq!(outcome.entries.len(), 1);
     assert!(
         outcome
             .entries

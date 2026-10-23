@@ -2,6 +2,7 @@
 
 import argparse
 import contextlib
+import hashlib
 import io
 import json
 import os
@@ -21,6 +22,29 @@ from scripts.build.validation_observations import (
 
 
 class ValidationObservationsTest(unittest.TestCase):
+    def test_overlapping_roots_share_observations_and_budgets(self):
+        from scripts.build import validation_observations as owner
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            nested = root / "tests"
+            nested.mkdir()
+            source = nested / "lib.rs"
+            source.write_bytes(b"x" * 1024)
+            expected = [
+                source_observations([path])[0] for path in (root, nested)
+            ]
+            with (
+                mock.patch.object(owner, "file_observation", wraps=owner.file_observation) as read,
+                mock.patch.object(owner.os, "scandir", wraps=owner.os.scandir) as scan,
+            ):
+                actual = source_observations(
+                    [nested, root, nested], max_entries=2, max_bytes=1536
+                )
+            self.assertEqual(actual, expected)
+            self.assertEqual(read.call_count, 1)
+            self.assertEqual(scan.call_count, 2)
+
     def test_same_size_restored_mtime_source_and_artifact_changes_are_observed(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -137,4 +161,119 @@ class RunnerObservationHandoffTest(RunnerTestCase):
         self.assertEqual(receipt["executed_tests"], 1)
         self.assertEqual(
             len(calls), 1, "observations must not add discovery or duplicate execution"
+        )
+
+
+class ExecutionReceiptPublicationTest(RunnerTestCase):
+    """Receipts reach the harness intact, under a lane-independent identity."""
+
+    def publish(self, target_dir: Path, *, cargo_profile=None) -> list[dict]:
+        manifest = self.manifest()
+        manifest.targets["core_lib"] = replace(
+            manifest.targets["core_lib"], helpers=(), helpers_by_test_prefix={}
+        )
+        target_dir.mkdir(parents=True, exist_ok=True)
+        runner = rust_test_runner.RustTestRunner(
+            manifest,
+            self.metadata(),
+            target_dir=target_dir,
+            platform="windows",
+            cargo_profile=cargo_profile,
+            executor=lambda args, **_kwargs: subprocess.CompletedProcess(
+                args, 0, nextest_run_payload([("alpha", "ok")]), ""
+            ),
+        )
+        cargo_manifest = self.temp_dir / "package" / "Cargo.toml"
+        cargo_manifest.parent.mkdir(exist_ok=True)
+        cargo_manifest.write_text("fixture")
+        runner.metadata.packages["codex-core"]["manifest_path"] = str(cargo_manifest)
+        args = argparse.Namespace(
+            command="run-target",
+            name="core_lib",
+            names=[],
+            manifest=cargo_manifest,
+            admission_timeout_seconds=0,
+        )
+        stdout = io.StringIO()
+        with (
+            mock.patch.object(rust_test_runner.Manifest, "load", return_value=manifest),
+            contextlib.redirect_stdout(stdout),
+            contextlib.redirect_stderr(io.StringIO()),
+        ):
+            self.assertEqual(
+                rust_test_runner._dispatch_with_admission(
+                    args,
+                    runner,
+                    runner.metadata,
+                    "a" * 64,
+                    ["-E", "test(=alpha)"],
+                    False,
+                ),
+                0,
+            )
+        return [
+            json.loads(line)
+            for line in stdout.getvalue().splitlines()
+            if line.startswith("{")
+        ]
+
+    @staticmethod
+    def receipt(lines: list[dict]) -> dict:
+        return next(
+            line for line in lines if line.get("kind") == "codex_test_execution_v1"
+        )
+
+    def test_large_receipt_is_retained_and_referenced_by_digest(self):
+        # Harness output retention keeps a 512 KiB tail, so a longer receipt
+        # line would be cut; it must arrive as one hash-bound reference.
+        with mock.patch.object(rust_test_runner, "INLINE_RECEIPT_MAX_BYTES", 64):
+            lines = self.publish(self.target_dir)
+        kinds = [line.get("kind") for line in lines]
+        self.assertNotIn("codex_test_execution_v1", kinds)
+        self.assertEqual(kinds.count("codex_test_execution_ref_v1"), 1)
+        reference = next(
+            line for line in lines if line.get("kind") == "codex_test_execution_ref_v1"
+        )
+        self.assertEqual(reference["runner"], "rust_test_runner")
+        retained = Path(reference["path"])
+        self.assertTrue(retained.is_absolute())
+        self.assertEqual(retained.parent.name, "test-runner-logs")
+        self.assertTrue(retained.name.startswith("execution-receipt-"))
+        data = retained.read_bytes()
+        self.assertEqual(len(data), reference["bytes"])
+        self.assertEqual(hashlib.sha256(data).hexdigest(), reference["sha256"])
+        receipt = json.loads(data)
+        self.assertEqual(receipt["kind"], "codex_test_execution_v1")
+        self.assertEqual(receipt["executed_tests"], 1)
+        self.assertEqual(
+            [execution["test"] for execution in receipt["executions"]], ["alpha"]
+        )
+        self.assertEqual(reference["executed_tests"], receipt["executed_tests"])
+        # Negative control: a receipt within the bound stays inline.
+        kinds = [
+            line.get("kind") for line in self.publish(self.temp_dir / "lanes" / "inline")
+        ]
+        self.assertEqual(kinds.count("codex_test_execution_v1"), 1)
+        self.assertNotIn("codex_test_execution_ref_v1", kinds)
+
+    def test_execution_configuration_is_lane_independent(self):
+        # Admission may run a repair in a sibling lane of the same family; the
+        # repair identity must not differ by build-cache location.
+        first = self.receipt(self.publish(self.temp_dir / "lanes" / "core-tests"))
+        second = self.receipt(self.publish(self.temp_dir / "lanes" / "core-tests-2"))
+        self.assertNotIn("target_dir", first["execution_configuration"])
+        self.assertEqual(
+            first["execution_configuration"], second["execution_configuration"]
+        )
+        # The lane stays diagnosable in the admission record.
+        self.assertNotEqual(
+            first["admission"]["target_dir"], second["admission"]["target_dir"]
+        )
+        # Negative control: a real configuration difference still separates runs.
+        profiled = self.receipt(
+            self.publish(self.temp_dir / "lanes" / "profiled", cargo_profile="dev-small")
+        )
+        self.assertEqual(profiled["execution_configuration"]["cargo_profile"], "dev-small")
+        self.assertNotEqual(
+            first["execution_configuration"], profiled["execution_configuration"]
         )

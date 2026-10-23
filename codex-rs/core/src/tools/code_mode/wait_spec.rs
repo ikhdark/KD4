@@ -15,7 +15,7 @@ pub(crate) fn create_wait_tool() -> ToolSpec {
             JsonSchema {
                 minimum: Some(serde_json::Number::from(0_u64)),
                 ..JsonSchema::integer(Some(format!(
-                    "Output token budget for this wait call. {}.",
+                    "Cell output budget from this wait onward (omit to keep the cell's current budget). {}.",
                     adaptive_output_budget_description()
                 )))
             },
@@ -79,7 +79,7 @@ mod tests {
                             JsonSchema {
                                 minimum: Some(serde_json::Number::from(0_u64)),
                                 ..JsonSchema::integer(Some(format!(
-                                    "Output token budget for this wait call. {}.",
+                                    "Cell output budget from this wait onward (omit to keep the cell's current budget). {}.",
                                     adaptive_output_budget_description()
                                 )))
                             },
@@ -114,6 +114,13 @@ mod tests {
             code_properties.keys().cloned().collect::<Vec<_>>(),
             vec!["cell_id", "max_tokens", "terminate"]
         );
+        // An explicit budget replaces the cell's budget for later results too.
+        let max_tokens_description = code_properties["max_tokens"]
+            .description
+            .as_deref()
+            .expect("max_tokens description");
+        assert!(max_tokens_description.contains("from this wait onward"));
+        assert!(!max_tokens_description.contains("this wait call"));
         let code_wait_schema =
             serde_json::to_value(&code_wait.parameters).expect("serialize code-mode wait schema");
         let code_wait_validator =

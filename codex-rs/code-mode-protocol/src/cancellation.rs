@@ -56,6 +56,7 @@ fn turn_abort_reason_label(reason: &TurnAbortReason) -> &'static str {
         TurnAbortReason::BudgetLimited => "budget limited",
         TurnAbortReason::InternalError => "internal error",
         TurnAbortReason::ProcessLost => "process lost",
+        TurnAbortReason::SessionShutdown => "session shutdown",
     }
 }
 
@@ -259,6 +260,13 @@ mod tests {
                 },
                 "cancelled: turn process lost",
                 json!({"type": "turn_aborted", "reason": "process_lost"}),
+            ),
+            (
+                CancellationCause::TurnAborted {
+                    reason: TurnAbortReason::SessionShutdown,
+                },
+                "cancelled: turn session shutdown",
+                json!({"type": "turn_aborted", "reason": "session_shutdown"}),
             ),
             (
                 CancellationCause::NestedDeadline,

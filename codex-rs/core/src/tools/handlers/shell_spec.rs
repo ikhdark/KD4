@@ -111,6 +111,13 @@ pub(crate) fn create_exec_command_tool_for_policy(
             )),
         ),
         (
+            "env".to_string(),
+            JsonSchema {
+                description: Some("Environment overrides scoped to this command only; values are literal strings, never shell-expanded. Use with standalone program/args when shell assignments prevent command admission. Does not change the session or global environment.".to_string()),
+                ..JsonSchema::object(BTreeMap::new(), None, Some(JsonSchema::string(None).into()))
+            },
+        ),
+        (
             "workdir".to_string(),
             JsonSchema::string(Some(
                 "Working directory for the command. Defaults to the turn cwd."
@@ -552,7 +559,7 @@ fn unified_exec_output_schema() -> Value {
             },
             "recovery": {
                 "type": "object",
-                "description": "Ready-to-use read_tool_output call for the retained output.",
+                "description": "read_tool_output call for the retained output; a running command's artifact is readable after it exits.",
                 "properties": {"tool":{"const":"read_tool_output"}, "arguments":{"type":"object"}},
                 "required": ["tool", "arguments"]
             },

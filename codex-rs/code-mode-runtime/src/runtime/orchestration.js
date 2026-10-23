@@ -347,7 +347,7 @@
           evidence,
         );
       }
-      const result = evidence.result;
+      let result = evidence.result;
       if (
         result?.execution_suppressed === true &&
         (force_fresh ||
@@ -364,11 +364,31 @@
       ) {
         fail("search replay lacks verified typed evidence", evidence);
       }
-      if (result?.session_id != null)
-        fail(
-          "search did not finish in one observation; resume its retained handle",
-          evidence,
-        );
+      if (result?.session_id != null) {
+        try {
+          const drained = await globalThis.await_command(result);
+          evidence.observations = drained.observations;
+          result = drained.terminal;
+        } catch (cause) {
+          const terminal = cause?.evidence?.terminal;
+          // await_command deliberately rejects failed commands. rg's 1 and 2
+          // still carry useful search evidence, but only after a normal drain.
+          if (
+            cause?.message?.startsWith("command did not succeed (") &&
+            terminal?.execution_state === "exited" &&
+            terminal.process_exited === true &&
+            terminal.session_id == null &&
+            [1, 2].includes(terminal.exit_code)
+          ) {
+            evidence.observations = cause.evidence.observations;
+            result = terminal;
+          } else {
+            evidence.cause = cause;
+            fail("search observation needs a decision; resume only its retained handle", evidence);
+          }
+        }
+        evidence.result = result;
+      }
       // 1 is ripgrep's no-match status; 2 reports errors, possibly beside partial results.
       const code = result?.exit_code;
       if (code !== 0 && code !== 1 && code !== 2) {
@@ -493,12 +513,38 @@
               continue;
             }
             seen.set(data.line_number, identity);
-            const preview = text.slice(0, 240);
+            let start = 0;
+            let end = Math.min(text.length, text.length > 240 ? 239 : 240);
+            if (text.length > 240 && Array.isArray(data.submatches)) {
+              const hit = data.submatches.find((match) =>
+                Number.isSafeInteger(match.start) && match.start >= 0);
+              if (hit) {
+                // rg offsets count UTF-8 bytes, not JavaScript code units.
+                let offset = 0, at = 0;
+                while (at < text.length && offset < hit.start) {
+                  const cp = text.codePointAt(at);
+                  offset += cp < 128 ? 1 : cp < 2048 ? 2 : cp < 65536 ? 3 : 4;
+                  at += cp > 65535 ? 2 : 1;
+                }
+                if (offset === hit.start) {
+                  start = Math.max(0, at - 80);
+                  if (start && /[\uDC00-\uDFFF]/.test(text[start])) --start;
+                  end = Math.min(text.length, start + 238);
+                }
+              }
+            }
+            if (end < text.length && /[\uDC00-\uDFFF]/.test(text[end])) --end;
+            const truncated = start > 0 || end < text.length;
+            const preview = (start ? "…" : "") + text.slice(start, end) +
+              (end < text.length ? "…" : "");
             if (entry.lines.length < max_per_file) {
               entry.lines.push({
                 line: data.line_number,
                 text: preview,
-                ...(preview.length < text.length ? { truncated: true } : {}),
+                ...(truncated ? { truncated: true,
+                  line_byte_start: bytes(text.slice(0, start)),
+                  line_byte_end: bytes(text.slice(0, end)),
+                  omitted_prefix: start > 0, omitted_suffix: end < text.length } : {}),
               });
             }
             entry.count++;
@@ -530,6 +576,11 @@
         match_count: sorted.reduce((sum, entry) => sum + entry.count, 0),
         complete: code !== 2 && !capped && !unparsed && !binary,
         ...(errors.length ? { errors: errors.slice(0, 20) } : {}),
+        // The host's advisory for this search, such as existing paths near a
+        // guessed one that rg could not open. Dropping it cost another search.
+        ...(typeof result.repair === "string" && result.repair
+          ? { hint: result.repair }
+          : {}),
       };
     },
   });
@@ -541,7 +592,10 @@
     ) {
       integer(max_observations, 1, 1024, "max_observations");
       integer(max_wait_ms, 5_000, 300_000, "max_wait_ms");
-      const deadline = Date.now() + max_wait_ms;
+      // Capture the host's steady clock for this observation chain. Wall-clock
+      // corrections must not lengthen the budget or invalidate a live handle.
+      const now = globalThis.__codex_monotonic_now;
+      const deadline = now() + max_wait_ms;
       if (on_progress !== undefined && typeof on_progress !== "function") {
         throw new TypeError("on_progress must be a function");
       }
@@ -602,29 +656,26 @@
         }
         session = current.session_id;
         incarnation = current.session_capabilities.incarnation;
-        // Silence is a decision boundary, not proof of failure. Keep the live
-        // owner and all completed output; do not hide the notice in another poll.
-        if (
+        // Silence is not failure. The owner's no-output notice stays in this
+        // observation, so keep waiting on the same handle; a process that stays
+        // silent stops at the wait budget with that silence named.
+        const silent =
           !exited &&
           current.session_capabilities.observation?.reason ===
-            "no_output_observed"
-        ) {
-          fail(
-            "command reported no output; inspect and resume the retained handle",
-            evidence,
-          );
-        }
+            "no_output_observed";
         if (observations.length >= max_observations)
           fail("command observation limit reached", evidence);
         try {
           if (on_progress && (await on_progress(current)) !== true)
             fail("command progress needs review", evidence);
-          const remaining = deadline - Date.now();
+          const remaining = Math.floor(deadline - now());
           // Empty native polls have a five-second floor. Do not launch a
           // fresh observation that cannot fit in the remaining wait budget.
           if (remaining < 5_000)
             fail(
-              "command wait budget reached; inspect and resume the retained handle",
+              silent
+                ? "command wait budget reached with no output observed; inspect and resume the retained handle"
+                : "command wait budget reached; inspect and resume the retained handle",
               evidence,
             );
           // A passive output wait can remain pending forever. Bound the existing

@@ -92,13 +92,17 @@ pub use plan::PlanHandler;
 pub(crate) use read_file::ReadFileHandler;
 pub(crate) use read_file::ReadStatusHandler;
 pub(crate) use read_file::canonical_read_file_arguments;
+pub(crate) use read_file::current_file_fingerprint;
+pub(crate) use read_file::current_file_snapshot;
+pub(crate) use read_file::ReadFileReplayMiss;
+pub(crate) use read_file::scope_read_file_replay_miss;
 pub(crate) use read_file::existing_tests_changed;
 pub(crate) use read_file::reselect_read_file_output;
 pub(crate) use read_file::validate_read_file_arguments;
-pub(crate) use read_file::validate_retained_file_hash;
 pub use read_tool_output::ReadToolOutputHandler;
 #[cfg(test)]
 pub(crate) use read_tool_output::execute_recovery_transaction;
+pub(crate) use read_tool_output::file_only_selector_hint as read_tool_output_file_only_selector_hint;
 #[cfg(test)]
 pub(crate) use read_tool_output::execute_recovery_transaction_with_continuations;
 pub use request_permissions::RequestPermissionsHandler;

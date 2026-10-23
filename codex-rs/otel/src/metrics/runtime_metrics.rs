@@ -39,6 +39,8 @@ impl RuntimeMetricTotals {
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+/// Unlabeled histogram observation sums, not exclusive elapsed time or mean
+/// latency. Use the attributed metric snapshot for tool/outcome/phase diagnosis.
 pub struct RuntimeMetricsSummary {
     pub tool_calls: RuntimeMetricTotals,
     pub api_calls: RuntimeMetricTotals,
@@ -57,6 +59,9 @@ pub struct RuntimeMetricsSummary {
     /// This keeps poll boundaries from rounding away short observations.
     #[doc(hidden)]
     pub duration_residual_ns: [i32; 13],
+    /// Sample counts paired with the thirteen duration fields in the same order.
+    /// A mean requires its own count, not an unrelated API/tool counter.
+    pub duration_sample_counts: [u64; 13],
 }
 
 impl RuntimeMetricsSummary {
@@ -75,11 +80,15 @@ impl RuntimeMetricsSummary {
             && self.turn_ttft_ms == 0
             && self.turn_ttfm_ms == 0
             && self.duration_residual_ns.iter().all(|value| *value == 0)
+            && self.duration_sample_counts.iter().all(|value| *value == 0)
     }
 
     /// Accumulate process-local histogram observation sums. These are neither
     /// a latest-response vector nor exclusive turn/inference durations.
     pub fn merge(&mut self, other: Self) {
+        for (count, other) in self.duration_sample_counts.iter_mut().zip(other.duration_sample_counts) {
+            *count = count.saturating_add(other);
+        }
         for (index, (left, right)) in [
             (&mut self.tool_calls, other.tool_calls),
             (&mut self.api_calls, other.api_calls),
@@ -154,6 +163,9 @@ impl RuntimeMetricsSummary {
                     0
                 }
             }),
+            duration_sample_counts: std::array::from_fn(|index| {
+                if (5..11).contains(&index) { self.duration_sample_counts[index] } else { 0 }
+            }),
             ..RuntimeMetricsSummary::default()
         }
     }
@@ -179,24 +191,26 @@ impl RuntimeMetricsSummary {
                 *counter = counter.saturating_add(sum_counter_metric(metric));
                 continue;
             }
-            let duration = match metric.name() {
-                TOOL_CALL_DURATION_METRIC => &mut durations[0],
-                API_CALL_DURATION_METRIC => &mut durations[1],
-                SSE_EVENT_DURATION_METRIC => &mut durations[2],
-                WEBSOCKET_REQUEST_DURATION_METRIC => &mut durations[3],
-                WEBSOCKET_EVENT_DURATION_METRIC => &mut durations[4],
-                RESPONSES_API_OVERHEAD_DURATION_METRIC => &mut durations[5],
-                RESPONSES_API_INFERENCE_TIME_DURATION_METRIC => &mut durations[6],
-                RESPONSES_API_ENGINE_IAPI_TTFT_DURATION_METRIC => &mut durations[7],
-                RESPONSES_API_ENGINE_SERVICE_TTFT_DURATION_METRIC => &mut durations[8],
-                RESPONSES_API_ENGINE_IAPI_TBT_DURATION_METRIC => &mut durations[9],
-                RESPONSES_API_ENGINE_SERVICE_TBT_DURATION_METRIC => &mut durations[10],
-                TURN_TTFT_DURATION_METRIC => &mut durations[11],
-                TURN_TTFM_DURATION_METRIC => &mut durations[12],
+            let index = match metric.name() {
+                TOOL_CALL_DURATION_METRIC => 0,
+                API_CALL_DURATION_METRIC => 1,
+                SSE_EVENT_DURATION_METRIC => 2,
+                WEBSOCKET_REQUEST_DURATION_METRIC => 3,
+                WEBSOCKET_EVENT_DURATION_METRIC => 4,
+                RESPONSES_API_OVERHEAD_DURATION_METRIC => 5,
+                RESPONSES_API_INFERENCE_TIME_DURATION_METRIC => 6,
+                RESPONSES_API_ENGINE_IAPI_TTFT_DURATION_METRIC => 7,
+                RESPONSES_API_ENGINE_SERVICE_TTFT_DURATION_METRIC => 8,
+                RESPONSES_API_ENGINE_IAPI_TBT_DURATION_METRIC => 9,
+                RESPONSES_API_ENGINE_SERVICE_TBT_DURATION_METRIC => 10,
+                TURN_TTFT_DURATION_METRIC => 11,
+                TURN_TTFM_DURATION_METRIC => 12,
                 _ => continue,
             };
+            let duration = &mut durations[index];
             if let AggregatedMetrics::F64(MetricData::Histogram(histogram)) = metric.data() {
                 for point in histogram.data_points() {
+                    summary.duration_sample_counts[index] = summary.duration_sample_counts[index].saturating_add(point.count());
                     let value = point.sum();
                     if value.is_finite() && value > 0.0 {
                         *duration = (*duration + value).min(u64::MAX as f64);
@@ -314,6 +328,8 @@ mod tests {
         assert_eq!(split, combined);
         assert_eq!(split.responses_api_engine_iapi_ttft_ms, 1); // 800 us rounded once
         assert_eq!(split.duration_residual_ns[7], -200_000);
+        assert_eq!(split.duration_sample_counts[7], 2);
+        assert_eq!(split.responses_api_summary().duration_sample_counts[7], 2);
         split.merge(RuntimeMetricsSummary::default());
         assert_eq!(split, combined);
         metrics.shutdown().unwrap();
@@ -346,6 +362,7 @@ mod tests {
             }
         );
         assert_eq!(summary.api_calls, RuntimeMetricTotals::default());
+        assert_eq!(summary.duration_sample_counts[0], 3);
         assert_eq!(
             RuntimeMetricsSummary::from_snapshot(&metrics.snapshot().unwrap()),
             RuntimeMetricsSummary::default()

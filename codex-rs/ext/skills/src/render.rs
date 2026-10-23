@@ -125,6 +125,22 @@ fn render_skill_line(entry: &SkillCatalogEntry, description: &str, locator_kind:
     }
 }
 
+/// Water-fill the shared rendered-byte cap after every complete cost is known.
+/// Small bodies keep their unused share available to large bodies, independent
+/// of catalog order. Recovery envelopes remain accounted by the renderer.
+pub(crate) fn selected_prompt_budgets(costs: &[usize], cap: usize) -> Vec<usize> {
+    let mut order = (0..costs.len()).collect::<Vec<_>>();
+    order.sort_by_key(|index| (costs[*index], *index));
+    let mut budgets = vec![0; costs.len()];
+    let mut remaining = cap;
+    for (position, index) in order.into_iter().enumerate() {
+        let budget = costs[index].min(remaining / (costs.len() - position));
+        budgets[index] = budget;
+        remaining -= budget;
+    }
+    budgets
+}
+
 pub(crate) fn main_prompt_fragment(
     contents: &str,
     entry: &SkillCatalogEntry,
@@ -281,6 +297,33 @@ mod tests {
             remaining -= fragment.render().len();
         }
         assert!(rendered <= MAX_SELECTED_PROMPT_BYTES);
+    }
+
+    #[test]
+    fn selected_body_allocation_preserves_unequal_complete_bodies_in_either_order() {
+        assert_eq!(selected_prompt_budgets(&[25_000, 1_000], 32_000), vec![25_000, 1_000]);
+        assert_eq!(selected_prompt_budgets(&[1_000, 25_000], 32_000), vec![1_000, 25_000]);
+        assert_eq!(selected_prompt_budgets(&[40_000, 1_000], 32_000), vec![31_000, 1_000]);
+        assert!(selected_prompt_budgets(&[], 0).is_empty());
+        use codex_extension_api::ContextualUserFragment;
+        let entry = SkillCatalogEntry::new(
+            crate::catalog::SkillPackageId("skill://selected".into()),
+            crate::catalog::SkillAuthority::new(SkillSourceKind::Orchestrator, "test"),
+            "selected", "description",
+            crate::catalog::SkillResourceId::new("skill://selected/SKILL.md"),
+        );
+        for bodies in [vec!["x".repeat(25_000), "<&>".repeat(100)],
+                       vec!["<&>".repeat(100), "x".repeat(25_000)]] {
+            let complete = bodies.iter().map(|body| main_prompt_fragment(body, &entry, usize::MAX).unwrap().0)
+                .collect::<Vec<_>>();
+            let costs = complete.iter().map(|fragment| fragment.render().len()).collect::<Vec<_>>();
+            let budgets = selected_prompt_budgets(&costs, MAX_SELECTED_PROMPT_BYTES);
+            for (body, budget) in bodies.iter().zip(budgets) {
+                let (fragment, truncated) = main_prompt_fragment(body, &entry, budget).unwrap();
+                assert!(!truncated);
+                assert_eq!(&fragment.contents, body);
+            }
+        }
     }
 
     #[test]

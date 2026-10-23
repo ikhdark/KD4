@@ -484,11 +484,8 @@ fn apply_namespace_description_budget(planned_tools: &mut PlannedTools) {
             *description = default_namespace_description(namespace_name);
         }
     }
-    // Bound each source description independently. The final visible projection
-    // applies its shared budget after hidden and deferred tools are filtered out.
-    for description in descriptions.values_mut() {
-        apply_fair_description_budget(std::slice::from_mut(description));
-    }
+    // Keep the authoritative guidance intact for lazy discovery and resolution.
+    // Only the final model-visible projection applies the shared byte budget.
 
     for spec in planned_tools
         .runtimes
@@ -589,6 +586,11 @@ fn multi_agent_v2_enabled(turn_context: &TurnContext) -> bool {
 }
 
 fn collab_tools_enabled(turn_context: &TurnContext) -> bool {
+    // Bulk workers carry a report tag rather than structured ThreadSpawn
+    // ancestry. Do not let them reset nesting depth or the child namespace.
+    if matches!(&turn_context.session_source, SessionSource::SubAgent(SubAgentSource::Other(label)) if label.starts_with("agent_job:")) {
+        return false;
+    }
     match turn_context.multi_agent_version {
         MultiAgentVersion::Disabled => false,
         MultiAgentVersion::V1 => !exceeds_thread_spawn_depth_limit(
@@ -624,7 +626,10 @@ fn agent_jobs_tools_enabled(context: &CoreToolPlanContext<'_>) -> bool {
         .features
         .get()
         .enabled(Feature::SpawnCsv)
-        && collab_tools_enabled(turn_context)
+        && !turn_context.config.ephemeral
+        && turn_context.multi_agent_version != MultiAgentVersion::Disabled
+        && (collab_tools_enabled(turn_context)
+            || matches!(&turn_context.session_source, SessionSource::SubAgent(SubAgentSource::Other(label)) if label.starts_with("agent_job:")))
         && context
             .step_context
             .environments
@@ -883,7 +888,16 @@ fn build_code_mode_executors(
         lazy_builtin_tool_names.dedup();
         eager_nested_tool_descriptions.push(format!(
             "Other built-in nested tools (lazy contracts; resolve_tool(name) and call in the same cell): {}.",
-            lazy_builtin_tool_names.join(", ")
+            lazy_builtin_tool_names
+                .iter()
+                .map(|name| match name.as_str() {
+                    // Read as task or validation status, it was called without
+                    // paths after failed checks (audit 2026-10-22 #29).
+                    "read_status" => "read_status (read-history coverage for given paths)",
+                    name => name,
+                })
+                .collect::<Vec<_>>()
+                .join(", ")
         ));
     }
     let mut result: Vec<Arc<dyn CoreToolRuntime>> = vec![Arc::new(CodeModeExecuteHandler::new(
@@ -1855,3 +1869,21 @@ impl CoreToolRuntime for MultiAgentV2NamespaceOverride {
 #[cfg(test)]
 #[path = "spec_plan_tests.rs"]
 mod tests;
+#[cfg(test)]
+mod audit150_namespace_tests {
+    use super::*;
+    #[test]
+    fn registration_retains_full_guidance_while_visible_projection_is_bounded() {
+        let description = format!("{}\nFINAL_REQUIRED_SAFETY_INSTRUCTION", "guidance ".repeat(8000));
+        let mut planned = PlannedTools { hosted_specs:vec![ToolSpec::Namespace(ResponsesApiNamespace {
+            name:"large_namespace".into(),description:description.clone(),tools:vec![],
+        })], ..Default::default() };
+        apply_namespace_description_budget(&mut planned);
+        let ToolSpec::Namespace(authoritative)=&planned.hosted_specs[0] else { panic!("namespace"); };
+        assert_eq!(authoritative.description,description);
+        let projected=merge_into_namespaces(planned.hosted_specs.clone());
+        let ToolSpec::Namespace(visible)=&projected[0] else { panic!("namespace"); };
+        assert!(visible.description.len()<description.len());
+        assert!(authoritative.description.contains("FINAL_REQUIRED_SAFETY_INSTRUCTION"));
+    }
+}

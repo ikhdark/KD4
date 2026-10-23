@@ -36,6 +36,7 @@ pub fn open_confined_file_with_metadata(
         ));
     }
 
+    let _capture = crate::guard_patch_read(path)?;
     open_confined_file_impl(root, path, &components)
 }
 

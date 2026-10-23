@@ -1078,6 +1078,11 @@ async fn code_mode_exposes_bootstrap_contracts_and_keeps_other_builtins_resolvab
         .find(|line| line.starts_with("Other built-in nested tools (lazy contracts;"))
         .expect("code-mode-only sessions name lazily resolved built-ins");
     assert!(lazy_line.contains("list_files"), "{lazy_line}");
+    // The only lazy name the model mistook for task/validation status.
+    assert!(
+        lazy_line.contains("read_status (read-history coverage for given paths)"),
+        "{lazy_line}"
+    );
     assert!(
         !lazy_line.contains("read_file") && !nested_exec.description.contains("list_files(args:")
     );
@@ -1701,6 +1706,7 @@ async fn host_context_gates_agent_job_tools() {
     .await;
     worker_agent_job.assert_visible_contains(&["report_agent_job_result"]);
     worker_agent_job.assert_registered_lacks(&["spawn_agents_on_csv"]);
+    worker_agent_job.assert_registered_lacks(&["spawn_agent"]);
     assert_eq!(
         worker_agent_job.authorization_class("report_agent_job_result"),
         TypedToolClass::OwnTask
@@ -1723,6 +1729,16 @@ async fn host_context_gates_agent_job_tools() {
     .await;
     v2_worker.assert_visible_contains(&["report_agent_job_result"]);
     v2_worker.assert_registered_lacks(&["spawn_agents_on_csv"]);
+    v2_worker.assert_registered_lacks(&["spawn_agent"]);
+
+    for v2 in [false, true] {
+        let ephemeral = probe(|turn| {
+            set_feature(turn, Feature::SpawnCsv, true);
+            set_feature(turn, Feature::MultiAgentV2, v2);
+            Arc::make_mut(&mut turn.config).ephemeral = true;
+        }).await;
+        ephemeral.assert_registered_lacks(&["spawn_agents_on_csv", "report_agent_job_result"]);
+    }
 
     let remote_agent_job = probe(|turn| {
         set_feature(turn, Feature::SpawnCsv, /*enabled*/ true);

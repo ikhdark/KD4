@@ -586,8 +586,9 @@ class RunnerMetricsTest(RunnerTestCase):
         self.assertEqual(len(value["input_digest"]), 64)
         self.assertIsNotNone(value["phases"]["admission"])
         self.assertIsNotNone(value["phases"]["preparation"])
-        self.assertEqual(value["commands"][0]["reported_build_seconds"], 2)
-        self.assertEqual(value["commands"][0]["reported_test_seconds"], 0.2)
+        # Unframed human output is diagnostic text, not provider timing proof.
+        self.assertIsNone(value["commands"][0]["reported_build_seconds"])
+        self.assertIsNone(value["commands"][0]["reported_test_seconds"])
         self.assertIsNone(value["commands"][0]["cleanup_seconds"])
         self.assertFalse(rust_build_status.cargo_lock_is_busy(self.target_dir))
 

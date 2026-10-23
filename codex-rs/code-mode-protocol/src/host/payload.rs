@@ -109,6 +109,8 @@ pub struct WireToolDefinition {
     pub name: String,
     pub tool_name: WireToolName,
     pub description: std::sync::Arc<str>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub namespace_description: Option<std::sync::Arc<str>>,
     pub kind: WireToolKind,
     pub input_schema: Option<JsonValue>,
     pub output_schema: Option<JsonValue>,
@@ -119,10 +121,17 @@ pub struct WireToolDefinition {
 
 impl From<ToolDefinition> for WireToolDefinition {
     fn from(value: ToolDefinition) -> Self {
+        // Carry guidance separately without doubling its transport bytes. The
+        // receiver reconstructs the self-contained lazy-resolution contract.
+        let description = value.namespace_description.as_deref().map(str::trim)
+            .and_then(|guidance| value.description.strip_prefix(guidance))
+            .and_then(|rest| rest.strip_prefix("\n\n"))
+            .map(std::sync::Arc::from).unwrap_or_else(|| value.description.clone());
         Self {
             name: value.name,
             tool_name: value.tool_name.into(),
-            description: value.description,
+            description,
+            namespace_description: value.namespace_description,
             kind: value.kind.into(),
             input_schema: value.input_schema,
             output_schema: value.output_schema,
@@ -133,10 +142,15 @@ impl From<ToolDefinition> for WireToolDefinition {
 
 impl From<WireToolDefinition> for ToolDefinition {
     fn from(value: WireToolDefinition) -> Self {
+        let description = value.namespace_description.as_deref().map(str::trim)
+            .filter(|guidance| !guidance.is_empty())
+            .map(|guidance| format!("{guidance}\n\n{}", value.description).into())
+            .unwrap_or_else(|| value.description.clone());
         Self {
             name: value.name,
             tool_name: value.tool_name.into(),
-            description: value.description,
+            description,
+            namespace_description: value.namespace_description,
             kind: value.kind.into(),
             input_schema: value.input_schema,
             output_schema: value.output_schema,

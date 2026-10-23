@@ -990,6 +990,16 @@ fn map_ws_error(err: WsError, url: &Url) -> ApiError {
         WsError::Url(err) => ApiError::Transport(TransportError::Build(format!(
             "invalid websocket configuration: {err}"
         ))),
+        // Lost dispatch authority before any byte was sent. Match the HTTP and
+        // WebSocket send paths: a request-build failure, not a transport fault
+        // that would demote WebSockets for the session.
+        WsError::Io(err)
+            if err
+                .get_ref()
+                .is_some_and(|inner| inner.is::<codex_websocket_client::DispatchRejected>()) =>
+        {
+            ApiError::Transport(TransportError::Build(err.to_string()))
+        }
         WsError::Io(err) if codex_http_client::is_permanent_connection_error(&err) => {
             ApiError::Transport(TransportError::Build(format!(
                 "permanent websocket configuration failure: {err}"
@@ -1051,7 +1061,12 @@ fn map_wrapped_websocket_error_event(
             _ => None,
         }
     {
-        return Some(ApiError::Retryable {
+        return Some(ApiError::WebsocketRejected {
+            reason: if code == PREVIOUS_RESPONSE_NOT_FOUND_CODE {
+                codex_protocol::error::WebsocketRecoveryReason::PreviousResponseNotFound
+            } else {
+                codex_protocol::error::WebsocketRecoveryReason::ConnectionLimitReached
+            },
             message: error
                 .message
                 .clone()
@@ -1353,6 +1368,56 @@ mod tests {
         assert!(crate::map_api_error(map_ws_error(transient, &url)).is_retryable());
     }
 
+    #[tokio::test]
+    async fn connect_dispatch_rejection_maps_to_build_not_network() {
+        struct RejectedAuthority;
+
+        impl codex_http_client::RequestDispatchGuard for RejectedAuthority {
+            fn admit(&self, _: &mut dyn FnMut()) -> Result<(), String> {
+                Err("account changed during connection preparation".into())
+            }
+        }
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let url =
+            Url::parse(&format!("ws://{}/responses", listener.local_addr().unwrap())).unwrap();
+        let factory =
+            HttpClientFactory::new(codex_http_client::OutboundProxyPolicy::ReqwestDefault);
+        let result = codex_http_client::with_dispatch_guard(
+            Some(Arc::new(RejectedAuthority)),
+            connect_websocket(url, HeaderMap::new(), &factory, /*turn_state*/ None),
+        )
+        .await;
+        let Err(error) = result else {
+            panic!("a rejected authority must not open a websocket");
+        };
+        assert!(
+            matches!(&error, ApiError::Transport(TransportError::Build(message))
+                if message.contains("account changed")),
+            "{error:?}"
+        );
+        assert!(matches!(
+            crate::map_api_error(error),
+            codex_protocol::error::CodexErr::RequestBuild(_)
+        ));
+        assert!(matches!(listener.accept(), Err(error)
+            if error.kind() == std::io::ErrorKind::WouldBlock));
+    }
+
+    #[test]
+    fn os_permission_denied_still_maps_to_network() {
+        let url = Url::parse("wss://example.test/responses").unwrap();
+        let error = map_ws_error(
+            WsError::Io(std::io::Error::from(std::io::ErrorKind::PermissionDenied)),
+            &url,
+        );
+        assert!(
+            matches!(error, ApiError::Transport(TransportError::Network(_))),
+            "{error:?}"
+        );
+    }
+
     #[tokio::test(start_paused = true)]
     async fn transport_audit_websocket_metadata_backpressure_preserves_deadline() {
         let (tx_command, _commands) = mpsc::channel(1);
@@ -1531,6 +1596,45 @@ mod tests {
                 }
             }
             drop(tx_message);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn duplicate_summary_done_does_not_renew_websocket_progress_deadline() {
+        for text in ["", "thinking"] {
+            let (tx_command, _commands) = mpsc::channel(1);
+            let (tx_message, rx_message) = ws_ingress_channel(16, 8192);
+            let producer = tokio::spawn(async move {
+                for index in 0..9 {
+                    tokio::time::sleep(Duration::from_millis(30)).await;
+                    let event = if index == 0 {
+                        json!({"type":"response.output_item.added","item":{"type":"reasoning","id":"r","summary":[]}})
+                    } else {
+                        json!({"type":"response.reasoning_summary_text.done","item_id":"r","summary_index":0,"text":text})
+                    };
+                    let _ = tx_message.try_send(Message::Text(event.to_string().into()));
+                }
+            });
+            let mut ws_stream = WsStream {
+                tx_command, rx_message, rx_failure: None, pending_failure: None,
+                response_history: Default::default(),
+                pump_task: tokio::spawn(std::future::pending()),
+            };
+            let (tx, mut rx) = response_event_channel(32);
+            let started = tokio::time::Instant::now();
+            let result = run_websocket_response_stream(&mut ws_stream, tx,
+                Duration::from_millis(80), None, ResponsesStreamMetadata::default(), None).await;
+            let elapsed = started.elapsed();
+            producer.await.unwrap();
+            assert_eq!(elapsed, Duration::from_millis(140));
+            assert!(matches!(result, Err(ApiError::Stream(message)) if message.contains("timeout")));
+            let mut finalities = 0;
+            while let Some(event) = rx.recv().await {
+                if matches!(event, Ok(ResponseEvent::ReasoningSummaryDone { .. })) {
+                    finalities += 1;
+                }
+            }
+            assert_eq!(finalities, 1);
         }
     }
 
@@ -3286,9 +3390,14 @@ mod tests {
                 .expect("expected websocket error payload to be parsed");
             let api_error = map_wrapped_websocket_error_event(wrapped_error, payload)
                 .expect("expected websocket error payload to map to ApiError");
-            let ApiError::Retryable { message, delay } = api_error else {
-                panic!("expected ApiError::Retryable");
+            let ApiError::WebsocketRejected { message, delay, reason } = api_error else {
+                panic!("expected typed websocket rejection");
             };
+            assert_eq!(reason, if error["code"] == PREVIOUS_RESPONSE_NOT_FOUND_CODE {
+                codex_protocol::error::WebsocketRecoveryReason::PreviousResponseNotFound
+            } else {
+                codex_protocol::error::WebsocketRecoveryReason::ConnectionLimitReached
+            });
             assert_eq!(message, expected);
             assert_eq!(delay, None);
         }

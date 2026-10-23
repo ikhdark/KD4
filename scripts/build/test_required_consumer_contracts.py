@@ -12,6 +12,19 @@ from scripts.build.test_rust_test_runner import RunnerTestCase, nextest_run_payl
 
 
 class RequiredConsumerContractsTest(RunnerTestCase):
+    def test_repository_filter_only_gates_have_reviewed_source_routing(self):
+        manifest = r.Manifest.load(r.DEFAULT_MANIFEST)
+        for path, gate in (
+            ("codex-rs/core/src/session/turn_execution.rs", "completion-path-evidence"),
+            ("codex-rs/core/src/tools/registry.rs", "completion-path-evidence"),
+            ("codex-rs/core/tests/suite/client_websockets.rs", "wall-clock-runtime"),
+            ("codex-rs/code-mode-runtime/src/session_runtime/mod.rs", "wall-clock-runtime"),
+        ):
+            with self.subTest(path=path), mock.patch.object(r, "load_metadata") as metadata:
+                result = manifest.required_contracts([path], cwd=r.REPO_ROOT)
+                self.assertIn(gate, result["required_gates"])
+                metadata.assert_not_called()
+
     def contract_manifest(self, **changes):
         declaration = {
             "paths": ["producer/src/api.rs"],
@@ -150,3 +163,68 @@ class RequiredConsumerContractsTest(RunnerTestCase):
         self.assertEqual(
             len(calls), 1, "compatible local and consumer checks share one execution"
         )
+
+    def test_wrong_base_relative_changed_paths_are_unresolved(self):
+        # `core-gate --changed-path` resolves from the repository root while the
+        # [no-cd] `core-test-gates-for` resolves from the caller's directory. A
+        # path naming an existing file only from another base is reported, not
+        # silently matched against no declaration.
+        repository = self.temp_dir
+        codex_rs = repository / "codex-rs"
+        (codex_rs / "producer" / "src").mkdir(parents=True)
+        (codex_rs / "producer" / "src" / "api.rs").write_text("pub fn api() {}")
+        manifest = self.contract_manifest(
+            paths=["codex-rs/producer/src/api.rs", "codex-rs/producer/src/deleted.rs"]
+        )
+        with mock.patch.object(r, "CODEX_RS_ROOT", codex_rs):
+            wrong_base = manifest.required_contracts(
+                ["producer/src/api.rs"], cwd=repository
+            )
+            self.assertEqual(wrong_base["required_gates"], [])
+            self.assertEqual(
+                wrong_base["unresolved_contract_paths"], ["producer/src/api.rs"]
+            )
+            runner, executor = self.runner(manifest=manifest)
+            self.assertEqual(
+                runner.gates_for(["producer/src/api.rs"], cwd=repository)[
+                    "unresolved_contract_paths"
+                ],
+                ["producer/src/api.rs"],
+            )
+            self.assertEqual(executor.calls, [])
+            # Negative controls: the repository-relative spelling of the same
+            # file, and a deleted file that exists at no base, still match.
+            for path in (
+                "codex-rs/producer/src/api.rs",
+                "codex-rs/producer/src/deleted.rs",
+            ):
+                with self.subTest(path=path):
+                    result = manifest.required_contracts([path], cwd=repository)
+                    self.assertEqual(result["required_gates"], ["consumer"])
+                    self.assertEqual(result["unresolved_contract_paths"], [])
+
+        # The run-gate preflight names the path before Cargo starts.
+        manifest_path = self.temp_dir / "manifest.toml"
+        manifest_path.write_bytes(b"manifest bytes")
+        args = r.build_parser().parse_args(
+            [
+                "--manifest",
+                str(manifest_path),
+                "run-gate",
+                "--changed-path",
+                "producer/src/api.rs",
+                "local",
+            ]
+        )
+        with (
+            mock.patch.object(r, "REPO_ROOT", repository),
+            mock.patch.object(r, "CODEX_RS_ROOT", codex_rs),
+            mock.patch.object(r.Manifest, "load", return_value=manifest),
+            mock.patch.object(r, "load_metadata") as metadata,
+            contextlib.redirect_stderr(io.StringIO()) as stderr,
+        ):
+            self.assertEqual(r._main(args), 2)
+        metadata.assert_not_called()
+        self.assertIn("producer/src/api.rs", stderr.getvalue())
+        self.assertIn("repository-relative", stderr.getvalue())
+        self.assertEqual(args.names, ["local"])

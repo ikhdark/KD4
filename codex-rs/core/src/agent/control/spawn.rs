@@ -1410,134 +1410,158 @@ impl AgentControl {
         };
         #[cfg(test)]
         self.pause_before_initial_submission_for_test().await;
-        let initial_submission_result = match initial_input {
-            SpawnInitialInput::UserInput(input) => {
-                self.send_input_after_capacity_check(
-                    new_thread.thread_id,
-                    &state,
-                    input,
-                    execution_guard,
-                )
-                .await
-            }
-            SpawnInitialInput::InterAgentCommunication(communication, context) => {
-                self.send_inter_agent_communication_after_capacity_check(
-                    new_thread.thread_id,
-                    &state,
-                    communication,
-                    context,
-                    execution_guard,
-                )
-                .await
-            }
-            SpawnInitialInput::TaskCapsule(canonical_payload) => {
-                let rendered = TaskCapsuleFragment::new(canonical_payload).render();
-                self.send_input_after_capacity_check(
-                    new_thread.thread_id,
-                    &state,
-                    vec![UserInput::Text {
-                        text: rendered,
-                        text_elements: Vec::new(),
-                    }],
-                    execution_guard,
-                )
-                .await
-            }
-        };
-        if let Err(err) = initial_submission_result {
-            return Err(pending_cleanup.rollback(err).await);
-        }
-        agent_metadata.last_task_message = initial_last_task_message;
-        #[expect(
-            clippy::expect_used,
-            reason = "PendingSpawnCleanup owns the reservation until this commit consumes it"
-        )]
-        let reservation = pending_cleanup
-            .capacity
-            .reservation
-            .as_mut()
-            .expect("created child retains its uncommitted spawn reservation");
-        if let Err(err) = reservation.try_commit(agent_metadata.clone()) {
-            return Err(pending_cleanup.rollback(err).await);
-        }
-        drop(pending_cleanup.capacity.reservation.take());
-        if let Some(residency_slot) = pending_cleanup.capacity.residency_slot.take() {
-            residency_slot.commit(new_thread.thread_id);
-        }
-
-        // Notify only after the initial work is queued and the child becomes path-addressable.
-        state
-            .notify_thread_created(new_thread.thread_id, &new_thread.thread)
-            .await;
-        #[cfg(test)]
-        self.pause_after_thread_created_for_test().await;
-
-        if let Some(SessionSource::SubAgent(
-            subagent_source @ SubAgentSource::ThreadSpawn {
-                parent_thread_id, ..
-            },
-        )) = notification_source.as_ref()
-        {
-            let client_metadata = match state.get_thread(*parent_thread_id).await {
-                Ok(parent_thread) => {
-                    parent_thread
-                        .codex
-                        .session
-                        .app_server_client_metadata()
-                        .await
+        // Construction before this point cannot execute the worker. From the
+        // possible-start boundary onward its deadline also covers a stalled
+        // publication/metadata handoff. Timeout drops the existing rollback
+        // owner, never an unowned running child.
+        let execution_started_at = tokio::time::Instant::now();
+        let execution_deadline = options
+            .agent_job_binding
+            .as_ref()
+            .and_then(|binding| binding.runtime_timeout)
+            .and_then(|timeout| execution_started_at.checked_add(timeout));
+        let finish_spawn = async {
+            let initial_submission_result = match initial_input {
+                SpawnInitialInput::UserInput(input) => {
+                    self.send_input_after_capacity_check(
+                        new_thread.thread_id,
+                        &state,
+                        input,
+                        execution_guard,
+                    )
+                    .await
                 }
-                Err(error) => {
-                    tracing::warn!(
-                        error = %error,
-                        parent_thread_id = %parent_thread_id,
-                        "skipping subagent thread analytics: failed to load parent thread metadata"
-                    );
-                    crate::session::session::AppServerClientMetadata {
-                        client_name: None,
-                        client_version: None,
-                    }
+                SpawnInitialInput::InterAgentCommunication(communication, context) => {
+                    self.send_inter_agent_communication_after_capacity_check(
+                        new_thread.thread_id,
+                        &state,
+                        communication,
+                        context,
+                        execution_guard,
+                    )
+                    .await
+                }
+                SpawnInitialInput::TaskCapsule(canonical_payload) => {
+                    let rendered = TaskCapsuleFragment::new(canonical_payload).render();
+                    self.send_input_after_capacity_check(
+                        new_thread.thread_id,
+                        &state,
+                        vec![UserInput::Text {
+                            text: rendered,
+                            text_elements: Vec::new(),
+                        }],
+                        execution_guard,
+                    )
+                    .await
                 }
             };
-            let thread_config = new_thread.thread.codex.thread_config_snapshot().await;
-            let parent_thread_id = thread_config.parent_thread_id;
-            emit_subagent_session_started(
-                &new_thread
-                    .thread
-                    .codex
-                    .session
-                    .services
-                    .analytics_events_client,
-                client_metadata,
-                new_thread.thread.codex.session.session_id(),
-                new_thread.thread_id,
-                parent_thread_id,
-                thread_config,
-                subagent_source.clone(),
-            );
-        }
-        if multi_agent_version != MultiAgentVersion::V2 {
-            let child_reference = agent_metadata
-                .agent_path
-                .as_ref()
-                .map(ToString::to_string)
-                .unwrap_or_else(|| new_thread.thread_id.to_string());
-            let _ = self.maybe_start_completion_watcher(
-                new_thread.thread_id,
-                notification_source,
-                child_reference,
-                agent_metadata.agent_path.clone(),
-            );
-        }
+            if let Err(err) = initial_submission_result {
+                return Err(pending_cleanup.rollback(err).await);
+            }
+            agent_metadata.last_task_message = initial_last_task_message;
+            #[expect(
+                clippy::expect_used,
+                reason = "PendingSpawnCleanup owns the reservation until this commit consumes it"
+            )]
+            let reservation = pending_cleanup
+                .capacity
+                .reservation
+                .as_mut()
+                .expect("created child retains its uncommitted spawn reservation");
+            if let Err(err) = reservation.try_commit(agent_metadata.clone()) {
+                return Err(pending_cleanup.rollback(err).await);
+            }
+            drop(pending_cleanup.capacity.reservation.take());
+            if let Some(residency_slot) = pending_cleanup.capacity.residency_slot.take() {
+                residency_slot.commit(new_thread.thread_id);
+            }
 
-        let status = self.get_status(new_thread.thread_id).await;
-        // Metadata and status collection can still suspend after publication.
-        // Retain rollback ownership until the completed result is handed back.
-        pending_cleanup.disarm();
-        Ok(LiveAgent {
-            thread_id: new_thread.thread_id,
-            metadata: agent_metadata,
-            status,
-        })
+            // Notify only after the initial work is queued and the child becomes path-addressable.
+            state
+                .notify_thread_created(new_thread.thread_id, &new_thread.thread)
+                .await;
+            #[cfg(test)]
+            self.pause_after_thread_created_for_test().await;
+
+            if let Some(SessionSource::SubAgent(
+                subagent_source @ SubAgentSource::ThreadSpawn {
+                    parent_thread_id, ..
+                },
+            )) = notification_source.as_ref()
+            {
+                let client_metadata = match state.get_thread(*parent_thread_id).await {
+                    Ok(parent_thread) => {
+                        parent_thread
+                            .codex
+                            .session
+                            .app_server_client_metadata()
+                            .await
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            error = %error,
+                            parent_thread_id = %parent_thread_id,
+                            "skipping subagent thread analytics: failed to load parent thread metadata"
+                        );
+                        crate::session::session::AppServerClientMetadata {
+                            client_name: None,
+                            client_version: None,
+                        }
+                    }
+                };
+                let thread_config = new_thread.thread.codex.thread_config_snapshot().await;
+                let parent_thread_id = thread_config.parent_thread_id;
+                emit_subagent_session_started(
+                    &new_thread
+                        .thread
+                        .codex
+                        .session
+                        .services
+                        .analytics_events_client,
+                    client_metadata,
+                    new_thread.thread.codex.session.session_id(),
+                    new_thread.thread_id,
+                    parent_thread_id,
+                    thread_config,
+                    subagent_source.clone(),
+                );
+            }
+            if multi_agent_version != MultiAgentVersion::V2 {
+                let child_reference = agent_metadata
+                    .agent_path
+                    .as_ref()
+                    .map(ToString::to_string)
+                    .unwrap_or_else(|| new_thread.thread_id.to_string());
+                let _ = self.maybe_start_completion_watcher(
+                    new_thread.thread_id,
+                    notification_source,
+                    child_reference,
+                    agent_metadata.agent_path.clone(),
+                );
+            }
+
+            let status = self.get_status(new_thread.thread_id).await;
+            // Metadata and status collection can still suspend after publication.
+            // Retain rollback ownership until the completed result is handed back.
+            pending_cleanup.disarm();
+            Ok(LiveAgent {
+                thread_id: new_thread.thread_id,
+                metadata: agent_metadata,
+                status,
+                execution_started_at,
+            })
+        };
+        if let Some(deadline) = execution_deadline {
+            tokio::time::timeout_at(deadline, finish_spawn)
+                .await
+                .unwrap_or_else(|_| {
+                    Err(CodexErr::Fatal(
+                        "worker exceeded max runtime during spawn handoff".into(),
+                    ))
+                })
+        } else {
+            finish_spawn.await
+        }
     }
 
     pub(crate) async fn rollback_failed_initial_submission(
@@ -1645,6 +1669,23 @@ impl AgentControl {
 
         let parent_thread_id = *parent_thread_id;
         if matches!(fork_mode, SpawnAgentForkMode::TaskCapsule) {
+            // Capability selection is thread metadata, not conversation history.
+            // Reuse the parent's selected roots; child resolution still applies
+            // its own environment and permission policy.
+            let roots = if let Ok(parent) = state.get_thread(parent_thread_id).await {
+                parent.codex.session.services.selected_capability_roots.clone()
+            } else {
+                state.read_stored_thread(ReadThreadParams {
+                    thread_id: parent_thread_id, include_archived: true, include_history: true,
+                }).await?.history.map(|history| {
+                    history.items.iter().find_map(|item| match item {
+                        RolloutItem::SessionMeta(meta) => Some(meta.meta.selected_capability_roots.clone()),
+                        _ => None,
+                    }).unwrap_or_default()
+                }).unwrap_or_default()
+            };
+            let mut extension_init = ExtensionDataInit::new();
+            extension_init.insert(roots);
             return state
                 .fork_thread_with_source(
                     config.clone(),
@@ -1657,7 +1698,7 @@ impl AgentControl {
                     inherited_environments,
                     inherited_exec_policy,
                     options.environments.clone(),
-                    ExtensionDataInit::new(),
+                    extension_init,
                 )
                 .await;
         }

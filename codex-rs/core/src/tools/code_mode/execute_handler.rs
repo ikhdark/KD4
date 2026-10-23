@@ -427,16 +427,21 @@ impl CodeModeExecuteHandler {
             );
         // Establish cleanup ownership before queuing trace work.
         let dispatch_lease = CellDispatchLease::new(Arc::clone(&exec.session), cell_id.clone());
-        emit_failed_code_mode_cell_item(
-            &exec,
-            &call_id,
-            &codex_code_mode::RuntimeResponse::Yielded {
-                cell_id: cell_id.clone(),
-                content_items: Vec::new(),
-            },
-            started_at,
-        )
-        .await;
+        // Register one owned publication before opening dispatch. Downstream
+        // presentation pressure must not gate the cell's nested tool work.
+        // The session tracker drains it even if this caller is cancelled.
+        let started_publication = exec.session.terminal_tasks.spawn({
+            let exec = ExecContext { session: Arc::clone(&exec.session), turn: Arc::clone(&exec.turn) };
+            let call_id = call_id.clone();
+            let cell_id = cell_id.clone();
+            async move {
+                emit_failed_code_mode_cell_item(
+                    &exec, &call_id,
+                    &codex_code_mode::RuntimeResponse::Yielded { cell_id, content_items: Vec::new() },
+                    started_at,
+                ).await;
+            }
+        });
         let trace_enabled = exec.session.services.rollout_thread_trace.is_enabled();
         let code_cell_trace = exec
             .session
@@ -584,12 +589,32 @@ impl CodeModeExecuteHandler {
         }
         // Preserve the captured response while allowing cancellation to finish
         // delivery and dispatch cleanup despite an unrelated open dialog.
+        let dialog_wait_started = std::time::Instant::now();
         tokio::select! {
             biased;
             _ = cancellation_token.cancelled() => {}
             _ = exec.session.services.elicitations.wait_until_clear() => {}
         }
-        emit_failed_code_mode_cell_item(&exec, &call_id, &response, started_at).await;
+        tracing::info!(event.name = "codex.code_mode.dialog_delivery_gate",
+            turn_id = %exec.turn.sub_id, runtime_cell_id = %cell_id,
+            parent_tool_call_id = %call_id,
+            dialog_wait_ms = u64::try_from(dialog_wait_started.elapsed().as_millis()).unwrap_or(u64::MAX),
+            cancelled = cancellation_token.is_cancelled(),
+            scope = "session_wide", "captured cell response finished dialog delivery gate");
+        // Sequence presentation in its owned task, not ahead of retention or
+        // packaging. Even a still-blocked started event must not gate those.
+        let completed_publication = exec.session.terminal_tasks.spawn({
+            let exec = ExecContext { session: Arc::clone(&exec.session), turn: Arc::clone(&exec.turn) };
+            let call_id = call_id.clone();
+            let response = response.clone();
+            let lease = dispatch_lease.clone();
+            async move {
+                started_publication.await?;
+                emit_failed_code_mode_cell_item(&exec, &call_id, &response, started_at).await;
+                drop(lease);
+                Ok::<(), tokio::task::JoinError>(())
+            }
+        });
         let retention_settled = exec
             .session
             .services
@@ -619,6 +644,13 @@ impl CodeModeExecuteHandler {
             super::attach_pending_retention(&mut output, &cell_id, &call_id);
         }
         attach_delivery_decision(&mut output, delivery);
+        // Packaging and retention may overlap presentation, but accepted
+        // finalization still joins every required lifecycle publication.
+        completed_publication.await.map_err(|error| {
+            FunctionCallError::RespondToModel(format!("code-mode completed publication failed: {error}"))
+        })?.map_err(|error| {
+            FunctionCallError::RespondToModel(format!("code-mode started publication failed: {error}"))
+        })?;
         if keep_dispatch_open {
             dispatch_lease.keep_open();
         }

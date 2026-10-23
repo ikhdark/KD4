@@ -1,6 +1,102 @@
 use super::*;
 
 #[test]
+fn early_traceback_keeps_causal_frames_beyond_headline_context() {
+    let mut lines = vec!["Traceback (most recent call last):".to_string()];
+    lines.extend((0..28).map(|index| format!("  causal frame {index}")));
+    lines.push("RuntimeError: operation failed".to_string());
+    lines.extend((0..700).map(|index| format!("later progress {index}")));
+    let output = lines.join("\n");
+    let selected = select_lines(&output, lines.len(), true, false);
+    assert!((0..30).all(|index| selected.indexes.contains(&index)));
+    let summary = summarize_shell_output_for_model(&output, 1, false,
+        ShellOutputSummaryOptions {enabled: true, applied_token_limit: None, command_text: None}).unwrap();
+    assert!(summary.contains("causal frame 10"));
+    assert!(summary.len() <= SUMMARY_MAX_BYTES);
+}
+
+#[test]
+fn clean_cargo_build_receipt_requires_terminal_success_and_preserves_recovery() {
+    let artifacts = (0..100).map(|index| serde_json::json!({
+        "reason":"compiler-artifact", "target":{"name":format!("target-{index}")},
+        "filenames":["long/build/output/path".repeat(10)],
+    }).to_string()).collect::<Vec<_>>().join("\n");
+    let output = format!("{artifacts}\n{{\"reason\":\"build-finished\",\"success\":true}}\n");
+    let summary = structured_compiler_summary_with_streams(&output, 0, false, Some(4_000), None).unwrap();
+    let receipt: serde_json::Value = serde_json::from_str(&summary).unwrap();
+    assert_eq!(receipt["format"], "compiler_build_receipt");
+    assert_eq!(receipt["artifact_count"], 100);
+    assert_eq!(receipt["test_execution"], "not_established");
+    assert_eq!(receipt["recovery_selector"]["end"], output.len());
+    assert!(summary.len() < output.len() / 4);
+    for invalid in [
+        artifacts,
+        output.replace("\"success\":true", "\"success\":false"),
+        format!("{output}{{\"reason\":\"unknown-record\"}}\n"),
+        format!("{output}independent text must not disappear\n"),
+    ] {
+        assert!(structured_compiler_summary_with_streams(&invalid, 0, false, None, None).is_none());
+    }
+    assert!(structured_compiler_summary_with_streams(&output, 1, false, None, None).is_none());
+    assert!(structured_compiler_summary_with_streams(&output, 0, true, None, None).is_none());
+}
+
+#[test]
+fn structured_duplicates_keep_unique_failures_counts_and_bounded_owner_provenance() {
+    let mut records = Vec::new();
+    for index in 0..80 {
+        let mut record: serde_json::Value = serde_json::from_str(&compiler_record("repeated")).unwrap();
+        record["package_id"] = format!("package-{index}").into();
+        record["target"] = serde_json::json!({"name":format!("target-{index}"), "kind":["lib"], "src_path":"src/lib.rs"});
+        records.push(record.to_string());
+    }
+    for message in ["unique one", "unique two", "unique three"] {
+        records.push(compiler_record(message));
+    }
+    let mut changed_span: serde_json::Value = serde_json::from_str(&compiler_record("repeated")).unwrap();
+    changed_span["message"]["spans"][0]["line_start"] = 8.into();
+    records.push(changed_span.to_string());
+    let raw = records.join("\n");
+    let summary = structured_compiler_summary_with_streams(&raw, 1, false, Some(8_000), None).unwrap();
+    let value: serde_json::Value = serde_json::from_str(&summary).unwrap();
+    assert_eq!(value["diagnostic_count"], 84);
+    assert_eq!(value["error_count"], 84);
+    assert_eq!(value["omitted_diagnostics"], 0);
+    let groups = value["diagnostics"].as_array().unwrap();
+    assert_eq!(groups.len(), 5, "factor bodies before the 64-group eviction");
+    assert_eq!(groups[0]["occurrence_count"], 80);
+    assert_eq!(groups[0]["occurrences"].as_array().unwrap().len(), 16);
+    assert_eq!(groups[0]["unlisted_occurrences"], 64);
+    assert_eq!(groups[0]["occurrence_recovery_selector"]["end"], raw.len());
+    assert_eq!(groups[4]["diagnostic"]["spans"][0]["line_start"], 8);
+    for (index, occurrence) in groups[0]["occurrences"].as_array().unwrap().iter().enumerate() {
+        assert_eq!(occurrence["source_line"], index + 1);
+        assert_eq!(occurrence["package_id"], format!("package-{index}"));
+        let selector = &occurrence["recovery_selector"];
+        let start = selector["start"].as_u64().unwrap() as usize;
+        let end = selector["end"].as_u64().unwrap() as usize;
+        assert_eq!(&raw[start..end], records[index]);
+    }
+}
+
+#[test]
+fn ascii_search_matches_independent_window_scan_for_long_near_matches_and_unicode() {
+    for length in [1, 31, 32, 128, 1024] {
+        let mut needle = vec![b'A'; length];
+        needle[length - 1] = b'b';
+        let mut source = vec![b'a'; 8192];
+        assert_eq!(find_ascii_case_bytes(&source, &needle), None);
+        source.extend_from_slice("λ😀".as_bytes());
+        source.extend(needle.iter().map(u8::to_ascii_lowercase));
+        let expected = source.windows(needle.len()).position(|part| part.eq_ignore_ascii_case(&needle));
+        assert_eq!(find_ascii_case_bytes(&source, &needle), expected);
+    }
+    assert_eq!(find_ascii_case_bytes("Éé".as_bytes(), "é".as_bytes()), Some(2));
+    assert_eq!(find_ascii_case_bytes(b"a", b""), None);
+    assert_eq!(find_ascii_case_bytes(b"a", b"longer"), None);
+}
+
+#[test]
 fn audit132_compiler_locations_keep_fatal_and_coded_errors_without_matching_prose() {
     for line in [
         "src/main.c:1:10: fatal error: missing_header.h: No such file or directory",

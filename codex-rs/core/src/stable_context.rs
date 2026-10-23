@@ -94,6 +94,15 @@ fn is_trusted_stable_context_id(id: &ResponseItemId) -> bool {
 /// The deterministic replacement keeps added/done events and response history
 /// aligned without changing ordinary provider IDs or durable local context IDs.
 pub(crate) fn normalize_provider_context_item_id(item: &mut ResponseItem) {
+    if !provider_context_item_id_needs_normalization(item) {
+        return;
+    }
+    if let ResponseItem::Message { id: Some(id), .. } = item {
+        *id = ResponseItemId::with_suffix("msg_provider", id.as_str());
+    }
+}
+
+pub(crate) fn provider_context_item_id_needs_normalization(item: &ResponseItem) -> bool {
     if let ResponseItem::Message { id: Some(id), .. } = item
         && (is_trusted_stable_context_id(id)
             || crate::event_mapping::is_user_input_item_id(id)
@@ -102,7 +111,9 @@ pub(crate) fn normalize_provider_context_item_id(item: &mut ResponseItem) {
             || id.as_str().starts_with("msg_turn_advice_")
             || id.as_str().starts_with("msg_provider_"))
     {
-        *id = ResponseItemId::with_suffix("msg_provider", id.as_str());
+        true
+    } else {
+        false
     }
 }
 
@@ -242,6 +253,9 @@ pub(crate) struct StableContextComponent {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct StableContextManifest {
     components: Arc<[StableContextComponent]>,
+    // Transformation history is not an assembled-prompt component namespace.
+    // Keep it separate so retired slots cannot overwrite active-tail identities.
+    filtering_receipts: Arc<[StableContextComponent]>,
     fingerprint: [u8; 32],
     projection_enabled: bool,
     fail_open: bool,
@@ -250,6 +264,15 @@ pub(crate) struct StableContextManifest {
 impl StableContextManifest {
     pub(crate) fn components(&self) -> &[StableContextComponent] {
         &self.components
+    }
+
+    pub(crate) fn filtering_receipts(&self) -> &[StableContextComponent] {
+        &self.filtering_receipts
+    }
+
+    pub(crate) fn with_filtering_receipts(mut self, receipts: Arc<[StableContextComponent]>) -> Self {
+        self.filtering_receipts = receipts;
+        self
     }
 
     pub(crate) fn fingerprint(&self) -> [u8; 32] {
@@ -304,6 +327,7 @@ impl StableContextManifest {
         Self {
             components: components.into(),
             fingerprint: self.fingerprint,
+            filtering_receipts: Arc::clone(&self.filtering_receipts),
             projection_enabled: self.projection_enabled,
             fail_open: self.fail_open,
         }
@@ -313,6 +337,7 @@ impl StableContextManifest {
         let mut components = self.components.to_vec();
         components.push(base_component(model_slug, base_instructions));
         Self::from_components(components, self.projection_enabled, self.fail_open)
+            .with_filtering_receipts(Arc::clone(&self.filtering_receipts))
     }
 
     pub(crate) fn with_repository_identity(
@@ -334,6 +359,7 @@ impl StableContextManifest {
             }
         }
         Self::from_components(components, self.projection_enabled, self.fail_open)
+            .with_filtering_receipts(Arc::clone(&self.filtering_receipts))
     }
 
     pub(crate) fn add_component_bytes(
@@ -352,6 +378,7 @@ impl StableContextManifest {
             None,
         ));
         Self::from_components(components, self.projection_enabled, self.fail_open)
+            .with_filtering_receipts(Arc::clone(&self.filtering_receipts))
     }
 
     pub(crate) fn add_measured_component(
@@ -373,6 +400,7 @@ impl StableContextManifest {
         );
         components.push(component);
         Self::from_components(components, self.projection_enabled, self.fail_open)
+            .with_filtering_receipts(Arc::clone(&self.filtering_receipts))
     }
 
     /// Inserts the request-dynamic history measurement without rebuilding the
@@ -407,6 +435,7 @@ impl StableContextManifest {
         Self {
             components: components.into(),
             fingerprint: self.fingerprint,
+            filtering_receipts: Arc::clone(&self.filtering_receipts),
             projection_enabled: self.projection_enabled,
             fail_open: self.fail_open,
         }
@@ -428,6 +457,7 @@ impl StableContextManifest {
         Self {
             components: components.into(),
             fingerprint,
+            filtering_receipts: Arc::from([]),
             projection_enabled,
             fail_open,
         }
@@ -800,9 +830,11 @@ pub(crate) fn project_compaction_context(items: Arc<[ResponseItem]>) -> Vec<Resp
 /// the provider re-bills everything after it uncached. Each snapshot states
 /// that it replaces earlier ones; compaction keeps only the latest.
 pub(crate) fn project_sampling_history_context(items: Arc<[ResponseItem]>) -> Vec<ResponseItem> {
+    project_sampling_history_with_receipt(items).items.to_vec()
+}
+
+pub(crate) fn project_sampling_history_with_receipt(items: Arc<[ResponseItem]>) -> StableContextProjection {
     project_stable_context_inner(items, StableContextTarget::Sampling, true, true)
-        .items
-        .to_vec()
 }
 
 fn project_stable_context_inner(
@@ -963,7 +995,7 @@ fn project_items(
     retain_task_state_history: bool,
 ) -> (Vec<ResponseItem>, Vec<StableContextComponent>) {
     let selected_skill_indexes =
-        current_selected_skill_indexes(items, occurrences, latest_real_user);
+        current_selected_skill_indexes(items, occurrences, latest_real_user, retain_task_state_history);
     let mut latest_by_slot = HashMap::<StableContextSlot, usize>::new();
     for (index, occurrence) in occurrences.iter().enumerate() {
         if occurrence.slot != StableContextSlot::SelectedSkill {
@@ -1046,10 +1078,13 @@ fn project_items(
         keep.insert((occurrence.item_index, occurrence.content_index));
     }
     if retain_task_state_history {
+        // Sent replacement/retraction messages change effective authority, not
+        // the acknowledged bytes before them. Collapse trusted slots only at
+        // compaction, where the owner installs a new complete baseline.
         keep.extend(
             occurrences
                 .iter()
-                .filter(|occurrence| occurrence.slot == StableContextSlot::TaskState)
+                .filter(|occurrence| occurrence.slot != StableContextSlot::SelectedSkill)
                 .map(|occurrence| (occurrence.item_index, occurrence.content_index)),
         );
     }
@@ -1302,6 +1337,7 @@ fn current_selected_skill_indexes(
     items: &[ResponseItem],
     occurrences: &[Occurrence],
     latest_real_user: Option<usize>,
+    preserve_revisions: bool,
 ) -> Vec<usize> {
     // An interruption or turn-ID change is not task completion. Share the
     // conservative completion boundary with sampling and compaction; legacy
@@ -1320,13 +1356,44 @@ fn current_selected_skill_indexes(
         .collect::<Vec<_>>();
     if selected.len() > 1 {
         let mut seen = HashSet::new();
+        let mut latest = HashMap::new();
+        let identity = |index: usize| {
+            let occurrence = &occurrences[index];
+            let ResponseItem::Message { role, .. } = &items[occurrence.item_index] else { return None; };
+            // Only an owner-stamped, reserved message identity confers revision
+            // authority. Skill contents or user-supplied lookalike tags cannot.
+            let id = items[occurrence.item_index].id()?;
+            let (source, revision) = id.as_str()
+                .strip_prefix("msg_sctx_skill_revision_v1_")?.split_once('_')?;
+            // ResponseItemId::new appends a unique suffix to the stamped
+            // prefix. Keep accepting legacy unsuffixed identities as well.
+            let revision = match revision.split_once('_') {
+                Some((revision, suffix)) if uuid::Uuid::parse_str(suffix).is_ok() => revision,
+                None => revision,
+                _ => return None,
+            };
+            (source.len() == 24 && revision.len() == 64
+                && source.bytes().chain(revision.bytes()).all(|byte| byte.is_ascii_hexdigit()))
+                .then_some((role.as_str(), source))
+        };
+        if !preserve_revisions {
+            for &index in &selected {
+                if let Some(owner) = identity(index) { latest.insert(owner, index); }
+            }
+        }
+        let mut delivered = HashMap::new();
         selected.retain(|&index| {
             let occurrence = &occurrences[index];
             let ResponseItem::Message { role, .. } = &items[occurrence.item_index] else {
                 return false;
             };
-            // The rendered body includes path and scope. Keep the first exact
-            // occurrence in place; different bodies or authority never coalesce.
+            if let Some(owner) = identity(index) {
+                if !preserve_revisions { return latest.get(&owner) == Some(&index); }
+                // Consecutive equal reads deduplicate; v1 -> v2 -> v1 is a new
+                // authoritative selection, not a duplicate of its first body.
+                return delivered.insert(owner, occurrence.text(items)) != Some(occurrence.text(items));
+            }
+            // Legacy/foreign fragments without an owner identity stay independent.
             seen.insert((role.as_str(), occurrence.text(items)))
         });
     }

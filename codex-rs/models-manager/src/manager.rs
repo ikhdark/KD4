@@ -169,14 +169,16 @@ impl ModelCatalogActivity {
         self.initial_refresh_ready.send_replace(true);
     }
 
-    async fn note_activity(&self) {
-        self.activated.send_replace(true);
-        let should_wait = self
-            .initial_refresh_deadline
+    fn initial_refresh_wait_is_due(&self) -> bool {
+        self.initial_refresh_deadline
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .is_some_and(|deadline| Instant::now() >= deadline);
-        if !should_wait {
+            .is_some_and(|deadline| Instant::now() >= deadline)
+    }
+
+    async fn note_activity(&self) {
+        self.activated.send_replace(true);
+        if !self.initial_refresh_wait_is_due() {
             return;
         }
         let mut ready = self.initial_refresh_ready.subscribe();
@@ -1024,12 +1026,31 @@ impl OpenAiModelsManager {
                 .is_some_and(|deadline| Instant::now() < deadline)
     }
 
+    #[expect(
+        clippy::await_holding_invalid_type,
+        reason = "Eligible disk loads join the refresh transaction only when the gate is free"
+    )]
     async fn note_catalog_activity(&self, strategy: RefreshStrategy) {
         // A periodic refresh must not hold up a consumer that can already use
         // an unexpired snapshot for the current account/provider. Identity
         // changes reset freshness before this check; explicit online requests
         // and cold/expired caches still join the first-refresh gate.
         self.ensure_current_cache_identity().await;
+        if strategy != RefreshStrategy::Online
+            && self.model_catalog_activity.initial_refresh_wait_is_due()
+            && !self.memory_is_fresh().await
+        {
+            // Cold readers should evaluate an eligible disk snapshot before
+            // joining the initial network refresh. Never queue behind a refresh
+            // transaction. Without an active gate there is nothing to bypass:
+            // read-only metadata lookups must remain free of disk I/O and
+            // exclusive state publication, even when memory is not fresh.
+            if let Ok(_refresh) = self.refresh_gate.try_lock()
+                && let Err(err) = self.try_load_cache_locked().await
+            {
+                error!("models cache unavailable before initial refresh: {err}");
+            }
+        }
         if strategy != RefreshStrategy::Online && self.memory_is_fresh().await {
             self.model_catalog_activity.note_activity_without_waiting();
         } else {

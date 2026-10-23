@@ -698,6 +698,15 @@ pub fn rg_search_path_indices(argv: &[String]) -> Option<Vec<usize>> {
 /// Bounded advisory candidates only; no search results are inferred from this
 /// directory walk. The caller excludes Git-ignored candidates separately.
 pub fn skipped_hidden_rg_directories(script: &str, cwd: &Path) -> Vec<PathBuf> {
+    skipped_hidden_rg_directories_with_cancellation(script, cwd, CancellationToken::new())
+}
+
+pub fn skipped_hidden_rg_directories_with_cancellation(
+    script: &str,
+    cwd: &Path,
+    cancellation: CancellationToken,
+) -> Vec<PathBuf> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(25);
     let Some(argv) = codex_shell_command::validation::standalone_argv(script) else {
         return Vec::new();
     };
@@ -719,16 +728,26 @@ pub fn skipped_hidden_rg_directories(script: &str, cwd: &Path) -> Vec<PathBuf> {
     };
     let mut found = std::collections::BTreeSet::new();
     let mut inspected = 0;
-    for root in roots.into_iter().filter(|root| root.is_dir()) {
+    for root in roots {
+        if cancellation.is_cancelled() || std::time::Instant::now() >= deadline {
+            break;
+        }
+        if !root.is_dir() {
+            continue;
+        }
         let mut walk = walkdir::WalkDir::new(&root)
             .follow_links(false)
-            .sort_by_file_name()
             .into_iter();
-        while let Some(entry) = walk.next() {
-            inspected += 1;
-            if inspected > 2048 || found.len() >= 16 {
+        loop {
+            if cancellation.is_cancelled()
+                || std::time::Instant::now() >= deadline
+                || inspected >= 2048
+                || found.len() >= 16
+            {
                 return found.into_iter().collect();
             }
+            let Some(entry) = walk.next() else { break };
+            inspected += 1;
             let Ok(entry) = entry else { continue };
             if entry.depth() == 0 || !entry.file_type().is_dir() {
                 continue;
@@ -1183,6 +1202,17 @@ mod deadline_tests {
                 "{command}"
             );
         }
+    }
+
+    #[test]
+    fn hidden_rg_advisory_honors_cancellation_before_traversal() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join(".hidden")).unwrap();
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+        assert!(skipped_hidden_rg_directories_with_cancellation(
+            "rg needle .", root.path(), cancellation,
+        ).is_empty());
     }
 
     #[test]

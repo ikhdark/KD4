@@ -52,6 +52,12 @@ impl ToolExecutor<ToolInvocation> for WaitForEnvironmentHandler {
         ToolName::plain(WAIT_FOR_ENVIRONMENT_TOOL_NAME)
     }
 
+    fn supports_parallel_tool_calls(&self) -> bool {
+        // Readiness waits observe an already-started environment; they do not
+        // mutate the workspace or need the global exclusive admission lease.
+        true
+    }
+
     fn spec(&self) -> ToolSpec {
         ToolSpec::Function(ResponsesApiTool {
             name: WAIT_FOR_ENVIRONMENT_TOOL_NAME.to_string(),

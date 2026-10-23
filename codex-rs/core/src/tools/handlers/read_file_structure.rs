@@ -11,11 +11,108 @@ use super::code_sections::CodeItem;
 use crate::tools::command_output_artifact::ReadToolOutputError;
 use crate::tools::command_output_artifact::ToolOutputSelector;
 
-#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+// Derived syntax only: this cache never authenticates a filesystem read. The
+// caller has already acquired and hashed its canonical bytes. Path remains in
+// the key because linked module identities depend on source context. The
+// parser/schema revision is binary-local, so a new build starts with no cache.
+struct ParsedSource {
+    path: String,
+    sha256: String,
+    items: Vec<CodeItem>,
+    bytes: usize,
+}
+
+static PARSED_SOURCES: std::sync::LazyLock<std::sync::Mutex<std::collections::VecDeque<ParsedSource>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::VecDeque::new()));
+const PARSED_SOURCE_CACHE_BYTES: usize = 16 * 1024 * 1024;
+
+#[cfg(test)]
+thread_local! { static SOURCE_PARSE_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
+
+fn parsed_source(path: &str, source: &str, sha256: &str) -> Option<(Vec<CodeItem>, bool)> {
+    if let Some(items) = PARSED_SOURCES.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+        .iter().find(|entry| entry.path == path && entry.sha256 == sha256)
+        .map(|entry| entry.items.clone())
+    {
+        return Some((items, true));
+    }
+    #[cfg(test)]
+    SOURCE_PARSE_COUNT.with(|count| count.set(count.get() + 1));
+    // Parsing and allocation never hold the cache lock. Concurrent cold misses
+    // may parse twice rather than serialize unrelated readers behind a parser.
+    let (items, complete) = code_sections::parse_with_completeness(
+        path, source, sha256, Instant::now() + Duration::from_secs(2),
+    )?;
+    let bytes = path.len().saturating_add(sha256.len()).saturating_add(
+        items.iter().map(|item| {
+            std::mem::size_of::<CodeItem>() + item.id.capacity() + item.name.capacity()
+                + item.qualified_name.capacity() + item.signature.capacity()
+                + item.linked_path.as_ref().map_or(0, String::capacity)
+                + item.trait_method_alias.as_ref().map_or(0, String::capacity)
+                + item.linked_path_candidates.capacity() * std::mem::size_of::<String>()
+                + item.linked_path_candidates.iter().map(String::capacity).sum::<usize>()
+        }).sum::<usize>(),
+    );
+    // Timeout/failure and recovered syntax must never become a complete hit.
+    if complete && bytes <= PARSED_SOURCE_CACHE_BYTES {
+        let mut cache = PARSED_SOURCES.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !cache.iter().any(|entry| entry.path == path && entry.sha256 == sha256) {
+            while cache.len() >= 32 || cache.iter().map(|entry| entry.bytes).sum::<usize>()
+                .saturating_add(bytes) > PARSED_SOURCE_CACHE_BYTES
+            { cache.pop_front(); }
+            cache.push_back(ParsedSource { path: path.into(), sha256: sha256.into(), items: items.clone(), bytes });
+        }
+    }
+    Some((items, complete))
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(untagged)]
 pub(super) enum FileSelector {
     Structure(StructureSelector),
     Exact(ToolOutputSelector),
+}
+
+const FILE_SELECTOR_KINDS: &str =
+    "bytes, lines, search, section, json_pointer, symbol or enclosing";
+
+/// Decodes as `#[serde(untagged)]` did (structure, then exact), but a
+/// rejection names the selector's own problem. Untagged decoding said only
+/// "did not match any variant", so a guessed kind was retried blind.
+impl<'de> Deserialize<'de> for FileSelector {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = serde_json::Value::deserialize(deserializer)?;
+        let kind = value.get("kind").and_then(serde_json::Value::as_str);
+        // The outline is advertised as a section; models also spell it as its
+        // own kind. Only that bare spelling is an alias.
+        if kind == Some("outline") && value.as_object().is_some_and(|fields| fields.len() == 1) {
+            return Ok(Self::Exact(ToolOutputSelector::Section {
+                id: "outline".to_string(),
+            }));
+        }
+        let structure = match StructureSelector::deserialize(&value) {
+            Ok(selector) => return Ok(Self::Structure(selector)),
+            Err(error) => error,
+        };
+        let exact = match ToolOutputSelector::deserialize(&value) {
+            Ok(selector) => return Ok(Self::Exact(selector)),
+            Err(error) => error,
+        };
+        Err(serde::de::Error::custom(match kind {
+            Some("symbol" | "enclosing" | "search") => structure.to_string(),
+            Some("bytes" | "lines" | "section" | "json_pointer") => exact.to_string(),
+            Some(other) => format!(
+                "unsupported read_file selector kind `{}`; use one of {FILE_SELECTOR_KINDS} ({{\"kind\":\"section\",\"id\":\"outline\"}} lists Rust/Python items)",
+                other.chars().take(64).collect::<String>()
+            ),
+            None => {
+                format!("read_file selectors need a string `kind`: one of {FILE_SELECTOR_KINDS}")
+            }
+        }))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
@@ -218,22 +315,28 @@ pub(super) fn resolve_batch(
             )
         )
     });
-    let items = needs_items
+    let parsed = needs_items
         .then(|| {
             std::str::from_utf8(&canonical.bytes)
                 .ok()
                 .and_then(|source| {
-                    code_sections::parse(
-                        path,
-                        source,
-                        &canonical.sha256,
-                        Instant::now() + Duration::from_secs(2),
-                    )
+                    parsed_source(path, source, &canonical.sha256)
                 })
         })
         .flatten();
+    let parse_complete = parsed.as_ref().is_some_and(|(_, complete)| *complete);
+    let items = parsed.map(|(items, _)| items);
     if let Some(items) = &items {
         canonical.sections = code_sections::sections(items);
+        for section in &mut canonical.sections {
+            if let Some(value) = section.value.as_mut() {
+                value["parse_complete"] = parse_complete.into();
+                if !parse_complete {
+                    value["warning"] = "Parser recovery omitted unindexed syntax; use exact bytes or lines for full source coverage.".into();
+                    value["fallback"] = serde_json::json!({"kind":"bytes", "start":0, "end":canonical.exact_bytes});
+                }
+            }
+        }
     }
     let mut resolved = Vec::new();
     let mut failures = Vec::new();
@@ -372,10 +475,21 @@ pub(super) fn resolve_batch(
                     }
                     // This index covers selected declarations, not every symbol.
                     if candidate_count == 0 && items.is_some() {
-                        let leaf = name.rsplit([':', '.']).next().unwrap_or(name);
-                        elsewhere = Some(format!(
-                            " No matching indexed item for {leaf:?} in this snapshot. Assignments, fields, variants and generated items may not be indexed. Use fixed-string search or lines on this retained snapshot; widen the search if needed."
-                        ));
+                        if name.eq_ignore_ascii_case("outline") {
+                            // Recorded sessions asked for the item listing as a
+                            // symbol. Every parsed snapshot has the outline section.
+                            candidate_count += 1;
+                            candidates.push(serde_json::json!({"qualified_name":"outline",
+                                "selector":{"kind":"section", "id":"outline"}}));
+                            message_suffix = Some(
+                                " The outline is a section, not a symbol: the candidate {\"kind\":\"section\",\"id\":\"outline\"} lists this file's items.",
+                            );
+                        } else {
+                            let leaf = name.rsplit([':', '.']).next().unwrap_or(name);
+                            elsewhere = Some(format!(
+                                " No matching indexed item for {leaf:?} in this snapshot. Assignments, fields, variants and generated items may not be indexed. Use fixed-string search or lines on this retained snapshot; widen the search if needed."
+                            ));
+                        }
                     }
                 } else if let FileSelector::Structure(StructureSelector::Enclosing { line }) =
                     &selector
@@ -621,6 +735,50 @@ mod tests {
             assert!(!message.contains("defined in another file"));
             assert_eq!(failures[0]["source_sha256"], canonical.sha256);
         }
+    }
+
+    #[test]
+    fn outline_requested_as_a_symbol_offers_the_outline_section() {
+        // Recorded sessions sent {kind:"symbol",name:"outline"} and received an
+        // empty candidate list; the item listing is the outline section.
+        let symbol = |name: &str| {
+            Some(vec![FileSelector::Structure(StructureSelector::Symbol {
+                name: name.into(),
+            })])
+        };
+        for name in ["outline", "Outline"] {
+            let mut canonical = CanonicalToolResult::text("fn present() {}\n".to_owned());
+            let (ranges, failures, bindings) = resolve_batch("lib.rs", &mut canonical, symbol(name));
+            assert_eq!(ranges, Some(Vec::new()), "a candidate is never executed");
+            assert!(bindings.is_empty());
+            assert_eq!(
+                failures[0]["candidates"],
+                serde_json::json!([{"qualified_name":"outline",
+                    "selector":{"kind":"section","id":"outline"}}])
+            );
+            assert_eq!(failures[0]["omitted_candidates"], 0);
+            // A valid read_file selector for a section this snapshot has.
+            let selector = failures[0]["candidates"][0]["selector"].clone();
+            assert_eq!(
+                serde_json::from_value::<FileSelector>(selector).unwrap(),
+                FileSelector::Exact(ToolOutputSelector::Section {
+                    id: "outline".into()
+                })
+            );
+            assert!(canonical.sections.iter().any(|section| section.id == "outline"));
+            let message = failures[0]["message"].as_str().unwrap();
+            assert!(message.contains("not a symbol"), "{message}");
+            assert!(!message.contains("fixed-string search"), "{message}");
+        }
+        // An item really named outline still resolves as a symbol.
+        let mut canonical = CanonicalToolResult::text("fn outline() {}\n".to_owned());
+        let (ranges, failures, _) = resolve_batch("lib.rs", &mut canonical, symbol("outline"));
+        assert!(failures.is_empty(), "{failures:?}");
+        assert_eq!(ranges, Some(vec![ToolOutputSelector::Lines { start: 1, end: 1 }]));
+        // Without parsed items there is no outline section to offer.
+        let mut canonical = CanonicalToolResult::text("outline\n".to_owned());
+        let (_, failures, _) = resolve_batch("notes.txt", &mut canonical, symbol("outline"));
+        assert_eq!(failures[0]["candidates"], serde_json::json!([]));
     }
 
     #[test]
@@ -1056,5 +1214,38 @@ mod tests {
                 .contains("No matching indexed item"),
             "{errors:?}"
         );
+    }
+}
+#[cfg(test)]
+mod source_cache_regressions {
+    use super::*;
+    use sha2::Digest;
+
+    #[test]
+    fn immutable_syntax_is_reused_but_changed_bytes_and_paths_are_not() {
+        let source = "mod neighboring;\nfn cached_fixture() {}\n";
+        let sha = hex::encode(sha2::Sha256::digest(source));
+        SOURCE_PARSE_COUNT.with(|count| count.set(0));
+        let first = parsed_source("/cache-fixture/a/mod.rs", source, &sha).unwrap();
+        let second = parsed_source("/cache-fixture/a/mod.rs", source, &sha).unwrap();
+        assert_eq!(SOURCE_PARSE_COUNT.with(std::cell::Cell::get), 1);
+        assert_eq!(serde_json::to_value(&first).unwrap(), serde_json::to_value(&second).unwrap());
+        let elsewhere = parsed_source("/cache-fixture/b/mod.rs", source, &sha).unwrap();
+        assert_ne!(first.0[0].linked_path_candidates, elsewhere.0[0].linked_path_candidates);
+        let changed = "fn changed_cache_fixture() {}\n";
+        let changed_sha = hex::encode(sha2::Sha256::digest(changed));
+        let result = parsed_source("/cache-fixture/a/mod.rs", changed, &changed_sha).unwrap();
+        assert_eq!(result.0[0].name, "changed_cache_fixture");
+        assert_eq!(SOURCE_PARSE_COUNT.with(std::cell::Cell::get), 3);
+    }
+
+    #[test]
+    fn syntax_recovery_is_never_cached_as_complete() {
+        let source = "fn invalid_cache_fixture( {";
+        let sha = hex::encode(sha2::Sha256::digest(source));
+        SOURCE_PARSE_COUNT.with(|count| count.set(0));
+        let _ = parsed_source("/cache-fixture/incomplete.rs", source, &sha);
+        let _ = parsed_source("/cache-fixture/incomplete.rs", source, &sha);
+        assert_eq!(SOURCE_PARSE_COUNT.with(std::cell::Cell::get), 2);
     }
 }

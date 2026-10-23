@@ -120,7 +120,7 @@ fn check(
         {
             return Err(rejected_build(
                 &format!(
-                    "Cannot resolve a raw Cargo build's effective target through this script; the `{}` clause would build. Use a standalone Cargo command with an explicit workdir so configuration and directory ownership can be resolved.",
+                    "Cannot resolve a raw Cargo build's effective target through this script; the `{}` clause would build. Run each Cargo command as its own standalone call with an explicit workdir, setting environment through the call rather than the script, so configuration and directory ownership can be resolved. Do not wait for or poll other Cargo processes first: Cargo waits on its own build lock, and the harness reports or queues a busy validation holder itself.",
                     offending.join(" ")
                 ),
                 cwd,
@@ -136,7 +136,7 @@ fn check(
         };
         if parsed.is_none() && !inspection_only && visible_build {
             return Err(rejected_build(
-                "Cannot resolve a raw Cargo build's effective target through this script, which names a Cargo build token but could not be parsed into separate commands. Reissue it as standalone argv, or as a command whose program is recognizably read-only, so the effective target can be resolved.",
+                "Cannot resolve a raw Cargo build's effective target through this script, which names a Cargo build token but could not be parsed into separate commands. Reissue each Cargo command as standalone argv, or as a command whose program is recognizably read-only, so the effective target can be resolved. Do not wrap it in a wait for or poll of other Cargo processes: Cargo waits on its own build lock, and the harness reports or queues a busy validation holder itself.",
                 cwd,
             ));
         }
@@ -1458,6 +1458,40 @@ mod tests {
             error.contains("cargo build"),
             "rejection should name the offending clause: {error}"
         );
+    }
+
+    #[test]
+    fn wait_then_build_scripts_are_steered_to_standalone_calls_not_polling() {
+        let root = fixture();
+        let cwd = root.path().join("codex-rs");
+        // Scripts saved sessions wrote to wait out another session's build.
+        for script in [
+            "$p = @(Get-Process -Name cargo -ErrorAction SilentlyContinue); foreach ($item in $p) { Wait-Process -Id $item.Id -ErrorAction SilentlyContinue }; cargo check --locked -p kda --lib --bins --tests",
+            "$holder = Get-Process -Id 19156 -ErrorAction SilentlyContinue; if ($holder) { $holder | Wait-Process -Timeout 240 -ErrorAction Stop }; cargo check --locked -p kda --lib --bins --tests",
+            "cargo check --locked -p kda-bench --all-targets; $bench = $LASTEXITCODE; Write-Output \"BENCH_CHECK_EXIT=$bench\"; cargo check --locked -p kda --lib --bins --tests",
+        ] {
+            let error = check(
+                &["pwsh".into(), "-Command".into(), script.into()],
+                &cwd,
+                &HashMap::new(),
+                0,
+            )
+            .expect_err("an unresolvable build script must still be rejected");
+            assert!(
+                error.contains("Raw Cargo launch rejected; no build started"),
+                "{script}: {error}"
+            );
+            assert!(error.contains("standalone"), "{script}: {error}");
+            assert!(
+                error.contains("Do not wait for or poll")
+                    || error.contains("Do not wrap it in a wait for or poll"),
+                "the rejection must not leave a wait script as the workaround: {error}"
+            );
+            assert!(
+                error.contains("harness reports or queues a busy validation holder"),
+                "{script}: {error}"
+            );
+        }
     }
 
     #[cfg(windows)]

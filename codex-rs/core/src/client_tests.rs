@@ -1,5 +1,8 @@
 use super::AuthRequestTelemetryContext;
 
+#[path = "client_queue_timing_tests.rs"]
+mod queue_timing_tests;
+
 #[test]
 fn websocket_identity_ignores_assertion_time_but_not_authority_or_route() {
     struct TimestampedAssertion {
@@ -117,6 +120,7 @@ use super::websocket_connection_expiring;
 use crate::AttestationContext;
 use crate::AttestationProvider;
 use crate::GenerateAttestationFuture;
+use crate::client_common::PromptDigests;
 use crate::context::PromptContextCategory;
 use crate::context::PromptProvenanceSidecar;
 use crate::responses_metadata::CodexResponsesMetadata;
@@ -762,6 +766,119 @@ async fn model_http_transport_preserves_system_proxy_redirect_handoff() {
     assert_eq!(client.state.http_clients.cached_route_count(), 1);
 }
 
+#[tokio::test]
+async fn prepared_turn_stays_on_http_after_cooldown_and_new_turn_retries_websockets() {
+    let server = MockServer::start().await;
+    let sse = concat!(
+        "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"r\"}}\n\n",
+        "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"r\"}}\n\n",
+    );
+    Mock::given(method("POST"))
+        .and(path("/v1/responses"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(sse, "text/event-stream"))
+        .expect(2)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/v1/responses"))
+        .respond_with(ResponseTemplate::new(400))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let mut provider =
+        create_oss_provider_with_base_url(&format!("{}/v1", server.uri()), WireApi::Responses);
+    provider.supports_websockets = true;
+    let client = ModelClient::new(
+        None,
+        AgentIdentityAuthPolicy::JwtOnly,
+        ThreadId::new(),
+        provider,
+        SessionSource::Cli,
+        "test".into(),
+        None,
+        false,
+        false,
+        None,
+        false,
+        None,
+        HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault),
+    );
+    let telemetry = test_session_telemetry();
+    let model = test_model_info();
+    let prompt = Prompt::default();
+    let trace = InferenceTraceContext::disabled();
+    let metadata = test_responses_metadata_for_client(
+        &client,
+        None,
+        "window".into(),
+        None,
+        TestCodexResponsesRequestKind::Turn,
+    );
+    let mut session = client.new_session();
+    session.last_stream_transport = Some(ModelAttemptTransport::ResponsesWebsocket);
+    let error = codex_api::map_api_error(ApiError::Transport(TransportError::ConnectionTimeout));
+    assert!(session.try_switch_fallback_transport_after_error(&telemetry, &error));
+    for continuation in 0..2 {
+        if continuation == 1 {
+            tokio::time::pause();
+            tokio::time::advance(Duration::from_secs(61)).await;
+            tokio::time::resume();
+            assert!(client.responses_websocket_enabled());
+        }
+        let mut stream = session
+            .stream_with_attempt_prepared(
+                &prompt,
+                &model,
+                &telemetry,
+                None,
+                codex_protocol::config_types::ReasoningSummary::None,
+                None,
+                &metadata,
+                &trace,
+                None,
+            )
+            .await
+            .unwrap();
+        while let Some(event) = stream.next().await {
+            event.unwrap();
+        }
+        assert_eq!(
+            session.last_stream_transport,
+            Some(ModelAttemptTransport::ResponsesHttp)
+        );
+    }
+    assert_eq!(session.logical_sampling_request_count, 2);
+    let mut next_turn = client.new_session();
+    assert!(!next_turn.http_for_turn);
+    let result = next_turn
+        .stream_with_attempt_prepared(
+            &prompt,
+            &model,
+            &telemetry,
+            None,
+            codex_protocol::config_types::ReasoningSummary::None,
+            None,
+            &metadata,
+            &trace,
+            None,
+        )
+        .await;
+    assert!(
+        result.is_err(),
+        "the new turn must try the fixture's rejected upgrade"
+    );
+    assert_eq!(
+        next_turn.last_stream_transport,
+        Some(ModelAttemptTransport::ResponsesWebsocket)
+    );
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(
+        requests.len(),
+        3,
+        "two model dispatches and one transport-only upgrade"
+    );
+}
+
 fn websocket_test_model_client() -> ModelClient {
     let mut provider =
         create_oss_provider_with_base_url("https://example.com/v1", WireApi::Responses);
@@ -1312,6 +1429,145 @@ async fn turn_preconnect_join_reports_failure_once_without_another_connection() 
 }
 
 #[tokio::test]
+async fn prepared_dispatch_charges_failed_preconnect_and_standalone_keeps_best_effort_recovery() {
+    use crate::test_harness::responses::ev_completed;
+    use crate::test_harness::responses::start_websocket_server;
+    use tokio::io::AsyncReadExt;
+    use tokio::io::AsyncWriteExt;
+    use tokio::net::TcpListener;
+    use tokio::net::TcpStream;
+    use tokio_util::sync::CancellationToken;
+    use tokio_util::task::AbortOnDropHandle;
+
+    for persistent in [false, true] {
+        for max_retries in [0, 1] {
+            let server = start_websocket_server(vec![vec![vec![ev_completed("recovered")]]]).await;
+            let upstream = server.uri().strip_prefix("ws://").unwrap().to_string();
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let forwarding = AbortOnDropHandle::new(tokio::spawn(async move {
+                for attempt in 0..if persistent { 1 } else { 2 } {
+                    let (mut socket, _) = listener.accept().await.unwrap();
+                    if attempt == 1 && !persistent {
+                        let mut backend = TcpStream::connect(&upstream).await.unwrap();
+                        let _ = tokio::io::copy_bidirectional(&mut socket, &mut backend).await;
+                        break;
+                    }
+                    let mut request = Vec::new();
+                    while !request.ends_with(b"\r\n\r\n") {
+                        assert!(request.len() < 16_384);
+                        request.push(socket.read_u8().await.unwrap());
+                    }
+                    assert!(request.starts_with(b"GET "));
+                    socket.write_all(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await.unwrap();
+                    socket.shutdown().await.unwrap();
+                }
+            }));
+            let mut provider = create_oss_provider_with_base_url(
+                &format!("http://{address}/v1"),
+                WireApi::Responses,
+            );
+            provider.supports_websockets = true;
+            provider.request_max_retries = Some(0);
+            provider.stream_max_retries = Some(max_retries);
+            let client = ModelClient::new(
+                None,
+                AgentIdentityAuthPolicy::JwtOnly,
+                ThreadId::new(),
+                provider,
+                SessionSource::Cli,
+                "test".into(),
+                None,
+                false,
+                false,
+                None,
+                false,
+                None,
+                HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault),
+            );
+            let metadata = test_responses_metadata_for_client(
+                &client,
+                None,
+                "window".into(),
+                None,
+                TestCodexResponsesRequestKind::Turn,
+            );
+            let mut session = client.new_session();
+            let model = test_model_info();
+            let telemetry = test_session_telemetry();
+            session
+                .start_websocket_preconnect(&model, None, &telemetry, &metadata)
+                .await;
+            let result = if persistent { session
+                .stream_with_attempt_prepared(
+                    &Prompt::default(),
+                    &model,
+                    &telemetry,
+                    None,
+                    codex_protocol::config_types::ReasoningSummary::None,
+                    None,
+                    &metadata,
+                    &InferenceTraceContext::disabled(),
+                    None,
+                )
+                .await } else {
+                    session.stream(&Prompt::default(), &model, &telemetry, None,
+                        codex_protocol::config_types::ReasoningSummary::None, None, &metadata,
+                        &InferenceTraceContext::disabled()).await
+                };
+            assert_eq!(session.logical_sampling_request_count, if persistent { 0 } else { 1 });
+            assert!(session.pending_websocket_preconnect.is_none());
+            if persistent {
+                let error = result.err().expect("same-setup speculative failure reaches the retry owner without another dial");
+                let (sess, turn) = crate::session::tests::make_session_and_context().await;
+                let mut retry = crate::responses_retry::ResponsesStreamRetryState::default();
+                tokio::time::pause();
+                let started = tokio::time::Instant::now();
+                crate::responses_retry::handle_retryable_response_stream_error(
+                    &mut retry,
+                    max_retries,
+                    error,
+                    &mut session,
+                    &sess,
+                    &turn,
+                    crate::responses_retry::ResponsesStreamRequest::Sampling,
+                    &CancellationToken::new(),
+                )
+                .await
+                .unwrap();
+                assert_eq!(
+                    started.elapsed(),
+                    Duration::ZERO,
+                    "no extra backoff before fallback"
+                );
+                assert!(!client.responses_websocket_enabled());
+                assert!(
+                    !session.take_preconnect_failure_credit(),
+                    "the receipt is single use"
+                );
+                tokio::time::resume();
+            } else {
+                let mut stream = result
+                    .expect("ordinary zero-budget dispatch recovers from speculative failure");
+                let mut completed = false;
+                while let Some(event) = stream.next().await {
+                    completed |= matches!(event.unwrap(), ResponseEvent::Completed { .. });
+                }
+                assert!(completed);
+                assert!(!session.take_preconnect_failure_credit());
+                assert!(client.responses_websocket_enabled());
+            }
+            drop(session);
+            server.shutdown().await;
+            tokio::time::timeout(Duration::from_secs(5), forwarding)
+                .await
+                .unwrap()
+                .unwrap();
+        }
+    }
+}
+
+#[tokio::test]
 async fn turn_preconnect_failure_yields_to_an_already_selected_http_transport() {
     let client = websocket_test_model_client();
     let mut session = client.new_session();
@@ -1800,6 +2056,253 @@ fn model_request_measurements_count_serialized_tools_independently() {
     );
     assert!(measured.producer_selected_context_tokens() <= categories.logical_total);
     assert!(measured.density_bps(measured.producer_selected_context_tokens()) <= 10_000);
+}
+
+#[test]
+fn token_cache_audit_lite_schema_breakdown_matches_full_requests() {
+    let tool = json!({
+        "type": "function", "name": "lookup", "description": "Look up a record",
+        "parameters": {"type": "object", "properties": {}}
+    });
+    let mut full = history_test_request(vec![history_test_item("lookup a record", None)]);
+    full.tools = Some(vec![tool.clone()].into());
+    let expected = ModelRequestMeasurements::for_responses_request(
+        &full,
+        &history_test_provenance(&full),
+        &full.instructions,
+    )
+    .unwrap();
+    let mut lite = full.clone();
+    lite.tools = None;
+    lite.input = vec![
+        ResponseItem::AdditionalTools {
+            id: None,
+            role: "developer".into(),
+            tools: vec![tool.clone()],
+        },
+        history_test_item("lookup a record", None),
+    ]
+    .into();
+    for encoded in [false, true] {
+        let bytes = serde_json::to_vec(&lite).unwrap();
+        let measured = if encoded {
+            ModelRequestMeasurements::for_responses_request_from_encoded_cancellable(
+                &lite,
+                &history_test_provenance(&lite),
+                &lite.instructions,
+                None,
+                &bytes,
+                bytes.len() as u64,
+            )
+            .unwrap()
+        } else {
+            ModelRequestMeasurements::for_responses_request(
+                &lite,
+                &history_test_provenance(&lite),
+                &lite.instructions,
+            )
+            .unwrap()
+        };
+        assert_eq!(measured.tool_schema_breakdown.len(), 1);
+        assert_eq!(measured.tool_schema_breakdown[0].name, "lookup");
+        assert_eq!(
+            measured.tool_schema_breakdown[0].serialized_bytes,
+            expected.tool_schema_breakdown[0].serialized_bytes
+        );
+        assert_eq!(
+            measured.tool_schema_breakdown[0].approx_tokens,
+            expected.tool_schema_breakdown[0].approx_tokens
+        );
+        let selected = selected_tool_schema_breakdown(
+            &measured.tool_schema_breakdown,
+            &[ResponseItem::FunctionCall {
+                id: None,
+                call_id: "lookup-call".into(),
+                name: "lookup".into(),
+                namespace: None,
+                arguments: "{}".into(),
+                internal_chat_message_metadata_passthrough: None,
+            }],
+        );
+        assert!(selected[0].selected_by_model);
+    }
+}
+
+#[tokio::test]
+async fn token_cache_audit_reuses_only_complete_matching_serialized_history() {
+    use crate::client_common::DeferredDynamicHistoryMeasurement;
+
+    for case in ["full", "missing", "incremental", "reprojected", "cancelled"] {
+        let input = vec![history_test_item(&"source λ \"line\"\n".repeat(2048), None)];
+        let mut request = history_test_request(input.clone());
+        if case == "reprojected" {
+            request.input = vec![history_test_item("fallback history", None)].into();
+        }
+        let measurement = DeferredDynamicHistoryMeasurement::new(0, 0);
+        let prompt = Prompt {
+            input: input.into(),
+            deferred_dynamic_history: Some(measurement.clone()),
+            ..Prompt::default()
+        };
+        let mut reference = prompt.clone();
+        reference.deferred_dynamic_history = Some(DeferredDynamicHistoryMeasurement::new(0, 0));
+        let expected = reference.measured_stable_context_manifest();
+        let bytes = if case == "missing" {
+            None
+        } else if case == "incremental" {
+            let mut value = serde_json::to_value(&request).unwrap();
+            value["input"] = json!([]);
+            Some(serde_json::to_vec(&value).unwrap().into())
+        } else {
+            Some(serde_json::to_vec(&request).unwrap().into())
+        };
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        if case == "cancelled" {
+            cancellation.cancel();
+        }
+        let result = super::measure_responses_request_after_dispatch(
+            request,
+            prompt.clone(),
+            super::SelectedInputRepresentation::default(),
+            cancellation,
+            None,
+            bytes,
+            None,
+            Arc::new(
+                Arc::new(tokio::sync::Semaphore::new(1))
+                    .try_acquire_owned()
+                    .unwrap(),
+            ),
+        )
+        .await
+        .unwrap();
+        if case == "cancelled" {
+            assert!(result.measurements.prompt_context_categories.is_empty());
+            assert_eq!(measurement.serialization_count(), 0);
+            continue;
+        }
+        assert!(
+            !result.measurements.prompt_context_categories.is_empty(),
+            "{case}"
+        );
+        let components = |manifest: &StableContextManifest| {
+            manifest
+                .components()
+                .iter()
+                .map(|component| {
+                    (
+                        component.kind,
+                        component.identity.clone(),
+                        component.active,
+                        component.disposition,
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            components(&result.stable_context_manifest),
+            components(&expected),
+            "{case}"
+        );
+        assert_eq!(
+            measurement.serialization_count(),
+            usize::from(case != "full"),
+            "{case}"
+        );
+        // A transport retry sharing the prompt must retain the same lazy cache.
+        assert_eq!(
+            components(&prompt.measured_stable_context_manifest()),
+            components(&expected)
+        );
+        assert_eq!(
+            measurement.serialization_count(),
+            usize::from(case != "full"),
+            "{case}"
+        );
+    }
+}
+
+#[test]
+fn token_cache_audit_discovery_schemas_do_not_rewrite_the_fixed_prefix() {
+    for receipt in [false, true] {
+        for encoded in [false, true] {
+            let tools = if receipt {
+                vec![json!({"type": "tool_search_receipt", "receipt": {"call_id": "search"}})]
+            } else {
+                vec![
+                    json!({"type": "function", "name": "lookup", "description": "Lookup",
+                    "parameters": {"type": "object", "properties": {}}}),
+                ]
+            };
+            let initial = history_test_request(vec![history_test_item("task", None)]);
+            let mut baseline = None;
+            let mut previous = ModelRequestMeasurements::for_responses_request(
+                &initial,
+                &history_test_provenance(&initial),
+                &initial.instructions,
+            )
+            .unwrap();
+            previous.compare_and_remember_prompt_context(
+                &mut baseline,
+                None,
+                PromptDigests::default(),
+            );
+            let output = ResponseItem::ToolSearchOutput {
+                id: None,
+                call_id: Some("search".into()),
+                status: "completed".into(),
+                execution: "client".into(),
+                tools,
+                omitted_result_count: Some(0),
+                internal_chat_message_metadata_passthrough: None,
+            };
+            let output_bytes = serde_json::to_vec(&output).unwrap().len() as u64;
+            let request = history_test_request(vec![initial.input[0].clone(), output]);
+            let bytes = serde_json::to_vec(&request).unwrap();
+            let mut measured = if encoded {
+                ModelRequestMeasurements::for_responses_request_from_encoded_cancellable(
+                    &request,
+                    &history_test_provenance(&request),
+                    &request.instructions,
+                    None,
+                    &bytes,
+                    bytes.len() as u64,
+                )
+                .unwrap()
+            } else {
+                ModelRequestMeasurements::for_responses_request(
+                    &request,
+                    &history_test_provenance(&request),
+                    &request.instructions,
+                )
+                .unwrap()
+            };
+            assert_eq!(measured.tool_schema_breakdown.len(), usize::from(!receipt));
+            assert_eq!(
+                measured.conversation_history_bytes,
+                if receipt { output_bytes } else { 0 }
+            );
+            assert_eq!(
+                measured.tool_schemas_bytes,
+                if receipt { 0 } else { output_bytes }
+            );
+            measured.compare_and_remember_prompt_context(
+                &mut baseline,
+                None,
+                PromptDigests::default(),
+            );
+            assert!(
+                measured.fixed_prefix_reuse_eligible,
+                "appended definitions are not a prefix rewrite"
+            );
+            assert!(
+                measured
+                    .request_token_categories()
+                    .fixed_prefix_changed_categories
+                    .is_empty()
+            );
+        }
+    }
 }
 
 #[test]
@@ -3077,6 +3580,152 @@ async fn turn_timing_carries_prefix_divergence() -> anyhow::Result<()> {
     Ok(())
 }
 
+#[tokio::test]
+async fn turn_start_request_compares_with_previous_turn_final_request() -> anyhow::Result<()> {
+    let server = MockServer::start().await;
+    let sse_body = concat!(
+        "event: response.created\n",
+        "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-1\"}}\n\n",
+        "event: response.completed\n",
+        "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-1\",",
+        "\"usage\":{\"input_tokens\":0,\"input_tokens_details\":null,",
+        "\"output_tokens\":0,\"output_tokens_details\":null,\"total_tokens\":0}}}\n\n",
+    );
+    Mock::given(method("POST"))
+        .and(path("/v1/responses"))
+        .respond_with(
+            ResponseTemplate::new(/*status*/ 200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_raw(sse_body, "text/event-stream"),
+        )
+        .expect(/*requests*/ 3)
+        .mount(&server)
+        .await;
+
+    let provider =
+        create_oss_provider_with_base_url(&format!("{}/v1", server.uri()), WireApi::Responses);
+    let client = ModelClient::new(
+        /*auth_manager*/ None,
+        AgentIdentityAuthPolicy::JwtOnly,
+        ThreadId::from_string("018f31aa-3333-7333-8333-333333333333")?,
+        provider,
+        SessionSource::Cli,
+        "test_originator".to_string(),
+        /*model_verbosity*/ None,
+        /*enable_request_compression*/ false,
+        /*include_timing_metrics*/ false,
+        /*beta_features_header*/ None,
+        /*concurrent_reasoning_summaries_enabled*/ false,
+        /*attestation_provider*/ None,
+        HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault),
+    );
+    let model_info = test_model_info();
+    let mut next_model_info = test_model_info();
+    next_model_info.slug = "gpt-test-next".to_string();
+    let session_telemetry = test_session_telemetry();
+    let inference_trace = InferenceTraceContext::disabled();
+    let first_item = history_test_tool_output("call-1", "first result");
+    let second_item = history_test_tool_output("call-2", "second result");
+    let third_item = history_test_tool_output("call-3", "third result");
+
+    // Each turn opens a fresh turn-scoped session, as `run_turn` does, and only
+    // appends to the previous turn's final request. The last turn also switches
+    // model, which must still be compared but must not be reuse eligible.
+    let mut turn_starts = Vec::new();
+    for (turn_id, turn_model_info, input) in [
+        ("turn-1", &model_info, vec![first_item.clone()]),
+        (
+            "turn-2",
+            &model_info,
+            vec![first_item.clone(), second_item.clone()],
+        ),
+        (
+            "turn-3",
+            &next_model_info,
+            vec![first_item, second_item, third_item],
+        ),
+    ] {
+        let timing = Arc::new(TurnTimingState::default());
+        timing.mark_turn_started();
+        let mut session = client.new_session();
+        session.set_turn_timing(Arc::clone(&timing));
+        let prompt = Prompt {
+            input: input.into(),
+            base_instructions: BaseInstructions {
+                text: "stable base instructions".to_string(),
+            },
+            ..Prompt::default()
+        };
+        let responses_metadata = test_responses_metadata_for_client(
+            &client,
+            Some(turn_id),
+            format!("{}:0", client.state.thread_id),
+            /*parent_thread_id*/ None,
+            TestCodexResponsesRequestKind::Turn,
+        );
+        let request_wait = timing.begin_model_request_wait();
+        let mut stream = session
+            .stream(
+                &prompt,
+                turn_model_info,
+                &session_telemetry,
+                /*effort*/ None,
+                codex_protocol::config_types::ReasoningSummary::None,
+                /*service_tier*/ None,
+                &responses_metadata,
+                &inference_trace,
+            )
+            .await?;
+        drop(request_wait);
+        while let Some(event) = stream.next().await {
+            event?;
+        }
+        // Provider completion does not join optional diagnostics. The next turn
+        // can only compare with a baseline this turn has already published.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while Arc::strong_count(&session.latest_measurement_attempt) != 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("request diagnostics should finish");
+        drop(session);
+
+        let protocol = timing.complete_snapshot().protocol_timing();
+        assert_eq!(protocol.model_requests.len(), 1, "{turn_id}");
+        let request = &protocol.model_requests[0];
+        let categories = request
+            .request_token_categories
+            .clone()
+            .expect("request token categories");
+        turn_starts.push((
+            request.fixed_prefix_reuse_eligible,
+            categories.history_items_previous,
+            categories.history_prefix_items_reused,
+            categories.history_first_divergent_index,
+            categories.fixed_prefix_changed_categories,
+        ));
+    }
+
+    assert_eq!(
+        turn_starts,
+        vec![
+            (Some(false), None, None, None, Vec::new()),
+            (Some(true), Some(1), Some(1), Some(1), Vec::new()),
+            (
+                Some(false),
+                Some(2),
+                Some(2),
+                Some(2),
+                vec!["request.model".to_string()],
+            ),
+        ],
+        "a turn's first request must compare with the previous turn's final request"
+    );
+
+    Ok(())
+}
+
 #[test]
 fn model_attempt_offsets_require_monotonic_elapsed_values_and_allow_nulls() {
     let minimal = ModelAttemptOffsets::default();
@@ -3724,7 +4373,6 @@ fn tool_history_receipt_inside_provider_prefix_forces_transactional_rebase() {
         request_setting_digests: None,
         category_hashes: BTreeMap::new(),
         ordered_fixed_hashes: Vec::new(),
-        digests: Default::default(),
         input_item_digests: Vec::new(),
     });
     let (sender, receiver) = tokio::sync::oneshot::channel();
@@ -6885,4 +7533,479 @@ async fn decoded_core_queue_stops_a_large_valid_prefix_and_releases_on_drop() {
         34,
         "dropping a byte-blocked consumer must stop upstream work"
     );
+}
+
+#[test]
+fn audit143_prepare_and_remember_do_not_rehash_unchanged_history() {
+    let client = test_model_client(SessionSource::Cli);
+    let mut session = client.new_session();
+    let original = history_test_request(vec![history_test_item(&"x".repeat(1024 * 1024), None)]);
+    session.remember_request_history(&original, [1; 32]);
+    session.websocket_session.last_request = Some(original.clone());
+    let response = LastResponse { response_id: "response".into(), items_added: Vec::new() };
+    let delta = history_test_item("next", None);
+    let mut request = original.clone();
+    let mut input = request.input.to_vec();
+    input.push(delta.clone());
+    request.input = input.into();
+    let before = super::AUDIT143_PREFIX_ITEMS_HASHED.with(std::cell::Cell::get);
+    let (items, verified) = session.get_incremental_items_with_history(&request, Some(&response), false).unwrap();
+    assert_eq!(items, vec![delta]);
+    assert!(verified.is_some());
+    session.remember_verified_request_history(&request, [1; 32], verified);
+    assert_eq!(super::AUDIT143_PREFIX_ITEMS_HASHED.with(std::cell::Cell::get) - before, 1,
+        "only the appended item is serialized/hashed across prepare plus remember");
+    let mut changed = request.clone();
+    let mut changed_input = changed.input.to_vec();
+    changed_input[0] = history_test_item(&"y".repeat(1024 * 1024), None);
+    changed.input = changed_input.into();
+    assert!(session.get_incremental_items(&changed, Some(&response), false).is_none());
+}
+
+#[tokio::test]
+async fn audit143_trace_admission_loss_is_visible_without_blocking_dispatch() {
+    use codex_rollout_trace::{TraceWriter, RawTraceEventPayload};
+    let temp = tempfile::tempdir().unwrap();
+    let writer = Arc::new(TraceWriter::create(temp.path(), "trace".into(), "rollout".into(), "root".into()).unwrap());
+    let trace = InferenceTraceContext::enabled(Arc::clone(&writer), "root".into(), "turn".into(), "model".into(), "provider".into());
+    // No await lets these workers consume their slots or finish: admission is
+    // deterministic on this current-thread runtime, including slow storage.
+    let attempts = (0..17).map(|_| super::AsyncInferenceTraceAttempt::unstarted(trace.start_attempt())).collect::<Vec<_>>();
+    assert!(attempts.last().unwrap().writes.is_none());
+    writer.append(RawTraceEventPayload::ThreadStarted { thread_id: "root".into(), agent_path: "/root".into(), metadata_payload: None }).unwrap();
+    let replay = codex_rollout_trace::replay_bundle(temp.path()).unwrap();
+    assert!(replay.payload_capture_gap_count.unwrap_or_default() >= 1);
+    assert!(replay.inference_calls.is_empty(), "a gap must not invent an executed request");
+    drop(attempts);
+}
+#[test]
+fn audit150_dispatched_category_hashes_override_equal_prepared_digests() {
+    let mut baseline = None;
+    let digests = PromptDigests { instructions:Some([7;32]),tools:Some([8;32]),history:Some([9;32]) };
+    let original = history_test_request(vec![history_test_item("original", None)]);
+    let mut prior = ModelRequestMeasurements::for_responses_request(&original,
+        &history_test_provenance(&original), &original.instructions).unwrap();
+    prior.compare_and_remember_prompt_context(&mut baseline,None,digests.clone());
+    let mut changed = original.clone();
+    changed.instructions.push_str(" provider fallback");
+    changed.input = vec![history_test_item("changed dispatched history",None)].into();
+    let mut measured = ModelRequestMeasurements::for_responses_request(&changed,
+        &history_test_provenance(&changed), &changed.instructions).unwrap();
+    measured.compare_and_remember_prompt_context(&mut baseline,None,digests);
+    let mut changed_categories=0;
+    for category in &measured.prompt_context_categories {
+        let prior=prior.prompt_context_categories.iter().find(|old|old.category==category.category).unwrap();
+        if prior.hash!=category.hash {
+            changed_categories+=1;
+            assert!(!category.unchanged_from_previous_request,"{}",category.category);
+        }
+    }
+    assert!(changed_categories>=2,"instructions and dispatched input both changed");
+}
+
+#[test]
+fn audit150_full_logical_estimate_is_an_independent_one_pass_basis() {
+    let request = history_test_request((0..31).map(|_| history_test_item("x",None)).collect());
+    let measured = ModelRequestMeasurements::for_responses_request(&request,
+        &history_test_provenance(&request), &request.instructions).unwrap();
+    let logical = serde_json::to_string(&(&request.instructions,&request.input,&request.tools,&request.text)).unwrap();
+    let expected = codex_utils_string::approx_token_count(&logical) as u64;
+    assert_eq!(measured.full_prompt_estimated_tokens,expected);
+    let sum:u64=measured.prompt_context_categories.iter().map(|category|category.estimated_tokens).sum();
+    assert_ne!(expected,sum,"the independent estimate includes logical envelopes, not a sum of rounded categories");
+    let wire=serde_json::to_vec(&request).unwrap();
+    let encoded=ModelRequestMeasurements::for_responses_request_from_encoded_cancellable(&request,
+        &history_test_provenance(&request),&request.instructions,None,&wire,wire.len() as u64).unwrap();
+    assert_eq!(encoded.full_prompt_estimated_tokens,expected);
+}
+
+#[tokio::test]
+async fn audit143_quota_wait_uses_dispatched_identity_after_predispatch_account_switch() {
+    struct FixedAuth(&'static str);
+    impl codex_login::ExternalAuth for FixedAuth {
+        fn resolve(&self) -> codex_login::ExternalAuthFuture<'_, CodexAuth> {
+            Box::pin(async move { Ok(CodexAuth::from_api_key(self.0)) })
+        }
+        fn refresh(&self, _: codex_login::ExternalAuthRefreshContext) -> codex_login::ExternalAuthFuture<'_, CodexAuth> {
+            self.resolve()
+        }
+    }
+    let server = MockServer::start().await;
+    Mock::given(method("POST")).and(path("/v1/responses"))
+        .and(wiremock::matchers::header("authorization", "Bearer dispatched-account"))
+        .respond_with(ResponseTemplate::new(429).set_body_json(json!({"error":{
+            "type":"usage_limit_reached", "code":"usage_limit_reached", "message":"quota"
+        }}))).expect(1).mount(&server).await;
+    let manager = AuthManager::from_auth_for_testing(CodexAuth::from_api_key("earlier-account"));
+    let before_setup = crate::responses_retry::AccountChangeIdentity::from_auth(&manager.auth_cached().unwrap()).unwrap();
+    // Deterministic boundary between the turn's former cached snapshot and
+    // the client's credential resolution. The newly dispatched key is rejected.
+    manager.set_configured_external_auth(Arc::new(FixedAuth("dispatched-account"))).await.unwrap();
+    let mut provider = ModelProviderInfo::create_openai_provider(None);
+    provider.base_url = Some(format!("{}/v1", server.uri()));
+    provider.supports_websockets = false;
+    let client = ModelClient::new(Some(Arc::clone(&manager)), AgentIdentityAuthPolicy::JwtOnly,
+        ThreadId::new(), provider, SessionSource::Cli, "test".into(), None, false, false,
+        None, false, None, HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault));
+    let metadata = test_responses_metadata_for_client(&client, None, "window".into(), None,
+        TestCodexResponsesRequestKind::Turn);
+    let mut client_session = client.new_session();
+    let response = client_session.stream(&Prompt::default(), &test_model_info(),
+        &test_session_telemetry(), None, ReasoningSummaryConfig::default(), None,
+        &metadata, &InferenceTraceContext::disabled()).await;
+    let error = match response {
+        Err(error) => error,
+        Ok(mut response) => loop {
+            match response.next().await {
+                Some(Err(error)) => break error,
+                Some(Ok(_)) => {}
+                None => panic!("quota rejection must be retained"),
+            }
+        },
+    };
+    let codex_protocol::error::CodexErr::UsageLimitReached(error) = error else {
+        panic!("expected quota rejection");
+    };
+    let failed = client_session.dispatched_account().cloned().expect("dispatched identity");
+    assert!(failed != before_setup, "the obsolete turn snapshot cannot own this rejection");
+    let (session, mut turn) = crate::session::tests::make_session_and_context().await;
+    turn.provider = Arc::clone(&client.state.provider);
+    turn.session_source = SessionSource::Cli;
+    let mut deadline = None;
+    let cancellation = tokio_util::sync::CancellationToken::new();
+    let wait = crate::responses_retry::wait_for_account_change(
+        crate::responses_retry::AccountChangeWait::UsageLimit(&error, Some(&failed)),
+        &mut deadline, &session, &turn, &cancellation);
+    tokio::pin!(wait);
+    assert!(futures::poll!(wait.as_mut()).is_pending(), "a rejected current account is not recovery");
+    manager.set_configured_external_auth(Arc::new(FixedAuth("later-account"))).await.unwrap();
+    assert!(wait.await.unwrap(), "a genuine later switch still permits recovery");
+}
+
+#[tokio::test]
+async fn audit143_claimed_socket_never_waits_for_redundant_turn_preconnect() {
+    use crate::test_harness::responses::start_websocket_server;
+
+    struct DropFlag(Arc<std::sync::atomic::AtomicBool>);
+    impl Drop for DropFlag {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    let server = start_websocket_server(vec![vec![]]).await;
+    let mut provider =
+        create_oss_provider_with_base_url(&format!("{}/v1", server.uri()), WireApi::Responses);
+    provider.supports_websockets = true;
+    let client = ModelClient::new(
+        None,
+        AgentIdentityAuthPolicy::JwtOnly,
+        ThreadId::new(),
+        provider,
+        SessionSource::Cli,
+        "test".into(),
+        None,
+        false,
+        false,
+        None,
+        false,
+        None,
+        HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault),
+    );
+    let metadata = test_responses_metadata_for_client(
+        &client,
+        None,
+        "window".into(),
+        None,
+        TestCodexResponsesRequestKind::Turn,
+    );
+    let mut session = client.new_session();
+    // Stands in for the socket a startup-prewarm claim installs before dispatch.
+    session
+        .preconnect_websocket(&test_model_info(), None, &test_session_telemetry(), &metadata)
+        .await
+        .expect("handshake");
+    assert!(session.websocket_session.connection.is_some());
+    let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let flag = DropFlag(Arc::clone(&dropped));
+    session.pending_websocket_preconnect = Some(tokio_util::task::AbortOnDropHandle::new(
+        tokio::spawn(async move {
+            let _flag = flag;
+            std::future::pending::<()>().await;
+            Err(codex_protocol::error::CodexErr::RequestTimeout)
+        }),
+    ));
+
+    tokio::time::timeout(Duration::from_secs(5), session.finish_websocket_preconnect())
+        .await
+        .expect("a claimed socket must not wait for the redundant dial")
+        .expect("the redundant dial cannot fail this dispatch");
+    assert!(session.pending_websocket_preconnect.is_none());
+    assert!(session.websocket_session.connection.is_some());
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !dropped.load(Ordering::SeqCst) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the redundant dial is aborted");
+    // Without a claimed socket the dial still owns dispatch; see
+    // turn_preconnect_join_reports_failure_once_without_another_connection.
+}
+
+#[tokio::test]
+async fn audit143_outer_replay_and_compaction_keep_logical_request_kind() {
+    let client = test_model_client(SessionSource::Cli);
+    let turn = test_responses_metadata_for_client(
+        &client,
+        None,
+        "window".into(),
+        None,
+        TestCodexResponsesRequestKind::Turn,
+    );
+    let mut compaction = turn.clone();
+    compaction.request_kind = Some(
+        crate::responses_metadata::CodexResponsesRequestKind::Compaction(
+            crate::responses_metadata::CompactionTurnMetadata::new(
+                codex_analytics::CompactionTrigger::Manual,
+                codex_analytics::CompactionReason::UserRequested,
+                codex_analytics::CompactionImplementation::Responses,
+                codex_analytics::CompactionPhase::StandaloneTurn,
+            ),
+        ),
+    );
+
+    let mut session = client.new_session();
+    // Pre-sampling compaction shares the turn session but is not a sampling step.
+    assert_eq!(
+        session.next_logical_request_kind(&compaction),
+        ModelAttemptRequestKind::Initial
+    );
+    assert_eq!(
+        session.next_logical_request_kind(&turn),
+        ModelAttemptRequestKind::Initial
+    );
+    // That request failed before any output was accepted; the outer loop replays it.
+    session.note_logical_request_replay();
+    assert_eq!(
+        session.next_logical_request_kind(&turn),
+        ModelAttemptRequestKind::Initial
+    );
+    // Negative control: the following sampling step is still a continuation.
+    assert_eq!(
+        session.next_logical_request_kind(&turn),
+        ModelAttemptRequestKind::Continuation
+    );
+
+    // A dispatch that failed before assigning a kind cannot rewind an earlier request.
+    let mut session = client.new_session();
+    assert_eq!(
+        session.next_logical_request_kind(&turn),
+        ModelAttemptRequestKind::Initial
+    );
+    session.last_logical_request_counted = false;
+    session.note_logical_request_replay();
+    assert_eq!(
+        session.next_logical_request_kind(&turn),
+        ModelAttemptRequestKind::Continuation
+    );
+}
+
+#[test]
+fn audit143_safe_http_retry_moves_dispatch_ready_without_changing_phase_totals() {
+    // The first try entered transport at 10us and failed before sending; after backoff
+    // the retry dispatched at 110us and its headers arrived at 130us.
+    let mut retried = ModelAttemptOffsets {
+        queue_us: 4,
+        dispatch_ready_us: Some(10),
+        ..ModelAttemptOffsets::default()
+    };
+    super::redispatch_offsets(&mut retried, 110);
+    retried.stream_established_us = Some(130);
+    assert_eq!(retried.dispatch_ready_us, Some(110));
+    assert_eq!(retried.connection_setup_us, 100);
+    // Construction stays 6us and transport still owns the whole 120us.
+    assert_eq!(model_attempt_phase_durations(&retried), (6, 4, Some(120)));
+    assert!(attempt_offsets_are_nondecreasing(&retried, 140));
+
+    // Negative control: a first dispatch has no failed try to fold.
+    let mut first = ModelAttemptOffsets::default();
+    super::redispatch_offsets(&mut first, 10);
+    assert_eq!(first.dispatch_ready_us, Some(10));
+    assert_eq!(first.connection_setup_us, 0);
+}
+
+#[test]
+fn audit143_body_event_before_establishment_keeps_attempt_offsets_ordered() {
+    // The spawned HTTP body task can decode the first event before the dispatching
+    // task records establishment.
+    let raced = ModelAttemptClock::new();
+    raced.mark_dispatch_ready();
+    raced.mark_first_provider_event();
+    std::thread::sleep(Duration::from_millis(2));
+    raced.mark_stream_established();
+    raced.mark_completed();
+    let offsets = raced.offsets.lock().unwrap();
+    assert!(offsets.stream_established_us <= offsets.first_provider_event_us);
+    assert!(attempt_offsets_are_nondecreasing(
+        &offsets,
+        offsets.completed_us.unwrap()
+    ));
+    drop(offsets);
+
+    // Negative control: an earlier establishment is never moved to the event.
+    let ordered = ModelAttemptClock::new();
+    ordered.mark_dispatch_ready();
+    ordered.mark_stream_established();
+    std::thread::sleep(Duration::from_millis(2));
+    ordered.mark_first_provider_event();
+    let offsets = ordered.offsets.lock().unwrap();
+    assert!(offsets.stream_established_us < offsets.first_provider_event_us);
+}
+
+#[test]
+fn audit150_conversation_history_includes_tool_outputs() {
+    let measure = |input: Vec<ResponseItem>| {
+        let request = history_test_request(input);
+        ModelRequestMeasurements::for_responses_request(
+            &request,
+            &history_test_provenance(&request),
+            &request.instructions,
+        )
+        .expect("measure request")
+    };
+    let category = |measured: &ModelRequestMeasurements, name: &str| {
+        let measurement = measured
+            .prompt_context_categories
+            .iter()
+            .find(|measurement| measurement.category == name)
+            .expect("category measurement");
+        (measurement.serialized_bytes, measurement.estimated_tokens)
+    };
+
+    // Tool results get their own category, and the compatibility history
+    // totals still count them.
+    let tool_output = history_test_tool_output("call-1", &"source body line\n".repeat(64));
+    let with_tool_output = measure(vec![
+        tool_output.clone(),
+        history_test_item("current task", Some("turn-1")),
+    ]);
+    let (tool_bytes, tool_tokens) = category(&with_tool_output, "tool_outputs");
+    let (history_bytes, history_tokens) = category(&with_tool_output, "history");
+    assert_eq!(
+        tool_bytes,
+        serde_json::to_vec(&tool_output).unwrap().len() as u64
+    );
+    assert!(tool_tokens > 0);
+    assert_eq!(
+        with_tool_output.conversation_history_bytes,
+        history_bytes + tool_bytes
+    );
+    assert_eq!(
+        with_tool_output
+            .request_token_categories()
+            .conversation_history,
+        history_tokens + tool_tokens
+    );
+
+    // Negative control: ordinary history is not attributed to tool outputs.
+    let without_tool_output = measure(vec![
+        history_test_item("earlier task", Some("turn-0")),
+        history_test_item("current task", Some("turn-1")),
+    ]);
+    let (tool_bytes, _) = category(&without_tool_output, "tool_outputs");
+    let (history_bytes, history_tokens) = category(&without_tool_output, "history");
+    assert_eq!(tool_bytes, 0);
+    assert!(history_bytes > 0);
+    assert_eq!(without_tool_output.conversation_history_bytes, history_bytes);
+    assert_eq!(
+        without_tool_output
+            .request_token_categories()
+            .conversation_history,
+        history_tokens
+    );
+}
+
+#[tokio::test]
+async fn audit143x_model_http_tls_stall_is_bounded_connection_failure() {
+    // The peer accepts TCP and reads the TLS ClientHello but never answers it, so
+    // no request byte can have been dispatched.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let (hello_tx, hello_rx) = tokio::sync::oneshot::channel();
+    let peer = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut first_byte = [0_u8; 1];
+        tokio::io::AsyncReadExt::read_exact(&mut socket, &mut first_byte)
+            .await
+            .unwrap();
+        let _ = hello_tx.send(());
+        std::future::pending::<()>().await;
+        drop(socket);
+    });
+    let provider =
+        create_oss_provider_with_base_url(&format!("https://{address}/v1"), WireApi::Responses);
+    let client = ModelClient::new(
+        /*auth_manager*/ None,
+        AgentIdentityAuthPolicy::JwtOnly,
+        ThreadId::new(),
+        provider,
+        SessionSource::Exec,
+        "test".into(),
+        /*model_verbosity*/ None,
+        /*enable_request_compression*/ false,
+        /*include_timing_metrics*/ false,
+        /*beta_features_header*/ None,
+        /*concurrent_reasoning_summaries_enabled*/ false,
+        /*attestation_provider*/ None,
+        HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault),
+    );
+    let metadata = test_responses_metadata_for_client(
+        &client,
+        None,
+        "window".into(),
+        None,
+        TestCodexResponsesRequestKind::Turn,
+    );
+    let telemetry = test_session_telemetry();
+    let model = test_model_info();
+    let prompt = Prompt::default();
+    let trace = InferenceTraceContext::disabled();
+    let mut session = client.new_session();
+    let stream = session.stream(
+        &prompt,
+        &model,
+        &telemetry,
+        None,
+        ReasoningSummaryConfig::default(),
+        None,
+        &metadata,
+        &trace,
+    );
+    tokio::pin!(stream);
+    tokio::select! {
+        result = &mut stream => panic!("request ended before the TLS stall: {:?}", result.err()),
+        hello = hello_rx => hello.expect("peer received the TLS ClientHello"),
+    }
+    // Skip past the connect bound but stay far below the 300 s header deadline,
+    // which would misreport this stall as a possibly dispatched request.
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(16)).await;
+    let error = match stream.await {
+        Err(error) => error,
+        Ok(mut response) => loop {
+            match response.next().await {
+                Some(Err(error)) => break error,
+                Some(Ok(_)) => {}
+                None => panic!("a stalled handshake must fail the request"),
+            }
+        },
+    };
+    tokio::time::resume();
+    assert!(
+        matches!(error, codex_protocol::error::CodexErr::ConnectionFailed(_)),
+        "{error:?}"
+    );
+    assert!(error.is_retryable());
+    peer.abort();
 }

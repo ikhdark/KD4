@@ -13,6 +13,152 @@ use std::time::Duration;
 use std::time::Instant;
 use tempfile::tempdir;
 
+#[cfg(unix)]
+#[tokio::test]
+async fn audit151_alias_patch_continuity_rejects_an_intervening_peer_edit() {
+    let dir = tempdir().unwrap();
+    fs::create_dir(dir.path().join("real")).unwrap();
+    fs::write(dir.path().join("real/shared.txt"), "base\n").unwrap();
+    std::os::unix::fs::symlink(dir.path().join("real"), dir.path().join("alias")).unwrap();
+    let mut tracker = tracker_with_root(dir.path());
+    let first = apply_verified_patch(dir.path(), "*** Begin Patch\n*** Update File: alias/shared.txt\n@@\n-base\n+mine\n*** End Patch").await;
+    tracker.track_delta("local", &first);
+    fs::write(dir.path().join("real/shared.txt"), "peer\n").unwrap();
+    let second = apply_verified_patch(dir.path(), "*** Begin Patch\n*** Update File: real/shared.txt\n@@\n-peer\n+next\n*** End Patch").await;
+    tracker.track_delta("local", &second);
+    assert!(tracker.exact_unified_diff().is_err());
+    assert!(!tracker.unattributed_display_paths().is_empty());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn audit151_equal_text_metadata_changes_are_uncertainty_not_progress() {
+    use std::os::unix::fs::PermissionsExt;
+    for symlink in [false, true] {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("own.txt");
+        let mut tracker = tracker_with_root(dir.path());
+        let owned = apply_verified_patch(dir.path(), "*** Begin Patch\n*** Add File: own.txt\n+mine\n*** End Patch").await;
+        tracker.track_delta("local", &owned);
+        let revision = tracker.attributed_mutation_revision();
+        if symlink {
+            fs::write(dir.path().join("target.txt"), "mine\n").unwrap();
+            fs::remove_file(&path).unwrap();
+            std::os::unix::fs::symlink(dir.path().join("target.txt"), &path).unwrap();
+        } else {
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let mutation = tracker.attribute_observed_changes("local", Some(dir.path()), None, &BTreeSet::from([path]), Some(LOCAL_FS.as_ref())).await;
+        tracker.record_exec_command_end_with_mutation_at(&["inspection".into()], 0, false, "local", Some(dir.path()), mutation);
+        assert_eq!(tracker.attributed_mutation_revision(), revision);
+        assert_eq!(tracker.unattributed_display_paths(), ["own.txt"]);
+    }
+}
+
+#[tokio::test]
+async fn audit147_operation_history_is_bounded_and_never_repairs_net_attribution() {
+    let root = tempdir().unwrap();
+    let mut tracker = tracker_with_root(root.path());
+    for index in 0..70 {
+        let delta = apply_verified_patch(
+            root.path(),
+            &format!("*** Begin Patch\n*** Add File: file-{index}\n+owned\n*** End Patch"),
+        )
+        .await;
+        tracker.track_delta("", &delta);
+    }
+    let summary = tracker.owned_operation_summary();
+    assert_eq!(
+        summary["available_operations"].as_array().unwrap().len(),
+        64
+    );
+    assert_eq!(summary["exact_operation_history_complete"], false);
+    assert!(summary["retained_bytes"].as_u64().unwrap() <= 8 * 1024 * 1024);
+    assert!(tracker.owned_operation_receipt(1).is_none());
+    assert!(tracker.owned_operation_receipt(70).is_some());
+    tracker.record_unknown_mutation();
+    assert!(tracker.exact_unified_diff().is_err());
+    assert_eq!(
+        tracker.owned_operation_receipt(70).unwrap()["current_source_verified"],
+        false
+    );
+}
+
+#[tokio::test]
+async fn audit147_new_discontinuities_have_call_paths_and_preimage_hashes() {
+    let dir = tempdir().unwrap();
+    let mut tracker = tracker_with_root(dir.path());
+    let seed = apply_verified_patch(
+        dir.path(),
+        "*** Begin Patch\n*** Add File: a\n+owned\n*** Add File: b\n+owned\n*** End Patch",
+    )
+    .await;
+    tracker.track_delta("", &seed);
+    for (path, call) in [("a", "first-patch"), ("b", "second-patch")] {
+        fs::write(dir.path().join(path), "foreign\n").unwrap();
+        let delta = apply_verified_patch(
+            dir.path(),
+            &format!(
+                "*** Begin Patch\n*** Update File: {path}\n@@\n-foreign\n+next owned\n*** End Patch"
+            ),
+        )
+        .await;
+        tracker.track_delta_for_call("", &delta, Some(call));
+        let warning = tracker
+            .take_invalidation_warning()
+            .expect("a newly affected scope must be reported");
+        assert!(warning.contains(call) && warning.contains(path));
+        assert!(warning.contains("expected_sha256") && warning.contains("observed_sha256"));
+        assert_eq!(tracker.take_invalidation_warning(), None);
+    }
+}
+
+#[test]
+fn audit147_unknown_empty_delta_advances_evidence_without_owned_progress() {
+    let mut tracker = TurnDiffTracker::new();
+    tracker.track_delta("local", &AppliedPatchDelta::default());
+    assert_eq!(tracker.current_mutation_revision(), 0);
+    tracker.track_delta("local", &AppliedPatchDelta::unknown());
+    assert_eq!(tracker.current_mutation_revision(), 1);
+    assert_eq!(tracker.current_validation_revision(), 1);
+    assert_eq!(tracker.attributed_mutation_revision(), 0);
+    assert!(tracker.has_untracked_changes());
+    tracker.track_delta("local", &AppliedPatchDelta::unknown());
+    assert_eq!(tracker.current_mutation_revision(), 2);
+}
+
+#[tokio::test]
+async fn audit147_foreign_tracked_change_is_not_command_progress() {
+    let dir = tempdir().unwrap();
+    let mut tracker = tracker_with_root(dir.path());
+    let delta = apply_verified_patch(dir.path(), "*** Begin Patch\n*** Add File: own.txt\n+mine\n*** Add File: untouched.txt\n+owned\n*** End Patch").await;
+    tracker.track_delta("", &delta);
+    let owned_revision = tracker.attributed_mutation_revision();
+    fs::write(dir.path().join("own.txt"), "foreign\n").unwrap();
+    let observed = BTreeSet::from([dir.path().join("own.txt")]);
+    let mutation = tracker
+        .attribute_observed_changes(
+            "",
+            Some(dir.path()),
+            None,
+            &observed,
+            Some(LOCAL_FS.as_ref()),
+        )
+        .await;
+    tracker.record_exec_command_end_with_mutation_at(
+        &["inspection".into()],
+        0,
+        false,
+        "",
+        Some(dir.path()),
+        mutation,
+    );
+    assert_eq!(tracker.attributed_mutation_revision(), owned_revision);
+    assert_eq!(tracker.unattributed_display_paths(), ["own.txt"]);
+    assert!(tracker.get_unified_diff().unwrap().contains("+owned"));
+    assert!(tracker.exact_unified_diff().is_err());
+}
+
 fn git_blob_sha1_hex(data: &str) -> String {
     // Independently computed with Python hashlib.sha1 over Git's blob framing:
     // b"blob " + str(len(data.encode())).encode() + b"\0" + data.encode().
@@ -209,7 +355,11 @@ async fn absence_survives_an_add_delete_cycle_for_continuity() {
         }
         let delta = apply_verified_patch(
             dir.path(),
-            "*** Begin Patch\n*** Add File: new.py\n+new owned\n*** End Patch",
+            if foreign {
+                "*** Begin Patch\n*** Update File: new.py\n@@\n-foreign\n+new owned\n*** End Patch"
+            } else {
+                "*** Begin Patch\n*** Add File: new.py\n+new owned\n*** End Patch"
+            },
         )
         .await;
         tracker.track_delta("", &delta);
@@ -236,7 +386,7 @@ async fn audit107_patch_preimages_check_existence_and_both_move_endpoints() {
         tracker.track_delta("", &seed);
         let patch = match operation {
             "delete" => "*** Delete File: source",
-            "overwrite" | "recreate" => "*** Add File: source\n+next",
+            "overwrite" | "recreate" => "*** Update File: source\n@@\n-foreign\n+next",
             _ => "*** Update File: source\n*** Move to: destination",
         };
         if operation == "recreate" {
@@ -1938,7 +2088,7 @@ async fn concurrent_writes_stay_unattributed_and_keep_this_turns_exact_diff() {
 }
 
 #[tokio::test]
-async fn declared_paths_and_rewritten_tracked_paths_stay_attributed() {
+async fn declared_paths_stay_owned_but_observed_rewrites_do_not() {
     let dir = tempdir().expect("tempdir");
     let mut tracker = tracker_with_root(dir.path());
     let add = apply_verified_patch(
@@ -1966,10 +2116,9 @@ async fn declared_paths_and_rewritten_tracked_paths_stay_attributed() {
         .await;
     assert_eq!(
         mutation,
-        CommandMutation::KnownMutation {
-            paths: Some(BTreeSet::from(
-                ["out.txt", "own.txt"].map(|name| dir.path().join(name))
-            )),
+        CommandMutation::ObservedChanges {
+            declared_paths: BTreeSet::from([dir.path().join("out.txt")]),
+            unattributed_paths: BTreeSet::from([dir.path().join("own.txt")]),
         }
     );
     tracker.record_exec_command_end_with_mutation_at(
@@ -1987,7 +2136,7 @@ async fn declared_paths_and_rewritten_tracked_paths_stay_attributed() {
     );
     assert_eq!(
         tracker.unattributed_display_paths(),
-        vec!["foreign.txt".to_string()]
+        vec!["foreign.txt".to_string(), "own.txt".to_string()]
     );
 }
 #[tokio::test]
@@ -2095,4 +2244,168 @@ async fn git_unchanged_observation_keeps_tracked_mismatches_as_source_changes() 
     assert_eq!(tracker.current_mutation_revision(), 3);
     assert_eq!(tracker.current_validation_revision(), 2);
     assert_eq!(tracker.validation_changes_since(1), None);
+}
+
+#[tokio::test]
+async fn audit147_invalidated_diff_still_names_later_edit_paths() {
+    for invalid in [true, false] {
+        let dir = tempdir().unwrap();
+        let mut tracker = tracker_with_root(dir.path());
+        if invalid {
+            // For example a workspace hook or a mutating finalizer.
+            tracker.record_unknown_mutation();
+        }
+        let delta = apply_verified_patch(
+            dir.path(),
+            "*** Begin Patch\n*** Add File: later.txt\n+after invalidation\n*** End Patch",
+        )
+        .await;
+        tracker.track_delta("", &delta);
+        tracker.record_exec_command_end_at(
+            &["rm".into(), "gone.txt".into()],
+            0,
+            false,
+            "",
+            Some(dir.path()),
+        );
+        // Known edit paths stay available to completion attribution and
+        // live-session publication even when the exact diff is gone.
+        let changed = tracker.changed_paths();
+        for name in ["later.txt", "gone.txt"] {
+            assert!(
+                changed.iter().any(|(_, path)| path.ends_with(name)),
+                "invalid={invalid}: {changed:?}"
+            );
+        }
+        assert_eq!(
+            tracker
+                .uncertain_content_paths()
+                .contains(&"later.txt".to_string()),
+            invalid
+        );
+        // An invalid diff still reports itself as wholly unavailable.
+        let expected: Vec<String> = if invalid {
+            Vec::new()
+        } else {
+            vec!["gone.txt".to_string()]
+        };
+        assert_eq!(tracker.exact_unified_diff(), Err(expected));
+    }
+}
+
+#[tokio::test]
+async fn audit147_declared_command_rewrite_is_not_relabeled_by_next_patch() {
+    for declared in [true, false] {
+        let dir = tempdir().unwrap();
+        let mut tracker = tracker_with_root(dir.path());
+        let add = apply_verified_patch(
+            dir.path(),
+            "*** Begin Patch\n*** Add File: a.rs\n+fn main(){}\n*** End Patch",
+        )
+        .await;
+        tracker.track_delta("", &add);
+        // A formatter (declared) or another writer (undeclared) rewrites it.
+        fs::write(dir.path().join("a.rs"), "fn main() {}\n").unwrap();
+        if declared {
+            tracker.record_exec_command_end_with_mutation_at(
+                &["rustfmt".into(), "a.rs".into()],
+                0,
+                false,
+                "",
+                Some(dir.path()),
+                CommandMutation::KnownMutation {
+                    paths: Some(BTreeSet::from([PathBuf::from("a.rs")])),
+                },
+            );
+        }
+        let next = apply_verified_patch(
+            dir.path(),
+            "*** Begin Patch\n*** Update File: a.rs\n@@\n-fn main() {}\n+fn main() { run() }\n*** End Patch",
+        )
+        .await;
+        tracker.track_delta("", &next);
+        // The diff is partial either way; only the undeclared write is
+        // another writer's change.
+        assert!(tracker.exact_unified_diff().is_err());
+        assert_eq!(
+            tracker.unattributed_display_paths().is_empty(),
+            declared,
+            "{:?}",
+            tracker.unattributed_display_paths()
+        );
+    }
+}
+
+#[tokio::test]
+async fn audit147_partial_to_unavailable_escalation_is_reported() {
+    let dir = tempdir().unwrap();
+    let mut tracker = tracker_with_root(dir.path());
+    let add = apply_verified_patch(
+        dir.path(),
+        "*** Begin Patch\n*** Add File: a.txt\n+one\n*** End Patch",
+    )
+    .await;
+    tracker.track_delta("", &add);
+    tracker.record_exec_command_end_at(
+        &["rm".into(), "a.txt".into()],
+        0,
+        false,
+        "",
+        Some(dir.path()),
+    );
+    let partial = tracker
+        .take_invalidation_warning()
+        .expect("partial diff warning");
+    assert!(partial.starts_with("The turn diff is partial"), "{partial}");
+    // A hook or finalizer mutation records no new cause, yet the diff is now
+    // unavailable rather than partial.
+    tracker.record_unknown_mutation();
+    let unavailable = tracker
+        .take_invalidation_warning()
+        .expect("escalation warning");
+    assert!(
+        unavailable.starts_with("The turn diff is unavailable"),
+        "{unavailable}"
+    );
+    // Already unavailable: nothing new to report.
+    tracker.record_unknown_mutation();
+    assert_eq!(tracker.take_invalidation_warning(), None);
+}
+
+#[tokio::test]
+async fn audit147_display_scope_change_does_not_republish_an_invalidated_diff() {
+    let root = tempdir().unwrap();
+    let delta = apply_verified_patch(
+        root.path(),
+        "*** Begin Patch\n*** Add File: shared.txt\n+content\n*** End Patch\n",
+    )
+    .await;
+    let roots = [
+        ("alpha".to_string(), root.path().to_path_buf()),
+        ("beta".to_string(), root.path().to_path_buf()),
+    ];
+    for invalid in [true, false] {
+        let mut tracker = TurnDiffTracker::with_environment_display_roots([(
+            "alpha".to_string(),
+            root.path().to_path_buf(),
+        )]);
+        tracker.track_delta("alpha", &delta);
+        assert!(tracker.take_unified_diff_if_changed().is_some());
+        if invalid {
+            tracker.record_unknown_mutation();
+            // Invalidation withdraws the published diff.
+            assert_eq!(tracker.take_unified_diff_if_changed(), Some(String::new()));
+        }
+        tracker.set_environment_display_roots(roots.clone());
+        let republished = tracker.take_unified_diff_if_changed();
+        if invalid {
+            assert_eq!(republished, None, "an invalidated diff must stay withdrawn");
+        } else {
+            assert!(
+                republished
+                    .expect("rerendered diff")
+                    .contains("alpha/shared.txt")
+            );
+        }
+    }
 }

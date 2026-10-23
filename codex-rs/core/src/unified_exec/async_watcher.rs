@@ -954,6 +954,16 @@ pub(crate) async fn emit_exec_end_for_unified_exec(
                 search_no_match,
             )
             .await;
+        if process_exited && output_drained {
+            let mut signal = serde_json::json!({"outcome": if metadata.failure_cause.is_none()
+                && (exit_code == Some(0) || search_no_match) { "success" } else { "failure" }});
+            let validation = process.validation();
+            crate::tools::context::attach_command_validation(&mut signal,
+                snapshot.as_ref().map(|output| output.aggregated_output.as_slice()).unwrap_or_default(),
+                validation.as_ref(), exit_code, true);
+            session_ref.services.command_execution.retain_terminal_validation_signal(
+                process_id, parent, process.session_capabilities(tty).incarnation, signal).await;
+        }
     }
     let (aggregated_output, stdout, stderr) = if let Some(output) = snapshot {
         (

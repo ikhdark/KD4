@@ -923,3 +923,62 @@ async fn actual_registration_endpoints_do_not_share_catalogs() {
     );
     assert_eq!(first.tools()[0].tool.name, "hosted");
 }
+#[tokio::test]
+async fn cold_seed_does_not_block_an_unrelated_warm_entry_or_overwrite_live_tools() {
+    let home = tempdir().unwrap();
+    let cache = CodexAppsToolsCache::default();
+    let warm_key = codex_apps_tools_cache_key(None, "https://warm.example", None);
+    let warm = cache
+        .context(home.path().to_path_buf(), warm_key.clone())
+        .await;
+    warm.store_current_tools_for_test(vec![create_test_tool(CODEX_APPS_MCP_SERVER_NAME, "warm")]);
+    let identity = CodexAppsToolsCacheIdentity {
+        codex_home: home.path().to_path_buf(),
+        auth_key: codex_apps_tools_cache_key(None, "https://cold.example", None),
+    };
+    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let seed_cache = cache.clone();
+    let seed_identity = identity.clone();
+    let seeding = std::thread::spawn(move || {
+        seed_cache.context_blocking_with_seed(
+            seed_identity.codex_home,
+            seed_identity.auth_key,
+            |_| {
+                entered_tx.send(()).unwrap();
+                release_rx
+                    .recv_timeout(std::time::Duration::from_secs(5))
+                    .unwrap();
+                Some(vec![create_test_tool(
+                    CODEX_APPS_MCP_SERVER_NAME,
+                    "old-disk",
+                )])
+            },
+        )
+    });
+    entered_rx.await.unwrap();
+    let cold = CodexAppsToolsCacheContext {
+        entry: lock_unpoisoned(&cache.entries).context_entry(identity.clone()),
+    };
+    let snapshot = tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        cache.current_snapshot(home.path().to_path_buf(), warm_key),
+    )
+    .await;
+    cold.publish_if_newest_accepted(
+        cold.begin_fetch(CodexAppsToolsFetchSource::HardRefresh),
+        &create_test_server_info("live"),
+        vec![create_test_tool(CODEX_APPS_MCP_SERVER_NAME, "live")],
+    )
+    .await;
+    release_tx.send(()).unwrap();
+    assert!(Arc::ptr_eq(&seeding.join().unwrap().entry, &cold.entry));
+    assert!(Arc::ptr_eq(
+        &snapshot.unwrap().unwrap(),
+        &warm.current_snapshot().unwrap()
+    ));
+    assert_eq!(cold.current_tools().unwrap()[0].callable_name, "live");
+    cache.context_blocking_with_seed(identity.codex_home, identity.auth_key, |_| {
+        panic!("the entry must only seed once")
+    });
+}

@@ -355,6 +355,9 @@ pub(crate) struct WorkspaceExecutionCoordinator {
             >,
         >,
     >,
+    /// Calls and hooks blocked on this turn's admission. A queued validation
+    /// launch stops queueing once one waits, rather than holding its lease.
+    admission_waiters: Arc<crate::workspace_operation_gate::TurnAdmissionWaiters>,
 }
 
 struct PendingWorkspaceEvidenceResponse {
@@ -416,10 +419,11 @@ pub(crate) async fn run_workspace_hook_with_receipt<T: Send + 'static>(
     terminal_tasks.spawn(async move {
         let _commit = commit;
         close_read_cohort(&turn.workspace_execution_coordinator.global_gate_holders);
+        let coordinator = &turn.workspace_execution_coordinator;
         let _lease = match inherited {
             Some(lease) => lease,
             None => tokio::select! {
-                lease = Arc::clone(&turn.workspace_execution_coordinator.parallel_execution).write_owned() => Arc::new(lease),
+                lease = coordinator.admission_waiters.track(Arc::clone(&coordinator.parallel_execution).write_owned()) => Arc::new(lease),
                 _ = cancellation.cancelled() => return Err(FunctionCallError::RespondToModel("hook cancelled before execution".into())),
             },
         };
@@ -1589,6 +1593,7 @@ pub(crate) fn new_workspace_evidence_baseline_slot() -> WorkspaceEvidenceBaselin
 
 #[derive(Default)]
 struct ToolCallWorkspaceEvidenceContext {
+    read_file_replay_miss: Option<crate::tools::handlers::ReadFileReplayMiss>,
     projection_source_dependencies:
         Option<std::collections::BTreeSet<crate::tool_history::SourceDependencyV1>>,
     workspace_admission_hint: Option<(crate::tool_history::WorkspaceCallClassification, bool)>,
@@ -1766,9 +1771,21 @@ impl Drop for WorkspaceGlobalHolder {
 struct WorkspaceGateTimeout(String);
 
 // Admission is not execution. A long observation budget must not hide minutes
-// of waiting before a handler runs. This only bounds nested gate acquisition;
-// the admitted operation and explicit process ownership are unchanged.
-const NESTED_WORKSPACE_GATE_GRACE: Duration = Duration::from_secs(1);
+// of waiting before a handler runs, and admission must leave the admitted call
+// time to run, so a nested call waits at most half of its remaining budget,
+// within these bounds. A sibling's exclusive hold usually ends with its yield
+// window; a fixed one-second grace refused calls a moment before admission.
+// This only bounds nested gate acquisition; the admitted operation and
+// explicit process ownership are unchanged.
+const NESTED_WORKSPACE_GATE_MIN_GRACE: Duration = Duration::from_secs(1);
+const NESTED_WORKSPACE_GATE_MAX_GRACE: Duration = Duration::from_secs(30);
+
+fn nested_workspace_gate_grace(started: TokioInstant, return_bound: TokioInstant) -> Duration {
+    (return_bound.saturating_duration_since(started) / 2).clamp(
+        NESTED_WORKSPACE_GATE_MIN_GRACE,
+        NESTED_WORKSPACE_GATE_MAX_GRACE,
+    )
+}
 
 async fn acquire_shared_workspace_gate(
     gate: Arc<RwLock<()>>,
@@ -1881,7 +1898,8 @@ async fn acquire_workspace_gate_for_call(
     let reason = if let Some(return_bound) =
         crate::unified_exec::nested_poll_bound(source.nested_deadline())
     {
-        let admission_bound = started + NESTED_WORKSPACE_GATE_GRACE;
+        let grace = nested_workspace_gate_grace(started, return_bound);
+        let admission_bound = started + grace;
         let bound = return_bound.min(admission_bound);
         // Drop the entire acquisition on expiry, including any partial resource
         // lease and queued native-addition claim, before taking the snapshot.
@@ -1889,9 +1907,12 @@ async fn acquire_workspace_gate_for_call(
             return Ok(guard);
         }
         if admission_bound < return_bound {
-            "the one-second workspace admission grace was exhausted (execution was not started)"
+            format!(
+                "the {} ms workspace admission grace was exhausted (execution was not started)",
+                grace.as_millis()
+            )
         } else {
-            "the nested deadline's return margin was reached"
+            "the nested deadline's return margin was reached".to_string()
         }
     } else if matches!(source, ToolCallSource::Direct) {
         // Direct calls retain their existing cancellation-only policy.
@@ -1902,7 +1923,7 @@ async fn acquire_workspace_gate_for_call(
         if let Some(guard) = acquire.now_or_never() {
             return Ok(guard);
         }
-        "no nested deadline was supplied; refusing an unbounded wait"
+        "no nested deadline was supplied; refusing an unbounded wait".to_string()
     };
     const HOLDER_LIMIT: usize = 8;
     let (count, holders) = if let Some(resource) = waiting_resource {
@@ -2947,6 +2968,7 @@ impl ToolCallRuntime {
                 }
                 return Ok(completion);
             }
+            let mut read_file_replay_miss = None;
             if !pre_tool_use_hook_may_run
                 && let Some(registration) = signal_registration.as_ref()
                 && let Some(guard) = registration.replayed_success.as_ref()
@@ -3004,9 +3026,16 @@ impl ToolCallRuntime {
                             .unwrap_or(&workspace_call_classification.workspace_cwd),
                         &workspace_call_classification.source_dependencies).await;
                     if !observations.is_empty()
-                        && crate::tools::handlers::validate_retained_file_hash(&self.step_context, arguments, &hash, bytes).await
+                        && let Some(snapshot) = crate::tools::handlers::current_file_snapshot(&self.step_context, arguments).await
                     {
-                        validated = Some(guard.with_validated_source_paths(observations, workspace_revision.clone(), revision));
+                        let fresh = guard.with_validated_source_paths(observations, workspace_revision.clone(), revision);
+                        if snapshot.sha256 == hash && snapshot.canonical_bytes == bytes {
+                            validated = Some(fresh.clone());
+                        }
+                        read_file_replay_miss = Some(crate::tools::handlers::ReadFileReplayMiss {
+                            snapshot, guard:fresh, workspace_cwd:workspace_call_classification.workspace_cwd.clone(),
+                            mutation_revision:revision,
+                        });
                     }
                 }
                 // Never fall back to watcher silence after failed byte validation.
@@ -3016,6 +3045,16 @@ impl ToolCallRuntime {
                     && guard.is_fresh(revision, self.session.services.git_workspace.as_ref(), workspace_revision.as_ref())
                     && guard.matches_source_dependencies(&workspace_call_classification.source_dependencies)
                     && let Some(response) = guard.response_for_call(&call.call_id)
+                    && (call.tool_name.name != "read_file" || match &response {
+                        ResponseInputItem::FunctionCallOutput { output, .. } => {
+                            // Replay bypasses normal handler projection. Reject
+                            // packets the current exact-delivery policy would cut.
+                            crate::context_manager::truncate_function_output_payload(
+                                output, self.step_context.turn.model_info.truncation_policy.into(),
+                            ) == *output
+                        }
+                        _ => false,
+                    })
                 {
                     // A rejected replay must not mask the later fresh gate.
                     timing.mark_captured_gate_admission(replay_admission);
@@ -3030,7 +3069,7 @@ impl ToolCallRuntime {
                                 crate::tools::registry::authorized_tool_invocation_sha256(
                                     &self.step_context.turn, guard.authorization_payload(&call.payload), None));
                         }
-                        signal_collector.record_replayed_response_result(registration.ordinal, &response);
+                        signal_collector.record_validated_read_replay(registration.ordinal, &response, guard);
                     }
                     let provenance = "its exact source hash was revalidated by a sandboxed read under a fresh watcher; the returned result itself is retained evidence";
                     let replay_notice = codex_protocol::models::ResponseItem::Message {
@@ -3133,6 +3172,7 @@ impl ToolCallRuntime {
                 cancellation_token,
                 timing,
                 ToolCallWorkspaceEvidenceContext {
+                    read_file_replay_miss,
                     projection_source_dependencies: Some(
                         workspace_call_classification.source_dependencies.clone(),
                     ),
@@ -3171,10 +3211,13 @@ impl ToolCallRuntime {
                     };
                     let outcome_context = response.outcome_context();
                     let mut original_signal = response.sampling_request_signal();
-                    if crate::validation_task::take_admission_refusal(&self.step_context.turn, &error_call.call_id) {
+                    if let Some(validation_proof) = crate::validation_task::take_admission_refusal(&self.step_context.turn, &error_call.call_id) {
                         let signal = original_signal.get_or_insert_with(|| serde_json::json!({}));
                         signal["validation_admission_pending"] = serde_json::json!(true);
                         signal["outcome"] = serde_json::json!("blocked");
+                        if validation_proof {
+                            signal["validation_admission_proof"] = serde_json::json!(true);
+                        }
                     }
                     if let Some(revision) = mutation_revision_before {
                         original_signal.get_or_insert_with(|| serde_json::json!({}))
@@ -3399,8 +3442,8 @@ impl ToolCallRuntime {
                         false
                     };
                     if let (Some(collector), Some(ordinal)) = (&signal_collector, signal_ordinal) {
-                        if crate::validation_task::take_admission_refusal(&self.step_context.turn, &error_call.call_id) {
-                            collector.record_admission_pending(ordinal);
+                        if let Some(validation_proof) = crate::validation_task::take_admission_refusal(&self.step_context.turn, &error_call.call_id) {
+                            collector.record_admission_pending(ordinal, validation_proof);
                         } else {
                             collector.record_failure(
                                 ordinal,
@@ -3565,6 +3608,7 @@ impl ToolCallRuntime {
         workspace_evidence: ToolCallWorkspaceEvidenceContext,
     ) -> impl std::future::Future<Output = Result<AnyToolResult, FunctionCallError>> {
         let ToolCallWorkspaceEvidenceContext {
+            read_file_replay_miss,
             projection_source_dependencies,
             workspace_admission_hint,
             baseline_slot: workspace_evidence_baseline_slot,
@@ -3829,11 +3873,13 @@ impl ToolCallRuntime {
                 {
                     close_read_cohort(&global_gate_holders);
                     Some(Arc::new(
-                        acquire_exclusive_workspace_gate(
-                            Arc::clone(&lock),
-                            &turn.turn_timing_state,
-                        )
-                        .await,
+                        turn.workspace_execution_coordinator
+                            .admission_waiters
+                            .track(acquire_exclusive_workspace_gate(
+                                Arc::clone(&lock),
+                                &turn.turn_timing_state,
+                            ))
+                            .await,
                     ))
                 } else {
                     None
@@ -3883,16 +3929,19 @@ impl ToolCallRuntime {
                     None
                 } else {
                     Some(
-                        match acquire_workspace_gate_for_call(
-                            Arc::clone(&lock),
-                            Arc::clone(&workspace_execution),
-                            workspace_admission,
-                            &turn.turn_timing_state,
-                            &global_gate_holders,
-                            &dispatch_call,
-                            &source,
-                        )
-                        .await
+                        match turn
+                            .workspace_execution_coordinator
+                            .admission_waiters
+                            .track(acquire_workspace_gate_for_call(
+                                Arc::clone(&lock),
+                                Arc::clone(&workspace_execution),
+                                workspace_admission,
+                                &turn.turn_timing_state,
+                                &global_gate_holders,
+                                &dispatch_call,
+                                &source,
+                            ))
+                            .await
                         {
                             Ok(guard) => guard,
                             Err(result) => {
@@ -4070,6 +4119,20 @@ impl ToolCallRuntime {
                             .map(|classification| classification.source_dependencies.clone())
                     });
 
+                // A launch may queue behind another session's validation, within
+                // a code-mode call's wrapper deadline, ending on this call's
+                // cancellation or once another call of this turn waits behind
+                // its lease. Direct calls queue too; an immediate busy result
+                // only invites model-written polling (audit 2026-10-22 #23).
+                let validation_admission_wait = Some(
+                    crate::workspace_operation_gate::ValidationAdmissionWait::new(
+                        crate::unified_exec::nested_poll_bound(source.nested_deadline()),
+                        invocation_cancellation_token.clone(),
+                    )
+                    .yielding_to(Arc::clone(
+                        &turn.workspace_execution_coordinator.admission_waiters,
+                    )),
+                );
                 // Keep the handler future out of every task-local/join wrapper's
                 // inline state; large handler variants otherwise exhaust a worker stack.
                 let dispatch = Box::pin(router.dispatch_tool_call_with_terminal_outcome(
@@ -4084,7 +4147,12 @@ impl ToolCallRuntime {
                 .instrument(dispatch_span.clone());
                 let dispatch =
                     crate::tools::registry::with_prepared_hook_input(hook_notice, dispatch);
+                let dispatch = crate::tools::handlers::scope_read_file_replay_miss(read_file_replay_miss, dispatch);
                 let dispatch = HOOK_WORKSPACE_LEASE.scope(hook_lease, dispatch);
+                let dispatch = crate::workspace_operation_gate::scope_validation_admission_wait(
+                    validation_admission_wait,
+                    dispatch,
+                );
                 let dispatch = WORKSPACE_BASELINE_READY.scope(
                     baseline_ready.clone(),
                     scope_tool_dispatch_timing(
@@ -5603,19 +5671,20 @@ mod tests {
             tokio::pin!(pending);
             assert!(futures::poll!(&mut pending).is_pending());
             assert!(Arc::clone(&resource).try_write_owned().is_err());
-            tokio::time::advance(Duration::from_millis(999)).await;
+            // A 298 s return budget is capped at the 30 s grace, not halved.
+            tokio::time::advance(Duration::from_millis(29_999)).await;
             assert!(futures::poll!(&mut pending).is_pending());
             tokio::time::advance(Duration::from_millis(1)).await;
             let Err(error) = pending.await else {
                 panic!("busy command must not run")
             };
             assert!(
-                error.0.contains("one-second workspace admission grace"),
+                error.0.contains("30000 ms workspace admission grace"),
                 "{}",
                 error.0
             );
         }
-        assert_eq!(started.elapsed(), Duration::from_secs(1));
+        assert_eq!(started.elapsed(), NESTED_WORKSPACE_GATE_MAX_GRACE);
         assert!(
             Arc::clone(&resource).try_write_owned().is_ok(),
             "expiry must release partial admission"
@@ -5661,6 +5730,90 @@ mod tests {
         drop(pending.await.unwrap());
         assert_eq!(idle.elapsed(), Duration::from_millis(400));
         assert!(Arc::clone(&resource).try_write_owned().is_ok());
+    }
+
+    // Saved sessions (7d47, 99f1) refused a sibling `read_file` 1 ms before
+    // the same cell's `exec_command` left its 1 s yield window and released.
+    #[tokio::test(start_paused = true)]
+    async fn nested_workspace_grace_outlasts_a_sibling_yield_window_but_keeps_half_its_budget() {
+        let global = Arc::new(RwLock::new(()));
+        let resources = Arc::new(Mutex::new(std::collections::HashMap::new()));
+        let holders = WorkspaceGlobalHolders::default();
+        let timing = Arc::new(TurnTimingState::default());
+        let call = ToolCall {
+            tool_name: codex_tools::ToolName::plain("read_file"),
+            call_id: "queued-read".into(),
+            payload: ToolPayload::Function {
+                arguments: "{}".into(),
+            },
+        };
+        let plan = || WorkspaceAdmissionPlan {
+            native_additions: None,
+            native_read_cohort: false,
+            bypass_outer_gate: false,
+            resource_key: None,
+            shared_resource: true,
+            supports_parallel: true,
+            workspace_capable: true,
+        };
+        let source = |budget: Duration| ToolCallSource::CodeMode {
+            cell_id: "cell".into(),
+            parent_call_id: Some("outer".into()),
+            runtime_tool_call_id: "queued".into(),
+            cancellation_cause: None,
+            nested_deadline: Some((TokioInstant::now() + budget).into_std()),
+        };
+
+        // The default 60 s wrapper: the sibling releases 1.2 s later.
+        let default_wrapper = source(Duration::from_secs(60));
+        let held = Arc::clone(&global).write_owned().await;
+        let started = TokioInstant::now();
+        let pending = acquire_workspace_gate_for_call(
+            Arc::clone(&global),
+            Arc::clone(&resources),
+            plan(),
+            &timing,
+            &holders,
+            &call,
+            &default_wrapper,
+        );
+        tokio::pin!(pending);
+        assert!(futures::poll!(&mut pending).is_pending());
+        tokio::time::advance(Duration::from_millis(1_200)).await;
+        assert!(futures::poll!(&mut pending).is_pending());
+        drop(held);
+        drop(
+            pending
+                .await
+                .expect("a sibling's yield-window hold must not refuse the read"),
+        );
+        assert_eq!(started.elapsed(), Duration::from_millis(1_200));
+
+        // A 10 s wrapper leaves an 8 s return budget; half stays for execution.
+        let held = Arc::clone(&global).write_owned().await;
+        let started = TokioInstant::now();
+        let Err(error) = acquire_workspace_gate_for_call(
+            Arc::clone(&global),
+            Arc::clone(&resources),
+            plan(),
+            &timing,
+            &holders,
+            &call,
+            &source(Duration::from_secs(10)),
+        )
+        .await
+        else {
+            panic!("a held exclusive gate must refuse the queued read")
+        };
+        assert_eq!(started.elapsed(), Duration::from_secs(4));
+        assert!(
+            error.0.contains("4000 ms workspace admission grace"),
+            "{}",
+            error.0
+        );
+        assert!(error.0.contains("did not run"), "{}", error.0);
+        assert_eq!(timing.lifecycle_context().parallel_gate_waiter_count, 0);
+        drop(held);
     }
 
     #[tokio::test]
@@ -6802,6 +6955,28 @@ mod tests {
             handler.supports_parallel_tool_calls(),
             /*workspace_capable*/ true,
         ));
+    }
+
+    #[tokio::test]
+    async fn readiness_wait_admits_siblings_and_preserves_writer_exclusion() {
+        use codex_tools::ToolExecutor as _;
+        let handler = crate::tools::handlers::WaitForEnvironmentHandler;
+        assert!(workspace_tool_may_use_parallel_gate(
+            handler.supports_parallel_tool_calls(),
+            false,
+        ));
+        let gate = Arc::new(RwLock::new(()));
+        let timing = Arc::new(TurnTimingState::default());
+        let readiness = acquire_shared_workspace_gate(Arc::clone(&gate), &timing).await;
+        let sibling = Arc::clone(&gate)
+            .try_read_owned()
+            .expect("independent tools must enter while readiness is pending");
+        assert!(Arc::clone(&gate).try_write_owned().is_err());
+        drop(sibling);
+        assert!(Arc::clone(&gate).try_write_owned().is_err());
+        // Cancellation/completion drops the readiness dispatch's owned lease.
+        drop(readiness);
+        assert!(gate.try_write_owned().is_ok());
     }
 
     #[test]

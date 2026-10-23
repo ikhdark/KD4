@@ -1,7 +1,8 @@
 use std::sync::Arc;
 
+use super::AsyncCompactionTraceContext as CompactionTraceContext;
 use super::RemoteCompactionV2Output;
-use super::prepare_v2_retained_input;
+use super::prepare_v2_retained_input_source;
 use super::run_remote_compaction_request_v2;
 use crate::Prompt;
 use crate::client::ModelClientSession;
@@ -14,16 +15,18 @@ use crate::session::step_context::StepContext;
 use crate::session::turn::build_projected_prompt;
 use crate::session::turn::built_tools;
 use crate::session::turn::prepare_sampling_prompt_with_workspace_identity;
+use crate::session::turn::prompt_token_estimates;
 use crate::session::turn::with_sampling_workspace_identity;
 use codex_protocol::error::Result as CodexResult;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::TokenUsage;
-use codex_rollout_trace::CompactionTraceContext;
 use tokio_util::sync::CancellationToken;
 use tracing::info;
 
 pub(super) struct RemoteCompactV2Attempt {
     pub(super) trace_input_history: Option<Vec<ResponseItem>>,
+    pub(super) retained_input: crate::compact::TaskInputCheckpoint,
+    #[cfg(test)]
     pub(super) retention_input: Vec<ResponseItem>,
     pub(super) compaction_output: ResponseItem,
     pub(super) token_usage: Option<TokenUsage>,
@@ -151,11 +154,17 @@ pub(super) async fn run_remote_compact_v2_attempt(
     }
 
     // Trimming is best effort, not a fit receipt. Required text may still be
-    // oversized; do not spend a compaction request that cannot fit either.
+    // oversized; do not spend a compaction request that cannot fit either. The
+    // byte estimate overstates recorded text-heavy prompts by 11-45 % (557,192
+    // tokens for a measured 442,400), so refuse only when sampling admission's
+    // provider-calibrated estimate does not fit either.
     let largest_input = largest_compaction_request_input(&prompt);
-    if turn_context
-        .model_context_window()
-        .is_some_and(|limit| prompt.budget_tokens_for_input(&largest_input) >= limit)
+    if let Some(limit) = turn_context.model_context_window()
+        && prompt.budget_tokens_for_input(&largest_input) >= limit
+        && prompt_token_estimates(sess, turn_context, &prompt)
+            .await
+            .calibrated_tokens
+            >= limit
     {
         return Err(codex_protocol::error::CodexErr::ContextWindowExceeded);
     }
@@ -167,11 +176,14 @@ pub(super) async fn run_remote_compact_v2_attempt(
     // Required recovery must be available before spending a provider request.
     // Use source IDs, not the lossy sampling projection or synthetic trigger.
     // Retention is awaited to completion: cancellation must not detach writes.
+    let retained_input = prepare_v2_retained_input_source(sess, history.raw_items()).await?;
     {
-        let (retained_input, _) = prepare_v2_retained_input(sess, history.raw_items()).await?;
         let current_history = sess.clone_history().await;
         let mut reference_items = current_history.raw_items().to_vec();
-        reference_items.extend(retained_input);
+        reference_items.extend(retained_input.items.iter().cloned());
+        if let Some(plan) = crate::compact::retained_plan_context(sess).await? {
+            reference_items.push(plan);
+        }
         // Installation rechecks the live plan and pins after the provider wait.
         // Existing content-addressed retention reuses unchanged recovery bytes.
         sess.compaction_artifact_pins(&current_history.tool_history_state(), &reference_items)
@@ -204,10 +216,11 @@ pub(super) async fn run_remote_compact_v2_attempt(
         compaction_output,
         token_usage,
     } = compaction_output_result?;
-    let retention_input = history.into_raw_items();
     Ok(RemoteCompactV2Attempt {
         trace_input_history,
-        retention_input,
+        retained_input,
+        #[cfg(test)]
+        retention_input: history.into_raw_items(),
         compaction_output,
         token_usage,
         owned_client_session,
@@ -609,6 +622,157 @@ mod tests {
         assert_eq!(request.physical_attempt_ids.len(), 1);
         assert_eq!(timing.counters.model_request_count, 1);
         assert_eq!(timing.milestones.first_visible_output_ms, None);
+        Ok(())
+    }
+
+    /// e6b3: the byte estimate put a prompt the provider measured at 442,400
+    /// tokens at 557,192, so the fit check refused a compaction request that
+    /// fit the 475,000-token window and the turn compacted locally instead.
+    #[tokio::test]
+    async fn remote_compaction_fit_check_uses_the_provider_calibrated_size() -> anyhow::Result<()> {
+        use crate::client_common::ResponseEvent;
+        use crate::session::turn::prepare_sampling_prompt_for_client;
+        use crate::test_harness::responses;
+        use codex_analytics::CompactionImplementation;
+        use codex_analytics::CompactionPhase;
+        use codex_analytics::CompactionReason;
+        use codex_analytics::CompactionTrigger;
+        use codex_protocol::error::CodexErr;
+        use codex_protocol::models::ContentItem;
+
+        const WINDOW: i64 = 40_000;
+        crate::test_harness::require_network!();
+        let server = responses::start_mock_server().await;
+        let home = tempfile::tempdir()?;
+        let (session, mut turn, _events) =
+            crate::session::tests::make_session_and_context_with_auth_config_home_and_rx(
+                codex_login::CodexAuth::from_api_key("test"),
+                Vec::new(),
+                home.path(),
+                |config| {
+                    config.model_provider.base_url = Some(format!("{}/v1", server.uri()));
+                    config.model_provider.supports_websockets = false;
+                },
+            )
+            .await;
+        let turn_mut = Arc::get_mut(&mut turn).unwrap();
+        turn_mut.model_info.context_window = Some(WINDOW);
+        turn_mut.model_info.max_context_window = None;
+        turn_mut.model_info.effective_context_window_percent = 100;
+        let message = |role: &str, text: String| ResponseItem::Message {
+            id: None,
+            role: role.into(),
+            content: vec![ContentItem::InputText { text }],
+            phase: None,
+            internal_chat_message_metadata_passthrough: None,
+        };
+        // The checkpoint keeps no developer context, so only the fit check
+        // decides whether the request is spent.
+        session
+            .replace_history(
+                vec![
+                    message("user", "compact this history".into()),
+                    message("developer", "x".repeat(4 * WINDOW as usize)),
+                ],
+                None,
+            )
+            .await;
+        let step = session.capture_step_context(Arc::clone(&turn)).await?;
+        let metadata = CompactionTurnMetadata::new(
+            CompactionTrigger::Auto,
+            CompactionReason::ContextLimit,
+            CompactionImplementation::ResponsesCompactionV2,
+            CompactionPhase::MidTurn,
+        );
+        let log = responses::mount_sse_once(
+            &server,
+            responses::sse(vec![
+                serde_json::json!({"type":"response.output_item.done",
+                "item":{"type":"compaction","encrypted_content":"opaque"}}),
+                responses::ev_completed("compacted"),
+            ]),
+        )
+        .await;
+
+        // With no provider measurement, the byte estimate alone cannot fit.
+        let refused = run_remote_compact_v2_attempt(
+            &session,
+            &step,
+            None,
+            &CompactionTraceContext::disabled(),
+            metadata,
+            &mut CompactionAnalyticsDetails::default(),
+            &CancellationToken::new(),
+        )
+        .await;
+        assert!(
+            matches!(refused, Err(CodexErr::ContextWindowExceeded)),
+            "an unmeasured oversized prompt must be refused locally"
+        );
+        assert!(log.requests().is_empty());
+
+        // The previous sampling request sent this prompt, and the provider
+        // measured it at half the byte estimate.
+        let router = built_tools(session.as_ref(), &step, &[], &CancellationToken::new()).await?;
+        let prepared = prepare_sampling_prompt_for_client(
+            session.clone_history().await,
+            &turn,
+            session.services.git_workspace.as_ref(),
+        )
+        .await;
+        let sampled = build_projected_prompt(
+            session.as_ref(),
+            &prepared,
+            &router,
+            step.as_ref(),
+            turn.base_instructions.as_ref().clone(),
+        );
+        let basis = sampled.calibration_basis(Arc::clone(&sampled.input));
+        assert!(basis.local_tokens >= WINDOW, "{}", basis.local_tokens);
+        let timing = &turn.turn_timing_state;
+        timing.mark_turn_started();
+        drop(timing.begin_model_request_wait());
+        timing.record_model_attempt_identity("sampled", "physical");
+        let model = serde_json::json!({"model": turn.model_info.slug}).to_string();
+        timing.record_model_request_payload("sampled", "physical", model.as_bytes());
+        timing.record_model_request_sections("sampled", "physical", model.as_bytes());
+        timing.record_model_request_token_categories(
+            "sampled",
+            "physical",
+            codex_protocol::protocol::TurnTimingRequestTokenCategories {
+                local_input_estimate: u64::try_from(basis.local_tokens)?,
+                ..Default::default()
+            },
+        );
+        let usage = TokenUsage {
+            input_tokens: basis.local_tokens / 2,
+            total_tokens: basis.local_tokens / 2,
+            ..Default::default()
+        };
+        timing.record_generation_token_usage(Some(&usage));
+        timing.record_response_event_milestones(&ResponseEvent::Completed {
+            response_id: "sampled".to_string(),
+            token_usage: Some(usage.clone()),
+            end_turn: Some(true),
+        });
+        turn.extension_data.insert(basis);
+        session.record_token_usage_info(&turn, Some(&usage)).await?;
+
+        let attempt = run_remote_compact_v2_attempt(
+            &session,
+            &step,
+            None,
+            &CompactionTraceContext::disabled(),
+            metadata,
+            &mut CompactionAnalyticsDetails::default(),
+            &CancellationToken::new(),
+        )
+        .await?;
+        assert!(matches!(
+            attempt.compaction_output,
+            ResponseItem::Compaction { .. }
+        ));
+        assert_eq!(log.requests().len(), 1);
         Ok(())
     }
 

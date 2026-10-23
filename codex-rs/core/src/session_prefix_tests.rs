@@ -253,3 +253,56 @@ fn protected_completion_diagnostics_survive_middle_echo_and_multibyte_truncation
         assert!(approx_token_count(&communication.content) < COMPLETION_MESSAGE_MAX_TOKENS);
     }
 }
+
+#[test]
+fn audit149x_protected_host_summary_is_not_repeated_in_error_or_stopped_payloads() {
+    use codex_protocol::protocol::TurnExecutionStopCause;
+    let summary = codex_protocol::protocol::TurnCompletionAssessment {
+        verification_gaps: vec!["final workspace not verified".into()],
+        ..Default::default()
+    }
+    .bounded_summary("child-turn")
+    .unwrap();
+    let render = |status: &AgentStatus, protected: Option<&str>| {
+        super::inter_agent_completion_communication_with_diagnostics(
+            AgentPath::root(),
+            AgentPath::try_from("/root/worker").unwrap(),
+            codex_protocol::ThreadId::new(),
+            status,
+            None,
+            protected,
+        )
+        .unwrap()
+        .content
+    };
+    let stopped = |report: String| AgentStatus::Stopped {
+        last_agent_message: Some(report),
+        stop_cause: TurnExecutionStopCause::SubagentContextBudget,
+    };
+
+    // Status projection already placed the host summary first in each payload.
+    let errored = render(
+        &AgentStatus::Errored(format!("{summary}\n\nturn failed")),
+        Some(summary.as_str()),
+    );
+    assert_eq!(errored.matches(summary.as_str()).count(), 1, "{errored}");
+    assert!(errored.contains("Agent errored: turn failed"));
+
+    let partial = render(
+        &stopped(format!("{summary}\n\npartial report")),
+        Some(summary.as_str()),
+    );
+    assert_eq!(partial.matches(summary.as_str()).count(), 1, "{partial}");
+    assert!(partial.contains("partial report"));
+
+    let host_only = render(&stopped(summary.clone()), Some(summary.as_str()));
+    assert_eq!(host_only.matches(summary.as_str()).count(), 1, "{host_only}");
+    assert!(host_only.contains("No authored report was delivered."));
+
+    // Negative control: without a protected summary nothing is removed.
+    let unprotected = render(
+        &AgentStatus::Errored(format!("{summary}\n\nturn failed")),
+        None,
+    );
+    assert!(unprotected.contains(&format!("Agent errored: {summary}")));
+}

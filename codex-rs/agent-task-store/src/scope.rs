@@ -2,6 +2,7 @@ use serde::Deserialize;
 use serde::Serialize;
 use sha2::Digest;
 use sha2::Sha256;
+use std::collections::HashMap;
 use std::collections::HashSet;
 use std::path::Component;
 use std::path::Path;
@@ -174,21 +175,30 @@ pub fn normalize_repo_scopes(
 ) -> StoreResult<Vec<RepoScope>> {
     let canonical_root = std::fs::canonicalize(repo_root)?;
     let mut normalized = Vec::with_capacity(scopes.len());
-    let mut seen = HashSet::with_capacity(scopes.len());
 
     for scope in scopes {
         let path = normalize_lexically(&scope.path)?;
         let path = canonical_relative_identity(&canonical_root, &path)?;
-        let duplicate_key = comparison_key(&path);
-        if !seen.insert(duplicate_key) {
-            return Err(StoreError::InvalidScope(format!(
-                "duplicate scope path {path}"
-            )));
-        }
         normalized.push(RepoScope {
             path,
             recursive: scope.recursive,
         });
+    }
+    let paths = normalized
+        .iter()
+        .map(|scope| scope.path.clone())
+        .collect::<Vec<_>>();
+    let mut seen = HashSet::with_capacity(paths.len());
+    for (scope, key) in normalized
+        .iter()
+        .zip(repo_path_identity_keys(&canonical_root, &paths)?)
+    {
+        if !seen.insert(key) {
+            return Err(StoreError::InvalidScope(format!(
+                "duplicate scope path {}",
+                scope.path
+            )));
+        }
     }
 
     Ok(normalized)
@@ -319,6 +329,239 @@ pub(crate) fn filesystem_paths_equal(left: &str, right: &str) -> bool {
     paths_equal(left, right)
 }
 
+/// Whether lookups in a directory resolve spellings that differ only by case
+/// to the same entry. Observed from the filesystem rather than the platform:
+/// Windows enables case sensitivity per directory.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) enum ScopeCaseSemantics {
+    /// Lookups distinguish case, or the semantics could not be observed.
+    #[default]
+    Exact,
+    IgnoresCase,
+}
+
+/// Case semantics observed for an admission candidate's scopes before its
+/// transaction opens, so admission never holds the database while it waits
+/// on the filesystem.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct CandidateScopeCase {
+    read: Vec<ScopeCaseSemantics>,
+    write: Vec<ScopeCaseSemantics>,
+}
+
+impl CandidateScopeCase {
+    pub(crate) fn observe(
+        repo_root: &Path,
+        read_scope: &[RepoScope],
+        write_scope: &[RepoScope],
+    ) -> Self {
+        let Ok(mut observer) = CaseObserver::new(repo_root) else {
+            // Unobservable semantics keep exact comparison.
+            return Self::default();
+        };
+        Self {
+            read: observer.scopes(read_scope),
+            write: observer.scopes(write_scope),
+        }
+    }
+
+    pub(crate) fn read(&self, index: usize) -> ScopeCaseSemantics {
+        self.read.get(index).copied().unwrap_or_default()
+    }
+
+    pub(crate) fn write(&self, index: usize) -> ScopeCaseSemantics {
+        self.write.get(index).copied().unwrap_or_default()
+    }
+}
+
+/// Overlap between a persisted scope and an admission candidate under the
+/// case semantics observed for the candidate. Normalization keeps the declared
+/// spelling of components that did not exist yet, so a persisted scope can
+/// differ from a candidate alias by case alone. Aliases share directories, so
+/// the candidate's observation governs both spellings.
+pub(crate) fn scopes_overlap_observed(
+    existing: &RepoScope,
+    candidate: &RepoScope,
+    semantics: ScopeCaseSemantics,
+) -> bool {
+    if existing.overlaps(candidate) {
+        return true;
+    }
+    if semantics != ScopeCaseSemantics::IgnoresCase {
+        return false;
+    }
+    let existing_key = case_folded(&existing.path);
+    let candidate_key = case_folded(&candidate.path);
+    existing_key == candidate_key
+        || existing.recursive && is_descendant(&existing_key, &candidate_key)
+        || candidate.recursive && is_descendant(&candidate_key, &existing_key)
+}
+
+/// Deduplication keys for normalized repository paths, in input order.
+///
+/// Normalization resolves existing aliases to the filesystem's spelling, so
+/// only spellings that still differ by case alone can name one entry: a path
+/// that does not exist yet, or one created after it was declared. Those keys
+/// fold exactly where the deepest existing directory is observed to ignore
+/// case. Keys compare paths; persist the normalized paths themselves.
+pub fn repo_path_identity_keys(repo_root: &Path, paths: &[String]) -> StoreResult<Vec<String>> {
+    let mut spellings = HashMap::<String, HashSet<&str>>::new();
+    for path in paths {
+        spellings
+            .entry(case_folded(path))
+            .or_default()
+            .insert(path.as_str());
+    }
+    if spellings.values().all(|spellings| spellings.len() < 2) {
+        return Ok(paths.to_vec());
+    }
+    let mut observer = CaseObserver::new(repo_root)?;
+    Ok(paths
+        .iter()
+        .map(|path| {
+            let folded = case_folded(path);
+            let ambiguous = spellings
+                .get(&folded)
+                .is_some_and(|spellings| spellings.len() > 1);
+            if ambiguous && observer.semantics(path) == ScopeCaseSemantics::IgnoresCase {
+                // Paths never contain NUL, so a folded key cannot equal an exact one.
+                format!("\0{folded}")
+            } else {
+                path.clone()
+            }
+        })
+        .collect())
+}
+
+/// Entries read while looking for a name whose case can be swapped, bounded
+/// so a very large directory cannot stall normalization or admission.
+const CASE_PROBE_ENTRY_LIMIT: usize = 64;
+
+/// Observes each directory's case semantics once per operation.
+struct CaseObserver {
+    canonical_root: PathBuf,
+    observed: HashMap<PathBuf, ScopeCaseSemantics>,
+}
+
+impl CaseObserver {
+    fn new(repo_root: &Path) -> StoreResult<Self> {
+        Ok(Self {
+            canonical_root: std::fs::canonicalize(repo_root)?,
+            observed: HashMap::new(),
+        })
+    }
+
+    fn scopes(&mut self, scopes: &[RepoScope]) -> Vec<ScopeCaseSemantics> {
+        scopes
+            .iter()
+            .map(|scope| self.semantics(&scope.path))
+            .collect()
+    }
+
+    /// Semantics of the deepest existing directory at or above a normalized
+    /// path. Components that do not exist yet will be created under it.
+    fn semantics(&mut self, normalized_path: &str) -> ScopeCaseSemantics {
+        let Some(directory) = deepest_existing_directory(&self.canonical_root, normalized_path)
+        else {
+            return ScopeCaseSemantics::Exact;
+        };
+        *self
+            .observed
+            .entry(directory)
+            .or_insert_with_key(|directory| observe_case_semantics(directory.as_path()))
+    }
+}
+
+fn deepest_existing_directory(canonical_root: &Path, normalized_path: &str) -> Option<PathBuf> {
+    let target = if normalized_path == "." {
+        canonical_root.to_path_buf()
+    } else {
+        canonical_root.join(normalized_path)
+    };
+    let mut candidate = target.as_path();
+    loop {
+        if std::fs::metadata(candidate).is_ok_and(|metadata| metadata.is_dir()) {
+            return Some(candidate.to_path_buf());
+        }
+        candidate = candidate.parent()?;
+        if !candidate.starts_with(canonical_root) {
+            return None;
+        }
+    }
+}
+
+fn observe_case_semantics(directory: &Path) -> ScopeCaseSemantics {
+    let observed = std::fs::read_dir(directory).ok().and_then(|entries| {
+        entries
+            .take(CASE_PROBE_ENTRY_LIMIT)
+            .filter_map(Result::ok)
+            // A symlink's target can satisfy both spellings in a case-sensitive directory.
+            .filter(|entry| entry.file_type().is_ok_and(|kind| !kind.is_symlink()))
+            .find_map(|entry| lookup_ignores_case(directory, &entry.file_name()))
+    });
+    // Without a usable entry, fall back to the directory's own name in its
+    // parent: a new directory starts with its parent's semantics.
+    let observed = observed.or_else(|| {
+        let name = directory.file_name()?;
+        lookup_ignores_case(directory.parent()?, name)
+    });
+    match observed {
+        Some(true) => ScopeCaseSemantics::IgnoresCase,
+        Some(false) | None => ScopeCaseSemantics::Exact,
+    }
+}
+
+/// Resolve an existing entry through its case-swapped spelling. A miss, or a
+/// distinct sibling under that spelling, proves the lookup is case-sensitive.
+fn lookup_ignores_case(directory: &Path, name: &std::ffi::OsStr) -> Option<bool> {
+    let name = name.to_str()?;
+    let swapped = swap_ascii_case(name);
+    if swapped == name {
+        return None;
+    }
+    let swapped = directory.join(swapped);
+    match std::fs::symlink_metadata(&swapped) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Some(false),
+        Err(_) => None,
+        Ok(_) => {
+            let original = std::fs::canonicalize(directory.join(name)).ok()?;
+            let swapped = std::fs::canonicalize(&swapped).ok()?;
+            Some(original == swapped)
+        }
+    }
+}
+
+fn swap_ascii_case(value: &str) -> String {
+    value
+        .chars()
+        .map(|character| {
+            if character.is_ascii_uppercase() {
+                character.to_ascii_lowercase()
+            } else {
+                character.to_ascii_uppercase()
+            }
+        })
+        .collect()
+}
+
+/// One-to-one simple uppercase mapping of BMP characters, the per-UTF-16-unit
+/// comparison case-insensitive filesystems apply. Unlike full Unicode folding
+/// it never changes a name's length.
+fn case_folded(path: &str) -> String {
+    path.chars()
+        .map(|character| {
+            if u32::from(character) > 0xFFFF {
+                return character;
+            }
+            let mut upper = character.to_uppercase();
+            match (upper.next(), upper.next()) {
+                (Some(single), None) => single,
+                _ => character,
+            }
+        })
+        .collect()
+}
+
 fn filesystem_identity_bytes(path: &Path) -> Vec<u8> {
     // A new domain keeps legacy folded identities from being treated as proof
     // of equality. The old store rows remain intact, not silently merged.
@@ -401,5 +644,103 @@ mod audit_tests {
         let upper = normalize_repo_path(temp.path(), "Owner.rs").unwrap();
         let lower = normalize_repo_path(temp.path(), "owner.rs").unwrap();
         assert_eq!(upper == lower, aliases);
+    }
+
+    #[test]
+    fn observed_case_semantics_fold_only_where_lookups_ignore_case() {
+        let existing = RepoScope {
+            path: "src/new.rs".to_string(),
+            recursive: false,
+        };
+        let candidate = RepoScope {
+            path: "src/New.rs".to_string(),
+            recursive: false,
+        };
+        let directory = RepoScope {
+            path: "Src".to_string(),
+            recursive: true,
+        };
+        let sibling = RepoScope {
+            path: "srcs/New.rs".to_string(),
+            recursive: false,
+        };
+        // Case-sensitive negatives survive: exact semantics never fold.
+        assert!(!scopes_overlap_observed(&existing, &candidate, ScopeCaseSemantics::Exact));
+        assert!(!scopes_overlap_observed(&directory, &candidate, ScopeCaseSemantics::Exact));
+        assert!(scopes_overlap_observed(&existing, &candidate, ScopeCaseSemantics::IgnoresCase));
+        assert!(scopes_overlap_observed(&directory, &candidate, ScopeCaseSemantics::IgnoresCase));
+        // Folding never merges distinct names, and keeps one-to-one mappings.
+        assert!(!scopes_overlap_observed(&directory, &sibling, ScopeCaseSemantics::IgnoresCase));
+        assert_eq!(case_folded("straße/ß.rs"), "STRAßE/ß.RS");
+    }
+
+    #[test]
+    fn missing_case_aliases_follow_the_observed_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("src");
+        std::fs::create_dir(&source).unwrap();
+        // Independent oracle: exclusive creation of an alias collides exactly
+        // when lookups in this directory ignore case.
+        std::fs::write(source.join("Oracle.rs"), "oracle").unwrap();
+        let ignores_case = match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(source.join("oracle.RS"))
+        {
+            Ok(_) => false,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => true,
+            Err(error) => panic!("case alias oracle failed: {error}"),
+        };
+
+        let upper = normalize_repo_path(temp.path(), "src/New.rs").unwrap();
+        let lower = normalize_repo_path(temp.path(), "src/new.rs").unwrap();
+        assert_eq!((upper.as_str(), lower.as_str()), ("src/New.rs", "src/new.rs"));
+        let candidate = RepoScope {
+            path: upper.clone(),
+            recursive: false,
+        };
+        let observed = CandidateScopeCase::observe(temp.path(), &[], &[candidate.clone()]);
+        let expected = if ignores_case {
+            ScopeCaseSemantics::IgnoresCase
+        } else {
+            ScopeCaseSemantics::Exact
+        };
+        assert_eq!(observed.write(0), expected);
+        let existing = RepoScope {
+            path: lower.clone(),
+            recursive: false,
+        };
+        assert_eq!(
+            scopes_overlap_observed(&existing, &candidate, observed.write(0)),
+            ignores_case
+        );
+
+        let keys = repo_path_identity_keys(temp.path(), &[upper, lower]).unwrap();
+        assert_eq!(keys[0] == keys[1], ignores_case);
+        let duplicates = normalize_repo_scopes(
+            temp.path(),
+            &[
+                RepoScope {
+                    path: "src/New.rs".to_string(),
+                    recursive: false,
+                },
+                RepoScope {
+                    path: "src/new.rs".to_string(),
+                    recursive: false,
+                },
+            ],
+        );
+        let rejected_as_duplicate = matches!(
+            &duplicates,
+            Err(StoreError::InvalidScope(message)) if message.contains("duplicate scope path")
+        );
+        assert_eq!(rejected_as_duplicate, ignores_case, "{duplicates:?}");
+        // Unrelated spellings never need an observation and keep exact keys.
+        let distinct = repo_path_identity_keys(
+            temp.path(),
+            &["src/a.rs".to_string(), "src/b.rs".to_string()],
+        )
+        .unwrap();
+        assert_eq!(distinct, vec!["src/a.rs".to_string(), "src/b.rs".to_string()]);
     }
 }

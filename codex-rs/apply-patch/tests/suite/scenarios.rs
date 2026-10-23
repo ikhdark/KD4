@@ -45,7 +45,9 @@ scenarios! {
     scenario_021_update_file_deletion_only: "021_update_file_deletion_only" => (0, ""),
     scenario_022_update_file_end_of_file_marker: "022_update_file_end_of_file_marker" => (0, ""),
     scenario_023_whitespace_padded_patch_marker_lines: "023_whitespace_padded_patch_marker_lines" => (0, ""),
-    scenario_024_rejects_out_of_order_chunks: "024_rejects_out_of_order_chunks" => (1, "after line 2. Chunks must be in top-to-bottom file order"),
+    scenario_024_rejects_out_of_order_chunks: "024_rejects_out_of_order_chunks" => (1, "A chunk listed out of file order must match one location"),
+    scenario_025_applies_unique_out_of_order_chunks: "025_applies_unique_out_of_order_chunks" => (0, ""),
+    scenario_026_applies_repeated_updates_in_sequence: "026_applies_repeated_updates_in_sequence" => (0, ""),
 }
 
 #[test]

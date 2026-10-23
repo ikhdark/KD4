@@ -274,6 +274,9 @@ pub enum ThreadItem {
         id: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         #[ts(optional)]
+        effects: Option<codex_protocol::items::FileChangeEffects>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
         environment: Option<codex_protocol::items::EnvironmentProvenance>,
         changes: Vec<FileUpdateChange>,
         status: PatchApplyStatus,
@@ -636,6 +639,7 @@ impl From<CoreTurnItem> for ThreadItem {
             },
             CoreTurnItem::FileChange(file_change) => ThreadItem::FileChange {
                 id: file_change.id,
+                effects: file_change.effects,
                 environment: file_change.environment,
                 changes: convert_patch_changes(&file_change.changes),
                 status: file_change

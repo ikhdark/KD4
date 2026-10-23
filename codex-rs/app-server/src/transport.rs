@@ -1,5 +1,6 @@
 use crate::message_processor::ConnectionSessionState;
 use crate::outgoing_message::OutgoingEnvelope;
+use crate::outgoing_message::OutgoingWriteReceipt;
 use codex_app_server_protocol::ExperimentalApi;
 use codex_app_server_protocol::ServerRequest;
 use std::collections::HashMap;
@@ -225,7 +226,7 @@ async fn send_message_to_connection(
     connections: &mut HashMap<ConnectionId, OutboundConnectionState>,
     connection_id: ConnectionId,
     message: OutgoingMessage,
-    write_complete_tx: Option<tokio::sync::oneshot::Sender<std::time::Instant>>,
+    write_complete_tx: Option<OutgoingWriteReceipt>,
 ) -> bool {
     let Some(connection_state) = connections.get_mut(&connection_id) else {
         warn!("dropping message for disconnected connection: {connection_id:?}");
@@ -233,13 +234,18 @@ async fn send_message_to_connection(
     };
     let message = filter_outgoing_message_for_connection(connection_state, message);
     if should_skip_notification_for_connection(connection_state, &message) {
+        if let Some(receipt) = write_complete_tx
+            && let Some(filtered) = receipt.filtered
+        {
+            let _ = filtered.send(());
+        }
         return false;
     }
 
     let writer = connection_state.writer.clone();
     let queued_message = QueuedOutgoingMessage {
         message,
-        write_complete_tx,
+        write_complete_tx: write_complete_tx.map(|receipt| receipt.writer),
     };
     if connection_state.can_disconnect() {
         match writer.try_send(queued_message) {

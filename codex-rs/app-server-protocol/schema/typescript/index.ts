@@ -22,6 +22,8 @@ export type { ExecCommandApprovalResponse } from "./ExecCommandApprovalResponse"
 export type { ExecOutputStream } from "./ExecOutputStream";
 export type { ExecPolicyAmendment } from "./ExecPolicyAmendment";
 export type { FileChange } from "./FileChange";
+export type { FileChangeEffect } from "./FileChangeEffect";
+export type { FileChangeEffects } from "./FileChangeEffects";
 export type { FileSystemAccessMode } from "./FileSystemAccessMode";
 export type { FileSystemPath } from "./FileSystemPath";
 export type { FileSystemSandboxEntry } from "./FileSystemSandboxEntry";

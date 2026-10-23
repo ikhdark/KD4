@@ -1,6 +1,6 @@
 //! Admission for native operations with enforced filesystem footprints.
-//! Opaque writers exclude everything; readers commute; additions commute only
-//! in disjoint, existing directories. A cancelled waiter removes its own claim.
+//! Opaque writers exclude everything; readers commute; native mutations commute
+//! only with disjoint endpoint/parent claims. Cancelled waiters remove their claims.
 
 use std::collections::BTreeSet;
 use std::path::Path;
@@ -242,9 +242,10 @@ pub(crate) struct NativeAdditions {
 }
 
 impl NativeAdditions {
-    /// Only absent targets under existing canonical directories qualify. No
-    /// update, rename, directory creation, metadata write, remote path, or
-    /// ambiguous Windows path is granted a scoped mutation lease.
+    /// Absent targets claim their parent; existing ordinary files claim their
+    /// canonical endpoint. Renames, symlinks, directory creation, remote paths
+    /// and ambiguous Windows names retain the opaque workspace lease. The
+    /// historical type name also covers guarded in-place text updates.
     pub(crate) async fn resolve(root: &Path, cwd: &Path, paths: &[PathBuf]) -> Option<Self> {
         if paths.is_empty() || paths.len() > 64 {
             return None;
@@ -291,14 +292,21 @@ impl NativeAdditions {
             if cfg!(windows) && !parent_text.is_ascii() {
                 return None;
             }
-            match tokio::fs::symlink_metadata(parent.join(name)).await {
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            let resource = match tokio::fs::symlink_metadata(parent.join(name)).await {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => parent,
+                Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => {
+                    tokio::fs::canonicalize(parent.join(name)).await.ok()?
+                }
                 _ => return None,
+            };
+            let resource_text = resource.to_str()?;
+            if cfg!(windows) && !resource_text.is_ascii() {
+                return None;
             }
             directories.insert(if cfg!(windows) {
-                PathBuf::from(parent_text.to_ascii_lowercase())
+                PathBuf::from(resource_text.to_ascii_lowercase())
             } else {
-                parent
+                resource
             });
         }
         Some(Self {
@@ -332,6 +340,47 @@ impl NativeAdditions {
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    #[tokio::test]
+    async fn audit147_existing_disjoint_endpoints_progress_and_conflicts_cancel_cleanly() {
+        let root = tempfile::tempdir().unwrap();
+        for name in ["a", "b"] {
+            std::fs::write(root.path().join(name), "old\n").unwrap();
+        }
+        let gate = Arc::new(ScopedWorkspaceGate::default());
+        let a = NativeAdditions::resolve(root.path(), root.path(), &[PathBuf::from("a")])
+            .await
+            .unwrap()
+            .acquire(Arc::clone(&gate))
+            .await;
+        let b = NativeAdditions::resolve(root.path(), root.path(), &[PathBuf::from("b")])
+            .await
+            .unwrap();
+        let b = tokio::time::timeout(Duration::from_secs(1), b.acquire(Arc::clone(&gate)))
+            .await
+            .expect("disjoint existing files must not wait");
+        let blocked = NativeAdditions::resolve(root.path(), root.path(), &[PathBuf::from("a")])
+            .await
+            .unwrap();
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(20),
+                blocked.acquire(Arc::clone(&gate))
+            )
+            .await
+            .is_err()
+        );
+        assert!(Arc::clone(&gate).try_read_owned().is_err());
+        drop(a);
+        let a = NativeAdditions::resolve(root.path(), root.path(), &[PathBuf::from("a")])
+            .await
+            .unwrap();
+        let a = tokio::time::timeout(Duration::from_secs(1), a.acquire(Arc::clone(&gate)))
+            .await
+            .expect("cancelled waiter must release its claim");
+        drop((a, b));
+        assert!(Arc::clone(&gate).try_write_owned().is_ok());
+    }
 
     #[tokio::test]
     async fn queued_writer_blocks_later_readers_until_downgrade() {
@@ -454,7 +503,7 @@ mod tests {
         let second_reader = Arc::clone(&gate).try_read_owned().unwrap();
         drop((first_reader, second_reader));
         std::fs::write(root.path().join("left/existing"), "existing").unwrap();
-        for path in ["left/existing", "missing/new", ".git", "left/../right/new"] {
+        for path in ["missing/new", ".git", "left/../right/new"] {
             assert!(
                 NativeAdditions::resolve(root.path(), root.path(), &paths(path))
                     .await

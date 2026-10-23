@@ -1,6 +1,8 @@
 use super::*;
 #[path = "control_audit53_tests.rs"]
 mod audit53;
+#[path = "control_audit142_tests.rs"]
+mod audit142;
 use crate::CodexThread;
 use crate::StateDbHandle;
 use crate::ThreadManager;

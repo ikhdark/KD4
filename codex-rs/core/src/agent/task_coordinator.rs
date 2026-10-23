@@ -71,6 +71,11 @@ struct InitializedTaskStore {
 type SuiteBudgets =
     HashMap<(String, String), Arc<codex_command_analysis::command_preflight::FullSuiteBudget>>;
 
+type NativeValidationDeliveries = HashMap<
+    String,
+    Arc<tokio::sync::Mutex<crate::tools::typed_validation::DeliveryState>>,
+>;
+
 /// Shared typed-task persistence and identity index for one root agent tree.
 ///
 /// The coordinator is cloned with [`super::AgentControl`], so every child resolves the same
@@ -83,9 +88,31 @@ pub(crate) struct AgentTaskCoordinator {
     bindings: Arc<RwLock<BindingIndex>>,
     metrics: Arc<Mutex<TaskMetricIndex>>,
     suite_budgets: Arc<Mutex<SuiteBudgets>>,
+    unavailable_descendants: Arc<RwLock<HashMap<String, String>>>,
+    pub(crate) native_validation_deliveries: Arc<Mutex<NativeValidationDeliveries>>,
+    /// Retained terminal outcomes this process already reconciled. The rows stay
+    /// pending for their delivery owner; another pass would only rewrite the
+    /// same idempotent evidence and bump the task revision.
+    reconciled_terminal_outcomes: Arc<Mutex<HashSet<(AttemptId, String)>>>,
 }
 
 impl AgentTaskCoordinator {
+    pub(crate) fn record_unavailable_descendant(&self, thread: ThreadId, unavailable: bool) {
+        let mut records = self.unavailable_descendants.write().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if unavailable {
+            records.insert(thread.to_string(), "missing_or_archived_thread: retained graph obligation is unresolved; restore storage or explicitly resolve the obligation".into());
+        } else {
+            records.remove(&thread.to_string());
+        }
+    }
+
+    pub(crate) fn unavailable_descendants(&self) -> Vec<(String, String)> {
+        let mut records = self.unavailable_descendants.read().unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter().map(|(id, reason)| (id.clone(), reason.clone())).collect::<Vec<_>>();
+        records.sort();
+        records
+    }
+
     pub(crate) async fn validation_budget(
         &self,
         thread: ThreadId,
@@ -132,8 +159,7 @@ impl AgentTaskCoordinator {
         let initialized = self
             .store
             .get_or_try_init(|| async {
-                let store =
-                    Arc::new(LocalAgentTaskStore::initialize(state_runtime.as_ref()).await?);
+                let store = LocalAgentTaskStore::initialize_shared(state_runtime.as_ref()).await?;
                 let persisted = store
                     .list_agent_task_bindings(root_session_id.clone(), None)
                     .await?;
@@ -323,19 +349,23 @@ impl AgentTaskCoordinator {
             .unstarted_assignments(&initialized.root_session_id)
             .await?
         {
-            if let Some(owner) = owner
+            if let Some(owner) = owner.as_deref()
                 && initialized
                     .state_runtime
-                    .agent_job_runner_instance_is_live(&owner)
+                    .agent_job_runner_instance_is_live(owner)
                     .await
                     .map_err(|error| StoreError::CorruptData(error.to_string()))?
             {
                 continue;
             }
-            initialized
+            let _update = self.binding_updates.lock().await;
+            let recovered = initialized
                 .store
-                .recover_nonproductive_assignment(assignment, threshold)
+                .recover_unstarted_assignment(assignment, threshold, owner)
                 .await?;
+            if matches!(recovered, codex_agent_task_store::NonproductiveRecovery::Recovered { .. }) {
+                self.forget_binding(assignment);
+            }
         }
         Ok(())
     }
@@ -344,13 +374,31 @@ impl AgentTaskCoordinator {
         let Some(initialized) = self.store.get() else {
             return Ok(());
         };
-        for (binding, status) in initialized
+        for pending in initialized
             .store
             .pending_terminal_outcomes(&initialized.root_session_id)
             .await?
         {
+            let pending = match pending {
+                Ok(pending) => pending,
+                Err(error) => {
+                    tracing::warn!(%error, "invalid terminal record retained; continuing unrelated recovery");
+                    continue;
+                }
+            };
+            let key = (pending.binding.attempt_id, pending.turn_id.clone());
+            if self
+                .reconciled_terminal_outcomes
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .contains(&key)
+            {
+                continue;
+            }
+            let binding = pending.binding;
             let result: StoreResult<()> = async {
-                let status: AgentStatus = serde_json::from_str(&status)?;
+                let status: AgentStatus = serde_json::from_str(&pending.status_json)?;
+                let event: codex_protocol::protocol::EventMsg = serde_json::from_str(&pending.event_json)?;
                 let path = AgentPath::try_from(binding.agent_path.as_str())
                     .map_err(StoreError::InvalidAssignment)?;
                 let thread = binding
@@ -360,17 +408,48 @@ impl AgentTaskCoordinator {
                     .ok_or_else(|| {
                         StoreError::CorruptData("pending terminal has no thread".into())
                     })?;
+                let summary = match &event {
+                    codex_protocol::protocol::EventMsg::TurnComplete(event) => event.timing.as_ref()
+                        .and_then(|timing| timing.completion_assessment.as_ref())
+                        .and_then(|assessment| assessment.bounded_summary(&event.turn_id))
+                        .unwrap_or_else(|| crate::agent::status::NO_COMPLETION_DIAGNOSTICS.to_string()),
+                    codex_protocol::protocol::EventMsg::TurnAborted(_) => format!(
+                        "Host terminal boundary for turn {}: turn aborted; partial effects may remain.", pending.turn_id),
+                    _ => return Err(StoreError::CorruptData("pending terminal event is not terminal".into())),
+                };
+                self.record_host_completion_observation(&binding, thread, &pending.turn_id, summary, Some(&status)).await?;
                 self.seal_missing_receipt_for_attempt(&path, thread, &status, binding.attempt_id)
                     .await?;
-                initialized
-                    .store
-                    .acknowledge_terminal_outcome(binding.attempt_id)
-                    .await
+                self.record_host_completion_observation(&binding, thread,
+                    &format!("{}:parent-delivery", pending.turn_id),
+                    format!("Completion retained across recovery; parent delivery is unacknowledged. Read get_agent_task for assignment {} attempt {}; do not replay the child.", binding.assignment_id, binding.attempt_id), None).await?;
+                // Receipt recovery is not parent delivery. Retain the original
+                // event until the delivery owner acknowledges it explicitly.
+                Ok(())
             }
             .await;
-            if let Err(error) = result {
-                tracing::warn!(attempt_id = %binding.attempt_id, %error,
-                    "terminal reconciliation remains pending; continuing unrelated recovery");
+            let settled = match result {
+                Ok(()) => true,
+                // A superseded attempt can never accept this evidence.
+                Err(error @ StoreError::AttemptNotActive(_)) => {
+                    tracing::warn!(attempt_id = %binding.attempt_id, %error,
+                        "terminal outcome belongs to a superseded attempt; retained without further reconciliation");
+                    true
+                }
+                Err(error) => {
+                    tracing::warn!(attempt_id = %binding.attempt_id, %error,
+                        "terminal reconciliation remains pending; continuing unrelated recovery");
+                    false
+                }
+            };
+            if settled {
+                let mut reconciled = self
+                    .reconciled_terminal_outcomes
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if reconciled.len() < MAX_DIAGNOSTIC_ATTEMPT_IDENTITIES {
+                    reconciled.insert(key);
+                }
             }
         }
         Ok(())
@@ -394,9 +473,9 @@ impl AgentTaskCoordinator {
             .await
     }
 
-    pub(crate) async fn acknowledge_terminal_outcome(&self, attempt: AttemptId) -> StoreResult<()> {
+    pub(crate) async fn acknowledge_terminal_outcome(&self, attempt: AttemptId, turn_id: &str) -> StoreResult<()> {
         self.required_store()?
-            .acknowledge_terminal_outcome(attempt)
+            .acknowledge_terminal_outcome(attempt, turn_id)
             .await
     }
 
@@ -710,7 +789,19 @@ impl AgentTaskCoordinator {
                 return;
             }
         };
-        if !terminal_metrics_ready(&task) {
+        self.emit_terminal_metrics_from_snapshot(&task, session_telemetry);
+    }
+
+    /// The caller may already own the sealed outcome used for parent delivery.
+    /// Reuse that snapshot, not a second store read; attempt/readiness and
+    /// exactly-once runtime retirement checks still apply below.
+    pub(crate) fn emit_terminal_metrics_from_snapshot(
+        &self,
+        task: &AgentTask,
+        session_telemetry: &SessionTelemetry,
+    ) {
+        let assignment_id = task.assignment.assignment_id;
+        if !terminal_metrics_ready(task) {
             return;
         }
 
@@ -733,7 +824,7 @@ impl AgentTaskCoordinator {
         if metrics.active.remove(&assignment_id) {
             transition_metric_runtimes(&mut metrics);
         }
-        match runtime.finish(&task) {
+        match runtime.finish(task) {
             Ok(Some(finalized)) => {
                 metrics.host_terminal_attempts.remove(&assignment_id);
                 drop(metrics);
@@ -762,6 +853,11 @@ impl AgentTaskCoordinator {
         source: &SessionSource,
         thread_id: ThreadId,
     ) -> StoreResult<()> {
+        // Root sources cannot have a binding. Avoid an unrelated sibling's
+        // durable binding transaction for this immutable no-op case.
+        if source.get_agent_path().is_none() {
+            return Ok(());
+        }
         let _update = self.binding_updates.lock().await;
         let Some(binding) = self
             .binding_for_source(source)
@@ -880,6 +976,23 @@ impl AgentTaskCoordinator {
             || task.current_attempt.state != AttemptState::Active
         {
             return Ok(None);
+        }
+        if super::status::is_final(status)
+            && task
+                .validation_calls
+                .iter()
+                .any(|call| !call.status.is_terminal())
+        {
+            // The terminal runtime no longer produces work. Reuse the store's
+            // lease-fenced recovery: unexpired operations suspend settlement;
+            // expired operations become cancelled, never successful evidence.
+            if let codex_agent_task_store::NonproductiveRecovery::Recovered { receipt, .. } = store
+                .recover_nonproductive_assignment(binding.assignment_id, Utc::now())
+                .await?
+            {
+                self.mark_task_inactive(binding.assignment_id);
+                return Ok(Some(*receipt));
+            }
         }
         let validation_call_ids = task
             .validation_calls

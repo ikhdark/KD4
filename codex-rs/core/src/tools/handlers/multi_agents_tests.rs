@@ -5413,6 +5413,7 @@ async fn multi_agent_v2_wait_agent_accepts_timeout_only_argument() {
     });
     tokio::task::yield_now().await;
 
+    let worker_label = worker_path.to_string();
     session
         .input_queue
         .enqueue_mailbox_communication(InterAgentCommunication::new(
@@ -5432,7 +5433,14 @@ async fn multi_agent_v2_wait_agent_accepts_timeout_only_argument() {
     let (content, success) = expect_text_output(output);
     let result: crate::tools::handlers::multi_agents_v2::wait::WaitAgentResult =
         serde_json::from_str(&content).expect("wait_agent result should be json");
-    assert_eq!(result.message, "Wait completed.");
+    // A mailbox wake names its kind and the author of the queued message; it
+    // is not a statement that the worker finished.
+    assert_eq!(
+        result.message,
+        format!(
+            "Wait woke on mailbox activity: messages from {worker_label} arrive with your next request."
+        )
+    );
     assert!(!result.timed_out);
     // Mail is an input-only exit: no durable page is delivered and the
     // caller's automatic cursor (unset for this fresh root) is not advanced.
@@ -5989,6 +5997,7 @@ async fn multi_agent_v2_wait_agent_returns_summary_for_mailbox_activity() {
     });
     tokio::task::yield_now().await;
 
+    let worker_label = worker_path.to_string();
     session
         .input_queue
         .enqueue_mailbox_communication(InterAgentCommunication::new(
@@ -6008,7 +6017,12 @@ async fn multi_agent_v2_wait_agent_returns_summary_for_mailbox_activity() {
     let (content, success) = expect_text_output(wait_output);
     let result: crate::tools::handlers::multi_agents_v2::wait::WaitAgentResult =
         serde_json::from_str(&content).expect("wait_agent result should be json");
-    assert_eq!(result.message, "Wait completed.");
+    assert_eq!(
+        result.message,
+        format!(
+            "Wait woke on mailbox activity: messages from {worker_label} arrive with your next request."
+        )
+    );
     assert!(!result.timed_out);
     // Mail is an input-only exit: no durable page is delivered and the
     // caller's automatic cursor (unset for this fresh root) is not advanced.
@@ -6020,22 +6034,26 @@ async fn multi_agent_v2_wait_agent_returns_summary_for_mailbox_activity() {
 
 #[tokio::test]
 async fn multi_agent_v2_wait_agent_returns_for_already_queued_mail() {
-    let (mut session, mut turn) = make_session_and_context().await;
+    let (mut session, mut turn, rx) = make_session_and_context_with_rx().await;
     let manager = thread_manager();
     let root = manager
         .start_thread((*turn.config).clone())
         .await
         .expect("root thread should start");
-    session.services.agent_control = manager.agent_control();
-    session.thread_id = root.thread_id;
+    {
+        let session = Arc::get_mut(&mut session).expect("session should be uniquely owned");
+        session.services.agent_control = manager.agent_control();
+        session.thread_id = root.thread_id;
+    }
     let mut config = (*turn.config).clone();
     config
         .features
         .enable(Feature::MultiAgentV2)
         .expect("test config should allow feature update");
-    set_turn_config(&mut turn, config);
-    let session = Arc::new(session);
-    let turn = Arc::new(turn);
+    set_turn_config(
+        Arc::get_mut(&mut turn).expect("turn context should be uniquely owned"),
+        config,
+    );
 
     SpawnAgentHandlerV2::default()
         .handle(invocation(
@@ -6063,6 +6081,7 @@ async fn multi_agent_v2_wait_agent_returns_for_already_queued_mail() {
         .agent_path
         .expect("worker path");
 
+    let worker_label = worker_path.to_string();
     session
         .input_queue
         .enqueue_mailbox_communication(InterAgentCommunication::new(
@@ -6093,12 +6112,28 @@ async fn multi_agent_v2_wait_agent_returns_for_already_queued_mail() {
     assert_eq!(
         result,
         crate::tools::handlers::multi_agents_v2::wait::WaitAgentResult {
-            message: "Wait completed.".to_string(),
+            message: format!(
+                "Wait woke on mailbox activity: messages from {worker_label} arrive with your next request."
+            ),
             timed_out: false,
             ..Default::default()
         }
     );
     assert_eq!(success, None);
+    // The completed item names the agent whose message the wait delivered,
+    // with its current state, as V1 wait items do.
+    let item = completed_collab_item(&rx, "call-1").await;
+    assert_eq!(item.status, CollabAgentToolCallStatus::Completed);
+    assert_eq!(item.receiver_thread_ids, vec![agent_id]);
+    assert_eq!(
+        item.receiver_agents
+            .iter()
+            .map(|agent| agent.thread_id)
+            .collect::<Vec<_>>(),
+        vec![agent_id]
+    );
+    assert_eq!(item.agents_states.len(), 1);
+    assert!(item.agents_states.contains_key(&agent_id));
 }
 
 #[tokio::test]
@@ -6164,6 +6199,7 @@ async fn multi_agent_v2_wait_agent_wakes_on_any_mailbox_notification() {
     });
     tokio::task::yield_now().await;
 
+    let worker_b_label = worker_b_path.to_string();
     session
         .input_queue
         .enqueue_mailbox_communication(InterAgentCommunication::new(
@@ -6183,7 +6219,14 @@ async fn multi_agent_v2_wait_agent_wakes_on_any_mailbox_notification() {
     let (content, success) = expect_text_output(output);
     let result: crate::tools::handlers::multi_agents_v2::wait::WaitAgentResult =
         serde_json::from_str(&content).expect("wait_agent result should be json");
-    assert_eq!(result.message, "Wait completed.");
+    assert!(
+        result
+            .message
+            .starts_with("Wait woke on mailbox activity: messages from ")
+            && result.message.contains(&worker_b_label),
+        "{}",
+        result.message
+    );
     assert!(!result.timed_out);
     // Any child's mail wakes the wait as an input-only exit: no durable page is
     // delivered and the automatic cursor is not advanced.
@@ -6191,41 +6234,36 @@ async fn multi_agent_v2_wait_agent_wakes_on_any_mailbox_notification() {
     assert!(result.typed_deltas.is_empty());
     assert_eq!(success, None);
 
-    // The workers' durable progress stays retained for the next wait.
-    session
-        .input_queue
-        .get_pending_input(&session.active_turn)
-        .await;
-    let output = timeout(
-        Duration::from_secs(5),
-        WaitAgentHandlerV2::default().handle(invocation(
-            session.clone(),
-            turn.clone(),
-            "wait_agent",
-            function_payload(json!({})),
-        )),
-    )
-    .await
-    .expect("retained durable progress should complete the next wait")
-    .expect("wait_agent should succeed");
-    let (content, _) = expect_text_output(output);
-    let result: crate::tools::handlers::multi_agents_v2::wait::WaitAgentResult =
-        serde_json::from_str(&content).expect("wait_agent result should be json");
-    assert!(result.cursor.is_some());
+    // The workers' durable events stay retained behind the unchanged automatic
+    // cursor. Their admission alone no longer wakes a later wait, so inspect the
+    // retained stream directly.
+    let coordinator = session.services.agent_control.task_coordinator();
+    let store = coordinator.store().expect("spawn initialized the task store");
+    let root_session_id = coordinator.root_session_id().expect("root session");
+    let consumer = turn
+        .session_source
+        .get_agent_path()
+        .unwrap_or_else(AgentPath::root)
+        .to_string();
+    let cursor = store
+        .automatic_wake_cursor(root_session_id.clone(), consumer)
+        .await
+        .expect("automatic cursor");
+    let retained = store
+        .read_wake_events(root_session_id, cursor)
+        .await
+        .expect("retained wake events");
     for task_name in ["worker_a", "worker_b"] {
         let agent_path = AgentPath::root().join(task_name).expect("worker path");
-        let binding = session
-            .services
-            .agent_control
-            .task_coordinator()
+        let binding = coordinator
             .binding_for_agent_path(&agent_path)
             .expect("worker assignment");
         assert!(
-            result
-                .typed_deltas
+            retained
+                .updated_agents
                 .iter()
-                .any(|delta| { delta["assignment_id"] == binding.assignment_id.to_string() }),
-            "wait must include the worker's durable progress"
+                .any(|event| event.assignment_id == binding.assignment_id),
+            "the mailbox exit must not consume {task_name}'s durable events"
         );
     }
 }
@@ -7502,4 +7540,83 @@ async fn compact_uuid_leaf_routes_to_the_named_child_not_the_other_live_thread()
     manager
         .shutdown_all_threads_bounded(Duration::from_secs(5))
         .await;
+}
+
+#[tokio::test]
+async fn wait_agent_v1_returns_timed_out_before_the_nested_deadline() {
+    let (mut session, mut turn) = make_session_and_context().await;
+    let mut v1_config = (*turn.config).clone();
+    let _ = v1_config.features.disable(Feature::MultiAgentV2);
+    set_turn_config(&mut turn, v1_config);
+    let manager = thread_manager();
+    session.services.agent_control = manager.agent_control();
+    let thread = manager
+        .start_thread((*turn.config).clone())
+        .await
+        .expect("start target thread");
+    // Legacy UUID tools act only on agents of the caller's session tree.
+    session
+        .services
+        .agent_control
+        .register_running_agent_for_test(thread.thread_id)
+        .expect("register target as the caller's agent");
+    let session = Arc::new(session);
+    let turn = Arc::new(turn);
+    // The target never finishes here. A nested call whose wrapper budget is
+    // exhausted must end as a normal timed-out wait, not be dropped by the
+    // wrapper: both without a caller deadline and with a longer one.
+    for arguments in [
+        json!({"targets": [thread.thread_id.to_string()]}),
+        json!({
+            "targets": [thread.thread_id.to_string()],
+            "timeout_ms": MULTI_AGENT_MIN_WAIT_TIMEOUT_MS
+        }),
+    ] {
+        let mut nested = invocation(
+            Arc::clone(&session),
+            Arc::clone(&turn),
+            "wait_agent",
+            function_payload(arguments),
+        );
+        nested.source = crate::tools::context::ToolCallSource::CodeMode {
+            cell_id: "nested-wait-cell".to_string(),
+            parent_call_id: None,
+            runtime_tool_call_id: "nested-wait".to_string(),
+            nested_deadline: Some(std::time::Instant::now()),
+            cancellation_cause: None,
+        };
+        let output = timeout(
+            Duration::from_secs(5),
+            WaitAgentHandler::default().handle(nested),
+        )
+        .await
+        .expect("a nested wait must return before its wrapper deadline")
+        .expect("a nested timeout is a normal result");
+        let (content, _) = expect_text_output(output);
+        let result: wait::WaitAgentResult =
+            serde_json::from_str(&content).expect("wait_agent result should be json");
+        assert!(result.timed_out, "{content}");
+        assert_eq!(result.interruption, None);
+    }
+    // Negative control: a direct wait without a caller deadline keeps waiting.
+    let direct = invocation(
+        Arc::clone(&session),
+        Arc::clone(&turn),
+        "wait_agent",
+        function_payload(json!({"targets": [thread.thread_id.to_string()]})),
+    );
+    assert!(
+        timeout(
+            Duration::from_millis(200),
+            WaitAgentHandler::default().handle(direct),
+        )
+        .await
+        .is_err(),
+        "a direct owned wait has no nested deadline"
+    );
+    let _ = thread
+        .thread
+        .submit(Op::Shutdown {})
+        .await
+        .expect("shutdown should submit");
 }

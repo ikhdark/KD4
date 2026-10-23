@@ -33,6 +33,7 @@ use crate::tools::sandboxing::managed_network_for_sandbox_permissions;
 use crate::tools::sandboxing::sandbox_permissions_preserving_denied_reads;
 use crate::tools::sandboxing::with_cached_approval;
 use crate::unified_exec::NoopSpawnLifecycle;
+use crate::unified_exec::ObservedSpawnLifecycle;
 use crate::unified_exec::PendingSpawnRegistration;
 use crate::unified_exec::UnifiedExecProcess;
 use crate::unified_exec::UnifiedExecProcessManager;
@@ -112,6 +113,7 @@ pub struct UnifiedExecRequest {
     pub env: HashMap<String, String>,
     pub exec_server_env_config: Option<ExecServerEnvConfig>,
     pub explicit_env_overrides: HashMap<String, String>,
+    pub has_command_env_overrides: bool,
     pub network: Option<NetworkProxy>,
     pub tty: bool,
     pub sandbox_permissions: SandboxPermissions,
@@ -157,6 +159,7 @@ pub struct UnifiedExecApprovalKey {
     pub environment_id: String,
     pub approval_scope_id: String,
     pub command: Vec<String>,
+    pub environment_overrides: std::collections::BTreeMap<String, String>,
     pub cwd: PathUri,
     pub tty: bool,
     pub sandbox_permissions: SandboxPermissions,
@@ -246,6 +249,7 @@ impl Approvable<UnifiedExecRequest> for UnifiedExecRuntime<'_> {
                 .approval_scope_id()
                 .to_string(),
             command: canonicalize_command_for_approval(&req.command_for_approval),
+            environment_overrides: req.explicit_env_overrides.clone().into_iter().collect(),
             cwd: req.cwd.clone(),
             tty: req.tty,
             sandbox_permissions: req.sandbox_permissions,
@@ -272,6 +276,23 @@ impl Approvable<UnifiedExecRequest> for UnifiedExecRuntime<'_> {
         // Legacy structured approvals are host-native. The existing reason is
         // preserved by all clients and must show every URI grant, including foreign paths.
         let reason = unified_exec_approval_reason(reason, permissions.as_ref());
+        let reason = if req.has_command_env_overrides {
+            let mut names = req
+                .explicit_env_overrides
+                .keys()
+                .cloned()
+                .collect::<Vec<_>>();
+            names.sort();
+            Some(format!(
+                "{}Command-scoped environment overrides: {}",
+                reason
+                    .map(|reason| format!("{reason}\n"))
+                    .unwrap_or_default(),
+                names.join(", ")
+            ))
+        } else {
+            reason
+        };
         Box::pin(async move {
             with_cached_approval(&session.services, "unified_exec", keys, || async move {
                 let available_decisions = permissions
@@ -375,8 +396,7 @@ impl<'a> ToolRuntime<UnifiedExecRequest, Arc<UnifiedExecProcess>> for UnifiedExe
         // Reject busy admission before process creation instead of hiding an
         // unbounded wait before the caller can receive a resumable handle.
         // Arbitrary long-lived servers and opaque scripts do not use this gate.
-        let pending_spawns = if !req.tty && validation_workspace_required(&req.command_for_approval)
-        {
+        let pending_spawns = if validation_workspace_required(&req.command_for_approval) {
             let _tool_wait = ctx.turn.turn_timing_state.begin_tool_execution();
             let _phase =
                 crate::tools::tool_dispatch_trace::begin_tool_phase("validation_gate_wait");
@@ -391,7 +411,8 @@ impl<'a> ToolRuntime<UnifiedExecRequest, Arc<UnifiedExecProcess>> for UnifiedExe
             )
             .await
             .map_err(|reason| {
-                crate::validation_task::record_admission_refusal(ctx);
+                // Gate admission is argument-classified; settlement re-derives it.
+                crate::validation_task::record_admission_refusal(ctx, false);
                 ToolError::Rejected(reason)
             })?;
             self.pending_spawns.with_workspace_operation(permit)
@@ -406,14 +427,19 @@ impl<'a> ToolRuntime<UnifiedExecRequest, Arc<UnifiedExecProcess>> for UnifiedExe
         let native_cwd = req.cwd.to_abs_path().ok();
         let classification_phase =
             crate::tools::tool_dispatch_trace::begin_tool_phase("command_mutation_classification");
-        let mutation = crate::tools::events::command_mutation_for_exec(
-            &req.command_for_approval,
-            native_cwd
-                .as_ref()
-                .map(codex_utils_absolute_path::AbsolutePathBuf::as_path),
-        )
-        .await
-        .map_err(ToolError::Codex)?;
+        let mutation = if req.has_command_env_overrides {
+            // Loader/config/PATH overrides invalidate an argv-only read proof.
+            crate::turn_diff_tracker::CommandMutation::Uncertain
+        } else {
+            crate::tools::events::command_mutation_for_exec(
+                &req.command_for_approval,
+                native_cwd
+                    .as_ref()
+                    .map(codex_utils_absolute_path::AbsolutePathBuf::as_path),
+            )
+            .await
+            .map_err(ToolError::Codex)?
+        };
         drop(classification_phase);
         let event_ctx = crate::tools::events::ToolEventCtx::new(
             ctx.session.as_ref(),
@@ -501,7 +527,12 @@ impl<'a> ToolRuntime<UnifiedExecRequest, Arc<UnifiedExecProcess>> for UnifiedExe
                 &env,
             )
             .await
-            .map_err(ToolError::Rejected)?;
+            .map_err(|reason| {
+                // Nothing was launched: required validation remains pending.
+                // Raw Cargo is argument-classified; settlement re-derives it.
+                crate::validation_task::record_admission_refusal(ctx, false);
+                ToolError::Rejected(reason)
+            })?;
         }
 
         let additional_read_roots = shell_snapshot_additional_read_roots(
@@ -527,14 +558,16 @@ impl<'a> ToolRuntime<UnifiedExecRequest, Arc<UnifiedExecProcess>> for UnifiedExe
         let options = unified_exec_options(attempt.network_denial_cancellation_token.clone());
         drop(setup_phase);
         drop(setup_timing);
-        crate::validation_task::begin_dispatch(
+        let full_suite_dispatch = crate::validation_task::begin_dispatch(
             ctx,
             &mut command.env,
             !req.turn_environment.environment.is_remote(),
         )
         .await
         .map_err(ToolError::Rejected)?;
-        self.manager
+        let spawned = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let result = self
+            .manager
             .open_session_with_exec_env(
                 req.process_id,
                 command,
@@ -546,13 +579,28 @@ impl<'a> ToolRuntime<UnifiedExecRequest, Arc<UnifiedExecProcess>> for UnifiedExe
                 /*environment_id*/ Some(&req.turn_environment.environment_id),
                 req.exec_server_env_config.clone(),
                 req.tty,
-                Box::new(NoopSpawnLifecycle),
+                if full_suite_dispatch.is_some() {
+                    Box::new(ObservedSpawnLifecycle::new(Arc::clone(&spawned)))
+                } else {
+                    Box::new(NoopSpawnLifecycle)
+                },
                 Some(req.raw_output_artifact.clone()),
                 req.turn_environment.environment.as_ref(),
                 Some(req.turn_environment.exec_backend()),
                 &pending_spawns,
             )
-            .await
+            .await;
+        // Every launcher reports creation through `after_spawn`. A failed
+        // Windows sandbox launch may still leave a helper-owned child, so it
+        // stays spent like any possible start.
+        if result.is_err()
+            && !spawned.load(std::sync::atomic::Ordering::Acquire)
+            && attempt.sandbox != codex_sandboxing::SandboxType::WindowsRestrictedToken
+            && let Some(dispatch) = full_suite_dispatch
+        {
+            dispatch.acknowledge_not_spawned().await;
+        }
+        result
     }
 }
 
@@ -696,18 +744,24 @@ mod tests {
             network_denial_cancellation_token: None,
             network_proxy: None,
         };
-        let (result, observed) = test_observation::observe(tokio::time::timeout(
-            Duration::from_secs(1),
-            runtime.run(&request, &attempt, &ctx),
-        ))
-        .await;
-        let result = result.expect("busy admission must not wait for the held owner");
-        assert!(matches!(result, Err(ToolError::Rejected(message))
-            if message.contains("No process was started or queued")
-                && message.contains(owner_command)
-                && message.contains("held for ")
-                && message.contains("This validation did not run")));
-        assert_eq!(observed.process_launches, 0);
+        for tty in [false, true] {
+            request.tty = tty;
+            let (result, observed) = test_observation::observe(tokio::time::timeout(
+                Duration::from_secs(1),
+                runtime.run(&request, &attempt, &ctx),
+            ))
+            .await;
+            let result = result.expect("busy admission must not wait for the held owner");
+            assert!(
+                matches!(result, Err(ToolError::Rejected(message))
+                if message.contains("No process was started or queued")
+                    && message.contains(owner_command)
+                    && message.contains("held for ")
+                    && message.contains("This validation did not run")),
+                "tty={tty}"
+            );
+            assert_eq!(observed.process_launches, 0, "tty={tty}");
+        }
         // Exercise the real dispatch/error conversion and validation ledger,
         // not a synthetic success=false result constructed by this test.
         use crate::session::step_context::StepContext;
@@ -847,6 +901,168 @@ mod tests {
             .await
             .is_ok()
         );
+    }
+
+    /// Audit 2026-10-22 #24: a raw Cargo validation rejected by the lane check
+    /// never started. Through a nested code-mode call into either runtime it
+    /// stays pending, never a failed check or repair work.
+    #[tokio::test]
+    async fn raw_cargo_rejected_nested_validation_is_pending_without_repair_work() {
+        use crate::session::step_context::StepContext;
+        use crate::session::turn_execution::SamplingRequestSettledState;
+        use crate::session::turn_execution::TurnExecutionControl;
+        use crate::tools::context::ToolInvocation;
+        use crate::tools::context::ToolPayload;
+        use crate::tools::registry::CoreToolRuntime;
+        use codex_tools::ToolExecutor;
+        use codex_tools::ToolOutput;
+
+        let temp = tempdir().unwrap();
+        // A KD4 tree reserves its core test lane against raw Cargo builds.
+        let checkout = temp.path().join("codex-rs");
+        std::fs::create_dir_all(checkout.join(".config")).unwrap();
+        std::fs::write(checkout.join(".config/kd4-rust-tests.toml"), "").unwrap();
+        let root = AbsolutePathBuf::try_from(checkout.clone()).unwrap();
+        let cwd = PathUri::from_abs_path(&root);
+        for (tool, handler) in [
+            (
+                "exec_command",
+                Arc::new(crate::tools::handlers::ExecCommandHandler::default())
+                    as Arc<dyn CoreToolRuntime>,
+            ),
+            (
+                "shell_command",
+                Arc::new(crate::tools::handlers::ShellCommandHandler::default())
+                    as Arc<dyn CoreToolRuntime>,
+            ),
+        ] {
+            let (mut session, mut turn) = crate::session::tests::make_session_and_context().await;
+            turn.approval_policy
+                .set(codex_protocol::protocol::AskForApproval::Never)
+                .unwrap();
+            turn.permission_profile = codex_protocol::models::PermissionProfile::Disabled;
+            let config = Arc::make_mut(&mut turn.config);
+            config.cwd = root.clone();
+            config
+                .features
+                .enable(codex_features::Feature::Kd4Runtime)
+                .unwrap();
+            // Only the fixture tree may decide the target: no inherited Cargo state.
+            let policy = &mut config.permissions.shell_environment_policy;
+            policy.inherit = codex_protocol::config_types::ShellEnvironmentPolicyInherit::None;
+            policy.r#set = std::env::vars()
+                .filter(|(key, _)| !key.to_ascii_uppercase().starts_with("CARGO_"))
+                .collect();
+            policy.r#set.insert(
+                "CARGO_HOME".into(),
+                temp.path().join("cargo-home").display().to_string(),
+            );
+            turn.environments.turn_environments = vec![test_turn_environment(cwd.clone())];
+            turn.model_info.tool_mode = Some(codex_protocol::openai_models::ToolMode::CodeMode);
+            session.services.code_mode_service = crate::tools::code_mode::CodeModeService::new(
+                Arc::new(codex_code_mode_runtime::InProcessCodeModeSessionProvider),
+            );
+            let session = Arc::new(session);
+            let execute = crate::tools::code_mode::CodeModeExecuteHandler::new(
+                crate::tools::code_mode::execute_spec::create_code_mode_tool(false, false, &[], &[]),
+                vec![handler.spec()],
+                Vec::new(),
+            )
+            .unwrap();
+            let router = Arc::new(crate::tools::router::ToolRouter::from_parts(
+                crate::tools::registry::ToolRegistry::from_tools([handler]),
+                Vec::new(),
+            ));
+            let step = StepContext::for_test(Arc::new(turn)).with_tool_router_for_test(router);
+            let tracker = Arc::new(tokio::sync::Mutex::new(
+                crate::turn_diff_tracker::TurnDiffTracker::new(),
+            ));
+            let mut control = TurnExecutionControl::new();
+            let baseline = control.baselines(0);
+            let collector = control.collector(&baseline);
+            let _worker = session
+                .services
+                .code_mode_service
+                .start_turn_worker(
+                    &session,
+                    Arc::clone(&step),
+                    Arc::clone(&tracker),
+                    collector.clone(),
+                )
+                .unwrap();
+            let arguments = serde_json::json!({
+                "program": "cargo",
+                "args": ["check", "--target-dir", "target/lanes/core-tests"],
+                "workdir": checkout,
+            });
+            let output = tokio::time::timeout(
+                Duration::from_secs(20),
+                execute.handle(ToolInvocation {
+                    session: Arc::clone(&session),
+                    step_context: step,
+                    tracker,
+                    cancellation_token: CancellationToken::new(),
+                    call_id: format!("raw-cargo-{tool}"),
+                    tool_name: codex_tools::ToolName::plain("exec"),
+                    source: crate::tools::router::ToolCallSource::Direct,
+                    payload: ToolPayload::Custom {
+                        input: format!(
+                            "try {{ text(await tools.{tool}({arguments})); }} catch (error) {{ text(String(error)); }}"
+                        ),
+                    },
+                }),
+            )
+            .await
+            .expect("the rejected cell settles")
+            .unwrap();
+            let codex_protocol::models::ResponseInputItem::CustomToolCallOutput { output, .. } =
+                output.to_response_item(
+                    "raw-cargo-output",
+                    &ToolPayload::Custom {
+                        input: String::new(),
+                    },
+                )
+            else {
+                panic!("{tool}: exec must produce a custom tool output");
+            };
+            let visible = output.body.to_text().unwrap();
+            assert!(
+                visible.contains("Raw Cargo launch rejected; no build started"),
+                "{tool}: {visible}"
+            );
+            control.settle(
+                &baseline,
+                &collector,
+                &SamplingRequestSettledState {
+                    mutation_revision: 0,
+                    attributed_mutation_revision: 0,
+                    tool_exposure_revision: 0,
+                },
+            );
+            let work = control.completion_readiness(0).validation_work;
+            assert!(work.is_empty(), "{tool}: {work:?}");
+            let assessment = control.completion_assessment_with_changed_paths(
+                0,
+                Some(&[(LOCAL_ENVIRONMENT_ID.into(), checkout.join("changed.rs"))]),
+                false,
+            );
+            assert!(assessment.failed_checks.is_empty(), "{tool}: {assessment:?}");
+            assert!(
+                assessment
+                    .verification_gaps
+                    .iter()
+                    .any(|gap| gap.contains("refused admission before execution")),
+                "{tool}: {assessment:?}"
+            );
+            assert_eq!(
+                assessment
+                    .validation_uncertainty
+                    .as_ref()
+                    .map(|uncertainty| uncertainty.pending_checks.len()),
+                Some(1),
+                "{tool}: {assessment:?}"
+            );
+        }
     }
 
     /// Like `build_exec_request`, a local launch under managed network whose policy requested a
@@ -1073,6 +1289,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn approval_cache_distinguishes_command_environment_values() {
+        let manager = UnifiedExecProcessManager::default();
+        let runtime = UnifiedExecRuntime::new(&manager);
+        let mut request = test_request(
+            SandboxPermissions::UseDefault,
+            ExecApprovalRequirement::Skip {
+                bypass_sandbox: false,
+                proposed_execpolicy_amendment: None,
+            },
+        );
+        let original = runtime.approval_keys(&request);
+        request
+            .explicit_env_overrides
+            .insert("PATH".into(), "first".into());
+        let first = runtime.approval_keys(&request);
+        assert_ne!(original, first);
+        request
+            .explicit_env_overrides
+            .insert("PATH".into(), "second".into());
+        assert_ne!(first, runtime.approval_keys(&request));
+    }
+
+    #[tokio::test]
     async fn unified_exec_uses_the_trusted_sandbox_cwd() {
         let cwd_dir = tempdir().expect("create process temp dir");
         let sandbox_dir = tempdir().expect("create sandbox temp dir");
@@ -1104,6 +1343,7 @@ mod tests {
             env: HashMap::new(),
             exec_server_env_config: None,
             explicit_env_overrides: HashMap::new(),
+            has_command_env_overrides: false,
             network: None,
             tty: false,
             sandbox_permissions: SandboxPermissions::UseDefault,
@@ -1192,6 +1432,7 @@ mod tests {
             env: HashMap::new(),
             exec_server_env_config: None,
             explicit_env_overrides: HashMap::new(),
+            has_command_env_overrides: false,
             network: None,
             tty: false,
             sandbox_permissions,

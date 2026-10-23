@@ -386,7 +386,7 @@ fn check_command(
         return Ok(false);
     };
     let program = basename(program);
-    if matches!(program.as_str(), "env" | "command" | "rustup") {
+    if matches!(program.as_str(), "env" | "command" | "time" | "exec" | "rustup") {
         use codex_shell_command::validation::ExecutionWrapper;
         return match codex_shell_command::validation::decode_execution_wrapper(&program, args) {
             ExecutionWrapper::Child(start) => check_command(&args[start..], None, depth + 1),
@@ -394,16 +394,16 @@ fn check_command(
         };
     }
     if matches!(program.as_str(), "python" | "python3" | "py") {
-        if let Some(index) = args
-            .iter()
-            .position(|arg| basename(arg) == "rust_build_status.py")
+        let Some(index) = codex_shell_command::validation::python_script_index(args) else {
+            return Ok(false);
+        };
+        if basename(&args[index]) == "rust_build_status.py"
+            && args.get(index + 1).is_some_and(|arg| arg == "run-lane")
             && let Some(separator) = args[index + 1..].iter().position(|arg| arg == "--")
         {
             return check_command(&args[index + separator + 2..], None, depth + 1);
         }
-        if let Some(index) = args
-            .iter()
-            .position(|arg| basename(arg) == "rust_test_runner.py")
+        if basename(&args[index]) == "rust_test_runner.py"
             && let Some(run) = args[index + 1..].iter().position(|arg| arg == "run-target")
         {
             return check_test_args(&args[index + run + 2..], 1, false);
@@ -429,7 +429,7 @@ fn check_command(
         }
         if !args
             .get(index)
-            .is_some_and(|arg| matches!(arg.as_str(), "test" | "nextest"))
+            .is_some_and(|arg| matches!(arg.as_str(), "test" | "t" | "nextest"))
         {
             return Ok(false);
         }
@@ -445,6 +445,9 @@ fn check_command(
         let Some(index) = just_recipe_index(args) else {
             return Ok(false);
         };
+        if let Some(child) = codex_shell_command::validation::just_lane_child(&args[index..]) {
+            return check_command(child, None, depth + 1);
+        }
         let (positionals, nextest) = match args[index].as_str() {
             "core-test"
             | "core-test-fast"
@@ -489,7 +492,7 @@ fn just_recipe_index(args: &[String]) -> Option<usize> {
     while let Some(arg) = args.get(index) {
         if matches!(
             arg.as_str(),
-            "--dry-run" | "--show" | "--list" | "--summary" | "--help" | "--version"
+            "--dry-run" | "-n" | "--show" | "--list" | "--summary" | "--help" | "--version"
         ) {
             return None;
         }
@@ -567,8 +570,9 @@ fn visibly_runs_test_argv(argv: &[String], depth: usize) -> bool {
             let runner = if basename(program) == "rust_test_runner.py" {
                 Some(0)
             } else if matches!(basename(program).as_str(), "python" | "python3" | "py") {
-                argv.iter()
-                    .position(|arg| basename(arg) == "rust_test_runner.py")
+                codex_shell_command::validation::python_script_index(rest)
+                    .filter(|index| basename(&rest[*index]) == "rust_test_runner.py")
+                    .map(|index| index + 1)
             } else {
                 None
             };
@@ -803,6 +807,32 @@ mod tests {
 
     fn words(command: &str) -> Vec<String> {
         command.split_whitespace().map(str::to_owned).collect()
+    }
+
+    #[test]
+    fn audit148_aliases_transports_and_previews_share_launch_semantics() {
+        for command in [
+            "cargo t --no-fail-fast",
+            "time -p cargo t --no-fail-fast",
+            "env MODE=test cargo test --no-fail-fast",
+            "exec cargo test --no-fail-fast",
+            "just cargo-lane core-tests cargo nextest run --no-fail-fast --retries 0",
+            "just cargo-lane-isolated-home core-tests cargo test --no-fail-fast",
+        ] {
+            assert_eq!(check_command(&words(command), None, 0), Ok(true), "{command}");
+        }
+        for command in [
+            "cargo t --no-run",
+            "cargo test -- --list",
+            "just -n core-test-fast core_lib --all --no-fail-fast",
+            "just --dry-run core-test-fast core_lib --all --no-fail-fast",
+            "just cargo-lane core-tests cargo check --tests",
+            "just cargo-lane core-tests cargo test --no-run",
+            "python -c preview rust_test_runner.py run-target core_lib --all --no-fail-fast",
+            "python -m unrelated rust_test_runner.py run-target core_lib --all --no-fail-fast",
+        ] {
+            assert_eq!(check_command(&words(command), None, 0), Ok(false), "{command}");
+        }
     }
 
     #[test]

@@ -33,6 +33,10 @@ const MAX_LIST_RESPONSE_BYTES: usize = 8_000;
 struct ListArgs {
     authority: SkillToolAuthority,
     cursor: Option<String>,
+    /// Exact, case-sensitive skill name. Mutually exclusive with query.
+    name: Option<String>,
+    /// ASCII-case-insensitive substring of a skill's name or description.
+    query: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, Hash, JsonSchema, PartialEq, Serialize)]
@@ -52,6 +56,8 @@ struct ListResponse {
     warnings: Vec<String>,
     warnings_omitted: usize,
     next_cursor: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    search_complete: Option<bool>,
 }
 
 #[derive(Clone)]
@@ -67,7 +73,7 @@ impl ToolExecutor<ToolCall> for ListTool {
     fn spec(&self) -> ToolSpec {
         skill_function_tool::<ListArgs, ListResponse>(
             TOOL_NAME,
-            "List a page of enabled skills owned by the requested authority. Only orchestrator-owned skills are currently supported. Returns opaque package and main-resource handles for skills.read. Pass next_cursor back as cursor to continue; restart from the first page if stale. An explicit first-page request retries failed discovery.",
+            "List a page of enabled skills owned by the requested authority. Only orchestrator-owned skills are currently supported. Use name for an exact name or query for a substring search (not both, at most 256 bytes). search_complete=false means no-match is not definitive. Returns opaque package and main-resource handles for skills.read. Pass next_cursor back as cursor with the same filters to continue; restart from the first page if stale. An explicit first-page request retries failed discovery.",
         )
     }
 
@@ -81,6 +87,15 @@ impl ToolExecutor<ToolCall> for ListTool {
     fn handle(&self, call: ToolCall) -> ToolExecutorFuture<'_> {
         Box::pin(async move {
             let args: ListArgs = parse_args(&call)?;
+            if (args.name.is_some() && args.query.is_some())
+                || [&args.name, &args.query].into_iter().flatten().any(|value| value.trim().is_empty() || value.len() > 256)
+            {
+                return Err(FunctionCallError::RespondToModel(
+                    "skills.list accepts either name or query, each nonempty and at most 256 bytes".to_string(),
+                ));
+            }
+            let query = args.query.as_deref().map(str::to_ascii_lowercase);
+            let search = args.name.is_some() || query.is_some();
             let budget = call.response_byte_budget(MAX_LIST_RESPONSE_BYTES);
             if args.cursor.is_none() {
                 self.context
@@ -94,6 +109,12 @@ impl ToolExecutor<ToolCall> for ListTool {
                     .entries
                     .iter()
                     .filter(|entry| entry.enabled && entry.authority == authority)
+                    .filter(|entry| args.name.as_ref().is_none_or(|name| entry.name == *name))
+                    .filter(|entry| query.as_ref().is_none_or(|query| {
+                        entry.name.to_ascii_lowercase().contains(query)
+                            || entry.description.to_ascii_lowercase().contains(query)
+                            || entry.short_description.as_ref().is_some_and(|description| description.to_ascii_lowercase().contains(query))
+                    }))
                     .cloned()
                     .filter_map(listed_skill)
                     .collect::<Vec<_>>()
@@ -109,7 +130,7 @@ impl ToolExecutor<ToolCall> for ListTool {
                         .filter(|offset| *offset <= skills.len())
                         .ok_or_else(invalid_cursor)?;
                     if u64::from_str_radix(hash, 16).ok()
-                        != Some(super::read::value_fingerprint(&skills[..offset]))
+                        != Some(list_fingerprint(&skills[..offset], &args))
                     {
                         return Err(FunctionCallError::RespondToModel(
                             "skills.list cursor is stale; restart from the first page".to_string(),
@@ -126,6 +147,16 @@ impl ToolExecutor<ToolCall> for ListTool {
                 skills = listed(&catalog);
             }
             let incomplete = catalog.continuation.is_some();
+            // Warnings can represent failed provider discovery; never turn
+            // that absence into a definitive targeted-search miss.
+            let search_complete = search.then_some(
+                !incomplete
+                    && catalog.warnings.is_empty()
+                    && catalog.entries.iter().filter(|entry| entry.enabled && entry.authority == authority).all(|entry| {
+                        is_bounded_handle(&entry.id.0, MAX_HANDLE_BYTES)
+                            && is_bounded_handle(entry.main_prompt.as_str(), MAX_HANDLE_BYTES)
+                    }),
+            );
             let (warnings, warnings_omitted) = bounded_warnings(catalog.warnings);
             let response = page_response(
                 skills,
@@ -134,6 +165,8 @@ impl ToolExecutor<ToolCall> for ListTool {
                 start,
                 incomplete,
                 budget,
+                &args,
+                search_complete,
             )?;
 
             external_json_output(&response)
@@ -152,6 +185,8 @@ fn page_response(
     start: usize,
     incomplete: bool,
     budget: usize,
+    args: &ListArgs,
+    search_complete: Option<bool>,
 ) -> Result<ListResponse, FunctionCallError> {
     let count = skills.len();
     let mut response = ListResponse {
@@ -161,9 +196,10 @@ fn page_response(
         next_cursor: incomplete.then(|| {
             format!(
                 "{:016x}:{start}",
-                super::read::value_fingerprint(&skills[..start])
+                list_fingerprint(&skills[..start], args)
             )
         }),
+        search_complete,
     };
     // Make room for complete handles before including advisory warnings.
     while super::read::serialized_len(&response)? > budget && !response.warnings.is_empty() {
@@ -174,7 +210,7 @@ fn page_response(
         let next_cursor = (index + 1 < count || incomplete).then(|| {
             format!(
                 "{:016x}:{}",
-                super::read::value_fingerprint(&skills[..=index]),
+                list_fingerprint(&skills[..=index], args),
                 index + 1
             )
         });
@@ -207,6 +243,10 @@ fn page_response(
         ));
     }
     Ok(response)
+}
+
+fn list_fingerprint(skills: &[ListedSkill], args: &ListArgs) -> u64 {
+    super::read::value_fingerprint(&(args.name.as_deref(), args.query.as_deref(), skills))
 }
 
 fn listed_skill(entry: SkillCatalogEntry) -> Option<ListedSkill> {

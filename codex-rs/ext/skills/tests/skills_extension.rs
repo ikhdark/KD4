@@ -1098,6 +1098,66 @@ struct ReadContentsProvider {
     read_calls: Arc<AtomicUsize>,
 }
 
+struct ConcurrentSelectedProvider {
+    catalog: SkillCatalog,
+    started: Arc<AtomicUsize>,
+    release: Arc<tokio::sync::Semaphore>,
+}
+
+impl SkillProvider for ConcurrentSelectedProvider {
+    fn list(&self, _query: SkillListQuery) -> SkillProviderFuture<'_, SkillCatalog> {
+        let catalog = self.catalog.clone();
+        Box::pin(async move { Ok(catalog) })
+    }
+
+    fn read(&self, request: SkillReadRequest) -> SkillProviderFuture<'_, SkillReadResult> {
+        Box::pin(async move {
+            let started = self.started.fetch_add(1, Ordering::SeqCst) + 1;
+            if started == 4 {
+                self.release.add_permits(4);
+            }
+            self.release.acquire().await.unwrap().forget();
+            Ok(SkillReadResult { resource: request.resource, contents: request.package.0 })
+        })
+    }
+}
+
+#[tokio::test]
+async fn selected_skill_reads_overlap_a_blocked_first_provider_without_reordering() -> TestResult {
+    let entries = (0..4).map(|index| test_entry(
+        SkillSourceKind::Orchestrator, "codex_apps",
+        &format!("orchestrator/concurrent-{index}"),
+        &format!("skill://orchestrator/concurrent-{index}/SKILL.md"),
+    )).collect::<Vec<_>>();
+    let input = TurnInputContext {
+        turn_id: "concurrent".into(),
+        user_input: entries.iter().map(|entry| UserInput::Mention {
+            name: entry.name.clone(), path: entry.main_prompt.as_str().into(),
+        }).collect(),
+        environments: Vec::new(), bound_selected_capability_roots: Vec::new(),
+        ready_selected_capability_roots: Vec::new(),
+    };
+    let started = Arc::new(AtomicUsize::new(0));
+    let provider = ConcurrentSelectedProvider {
+        catalog: SkillCatalog { entries: entries.clone(), continuation: None, warnings: Vec::new() },
+        started: started.clone(), release: Arc::new(tokio::sync::Semaphore::new(0)),
+    };
+    let (registry, session, thread) = start_test_extension(
+        SkillProviders::new().with_orchestrator_provider(Arc::new(provider)), default_config(),
+    ).await;
+    let turn = ExtensionData::new("concurrent");
+    let fragments = tokio::time::timeout(std::time::Duration::from_secs(2),
+        registry.turn_input_contributors()[0].contribute(&input, &session, &thread, &turn),
+    ).await?;
+    assert_eq!(started.load(Ordering::SeqCst), 4);
+    assert_eq!(fragments.len(), 4);
+    for (fragment, entry) in fragments.iter().zip(entries) {
+        assert!(fragment.render().contains(&format!("<name>{}</name>", entry.name)));
+        assert!(fragment.render().contains(&entry.id.0));
+    }
+    Ok(())
+}
+
 #[tokio::test]
 async fn undiscovered_package_reports_incomplete_discovery_without_reading() -> TestResult {
     for incomplete in [false, true] {
@@ -1351,6 +1411,48 @@ async fn skills_list_pages_preserve_handles_and_respect_serialized_budget() -> T
             result.err(),
             Some(FunctionCallError::RespondToModel(expected.to_string()))
         );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn skills_list_targets_names_beyond_first_page_and_qualifies_incomplete_misses() -> TestResult {
+    for incomplete in [false, true] {
+        let provider = StaticSkillProvider {
+            catalog: SkillCatalog {
+                continuation: None,
+                entries: (0..80).map(|index| test_entry(
+                    SkillSourceKind::Orchestrator, "codex_apps",
+                    &format!("orchestrator/item-{index}"),
+                    &format!("skill://orchestrator/item-{index}/SKILL.md"),
+                )).collect(),
+                warnings: if incomplete { vec!["Provider discovery incomplete".to_string()] } else { Vec::new() },
+            },
+            read_requests: Default::default(),
+            list_calls: None,
+            fail_first_list: false,
+        };
+        let (registry, session, thread) = start_test_extension(
+            SkillProviders::new().with_orchestrator_provider(Arc::new(provider)),
+            default_config(),
+        ).await;
+        let tools = registry.tool_contributors()[0].tools(&session, &thread);
+        let list = tools.iter().find(|tool| tool.tool_name().name == "list").ok_or("missing list")?;
+        for filter in [serde_json::json!({"name":"item-79"}), serde_json::json!({"query":"ITEM-79"}), serde_json::json!({"name":"absent"})] {
+            let mut args = filter.clone();
+            args["authority"] = serde_json::json!({"kind":"orchestrator"});
+            let call = skills_tool_call(list.tool_name(), args, 8_000);
+            let payload = call.payload.clone();
+            let response = list.handle(call).await?.post_tool_use_response("call", &payload).ok_or("missing output")?;
+            assert_eq!(response["search_complete"], !incomplete);
+            let skills = response["skills"].as_array().ok_or("skills")?;
+            if filter["name"] == "absent" {
+                assert!(skills.is_empty());
+            } else {
+                assert_eq!(skills.len(), 1);
+                assert_eq!(skills[0]["name"], "item-79");
+            }
+        }
     }
     Ok(())
 }

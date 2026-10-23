@@ -186,6 +186,62 @@ async fn explicit_nested_recovery_does_not_hide_a_model_handoff() {
     assert_eq!(counters.attributable_recovery_generation_count, 2);
 }
 
+/// Recorded failure: a root thread read five artifact IDs minted by its child
+/// subagent, was told each had expired, and re-read the sources directly.
+#[tokio::test]
+async fn artifact_retained_by_another_thread_is_not_reported_as_expired() {
+    let (session, turn) = crate::session::tests::make_session_and_context().await;
+    let session = std::sync::Arc::new(session);
+    let turn = std::sync::Arc::new(turn);
+    let owner = codex_protocol::ThreadId::new().to_string();
+    let foreign = crate::tools::command_output_artifact::create_canonical_output_artifact(
+        &turn.config.codex_home,
+        &owner,
+        &CanonicalToolResult::text("child evidence\n"),
+    )
+    .await
+    .artifact_id()
+    .expect("owner artifact");
+    let missing = uuid::Uuid::now_v7().to_string();
+    for artifact_id in [&foreign, &missing] {
+        let result = ReadToolOutputHandler
+            .handle(ToolInvocation {
+                session: std::sync::Arc::clone(&session),
+                step_context: crate::session::step_context::StepContext::for_test(
+                    std::sync::Arc::clone(&turn),
+                ),
+                cancellation_token: Default::default(),
+                tracker: std::sync::Arc::new(tokio::sync::Mutex::new(
+                    crate::turn_diff_tracker::TurnDiffTracker::new(),
+                )),
+                call_id: "cross-thread".to_string(),
+                tool_name: ToolName::plain("read_tool_output"),
+                source: ToolCallSource::Direct,
+                payload: ToolPayload::Function {
+                    arguments: serde_json::json!({
+                        "artifact_id": artifact_id,
+                        "selectors": [{"kind": "lines", "start": 1, "end": 1}],
+                    })
+                    .to_string(),
+                },
+            })
+            .await;
+        let Err(FunctionCallError::RespondToModel(message)) = result else {
+            panic!("a handle this thread does not retain must fail");
+        };
+        if artifact_id == &missing {
+            // A handle no thread retains keeps the expiry contract.
+            assert_eq!(message, ReadToolOutputError::Expired.for_model());
+            continue;
+        }
+        assert!(message.contains("belongs to another thread"), "{message}");
+        assert!(message.contains(&owner), "{message}");
+        assert!(!message.contains("artifact expired"), "{message}");
+        // Without a thread graph, membership is unknown rather than claimed.
+        assert!(!message.contains("descendant"), "{message}");
+    }
+}
+
 #[tokio::test]
 #[serial_test::serial(command_output_artifact)]
 async fn recovery_pages_use_one_validated_snapshot_without_reopening_the_artifact() {
@@ -2015,6 +2071,30 @@ fn invalid_recovery_selectors_defer_shape_to_advertised_schema() {
     assert!(message.contains("advertised read_tool_output schema"));
     assert!(!message.contains(r#""selectors""#));
     assert!(!message.contains(r#"{"artifact_id""#));
+}
+
+/// Recorded miss: a read_file symbol selector sent to read_tool_output was
+/// rejected without its snapshot equivalent, costing a remapping round trip.
+#[test]
+fn read_file_only_selectors_name_the_snapshot_section_form() {
+    for selector in [
+        serde_json::json!({"kind": "symbol", "name": "Type::method"}),
+        serde_json::json!({"kind": "enclosing", "line": 3}),
+    ] {
+        let kind = selector["kind"].as_str().unwrap().to_string();
+        let error = parse_read_tool_output_args(
+            &serde_json::json!({"artifact_id": "artifact", "selectors": [selector]}).to_string(),
+        )
+        .expect_err("read_file-only selectors are not snapshot selectors");
+        let FunctionCallError::RespondToModel(message) = error else {
+            panic!("parse failures must be returned to the model");
+        };
+        assert!(message.contains(&format!("`{kind}` selectors are read_file-only")), "{message}");
+        assert!(message.contains(r#"{"kind":"section","id":"outline"}"#), "{message}");
+        assert!(message.contains(r#"{"kind":"section","id":"<item id>"}"#), "{message}");
+        assert!(message.contains("advertised read_tool_output schema"), "{message}");
+        assert!(!message.contains("Type::method"), "{message}");
+    }
 }
 
 #[test]

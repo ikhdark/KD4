@@ -300,6 +300,32 @@ fn spawn_agent_tool_v2_exposes_typed_assignments_and_lists_visible_models() {
 }
 
 #[test]
+fn spawn_agent_tool_v2_accepts_task_text_aliases_exclusively() {
+    let ToolSpec::Function(ResponsesApiTool { parameters, .. }) =
+        create_spawn_agent_tool_v2(SpawnAgentToolOptions::default())
+    else {
+        panic!("spawn_agent should be a function tool");
+    };
+    // Code-mode argument preflight validates calls against this schema, so an
+    // alias the handler accepts must also pass here.
+    let validator = jsonschema::validator_for(&serde_json::to_value(&parameters).unwrap())
+        .expect("spawn_agent parameters compile");
+    for alias in ["message", "prompt", "instructions"] {
+        let mut call = json!({"task_name": "worker"});
+        call[alias] = json!("inspect the repo");
+        assert!(validator.is_valid(&call), "{alias}");
+    }
+    for invalid in [
+        json!({"task_name": "worker", "message": "inspect", "prompt": "inspect"}),
+        json!({"task_name": "worker", "prompt": "inspect", "assignment": {}}),
+        json!({"task_name": "worker", "task": "inspect"}),
+        json!({"task_name": "worker"}),
+    ] {
+        assert!(!validator.is_valid(&invalid), "{invalid}");
+    }
+}
+
+#[test]
 fn spawn_agent_tool_v1_keeps_legacy_fork_context_field() {
     let tool = create_spawn_agent_tool_v1(SpawnAgentToolOptions {
         available_models: Arc::new(Vec::new()),
@@ -738,6 +764,8 @@ fn list_agents_tool_includes_path_prefix_and_agent_fields() {
         .as_ref()
         .expect("list_agents should use object params");
     assert!(properties.contains_key("path_prefix"));
+    assert!(properties.contains_key("compact"));
+    assert!(properties.contains_key("since_revision"));
     assert_eq!(
         properties
             .get("path_prefix")

@@ -3,6 +3,75 @@ use codex_file_system::FileMutationOutcome;
 use std::os::windows::fs::OpenOptionsExt;
 
 #[tokio::test]
+async fn audit147_native_reads_do_not_certify_absence_during_patch_capture() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("source");
+    let retained = root.path().join("retained");
+    let uri = PathUri::from_host_native_path(&path).unwrap();
+    let root_uri = PathUri::from_host_native_path(root.path()).unwrap();
+    // A reader arriving before this path's very first mutation must also
+    // exclude capture. Merely checking for an already-created lock races.
+    let first_read = codex_file_system::guard_patch_read(&path).unwrap().unwrap();
+    assert_eq!(
+        codex_file_system::try_acquire_patch_capture(&path)
+            .unwrap_err()
+            .kind(),
+        io::ErrorKind::WouldBlock
+    );
+    assert!(!path.exists());
+    drop(first_read);
+    std::fs::write(&path, b"old\n").unwrap();
+    let capture = codex_file_system::try_acquire_patch_capture(&path).unwrap();
+    std::fs::rename(&path, &retained).unwrap();
+    let fs = DirectFileSystem;
+    let started = std::time::Instant::now();
+    assert_eq!(
+        fs.get_metadata(&uri, None).await.unwrap_err().kind(),
+        io::ErrorKind::WouldBlock
+    );
+    assert_eq!(
+        fs.read_file_bounded(&uri, 1024, None)
+            .await
+            .unwrap_err()
+            .kind(),
+        io::ErrorKind::WouldBlock
+    );
+    assert_eq!(
+        fs.read_file_bounded_confined(&uri, &root_uri, 1024, None)
+            .await
+            .unwrap_err()
+            .kind(),
+        io::ErrorKind::WouldBlock
+    );
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(2),
+        "a stalled writer must not block read cancellation"
+    );
+    std::fs::rename(&retained, &path).unwrap();
+    drop(capture);
+    assert_eq!(
+        fs.read_file_bounded(&uri, 1024, None)
+            .await
+            .unwrap()
+            .unwrap(),
+        b"old\n"
+    );
+    std::fs::remove_file(&path).unwrap();
+    assert_eq!(
+        fs.read_file_bounded(&uri, 1024, None)
+            .await
+            .unwrap_err()
+            .kind(),
+        io::ErrorKind::NotFound
+    );
+    assert_eq!(
+        std::fs::read_dir(root.path()).unwrap().count(),
+        0,
+        "read admission must not leave workspace lock files"
+    );
+}
+
+#[tokio::test]
 async fn conditional_native_mutations_refuse_stale_preimages_and_open_writers() {
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("file");

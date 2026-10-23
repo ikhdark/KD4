@@ -792,3 +792,141 @@ fn body_and_observation_survive_role_merging_and_compaction_projection() {
         "a fresh replacement retires the old cached observation"
     );
 }
+
+fn numbered_rules(changes: &[(usize, &str)]) -> String {
+    let mut lines = (0..300)
+        .map(|index| format!("Rule {index}: keep the documented owner for subsystem {index}."))
+        .collect::<Vec<_>>();
+    for (index, line) in changes {
+        lines[*index] = (*line).to_string();
+    }
+    lines.join("\n")
+}
+
+fn agents_world(body: String) -> WorldState {
+    let mut world = WorldState::default();
+    world.add_section(AgentsMdState::new(Some(
+        &LoadedAgentsMd::from_text_for_testing(body),
+    )));
+    world
+}
+
+#[test]
+fn mid_turn_change_is_a_bounded_line_diff_until_the_next_user_message() {
+    use codex_utils_output_truncation::TruncationPolicy;
+    let policy = TruncationPolicy::Bytes(1_000_000);
+    let mut history = crate::context_manager::ContextManager::new();
+    let (initial, _) = history.update_world_state(&agents_world(numbered_rules(&[])));
+    history.record_items(&render_fragments(initial), policy);
+    history.record_items(&[user_message("start the task")], policy);
+
+    // One small edit sends the changed lines, not another complete copy.
+    let first_changes = [(120, "Rule 120: route owner changes through the registry.")];
+    let first = agents_world(numbered_rules(&first_changes));
+    let (update, rollout) = history.update_world_state(&first);
+    assert!(rollout.is_some(), "the accepted body advances");
+    assert_eq!(update.len(), 1);
+    assert_eq!(update[0].role(), "user");
+    let text = update[0].render();
+    assert!(
+        text.contains(
+            "\n-Rule 120: keep the documented owner for subsystem 120.\n+Rule 120: route owner changes through the registry.\n"
+        ),
+        "{text}"
+    );
+    assert!(!text.contains("Rule 200:"), "unchanged lines stay out: {text}");
+    assert!(text.len() < 1_024, "{} bytes", text.len());
+    history.record_items(&render_fragments(update), policy);
+    let (unchanged, rollout) = history.update_world_state(&first);
+    assert!(unchanged.is_empty(), "the retained diff carries the current body");
+    assert!(rollout.is_none());
+
+    // A later edit in the same turn chains onto the first diff.
+    let second_changes = [first_changes[0], (7, "Rule 7: retired.")];
+    let second = agents_world(numbered_rules(&second_changes));
+    let (update, _) = history.update_world_state(&second);
+    assert_eq!(update.len(), 1);
+    let text = update[0].render();
+    assert!(
+        text.contains("\n-Rule 7: keep the documented owner for subsystem 7.\n+Rule 7: retired.\n"),
+        "{text}"
+    );
+    assert!(!text.contains("Rule 120:"), "an earlier diff is not repeated: {text}");
+    history.record_items(&render_fragments(update), policy);
+    assert!(history.update_world_state(&second).0.is_empty());
+
+    // The next user message gets one complete current copy.
+    history.record_items(&[user_message("continue")], policy);
+    let (replacement, _) = history.update_world_state(&second);
+    assert_eq!(replacement.len(), 1);
+    let text = replacement[0].render();
+    assert!(text.contains(REPLACEMENT_NOTICE), "{text}");
+    assert!(text.contains(&numbered_rules(&second_changes)));
+    history.record_items(&render_fragments(replacement), policy);
+    assert!(history.update_world_state(&second).0.is_empty());
+}
+
+#[test]
+fn line_diff_requires_its_retained_base_and_survives_slot_projection() {
+    let base = agents_world(numbered_rules(&[]));
+    let (fragments, accepted) = base.render_full_with_snapshot();
+    let mut retained = crate::context_manager::updates::merge_contextual_fragments(fragments);
+    retained.push(user_message("start the task"));
+    let changed_rules = numbered_rules(&[(40, "Rule 40: changed.")]);
+    let changed = agents_world(changed_rules.clone());
+    let (update, next) = changed.render_history_diff_with_snapshot(Some(&accepted), &retained);
+    assert_eq!(update.len(), 1);
+    assert!(!update[0].render().contains("Rule 200:"));
+    let update = crate::context_manager::updates::merge_contextual_fragments(update);
+    let mut with_update = retained.clone();
+    with_update.extend(update.clone());
+    assert!(
+        changed
+            .render_history_diff(Some(&next), &with_update)
+            .is_empty()
+    );
+    // The diff is not the repository slot: projection keeps the complete
+    // base beside it rather than retiring the base in its favour.
+    let projected = crate::stable_context::project_compaction_context(with_update.clone().into());
+    assert!(
+        changed
+            .render_history_diff(Some(&next), &projected)
+            .is_empty()
+    );
+
+    // Without its base, or without the diff, the complete body is resent.
+    let mut missing_base = vec![user_message("start the task")];
+    missing_base.extend(update);
+    for history in [missing_base, retained] {
+        let replay = changed.render_history_diff(Some(&next), &history);
+        assert_eq!(replay.len(), 1);
+        assert!(replay[0].render().contains(&changed_rules));
+    }
+
+    // A change to most lines, or to the scope, is a complete replacement.
+    let rewritten = agents_world(
+        (0..300)
+            .map(|index| format!("Rule {index}: rewritten."))
+            .collect::<Vec<_>>()
+            .join("\n"),
+    );
+    let (replacement, _) = rewritten.render_history_diff_with_snapshot(Some(&next), &with_update);
+    assert!(replacement[0].render().contains(REPLACEMENT_NOTICE));
+    let moved = AgentsMdState::from_instructions(
+        Some(UserInstructions {
+            directory: Some("/moved".into()),
+            text: changed_rules,
+        }),
+        AgentsMdFreshness::Refreshed,
+    );
+    let replacement = WorldStateSection::render_diff(
+        &moved,
+        PreviousSectionState::Known(&base_section_snapshot(&accepted)),
+    )
+    .unwrap();
+    assert!(replacement.render().contains(REPLACEMENT_NOTICE));
+}
+
+fn base_section_snapshot(snapshot: &super::super::WorldStateSnapshot) -> AgentsMdSnapshot {
+    serde_json::from_value(snapshot.section("agents_md").unwrap().clone()).unwrap()
+}

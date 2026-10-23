@@ -92,7 +92,7 @@ fn selector_schema(include_sections: bool) -> JsonSchema {
             BTreeMap::from([(
                 "id".to_string(),
                 JsonSchema::string(Some(
-                    "Stable section ID advertised by the original projection.".to_string(),
+                    "Stable section ID advertised by the original projection. A Rust/Python snapshot saved with an outline lists item IDs at id outline; select an item ID where read_file takes a symbol name.".to_string(),
                 )),
             )]),
             vec!["id"],
@@ -178,7 +178,7 @@ pub(crate) fn create_read_tool_output_tool() -> ToolSpec {
 
     ToolSpec::Function(ResponsesApiTool {
         name: READ_TOOL_OUTPUT_TOOL_NAME.to_string(),
-        description: "Read a saved tool-output snapshot without rerunning the tool. Batch independent searches or selections in one call. Search results include matching text in results[].value.hydrated_ranges. Returns exact content up to max_bytes plus continuation metadata; complete indicates whether all requested selections were returned. If continuation_stop is present, check its reason and resumable fields before retrying.".to_string(),
+        description: "Read a saved tool-output snapshot without rerunning the tool. Batch known searches or selections in one call to share authenticated snapshot validation. Search results include matching text in results[].value.hydrated_ranges; a complete search page can still have more matches. Returns exact text or data_base64 for arbitrary bytes up to max_bytes plus continuation metadata; complete indicates requested-selection delivery, not full capture or current workspace freshness. Raw command capture retains at most 16 MiB; capture gaps or safety limits mean missing bytes cannot be recovered by paging. Check retained_artifact_complete and continuation_stop.reason/resumable; preserve successful siblings and retry only missing selections. In scripts consume recovered data and print only needed evidence to avoid another enclosing display truncation. Never rerun the producer merely to recover output.".to_string(),
         strict: false,
         defer_loading: None,
         parameters: JsonSchema::object(

@@ -12,7 +12,17 @@ use std::path::PathBuf;
 const MAX_PAYLOAD_BYTES: u64 = 256 * 1024 * 1024;
 pub(crate) const INLINE_BYTES: usize = 8 * 1024;
 pub(crate) const KIND: &str = "rollout_payload_artifact";
+/// Directory beside the session collections that holds referenced bodies.
+pub(crate) const PAYLOAD_DIRECTORY: &str = "rollout-payloads";
 const MAX_CONCURRENT_PAYLOAD_SYNCS: usize = 8;
+
+/// A reference is the small fixed-shape record `store_line` writes, always far
+/// below the inline threshold. A longer line that only mentions the kind (tool
+/// output quoting this source, for example) is ordinary history: classify it
+/// without a JSON parse or a blocking-pool hop.
+pub(crate) fn may_be_reference(line: &str) -> bool {
+    line.len() < INLINE_BYTES && line.contains(KIND)
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PayloadDependencyVersion {
@@ -63,7 +73,7 @@ pub async fn payload_dependency_versions(path: &Path) -> io::Result<Vec<PayloadD
             if reader.read_line(&mut line)? == 0 {
                 break;
             }
-            if !line.contains(KIND) {
+            if !may_be_reference(&line) {
                 continue;
             }
             let record: serde_json::Value =
@@ -105,9 +115,7 @@ pub async fn payload_dependencies_unchanged(versions: &[PayloadDependencyVersion
 /// Stamps every payload a rollout names, so a known payload gap can be reused.
 /// Unlike [`payload_dependency_versions`], records that cannot name a payload
 /// are skipped instead of failing the scan: no artifact change repairs them.
-pub(crate) async fn named_payload_versions(
-    path: &Path,
-) -> io::Result<Vec<PayloadDependencyVersion>> {
+pub async fn named_payload_versions(path: &Path) -> io::Result<Vec<PayloadDependencyVersion>> {
     let path = path.to_path_buf();
     tokio::task::spawn_blocking(move || {
         use std::io::BufRead;
@@ -128,7 +136,7 @@ pub(crate) async fn named_payload_versions(
             let Ok(text) = std::str::from_utf8(&line) else {
                 continue;
             };
-            if !text.contains(KIND) {
+            if !may_be_reference(text) {
                 continue;
             }
             let Ok(record) = serde_json::from_str::<serde_json::Value>(text) else {
@@ -158,7 +166,7 @@ pub(crate) async fn named_payload_versions(
 /// Unlike [`payload_dependencies_unchanged`], a payload that was missing still
 /// matches while it stays missing: a known gap is read again only once a named
 /// payload appears, is replaced, or is repaired.
-pub(crate) async fn payload_versions_match(versions: &[PayloadDependencyVersion]) -> bool {
+pub async fn payload_versions_match(versions: &[PayloadDependencyVersion]) -> bool {
     let versions = versions.to_vec();
     tokio::task::spawn_blocking(move || {
         versions
@@ -187,12 +195,14 @@ pub(crate) async fn sync_payload_artifacts(path: &Path) -> io::Result<()> {
     let directory = root(path);
     let rollout = path.to_path_buf();
     tokio::task::spawn_blocking(move || {
+        // Keys order by owner first, so a barrier visits only its own entries rather
+        // than every rollout's retained work.
         let pending = pending_sync()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .paths
-            .iter()
-            .filter(|((owner, _), _)| owner == &rollout)
+            .range((rollout.clone(), PathBuf::new())..)
+            .take_while(|((owner, _), _)| owner == &rollout)
             .map(|(path, sequence)| (path.clone(), *sequence))
             .collect::<Vec<_>>();
         if pending.is_empty() {
@@ -302,12 +312,12 @@ pub(crate) fn root(path: &Path) -> PathBuf {
             return ancestor
                 .parent()
                 .unwrap_or(ancestor)
-                .join("rollout-payloads");
+                .join(PAYLOAD_DIRECTORY);
         }
     }
     path.parent()
         .unwrap_or(Path::new("."))
-        .join("rollout-payloads")
+        .join(PAYLOAD_DIRECTORY)
 }
 
 /// Held from opening an append owner through its last reference publication.
@@ -556,7 +566,7 @@ fn hydrate_line_with_limit(
     enroll: bool,
     max_bytes: u64,
 ) -> io::Result<String> {
-    if !line.contains(KIND) {
+    if !may_be_reference(&line) {
         return Ok(line);
     }
     let reference: serde_json::Value = match serde_json::from_str(&line) {
@@ -1053,5 +1063,41 @@ mod tests {
                 .to_string()
                 .contains("record 1")
         );
+    }
+
+    #[tokio::test]
+    async fn only_reference_sized_lines_are_parsed_as_payload_references() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("rollout.jsonl");
+        // Tool output quoting this source names the kind but is ordinary history.
+        let quoted = serde_json::json!({
+            "timestamp": "2026-10-02T00:00:00Z", "format_version": 1,
+            "type": "response_item", "payload": {"type": "function_call_output",
+                "call_id": "rg", "output": format!("{KIND}\n").repeat(INLINE_BYTES / KIND.len())}
+        })
+        .to_string();
+        assert!(quoted.len() >= INLINE_BYTES);
+        assert!(!may_be_reference(&quoted));
+        assert_eq!(hydrate_line(&path, quoted.clone()).unwrap(), quoted);
+
+        // Negative control: a stored reference is still classified and hydrated.
+        let item = serde_json::json!({
+            "timestamp": "2026-10-02T00:00:00Z", "format_version": 1,
+            "type": "event_msg", "payload": {"type": "turn_complete",
+                "turn_id": "turn", "timing": {"detail": "timing evidence".repeat(1000)}}
+        });
+        let stored =
+            String::from_utf8(store_line(&path, &serde_json::to_vec(&item).unwrap()).unwrap())
+                .unwrap();
+        assert!(may_be_reference(&stored));
+        std::fs::write(&path, format!("{quoted}\n{stored}")).unwrap();
+        let mut reader = crate::compression::open_rollout_line_reader(&path)
+            .await
+            .unwrap();
+        assert_eq!(reader.next_line().await.unwrap().unwrap(), quoted);
+        let restored: serde_json::Value =
+            serde_json::from_str(&reader.next_line().await.unwrap().unwrap()).unwrap();
+        assert_eq!(restored, item);
+        assert_eq!(reader.unresolved_payloads(), 0);
     }
 }

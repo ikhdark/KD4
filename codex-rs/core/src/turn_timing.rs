@@ -62,10 +62,12 @@ use crate::stream_events_utils::raw_assistant_output_text_from_item;
 use crate::tools::tool_dispatch_trace::ToolDispatchTimingSnapshot;
 
 const NANOS_PER_MILLISECOND: u128 = 1_000_000;
+// Schema 35 separates host assistant-text publication from reasoning/completion
+// and names continuation-after-truncation without a causal claim.
 // Schema 34 counts identity-bound transport attempts, including same-row auth retries.
 // Schema 33 records unique tool admission (not polling) and locally observed
 // nonempty model content for TTFT. Schemas <=32 aliased TTFT to visible output.
-pub(crate) const TIMING_SCHEMA_VERSION: u16 = 34;
+pub(crate) const TIMING_SCHEMA_VERSION: u16 = 35;
 const MAX_DETERMINISTIC_CONTINUATION_RECEIPTS: usize = 64;
 const MAX_TOOL_CALL_TIMINGS: usize = 1_024;
 // These records are diagnostic histories, not the source of truth for the
@@ -91,6 +93,13 @@ pub(crate) struct ToolCallTimingLineage<'a> {
 }
 
 fn tool_action_class(tool_name: &str) -> ToolActionClass {
+    // Only known built-in namespaces carry our registration semantics. An
+    // external MCP tool with a coincidentally identical suffix is domain work.
+    let builtin = !tool_name.contains('.')
+        || ["functions.", "collaboration.", "agents."].iter().any(|prefix| tool_name.starts_with(prefix));
+    if !builtin {
+        return ToolActionClass::Domain;
+    }
     let tool_name = tool_name.rsplit('.').next().unwrap_or(tool_name);
     if matches!(
         tool_name,
@@ -100,6 +109,14 @@ fn tool_action_class(tool_name: &str) -> ToolActionClass {
             | "request_permissions"
             | "wait"
             | "wait_agent"
+            | "spawn_agent"
+            | "send_message"
+            | "send_input"
+            | "followup_task"
+            | "list_agents"
+            | "interrupt_agent"
+            | "close_agent"
+            | "resume_agent"
             | "wait_for_environment"
             | "write_stdin"
     ) {
@@ -200,6 +217,49 @@ pub(crate) struct TurnTimingState {
     /// an earlier sampling checkpoint of this turn. Checkpoints persist only new
     /// or changed entries, so their size no longer grows with every prior request.
     checkpointed_entries: StdMutex<CheckpointedEntries>,
+    /// Essential per-physical-attempt receipts outlive optional detail eviction.
+    /// The session accounting lock must be held when claiming a settlement.
+    model_usage_receipts: StdMutex<BTreeMap<(String, String), (TokenUsage, bool)>>,
+    canonical_input_section: StdMutex<Option<CanonicalInputSection>>,
+}
+
+/// One bounded optional diagnostic baseline, never an authority/cache receipt.
+struct CanonicalInputSection {
+    raw_items: Vec<String>,
+    before_close: Sha256,
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static CANONICAL_SECTION_ITEM_VISITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+impl CanonicalInputSection {
+    fn hash(cache: &mut Option<Self>, raw: &serde_json::value::RawValue) -> Option<String> {
+        let items: Vec<&serde_json::value::RawValue> = serde_json::from_str(raw.get()).ok()?;
+        let prior = cache.as_ref().filter(|previous| {
+            previous.raw_items.len() <= items.len()
+                && previous.raw_items.iter().zip(&items).all(|(a, b)| a == b.get())
+        });
+        let start = prior.map_or(0, |previous| previous.raw_items.len());
+        let mut hasher = prior.map_or_else(|| {
+            let mut hasher = Sha256::new(); hasher.update(b"["); hasher
+        }, |previous| previous.before_close.clone());
+        for (index, item) in items.iter().enumerate().skip(start) {
+            if index != 0 { hasher.update(b","); }
+            #[cfg(test)]
+            CANONICAL_SECTION_ITEM_VISITS.with(|count| count.set(count.get() + 1));
+            let value: serde_json::Value = serde_json::from_str(item.get()).ok()?;
+            hasher.update(value.to_string().as_bytes());
+        }
+        let mut finished = hasher.clone(); finished.update(b"]");
+        // Both retained payload and per-item overhead are bounded. A replacement,
+        // unknown encoding, or oversized baseline takes the exact cold path.
+        if raw.get().len() <= 8 * 1024 * 1024 && items.len() <= 16_384 {
+            *cache = Some(Self { raw_items: items.iter().map(|item| item.get().to_owned()).collect(), before_close: hasher });
+        } else { *cache = None; }
+        Some(hex::encode(finished.finalize()))
+    }
 }
 
 /// Only current wait counts and the existing event sink, not an execution history.
@@ -488,6 +548,14 @@ impl TurnTimingSnapshot {
             ),
         };
         let milestones = TurnTimingMilestones {
+            turn_worker_started_ms: profile
+                .milestones
+                .turn_worker_started_ns
+                .map(|value| public_ms(value, &mut saturation_count)),
+            first_request_preparation_started_ms: profile
+                .milestones
+                .first_request_preparation_started_ns
+                .map(|value| public_ms(value, &mut saturation_count)),
             user_input_recorded_ms: profile
                 .milestones
                 .user_input_recorded_ns
@@ -552,6 +620,12 @@ impl TurnTimingSnapshot {
                 .milestones
                 .first_agent_message_ns
                 .map(|value| public_ms(value, &mut saturation_count)),
+            first_assistant_text_ms: profile
+                .milestones
+                .first_assistant_text_ns
+                .map(|value| public_ms(value, &mut saturation_count)),
+            first_assistant_text_item_id: profile.milestones.first_assistant_text_item_id.clone(),
+            first_assistant_text_phase: profile.milestones.first_assistant_text_phase.clone(),
         };
         let pre_first_model_output =
             profile
@@ -615,6 +689,9 @@ impl TurnTimingSnapshot {
                         categories
                     });
                 TurnTimingModelRequest {
+                    response_queue_timing_by_attempt: request
+                        .response_queue_timing_by_attempt
+                        .clone(),
                     setup_phase_ns: request
                         .setup_phases
                         .as_ref()
@@ -915,6 +992,8 @@ pub(crate) struct TurnTimingProfile {
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct ModelRequestTiming {
+    response_queue_timing_by_attempt:
+        BTreeMap<String, BTreeMap<String, codex_protocol::timing::ResponseQueueTiming>>,
     setup_phases: Option<ClientCriticalPhaseTiming>,
     request_sha256_by_attempt: BTreeMap<String, String>,
     request_section_sha256_by_attempt: BTreeMap<String, BTreeMap<String, String>>,
@@ -926,6 +1005,9 @@ pub(crate) struct ModelRequestTiming {
     relevant_state_fingerprint: Option<String>,
     failure_fingerprint: Option<String>,
     sampling_request_id: Option<String>,
+    estimator_model: Option<String>,
+    /// Registered once; lower HTTP retries share this logical measurement.
+    diagnostics_owner_attempt_id: Option<String>,
     physical_attempt_ids: Vec<String>,
     dispatched_attempt_ids: BTreeSet<String>,
     dispatched_attempt_count: u32,
@@ -1113,6 +1195,8 @@ pub(crate) struct LocalTiming {
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct TimingMilestones {
+    turn_worker_started_ns: Option<u128>,
+    first_request_preparation_started_ns: Option<u128>,
     pub(crate) user_input_recorded_ns: Option<u128>,
     pub(crate) first_tool_accepted_ns: Option<u128>,
     pub(crate) first_tool_gate_admitted_ns: Option<u128>,
@@ -1130,6 +1214,9 @@ pub(crate) struct TimingMilestones {
     pub(crate) first_actionable_output_ns: Option<u128>,
     pub(crate) first_visible_output_ns: Option<u128>,
     pub(crate) first_agent_message_ns: Option<u128>,
+    pub(crate) first_assistant_text_ns: Option<u128>,
+    first_assistant_text_item_id: Option<String>,
+    first_assistant_text_phase: Option<codex_protocol::models::MessagePhase>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -1690,6 +1777,7 @@ struct ActiveSet {
     model: u32,
     model_request_wait: u32,
     provider_request_dispatched: bool,
+    provider_terminal_observed: bool,
     model_stream_wait: u32,
     model_stream_processing: u32,
     tool: u32,
@@ -1729,9 +1817,9 @@ impl ActiveSet {
     /// Model time the provider can be serving. Validation still counts
     /// pre-dispatch request setup as explicit machine activity.
     fn provider_model_active(self) -> bool {
-        self.provider_request_wait()
+        !self.provider_terminal_observed && (self.provider_request_wait()
             || self.model_stream_wait > 0
-            || self.model_stream_processing > 0
+            || self.model_stream_processing > 0)
     }
 
     fn is_supported(self) -> bool {
@@ -1928,6 +2016,8 @@ impl TurnTimingState {
             active_tool_count: AtomicU32::new(0),
             tool_closure_changed: Notify::new(),
             checkpointed_entries: Default::default(),
+            model_usage_receipts: Default::default(),
+            canonical_input_section: Default::default(),
         }
     }
 
@@ -2058,6 +2148,18 @@ impl TurnTimingState {
         started_at
     }
 
+    pub(crate) fn mark_turn_worker_started(&self) {
+        let mut state = self.state();
+        let now = self.clock.sample().time.monotonic_ns;
+        state.advance(now);
+        if let Some(elapsed) = state.elapsed_since_start(now) {
+            state
+                .milestones
+                .turn_worker_started_ns
+                .get_or_insert(elapsed);
+        }
+    }
+
     /// Capture the dispatched bytes independently of optional post-dispatch
     /// token accounting, so cancelled/failed attempts still have an identity.
     pub(crate) fn record_model_request_payload(
@@ -2090,16 +2192,22 @@ impl TurnTimingState {
         physical_attempt_id: &str,
         bytes: &[u8],
     ) {
-        let sections = serde_json::from_slice::<serde_json::Map<String, serde_json::Value>>(bytes)
+        let sections = serde_json::from_slice::<BTreeMap<String, &serde_json::value::RawValue>>(bytes)
             .ok()
             .map(|fields| {
                 fields
                     .into_iter()
-                    .map(|(key, value)| {
-                        (
-                            key,
-                            hex::encode(Sha256::digest(value.to_string().as_bytes())),
-                        )
+                    .filter_map(|(key, value)| {
+                        let digest = if key == "input" {
+                            CanonicalInputSection::hash(
+                                &mut self.canonical_input_section.lock().unwrap_or_else(std::sync::PoisonError::into_inner), value,
+                            ).or_else(|| serde_json::from_str::<serde_json::Value>(value.get()).ok()
+                                .map(|value| hex::encode(Sha256::digest(value.to_string().as_bytes()))))
+                        } else {
+                            serde_json::from_str::<serde_json::Value>(value.get()).ok()
+                                .map(|value| hex::encode(Sha256::digest(value.to_string().as_bytes())))
+                        }?;
+                        Some((key, digest))
                     })
                     .collect()
             });
@@ -2153,14 +2261,15 @@ impl TurnTimingState {
     /// checkpoint of this turn are omitted, as are activity intervals before
     /// the previous checkpoint's last interval.
     pub(crate) fn sampling_checkpoint(&self) -> codex_protocol::protocol::SamplingTimingCheckpoint {
-        let (mut observation, tool_closure) = {
+        let (mut observation, tool_closure, sample) = {
             let state = self.state();
+            let sample = self.clock.sample();
             (
                 state.checkpoint_clone(),
                 state.tool_closure.snapshot_for_checkpoint(),
+                sample,
             )
         };
-        let sample = self.clock.sample();
         let mut timing = observation.complete(sample).protocol_timing();
         if let Some(timeline) = timing.activity_timeline.as_mut() {
             timeline.tail_unknown = true;
@@ -2359,6 +2468,7 @@ impl TurnTimingState {
             state.invalid_transition();
             return;
         }
+        request.diagnostics_owner_attempt_id.get_or_insert_with(|| physical_attempt_id.to_string());
         let mut detail_evicted = false;
         if !request
             .physical_attempt_ids
@@ -2371,6 +2481,7 @@ impl TurnTimingState {
                 request.request_sha256_by_attempt.remove(&evicted);
                 request.request_section_sha256_by_attempt.remove(&evicted);
                 request.response_id_by_attempt.remove(&evicted);
+                request.response_queue_timing_by_attempt.remove(&evicted);
                 detail_evicted = true;
             }
             request
@@ -3299,6 +3410,23 @@ impl TurnTimingState {
         }
     }
 
+    /// Records that this generation's turn ended by surfacing an existing tool
+    /// result as its final answer. That publication is communication progress,
+    /// even though the generation itself emitted no final-answer message.
+    pub(crate) fn record_surfaced_final_answer(&self) {
+        let mut state = self.state();
+        let Some(generation_index) = state.current_generation_index else {
+            return;
+        };
+        if let Some(request) = state.model_requests.iter_mut().find(|request| {
+            request.generation_index == generation_index
+                && request.attempt_kind == TurnTimingAttemptKind::Primary
+        }) {
+            request.final_answer_emitted = true;
+            request.unchanged_relevant_state = false;
+        }
+    }
+
     pub(crate) fn record_generation_token_usage(&self, usage: Option<&TokenUsage>) {
         let Some(usage) = usage else {
             return;
@@ -3335,6 +3463,66 @@ impl TurnTimingState {
         }) {
             request.observe_token_usage(usage);
         }
+        drop(state);
+        // Essential receipts survive bounded diagnostic request/attempt eviction.
+        self.model_usage_receipts.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entry((sampling_request_id.to_owned(), physical_attempt_id.to_owned()))
+            .or_insert_with(|| (usage.clone(), false));
+    }
+
+    pub(crate) fn record_model_estimator_model(&self, sampling: &str, attempt: &str, model: &str) {
+        let mut state = self.state();
+        if let Some(request) = state.model_requests.iter_mut().find(|request|
+            request.sampling_request_id.as_deref() == Some(sampling)
+                && request.physical_attempt_ids.iter().any(|id| id == attempt)) {
+            request.estimator_model = Some(model.to_owned());
+        }
+    }
+
+    /// Called under the session accounting lock, with no await before commit.
+    pub(crate) fn claim_current_model_usage(
+        &self, usage: &TokenUsage, delivered: Option<&crate::client_common::ResponseAttemptIdentity>,
+    ) -> bool {
+        let identity = delivered.map(|identity| (
+            identity.sampling_request_id.clone(), identity.physical_attempt_id.clone(),
+        )).or_else(|| {
+            let state = self.state();
+            state.model_requests.last().and_then(|request| Some((
+                request.sampling_request_id.clone()?, request.physical_attempt_ids.last()?.clone(),
+            )))
+        });
+        let Some(identity) = identity else { return true; }; // legacy/manual accounting
+        let mut receipts = self.model_usage_receipts.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let receipt = receipts.entry(identity).or_insert_with(|| (usage.clone(), false));
+        if receipt.1 || receipt.0 != *usage { return false; }
+        receipt.1 = true;
+        true
+    }
+
+    /// Caller holds the session accounting lock through the synchronous commit.
+    pub(crate) fn claim_unsettled_model_usage(&self) -> Vec<TokenUsage> {
+        self.model_usage_receipts.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+            .values_mut().filter_map(|(usage, settled)| {
+                if *settled { return None; }
+                *settled = true;
+                Some(usage.clone())
+            }).collect()
+    }
+
+    pub(crate) fn prompt_token_calibration_with_estimator(
+        &self, model: &str, usage: &TokenUsage, local: i64,
+    ) -> Option<(u64, u64)> {
+        let state = self.state();
+        let request = state.model_requests.last()?;
+        let input = usage.known_input()?;
+        if request.completed_ns.is_none()
+            || request.attempt_kind != TurnTimingAttemptKind::Primary
+            || request.physical_attempt_ids.len() != 1
+            || request.estimator_model.as_deref() != Some(model)
+            || request.token_usage.as_ref()?.input_tokens != input as u64
+            || input <= 0 || local <= 0
+        { return None; }
+        Some((local as u64, input as u64))
     }
 
     /// Pair only an unambiguous completed physical request. Partial responses,
@@ -3383,7 +3571,7 @@ impl TurnTimingState {
         let mut state = self.state();
         if let Some(request) = state.model_requests.iter_mut().find(|request| {
             request.sampling_request_id.as_deref() == Some(sampling_request_id)
-                && request.physical_attempt_ids.last().map(String::as_str)
+                && request.diagnostics_owner_attempt_id.as_deref()
                     == Some(physical_attempt_id)
         }) {
             request.request_diagnostics_status = TurnTimingRequestDiagnosticsStatus::Unavailable;
@@ -3395,6 +3583,39 @@ impl TurnTimingState {
                 request_diagnostics_status = "unavailable",
                 "late model request diagnostics"
             );
+        }
+        state.refresh_completed_request_diagnostics();
+    }
+
+    pub(crate) fn record_response_queue_timing(
+        &self,
+        sampling_request_id: &str,
+        physical_attempt_id: &str,
+        stage: &'static str,
+        observation: codex_protocol::timing::ResponseQueueTiming,
+    ) {
+        if !matches!(stage, "api_to_mapper" | "mapper_to_turn") {
+            return;
+        }
+        let mut state = self.state();
+        if let Some(request) = state.model_requests.iter_mut().find(|request| {
+            request.sampling_request_id.as_deref() == Some(sampling_request_id)
+                && request
+                    .physical_attempt_ids
+                    .iter()
+                    .any(|id| id == physical_attempt_id)
+        }) {
+            request
+                .response_queue_timing_by_attempt
+                .entry(physical_attempt_id.to_string())
+                .or_default()
+                .insert(stage.to_string(), observation.clone());
+        }
+        if state.completed_snapshot.is_some() {
+            tracing::info!(event.name = "codex.response_queue_timing",
+                sampling_request_id, physical_attempt_id, stage,
+                timing_json = %serde_json::to_string(&observation).unwrap_or_default(),
+                "late response queue timing");
         }
         state.refresh_completed_request_diagnostics();
     }
@@ -3413,7 +3634,7 @@ impl TurnTimingState {
         }
         if let Some(request) = state.model_requests.iter_mut().find(|request| {
             request.sampling_request_id.as_deref() == Some(sampling_request_id)
-                && request.physical_attempt_ids.last().map(String::as_str)
+                && request.diagnostics_owner_attempt_id.as_deref()
                     == Some(physical_attempt_id)
         }) {
             request.request_token_categories = Some(categories);
@@ -3439,7 +3660,7 @@ impl TurnTimingState {
         let mut state = self.state();
         let Some(request) = state.model_requests.iter_mut().find(|request| {
             request.sampling_request_id.as_deref() == Some(sampling_request_id)
-                && request.physical_attempt_ids.first().map(String::as_str)
+                && request.diagnostics_owner_attempt_id.as_deref()
                     == Some(physical_attempt_id)
         }) else {
             return;
@@ -3750,6 +3971,17 @@ impl TurnTimingState {
         state.tool_output_recovery_read_pending_continuation = true;
     }
 
+    /// A cell delivery carrying recovered evidence exceeded its visible output
+    /// budget, so that evidence was truncated again. Direct recovery is exempt
+    /// from generic re-projection and records its exact zero at the read.
+    pub(crate) fn record_tool_output_recovery_retruncation(&self) {
+        let mut state = self.state();
+        state.counters.tool_output_recovery_retruncation_count = state
+            .counters
+            .tool_output_recovery_retruncation_count
+            .saturating_add(1);
+    }
+
     pub(crate) fn record_tool_output_artifact_reread(&self) {
         let mut state = self.state();
         state.counters.tool_output_artifact_reread_count = state
@@ -3894,6 +4126,15 @@ impl TurnTimingState {
                 let mut state = self.state();
                 state.advance(self.clock.sample().time.monotonic_ns);
                 state.pending_request_setup = Some(ClientCriticalPhaseTiming::default());
+                if state.dispatch_ready_snapshot.is_none()
+                    && let Some(now) = state.last_monotonic_ns
+                    && let Some(elapsed) = state.elapsed_since_start(now)
+                {
+                    state
+                        .milestones
+                        .first_request_preparation_started_ns
+                        .get_or_insert(elapsed);
+                }
             }
             *preparation = Some(self.begin_local_phase(TurnLocalPhase::Preparation));
         }
@@ -4066,7 +4307,9 @@ impl TurnTimingState {
             );
         }
         let records_visible_output = records_visible_output && !compaction;
-        if records_model_content && !compaction {
+        let first_content = records_model_content && !compaction
+            && state.milestones.first_model_content_ns.is_none();
+        if first_content {
             state
                 .milestones
                 .first_model_content_ns
@@ -4132,11 +4375,76 @@ impl TurnTimingState {
                 });
             }
         }
-        if !records_visible_output || state.milestones.first_visible_output_ns.is_some() {
-            return None;
+        first_content.then(|| duration_from_nanos(elapsed_ns))
+    }
+
+    /// First nonempty assistant text accepted by the host after filtering.
+    /// Reasoning and completed-message time remain separate; this is not paint.
+    pub(crate) fn record_assistant_text_publication(
+        &self,
+        event: &codex_protocol::protocol::EventMsg,
+    ) {
+        use codex_protocol::items::AgentMessageContent;
+        use codex_protocol::protocol::EventMsg;
+        let (item_id, phase) = match event {
+            EventMsg::AgentMessageContentDelta(delta) if !delta.delta.is_empty() => {
+                (Some(delta.item_id.as_str()), None)
+            }
+            EventMsg::ItemStarted(codex_protocol::protocol::ItemStartedEvent {
+                item: TurnItem::AgentMessage(message), ..
+            }) | EventMsg::ItemCompleted(codex_protocol::protocol::ItemCompletedEvent {
+                item: TurnItem::AgentMessage(message), ..
+            }) => {
+                if !message.content.iter().any(|part| matches!(
+                    part, AgentMessageContent::Text { text } if !text.is_empty()
+                )) {
+                    return;
+                }
+                (Some(message.id.as_str()), message.phase.clone())
+            }
+            EventMsg::AgentMessage(message) if !message.message.is_empty() => (None, message.phase.clone()),
+            _ => return,
+        };
+        let mut state = self.state();
+        let sample = self.clock.sample();
+        state.advance(sample.time.monotonic_ns);
+        if state.current_generation_purpose == Some(TurnTimingGenerationPurpose::CompactionRecovery)
+            || state.milestones.first_assistant_text_ns.is_some()
+        {
+            return;
         }
-        state.milestones.first_visible_output_ns = Some(elapsed_ns);
-        Some(duration_from_nanos(elapsed_ns))
+        let Some(elapsed_ns) = state.elapsed_since_start(sample.time.monotonic_ns) else {
+            return;
+        };
+        state.milestones.first_assistant_text_ns = Some(elapsed_ns);
+        state.milestones.first_assistant_text_item_id = item_id.map(str::to_owned);
+        state.milestones.first_assistant_text_phase = phase;
+    }
+
+    /// Host queue acceptance after consumer routing, not native rendering.
+    pub(crate) fn record_visible_output_publication(&self) {
+        let mut state = self.state();
+        let sample = self.clock.sample();
+        state.advance(sample.time.monotonic_ns);
+        if state.current_generation_purpose != Some(TurnTimingGenerationPurpose::CompactionRecovery)
+            && let Some(elapsed_ns) = state.elapsed_since_start(sample.time.monotonic_ns)
+        {
+            state.milestones.first_visible_output_ns.get_or_insert(elapsed_ns);
+        }
+    }
+
+    pub(crate) fn record_provider_terminal(&self, sampling_request_id: &str, physical_attempt_id: &str) {
+        let mut state = self.state();
+        if !state.model_requests.last().is_some_and(|request| {
+            request.sampling_request_id.as_deref() == Some(sampling_request_id)
+                && (request.physical_attempt_ids.last().map(String::as_str) == Some(physical_attempt_id)
+                    || request.diagnostics_owner_attempt_id.as_deref() == Some(physical_attempt_id))
+        }) {
+            return;
+        }
+        state.advance(self.clock.sample().time.monotonic_ns);
+        state.activity.provider_terminal_observed = true;
+        state.activity.provider_request_dispatched = false;
     }
 
     pub(crate) fn mark_model_responses_accounted(&self, count: u64) {
@@ -4210,6 +4518,7 @@ impl TurnTimingState {
         let sample = self.clock.sample();
         state.advance(sample.time.monotonic_ns);
         state.activity.provider_request_dispatched = true;
+        state.activity.provider_terminal_observed = false;
         let elapsed_ns = state.elapsed_since_start(sample.time.monotonic_ns);
         let lifecycle_context = self.lifecycle_context();
         if let Some(model_resumed_at_ms) = state
@@ -4681,6 +4990,7 @@ impl TurnTimingStateInner {
                 } else {
                     self.activity_timeline.dropped_intervals =
                         self.activity_timeline.dropped_intervals.saturating_add(1);
+                    self.activity_timeline.record_coarse_interval(&interval);
                 }
             }
         }
@@ -4925,6 +5235,7 @@ impl TurnTimingStateInner {
             activity_timeline: codex_protocol::timing::TurnTimingTimeline {
                 duration_ns: u64::try_from(inclusive_duration_ns).unwrap_or(u64::MAX),
                 coverage_complete: profile_valid && self.activity_timeline.dropped_intervals == 0,
+                coverage_including_coarse_complete: Some(profile_valid),
                 open_process_count: self.activity.observed_processes,
                 ..self.activity_timeline.clone()
             },
@@ -4955,6 +5266,8 @@ impl TurnTimingStateInner {
                         current.request_section_sha256_by_attempt.clone();
                     request.request_token_categories = current.request_token_categories.clone();
                     request.request_diagnostics_status = current.request_diagnostics_status;
+                    request.response_queue_timing_by_attempt =
+                        current.response_queue_timing_by_attempt.clone();
                     request.fixed_prefix_reuse_eligible = current.fixed_prefix_reuse_eligible;
                     request.prompt_cache_key_fingerprint =
                         current.prompt_cache_key_fingerprint.clone();
@@ -5201,11 +5514,12 @@ impl LegacyProfileState {
 
 /// Nonempty decoded content observed by the turn consumer, not a provider token
 /// timestamp. Tool headers and opaque compaction checkpoints are not content.
-fn response_event_records_model_content(event: &ResponseEvent) -> bool {
+pub(crate) fn response_event_records_model_content(event: &ResponseEvent) -> bool {
     match event {
         ResponseEvent::OutputTextDelta(text)
         | ResponseEvent::ReasoningSummaryDelta { delta: text, .. }
         | ResponseEvent::ReasoningContentDelta { delta: text, .. }
+        | ResponseEvent::ReasoningSummaryDone { text, .. }
         | ResponseEvent::ToolCallInputDelta { delta: text, .. } => !text.is_empty(),
         ResponseEvent::OutputItemAdded(item) => response_item_records_visible_output(item),
         ResponseEvent::OutputItemDone(item) => {
@@ -5236,9 +5550,9 @@ pub(crate) fn response_event_records_model_output(event: &ResponseEvent) -> bool
         ResponseEvent::OutputTextDelta(text)
         | ResponseEvent::ReasoningSummaryDelta { delta: text, .. }
         | ResponseEvent::ReasoningContentDelta { delta: text, .. }
+        | ResponseEvent::ReasoningSummaryDone { text, .. }
         | ResponseEvent::ToolCallInputDelta { delta: text, .. } => !text.is_empty(),
-        ResponseEvent::ReasoningSummaryDone { .. }
-        | ResponseEvent::Created
+        ResponseEvent::Created
         | ResponseEvent::ServerModel(_)
         | ResponseEvent::ModelVerifications(_)
         | ResponseEvent::TurnModerationMetadata(_)
@@ -5315,18 +5629,19 @@ fn response_item_records_model_output(item: &ResponseItem) -> bool {
 }
 
 fn response_item_records_actionable_output(item: &ResponseItem) -> bool {
-    matches!(
-        item,
+    match item {
         ResponseItem::LocalShellCall { .. }
-            | ResponseItem::FunctionCall { .. }
-            | ResponseItem::CustomToolCall { .. }
-            | ResponseItem::ToolSearchCall { .. }
-            | ResponseItem::WebSearchCall { .. }
-            | ResponseItem::ImageGenerationCall { .. }
-            | ResponseItem::Compaction { .. }
-            | ResponseItem::ContextCompaction { .. }
-    ) || matches!(item, ResponseItem::Message { .. })
-        && raw_assistant_output_text_from_item(item).is_some_and(|text| !text.is_empty())
+        | ResponseItem::FunctionCall { .. }
+        | ResponseItem::CustomToolCall { .. }
+        | ResponseItem::ImageGenerationCall { .. } => true,
+        // Hosted web search and server-side tool search finish inside the provider and
+        // give the client neither an executable call nor answer text (see ToolRouter).
+        ResponseItem::ToolSearchCall { execution, .. } => execution == "client",
+        ResponseItem::Message { .. } => {
+            raw_assistant_output_text_from_item(item).is_some_and(|text| !text.is_empty())
+        }
+        _ => false,
+    }
 }
 
 fn response_item_records_visible_output(item: &ResponseItem) -> bool {

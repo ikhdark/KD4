@@ -3,6 +3,7 @@ import type { CollabAgentState, SurfacedToolResult } from "../src/index";
 
 import type { CodexExec } from "../src/exec";
 import type { ThreadEvent } from "../src/events";
+import { validateThreadEvent } from "../src/eventValidation";
 import { Thread } from "../src/thread";
 import type {
   CommandExecutionItem,
@@ -108,6 +109,28 @@ const missingMcpOutcomes: McpToolCallItem = {
   status: "in_progress",
 };
 void missingMcpOutcomes;
+
+it("preserves failed partial patch effects and distinguishes unknown from empty", () => {
+  const effects = {
+    exact: true,
+    changes: [{ path: "file:///repo/a", before: null, after: "owned\n" }],
+  };
+  const item: FileChangeItem = {
+    id: "partial-patch",
+    type: "file_change",
+    status: "failed",
+    changes: [{ path: "a", kind: "add" }, { path: "b", kind: "add" }],
+    effects,
+  };
+  const event = { type: "item.completed", item };
+  expect(validateThreadEvent(event)).toEqual(event);
+  expect(item.effects?.changes).toHaveLength(1);
+  for (const exact of [true, false]) {
+    const empty = { ...event, item: { ...item, effects: { exact, changes: [] } } };
+    expect(validateThreadEvent(empty)).toEqual(empty);
+  }
+  expect(() => validateThreadEvent({ ...event, item: { ...item, effects: {} } })).toThrow();
+});
 
 it("exposes optional authoritative child results through public types", () => {
   const surface: SurfacedToolResult = {

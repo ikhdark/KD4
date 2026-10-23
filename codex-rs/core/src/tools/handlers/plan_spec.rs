@@ -50,13 +50,23 @@ fn acceptance_schema() -> JsonSchema {
                     ),
                 ],
             ),
-            requirement(
-                "validation",
-                vec![
-                    ("environment_id", JsonSchema::string(None)),
-                    ("path", JsonSchema::string(None)),
-                    ("test_execution", JsonSchema::boolean(None)),
-                ],
+            JsonSchema::object(
+                BTreeMap::from([
+                    ("kind".into(), JsonSchema::string_enum(vec![json!("validation")], None)),
+                    ("environment_id".into(), JsonSchema::string(None)),
+                    ("path".into(), JsonSchema::string(None)),
+                    ("test_execution".into(), JsonSchema::boolean(None)),
+                    ("required_tests".into(), JsonSchema::array(
+                        JsonSchema::object(BTreeMap::from([
+                            ("binary".into(), JsonSchema::string(None)),
+                            ("helpers".into(), JsonSchema::array(JsonSchema::string(None), None)),
+                            ("test".into(), JsonSchema::string(None)),
+                        ]), Some(vec!["binary".into(), "helpers".into(), "test".into()]), Some(false.into())),
+                        Some("Optional exact host runner identities from one passing execution; requires test_execution=true. Counts, package inputs and unrelated passing tests do not satisfy this selection. Helpers use the runner's canonical order.".into()),
+                    )),
+                ]),
+                Some(vec!["kind".into(), "environment_id".into(), "path".into(), "test_execution".into()]),
+                Some(false.into()),
             ),
             requirement(
                 "assignment",
@@ -69,11 +79,18 @@ fn acceptance_schema() -> JsonSchema {
         ..Default::default()
     };
     JsonSchema {
-        description: Some("Independent declared acceptance IDs (maximum 128), not checklist statuses. Incremental: omitted criteria persist. Text, origin and proof kind are immutable; evidence_ref must name current task-state acceptance_evidence. Inspection ranges are byte offsets. Assignment criteria are mandatory and require current typed receipt, gates and parent integration; optional children need no criterion. Retire only with retired_by accepted input and retirement_reason. Declare every required artifact/consumer explicitly: this finite contract cannot certify omitted scope or semantic correctness. Never introduce unauthorized tests.".into()),
+        description: Some("Independent declared acceptance IDs (maximum 128), not checklist statuses. Incremental: omitted criteria persist. Text, origin and proof kind are immutable; Inspection/validation evidence_ref must name current task-state acceptance_evidence; the host resolves assignment evidence from its current typed query. Inspection ranges are byte offsets. Assignment criteria are mandatory and require current typed receipt, gates and parent integration; optional children need no criterion. Retire only with retired_by accepted input and retirement_reason. Declare every required artifact/consumer explicitly: this finite contract cannot certify omitted scope or semantic correctness. Never introduce unauthorized tests.".into()),
         ..JsonSchema::object(BTreeMap::new(), None, Some(JsonSchema::object(BTreeMap::from([
             ("text".into(), JsonSchema::string(None)),
             ("origin".into(), reference()),
             ("requirement".into(), proof),
+            ("plan_requirement_ids".into(), {
+                let mut ids = JsonSchema::array(JsonSchema::string(None), Some(
+                    "Known checklist requirement IDs covered by this criterion (maximum 128). A concrete blocker applies only to explicitly linked requirements; it never completes or retires them, excuses unrelated work, or authorizes tests. Omitted links preserve legacy same-ID matching.".into()
+                ));
+                ids.max_items = Some(128);
+                ids
+            }),
             ("evidence_ref".into(), JsonSchema::string(None)),
             ("blocker".into(), JsonSchema::string(Some("Concrete external dependency; do not use a truthful partial report to abandon obtainable work.".into()))),
             ("retired_by".into(), reference()),
@@ -313,4 +330,35 @@ pub fn create_update_plan_tool() -> ToolSpec {
             "additionalProperties": false
         }).into()),
     })
+}
+#[cfg(test)]
+mod audit149_tests {
+    use super::*;
+
+    #[test]
+    fn audit149_required_test_selection_schema_and_legacy_contract_are_valid() {
+        let ToolSpec::Function(spec) = create_update_plan_tool() else {
+            panic!("function tool")
+        };
+        let validator = jsonschema::validator_for(&serde_json::to_value(&spec.parameters).unwrap()).unwrap();
+        let mut args = json!({"plan":[], "acceptance": {"consumer":{
+            "text":"Verify consumer", "origin":{"turn_id":"task","sha256":"origin"},
+            "requirement":{"kind":"validation","environment_id":"local","path":"consumer.rs",
+                "test_execution":true,"required_tests":[{"binary":"codex-core","helpers":[],"test":"consumer_regression"}]}
+        }}});
+        assert!(validator.is_valid(&args));
+        args["acceptance"]["consumer"]["requirement"]["required_tests"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("test");
+        assert!(!validator.is_valid(&args));
+        args["acceptance"]["consumer"]["requirement"]
+            .as_object_mut()
+            .unwrap()
+            .remove("required_tests");
+        assert!(
+            validator.is_valid(&args),
+            "legacy path-only criteria remain supported"
+        );
+    }
 }

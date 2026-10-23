@@ -135,6 +135,7 @@ struct CollectedOutput {
     bytes: Vec<u8>,
     ranges: Option<crate::unified_exec::head_tail_buffer::OutputChunkRanges>,
     wake_reason: ToolLifecycleWakeReason,
+    observation_deadline: Instant,
 }
 
 // Record the manager's actual deadline, including failures before collection.
@@ -195,10 +196,11 @@ fn apply_unified_exec_env(
 fn build_unified_exec_environment(
     context: &UnifiedExecContext,
 ) -> (HashMap<String, String>, HashMap<String, String>) {
-    let local_policy_env = create_env(
+    let mut local_policy_env = create_env(
         &context.turn.config.permissions.shell_environment_policy,
         /*thread_id*/ None,
     );
+    context.apply_env_overrides(&mut local_policy_env);
     let mut env = local_policy_env.clone();
     env.insert(
         CODEX_THREAD_ID_ENV_VAR.to_string(),
@@ -421,6 +423,7 @@ pub(super) struct PendingProcessRegistration {
     network_approval: Option<DeferredNetworkApproval>,
     initial_exec_command_active: Option<Arc<AtomicBool>>,
     pending_startup_completion: Option<(PathUri, Arc<tokio::sync::Mutex<HeadTailBuffer>>, Instant)>,
+    observation_deadline: Option<Instant>,
     committed: bool,
 }
 
@@ -473,6 +476,7 @@ impl PendingProcessRegistration {
             network_approval: None,
             initial_exec_command_active: None,
             pending_startup_completion: None,
+            observation_deadline: None,
             committed: false,
         }
     }
@@ -1346,13 +1350,21 @@ impl UnifiedExecProcessManager {
                 mark_exec_process_exited();
             }
         }
-        finish_exited_process_result(
+        let result = finish_exited_process_result(
             registration.primary_process.as_ref(),
             result,
             Instant::now().saturating_duration_since(request_started_at),
-            nested_poll_bound(context.source.nested_deadline()),
+            registration
+                .observation_deadline
+                .or_else(|| nested_poll_bound(context.source.nested_deadline())),
         )
-        .await
+        .await;
+        tracing::info!(event.name = "codex.exec.handler_completed",
+            operation = "exec_command", call_id = %context.call_id,
+            handler_elapsed_ms = u64::try_from(request_started_at.elapsed().as_millis()).unwrap_or(u64::MAX),
+            success = result.is_ok(),
+            "handler elapsed includes launch, observation and result finalization");
+        result
     }
 
     #[expect(
@@ -1432,6 +1444,7 @@ impl UnifiedExecProcessManager {
         // orphan the process. Mutating sessions are explicitly terminated when their owning turn
         // reaches a terminal state; non-mutating sessions remain resumable across turns.
         let process_started_alive = (!process.has_exited() && process.exit_code().is_none())
+            || !process.output_is_closed()
             || context.source.nested_deadline().is_some();
         let _initial_exec_command_guard = if process_started_alive {
             let initial_exec_command_active = Arc::new(AtomicBool::new(true));
@@ -1487,6 +1500,7 @@ impl UnifiedExecProcessManager {
             Some(bound) => (start + Duration::from_millis(yield_time_ms)).min(bound),
             None => start + Duration::from_millis(yield_time_ms),
         };
+        registration.observation_deadline = Some(deadline);
         // A burst from a noninteractive command is progress, not completion.
         // Keep its existing observation window attached across quiet periods;
         // interactive terminals still yield promptly when a prompt is ready.
@@ -1504,8 +1518,14 @@ impl UnifiedExecProcessManager {
             &mut stall_handoff,
         )
         .await;
+        let deadline = collected.observation_deadline;
+        registration.observation_deadline = Some(deadline);
         let output_ranges = collected.ranges;
         let collected = collected.bytes;
+        // Root exit is not output closure. All post-observation finalizers,
+        // including the outer caller, share the collector's pause-adjusted
+        // observation bound, still capped by any enclosing hard deadline.
+        let poll_bound = Some(deadline);
         // Observer shutdown wakes the collector but is not an exit receipt.
         // The independent watcher records a later confirmed termination.
         if process.has_exited() {
@@ -1812,6 +1832,8 @@ impl UnifiedExecProcessManager {
         request: WriteStdinRequest<'_>,
         until_output: bool,
     ) -> Result<ExecCommandToolOutput, UnifiedExecError> {
+        let handler_started_at = Instant::now();
+        let process_id = request.process_id;
         let process = {
             let store = self.process_store.lock().await;
             if let Some(response) = store.finished_response(&request) {
@@ -1826,17 +1848,23 @@ impl UnifiedExecProcessManager {
                 })?
         };
         let started_at = Instant::now();
-        let hard_deadline = nested_poll_bound(request.nested_deadline);
+        let mut hard_deadline = nested_poll_bound(request.nested_deadline);
         let result = self
-            .write_stdin_inner(request, &process, until_output)
+            .write_stdin_inner(request, &process, until_output, &mut hard_deadline)
             .await;
-        finish_exited_process_result(
+        let result = finish_exited_process_result(
             Some(&process),
             result,
             Instant::now().saturating_duration_since(started_at),
             hard_deadline,
         )
-        .await
+        .await;
+        tracing::info!(event.name = "codex.exec.handler_completed",
+            operation = "write_stdin", process_id,
+            handler_elapsed_ms = u64::try_from(handler_started_at.elapsed().as_millis()).unwrap_or(u64::MAX),
+            success = result.is_ok(),
+            "handler elapsed includes interaction admission and result finalization");
+        result
     }
 
     async fn write_stdin_inner(
@@ -1844,6 +1872,7 @@ impl UnifiedExecProcessManager {
         request: WriteStdinRequest<'_>,
         locked_process: &Arc<UnifiedExecProcess>,
         until_output: bool,
+        observation_deadline: &mut Option<Instant>,
     ) -> Result<ExecCommandToolOutput, UnifiedExecError> {
         let process_id = request.process_id;
 
@@ -1982,6 +2011,7 @@ impl UnifiedExecProcessManager {
             Some(bound) => (start + Duration::from_millis(yield_time_ms)).min(bound),
             None => start + Duration::from_millis(yield_time_ms),
         };
+        *observation_deadline = Some(deadline);
         let effective_timeout_ms =
             u64::try_from(deadline.saturating_duration_since(start).as_millis())
                 .unwrap_or(u64::MAX);
@@ -2078,9 +2108,12 @@ impl UnifiedExecProcessManager {
         )
         .await;
         wait.0.wake_reason = collected.wake_reason;
+        let deadline = collected.observation_deadline;
+        *observation_deadline = Some(deadline);
         let output_ranges = collected.ranges;
         let collected = collected.bytes;
         let wall_time = Instant::now().saturating_duration_since(start);
+        let poll_bound = Some(deadline);
 
         let chunk_id = generate_chunk_id();
         if network_approval
@@ -2828,8 +2861,26 @@ impl UnifiedExecProcessManager {
         };
         // The canonical policy still depends on the direct-argv proof. Only
         // the independent original command policy runs alongside that chain.
-        let ((proven_direct_argv, canonical_exec_approval_requirement), exec_approval_requirement) =
-            tokio::join!(canonical_approval, original_approval);
+        let (
+            (proven_direct_argv, canonical_exec_approval_requirement),
+            mut exec_approval_requirement,
+        ) = tokio::join!(canonical_approval, original_approval);
+
+        // An argv safelist cannot prove a command trustworthy when its loader,
+        // configuration or executable search path is supplied by the caller.
+        if !context.env_overrides.is_empty()
+            && context.turn.approval_policy.value()
+                == codex_protocol::protocol::AskForApproval::UnlessTrusted
+            && matches!(
+                exec_approval_requirement,
+                crate::tools::sandboxing::ExecApprovalRequirement::Skip { .. }
+            )
+        {
+            exec_approval_requirement = crate::tools::sandboxing::ExecApprovalRequirement::NeedsApproval {
+                reason: Some("Command-scoped environment overrides require approval under the untrusted-command policy.".into()),
+                proposed_execpolicy_amendment: None,
+            };
+        }
 
         let approved_powershell_direct_argv = if let (Some(proof), Some(canonical_requirement)) =
             (proven_direct_argv, canonical_exec_approval_requirement)
@@ -2858,13 +2909,8 @@ impl UnifiedExecProcessManager {
             turn_environment: request.turn_environment.clone(),
             env,
             exec_server_env_config: Some(exec_server_env_config),
-            explicit_env_overrides: context
-                .turn
-                .config
-                .permissions
-                .shell_environment_policy
-                .r#set
-                .clone(),
+            explicit_env_overrides: context.explicit_env_overrides(),
+            has_command_env_overrides: !context.env_overrides.is_empty(),
             network: request.network.clone(),
             tty: request.tty,
             sandbox_permissions: request.sandbox_permissions,
@@ -3231,6 +3277,7 @@ impl UnifiedExecProcessManager {
             bytes: output,
             ranges,
             wake_reason,
+            observation_deadline: hard_deadline.map_or(deadline, |bound| deadline.min(bound)),
         }
     }
 
@@ -3564,15 +3611,17 @@ impl UnifiedExecProcessManager {
     }
 
     async fn terminate_process_inner(&self, process_id: u32, retain_for_poll: bool) -> bool {
-        let (process, already_exited) = {
+        let process = {
             let store = self.process_store.lock().await;
             let Some(entry) = store.processes.get(&process_id) else {
                 return false;
             };
-            (Arc::clone(&entry.process), entry.process.has_exited())
+            Arc::clone(&entry.process)
         };
 
-        if !already_exited && process.terminate_confirmed().await.is_err() {
+        // Root exit does not imply output custody has finished. The same
+        // termination owner also aborts remaining readers/finalization.
+        if process.terminate_confirmed().await.is_err() {
             return false;
         }
         if retain_for_poll {

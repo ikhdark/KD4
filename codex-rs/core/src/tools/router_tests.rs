@@ -3009,3 +3009,95 @@ async fn code_mode_same_turn_refreshes_eager_schemas_when_environment_becomes_re
         before.serialized()
     );
 }
+#[tokio::test]
+async fn audit150_inactive_deferred_namespace_does_not_enter_the_schema_snapshot() {
+    super::DEFERRED_SCHEMA_MATERIALIZATIONS.with(|count| count.set(0));
+    let (_, turn)=make_session_and_context().await;
+    let hidden=crate::tools::handlers::DynamicToolHandler::new_in_namespace(
+        &DynamicToolNamespaceSpec {name:"hidden".into(),description:"hidden guidance".repeat(1000),tools:vec![]},
+        &DynamicToolFunctionSpec {name:"large".into(),description:"large hidden schema".into(),
+            input_schema:json!({"type":"object","properties":{"payload":{"type":"string","description":"x".repeat(100_000)}}}),
+            defer_loading:true}).unwrap();
+    let registered=crate::tools::registry::RegisteredTool::with_exposure(
+        Arc::new(hidden),codex_tools::ToolExposure::Deferred,TypedToolClass::DynamicExternal);
+    let active=crate::tools::handlers::DynamicToolHandler::new(&DynamicToolFunctionSpec {
+        name:"active".into(),description:"active control".into(),input_schema:json!({"type":"object"}),defer_loading:true,
+    }).unwrap();
+    let active=crate::tools::registry::RegisteredTool::with_exposure(
+        Arc::new(active),codex_tools::ToolExposure::Deferred,TypedToolClass::DynamicExternal);
+    let router=ToolRouter::from_parts(ToolRegistry::from_unique_registered_tools(vec![registered,active]),vec![]);
+    turn.refresh_deferred_tool_capabilities(router.deferred_tool_capability_revisions());
+    turn.activate_deferred_tools([ToolName::plain("active")]);
+    assert!(namespace_function_names(router.model_visible_schemas_for_turn(&turn).specs(),"hidden").is_empty());
+    assert_eq!(super::DEFERRED_SCHEMA_MATERIALIZATIONS.with(std::cell::Cell::get),1);
+    turn.activate_deferred_tools([ToolName::namespaced("hidden","large")]);
+    assert_eq!(namespace_function_names(router.model_visible_schemas_for_turn(&turn).specs(),"hidden"),vec!["large"]);
+    assert_eq!(super::DEFERRED_SCHEMA_MATERIALIZATIONS.with(std::cell::Cell::get),3);
+}
+
+#[tokio::test]
+async fn audit150_activated_namespace_description_is_budgeted() {
+    let (_, turn) = make_session_and_context().await;
+    let deferred_namespace = |name: &str, description: String| {
+        let handler = crate::tools::handlers::DynamicToolHandler::new_in_namespace(
+            &DynamicToolNamespaceSpec {
+                name: name.into(),
+                description,
+                tools: vec![],
+            },
+            &DynamicToolFunctionSpec {
+                name: "lookup".into(),
+                description: "Look up records.".into(),
+                input_schema: json!({"type": "object"}),
+                defer_loading: true,
+            },
+        )
+        .unwrap();
+        crate::tools::registry::RegisteredTool::with_exposure(
+            Arc::new(handler),
+            codex_tools::ToolExposure::Deferred,
+            TypedToolClass::DynamicExternal,
+        )
+    };
+    let description_of = |specs: &[ToolSpec], name: &str| {
+        specs.iter().find_map(|spec| match spec {
+            ToolSpec::Namespace(namespace) if namespace.name == name => {
+                Some(namespace.description.clone())
+            }
+            _ => None,
+        })
+    };
+    let large_guidance = format!("{}FINAL_GUIDANCE", "guidance ".repeat(7_000));
+    let small_guidance = "Small namespace guidance.".to_string();
+    let router = ToolRouter::from_parts(
+        ToolRegistry::from_unique_registered_tools(vec![
+            deferred_namespace("large", large_guidance.clone()),
+            deferred_namespace("small", small_guidance.clone()),
+        ]),
+        vec![],
+    );
+    turn.refresh_deferred_tool_capabilities(router.deferred_tool_capability_revisions());
+
+    // Negative control: guidance within the shared budget stays byte-identical.
+    turn.activate_deferred_tools([ToolName::namespaced("small", "lookup")]);
+    let schemas = router.model_visible_schemas_for_turn(&turn);
+    assert_eq!(
+        description_of(schemas.specs(), "small"),
+        Some(small_guidance.clone())
+    );
+
+    // An activated namespace joins the final projection and shares its budget.
+    turn.activate_deferred_tools([ToolName::namespaced("large", "lookup")]);
+    let schemas = router.model_visible_schemas_for_turn(&turn);
+    let visible_large =
+        description_of(schemas.specs(), "large").expect("activated namespace is visible");
+    assert!(
+        visible_large.len() < large_guidance.len(),
+        "activated namespace guidance must not bypass the visible description budget"
+    );
+    assert!(visible_large.len() <= 40_000);
+    assert_eq!(
+        description_of(schemas.specs(), "small"),
+        Some(small_guidance)
+    );
+}

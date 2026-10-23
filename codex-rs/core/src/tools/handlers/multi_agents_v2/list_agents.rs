@@ -67,9 +67,11 @@ impl Handler {
                 )
                 .await
                 .map_err(|error| {
-                    FunctionCallError::RespondToModel(format!(
-                        "list_agents: durable typed-task state could not initialize: {error}"
-                    ))
+                    task_store_context_error(
+                        "list_agents",
+                        "list_agents: durable typed-task state could not initialize",
+                        error,
+                    )
                 })?;
         }
         let resolved_prefix = args
@@ -91,9 +93,11 @@ impl Handler {
                 .list_agent_task_bindings(root_session_id, None)
                 .await
                 .map_err(|error| {
-                    FunctionCallError::RespondToModel(format!(
-                        "list_agents: durable typed-task state is unavailable: {error}"
-                    ))
+                    task_store_context_error(
+                        "list_agents",
+                        "list_agents: durable typed-task state is unavailable",
+                        error,
+                    )
                 })?;
             for binding in bindings {
                 if resolved_prefix
@@ -102,15 +106,22 @@ impl Handler {
                 {
                     continue;
                 }
-                let task = coordinator
+                let task = match coordinator
                     .get_agent_task(binding.assignment_id, Some(0))
                     .await
-                    .map_err(|error| {
-                        FunctionCallError::RespondToModel(format!(
-                            "list_agents: assignment {} is unavailable: {error}",
-                            binding.assignment_id
-                        ))
-                    })?;
+                {
+                    Ok(task) => task,
+                    Err(error) if assignment_local_failure(&error) => {
+                        typed_tasks.push(json!({
+                            "assignment_id": binding.assignment_id, "attempt_id": binding.attempt_id,
+                            "agent_path": binding.agent_path, "task_name": binding.task_name,
+                            "health": "unavailable", "obligation_resolved": false,
+                            "error": task_store_error_detail("list_agents", error),
+                        }));
+                        continue;
+                    }
+                    Err(error) => return Err(FunctionCallError::RespondToModel(task_store_error_detail("list_agents", error))),
+                };
                 typed_tasks.push(json!({
                     "assignment_id": binding.assignment_id,
                     "attempt_id": binding.attempt_id,
@@ -129,10 +140,16 @@ impl Handler {
             }
         }
 
-        Ok(boxed_tool_output(ListAgentsResult {
+        let mut result = ListAgentsResult {
             agents,
             typed_tasks,
-        }))
+            unresolved_descendants: coordinator.unavailable_descendants(),
+            revision: String::new(),
+            unchanged: false,
+            task_text_recovery: None,
+        };
+        result.apply_view(&args, &session.thread_id.to_string())?;
+        Ok(boxed_tool_output(result))
     }
 }
 
@@ -146,12 +163,49 @@ impl CoreToolRuntime for Handler {
 #[serde(deny_unknown_fields)]
 struct ListAgentsArgs {
     path_prefix: Option<String>,
+    #[serde(default)]
+    compact: bool,
+    since_revision: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
 pub(crate) struct ListAgentsResult {
     agents: Vec<ListedAgent>,
     typed_tasks: Vec<JsonValue>,
+    unresolved_descendants: Vec<(String, String)>,
+    revision: String,
+    unchanged: bool,
+    task_text_recovery: Option<String>,
+}
+
+impl ListAgentsResult {
+    fn apply_view(&mut self, args: &ListAgentsArgs, root: &str) -> Result<(), FunctionCallError> {
+        use sha2::Digest;
+        // Hash the complete fresh projection, before removing task prose. Lease
+        // expiry, a changed answer, deletion, failed delivery and attempt/gate
+        // transitions must invalidate an unchanged response. This is a display
+        // fingerprint, never a task-store or source-freshness witness.
+        let bytes = serde_json::to_vec(&json!([
+            root, args.path_prefix, args.compact, self.agents, self.typed_tasks,
+            self.unresolved_descendants,
+        ]))
+        .map_err(|error| FunctionCallError::RespondToModel(format!("list_agents: snapshot serialization failed: {error}")))?;
+        self.revision = hex::encode(sha2::Sha256::digest(bytes));
+        if args.since_revision.as_ref() == Some(&self.revision) {
+            self.unchanged = true;
+            self.agents.clear();
+            self.typed_tasks.clear();
+            self.unresolved_descendants.clear();
+        } else if args.compact {
+            for agent in &mut self.agents {
+                agent.last_task_message = None;
+            }
+            // Keep lifecycle status (including final results), failures,
+            // blockers and required actions intact even in the compact view.
+            self.task_text_recovery = Some("Call list_agents with compact:false and the same path_prefix to retrieve task messages. A changed/unknown revision returns a full replacement snapshot; unchanged:true preserves the prior snapshot, including its failures.".into());
+        }
+        Ok(())
+    }
 }
 
 fn agent_path_matches_prefix(agent_path: &str, prefix: &AgentPath) -> bool {
@@ -179,5 +233,68 @@ impl ToolOutput for ListAgentsResult {
 
     fn code_mode_result(&self, _payload: &ToolPayload) -> JsonValue {
         tool_output_code_mode_result(self, "list_agents")
+    }
+}
+#[cfg(test)]
+mod view_tests {
+    use super::*;
+
+    fn snapshot() -> ListAgentsResult {
+        ListAgentsResult {
+            agents: vec![ListedAgent {
+                agent_name: "/worker".into(), agent_status: AgentStatus::Completed(Some("retained final answer".into())),
+                last_task_message: Some("λ task instructions ".repeat(500)), runtime_loaded: false,
+            }],
+            typed_tasks: vec![json!({"assignment_id":"assignment", "attempt_id":"attempt-one",
+                "workspace_status":{"lease_state":"active", "pending_gates":["review"], "next_required_action":"resolve review"}})],
+            unresolved_descendants: vec![("/unavailable".into(), "delivery failed".into())],
+            revision: String::new(), unchanged: false, task_text_recovery: None,
+        }
+    }
+
+    #[test]
+    fn compact_and_unchanged_views_preserve_failures_results_and_exact_full_recovery() {
+        let mut compact = snapshot();
+        let args = ListAgentsArgs { path_prefix: None, compact: true, since_revision: None };
+        compact.apply_view(&args, "root").unwrap();
+        assert!(compact.agents[0].last_task_message.is_none());
+        assert_eq!(compact.agents[0].agent_status, AgentStatus::Completed(Some("retained final answer".into())));
+        assert_eq!(compact.typed_tasks[0]["workspace_status"]["next_required_action"], "resolve review");
+        assert_eq!(compact.unresolved_descendants[0].1, "delivery failed");
+        assert!(compact.task_text_recovery.as_deref().unwrap().contains("compact:false"));
+        let mut unchanged = snapshot();
+        unchanged.apply_view(&ListAgentsArgs { since_revision: Some(compact.revision.clone()), ..args }, "root").unwrap();
+        assert!(unchanged.unchanged);
+        assert!(unchanged.agents.is_empty() && unchanged.typed_tasks.is_empty());
+        let mut full = snapshot();
+        full.apply_view(&ListAgentsArgs { path_prefix: None, compact: false, since_revision: Some(compact.revision) }, "root").unwrap();
+        assert!(!full.unchanged, "changing view requires a replacement snapshot");
+        assert_eq!(full.agents[0].last_task_message, snapshot().agents[0].last_task_message);
+        assert!(serde_json::to_vec(&full).unwrap().len() > serde_json::to_vec(&unchanged).unwrap().len() * 4);
+    }
+
+    #[test]
+    fn changes_deletions_attempts_leases_and_required_actions_invalidate_display_identity() {
+        let mut original = snapshot();
+        let args = || ListAgentsArgs { path_prefix: None, compact: true, since_revision: None };
+        original.apply_view(&args(), "root").unwrap();
+        for change in 0..6 {
+            let mut changed = snapshot();
+            match change {
+                0 => changed.agents.clear(),
+                1 => changed.agents[0].agent_status = AgentStatus::Completed(Some("new answer".into())),
+                2 => changed.typed_tasks[0]["attempt_id"] = json!("attempt-two"),
+                3 => changed.typed_tasks[0]["workspace_status"]["lease_state"] = json!("expired"),
+                4 => changed.typed_tasks[0]["workspace_status"]["next_required_action"] = json!("repair failure"),
+                _ => changed.unresolved_descendants.push(("/another".into(), "new delivery failure".into())),
+            }
+            changed.apply_view(&ListAgentsArgs { since_revision: Some(original.revision.clone()), ..args() }, "root").unwrap();
+            assert!(!changed.unchanged, "change {change} must return a complete replacement");
+        }
+        for (root, prefix) in [("other root", None), ("root", Some("/worker".into()))] {
+            let mut scoped = snapshot();
+            scoped.apply_view(&ListAgentsArgs { path_prefix: prefix, since_revision: Some(original.revision.clone()), ..args() }, root).unwrap();
+            assert!(!scoped.unchanged);
+        }
     }
 }

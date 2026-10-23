@@ -6,10 +6,15 @@ use serde_json::Value;
 use super::RuntimeState;
 use super::value::json_to_v8;
 
-const PROJECTOR: &str = r#"((isProxy) => {
+const PROJECTOR: &str = r#"((isProxy, boxedKind) => {
   const stringify = JSON.stringify;
   const parse = JSON.parse;
   const rawJSON = JSON.rawJSON;
+  const isRawJSON = JSON.isRawJSON;
+  const NativeString = String;
+  const booleanValue = Function.prototype.call.bind(Boolean.prototype.valueOf);
+  const isArray = Array.isArray;
+  const charCodeAt = Function.prototype.call.bind(String.prototype.charCodeAt);
   const NativeError = Error;
   const toBigInt = BigInt;
   const isSafeInteger = Number.isSafeInteger;
@@ -33,18 +38,22 @@ const PROJECTOR: &str = r#"((isProxy) => {
   // before changing a key; display overflow uses canonical cell-output custody.
   function canonicalError(error, display = false) {
     const active = new Set();
+    const completed = new WeakMap();
     function clone(value, depth = 0) {
       if (typeof value === 'function' || typeof value === 'symbol')
         throw new TypeError('Unsupported canonical error evidence value');
       if (value === null || typeof value !== 'object') return value;
       if (depth >= 128 || isProxy(value) || active.has(value))
         throw new TypeError('Canonical error evidence is cyclic, proxied, or too deep');
+      if (!display && completed.has(value)) return completed.get(value);
       const isError = value instanceof NativeError;
       // Diagnostic causes can be circular or arbitrarily deep. Preserve the
       // graph's complete node/value map while keeping those diagnostics bounded.
       // Canonical transport/storage never accepts this lossy fallback.
-      if (display && depth > 0 && isError)
-        return descriptor(value, 'results') ? canonicalError(value, true) : errorProjection(value);
+      if (display && depth > 0 && isError && !descriptor(value, 'results'))
+        return errorProjection(value);
+      // Nested graph errors share this clone's active/depth guards. Restarting
+      // canonicalError here allowed mutually nested graphs to recurse forever.
       const proto = prototype(value);
       if (!isError && proto !== null && proto !== objectPrototype && proto !== arrayPrototype)
         throw new TypeError('Canonical error evidence must contain plain data');
@@ -64,6 +73,7 @@ const PROJECTOR: &str = r#"((isProxy) => {
           Object.defineProperty(result, key, {value: clone(field.value, depth + 1),
             enumerable: true, writable: true, configurable: true});
         }
+        if (!display) completed.set(value, result);
         return result;
       } finally { active.delete(value); }
     }
@@ -272,6 +282,23 @@ const PROJECTOR: &str = r#"((isProxy) => {
   // Registered results, including ones inside batches, keep their JSON shape
   // in a one-line envelope. Counted text bodies follow in traversal order.
   // Only tool-owned text slots qualify, never arbitrary user JSON strings.
+  function smallerFrame(projected, raw) {
+    // Include all attribution and conservative batch body-index overhead. Raw
+    // bodies contribute the same UTF-8 bytes in both forms; escaped JSON and
+    // added framing differ only in their surrounding representation.
+    const bytes = text => {
+      let size = 0;
+      for (let i = 0; i < text.length; ++i) {
+        const cp = stringCodePointAt(text, i);
+        size += cp < 0x80 ? 1 : cp < 0x800 ? 2 : cp < 0x10000 ? 3 : 4;
+        if (cp > 0xffff) ++i;
+      }
+      return size;
+    };
+    const framedLength = bytes(stringify(raw.envelope)) + raw.texts.reduce((size, body) =>
+      size + bytes(stringify({body: Number.MAX_SAFE_INTEGER, ...body.source})) + 11 + bytes(body.text), 0);
+    return framedLength < bytes(stringify(projected)) ? raw : undefined;
+  }
   function rawText(projected, fragment, source = projected) {
     if (fragment) {
       const raw = rawText({results: fragment === 'rows' ? projected : [projected]}, undefined, source);
@@ -286,11 +313,11 @@ const PROJECTOR: &str = r#"((isProxy) => {
       if (!escapes(output)) return undefined;
       const text_lines = lineCount(output);
       envelope.output_lines = text_lines;
-      return {envelope, texts: [{text: output, source: {
+      return smallerFrame(projected, {envelope, texts: [{text: output, source: {
         path: source.path, artifact_id: source.artifact_id,
         session_id: source.session_id, chunk_id: source.chunk_id, field: 'output',
         text_lines,
-      }}]};
+      }}]});
     }
     if (Array.isArray(projected.results) && !('output' in projected)) {
       const texts = [];
@@ -323,7 +350,8 @@ const PROJECTOR: &str = r#"((isProxy) => {
       // Standalone registered rows have no parent envelope. Even a short or
       // empty body needs its trusted source label, not just its text/range.
       if (!texts.some(body => escapes(body.text)) && source === projected) return undefined;
-      return {envelope: {...projected, results}, texts};
+      const raw = {envelope: {...projected, results}, texts};
+      return source === projected ? smallerFrame(projected, raw) : raw;
     }
     if (Array.isArray(projected.content)) {
       const texts = [];
@@ -344,6 +372,70 @@ const PROJECTOR: &str = r#"((isProxy) => {
       return {envelope, texts};
     }
     return undefined;
+  }
+  const budgetExceeded = new NativeError('Canonical JSON byte budget exceeded');
+  function canonicalReplacer(maxBytes) {
+    let remaining = maxBytes, root = true;
+    const parents = [];
+    const take = bytes => {
+      if (bytes > remaining) throw budgetExceeded;
+      remaining -= bytes;
+    };
+    const stringBytes = (text, quoted) => {
+      if (quoted) take(2);
+      // Every UTF-16 code unit needs at least one encoded byte. Reject a giant
+      // primitive before allocating another escaped copy of it.
+      if (text.length > remaining) throw budgetExceeded;
+      for (let i = 0; i < text.length; ++i) {
+        const cp = charCodeAt(text, i);
+        if (quoted && (cp === 34 || cp === 92)) take(2);
+        else if (quoted && cp < 32)
+          take([8, 9, 10, 12, 13].includes(cp) ? 2 : 6);
+        else if (cp < 128) take(1);
+        else if (cp < 2048) take(2);
+        else if (cp >= 0xd800 && cp <= 0xdfff) {
+          const next = charCodeAt(text, i + 1);
+          if (cp <= 0xdbff && next >= 0xdc00 && next <= 0xdfff) {
+            take(4); ++i;
+          } else take(quoted ? 6 : 3);
+        } else take(3);
+      }
+    };
+    return function bounded(key, item) {
+      if (typeof item === 'bigint') {
+        if (item < -9223372036854775808n || item > 18446744073709551615n)
+          throw new RangeError('BigInt exceeds the exact JSON integer transport range');
+        item = rawJSON(item.toString());
+      }
+      // JSON unboxes these after its replacer. Do that once at the same point,
+      // so custom coercions are neither repeated nor omitted by accounting.
+      if (item !== null && typeof item === 'object') {
+        // Native brand checks neither invoke proxy traps nor depend on a
+        // wrapper retaining its original prototype.
+        const kind = boxedKind(item);
+        if (kind === 1) item = +item;
+        else if (kind === 2) item = NativeString(item);
+        else if (kind === 3) item = booleanValue(item);
+      }
+      while (parents.length && parents[parents.length - 1].value !== this) parents.pop();
+      const parent = parents[parents.length - 1];
+      const omitted = item === undefined || typeof item === 'function' || typeof item === 'symbol';
+      if (omitted && !parent?.array) { root = false; return item; }
+      if (!root && parent) {
+        if (parent.count++) take(1);
+        if (!parent.array) { stringBytes(key, true); take(1); }
+      }
+      root = false;
+      if (omitted || item === null) take(4);
+      else if (typeof item === 'string') stringBytes(item, true);
+      else if (typeof item === 'number' || typeof item === 'boolean') take(stringify(item).length);
+      else if (isRawJSON(item)) stringBytes(item.rawJSON, false);
+      else {
+        take(2);
+        parents.push({value: item, array: isArray(item), count: 0});
+      }
+      return item;
+    };
   }
   return function project(value, original, projected, sourceFragments) {
     // Only the native store/load callbacks can export/import this metadata.
@@ -407,7 +499,7 @@ const PROJECTOR: &str = r#"((isProxy) => {
     }
     // The transport codec shares this cell-owned, captured serializer, not
     // script-overridable JSON methods. BigInt never silently becomes Number.
-    if (arguments.length === 2) {
+    if (arguments.length === 2 || (arguments.length === 3 && original === 'canonical')) {
       if (original === 'helper_evidence') {
         // Only used after full uncaught-helper serialization fails or exceeds
         // the cell error limit. Give every settled node its own small budget;
@@ -431,6 +523,10 @@ const PROJECTOR: &str = r#"((isProxy) => {
       const previous = canonicalSerialization;
       if (original === 'canonical') canonicalSerialization = true;
       try {
+        if (arguments.length === 3 && original === 'canonical') {
+          try { return stringify(value, canonicalReplacer(projected)); }
+          catch (error) { if (error === budgetExceeded) return null; throw error; }
+        }
         return stringify(value, (_key, item) => {
           if (typeof item !== 'bigint') return item;
           if (item < -9223372036854775808n || item > 18446744073709551615n)
@@ -470,6 +566,8 @@ const PROJECTOR: &str = r#"((isProxy) => {
     // Both caches die with this serialization. No cross-call provenance,
     // freshness, or mutation decisions are cached.
     let fragmentCache, framedBodies;
+    const equalBodies = new Map();
+    let internedChars = 0;
     const append = (raw, owner) => {
       if (raw.texts.every(body => body.text.length < 512)) {
         texts.push(...raw.texts);
@@ -479,13 +577,20 @@ const PROJECTOR: &str = r#"((isProxy) => {
       let previous = framedBodies.get(owner);
       if (!previous) framedBodies.set(owner, previous = []);
       raw.texts.forEach((body, index) => {
-        const first = previous[index];
-        // Only repeated presentations of the same registered object qualify.
-        // Keep small bodies inline, and retain each observation's source label.
+        const first = previous[index] ?? (roots ? equalBodies.get(body.text) : undefined);
+        // Exact string-key equality shares rendering, never source identity.
+        // Content interning is restricted to inert packets and bounded below;
+        // all source labels and the existing mutation opt-outs remain intact.
         if (first !== undefined && body.text.length >= 512 && texts[first].text === body.text) {
           texts.push({...body, same_as_body: first + 1});
         } else {
           previous[index] = texts.length;
+          if (roots && body.text.length >= 512 && equalBodies.size < 1024 &&
+              internedChars + body.text.length <= 4 * 1024 * 1024 &&
+              !equalBodies.has(body.text)) {
+            equalBodies.set(body.text, texts.length);
+            internedChars += body.text.length;
+          }
           texts.push(body);
         }
       });
@@ -557,6 +662,24 @@ fn is_proxy_callback(
     retval.set_bool(args.get(0).is_proxy());
 }
 
+fn boxed_value_kind_callback(
+    _scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments,
+    mut retval: v8::ReturnValue<v8::Value>,
+) {
+    let value = args.get(0);
+    let kind = if value.is_number_object() {
+        1
+    } else if value.is_string_object() {
+        2
+    } else if value.is_boolean_object() {
+        3
+    } else {
+        0
+    };
+    retval.set_int32(kind);
+}
+
 pub(super) fn prepare(
     scope: &mut v8::PinScope<'_, '_>,
 ) -> Result<v8::Global<v8::Function>, String> {
@@ -568,9 +691,11 @@ pub(super) fn prepare(
         .ok_or_else(|| "failed to install output projector".to_string())?;
     let is_proxy = v8::Function::new(scope, is_proxy_callback)
         .ok_or_else(|| "failed to install proxy guard".to_string())?;
+    let boxed_kind = v8::Function::new(scope, boxed_value_kind_callback)
+        .ok_or_else(|| "failed to install JSON wrapper brand checks".to_string())?;
     let receiver = v8::undefined(scope).into();
     let function = factory
-        .call(scope, receiver, &[is_proxy.into()])
+        .call(scope, receiver, &[is_proxy.into(), boxed_kind.into()])
         .and_then(|value| v8::Local::<v8::Function>::try_from(value).ok())
         .ok_or_else(|| "failed to initialize output projector".to_string())?;
     Ok(v8::Global::new(scope, function))
@@ -646,6 +771,21 @@ pub(super) fn json_codec<'s>(
     function.call(scope, receiver, &[value, mode.into()])
 }
 
+pub(super) fn bounded_json_codec<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    value: v8::Local<'_, v8::Value>,
+    max_bytes: usize,
+) -> Option<v8::Local<'s, v8::Value>> {
+    let function = scope
+        .get_slot::<RuntimeState>()
+        .and_then(|state| state.output_projector.as_ref())
+        .map(|function| v8::Local::new(scope, function))?;
+    let receiver = v8::undefined(scope).into();
+    let mode = v8::String::new(scope, "canonical")?;
+    let limit = v8::Number::new(scope, max_bytes as f64);
+    function.call(scope, receiver, &[value, mode.into(), limit.into()])
+}
+
 pub(super) fn capture_stored_presentation(
     scope: &mut v8::PinScope<'_, '_>,
     value: v8::Local<'_, v8::Value>,
@@ -682,6 +822,36 @@ mod tests {
     use serde_json::json;
 
     #[tokio::test]
+    async fn mutually_nested_graph_errors_share_the_canonical_cycle_guard() {
+        let (event_tx, mut rx) = mpsc::unbounded_channel();
+        let request = ExecuteRequest {
+            state_path: None, tool_call_id: "cyclic-graphs".into(), enabled_tools: vec![].into(),
+            source: r#"
+                const left = new Error('left'), right = new Error('right');
+                left.results = {peer: right}; right.results = {peer: left};
+                let rejected = false;
+                try { JSON.stringify(left); } catch (error) {
+                    if (error.name !== 'TypeError' || !error.message.includes('cyclic')) throw error;
+                    rejected = true;
+                }
+                if (!rejected) throw Error('canonical cyclic graph must be rejected');
+            "#.into(),
+            yield_time_ms: None, max_output_tokens: None, default_tool_timeout_ms: None,
+        };
+        let (_tx, _termination) = spawn_runtime(HashMap::new(), request, 60_000, event_tx,
+            Arc::new(OutputAdmission::new(MAX_BUFFERED_OUTPUT_BYTES)), None).await.unwrap();
+        loop {
+            match tokio::time::timeout(Duration::from_secs(10), rx.recv()).await.unwrap().unwrap() {
+                RuntimeEvent::Started => {},
+                RuntimeEvent::Result { error_text, output_loss, .. } => {
+                    assert_eq!(error_text, None); assert_eq!(output_loss, None); break;
+                }
+                other => panic!("unexpected runtime event {other:?}"),
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn critical_path_escape_and_line_count_preserve_native_results() {
         for output in [
             "unescaped λ😀",
@@ -702,6 +872,7 @@ mod tests {
                     description: "".into(),
                     input_schema: None,
                     output_schema: None,
+                    namespace_description: None,
                     default_timeout_ms: None,
                 }]
                 .into(),
@@ -803,6 +974,7 @@ mod tests {
                 description: "".into(),
                 input_schema: None,
                 output_schema: None,
+                namespace_description: None,
                 default_timeout_ms: None,
             }]
             .into(),
@@ -883,16 +1055,16 @@ mod tests {
         let raw = json!({"path":"src/lib.rs","artifact_id":"snapshot","source_sha256":"hash",
             "complete":false, "results":[
                 {"selector":{"kind":"lines","start":1,"end":1},"status":"ok","complete":true,
-                    "text":"alpha"},
+                    "text":"alpha\n".repeat(400)},
                 {"selector":{"kind":"lines","start":2,"end":9},"status":"ok","complete":false,
-                    "text":"second \"line\"\n"}]});
+                    "text":"second \"line\"\n".repeat(400)}]});
         let (events, mut rx) = mpsc::unbounded_channel();
         let request = ExecuteRequest {
             state_path: None, tool_call_id: "label-provenance".into(),
             enabled_tools: vec![ToolDefinition {
                 name: "read_file".into(), tool_name: ToolName::plain("read_file"),
                 kind: CodeModeToolKind::Function, description: "".into(),
-                input_schema: None, output_schema: None, default_timeout_ms: None,
+                input_schema: None, output_schema: None, namespace_description: None, default_timeout_ms: None,
             }].into(),
             source: "const r = await tools.read_file({}); text(r); text(r.results[0]); text([r.results[0], r.results[1]]);".into(),
             yield_time_ms: None, max_output_tokens: None, default_tool_timeout_ms: None,
@@ -975,10 +1147,52 @@ mod tests {
             (&raw["path"], &raw["artifact_id"])
         );
         assert_eq!(fragment[0]["source_sha256"], "hash");
-        assert!(printed[1].ends_with("alpha"));
+        assert!(printed[1].ends_with("alpha\n"));
         let batch = labels(&printed[2]);
         assert_eq!(batch.len(), 2);
         assert!(batch.iter().all(|label| label["artifact_id"] == "snapshot"));
+    }
+
+    #[tokio::test]
+    async fn audit150_raw_command_framing_never_grows_the_outer_result() {
+        for (body, profitable) in [("ok".to_string(),false),
+            ("x".repeat(3000),false), ("quoted \"value\"\n".repeat(400),true)]
+        {
+            let raw=json!({"exit_code":0,"output":body});
+            let (events,mut rx)=mpsc::unbounded_channel();
+            let request=ExecuteRequest {
+                state_path:None,tool_call_id:"audit150-framing".into(),
+                enabled_tools:vec![ToolDefinition {name:"exec_command".into(),
+                    tool_name:ToolName::plain("exec_command"),kind:CodeModeToolKind::Function,
+                    description:"".into(),input_schema:None,output_schema:None,namespace_description: None, default_timeout_ms:None}].into(),
+                source:"const r = await tools.exec_command({}); text(r); text([r]);".into(),
+                yield_time_ms:None,max_output_tokens:None,default_tool_timeout_ms:None,
+            };
+            let (tx,_termination)=spawn_runtime(HashMap::new(),request,60_000,events,
+                Arc::new(OutputAdmission::new(MAX_BUFFERED_OUTPUT_BYTES)),None).await.unwrap();
+            let mut printed=Vec::new();
+            loop {
+                match tokio::time::timeout(Duration::from_secs(10),rx.recv()).await.unwrap().unwrap() {
+                    RuntimeEvent::Started=>{},
+                    RuntimeEvent::ToolCall{id,..}=>tx.send(RuntimeCommand::ToolResponse{id,result:raw.clone()}).unwrap(),
+                    RuntimeEvent::ContentItem{item:FunctionCallOutputContentItem::InputText{text},..}=>printed.push(text),
+                    RuntimeEvent::Result{error_text,output_loss,..}=>{
+                        assert_eq!(error_text,None);assert_eq!(output_loss,None);break;
+                    },
+                    other=>panic!("unexpected event {other:?}"),
+                }
+            }
+            assert_eq!(printed.len(),2);
+            for (actual,expected) in printed.iter().zip([raw.clone(),json!([raw])]) {
+                assert!(actual.len()<=expected.to_string().len(),"{actual}");
+                if profitable {
+                    assert!(actual.contains(&body));
+                    assert!(actual.contains("[source "));
+                } else {
+                    assert_eq!(serde_json::from_str::<Value>(actual).unwrap(),expected);
+                }
+            }
+        }
     }
 
     #[tokio::test]
@@ -1000,6 +1214,7 @@ mod tests {
                     description: String::new().into(),
                     input_schema: None,
                     output_schema: None,
+                    namespace_description: None,
                     default_timeout_ms: None,
                 }]
                 .into(),
@@ -1143,6 +1358,7 @@ mod tests {
                     description: String::new().into(),
                     input_schema: None,
                     output_schema: None,
+                    namespace_description: None,
                     default_timeout_ms: None,
                 }]
                 .into(),
@@ -1287,7 +1503,7 @@ mod tests {
             enabled_tools: vec![ToolDefinition {
                 name:"exec_command".into(), tool_name:ToolName::plain("exec_command"),
                 kind:CodeModeToolKind::Function, description:"".into(), input_schema:None,
-                output_schema:None, default_timeout_ms:None,
+                output_schema:None, namespace_description: None, default_timeout_ms:None,
             }].into(),
             source:r#"
                 const r = await tools.exec_command({});
@@ -1404,6 +1620,7 @@ mod tests {
                     description: "".into(),
                     input_schema: None,
                     output_schema: None,
+                    namespace_description: None,
                     default_timeout_ms: None,
                 }]
                 .into(),
@@ -1552,6 +1769,11 @@ mod tests {
             ),
         ] {
             let (event_tx, mut rx) = mpsc::unbounded_channel();
+            let second_observation = if fixture == "search" {
+                format!("await tools.{name}({{}})")
+            } else {
+                "r".to_string()
+            };
             let request = ExecuteRequest {
                 state_path: None,
                 tool_call_id: "raw-projection".into(),
@@ -1562,11 +1784,12 @@ mod tests {
                     description: "".into(),
                     input_schema: None,
                     output_schema: None,
+                    namespace_description: None,
                     default_timeout_ms: None,
                 }]
                 .into(),
                 source: format!(
-                    "const r = await tools.{name}({{}}); text(r); text({{part:7, results:[r,r]}}); store('raw', r); if(r.results){{text(r.results); text(r.results[0]); if(r.results[0].value?.hydrated_ranges) text(r.results[0].value.hydrated_ranges); text(JSON.parse(JSON.stringify(r.results)));}} r.extra = 1; text(r); if(r.results) text(r.results);"
+                    "const r = await tools.{name}({{}}); text(r); text({{part:7, results:[r,{second_observation}]}}); store('raw', r); if(r.results){{text(r.results); text(r.results[0]); if(r.results[0].value?.hydrated_ranges) text(r.results[0].value.hydrated_ranges); text(JSON.parse(JSON.stringify(r.results)));}} r.extra = 1; text(r); if(r.results) text(r.results);"
                 ),
                 yield_time_ms: None,
                 max_output_tokens: None,
@@ -1782,6 +2005,7 @@ mod tests {
                     description: "".into(),
                     input_schema: None,
                     output_schema: None,
+                    namespace_description: None,
                     default_timeout_ms: None,
                 }]
                 .into(),

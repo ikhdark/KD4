@@ -10,5 +10,6 @@ exclude = [
     "codex-rs/target-*/**",
     ".kda/**",
     "codex-rs/.kda/**",
+    ".codex/audits/**",
     "third_party/**",
 ]

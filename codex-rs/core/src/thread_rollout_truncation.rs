@@ -403,7 +403,10 @@ pub fn truncate_rollout_after_turn_id(
 /// Checkpoints in the suffix must be cut at that same boundary, not allowed to
 /// replace the child history with the parent's excluded prefix. If the boundary
 /// is no longer identifiable, refuse the fork rather than lose checkpoint-only
-/// content or silently restore excluded turns.
+/// content or silently restore excluded turns. A checkpoint's handoff state
+/// (a local summary or opaque provider checkpoint) is its only record of the
+/// retained turns' summarized work, so it survives the cut wherever the
+/// checkpoint placed it.
 pub(crate) fn truncate_rollout_to_last_n_fork_turns(
     items: &[RolloutItem],
     n_from_end: usize,
@@ -487,7 +490,11 @@ pub(crate) fn truncate_rollout_to_last_n_fork_turns(
             let mut index = 0;
             history.retain(|item| {
                 // Source-integrity diagnostics are global, not excluded turns.
-                let keep = index >= start || codex_rollout::is_rollout_reconstruction_notice(item);
+                // Local compaction inserts its handoff before the retained task
+                // input; dropping it would erase the retained turns' work.
+                let keep = index >= start
+                    || codex_rollout::is_rollout_reconstruction_notice(item)
+                    || is_checkpoint_handoff(item);
                 index += 1;
                 keep
             });
@@ -501,6 +508,16 @@ fn is_real_user_message_boundary(item: &ResponseItem) -> bool {
         event_mapping::parse_turn_item(item),
         Some(TurnItem::UserMessage(_))
     )
+}
+
+/// Checkpoint-only handoff state. A summary is recognized by its harness-owned
+/// ID and prefix, never by text alone, so a user message cannot claim it.
+fn is_checkpoint_handoff(item: &ResponseItem) -> bool {
+    crate::compact::is_compaction_summary_item(item)
+        || matches!(
+            item,
+            ResponseItem::Compaction { .. } | ResponseItem::ContextCompaction { .. }
+        )
 }
 
 #[cfg(test)]

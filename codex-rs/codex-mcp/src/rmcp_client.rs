@@ -400,27 +400,33 @@ impl ManagedClientStartup {
                     });
                 }
 
-                let client = Arc::new(
-                    make_rmcp_client(
-                        &server_name,
-                        codex_home,
-                        server.clone(),
-                        store_mode,
-                        keyring_backend_kind,
-                        runtime_context,
-                        runtime_auth_provider,
-                    )
-                    .await?,
-                );
+                let startup_timeout = server
+                    .configured_config()
+                    .and_then(|config| config.startup_timeout_sec)
+                    .unwrap_or(DEFAULT_STARTUP_TIMEOUT);
+                let constructor_server_name = server_name.clone();
+                let constructor_server = server.clone();
+                let (client, remaining_startup_timeout) =
+                    construct_with_startup_budget(startup_timeout, async move {
+                        make_rmcp_client(
+                            &constructor_server_name,
+                            codex_home,
+                            constructor_server,
+                            store_mode,
+                            keyring_backend_kind,
+                            runtime_context,
+                            runtime_auth_provider,
+                        )
+                        .await
+                    })
+                    .await?;
+                let client = Arc::new(client);
                 start_server_task(
                     server_name,
                     client,
                     StartServerTaskParams {
                         is_codex_apps_mcp_server,
-                        startup_timeout: server
-                            .configured_config()
-                            .and_then(|config| config.startup_timeout_sec)
-                            .or(Some(DEFAULT_STARTUP_TIMEOUT)),
+                        startup_timeout: Some(remaining_startup_timeout),
                         tool_timeout: server
                             .configured_config()
                             .and_then(|config| config.tool_timeout_sec)
@@ -1216,6 +1222,33 @@ fn advance_tool_catalog_revision_if_changed(
     }
 }
 
+/// Construction may already own blocking credential I/O or a remote process
+/// launch. Bound its observer without cancelling that admitted owner: a late
+/// result is dropped (and its transport cleaned up), never initialized.
+async fn construct_with_startup_budget<T, F>(
+    budget: Duration,
+    constructor: F,
+) -> Result<(T, Duration), StartupOutcomeError>
+where
+    T: Send + 'static,
+    F: Future<Output = Result<T, StartupOutcomeError>> + Send + 'static,
+{
+    let deadline = TokioInstant::now() + budget;
+    let owner = tokio::spawn(constructor);
+    let client = tokio::time::timeout_at(deadline, owner)
+        .await
+        .map_err(|_| StartupOutcomeError::Failed {
+            error: format!("MCP client construction exceeded startup timeout of {budget:?}"),
+            is_authentication_required: false,
+            is_timeout: true,
+        })?
+        .map_err(|error| StartupOutcomeError::from(anyhow!(error)))??;
+    Ok((
+        client,
+        deadline.saturating_duration_since(TokioInstant::now()),
+    ))
+}
+
 #[instrument(level = "trace", skip_all, fields(server_name = %server_name))]
 async fn start_server_task(
     server_name: String,
@@ -1487,6 +1520,53 @@ mod tests {
     use rmcp::transport::auth::AuthError;
     use std::collections::VecDeque;
     use std::sync::atomic::AtomicUsize;
+
+    #[tokio::test(start_paused = true)]
+    async fn constructor_consumes_the_initialize_startup_budget() {
+        let (value, remaining) = construct_with_startup_budget(Duration::from_millis(100), async {
+            tokio::time::sleep(Duration::from_millis(40)).await;
+            Ok(7)
+        })
+        .await
+        .unwrap();
+        assert_eq!(value, 7);
+        assert_eq!(remaining, Duration::from_millis(60));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn constructor_timeout_keeps_late_result_cleanup_owned() {
+        struct LateClient(Arc<AtomicUsize>, Option<tokio::sync::oneshot::Sender<()>>);
+        impl Drop for LateClient {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                if let Some(signal) = self.1.take() {
+                    let _ = signal.send(());
+                }
+            }
+        }
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let late_dropped = Arc::clone(&dropped);
+        let (cleaned, cleanup) = tokio::sync::oneshot::channel();
+        let (release, wait) = tokio::sync::oneshot::channel();
+        let result = construct_with_startup_budget(Duration::from_millis(50), async move {
+            let _ = wait.await;
+            Ok(LateClient(late_dropped, Some(cleaned)))
+        })
+        .await;
+        assert!(matches!(
+            result,
+            Err(StartupOutcomeError::Failed {
+                is_timeout: true,
+                ..
+            })
+        ));
+        release.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), cleanup)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(dropped.load(Ordering::SeqCst), 1);
+    }
 
     #[test]
     fn startup_outcome_error_identifies_authentication_required() {

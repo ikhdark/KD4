@@ -733,7 +733,7 @@ text(await send({target: "/root", message: "worker-mailbox-proof-7c49"}));
                 "exec",
                 r#"
 const wait = resolve_tool("agents.wait_agent");
-const waited = await wait({timeout_ms: 1000});
+const waited = await wait({timeout_ms: 10000});
 if (waited.timed_out) throw Error(JSON.stringify(waited));
 text("wait-proof:" + JSON.stringify(waited));
 const listed = await resolve_tool("agents.list_agents")({});

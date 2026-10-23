@@ -420,7 +420,9 @@ def summarize(records):
     reused = [row for row in rows if row["mode"] == "reused"]
     if len(executed) + len(reused) + len(requests) != len(rows):
         raise ValueError("mode must be executed or reused")
-    commands = [command for row in executed for command in row["commands"]]
+    # Lane envelopes may directly own Cargo rather than delegate to a runner.
+    # Their explicit leaf rows count once; their lifecycle stays an envelope.
+    commands = [command for row in [*executed, *requests] for command in row["commands"]]
     work = {"lifecycle": _sum_known(row["lifecycle_seconds"] for row in executed)}
     # Parent envelopes contain inner runner time. Never add the two as elapsed.
     work["request_lifecycle"] = _sum_known(
@@ -549,7 +551,7 @@ def summarize(records):
     )
     return {
         "schema_version": 1,
-        "launches": len(executed),
+        "launches": len(executed) + sum(bool(row["commands"]) for row in requests),
         "reuse_decisions": len(reused),
         "requests": len(requests),
         "request_outcomes": dict(
@@ -557,7 +559,9 @@ def summarize(records):
         ),
         "child_commands": len(commands),
         "duplicate_records": duplicates,
-        "outcomes": dict(sorted(Counter(row["outcome"] for row in executed).items())),
+        "outcomes": dict(sorted(Counter(
+            row["outcome"] for row in [*executed, *(row for row in requests if row["commands"])]
+        ).items())),
         "work": work,
         "proof_freshness": dict(sorted(proof_states.items())),
         "launches_producing_current_proof": new_current_proof,

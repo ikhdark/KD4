@@ -68,6 +68,10 @@ pub(crate) struct PlanLineage {
     /// replacing, resolving or completing every displayed step.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub(crate) acceptance: BTreeMap<String, acceptance::AcceptanceObligation>,
+    /// Fulfilled prior task scope, not current proof or new-turn debt. IDs and
+    /// immutable contracts remain reserved; explicit reviewed updates reopen them.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub(crate) acceptance_history: BTreeMap<String, acceptance::AcceptanceObligation>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) acceptance_reviewed_revision: Option<String>,
 }
@@ -235,6 +239,7 @@ impl PlanLineage {
             && self.step_revisions.is_empty()
             && self.accepted_supersessions.is_empty()
             && self.acceptance.is_empty()
+            && self.acceptance_history.is_empty()
             && self.acceptance_reviewed_revision.is_none()
     }
 
@@ -245,6 +250,11 @@ impl PlanLineage {
         let mut references = HashMap::<&str, usize>::new();
         for ids in self.step_requirements.values() {
             for id in ids {
+                *references.entry(id.as_str()).or_default() += 1;
+            }
+        }
+        for obligation in self.acceptance.values() {
+            for id in &obligation.plan_requirement_ids {
                 *references.entry(id.as_str()).or_default() += 1;
             }
         }
@@ -273,12 +283,19 @@ impl PlanLineage {
     /// Prompt projection only. Durable snapshots retain the full audit history.
     pub(crate) fn active_for_plan(&self, plan: &UpdatePlanArgs) -> Self {
         let mut active = self.compact_for_plan(plan);
-        let mapped = active
+        active.acceptance_history.clear();
+        let mut mapped = active
             .step_requirements
             .values()
             .flatten()
             .cloned()
             .collect::<HashSet<_>>();
+        mapped.extend(
+            active
+                .acceptance
+                .values()
+                .flat_map(|obligation| obligation.plan_requirement_ids.iter().cloned()),
+        );
         active.requirements.retain(|id, requirement| {
             (!active.accepted_supersessions.contains_key(id)
                 && (requirement.status != StepStatus::Completed
@@ -920,7 +937,8 @@ impl PlanStore {
                 &self
                     .acceptance_evidence
                     .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .for_obligations(&current.lineage.acceptance),
             )
     }
 
@@ -1034,10 +1052,7 @@ impl PlanStore {
     }
 
     /// Prepare an update without publishing the plan or its revision.
-    pub(crate) async fn stage_tool(
-        &self,
-        args: PlanToolArgs,
-    ) -> Result<StagedPlanUpdate<'_>, String> {
+    pub(crate) async fn stage_tool(&self, args: PlanToolArgs) -> Result<StagedPlanUpdate<'_>, String> {
         let PlanToolArgs {
             explanation,
             expected_revision,
@@ -1153,9 +1168,35 @@ impl PlanStore {
                 );
             }
             for (id, obligation) in updates {
-                let retained_origin = lineage
-                    .acceptance
-                    .get(&id)
+                match &obligation.requirement {
+                    acceptance::EvidenceRequirement::Inspection { environment_id, path, .. }
+                    | acceptance::EvidenceRequirement::Validation { environment_id, path, .. }
+                        if environment_id.trim().is_empty() || path.trim().is_empty() => {
+                        return Err("acceptance requires nonempty environment_id and path; no changes were made".into());
+                    }
+                    acceptance::EvidenceRequirement::Inspection { start, end, .. } if start >= end => {
+                        return Err(
+                            "inspection acceptance requires start < end; no changes were made".into(),
+                        );
+                    }
+                    acceptance::EvidenceRequirement::Validation {
+                        test_execution,
+                        required_tests,
+                        ..
+                    } if (!required_tests.is_empty() && !test_execution)
+                        || required_tests.iter().any(|test| {
+                            test.binary.trim().is_empty()
+                                || test.test.trim().is_empty()
+                                || test.helpers.iter().any(|helper| helper.trim().is_empty())
+                                || test.helpers.windows(2).any(|pair| pair[0] >= pair[1])
+                        }) =>
+                    {
+                        return Err("required_tests needs test_execution and nonempty exact runner identities; no changes were made".into());
+                    }
+                    _ => {}
+                }
+                let retained_origin = lineage.acceptance.get(&id)
+                    .or_else(|| lineage.acceptance_history.get(&id))
                     .is_some_and(|previous| previous.origin == obligation.origin);
                 if obligation.text.trim().is_empty()
                     || (!retained_origin && !input.references().contains(&obligation.origin))
@@ -1165,6 +1206,7 @@ impl PlanStore {
                     );
                 }
                 if let Some(previous) = lineage.acceptance.get(&id)
+                    .or_else(|| lineage.acceptance_history.get(&id))
                     && (previous.text != obligation.text
                         || previous.origin != obligation.origin
                         || !previous.requirement.same_contract(&obligation.requirement))
@@ -1179,16 +1221,14 @@ impl PlanStore {
                             .is_none_or(|reason| reason.trim().is_empty()))
                 {
                     return Err(
-                        "retiring acceptance requires reconciled accepted input and a reason"
-                            .into(),
+                        "retiring acceptance requires reconciled accepted input and a reason".into(),
                     );
                 }
                 lineage.acceptance.insert(id, obligation);
             }
-            if lineage.acceptance.len() > 128 {
+            if lineage.acceptance.values().filter(|criterion| criterion.retired_by.is_none()).count() > 128 {
                 return Err(
-                    "at most 128 acceptance criteria are supported; split the task explicitly"
-                        .into(),
+                    "at most 128 active acceptance criteria are supported; split the task explicitly".into(),
                 );
             }
         }
@@ -1245,6 +1285,44 @@ impl PlanStore {
             }
             next
         };
+        // Step IDs name presentation rows; readiness, reconciliation and archive
+        // key scope links by the requirement IDs those rows carry.
+        for obligation in lineage.acceptance.values_mut() {
+            if !obligation.plan_requirement_ids.iter().any(|id| {
+                !lineage.requirements.contains_key(id) && lineage.step_requirements.contains_key(id)
+            }) {
+                continue;
+            }
+            let mut ids = Vec::new();
+            for id in std::mem::take(&mut obligation.plan_requirement_ids) {
+                match lineage.step_requirements.get(&id) {
+                    Some(carried) if !lineage.requirements.contains_key(&id) => {
+                        ids.extend(carried.iter().cloned());
+                    }
+                    _ => ids.push(id),
+                }
+            }
+            ids.sort();
+            ids.dedup();
+            obligation.plan_requirement_ids = ids;
+        }
+        for obligation in lineage.acceptance.values() {
+            if obligation.plan_requirement_ids.len() > 128
+                || obligation.plan_requirement_ids.iter().any(|id| {
+                    !lineage.requirements.contains_key(id)
+                        && !lineage
+                            .step_requirements
+                            .values()
+                            .any(|ids| ids.contains(id))
+                        && !next
+                            .plan
+                            .iter()
+                            .any(|step| lineage.step_id(&step.step) == *id)
+                })
+            {
+                return Err("acceptance plan_requirement_ids must name known checklist requirements (at most 128); no changes were made".into());
+            }
+        }
         for (step_id, instruction) in scope_change_instructions {
             let sha256 = hex::encode(Sha256::digest(instruction.as_bytes()));
             let Some(reference) = accepted_input.as_ref().and_then(|input| {
@@ -1259,17 +1337,14 @@ impl PlanStore {
                 .get(&step_id)
                 .is_some_and(|existing| existing != &reference)
             {
-                return Err(
-                    "conflicting scope change text and reference; no changes were made".into(),
-                );
+                return Err("conflicting scope change text and reference; no changes were made".into());
             }
             scope_change_refs.insert(step_id, reference);
         }
         for (step_id, reference) in scope_change_refs {
             if !superseded.iter().any(|entry| entry.step_id == step_id) {
                 return Err(
-                    "scope change sources must name a superseded entry; no changes were made"
-                        .into(),
+                    "scope change sources must name a superseded entry; no changes were made".into(),
                 );
             }
             if !accepted_input.as_ref().is_some_and(|input| {
@@ -1418,7 +1493,10 @@ impl PlanStore {
             ));
         }
         let mut seen = HashSet::new();
+        let mut activated = HashSet::new();
+        let mut by_step_id = false;
         for update in updates {
+            by_step_id |= update.step_id.is_some();
             let index = match (update.index, update.step_id.as_deref()) {
                 (Some(index), None) => index,
                 (None, Some(id)) => {
@@ -1473,16 +1551,22 @@ impl PlanStore {
                     "stale or missing step revision for {id}; current step revision is {version}. Supply expected_step_revisions or expected_revision. No changes were made"
                 ));
             }
+            if update.status == StepStatus::InProgress {
+                activated.insert(index);
+            }
             item.status = update.status;
         }
-        if next
+        let active = next
             .plan
             .iter()
-            .filter(|item| item.status == StepStatus::InProgress)
-            .count()
-            > 1
-        {
-            return Err("update_plan permits at most one in_progress step at a time".to_string());
+            .enumerate()
+            .filter(|(_, item)| item.status == StepStatus::InProgress)
+            .map(|(index, item)| (index, lineage.step_id(&item.step), quoted_step(&item.step)))
+            .collect::<Vec<_>>();
+        if active.len() > 1 {
+            // Never infer that the earlier step finished: completion is the
+            // caller's claim. Name the conflict and the exact repair instead.
+            return Err(in_progress_conflict(&active, &activated, by_step_id));
         }
         if explanation.is_some() {
             next.explanation = explanation;
@@ -1641,13 +1725,56 @@ fn account_for_removed_steps(
     Ok(Some(stored))
 }
 
-fn quoted_step(step: &str) -> String {
+pub(crate) fn quoted_step(step: &str) -> String {
     const MAX_CHARS: usize = 80;
     let mut text = step.chars().take(MAX_CHARS).collect::<String>();
     if step.chars().nth(MAX_CHARS).is_some() {
         text.push_str("...");
     }
     format!("{text:?}")
+}
+
+/// Explains a status update that would leave several steps `in_progress`.
+/// A bare rule statement sent callers into repeated rejected updates, so name
+/// each active step and show the single-call repair.
+fn in_progress_conflict(
+    active: &[(usize, String, String)],
+    activated: &HashSet<usize>,
+    by_step_id: bool,
+) -> String {
+    let keep = active
+        .iter()
+        .map(|(index, _, _)| *index)
+        .find(|index| activated.contains(index))
+        .or_else(|| active.first().map(|(index, _, _)| *index));
+    let mut steps = Vec::with_capacity(active.len());
+    let mut repair = Vec::with_capacity(active.len());
+    for (index, id, step) in active {
+        let origin = if activated.contains(index) {
+            "set by this call"
+        } else {
+            "already in_progress"
+        };
+        steps.push(format!("index {index} {step} (step_id {id}, {origin})"));
+        let status = if Some(*index) == keep {
+            "in_progress"
+        } else if activated.contains(index) {
+            "pending"
+        } else {
+            "completed"
+        };
+        let address = if by_step_id {
+            format!("\"step_id\":\"{id}\"")
+        } else {
+            format!("\"index\":{index}")
+        };
+        repair.push(format!("{{{address},\"status\":\"{status}\"}}"));
+    }
+    format!(
+        "update_plan permits at most one in_progress step at a time; no changes were made. In progress after this update: {}. In the same call, mark each other step completed if it is finished or pending to pause it, for example \"set\":[{}]",
+        steps.join("; "),
+        repair.join(",")
+    )
 }
 
 #[cfg(test)]
@@ -2194,6 +2321,86 @@ mod tests {
             store.accepted_input.lock().unwrap().as_ref().unwrap().0,
             "new"
         );
+    }
+
+    #[tokio::test]
+    async fn second_in_progress_step_is_rejected_with_an_applicable_repair() {
+        // Shape of real rejected calls: step 0 is still in_progress when the
+        // caller starts step 1 without finishing it in the same `set`.
+        for by_step_id in [false, true] {
+            let store = PlanStore::default();
+            let initial = json_update(
+                &store,
+                serde_json::json!({"plan":[
+                    {"step":"Inspect","status":"in_progress"},
+                    {"step":"Fix","status":"pending"},
+                    {"step":"Verify","status":"pending"}
+                ]}),
+            )
+            .await;
+            let inspect = initial.lineage.step_id("Inspect");
+            let fix = initial.lineage.step_id("Fix");
+            let start_fix = if by_step_id {
+                serde_json::json!({"step_id":fix,"status":"in_progress"})
+            } else {
+                serde_json::json!({"index":1,"status":"in_progress"})
+            };
+            let before = store.current_for_test().await;
+            let revision = store.execution_snapshot().await.unwrap().revision;
+            let error = store
+                .update_tool(
+                    serde_json::from_value(serde_json::json!({
+                        "expected_revision": revision, "set":[start_fix]
+                    }))
+                    .unwrap(),
+                )
+                .await
+                .err()
+                .expect("a second in_progress step must be rejected");
+            assert!(error.contains("at most one in_progress"), "{error}");
+            assert!(error.contains("no changes were made"), "{error}");
+            assert!(
+                error.contains(&format!(
+                    "index 0 \"Inspect\" (step_id {inspect}, already in_progress)"
+                )),
+                "{error}"
+            );
+            assert!(
+                error.contains(&format!(
+                    "index 1 \"Fix\" (step_id {fix}, set by this call)"
+                )),
+                "{error}"
+            );
+            assert_eq!(store.current_for_test().await, before);
+            assert_eq!(store.execution_snapshot().await.unwrap().revision, revision);
+
+            // The example uses the caller's addressing and applies as sent.
+            let (_, example) = error.split_once("for example ").expect("repair example");
+            let mut repair: serde_json::Value =
+                serde_json::from_str(&format!("{{{example}}}")).expect("example is JSON");
+            assert_eq!(repair["set"][0].get("step_id").is_some(), by_step_id);
+            repair["expected_revision"] = revision.into();
+            store
+                .update_tool(serde_json::from_value(repair).unwrap())
+                .await
+                .expect("the example repair applies");
+            let statuses = store
+                .current_for_test()
+                .await
+                .expect("plan")
+                .plan
+                .into_iter()
+                .map(|item| item.status)
+                .collect::<Vec<_>>();
+            assert_eq!(
+                statuses,
+                [
+                    StepStatus::Completed,
+                    StepStatus::InProgress,
+                    StepStatus::Pending
+                ]
+            );
+        }
     }
 
     #[tokio::test]

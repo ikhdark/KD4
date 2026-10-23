@@ -124,6 +124,7 @@ async fn verified_validation_reuse_preserves_live_owner_and_rejects_retired_iden
         execution_context: None,
         declared: None,
         receipt_runner: None,
+        admission_runner: None,
         classification: crate::validation::classify_validation(
             &crate::tools::handlers::command_shape::CommandInvocation::Argv {
                 program: "cargo".into(),
@@ -2738,7 +2739,11 @@ async fn assert_remote_startup_failure_closes_command(cancel_during_registration
         serde_json::json!([
             "powershell.exe",
             "-Command",
-            "try { [Console]::OutputEncoding=[System.Text.Encoding]::UTF8 } catch {}\necho registered"
+            format!(
+                "try {{ [Console]::OutputEncoding=[System.Text.Encoding]::UTF8 }} catch {{}}\n{}echo registered{}",
+                codex_shell_command::powershell::NATIVE_EXIT_CODE_PROLOGUE,
+                codex_shell_command::powershell::NATIVE_EXIT_CODE_EPILOGUE,
+            )
         ])
     );
     for _ in 0..if cancel_during_registration { 1 } else { 2 } {
@@ -3012,7 +3017,11 @@ async fn remote_startup_cleanup_failure_retains_native_child_until_session_shutd
         serde_json::json!([
             "powershell.exe",
             "-Command",
-            "try { [Console]::OutputEncoding=[System.Text.Encoding]::UTF8 } catch {}\nStart-Sleep -Seconds 60",
+            format!(
+                "try {{ [Console]::OutputEncoding=[System.Text.Encoding]::UTF8 }} catch {{}}\n{}Start-Sleep -Seconds 60{}",
+                codex_shell_command::powershell::NATIVE_EXIT_CODE_PROLOGUE,
+                codex_shell_command::powershell::NATIVE_EXIT_CODE_EPILOGUE,
+            ),
         ])
     );
     for _ in 0..2 {

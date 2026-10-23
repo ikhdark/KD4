@@ -18,6 +18,7 @@ use codex_protocol::protocol::SkillScope;
 use codex_protocol::user_input::UserInput;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_path_uri::PathUri;
+use futures::StreamExt;
 
 #[derive(Debug, Default)]
 pub struct SkillInjections {
@@ -27,10 +28,42 @@ pub struct SkillInjections {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SkillInjection {
+    /// Owner-bound catalog identity; None retains conservative legacy behavior.
+    pub source_id: Option<String>,
     pub name: String,
     pub path: String,
     pub contents: String,
     pub scope: SkillScope,
+}
+
+fn revision_source_id(skill: &SkillMetadata) -> String {
+    use std::hash::BuildHasher;
+    use std::hash::Hasher;
+    use sha2::Digest;
+    let catalog = crate::model::skill_catalog_id(skill);
+    let Some(source) = &skill.source else { return catalog; };
+    // Catalog locators use Arc addresses and are intentionally not durable
+    // source proof. Add a process-salted lifetime token for revision authority.
+    // Weak owners prevent address reuse while registered, without retaining a
+    // dead filesystem; re-created owners always receive a new generation.
+    type Owner = (std::sync::Weak<dyn codex_exec_server::ExecutorFileSystem>, u64);
+    static OWNERS: std::sync::OnceLock<std::sync::Mutex<Vec<Owner>>> = std::sync::OnceLock::new();
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    static SALT: std::sync::OnceLock<std::collections::hash_map::RandomState> = std::sync::OnceLock::new();
+    let owner = Arc::downgrade(&source.file_system.0);
+    let mut owners = OWNERS.get_or_init(Default::default).lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    owners.retain(|(owner, _)| owner.strong_count() != 0);
+    let generation = if let Some((_, generation)) = owners.iter().find(|(prior, _)| prior.ptr_eq(&owner)) {
+        *generation
+    } else {
+        let generation = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        owners.push((owner, generation)); generation
+    };
+    let mut salted = SALT.get_or_init(Default::default).build_hasher();
+    salted.write_u64(generation); salted.write(catalog.as_bytes());
+    sha2::Sha256::digest(salted.finish().to_be_bytes())[..12]
+        .iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 impl ContextualUserFragment for SkillInjection {
@@ -47,11 +80,18 @@ impl ContextualUserFragment for SkillInjection {
     }
 
     fn body(&self) -> std::borrow::Cow<'_, str> {
+        use sha2::Digest;
+        let identity = self.source_id.as_ref().map(|source| {
+            let revision = sha2::Sha256::digest(self.contents.as_bytes());
+            let revision = revision.iter().map(|byte| format!("{byte:02x}")).collect::<String>();
+            format!("<source_id>{source}</source_id>\n<revision>{revision}</revision>\nThis successful read replaces earlier instructions from this same source_id and authority role only; independent user constraints remain.\n")
+        }).unwrap_or_default();
         std::borrow::Cow::Owned(format!(
-            "\n<name>{}</name>\n<path>{}</path>\n<scope>{}</scope>\n{}\n",
+            "\n<name>{}</name>\n<path>{}</path>\n<scope>{}</scope>\n{}{}\n",
             escape_fragment_text(&self.name),
             escape_fragment_text(&self.path),
             crate::skill_scope_label(self.scope),
+            identity,
             escape_fragment_text(&self.contents)
         ))
     }
@@ -154,6 +194,7 @@ impl InjectedHostSkillPrompts {
                 continue;
             };
             let injection = SkillInjection {
+                source_id: Some(revision_source_id(skill)),
                 name: skill.name.clone(),
                 path: skill.path_to_skills_md.to_string_lossy().into_owned(),
                 contents: body.clone(),
@@ -237,7 +278,11 @@ pub async fn plan_skill_injections_with_resolved(
         metrics: Vec::with_capacity(mentioned_skills.len()),
     };
 
-    for skill in mentioned_skills {
+    // Cold legacy reads share the same bounded, ordered policy as the installed
+    // skills extension. No spawned tasks outlive cancellation of this plan.
+    let mut reads = futures::stream::iter(0..mentioned_skills.len())
+        .map(|index: usize| async move {
+        let skill = &mentioned_skills[index];
         let fs = loaded_skills
             .and_then(|outcome| outcome.file_system_for_skill(skill))
             .unwrap_or_else(|| Arc::clone(&LOCAL_FS));
@@ -257,6 +302,10 @@ pub async fn plan_skill_injections_with_resolved(
                 .await
                 .map_err(|error| error.to_string())
         };
+        (skill, contents)
+        })
+        .buffered(4);
+    while let Some((skill, contents)) = reads.next().await {
         match contents {
             Ok(contents) => {
                 plan.metrics.push(SkillInjectionMetric {
@@ -271,6 +320,7 @@ pub async fn plan_skill_injections_with_resolved(
                     invocation_type: InvocationType::Explicit,
                 });
                 plan.injections.items.push(SkillInjection {
+                    source_id: Some(revision_source_id(skill)),
                     name: skill.name.clone(),
                     path: skill.path_to_skills_md.to_string_lossy().into_owned(),
                     contents,

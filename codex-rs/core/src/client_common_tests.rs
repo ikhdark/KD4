@@ -343,3 +343,22 @@ fn serializes_flex_service_tier_when_set() {
         Some("flex")
     );
 }
+
+#[test]
+fn audit143_lite_admission_projects_each_immutable_source_once() {
+    let mut prompt = prompt_with_image_outputs();
+    prompt.stable_context_fallback_input = Arc::clone(&prompt.input);
+    prompt.tool_history_fallback_input = Arc::clone(&prompt.input);
+    prompt.stable_context_tool_history_fallback_input = Arc::clone(&prompt.input);
+    let lite = prompt.get_formatted_admission_inputs(true);
+    assert_eq!(lite.len(), 1);
+    assert_eq!(lite[0], prompt.get_formatted_input_for_request(true));
+    assert!(has_image_details(&prompt.input), "canonical history must remain unchanged");
+    let normal = prompt.get_formatted_admission_inputs(false);
+    assert_eq!(normal.len(), 1);
+    assert!(Arc::ptr_eq(&normal[0], &prompt.input));
+    prompt.stable_context_fallback_input = Arc::from(prompt.input.to_vec());
+    prompt.tool_history_fallback_input = Arc::from(prompt.input.to_vec());
+    prompt.stable_context_tool_history_fallback_input = Arc::from(prompt.input.to_vec());
+    assert_eq!(prompt.get_formatted_admission_inputs(true).len(), 4);
+}

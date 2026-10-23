@@ -460,6 +460,90 @@ for (const acceptance of [1, "true", {}]) {
     "excluded capability prevented selected work",
   );
 }
+// A malformed node names its position, its ID and the field to fix, before any
+// work starts. `accept` may be omitted, but not replaced by a non-function.
+{
+  let calls = 0;
+  const good = node("good", () => ++calls);
+  for (const [nodes, expected] of [
+    [
+      [good, { id: "fmt", run: () => ++calls, accept: true }],
+      'run_graph node 1 "fmt": accept must be a function',
+    ],
+    [
+      [good, { id: "fmt", accept: () => true }],
+      'run_graph node 1 "fmt": run must be a function',
+    ],
+    [[good, node("good")], 'run_graph node 1 "good": id repeats an earlier'],
+    [[good, null], "run_graph node 1: expected {id, deps?, run, accept?}"],
+    [[good, node("x".repeat(257))], "run_graph node 1: id must be a nonempty"],
+    [
+      [good, node("fmt", undefined, { deps: "good" })],
+      'run_graph node 1 "fmt": deps must be an array',
+    ],
+  ]) {
+    const error = await run_graph(nodes).catch((error) => error);
+    check(
+      error instanceof TypeError && calls === 0,
+      "malformed node started work",
+    );
+    check(
+      error.message.startsWith(expected),
+      `imprecise node shape error: ${error.message}`,
+    );
+  }
+}
+// Without `accept`, command results (each one in an array) must exit 0 and
+// other values pass. Sessions omitted it for plain checks and got shape errors.
+{
+  const passed = await run_graph([
+    { id: "command", run: () => ({ exit_code: 0, output: "ok" }) },
+    {
+      id: "value",
+      deps: ["command"],
+      run: (deps) => deps.command.exit_code + 1,
+    },
+  ]);
+  check(
+    passed.command.status === "fulfilled" && passed.value.value === 1,
+    "default acceptance rejected successful work",
+  );
+  const running = { session_id: 7, execution_state: "running" };
+  let dependent = false;
+  const results = await run_graph([
+    { id: "failed", run: () => ({ exit_code: 2, output: "error" }) },
+    { id: "running", run: () => running },
+    { id: "killed", run: () => ({ exit_code: null, process_exited: true }) },
+    { id: "batch", run: () => [{ exit_code: 0 }, { exit_code: 1 }] },
+    { id: "read", run: () => ({ complete: true, text: "body" }) },
+    {
+      id: "after",
+      deps: ["failed"],
+      run: () => {
+        dependent = true;
+      },
+    },
+  ]).then(
+    () => {
+      throw Error("failed command accepted by default");
+    },
+    (error) => error.results,
+  );
+  check(
+    ["failed", "running", "killed", "batch"].every(
+      (id) =>
+        results[id].status === "rejected" &&
+        results[id].reason === "postcondition failed",
+    ) && results.running.value === running,
+    "default acceptance passed an unsuccessful command or lost its evidence",
+  );
+  check(
+    results.read.status === "fulfilled" &&
+      !dependent &&
+      results.after.status === "skipped",
+    "default acceptance misjudged a plain value or ran a failed dependent",
+  );
+}
 // Preflight names all bounded missing capabilities in the selected closure,
 // without activating tools, starting work, or including excluded branches.
 {

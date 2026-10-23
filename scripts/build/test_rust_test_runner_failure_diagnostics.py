@@ -29,7 +29,7 @@ class FailureDiagnosticTest(RunnerTestCase):
         command = (
             output.getvalue()
             .split("Rerun failed only (from repository root):\n", 1)[1]
-            .strip()
+            .splitlines()[0]
         )
         # All fixture arguments are single-quoted and contain no apostrophes;
         # shlex decodes this common PowerShell/POSIX subset without execution.

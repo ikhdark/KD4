@@ -48,6 +48,8 @@ pub(super) struct LocalThreadProjectionEntry {
     operation_gate: Arc<Semaphore>,
     source_version: Mutex<Option<(PathBuf, u64, Option<SystemTime>)>>,
     payload_versions: Mutex<Vec<codex_rollout::PayloadDependencyVersion>>,
+    /// Source version whose last unloaded read had reconstruction gaps.
+    gap_source_version: Mutex<Option<(PathBuf, u64, Option<SystemTime>)>>,
     last_unloaded_read: StdMutex<Option<Instant>>,
 }
 
@@ -501,6 +503,7 @@ impl LocalThreadProjectionEntry {
             operation_gate: Arc::new(Semaphore::new(1)),
             source_version: Mutex::new(None),
             payload_versions: Mutex::new(Vec::new()),
+            gap_source_version: Mutex::new(None),
             last_unloaded_read: StdMutex::new(None),
         }
     }
@@ -599,10 +602,12 @@ pub(super) async fn initialize_from_store(
         let dependencies = projection.payload_versions.lock().await.clone();
         let source_changed = source_version.is_none()
             || *projection.source_version.lock().await != source_version
-            || !codex_rollout::payload_dependencies_unchanged(&dependencies).await;
+            || !codex_rollout::payload_versions_match(&dependencies).await;
         if source_changed {
+            // Stamped before the read, so a payload that appears during or after it is
+            // still a change for the next page.
             let dependencies = if let Some((path, _, _)) = source_version.as_ref() {
-                codex_rollout::payload_dependency_versions(path).await.ok()
+                codex_rollout::named_payload_versions(path).await.ok()
             } else {
                 None
             };
@@ -626,12 +631,30 @@ pub(super) async fn initialize_from_store(
                 }
                 _ => false,
             });
-            let cacheable = !degraded
-                && if let Some(versions) = &dependencies {
-                    codex_rollout::payload_dependencies_unchanged(versions).await
+            // A gap read again at one source version is a deterministic view of that
+            // source and its payload stamps: reuse it while its missing payloads stay
+            // missing. A first gap may be a transient payload read failure.
+            let confirmed_gap = {
+                let mut gap_source_version = projection.gap_source_version.lock().await;
+                let confirmed = degraded
+                    && source_version.is_some()
+                    && *gap_source_version == source_version;
+                *gap_source_version = if degraded {
+                    source_version.clone()
                 } else {
-                    false
+                    None
                 };
+                confirmed
+            };
+            let cacheable = match &dependencies {
+                Some(versions) if confirmed_gap => {
+                    codex_rollout::payload_versions_match(versions).await
+                }
+                Some(versions) if !degraded => {
+                    codex_rollout::payload_dependencies_unchanged(versions).await
+                }
+                _ => false,
+            };
             *projection.payload_versions.lock().await = dependencies.unwrap_or_default();
             *projection.source_version.lock().await = if cacheable { source_version } else { None };
         }
@@ -993,6 +1016,74 @@ mod tests {
         list_turns(&store, params)
             .await
             .expect("second page reuses the projection");
+    }
+
+    #[tokio::test]
+    async fn unloaded_payload_gap_is_reused_once_a_second_read_confirms_it() {
+        use std::io::Write as _;
+
+        let home = tempfile::TempDir::new().expect("temp dir");
+        let store = LocalThreadStore::new(test_config(home.path()), /*state_db*/ None);
+        let uuid = uuid::Uuid::from_u128(701);
+        let thread_id = ThreadId::from_string(&uuid.to_string()).expect("valid thread id");
+        let rollout =
+            write_session_file(home.path(), "2025-01-03T12-00-00", uuid).expect("session file");
+        let digest = "0".repeat(64);
+        let reference = serde_json::json!({
+            "timestamp": "2025-01-03T12:00:01.000Z",
+            "type": "rollout_payload_artifact",
+            "payload": {"sha256": digest.as_str(), "bytes": 2, "item_type": "event_msg"},
+        });
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&rollout)
+            .expect("open rollout");
+        writeln!(file, "{reference}").expect("append a reference to a missing payload");
+        drop(file);
+        let params = ListTurnsParams {
+            thread_id,
+            include_archived: false,
+            cursor: None,
+            page_size: 10,
+            sort_direction: SortDirection::Asc,
+            items_view: StoredTurnItemsView::Summary,
+        };
+
+        // One unreadable payload may be a transient failure: the first gap is read again.
+        assert!(matches!(
+            list_turns(&store, params.clone()).await,
+            Err(ThreadStoreError::Conflict { .. })
+        ));
+        let projection = existing_entry(&store, thread_id)
+            .await
+            .expect("unloaded projection");
+        assert!(projection.source_version.lock().await.is_none());
+        assert!(matches!(
+            list_turns(&store, params.clone()).await,
+            Err(ThreadStoreError::Conflict { .. })
+        ));
+        assert!(projection.source_version.lock().await.is_some());
+        let stamps = projection.payload_versions.lock().await.clone();
+        assert_eq!(stamps.len(), 1);
+
+        // The confirmed gap is reused while its payload stays missing; a reload would
+        // replace this sentinel state.
+        projection.initialize(&[]).await.expect("sentinel state");
+        let page = list_turns(&store, params.clone())
+            .await
+            .expect("reused projection");
+        assert!(page.turns.is_empty());
+
+        // Negative control: a payload that appears is a change, so the next page reads again.
+        let payloads = home.path().join("rollout-payloads");
+        std::fs::create_dir_all(&payloads).expect("payload directory");
+        std::fs::write(payloads.join(format!("{digest}.json")), b"{}").expect("payload body");
+        assert!(!codex_rollout::payload_versions_match(&stamps).await);
+        assert!(matches!(
+            list_turns(&store, params).await,
+            Err(ThreadStoreError::Conflict { .. })
+        ));
+        assert_ne!(*projection.payload_versions.lock().await, stamps);
     }
 
     #[test]

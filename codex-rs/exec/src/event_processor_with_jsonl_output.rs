@@ -252,10 +252,11 @@ impl EventProcessorWithJsonOutput {
                 })
             }
             ThreadItem::FileChange {
-                changes, status, ..
+                changes, status, effects, ..
             } => Some(ExecThreadItem {
                 id: make_id(),
                 details: ThreadItemDetails::FileChange(FileChangeItem {
+                    effects,
                     changes: changes
                         .into_iter()
                         .map(|change| FileUpdateChange {

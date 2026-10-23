@@ -75,7 +75,6 @@ use codex_login::AuthManager;
 use codex_login::CodexAuth;
 use codex_login::RefreshTokenError;
 use codex_login::UnauthorizedRecovery;
-use codex_login::default_client::create_client_pool;
 use codex_otel::ModelAttemptOutcome;
 use codex_otel::ModelAttemptProviderBaseline;
 use codex_otel::ModelAttemptRequestKind;
@@ -153,6 +152,7 @@ use crate::turn_timing::TurnLocalPhase;
 use crate::turn_timing::TurnTimingGuard;
 use crate::turn_timing::TurnTimingState;
 use crate::turn_timing::response_event_records_actionable_output;
+use crate::turn_timing::response_event_records_model_content;
 use crate::turn_timing::response_event_records_model_output;
 use crate::turn_timing::response_event_records_visible_output;
 use codex_feedback::FeedbackRequestTags;
@@ -343,10 +343,19 @@ struct PromptContextBaseline {
     request_setting_digests: Option<RequestSettingDigests>,
     category_hashes: BTreeMap<&'static str, [u8; 32]>,
     ordered_fixed_hashes: Vec<(&'static str, [u8; 32])>,
-    digests: PromptDigests,
     input_item_digests: Vec<[u8; 32]>,
     fixed_prefix_item_count: usize,
     full_prompt_estimated_tokens: u64,
+}
+
+/// Independent one-pass basis: JSON [instructions, input, tools, text]. It
+/// includes logical envelopes, excludes transport/settings, and uses the same
+/// published image policy as category estimates rather than encoded payloads.
+fn independent_logical_prompt_estimate(request: &ResponsesApiRequest) -> serde_json::Result<u64> {
+    let logical = serde_json::to_vec(&(
+        &request.instructions, &request.input, &request.tools, &request.text,
+    ))?;
+    Ok(crate::context::content_aware_serialized_tokens(&logical))
 }
 
 impl ModelRequestMeasurements {
@@ -473,8 +482,14 @@ impl ModelRequestMeasurements {
                 .collect(),
             accounting_basis: TurnTimingTokenCategoryBasis::FullLogicalPrompt,
             base_instructions: self.tokens(PromptContextCategory::BaseSystem),
-            tool_schemas: self.tokens(PromptContextCategory::ToolSchemas),
-            conversation_history: self.tokens(PromptContextCategory::History),
+            tool_schemas: self
+                .tokens(PromptContextCategory::ToolSchemas)
+                .saturating_add(self.tokens(PromptContextCategory::DiscoveredToolSchemas)),
+            // Compatibility total: tool results are attributed separately by
+            // name in the categories, but remain conversation history here.
+            conversation_history: self
+                .tokens(PromptContextCategory::History)
+                .saturating_add(self.tokens(PromptContextCategory::ToolOutputs)),
             current_input: self.tokens(PromptContextCategory::TaskInput),
             repository_context: self.tokens(PromptContextCategory::Repository),
             skills: self
@@ -563,7 +578,8 @@ impl ModelRequestMeasurements {
                 &serde_json::to_vec(&request.instructions)?,
             );
         }
-        let mut tool_schema_breakdown = Vec::new();
+        let mut tool_schema_breakdown =
+            measure_input_tool_schemas(&request.input, None, cancellation)?;
         if let Some(tools) = request.tools.as_deref() {
             for (index, tool) in tools.iter().enumerate() {
                 ensure_measurement_not_cancelled(cancellation)?;
@@ -585,6 +601,7 @@ impl ModelRequestMeasurements {
         }
         Self::from_context(
             logical_request_bytes,
+            independent_logical_prompt_estimate(request)?,
             context,
             tool_schema_breakdown,
             input_item_digests(&request.input),
@@ -653,7 +670,8 @@ impl ModelRequestMeasurements {
                 instructions.get().as_bytes(),
             );
         }
-        let mut tool_schema_breakdown = Vec::new();
+        let mut tool_schema_breakdown =
+            measure_input_tool_schemas(&request.input, Some(&encoded.input), cancellation)?;
         if let (Some(tools), Some(serialized_tools)) =
             (request.tools.as_deref(), encoded.tools.as_deref())
         {
@@ -684,6 +702,7 @@ impl ModelRequestMeasurements {
         }
         Self::from_context(
             logical_request_bytes,
+            independent_logical_prompt_estimate(request)?,
             context,
             tool_schema_breakdown,
             encoded
@@ -696,17 +715,26 @@ impl ModelRequestMeasurements {
 
     fn from_context(
         logical_request_bytes: u64,
+        full_prompt_estimated_tokens: u64,
         context: PromptContextBreakdown,
         tool_schema_breakdown: Vec<ModelToolSchemaTelemetry>,
         input_item_digests: Vec<[u8; 32]>,
     ) -> serde_json::Result<Self> {
-        let full_prompt_estimated_tokens = context.total_estimated_tokens();
-        let tool_token_count =
-            i64::try_from(context.estimated_tokens(PromptContextCategory::ToolSchemas))
-                .unwrap_or(i64::MAX);
+        let tool_token_count = i64::try_from(
+            context
+                .estimated_tokens(PromptContextCategory::ToolSchemas)
+                .saturating_add(
+                    context.estimated_tokens(PromptContextCategory::DiscoveredToolSchemas),
+                ),
+        )
+        .unwrap_or(i64::MAX);
         let base_instructions_bytes = context.bytes(PromptContextCategory::BaseSystem);
-        let tool_schemas_bytes = context.bytes(PromptContextCategory::ToolSchemas);
-        let conversation_history_bytes = context.bytes(PromptContextCategory::History);
+        let tool_schemas_bytes = context
+            .bytes(PromptContextCategory::ToolSchemas)
+            .saturating_add(context.bytes(PromptContextCategory::DiscoveredToolSchemas));
+        let conversation_history_bytes = context
+            .bytes(PromptContextCategory::History)
+            .saturating_add(context.bytes(PromptContextCategory::ToolOutputs));
         let current_input_bytes = context.bytes(PromptContextCategory::TaskInput);
         let repository_context_bytes = context.bytes(PromptContextCategory::Repository);
         let skills_bytes = context
@@ -779,7 +807,7 @@ impl ModelRequestMeasurements {
         &mut self,
         baseline: &mut Option<PromptContextBaseline>,
         prompt_cache_key: Option<&str>,
-        digests: PromptDigests,
+        _digests: PromptDigests,
     ) {
         self.prompt_context_baseline_compared = baseline.is_some();
         // Settings are compared only when both requests were measured from
@@ -804,26 +832,9 @@ impl ModelRequestMeasurements {
         });
         if let Some(previous) = baseline.as_ref() {
             for measurement in &mut self.prompt_context_categories {
-                let reused_digest = match measurement.category {
-                    category if category == PromptContextCategory::BaseSystem.as_str() => previous
-                        .digests
-                        .instructions
-                        .zip(digests.instructions)
-                        .is_some_and(|(previous, current)| previous == current),
-                    category if category == PromptContextCategory::ToolSchemas.as_str() => previous
-                        .digests
-                        .tools
-                        .zip(digests.tools)
-                        .is_some_and(|(previous, current)| previous == current),
-                    category if category == PromptContextCategory::History.as_str() => previous
-                        .digests
-                        .history
-                        .zip(digests.history)
-                        .is_some_and(|(previous, current)| previous == current),
-                    _ => false,
-                };
-                measurement.unchanged_from_previous_request = reused_digest
-                    || previous
+                // Prepared digests precede fallback and provider formatting;
+                // only the measured dispatched representation proves equality.
+                measurement.unchanged_from_previous_request = previous
                         .category_hashes
                         .get(measurement.category)
                         .is_some_and(|hash| *hash == measurement.hash);
@@ -881,7 +892,6 @@ impl ModelRequestMeasurements {
             request_setting_digests: self.request_setting_digests,
             category_hashes,
             ordered_fixed_hashes,
-            digests,
             input_item_digests: self.input_item_digests.clone(),
             fixed_prefix_item_count: self.fixed_prefix_item_count,
             full_prompt_estimated_tokens: self.full_prompt_estimated_tokens,
@@ -964,6 +974,61 @@ fn cache_coverage_below_matched_task_baseline(
         .saturating_mul(10_000)
         .checked_div(input_tokens)?;
     (coverage_bps < MATCHED_TASK_CACHE_COVERAGE_BASELINE_BPS).then_some(coverage_bps)
+}
+
+fn measure_input_tool_schemas(
+    items: &[ResponseItem],
+    serialized_items: Option<&[&RawValue]>,
+    cancellation: Option<&CancellationToken>,
+) -> serde_json::Result<Vec<ModelToolSchemaTelemetry>> {
+    #[derive(Deserialize)]
+    struct EncodedSchemas<'a> {
+        #[serde(borrow)]
+        tools: Vec<&'a RawValue>,
+    }
+
+    let mut measured = Vec::new();
+    for (item_index, item) in items.iter().enumerate() {
+        let tools = match item {
+            ResponseItem::AdditionalTools { tools, .. }
+            | ResponseItem::ToolSearchOutput { tools, .. } => tools,
+            _ => continue,
+        };
+        ensure_measurement_not_cancelled(cancellation)?;
+        let encoded = serialized_items
+            .and_then(|items| items.get(item_index))
+            .map(|item| serde_json::from_str::<EncodedSchemas<'_>>(item.get()))
+            .transpose()?;
+        if encoded
+            .as_ref()
+            .is_some_and(|encoded| encoded.tools.len() != tools.len())
+        {
+            return Err(serde_json::Error::io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "encoded input schemas do not match logical schemas",
+            )));
+        }
+        for (index, tool) in tools.iter().enumerate() {
+            ensure_measurement_not_cancelled(cancellation)?;
+            if codex_tools::LoadableToolSpec::callable_names_from_value(tool).is_none() {
+                continue;
+            }
+            if let Some(encoded) = &encoded {
+                measured.extend(measure_tool_schemas_from_encoded(
+                    tool,
+                    index,
+                    encoded.tools[index],
+                )?);
+            } else {
+                measured.extend(measure_tool_schemas(
+                    tool,
+                    index,
+                    &serde_json::to_vec(tool)?,
+                )?);
+            }
+        }
+    }
+    Ok(measured)
 }
 
 fn measure_tool_schemas(
@@ -1280,6 +1345,7 @@ fn measure_responses_request_after_dispatch(
             } else {
                 prompt.prompt_provenance.clone()
             };
+            let mut measured_full_encoded_input = false;
             let measurements = (|| {
                 let wire_request_bytes = encoded_request.as_ref().map_or(0, |encoded| {
                     u64::try_from(encoded.len()).unwrap_or(u64::MAX)
@@ -1294,6 +1360,9 @@ fn measure_responses_request_after_dispatch(
                             encoded,
                             logical_request_bytes.unwrap_or(wire_request_bytes),
                         )
+                        .inspect(|_| {
+                            measured_full_encoded_input = true;
+                        })
                         .or_else(|_| {
                             ModelRequestMeasurements::for_responses_request_cancellable(
                                 &request,
@@ -1324,7 +1393,27 @@ fn measure_responses_request_after_dispatch(
             })();
             let stable_context_manifest =
                 if measurements.is_ok() && !blocking_cancellation.is_cancelled() {
-                    prompt.measured_stable_context_manifest()
+                    #[derive(Deserialize)]
+                    struct EncodedManifestInput<'a> {
+                        #[serde(borrow)]
+                        input: &'a RawValue,
+                    }
+                    // A successful encoded measurement has checked that input
+                    // is complete. Fallbacks, incremental WS bodies and model
+                    // normalization must keep measuring the original prompt.
+                    let serialized_input = measured_full_encoded_input
+                        .then_some(())
+                        .filter(|_| request.input.as_ref() == prompt.input.as_ref())
+                        .and_then(|_| encoded_request.as_deref())
+                        .and_then(|encoded| {
+                            serde_json::from_slice::<EncodedManifestInput<'_>>(encoded).ok()
+                        });
+                    match serialized_input {
+                        Some(encoded) => prompt.measured_stable_context_manifest_from_serialized_input(
+                            encoded.input.get().as_bytes(),
+                        ),
+                        None => prompt.measured_stable_context_manifest(),
+                    }
                 } else {
                     prompt.stable_context_manifest
                 };
@@ -1368,6 +1457,8 @@ struct ModelAttemptOffsets {
     first_model_output_us: Option<u64>,
     first_actionable_output_us: Option<u64>,
     completed_us: Option<u64>,
+    /// Candidate arrival in the internal relay, before session visibility
+    /// filtering. Core publication is recorded separately after acceptance.
     first_visible_output_us: Option<u64>,
 }
 
@@ -1401,6 +1492,16 @@ impl ModelAttemptClock {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         finish_queue_span(&mut offsets, now_us);
         offsets.dispatch_ready_us.get_or_insert(now_us);
+    }
+
+    /// A later safe pre-dispatch transport try of the same attempt.
+    fn mark_redispatch_ready(&self) {
+        let now_us = self.elapsed_us();
+        let mut offsets = self
+            .offsets
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        redispatch_offsets(&mut offsets, now_us);
     }
 
     fn mark_queue_started(&self) {
@@ -1469,11 +1570,15 @@ impl ModelAttemptClock {
     }
 
     fn mark_first_provider_event(&self) {
-        self.offsets
+        let now_us = self.elapsed_us();
+        let mut offsets = self
+            .offsets
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .first_provider_event_us
-            .get_or_insert_with(|| self.elapsed_us());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // A decoded event proves the stream exists. The spawned HTTP body task can decode
+        // it before the dispatching task records establishment; keep the offsets ordered.
+        offsets.stream_established_us.get_or_insert(now_us);
+        offsets.first_provider_event_us.get_or_insert(now_us);
     }
 
     fn mark_first_model_output(&self) {
@@ -1624,6 +1729,9 @@ impl ModelAttemptGuard {
         }
         self.emitted = true;
         self.clock.mark_completed();
+        if self.provider_completed && let Some(timing) = &self.turn_timing {
+            timing.record_provider_terminal(&self.sampling_request_id, &self.attempt_id);
+        }
         let uncached_input_tokens = input_tokens
             .zip(cached_input_tokens)
             .and_then(|(input, cached)| input.checked_sub(cached))
@@ -1828,6 +1936,13 @@ impl ModelAttemptGuard {
                 first_visible_output_us: offsets.first_visible_output_us,
                 completed_us,
             });
+        for receipt in self.measurements.stable_context_manifest.filtering_receipts() {
+            tracing::info!(event.name = "codex.stable_context.filtering_receipt",
+                sampling_request_id = %self.sampling_request_id, attempt_id = %self.attempt_id,
+                kind = receipt.kind.as_str(), semantic_id = %receipt.identity.semantic_id,
+                disposition = receipt.disposition.as_str(), active = receipt.active,
+                "sampling history filtering disposition (separate from assembled prompt)");
+        }
         for component in self.measurements.stable_context_manifest.components() {
             self.session_telemetry
                 .model_context_component(&ModelContextComponentTelemetry {
@@ -1860,6 +1975,18 @@ fn finish_queue_span(offsets: &mut ModelAttemptOffsets, now_us: u64) {
         offsets.queue_us = offsets
             .queue_us
             .saturating_add(now_us.saturating_sub(started_us));
+    }
+}
+
+/// A safe pre-dispatch retry sends nothing on the failed dial. Fold that dial and its
+/// backoff into connection setup and move dispatch-ready to the retry, so post-dispatch
+/// offsets (TTFT included) exclude client-side recovery. Phase totals are unchanged.
+fn redispatch_offsets(offsets: &mut ModelAttemptOffsets, now_us: u64) {
+    finish_queue_span(offsets, now_us);
+    if let Some(previous_us) = offsets.dispatch_ready_us.replace(now_us) {
+        offsets.connection_setup_us = offsets
+            .connection_setup_us
+            .saturating_add(now_us.saturating_sub(previous_us));
     }
 }
 
@@ -1950,6 +2077,29 @@ impl Drop for PendingModelAttempt {
 }
 
 impl ModelAttemptState {
+    fn observe_response_queue<E>(
+        &self,
+        receiver: &mut codex_api::response_event_channel::ResponseEventReceiver<E>,
+        stage: &'static str,
+    ) {
+        let guard = match self {
+            Self::Ready(guard) => guard.as_ref(),
+            Self::Pending(pending) => pending.essential.as_ref(),
+        };
+        if let Some(timing) = guard.turn_timing.as_ref() {
+            let timing = Arc::clone(timing);
+            let identity = self.response_identity();
+            receiver.observe_timing(move |observation| {
+                timing.record_response_queue_timing(
+                    &identity.sampling_request_id,
+                    &identity.physical_attempt_id,
+                    stage,
+                    observation,
+                );
+            });
+        }
+    }
+
     fn try_diagnostic_permit() -> Option<Arc<tokio::sync::OwnedSemaphorePermit>> {
         static DIAGNOSTICS: std::sync::LazyLock<Arc<tokio::sync::Semaphore>> =
             std::sync::LazyLock::new(|| Arc::new(tokio::sync::Semaphore::new(32)));
@@ -2223,6 +2373,18 @@ fn session_telemetry_for_request(
     )
 }
 
+/// Bounds model HTTP connection establishment (TCP, proxy CONNECT, TLS) like the default
+/// WebSocket connect timeout. Without it a stalled handshake is only caught by the
+/// response-header deadline, which must treat the request as possibly dispatched.
+const MODEL_HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+
+fn model_http_client_builder(headers: ApiHeaderMap) -> HttpClientBuilder {
+    HttpClientBuilder::new()
+        .default_headers(headers)
+        .with_chatgpt_cloudflare_cookie_store()
+        .connect_timeout(MODEL_HTTP_CONNECT_TIMEOUT)
+}
+
 /// Thread-manager-owned HTTP transports. Conversation and WebSocket state are never shared.
 /// Like individual route pools, these retain process TLS settings until their owner is replaced.
 #[derive(Default)]
@@ -2257,9 +2419,7 @@ impl SharedModelHttpClients {
         let pool = RouteAwareClientPool::with_builder(
             factory.clone(),
             ClientRouteClass::Api,
-            HttpClientBuilder::new()
-                .default_headers(headers.clone())
-                .with_chatgpt_cloudflare_cookie_store(),
+            model_http_client_builder(headers.clone()),
         );
         if pools.len() == MAX_POOLS {
             pools.pop_front();
@@ -2291,6 +2451,13 @@ struct ModelClientState {
     http_clients: RouteAwareClientPool,
     cached_websocket_transport: StdMutex<WebsocketTransportCache>,
     request_schema_cache: StdMutex<RequestSchemaSerializationCache>,
+    /// Prompt-context baseline of the thread's most recently measured request.
+    ///
+    /// Every turn-scoped [`ModelClientSession`] shares this cell, so a turn's first request is
+    /// compared with the previous turn's final request instead of reporting no predecessor. The
+    /// comparison still withholds reuse eligibility when the cache key, a dispatched setting such
+    /// as the model or service tier, an ordered prefix section, or a fixed prefix item changed.
+    prompt_context_baseline: Arc<StdMutex<Option<PromptContextBaseline>>>,
     startup_timing: Option<Arc<crate::startup_timing::StartupTimingState>>,
 }
 
@@ -2451,7 +2618,8 @@ impl RequestRouteTelemetry {
 /// A session-scoped client for model-provider API calls.
 ///
 /// This holds configuration and state that should be shared across turns within a Codex session
-/// (auth, provider selection, thread id, and transport fallback state).
+/// (auth, provider selection, thread id, transport fallback state, and the prompt-context
+/// diagnostic baseline that a turn's first request is compared against).
 ///
 /// WebSocket fallback is session-scoped. A transient failure uses HTTP for 60 seconds; a second
 /// failure within 30 minutes without an intervening successful request, or a non-transient
@@ -2486,6 +2654,10 @@ pub struct ModelClientSession {
     websocket_session: WebsocketSession,
     websocket_cache_publication: Option<WebsocketCachePublicationPermit>,
     pending_websocket_preconnect: Option<AbortOnDropHandle<Result<Option<WebsocketSession>>>>,
+    preconnect_failure_setup: Option<Arc<StdMutex<Option<WebsocketSetupFingerprint>>>>,
+    failed_websocket_setup: Option<WebsocketSetupFingerprint>,
+    dispatched_account: Option<crate::responses_retry::AccountChangeIdentity>,
+    preconnect_failure_credit: bool,
     prepared_startup_websocket_attempt: Option<PreparedStartupWebsocketAttempt>,
     /// A receipt-bearing request invalidated provider inheritance. Subsequent
     /// requests must keep using the unreplaced logical history while those
@@ -2494,10 +2666,20 @@ pub struct ModelClientSession {
     /// Transport selected for the current stream, including failed connection attempts.
     /// `None` means no stream has been selected yet.
     last_stream_transport: Option<ModelAttemptTransport>,
+    /// Once a prepared turn selects HTTP, cooldown expiry must not put another
+    /// WebSocket recovery cycle in front of that turn's continuations.
+    http_for_turn: bool,
     effective_input: Option<Arc<[ResponseItem]>>,
     turn_timing: Option<Arc<TurnTimingState>>,
     startup_timing: Option<Arc<crate::startup_timing::StartupTimingState>>,
     logical_sampling_request_count: u32,
+    /// Whether the latest dispatch advanced `logical_sampling_request_count`, so an outer
+    /// replay of that same request can reuse its Initial/Continuation kind.
+    last_logical_request_counted: bool,
+    /// The thread-scoped baseline shared through `ModelClientState`, not a per-turn copy. Only a
+    /// request without a measured predecessor in this session is compared against it, so a turn's
+    /// first request compares with the previous turn's final request; later requests compare with
+    /// their dispatched predecessor.
     prompt_context_baseline: Arc<StdMutex<Option<PromptContextBaseline>>>,
     latest_measurement_attempt: Arc<StdMutex<Option<String>>>,
     measurement_predecessor: Option<oneshot::Receiver<Option<PromptContextBaseline>>>,
@@ -2578,6 +2760,8 @@ impl CanonicalPrefixHash {
         // histories otherwise allocate and grow a fresh JSON buffer per item.
         let mut serialized = Vec::new();
         for item in items {
+            #[cfg(test)]
+            AUDIT143_PREFIX_ITEMS_HASHED.with(|count| count.set(count.get() + 1));
             let normalized = normalized_websocket_history_item(item);
             serialized.clear();
             serde_json::to_writer(&mut serialized, &normalized)?;
@@ -2595,6 +2779,9 @@ impl CanonicalPrefixHash {
 
 /// Hashes verified against the exact current request during preparation. This
 /// value travels with that request and is discarded whenever its input changes.
+#[cfg(test)]
+thread_local! { static AUDIT143_PREFIX_ITEMS_HASHED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
+
 struct VerifiedRequestHistory {
     prefix: CanonicalPrefixHash,
     properties: [u8; 32],
@@ -3068,7 +3255,11 @@ impl ModelClient {
         let auth_env_telemetry =
             collect_auth_env_telemetry(model_provider.info(), codex_api_key_env_enabled);
         let include_attestation = model_provider.supports_attestation();
-        let http_clients = create_client_pool(http_client_factory.clone(), ClientRouteClass::Api);
+        let http_clients = RouteAwareClientPool::with_builder(
+            http_client_factory.clone(),
+            ClientRouteClass::Api,
+            model_http_client_builder(codex_login::default_client::default_headers()),
+        );
         Self {
             state: Arc::new(ModelClientState {
                 thread_id,
@@ -3087,6 +3278,7 @@ impl ModelClient {
                 http_clients,
                 cached_websocket_transport: StdMutex::new(WebsocketTransportCache::default()),
                 request_schema_cache: StdMutex::new(RequestSchemaSerializationCache::default()),
+                prompt_context_baseline: Arc::new(StdMutex::new(None)),
                 startup_timing: None,
             }),
             agent_identity_policy,
@@ -3148,16 +3340,22 @@ impl ModelClient {
             websocket_session,
             websocket_cache_publication: Some(websocket_cache_publication),
             pending_websocket_preconnect: None,
+            preconnect_failure_setup: None,
+            failed_websocket_setup: None,
+            dispatched_account: None,
+            preconnect_failure_credit: false,
             prepared_startup_websocket_attempt: None,
             latest_measurement_attempt: Default::default(),
             measurement_predecessor: None,
             tool_history_fail_open_pending: false,
             last_stream_transport: None,
+            http_for_turn: false,
             effective_input: None,
             turn_timing: None,
             startup_timing: self.state.startup_timing.clone(),
             logical_sampling_request_count: 0,
-            prompt_context_baseline: Arc::new(StdMutex::new(None)),
+            last_logical_request_counted: false,
+            prompt_context_baseline: Arc::clone(&self.state.prompt_context_baseline),
             turn_state: Arc::new(OnceLock::new()),
         }
     }
@@ -3170,16 +3368,22 @@ impl ModelClient {
             websocket_session: WebsocketSession::default(),
             websocket_cache_publication: None,
             pending_websocket_preconnect: None,
+            preconnect_failure_setup: None,
+            failed_websocket_setup: None,
+            dispatched_account: None,
+            preconnect_failure_credit: false,
             prepared_startup_websocket_attempt: None,
             latest_measurement_attempt: Default::default(),
             measurement_predecessor: None,
             tool_history_fail_open_pending: false,
             last_stream_transport: None,
+            http_for_turn: false,
             effective_input: None,
             turn_timing: None,
             startup_timing: None,
             logical_sampling_request_count: 0,
-            prompt_context_baseline: Arc::new(StdMutex::new(None)),
+            last_logical_request_counted: false,
+            prompt_context_baseline: Arc::clone(&self.state.prompt_context_baseline),
             turn_state: Arc::new(OnceLock::new()),
         }
     }
@@ -3794,6 +3998,10 @@ impl ModelClientSession {
         self.turn_timing = Some(turn_timing);
     }
 
+    pub(crate) fn dispatched_account(&self) -> Option<&crate::responses_retry::AccountChangeIdentity> {
+        self.dispatched_account.as_ref()
+    }
+
     pub(crate) fn set_startup_timing(
         &mut self,
         timing: Arc<crate::startup_timing::StartupTimingState>,
@@ -3814,6 +4022,7 @@ impl ModelClientSession {
     ) -> Result<StartupPrewarmClaim> {
         prewarmed_session.revoke_cache_publication();
         if !Arc::ptr_eq(&self.client.state, &prewarmed_session.client.state)
+            || self.http_for_turn
             || !self.client.responses_websocket_enabled()
         {
             return Ok(StartupPrewarmClaim::Rejected);
@@ -4119,35 +4328,13 @@ impl ModelClientSession {
                 trace!("incremental request failed, incompatible request length");
                 return None;
             };
-            let request_prefix = match CanonicalPrefixHash::from_iter(
-                request.input.iter().take(expected_prefix.item_count),
-            ) {
-                Ok(request_prefix) => request_prefix,
-                Err(err) => {
-                    trace!(
-                        ?err,
-                        "candidate-prefix hashing unavailable; using full comparison"
-                    );
-                    return Self::get_incremental_items_full_compare(
-                        previous_request,
-                        request,
-                        last_response,
-                        allow_empty_delta,
-                    )
-                    .map(|items| (items, None));
-                }
-            };
-            if request_prefix != expected_prefix {
-                trace!(
-                    history_generation = baseline.generation,
-                    "incremental request failed, normalized prefix digest didn't match"
-                );
-                return None;
-            }
-            if !allow_empty_delta && request.input.len() == expected_prefix.item_count {
-                return None;
-            }
-            let mut prefix = request_prefix;
+            // Exact normalized comparison proves the unchanged prefix without
+            // serializing it again. Extend the already trusted digest only for
+            // new response/input items, and carry it through remember().
+            let incremental_items = Self::get_incremental_items_full_compare(
+                previous_request, request, last_response, allow_empty_delta,
+            )?;
+            let mut prefix = expected_prefix;
             let verified = prefix
                 .extend_iter(request.input.iter().skip(expected_prefix.item_count))
                 .ok()
@@ -4156,12 +4343,7 @@ impl ModelClientSession {
                     properties: current_properties_fingerprint,
                 });
             return Some((
-                request
-                    .input
-                    .iter()
-                    .skip(expected_prefix.item_count)
-                    .cloned()
-                    .collect(),
+                incremental_items,
                 verified,
             ));
         }
@@ -4405,7 +4587,9 @@ impl ModelClientSession {
         session_telemetry: &SessionTelemetry,
         responses_metadata: &CodexResponsesMetadata,
     ) {
-        if !self.client.responses_websocket_enabled() || self.pending_websocket_preconnect.is_some()
+        if self.http_for_turn
+            || !self.client.responses_websocket_enabled()
+            || self.pending_websocket_preconnect.is_some()
         {
             return;
         }
@@ -4437,6 +4621,8 @@ impl ModelClientSession {
             self.reset_websocket_session();
         }
         let mut session = self.client.new_speculative_session();
+        let failure_setup = Arc::new(StdMutex::new(None));
+        self.preconnect_failure_setup = Some(Arc::clone(&failure_setup));
         let model_info = model_info.clone();
         let session_telemetry = session_telemetry.clone();
         let responses_metadata = responses_metadata.clone();
@@ -4454,14 +4640,25 @@ impl ModelClientSession {
                 {
                     return Ok(None);
                 }
-                session
+                let result = session
                     .preconnect_websocket(
                         &model_info,
                         service_tier,
                         &session_telemetry,
                         &responses_metadata,
                     )
-                    .await?;
+                    .await;
+                if result.as_ref().err().is_some_and(|error| match error {
+                    CodexErr::ConnectionFailed(_) | CodexErr::RequestTimeout => true,
+                    CodexErr::UnexpectedStatus(error) => error.status.is_server_error(),
+                    _ => false,
+                }) {
+                    *failure_setup
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                        session.failed_websocket_setup;
+                }
+                result?;
                 Ok(Some(
                     std::mem::take(&mut session.websocket_session).into_transport_only(),
                 ))
@@ -4474,12 +4671,15 @@ impl ModelClientSession {
         let Some(task) = self.pending_websocket_preconnect.take() else {
             return Ok(());
         };
+        // A startup-prewarm claim may have won while preparation was running. Its socket
+        // already serves this dispatch: never wait for, or fail on, the redundant dial.
+        if self.websocket_session.connection.is_some() {
+            drop(task);
+            return Ok(());
+        }
         match task.await {
             Ok(Ok(Some(transport))) if self.client.responses_websocket_enabled() => {
-                // A startup-prewarm claim may have won while preparation was running.
-                if self.websocket_session.connection.is_none() {
-                    self.websocket_session = transport;
-                }
+                self.websocket_session = transport;
             }
             Ok(Err(error)) if self.client.responses_websocket_enabled() => {
                 // Count this connection attempt under the ordinary retry owner.
@@ -4492,6 +4692,38 @@ impl ModelClientSession {
             Err(err) => warn!("turn websocket preconnect join failed: {err}"),
         }
         Ok(())
+    }
+
+    /// Kind of the logical sampling request this dispatch carries. Compaction shares the
+    /// turn's session but is not a sampling step, so it never advances the sequence.
+    fn next_logical_request_kind(
+        &mut self,
+        responses_metadata: &CodexResponsesMetadata,
+    ) -> ModelAttemptRequestKind {
+        let request_kind = if self.logical_sampling_request_count == 0 {
+            ModelAttemptRequestKind::Initial
+        } else {
+            ModelAttemptRequestKind::Continuation
+        };
+        let counted = !matches!(
+            responses_metadata.request_kind,
+            Some(crate::responses_metadata::CodexResponsesRequestKind::Compaction(_))
+        );
+        if counted {
+            self.logical_sampling_request_count =
+                self.logical_sampling_request_count.saturating_add(1);
+        }
+        self.last_logical_request_counted = counted;
+        request_kind
+    }
+
+    /// The turn's outer recovery re-dispatches the same logical sampling request. Keep the
+    /// failed dispatch's Initial/Continuation kind instead of counting another step.
+    pub(crate) fn note_logical_request_replay(&mut self) {
+        if std::mem::take(&mut self.last_logical_request_counted) {
+            self.logical_sampling_request_count =
+                self.logical_sampling_request_count.saturating_sub(1);
+        }
     }
 
     /// Opportunistically preconnects a websocket for this turn-scoped client session.
@@ -4601,6 +4833,7 @@ impl ModelClientSession {
             routing_hint,
         } = params;
         let setup_fingerprint = websocket_setup_fingerprint(&api_provider, api_auth.as_ref());
+        self.failed_websocket_setup = None;
         let needs_new = match self.websocket_session.connection.as_ref() {
             Some(conn) => {
                 setup_fingerprint.is_none()
@@ -4643,6 +4876,7 @@ impl ModelClientSession {
             {
                 Ok(new_conn) => new_conn,
                 Err(err) => {
+                    self.failed_websocket_setup = setup_fingerprint;
                     if matches!(err, ApiError::Transport(TransportError::ConnectionTimeout)) {
                         self.reset_websocket_session();
                     }
@@ -4718,7 +4952,10 @@ impl ModelClientSession {
                 loop {
                     // Include client-side composition, normalization, serialization, and transport setup
                     // in dispatch_ready_us for this physical attempt.
-                    let attempt_clock = ModelAttemptClock::new();
+                    let attempt_clock = ModelAttemptClock {
+                        provider_event_at_transport: true,
+                        ..ModelAttemptClock::new()
+                    };
                     let transport_readiness_guard = self
                         .turn_timing
                         .as_ref()
@@ -4734,6 +4971,8 @@ impl ModelClientSession {
                         client_setup.agent_identity_telemetry.clone(),
                         pending_retry,
                     );
+                    self.dispatched_account = client_setup.auth.as_ref()
+                        .and_then(crate::responses_retry::AccountChangeIdentity::from_auth);
                     let compression = self.responses_request_compression(client_setup.auth.as_ref());
                     let mut options = self
                         .build_responses_options(
@@ -4791,6 +5030,10 @@ impl ModelClientSession {
                         timing.record_model_attempt_identity(
                             &attempt_identity.sampling_request_id,
                             &attempt_identity.physical_attempt_id,
+                        );
+                        timing.record_model_estimator_model(
+                            &attempt_identity.sampling_request_id,
+                            &attempt_identity.physical_attempt_id, &request.model,
                         );
                     }
                     let inference_trace_attempt =
@@ -5187,6 +5430,10 @@ impl ModelClientSession {
                 client_setup.agent_identity_telemetry.clone(),
                 pending_retry,
             );
+            if !warmup {
+                self.dispatched_account = client_setup.auth.as_ref()
+                    .and_then(crate::responses_retry::AccountChangeIdentity::from_auth);
+            }
             let request_session_telemetry = if warmup {
                 // `generate=false` prewarm is connection setup, not an inference request.
                 session_telemetry.clone()
@@ -5431,6 +5678,10 @@ impl ModelClientSession {
                 timing.record_model_attempt_identity(
                     &identity.sampling_request_id,
                     &identity.physical_attempt_id,
+                );
+                timing.record_model_estimator_model(
+                    &identity.sampling_request_id, &identity.physical_attempt_id,
+                    &model_info.slug,
                 );
             }
             if let Some(clock) = attempt_clock.as_ref() {
@@ -5915,7 +6166,7 @@ impl ModelClientSession {
         if let Err(error) = self.finish_websocket_preconnect().await {
             warn!("standalone websocket preconnect failed; connecting at dispatch: {error:#}");
         }
-        self.stream_with_attempt_prepared(
+        self.stream_with_attempt_prepared_inner(
             prompt,
             model_info,
             session_telemetry,
@@ -5925,6 +6176,7 @@ impl ModelClientSession {
             responses_metadata,
             inference_trace,
             None,
+            false,
         )
         .await
     }
@@ -5942,34 +6194,92 @@ impl ModelClientSession {
         inference_trace: &'a InferenceTraceContext,
         attempt_prepared: Option<AttemptPreparedCallback>,
     ) -> impl std::future::Future<Output = Result<ResponseStream>> + 'a {
+        self.stream_with_attempt_prepared_inner(
+            prompt,
+            model_info,
+            session_telemetry,
+            effort,
+            summary,
+            service_tier,
+            responses_metadata,
+            inference_trace,
+            attempt_prepared,
+            true,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn stream_with_attempt_prepared_inner<'a>(
+        &'a mut self,
+        prompt: &'a Prompt,
+        model_info: &'a ModelInfo,
+        session_telemetry: &'a SessionTelemetry,
+        effort: Option<ReasoningEffortConfig>,
+        summary: ReasoningSummaryConfig,
+        service_tier: Option<String>,
+        responses_metadata: &'a CodexResponsesMetadata,
+        inference_trace: &'a InferenceTraceContext,
+        attempt_prepared: Option<AttemptPreparedCallback>,
+        turn_scoped: bool,
+    ) -> impl std::future::Future<Output = Result<ResponseStream>> + 'a {
         // Construct the transport future outside the caller's polling frame;
         // the dispatch owner already heap-pins its input on this same task.
         codex_http_client::with_request_dispatch_scope(async move {
+            // A receipt is valid only for this immediate ordinary dispatch.
+            self.preconnect_failure_credit = false;
+            self.dispatched_account = None;
+            self.last_logical_request_counted = false;
+            if turn_scoped && !self.client.responses_websocket_enabled() {
+                self.http_for_turn = true;
+            }
+            if turn_scoped && self.http_for_turn {
+                // Owned speculation cannot become useful in this turn again.
+                self.pending_websocket_preconnect.take();
+            }
             // Resolve before auth setup and transport selection: preconnect can refresh auth or
             // discover that the endpoint requires HTTP. The normal connection path still checks
             // provider/auth compatibility, expiry, and closure before reusing the socket.
-            if let Err(error) = self.finish_websocket_preconnect().await {
-                // A speculative handshake has not dispatched a model request.
-                // Preserve the ordinary connection attempt, including callers
-                // with no stream retries and refreshed authentication/setup.
-                warn!("turn websocket preconnect failed; retrying at dispatch: {error:#}");
-            }
+            let failed_preconnect_setup =
+                if let Err(error) = self.finish_websocket_preconnect().await {
+                    // No prompt was dispatched by speculation. Preserve the immediate
+                    // ordinary attempt, including zero-retry transient recovery.
+                    warn!("turn websocket preconnect failed; retrying at dispatch: {error:#}");
+                    let failed_setup = self.preconnect_failure_setup.take().and_then(|setup| {
+                        setup
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .take()
+                    });
+                    if turn_scoped && !self.http_for_turn
+                        && let Some(failed_setup) = failed_setup
+                    {
+                        let current = self.client.current_client_setup().await?;
+                        if websocket_setup_fingerprint(&current.api_provider, current.api_auth.as_ref())
+                            == Some(failed_setup)
+                        {
+                            // Let the ordinary retry/fallback owner charge this
+                            // same-setup failure without a second handshake.
+                            return Err(error);
+                        }
+                    }
+                    failed_setup
+                } else {
+                    self.preconnect_failure_setup.take();
+                    None
+                };
+            self.failed_websocket_setup = None;
             let sampling_request_id = new_sampling_request_id();
-            let request_kind = if self.logical_sampling_request_count == 0 {
-                ModelAttemptRequestKind::Initial
-            } else {
-                ModelAttemptRequestKind::Continuation
-            };
-            self.logical_sampling_request_count =
-                self.logical_sampling_request_count.saturating_add(1);
+            let request_kind = self.next_logical_request_kind(responses_metadata);
             let wire_api = self.client.state.provider.info().wire_api;
             match wire_api {
                 WireApi::Responses => {
-                    if self.client.responses_websocket_enabled() {
+                    if (!turn_scoped || !self.http_for_turn)
+                        && self.client.responses_websocket_enabled()
+                    {
                         self.last_stream_transport =
                             Some(ModelAttemptTransport::ResponsesWebsocket);
                         let request_trace = current_span_w3c_trace_context();
-                        match Box::pin(self.stream_responses_websocket(
+                        let websocket_result = Box::pin(self.stream_responses_websocket(
                             prompt,
                             model_info,
                             session_telemetry,
@@ -5984,8 +6294,14 @@ impl ModelClientSession {
                             inference_trace,
                             attempt_prepared.clone(),
                         ))
-                        .await?
-                        {
+                        .await;
+                        if websocket_result.is_err() {
+                            // Do not transfer failures across auth/provider
+                            // transitions, or credit post-handshake stream errors.
+                            self.preconnect_failure_credit = failed_preconnect_setup.is_some()
+                                && failed_preconnect_setup == self.failed_websocket_setup;
+                        }
+                        match websocket_result? {
                             WebsocketStreamOutcome::Stream(stream) => return Ok(stream),
                             WebsocketStreamOutcome::FallbackToHttp => {
                                 self.try_switch_fallback_transport(session_telemetry);
@@ -6051,6 +6367,10 @@ impl ModelClientSession {
         self.switch_fallback_transport(session_telemetry, recoverable)
     }
 
+    pub(crate) fn take_preconnect_failure_credit(&mut self) -> bool {
+        std::mem::take(&mut self.preconnect_failure_credit)
+    }
+
     fn switch_fallback_transport(
         &mut self,
         session_telemetry: &SessionTelemetry,
@@ -6071,6 +6391,7 @@ impl ModelClientSession {
             .activate_http_fallback(session_telemetry, recoverable);
         self.websocket_session = WebsocketSession::default();
         self.last_stream_transport = Some(ModelAttemptTransport::ResponsesHttp);
+        self.http_for_turn = true;
         activated || failed_stream_was_websocket
     }
 }
@@ -6172,6 +6493,7 @@ impl From<InferenceTraceAttempt> for AsyncInferenceTraceAttempt {
         let attempt = Arc::new(attempt);
         let slots = TRACE_SLOTS.get_or_init(|| Arc::new(tokio::sync::Semaphore::new(16)));
         let Ok(permit) = Arc::clone(slots).try_acquire_owned() else {
+            attempt.note_capture_loss();
             warn!("inference trace incomplete: optional trace writer capacity exhausted");
             return Self {
                 attempt: Some(attempt),
@@ -6189,8 +6511,9 @@ impl From<InferenceTraceAttempt> for AsyncInferenceTraceAttempt {
                 let _permit = permit;
                 let mut terminal_written = false;
                 while let Some((terminal, write)) = receiver.recv().await {
-                    let attempt = Arc::clone(&attempt);
-                    if let Err(error) = tokio::task::spawn_blocking(move || write(&attempt)).await {
+                    let write_attempt = Arc::clone(&attempt);
+                    if let Err(error) = tokio::task::spawn_blocking(move || write(&write_attempt)).await {
+                        attempt.note_capture_loss();
                         warn!(%error, "inference trace incomplete: writer failed");
                     }
                     if terminal {
@@ -6206,10 +6529,12 @@ impl From<InferenceTraceAttempt> for AsyncInferenceTraceAttempt {
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner)
                         .take();
+                    let write_attempt = Arc::clone(&attempt);
                     if let Some((_, write)) = fallback
                         && let Err(error) =
-                            tokio::task::spawn_blocking(move || write(&attempt)).await
+                            tokio::task::spawn_blocking(move || write(&write_attempt)).await
                     {
+                        attempt.note_capture_loss();
                         warn!(%error, "inference trace terminal unavailable: fallback writer failed");
                     }
                 }
@@ -6369,6 +6694,9 @@ impl AsyncInferenceTraceAttempt {
             );
             if let Err(error) = writes.try_send(write) {
                 let closed = matches!(&error, tokio::sync::mpsc::error::TrySendError::Closed(_));
+                if (!terminal || closed) && let Some(attempt) = &self.attempt {
+                    attempt.note_capture_loss();
+                }
                 if terminal {
                     // One reserved terminal slot outside the bounded detail
                     // queue. Preserve the actual outcome during saturation.
@@ -6428,17 +6756,17 @@ fn map_response_stream(
     websocket_success: Option<(ModelClient, u64)>,
 ) -> (ResponseStream, oneshot::Receiver<LastResponse>) {
     let codex_api::ResponseStream {
-        rx_event,
+        mut rx_event,
         upstream_request_id,
     } = api_stream;
-    let api_stream = codex_api::ResponseStream {
-        rx_event,
-        upstream_request_id: None,
+    if let Some(attempt) = attempt.as_ref() {
+        attempt.observe_response_queue(&mut rx_event, "api_to_mapper");
     }
+    let api_stream = futures::stream::poll_fn(move |cx| rx_event.poll_recv_charged(cx))
     .inspect(move |event| {
         // Opening a stream or receiving partial output is not a successful
         // request. HTTP and connection-only warmup never clear WS failures.
-        if matches!(event, Ok(ResponseEvent::Completed { .. }))
+        if matches!(event.event(), Ok(ResponseEvent::Completed { .. }))
             && let Some((client, epoch)) = websocket_success.as_ref()
         {
             client
@@ -6470,16 +6798,20 @@ fn map_response_events<S>(
     stream_throughput: Option<Arc<StdMutex<WebsocketStreamThroughput>>>,
 ) -> (ResponseStream, oneshot::Receiver<LastResponse>)
 where
-    S: futures::Stream<Item = std::result::Result<ResponseEvent, ApiError>>
+    S: futures::Stream
         + Unpin
         + Send
         + 'static,
+    S::Item: Into<codex_api::response_event_channel::ChargedResponseEvent<ApiError>> + Send + 'static,
 {
     let inference_trace_attempt = inference_trace_attempt.into();
     let attempt_identity = attempt.as_ref().map(ModelAttemptState::response_identity);
     let attempt_clock = attempt.as_ref().map(ModelAttemptState::clock);
-    let (tx_event, rx_event) =
+    let (tx_event, mut rx_event) =
         codex_api::response_event_channel::response_event_channel(RESPONSE_STREAM_CHANNEL_CAPACITY);
+    if let Some(attempt) = attempt.as_ref() {
+        attempt.observe_response_queue(&mut rx_event, "mapper_to_turn");
+    }
     let (tx_last_response, rx_last_response) = oneshot::channel::<LastResponse>();
     let consumer_dropped = CancellationToken::new();
     let consumer_dropped_for_stream = consumer_dropped.clone();
@@ -6494,6 +6826,7 @@ where
             // First-event telemetry is one-shot. Once recorded, later deltas must
             // not reacquire the timing mutex or clone the clock's Arc.
             let mut first_provider_event_recorded = false;
+            let mut first_model_output_recorded = false;
             let mut first_actionable_output_recorded = false;
             let mut first_visible_output_recorded = false;
             let mut api_stream = api_stream;
@@ -6514,43 +6847,49 @@ where
                     }
                     event = api_stream.next() => event,
                 };
-                let Some(mut event) = event else {
+                let Some(event) = event else {
                     break;
                 };
+                let mut event: codex_api::response_event_channel::ChargedResponseEvent<ApiError> = event.into();
                 if let Ok(
                     ResponseEvent::OutputItemAdded(item) | ResponseEvent::OutputItemDone(item),
-                ) = &mut event
+                ) = event.event()
+                    && crate::stable_context::provider_context_item_id_needs_normalization(item)
                 {
-                    crate::stable_context::normalize_provider_context_item_id(item);
+                    event = event.map(|mut event| {
+                        if let Ok(ResponseEvent::OutputItemAdded(item) | ResponseEvent::OutputItemDone(item)) = &mut event {
+                            crate::stable_context::normalize_provider_context_item_id(item);
+                        }
+                        event
+                    });
                 }
-                let queued_payload_bytes = event
-                    .as_ref()
-                    .map_or(0, ResponseEvent::queued_payload_bytes);
+                let queued_payload_bytes = event.payload_bytes();
                 if queued_payload_bytes
                     > codex_api::response_event_channel::RESPONSE_EVENT_QUEUE_BYTES
                 {
                     event = Err(ApiError::invalid_response(
                         "decoded response event exceeds the queue payload limit",
-                    ));
+                    )).into();
                 }
-                if let Ok(response_event) = &event
+                if let Ok(response_event) = event.event()
                     && let Some(clock) = attempt_clock.as_ref()
                 {
                     if !first_provider_event_recorded && !clock.provider_event_at_transport {
                         clock.mark_first_provider_event();
                         first_provider_event_recorded = true;
                     }
-                    if ttft_ms.is_none() && response_event_records_model_output(response_event) {
+                    if !first_model_output_recorded && response_event_records_model_output(response_event) {
                         clock.mark_first_model_output();
+                        first_model_output_recorded = true;
+                    }
+                    if ttft_ms.is_none() && response_event_records_model_content(response_event) {
                         ttft_ms.get_or_insert_with(|| {
                             let offsets = clock
                                 .offsets
                                 .lock()
                                 .unwrap_or_else(std::sync::PoisonError::into_inner);
                             i64::try_from(
-                                offsets
-                                    .first_model_output_us
-                                    .unwrap_or_default()
+                                clock.elapsed_us()
                                     .saturating_sub(offsets.dispatch_ready_us.unwrap_or_default())
                                     / 1_000,
                             )
@@ -6567,22 +6906,23 @@ where
                 let records_visible_output = !first_visible_output_recorded
                     && attempt_clock.is_some()
                     && event
+                        .event()
                         .as_ref()
                         .is_ok_and(response_event_records_visible_output);
                 // With one sender, an empty capacity here means forwarding this
                 // nonterminal event can block polling the provider. Its completion
                 // time no longer isolates backend speed. Do not subtract this wait:
                 // it can overlap real provider work and invent an inflated rate.
-                if !matches!(&event, Ok(ResponseEvent::Completed { .. }))
+                if !matches!(event.event(), Ok(ResponseEvent::Completed { .. }))
                     && tx_event.is_backpressured(queued_payload_bytes)
                 {
                     downstream_backpressured = true;
                 }
-                match event {
+                match event.event() {
                     Ok(ResponseEvent::OutputItemDone(item)) => {
                         items_added.push(item.clone());
                         if tx_event
-                            .send(Ok(ResponseEvent::OutputItemDone(item)))
+                            .send_charged(event.map_err(|error| provider.map_api_error(error)))
                             .await
                             .is_err()
                         {
@@ -6603,8 +6943,10 @@ where
                     Ok(ResponseEvent::Completed {
                         response_id,
                         token_usage,
-                        end_turn,
+                        ..
                     }) => {
+                        let response_id = response_id.clone();
+                        let token_usage = token_usage.clone();
                         if let Some(throughput) = stream_throughput.as_ref() {
                             let mut throughput = throughput
                                 .lock()
@@ -6661,11 +7003,7 @@ where
                             });
                         }
                         if tx_event
-                            .send(Ok(ResponseEvent::Completed {
-                                response_id: response_id.clone(),
-                                token_usage: token_usage.clone(),
-                                end_turn,
-                            }))
+                            .send_charged(event.map_err(|error| provider.map_api_error(error)))
                             .await
                             .is_err()
                         {
@@ -6725,8 +7063,8 @@ where
                         // releases it without recording a second, failed terminal state.
                         return;
                     }
-                    Ok(event) => {
-                        if tx_event.send(Ok(event)).await.is_err() {
+                    Ok(_) => {
+                        if tx_event.send_charged(event.map_err(|error| provider.map_api_error(error))).await.is_err() {
                             inference_trace_attempt
                                 .record_cancelled(
                                     STREAM_DROPPED_REASON,
@@ -6741,7 +7079,8 @@ where
                             first_visible_output_recorded = true;
                         }
                     }
-                    Err(err) => {
+                    Err(_) => {
+                        let Err(err) = event.into_event() else { unreachable!() };
                         if let Some(attempt) = attempt.as_ref() {
                             attempt.clock().mark_completed();
                         }
@@ -7152,7 +7491,11 @@ impl RequestTelemetry for ApiTelemetry {
                     .take(),
             );
             context.dispatched.store(true, Ordering::Release);
-            context.clock.mark_dispatch_ready();
+            if transport_attempt == 0 {
+                context.clock.mark_dispatch_ready();
+            } else {
+                context.clock.mark_redispatch_ready();
+            }
             // Safe pre-dispatch transport retries share the enclosing API
             // request but are distinct physical entries. Keep their identity
             // stable for duplicate notifications without deriving it from payloads.
@@ -7298,6 +7641,15 @@ impl SseTelemetry for ApiTelemetry {
     }
 
     fn on_sse_event(&self, kind: &str, duration: Duration, error: Option<&dyn std::fmt::Display>) {
+        // Called for decoded body events, never header-derived initial events.
+        if !self.first_response_event.swap(true, Ordering::AcqRel)
+            && let Some(request) = self.model_request.as_ref()
+        {
+            request.clock.mark_first_provider_event();
+            tracing::info!(event.name = "codex.model_transport_milestone",
+                sampling_request_id = %request.identity.sampling_request_id,
+                endpoint = "first_decoded_sse_event", "first provider body event");
+        }
         self.session_telemetry
             .log_sse_event_result(kind, duration, error);
     }

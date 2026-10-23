@@ -1,20 +1,87 @@
 //! Bind native command observations to the existing typed-task evidence owner.
 //!
 //! Requirements must name the exact resolved argv (JSON array or shell-quoted
-//! argv), not merely describe a similar check. Caller paths remain attribution,
-//! not behavioral coverage. No result reuse or source-snapshot authority is added.
+//! argv), not merely describe a similar check. Public command schemas carry no
+//! coverage claims. Historical observations add no result-reuse or source-snapshot
+//! authority.
 use crate::tools::context::ToolInvocation;
 use codex_agent_task_store::AgentTaskBinding;
 use codex_agent_task_store::ValidationCall;
 use codex_agent_task_store::ValidationCallStatus;
 use codex_agent_task_store::ValidationEvidence;
-use codex_protocol::validation::ValidationResult;
-use codex_protocol::validation::ValidationTerminalStatus;
 use codex_tools::ToolOutput;
 use codex_tools::ToolOutputOutcome;
 use serde_json::Value;
 use serde_json::json;
 use std::time::Instant;
+
+/// Retry evidence delivery, never process execution. Slots are root-tree owned
+/// and serialize only observations of the same native execution identity.
+#[derive(Default)]
+pub(crate) struct DeliveryState {
+    launch: Option<ValidationCall>,
+    terminal: Option<ValidationCall>,
+    retry: bool,
+    #[cfg(test)]
+    pub(crate) fail_next_write: bool,
+}
+
+impl DeliveryState {
+    async fn flush(&mut self, store: &codex_agent_task_store::LocalAgentTaskStore, registered: bool) -> Result<(), String> {
+        self.retry = true;
+        #[cfg(test)]
+        if std::mem::take(&mut self.fail_next_write) {
+            return Err("injected transient validation write failure".into());
+        }
+        if !registered && let Some(launch) = &self.launch {
+            store.record_validation_call(launch.clone()).await.map_err(|error| error.to_string())?;
+        }
+        if let Some(terminal) = &self.terminal {
+            store.record_validation_call(terminal.clone()).await.map_err(|error| error.to_string())?;
+        }
+        self.retry = false;
+        Ok(())
+    }
+}
+
+async fn retry_delivery(invocation: &ToolInvocation, binding: &AgentTaskBinding) {
+    let coordinator = invocation.session.services.agent_control.task_coordinator();
+    let Some(store) = coordinator.store() else { return };
+    let pending = coordinator.native_validation_deliveries.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .iter().map(|(id, slot)| (id.clone(), std::sync::Arc::clone(slot))).collect::<Vec<_>>();
+    for (id, slot) in pending {
+        // Never wait for another live poll just to retry unrelated delivery.
+        let Ok(mut delivery) = slot.try_lock() else { continue };
+        if !delivery.retry || delivery.launch.as_ref().is_none_or(|call| call.attempt_id != binding.attempt_id) {
+            continue;
+        }
+        let registered = match store.get_validation_call(id.clone()).await {
+            Ok(Some(existing)) if existing.status.is_terminal() => {
+                if delivery.launch.as_ref().is_some_and(|launch|
+                    launch.attempt_id == existing.attempt_id && launch.command_summary == existing.command_summary)
+                {
+                    coordinator.native_validation_deliveries.lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner).remove(&id);
+                }
+                continue;
+            }
+            Ok(existing) => existing.is_some(),
+            Err(error) => {
+                tracing::warn!(%error, "native validation delivery retry could not query storage");
+                continue;
+            }
+        };
+        match delivery.flush(store.as_ref(), registered).await {
+            Ok(()) if delivery.terminal.is_some() => {
+                coordinator.native_validation_deliveries.lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner).remove(&id);
+            }
+            Ok(()) => {}
+            Err(error) => tracing::warn!(%error, "native validation evidence delivery remains pending"),
+        }
+    }
+}
 
 pub(super) struct Observation {
     binding: AgentTaskBinding,
@@ -42,6 +109,7 @@ impl Observation {
         if binding.thread_id.as_deref() != Some(invocation.session.thread_id.to_string().as_str()) {
             return None;
         }
+        retry_delivery(invocation, &binding).await;
         Some(Self {
             binding,
             // The command's own evidence-only observation is not a source change.
@@ -125,24 +193,35 @@ impl Observation {
             .assignment
             .required_evidence
             .iter()
-            .filter(|requirement| exact_argv(requirement).as_ref() == Some(&argv))
+            .filter(|requirement| codex_agent_task_store::required_command_argv(requirement).as_ref() == Some(&argv))
             .collect::<Vec<_>>();
         let [requirement] = matching.as_slice() else {
             return Ok(None);
         };
         let origin = output.post_tool_use_id(&invocation.call_id);
         let call_id = format!("command:{}:{origin}", invocation.session.thread_id);
+        let slot = {
+            let mut deliveries = coordinator.native_validation_deliveries.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            std::sync::Arc::clone(deliveries.entry(call_id.clone()).or_default())
+        };
+        // No coordinator/map/source lock is held across storage. A stalled
+        // write delays only this execution's delivery, not unrelated commands.
+        let mut delivery = slot.lock().await;
         let existing = store
             .get_validation_call(call_id.clone())
             .await
             .map_err(|e| e.to_string())?;
-        let mut call = if let Some(call) = existing {
+        let registered = existing.is_some();
+        let mut call = if let Some(call) = existing.or_else(|| delivery.launch.clone()) {
             if call.attempt_id != self.binding.attempt_id || call.command_summary != **requirement {
                 return Err(
                     "the original execution belongs to another attempt or obligation".into(),
                 );
             }
             if call.status.is_terminal() {
+                coordinator.native_validation_deliveries.lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner).remove(&call_id);
                 return Ok(Some(
                     json!({"call_id": call.call_id, "status": call.status}),
                 ));
@@ -154,6 +233,8 @@ impl Observation {
             if invocation.tool_name.name == "write_stdin"
                 || task.current_attempt.attempt_id != self.binding.attempt_id
             {
+                coordinator.native_validation_deliveries.lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner).remove(&call_id);
                 return Ok(None);
             }
             let call = ValidationCall {
@@ -172,13 +253,17 @@ impl Observation {
             };
             // Registration follows an actual native execution observation, not
             // command recognition/preflight. Busy and rejected calls never enter.
-            store
-                .record_validation_call(call.clone())
-                .await
-                .map_err(|e| e.to_string())?;
             call
         };
+        delivery.launch.get_or_insert_with(|| call.clone());
+        if let Some(terminal) = delivery.terminal.clone() {
+            delivery.flush(store.as_ref(), registered).await?;
+            coordinator.native_validation_deliveries.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner).remove(&call_id);
+            return Ok(Some(json!({"call_id": call_id, "status": terminal.status})));
+        }
         if output.outcome_for_logging() == ToolOutputOutcome::Yielded {
+            delivery.flush(store.as_ref(), registered).await?;
             return Ok(Some(json!({"call_id": call_id, "status": "running"})));
         }
         let start = call
@@ -208,61 +293,48 @@ impl Observation {
         } else {
             ValidationCallStatus::NotExecuted
         };
-        let covered_paths = output
-            .projection_metadata()
-            .and_then(|metadata| {
-                metadata.essential_inline["validation"]["covered_paths"]
-                    .as_array()
-                    .cloned()
-            })
-            .and_then(|values| {
-                values
-                    .into_iter()
-                    .map(serde_json::from_value::<String>)
-                    .collect::<Result<Vec<_>, _>>()
-                    .ok()
-            })
-            .unwrap_or_default();
-        let result = ValidationResult {
-            argv,
-            covered_paths,
-            call_id: call_id.clone(),
-            process_id: None,
-            status: if proved { ValidationTerminalStatus::Succeeded }
-                else if call.status == ValidationCallStatus::Failed { ValidationTerminalStatus::Failed }
-                else { ValidationTerminalStatus::Unverified },
-            duration_ms: self.started.elapsed().as_millis().try_into().unwrap_or(u64::MAX),
-            summary: Some("Native command observation; declared paths are attribution only, source freshness and behavioral coverage remain unverified.".into()),
-            failure_excerpt: None,
-            raw_artifact_ref: None,
-            raw_artifact_sha256: None,
-        };
-        // The public result validator also rejects malformed/empty path scope.
-        // Never let a successful exit manufacture valid task proof from it.
-        let encoded = serde_json::to_value(result).map_err(|e| e.to_string())?;
-        if serde_json::from_value::<ValidationResult>(encoded.clone()).is_err() {
-            call.status = ValidationCallStatus::NotExecuted;
-            call.evidence.validation_result = None;
-        } else {
-            call.evidence.validation_result = Some(encoded);
+        // Public command schemas intentionally do not accept coverage claims.
+        // Preserve the successful native observation without inventing paths or
+        // weakening the separate, path-bearing public ValidationResult contract.
+        call.evidence.validation_result = Some(json!({
+            "kind": "native_command_execution_v1",
+            "argv": argv,
+            "callId": call_id,
+            "status": if proved { "succeeded" }
+                else if call.status == ValidationCallStatus::Failed { "failed" }
+                else { "unverified" },
+            "durationMs": signal["process_duration_ms"].as_u64().or_else(||
+                (invocation.tool_name.name != "write_stdin").then(||
+                    u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX))),
+        }));
+        call.evidence.output_summary = signal["semantic_evidence"]
+            .as_str()
+            .map(str::to_owned)
+            .or_else(|| {
+                signal["semantic_evidence"]
+                    .as_array()?
+                    .iter()
+                    .map(Value::as_str)
+                    .collect::<Option<Vec<_>>>()
+                    .map(|lines| lines.join("\n"))
+            });
+        call.evidence.retained_output_ref = signal["native_output_artifact_id"].as_str().map(str::to_owned);
+        if call.status == ValidationCallStatus::Failed
+            && let Some(result) = call.evidence.validation_result.as_mut()
+        {
+            result["failureExcerpt"] = json!(call.evidence.output_summary);
         }
         call.recorded_at = chrono::Utc::now().max(call.recorded_at);
-        store
-            .record_validation_call(call.clone())
-            .await
-            .map_err(|e| e.to_string())?;
+        delivery.terminal = Some(call.clone());
+        delivery.flush(store.as_ref(), registered).await?;
+        coordinator.native_validation_deliveries.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner).remove(&call_id);
         Ok(Some(json!({
             "call_id": call_id, "status": call.status,
             "workspace_id": task.assignment.workspace_id,
             "freshness": "unverified", "behavioral_coverage": "unverified",
         })))
     }
-}
-
-fn exact_argv(requirement: &str) -> Option<Vec<String>> {
-    serde_json::from_str(requirement)
-        .ok()
-        .or_else(|| shlex::split(requirement))
 }
 
 fn verified_success(signal: &Value, outcome: ToolOutputOutcome) -> bool {
@@ -272,6 +344,12 @@ fn verified_success(signal: &Value, outcome: ToolOutputOutcome) -> bool {
         && (signal["command_validation"]["tests"] != true
             || (signal["runner_execution_receipt"]["exit_code"] == 0
                 && signal["runner_execution_receipt"]["executed_tests"]
+                    .as_u64()
+                    .is_some_and(|count| count > 0))
+            || (signal["test_execution_observation"]["kind"]
+                == "producer_test_execution_observation_v1"
+                && signal["test_execution_observation"]["exit_code"] == 0
+                && signal["test_execution_observation"]["executed_tests"]
                     .as_u64()
                     .is_some_and(|count| count > 0)))
 }

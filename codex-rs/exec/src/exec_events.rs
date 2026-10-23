@@ -316,6 +316,9 @@ pub enum PatchApplyStatus {
 /// A set of file changes by the agent.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, TS)]
 pub struct FileChangeItem {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub effects: Option<codex_protocol::items::FileChangeEffects>,
     pub changes: Vec<FileUpdateChange>,
     pub status: PatchApplyStatus,
 }

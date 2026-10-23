@@ -794,11 +794,12 @@ impl ToolDispatchTrace {
         let terminal_tasks = invocation.session.terminal_tasks.clone();
         let (sender, context) = tokio::sync::watch::channel(None);
         let trace_invocation = tool_dispatch_invocation(invocation);
+        let occurrence = codex_rollout_trace::TraceOccurrence::now();
         // Publish a handle before awaiting the accepted write. Cancellation
         // owns the same initialization and terminal ordering.
         drop(terminal_tasks.spawn_blocking(move || {
             let _permit = start_permit;
-            let context = thread_trace.start_tool_dispatch_trace(|| trace_invocation);
+            let context = thread_trace.start_tool_dispatch_trace_at(|| trace_invocation, occurrence);
             sender.send_replace(Some(context));
         }));
         Self {
@@ -908,6 +909,7 @@ impl ToolDispatchTrace {
         // Elect and hand off synchronously. Neither cancellation of the caller
         // nor a slow diagnostic disk can lose or reorder the accepted terminal.
         state.terminal_recording.call_once(|| {
+            let occurrence = codex_rollout_trace::TraceOccurrence::now();
             let trace = self.clone();
             let tasks = state.terminal_tasks.clone();
             let permit = Arc::clone(&state._permit);
@@ -921,7 +923,7 @@ impl ToolDispatchTrace {
                         {
                             context.record_process_observations(value);
                         }
-                        record(context);
+                        record(context.at_occurrence(occurrence));
                     })
                     .await;
                 }

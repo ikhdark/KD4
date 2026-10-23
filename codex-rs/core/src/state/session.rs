@@ -22,6 +22,7 @@ use crate::tool_history::ModelGenerationId;
 use crate::tool_history::ToolHistoryState;
 use codex_protocol::protocol::ContextFragmentDigest;
 use codex_protocol::protocol::RateLimitSnapshot;
+use codex_protocol::protocol::TokenCountEvent;
 use codex_protocol::protocol::TokenUsage;
 use codex_protocol::protocol::TokenUsageInfo;
 use codex_protocol::protocol::TurnContextItem;
@@ -155,11 +156,24 @@ impl PromptTokenCalibration {
     }
 }
 
+/// Usage of the latest compaction request, with the stored cumulative and
+/// conversation usage it was counted into. Compaction never becomes the
+/// context baseline, yet it stays the latest request until either changes.
+struct CompactionReceipt {
+    total_token_usage: TokenUsage,
+    last_token_usage: TokenUsage,
+    usage: TokenUsage,
+}
+
 /// Persistent, session-scoped state previously stored directly on `Session`.
 pub(crate) struct SessionState {
     pub(crate) session_configuration: SessionConfiguration,
     pub(crate) history: ContextManager,
     pub(crate) latest_rate_limits: Option<RateLimitSnapshot>,
+    /// Latest compaction request usage; see `published_token_info`.
+    latest_compaction_receipt: Option<CompactionReceipt>,
+    /// Usage and rate limits carried by the last published `TokenCount`.
+    last_published_token_count: Option<(Option<TokenUsageInfo>, Option<RateLimitSnapshot>)>,
     pub(crate) prompt_token_calibration: PromptTokenCalibration,
     /// Estimated retirable tokens re-sent by each request checked since history
     /// was last rewritten; see `retire_consumed_tool_outputs_before_limit`.
@@ -203,6 +217,8 @@ impl SessionState {
             session_configuration,
             history,
             latest_rate_limits: None,
+            latest_compaction_receipt: None,
+            last_published_token_count: None,
             prompt_token_calibration: PromptTokenCalibration::default(),
             proactive_retirement_carried_tokens: 0,
             mcp_dependency_prompted: HashSet::new(),
@@ -259,6 +275,10 @@ impl SessionState {
 
     pub(crate) fn tool_history_state(&self) -> ToolHistoryState {
         self.history.tool_history_state()
+    }
+
+    pub(crate) fn tool_history_state_ref(&self) -> &ToolHistoryState {
+        self.history.tool_history_state_ref()
     }
 
     pub(crate) fn apply_tool_history_mutation(
@@ -389,6 +409,32 @@ impl SessionState {
         self.history.token_info()
     }
 
+    /// Records compaction usage after it was added to the cumulative total
+    /// without replacing the context baseline.
+    pub(crate) fn record_compaction_receipt(&mut self, usage: &TokenUsage) {
+        self.latest_compaction_receipt = self.token_info().map(|info| CompactionReceipt {
+            total_token_usage: info.total_token_usage,
+            last_token_usage: info.last_token_usage,
+            usage: usage.clone(),
+        });
+    }
+
+    /// Usage as published to clients, rollouts, and usage contributors. History
+    /// keeps the conversation receipt as its context baseline, but a compaction
+    /// is reported as the latest request until another receipt is recorded.
+    pub(crate) fn published_token_info(&self) -> Option<TokenUsageInfo> {
+        let mut info = self.token_info()?;
+        if let Some(receipt) = &self.latest_compaction_receipt
+            && receipt.total_token_usage == info.total_token_usage
+            && receipt.last_token_usage == info.last_token_usage
+        {
+            // Keep the conversation's context size independent of the receipt.
+            info.estimated_context_tokens = Some(info.context_tokens());
+            info.last_token_usage = receipt.usage.clone();
+        }
+        Some(info)
+    }
+
     pub(crate) fn set_rate_limits(&mut self, snapshot: RateLimitSnapshot) {
         self.latest_rate_limits = Some(merge_rate_limit_fields(
             self.latest_rate_limits.as_ref(),
@@ -396,10 +442,24 @@ impl SessionState {
         ));
     }
 
+    /// The snapshot a `TokenCount` publishes; see `published_token_info`.
     pub(crate) fn token_info_and_rate_limits(
         &self,
     ) -> (Option<TokenUsageInfo>, Option<RateLimitSnapshot>) {
-        (self.token_info(), self.latest_rate_limits.clone())
+        (self.published_token_info(), self.latest_rate_limits.clone())
+    }
+
+    /// Whether `event` exactly repeats the last published `TokenCount`.
+    pub(crate) fn repeats_published_token_count(&self, event: &TokenCountEvent) -> bool {
+        self.last_published_token_count
+            .as_ref()
+            .is_some_and(|(info, rate_limits)| {
+                *info == event.info && *rate_limits == event.rate_limits
+            })
+    }
+
+    pub(crate) fn record_published_token_count(&mut self, event: &TokenCountEvent) {
+        self.last_published_token_count = Some((event.info.clone(), event.rate_limits.clone()));
     }
 
     pub(crate) fn set_token_usage_full(&mut self, context_window: i64) {
@@ -508,6 +568,17 @@ fn merge_rate_limit_fields(
 ) -> RateLimitSnapshot {
     if snapshot.limit_id.is_none() {
         snapshot.limit_id = Some("codex".to_string());
+    }
+    // Responses without rate-limit headers still yield an empty default bucket,
+    // and event updates can carry only credits or plan. Neither reports that the
+    // bucket's windows ended. A window-bearing update stays authoritative for
+    // both windows, and another bucket's windows never carry over.
+    if snapshot.primary.is_none()
+        && snapshot.secondary.is_none()
+        && let Some(prior) = previous.filter(|prior| prior.limit_id == snapshot.limit_id)
+    {
+        snapshot.primary = prior.primary.clone();
+        snapshot.secondary = prior.secondary.clone();
     }
     if snapshot.credits.is_none() {
         snapshot.credits = previous.and_then(|prior| prior.credits.clone());

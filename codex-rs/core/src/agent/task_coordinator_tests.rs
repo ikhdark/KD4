@@ -1,4 +1,6 @@
 use super::*;
+#[path = "task_coordinator_audit142_tests.rs"]
+mod audit142;
 use crate::agent::task_metrics::MAX_RECORDED_EVENTS;
 use codex_agent_task_store::AcceptanceCriterion;
 use codex_agent_task_store::AgentRole;
@@ -8,6 +10,33 @@ use codex_agent_task_store::CriterionStatus;
 use codex_agent_task_store::WorkspaceStrategy;
 use codex_protocol::ThreadId;
 use tempfile::TempDir;
+
+#[tokio::test]
+async fn pathless_turn_does_not_wait_for_binding_publication() {
+    use futures::FutureExt;
+
+    let coordinator = AgentTaskCoordinator::default();
+    let _update = coordinator.binding_updates.lock().await;
+    coordinator
+        .prepare_legacy_agent_turn(&SessionSource::Cli, ThreadId::new())
+        .now_or_never()
+        .expect("pathless root preparation must not wait for the binding lock")
+        .expect("pathless preparation does not require a task store");
+    let source = SessionSource::SubAgent(codex_protocol::protocol::SubAgentSource::ThreadSpawn {
+        parent_thread_id: ThreadId::new(),
+        depth: 1,
+        agent_path: Some(AgentPath::root().join("bound_child").unwrap()),
+        agent_nickname: None,
+        agent_role: None,
+    });
+    assert!(
+        coordinator
+            .prepare_legacy_agent_turn(&source, ThreadId::new())
+            .now_or_never()
+            .is_none(),
+        "path-bearing agents must still wait for atomic binding publication"
+    );
+}
 
 fn assignment_draft() -> AssignmentDraft {
     AssignmentDraft {
@@ -391,12 +420,9 @@ async fn terminal_emission_exports_once_after_diagnostic_event_saturation() {
             exporter.clone(),
         ))
         .expect("metrics client");
-    coordinator
-        .maybe_emit_terminal_metrics(assignment.assignment_id, &telemetry)
-        .await;
-    coordinator
-        .maybe_emit_terminal_metrics(assignment.assignment_id, &telemetry)
-        .await;
+    let sealed = coordinator.get_agent_task(assignment.assignment_id, Some(0)).await.unwrap();
+    coordinator.emit_terminal_metrics_from_snapshot(&sealed, &telemetry);
+    coordinator.emit_terminal_metrics_from_snapshot(&sealed, &telemetry);
 
     let metrics = coordinator
         .metrics
@@ -1206,6 +1232,24 @@ async fn ma008_restart_reconciles_the_retained_exact_terminal_attempt() {
         AgentStatusClaim::NeedsMain
     );
     assert!(task.receipt.unwrap().summary.contains("original result"));
+    let pending = restored
+        .required_store()
+        .unwrap()
+        .pending_terminal_outcomes("root-session")
+        .await
+        .unwrap();
+    assert_eq!(
+        pending.len(),
+        1,
+        "receipt recovery is not parent-delivery acknowledgment"
+    );
+    let pending = pending[0].as_ref().unwrap();
+    assert_eq!(pending.turn_id, "original-turn");
+    assert!(pending.event_json.contains("original result"));
+    restored
+        .acknowledge_terminal_outcome(attempt.attempt_id, "original-turn")
+        .await
+        .unwrap();
     assert!(
         restored
             .required_store()

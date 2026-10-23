@@ -336,6 +336,7 @@ fn exec_command_definition() -> ToolDefinition {
         description: "run a command".into(),
         kind: CodeModeToolKind::Function,
         input_schema: None,
+        namespace_description: None,
         default_timeout_ms: None,
         output_schema: None,
     }
@@ -604,6 +605,7 @@ async fn compact_tool_discovery_resolves_one_exact_description() {
                 description: "exact schema description".into(),
                 kind: CodeModeToolKind::Function,
                 input_schema: None,
+                namespace_description: None,
                 default_timeout_ms: None,
                 output_schema: None,
             }].into(),

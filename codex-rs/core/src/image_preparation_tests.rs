@@ -449,3 +449,28 @@ async fn local_image_acquisition_rejects_oversize_and_non_files_before_conversio
         );
     }
 }
+
+#[test]
+fn audit143_immutable_projection_cache_reuses_validation_without_mutating_source() {
+    let (image_url, _) = png_data_url(2300, 3);
+    let canonical: Arc<[ResponseItem]> = vec![ResponseItem::Message {
+        id: None, role: "user".into(), content: vec![ContentItem::InputImage {
+            image_url, detail: Some(ImageDetail::Original),
+        }], phase: None, internal_chat_message_metadata_passthrough: None,
+    }].into();
+    let first = for_model_image_detail(Arc::clone(&canonical), false);
+    let second = for_model_image_detail(Arc::clone(&canonical), false);
+    assert!(Arc::ptr_eq(&first, &second), "no repeated decode, encode or full-history copy");
+    assert!(Arc::ptr_eq(&for_model_image_detail(Arc::clone(&canonical), true), &canonical));
+    let mut changed = canonical.to_vec();
+    if let ResponseItem::Message { content, .. } = &mut changed[0] {
+        let ContentItem::InputImage { image_url, .. } = &mut content[0] else { panic!("image") };
+        *image_url = "data:image/png;base64,invalid".into();
+    }
+    let rejected = for_model_image_detail(changed.into(), false);
+    assert!(serde_json::to_string(&rejected).unwrap().contains(IMAGE_PROCESSING_ERROR_PLACEHOLDER));
+    let complete_bytes: usize = PROJECTIONS.get().unwrap().lock().unwrap().iter().map(|entry| entry.2).sum();
+    let fragment_bytes: usize = PREPARED_IMAGES.get().unwrap().lock().unwrap().iter().map(|entry| entry.bytes).sum();
+    assert!(complete_bytes <= PROJECTION_CACHE_BYTES);
+    assert!(fragment_bytes <= PROJECTION_CACHE_BYTES);
+}

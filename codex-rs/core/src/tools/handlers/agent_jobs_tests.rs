@@ -1004,7 +1004,10 @@ enum BlockedJobCleanupRoute {
 async fn assert_runner_preserves_worker_until_cleanup(route: BlockedJobCleanupRoute) {
     use sqlx::Connection;
 
-    let item_count = if matches!(route, BlockedJobCleanupRoute::ParentCancellation) {
+    let item_count = if matches!(
+        route,
+        BlockedJobCleanupRoute::ParentCancellation | BlockedJobCleanupRoute::ActiveTimeout
+    ) {
         2
     } else {
         1
@@ -1031,7 +1034,10 @@ async fn assert_runner_preserves_worker_until_cleanup(route: BlockedJobCleanupRo
             .await
             .expect("bind worker")
     );
-    let other_worker = if matches!(route, BlockedJobCleanupRoute::ParentCancellation) {
+    let other_worker = if matches!(
+        route,
+        BlockedJobCleanupRoute::ParentCancellation | BlockedJobCleanupRoute::ActiveTimeout
+    ) {
         let other = manager
             .start_thread((*turn.config).clone())
             .await
@@ -1177,9 +1183,6 @@ async fn assert_runner_preserves_worker_until_cleanup(route: BlockedJobCleanupRo
         !runner.is_finished(),
         "cleanup cannot succeed while terminal work remains"
     );
-    tokio::time::pause();
-    tokio::time::advance(Duration::from_secs(11)).await;
-    tokio::time::resume();
     if let Some(other) = other_worker.as_ref() {
         timeout(Duration::from_secs(5), async {
             loop {
@@ -1195,8 +1198,11 @@ async fn assert_runner_preserves_worker_until_cleanup(route: BlockedJobCleanupRo
             }
         })
         .await
-        .expect("cleanup must attempt both workers regardless of iteration order");
+        .expect("both shutdowns must start before either blocked shutdown times out");
     }
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(11)).await;
+    tokio::time::resume();
     let (result, mut active_items) = timeout(Duration::from_secs(5), runner)
         .await
         .expect("shutdown deadline returns")

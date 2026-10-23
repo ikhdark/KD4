@@ -246,6 +246,55 @@ pub(crate) struct TurnAborted {
 }
 
 impl TurnAborted {
+    pub(crate) fn interrupted_guidance(
+        history: &[ResponseItem],
+        plan: Option<&codex_protocol::plan_tool::UpdatePlanArgs>,
+        developer: bool,
+    ) -> String {
+        let mut guidance = String::from(if developer {
+            Self::INTERRUPTED_DEVELOPER_GUIDANCE
+        } else {
+            Self::INTERRUPTED_GUIDANCE
+        });
+        if let Some(plan) = plan {
+            let unresolved = plan
+                .plan
+                .iter()
+                .filter(|step| step.status != codex_protocol::plan_tool::StepStatus::Completed)
+                .count();
+            guidance.push_str(&format!("\nRetained checklist: {unresolved} unfinished step(s). A terminal turn does not complete the task; consult the retained task state and acceptance obligations before claiming completion."));
+        }
+        let mut results = std::collections::BTreeSet::new();
+        let mut calls = Vec::new();
+        for item in history.iter().rev() {
+            match item {
+                ResponseItem::FunctionCallOutput { call_id, .. }
+                | ResponseItem::CustomToolCallOutput { call_id, .. } => {
+                    results.insert(call_id.as_str());
+                }
+                ResponseItem::FunctionCall { call_id, name, .. }
+                | ResponseItem::CustomToolCall { call_id, name, .. } => {
+                    calls.push(serde_json::json!({
+                        "call_id": codex_utils_string::truncate_middle_chars(call_id, 160),
+                        "tool": codex_utils_string::truncate_middle_chars(name, 80),
+                        "recorded_result": results.contains(call_id.as_str()),
+                    }));
+                    if calls.len() == 32 {
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        if !calls.is_empty() {
+            calls.reverse();
+            guidance.push_str("\nRecent tool-result index (at most 32 calls; a result is an observation, not proof of success or completed effects; absent results remain uncertain):\n");
+            guidance.push_str(&serde_json::Value::Array(calls).to_string());
+            guidance.push_str("\nRead retained results before relaunching work. This index does not authorize resuming work the user stopped.");
+        }
+        guidance
+    }
+
     pub(crate) fn shutdown_guidance(
         history: &[ResponseItem],
         plan: Option<&codex_protocol::plan_tool::UpdatePlanArgs>,
@@ -317,6 +366,25 @@ mod audit110_tests {
     use super::*;
     use codex_protocol::protocol::SamplingBoundaryItem;
     use codex_protocol::protocol::SamplingTimingCheckpoint;
+
+    #[test]
+    fn interruption_indexes_results_without_claiming_success_or_repeating_bodies() {
+        let history = vec![
+            serde_json::from_value(serde_json::json!({"type":"function_call", "call_id":"done", "name":"exec_command", "arguments":"{}"})).unwrap(),
+            serde_json::from_value(serde_json::json!({"type":"function_call_output", "call_id":"done", "output":"failed secret-large-body"})).unwrap(),
+            serde_json::from_value(serde_json::json!({"type":"custom_tool_call", "call_id":"uncertain", "name":"exec", "input":"work"})).unwrap(),
+        ];
+        let notice = TurnAborted::interrupted_guidance(&history, None, true);
+        let index: serde_json::Value =
+            serde_json::from_str(notice.lines().find(|line| line.starts_with('[')).unwrap())
+                .unwrap();
+        assert_eq!(index[0]["call_id"], "done");
+        assert_eq!(index[0]["recorded_result"], true);
+        assert_eq!(index[1]["call_id"], "uncertain");
+        assert_eq!(index[1]["recorded_result"], false);
+        assert!(!notice.contains("secret-large-body"));
+        assert!(notice.contains("does not authorize resuming"));
+    }
 
     #[test]
     fn legacy_boundaries_do_not_invent_logical_generations() {

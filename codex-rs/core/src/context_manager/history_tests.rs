@@ -110,6 +110,39 @@ fn audit_instruction_authority_selected_system_skill_delivery_and_json_boundary(
     assert!(!history.raw_items().contains(&json_example));
 }
 
+#[test]
+fn trusted_turn_contributions_do_not_create_rollback_boundaries() {
+    let first = user_input_text_msg("first request");
+    let second = user_input_text_msg("second request");
+    let literal = user_input_text_msg(&crate::stable_context::turn_contribution_text(0, "literal request"));
+    assert!(is_user_turn_boundary(&literal));
+    let mut contribution = user_input_text_msg(&crate::stable_context::turn_contribution_text(0, "injected"));
+    crate::stable_context::mark_trusted_stable_context_item(&mut contribution);
+    assert!(!is_user_turn_boundary(&contribution));
+    let mut history = create_history_with_items(vec![first.clone(), second.clone(), contribution]);
+    history.drop_last_n_user_turns(1);
+    assert_eq!(history.raw_items(), std::slice::from_ref(&first));
+}
+
+#[test]
+fn sampling_keeps_filtering_receipts_separate_from_active_tail_context() {
+    let contribution = |value: &str| {
+        let mut item = user_input_text_msg(&crate::stable_context::turn_contribution_text(0, value));
+        crate::stable_context::mark_trusted_stable_context_item(&mut item);
+        item
+    };
+    let tail = contribution("active tail");
+    let history = create_history_with_items(vec![
+        contribution("old value"), user_input_text_msg("first request"),
+        contribution("replacement"), user_input_text_msg("second request"), tail.clone(),
+    ]);
+    let prepared = history.prepare_for_sampling_prompt(&default_input_modalities(),
+        crate::stable_context::StableContextTarget::Sampling);
+    assert!(prepared.items().contains(&tail));
+    assert!(prepared.stable_context_manifest().filtering_receipts().iter().any(|receipt| !receipt.active),
+        "latest-wins retirement must remain observable after fail-open assembly");
+}
+
 #[tokio::test]
 async fn continuity_user_authored_context_wrappers_survive_rollback_boundaries() {
     let (session, turn) = crate::session::tests::make_session_and_context().await;
@@ -489,7 +522,7 @@ fn update_plan_pair(
 }
 
 #[test]
-fn plan_history_projection_keeps_only_the_authoritative_current_plan() {
+fn plan_history_reset_projection_keeps_only_the_authoritative_current_plan() {
     let mut items = update_plan_pair(
         "plan-1",
         &"old plan detail ".repeat(500),
@@ -510,7 +543,7 @@ fn plan_history_projection_keeps_only_the_authoritative_current_plan() {
     let prepared = create_history_with_items(items)
         .prepare_for_sampling_prompt_with_completed_tool_projection(
             &default_input_modalities(),
-            StableContextTarget::Sampling,
+            StableContextTarget::FailOpen,
             None,
             &crate::git_workspace::GitWorkspaceCache::new(),
         );
@@ -5491,4 +5524,46 @@ fn ctxaudit_plan_projection_pairs_occurrences_not_raw_ids() {
         items, original,
         "ambiguous legacy results cannot establish an authoritative plan"
     );
+}
+#[test]
+fn audit150_sampling_keeps_accepted_plan_calls_and_outputs_verbatim() {
+    let first = update_plan_pair("plan-a", "{\"plan\":[{\"step\":\"original\"}]}",
+        serde_json::json!({"current_plan":{"plan":[{"step":"original"}]}}));
+    let prepared = create_history_with_items(first.clone())
+        .prepare_for_sampling_prompt_with_completed_tool_projection(&default_input_modalities(),
+            StableContextTarget::Sampling, None, &crate::git_workspace::GitWorkspaceCache::new());
+    assert_eq!(prepared.items(), first.as_slice());
+    let mut next = first.clone();
+    next.push(serde_json::from_value(serde_json::json!({"type":"message","role":"user",
+        "content":[{"type":"input_text","text":"interleaved evidence ".repeat(10_000)}]})).unwrap());
+    next.extend(update_plan_pair("plan-b", "{\"set\":[{\"index\":0,\"status\":\"completed\"}]}",
+        serde_json::json!({"current_plan":{"plan":[{"step":"original","status":"completed"}]}})));
+    let prepared_next = create_history_with_items(next.clone())
+        .prepare_for_sampling_prompt_with_completed_tool_projection(&default_input_modalities(),
+            StableContextTarget::Sampling, None, &crate::git_workspace::GitWorkspaceCache::new());
+    assert!(prepared_next.items().starts_with(prepared.items()));
+    assert_eq!(prepared_next.items(), next.as_slice());
+}
+
+#[test]
+fn audit150_trusted_instruction_replacement_is_append_only_until_reset() {
+    let trusted = |body: &str| {
+        let mut item: ResponseItem = serde_json::from_value(serde_json::json!({"type":"message",
+            "role":"user","content":[{"type":"input_text","text":format!(
+                "# AGENTS.md instructions for /repo\n\n<INSTRUCTIONS>\n{body}\n</INSTRUCTIONS>")}]})).unwrap();
+        crate::stable_context::mark_trusted_stable_context_item(&mut item);
+        item
+    };
+    let request: ResponseItem = serde_json::from_value(serde_json::json!({"type":"message",
+        "role":"user","content":[{"type":"input_text","text":"implement the task"}]})).unwrap();
+    let first = vec![trusted("original rules"), request.clone()];
+    let baseline = crate::stable_context::project_sampling_history_context(first.clone().into());
+    let mut updated = first;
+    updated.push(trusted("replacement rules supersede original rules"));
+    updated.push(request);
+    let sampling = crate::stable_context::project_sampling_history_context(updated.clone().into());
+    assert!(sampling.starts_with(&baseline));
+    assert_eq!(sampling.len(), updated.len());
+    let compacted = crate::stable_context::project_compaction_context(updated.into());
+    assert!(compacted.len() < sampling.len());
 }

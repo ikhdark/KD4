@@ -262,7 +262,7 @@ async fn to_connection_receipt_sender_reaches_the_transport_writer() {
                     range: None,
                 },
             )),
-            write_complete_tx: Some(write_complete_tx),
+            write_complete_tx: Some(write_complete_tx.into()),
         },
     )
     .await;
@@ -730,7 +730,7 @@ async fn stdio_shutdown_releases_backpressure_without_acknowledging_unsent_outpu
             OutgoingEnvelope::ToConnection {
                 connection_id,
                 message,
-                write_complete_tx: Some(receipt),
+                write_complete_tx: Some(receipt.into()),
             },
         );
         tokio::pin!(route);
@@ -776,7 +776,7 @@ async fn closed_stdio_writer_shuts_down_runtime() {
                 id: RequestId::Integer(1),
                 result: json!({}),
             }),
-            write_complete_tx: Some(receipt),
+            write_complete_tx: Some(receipt.into()),
         },
     )
     .await;

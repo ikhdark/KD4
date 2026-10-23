@@ -66,6 +66,23 @@ pub(crate) struct NoopSpawnLifecycle;
 
 impl SpawnLifecycle for NoopSpawnLifecycle {}
 
+/// Records process creation, so an owner can tell a definite pre-creation
+/// failure from a possible start.
+#[derive(Debug)]
+pub(crate) struct ObservedSpawnLifecycle(Arc<AtomicBool>);
+
+impl ObservedSpawnLifecycle {
+    pub(crate) fn new(spawned: Arc<AtomicBool>) -> Self {
+        Self(spawned)
+    }
+}
+
+impl SpawnLifecycle for ObservedSpawnLifecycle {
+    fn after_spawn(&mut self) {
+        self.0.store(true, Ordering::Release);
+    }
+}
+
 pub(crate) type OutputBuffer = Arc<Mutex<HeadTailBuffer>>;
 
 #[expect(
@@ -104,6 +121,7 @@ pub(crate) struct ProcessOutputChunk {
 /// Process-owned terminal output, retained independently of polling and live-event delivery.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct ProcessOutputSnapshot {
+    pub(crate) process_duration: Option<Duration>,
     pub(crate) aggregated_output: Vec<u8>,
     pub(crate) stdout: Vec<u8>,
     pub(crate) stderr: Vec<u8>,
@@ -160,6 +178,7 @@ pub(crate) struct UnifiedExecProcess {
     cancellation_token: CancellationToken,
     termination_requested: AtomicBool,
     silent_for_ms: AtomicU64,
+    silence_notice_at: StdMutex<Option<std::time::Instant>>,
     stdin_closed: AtomicBool,
     termination_lock: Semaphore,
     output_drained: CancellationToken,
@@ -209,7 +228,9 @@ impl UnifiedExecProcess {
         let mut output = self.output_tx.subscribe();
         let cancelled = self.cancellation_token.clone();
         let process = Arc::downgrade(self);
+        let initially_observed_at = self.launch_observed_at;
         let watchdog = async move {
+            let mut last_output_at = initially_observed_at;
             let timeout = Duration::from_millis(stall_timeout_ms);
             let deadline = tokio::time::sleep(timeout);
             tokio::pin!(deadline);
@@ -224,8 +245,10 @@ impl UnifiedExecProcess {
                             Err(broadcast::error::RecvError::Closed) => return,
                             // Lag means output progressed faster than the watchdog read it.
                             Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {
+                                last_output_at = std::time::Instant::now();
                                 if let Some(process) = process.upgrade() {
                                     process.silent_for_ms.store(0, Ordering::Release);
+                                    *process.silence_notice_at.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = None;
                                 }
                                 deadline.as_mut().reset(tokio::time::Instant::now() + timeout);
                                 notice_armed = true;
@@ -243,6 +266,7 @@ impl UnifiedExecProcess {
                         // One notice per silent interval; only real output re-arms it.
                         // Keep diagnostics out of stdout/stderr and the retained artifact.
                         process.silent_for_ms.store(stall_timeout_ms, Ordering::Release);
+                        *process.silence_notice_at.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(last_output_at);
                         let message = format!(
                             "\n[harness: no output observed for {stall_timeout_ms} milliseconds; process exit not observed, termination not requested. Resume this session; do not restart the command.]\n"
                         );
@@ -320,6 +344,7 @@ impl UnifiedExecProcess {
             cancellation_token,
             termination_requested: AtomicBool::new(false),
             silent_for_ms: AtomicU64::new(0),
+            silence_notice_at: StdMutex::new(None),
             stdin_closed: AtomicBool::new(false),
             termination_lock: Semaphore::new(1),
             output_drained,
@@ -489,7 +514,8 @@ impl UnifiedExecProcess {
         match &self.raw_output_artifact {
             Some(artifact) => {
                 // Only spilled output needs the writer to catch up. This signal
-                // precedes final fsync; inline responses never wait for the sink.
+                // follows finalization (metadata and unlock; data sync stays
+                // deferred); inline responses never wait for the sink.
                 if self.output_closed.load(Ordering::Acquire)
                     && self.completion_output_buffer.lock().await.retained_bytes()
                         > crate::tools::command_output_artifact::LAZY_RAW_OUTPUT_ARTIFACT_THRESHOLD_BYTES
@@ -526,6 +552,7 @@ impl UnifiedExecProcess {
         let (stdout, stdout_exact) = snapshot_retained_output(&self.stdout_buffer).await;
         let (stderr, stderr_exact) = snapshot_retained_output(&self.stderr_buffer).await;
         ProcessOutputSnapshot {
+            process_duration: self.observed_lifetime(),
             aggregated_output,
             stdout,
             stderr,
@@ -642,6 +669,13 @@ impl UnifiedExecProcess {
             UnifiedExecError::process_failed("termination gate is closed".to_string())
         })?;
         if self.has_exited() {
+            // Root exit is independent of reader custody. Explicit cancellation
+            // still releases inherited pipes without signalling the dead root.
+            match &self.process_handle {
+                ProcessHandle::Local(handle) => handle.finish(),
+                ProcessHandle::ExecServer(handle) => handle.terminate().await
+                    .map_err(|error| UnifiedExecError::process_failed(error.to_string()))?,
+            }
             self.finish_termination();
             return Ok(());
         }
@@ -712,11 +746,15 @@ impl UnifiedExecProcess {
         let interrupt =
             tty || matches!(&self.process_handle, ProcessHandle::Local(_)) && !cfg!(windows);
         let silent_for_ms = self.silent_for_ms.load(Ordering::Acquire);
+        let silent_for_ms = if silent_for_ms == 0 { 0 } else {
+            self.silence_notice_at.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+                .map_or(silent_for_ms, |at| u64::try_from(at.elapsed().as_millis()).unwrap_or(u64::MAX))
+        };
         crate::tools::context::ExecSessionCapabilities {
             incarnation: self.incarnation,
             stdin: running && tty && !self.stdin_closed.load(Ordering::Acquire),
             interrupt: running && interrupt,
-            cancellation: running,
+            cancellation: running || !self.output_closed.load(Ordering::Acquire),
             polling: true,
             observation: (silent_for_ms != 0).then_some(
                 crate::tools::context::ExecSilenceObservation {

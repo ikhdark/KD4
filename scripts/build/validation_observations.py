@@ -68,6 +68,9 @@ def source_observations(
     budget = [max_bytes]
     remaining = max_entries
     results = []
+    # Invocation-local only: sharing observations never authorizes later replay.
+    directories = {}
+    observations = {}
     for root in sorted({Path(root).absolute() for root in roots}, key=str):
         stack, records, incomplete = [root], [], False
         while stack:
@@ -80,26 +83,29 @@ def source_observations(
                 ):
                     incomplete = True
                     continue
-                with os.scandir(directory) as entries:
-                    bounded = []
-                    for entry in entries:
-                        if remaining <= 0:
-                            incomplete = True
-                            break
-                        remaining -= 1
-                        bounded.append(entry)
+                if directory not in directories:
+                    bounded, truncated = [], False
+                    with os.scandir(directory) as entries:
+                        for entry in entries:
+                            if remaining <= 0:
+                                truncated = True
+                                break
+                            remaining -= 1
+                            bounded.append(entry)
+                    directories[directory] = (bounded, truncated)
+                bounded, truncated = directories[directory]
+                incomplete |= truncated
                 for entry in sorted(bounded, key=lambda entry: entry.name):
                     path = Path(entry.path)
                     if entry.is_dir(follow_symlinks=False):
                         if entry.name not in EXCLUDED_OUTPUT_DIRECTORIES:
                             stack.append(path)
                     else:
-                        observed = file_observation(path, budget)
+                        if path not in observations:
+                            observations[path] = file_observation(path, budget)
+                        observed = observations[path]
                         records.append((path.relative_to(root).as_posix(), observed))
                         incomplete |= observed["state"] != "observed"
-                if remaining <= 0 or budget[0] <= 0:
-                    incomplete |= bool(stack)
-                    break
             except (OSError, ValueError):
                 incomplete = True
         digest = hashlib.sha256(

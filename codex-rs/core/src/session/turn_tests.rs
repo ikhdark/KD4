@@ -2165,6 +2165,92 @@ async fn deferred_tool_schema_survives_sampling_error_exit() {
     assert!(turn_context.deferred_tool_is_activated(&discovered_during_request));
 }
 
+#[tokio::test]
+async fn deferred_activation_survives_transient_capability_absence() {
+    let (_, turn_context) = crate::session::tests::make_session_and_context().await;
+    let tool = codex_tools::ToolName::namespaced("mcp__calendar", "create_event");
+    let available = Arc::new(HashMap::from([(tool.clone(), "calendar-v1".to_string())]));
+    turn_context.refresh_deferred_tool_capabilities(Arc::clone(&available));
+    turn_context.activate_deferred_tools(std::iter::once(tool.clone()));
+    assert!(turn_context.deferred_tool_is_activated(&tool));
+
+    // A router built from a timed-out MCP capture registers no MCP tools.
+    turn_context.refresh_deferred_tool_capabilities(Arc::new(HashMap::new()));
+    assert!(
+        !turn_context.deferred_tool_is_activated(&tool),
+        "an unregistered capability must never be treated as activated"
+    );
+    assert!(!turn_context.activated_deferred_tools().contains(&tool));
+
+    // The next coherent capture registers the same contract again.
+    turn_context.refresh_deferred_tool_capabilities(available);
+    assert!(
+        turn_context.deferred_tool_is_activated(&tool),
+        "a transient absence must not revoke an activation whose revision is unchanged"
+    );
+    assert!(turn_context.activated_deferred_tools().contains(&tool));
+}
+
+#[tokio::test]
+async fn deferred_activation_drops_on_changed_capability_revision() {
+    let (_, turn_context) = crate::session::tests::make_session_and_context().await;
+    let tool = codex_tools::ToolName::namespaced("mcp__calendar", "create_event");
+    let original = Arc::new(HashMap::from([(tool.clone(), "calendar-v1".to_string())]));
+    turn_context.refresh_deferred_tool_capabilities(Arc::clone(&original));
+    turn_context.activate_deferred_tools(std::iter::once(tool.clone()));
+    assert!(turn_context.deferred_tool_is_activated(&tool));
+
+    // A changed contract is stale: the activation is removed, not parked.
+    turn_context.refresh_deferred_tool_capabilities(Arc::new(HashMap::from([(
+        tool.clone(),
+        "calendar-v2".to_string(),
+    )])));
+    assert!(!turn_context.deferred_tool_is_activated(&tool));
+    turn_context.refresh_deferred_tool_capabilities(original);
+    assert!(
+        !turn_context.deferred_tool_is_activated(&tool),
+        "a revision change must discard the activation even if the old contract returns"
+    );
+}
+
+#[tokio::test]
+async fn mcp_discovery_completion_supersedes_only_a_delivered_notice() {
+    let (session, turn) = crate::session::tests::make_session_and_context().await;
+    let marker = "mcp_catalog_availability";
+    // Negative control: a session never told discovery was incomplete hears nothing.
+    assert!(
+        !supersede_context_notice_if_present(&session, &turn, marker, MCP_DISCOVERY_COMPLETE_NOTICE)
+            .await
+            .unwrap()
+    );
+    assert!(retained_context_notices(session.clone_history().await.raw_items(), marker).is_empty());
+
+    let incomplete = "MCP discovery is incomplete. Already advertised tools remain usable. Pending servers: [\"slow\"]. Failed or cancelled servers: []. A later step may discover more capabilities.";
+    assert!(
+        record_context_notice_if_changed(&session, &turn, marker, incomplete)
+            .await
+            .unwrap()
+    );
+    // Once every server settles, the stale notice is superseded exactly once.
+    assert!(
+        supersede_context_notice_if_present(&session, &turn, marker, MCP_DISCOVERY_COMPLETE_NOTICE)
+            .await
+            .unwrap()
+    );
+    assert!(
+        !supersede_context_notice_if_present(&session, &turn, marker, MCP_DISCOVERY_COMPLETE_NOTICE)
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        retained_context_notices(session.clone_history().await.raw_items(), marker),
+        vec![
+            incomplete.to_string(),
+            MCP_DISCOVERY_COMPLETE_NOTICE.to_string()
+        ]
+    );
+}
+
 #[test]
 fn audit_reports_17_19_retry_preserves_accepted_history_and_retry_limit() -> Result<()> {
     run_turn_multi_thread_test_with_stack("audit_reports_17_19_retry", || async {
@@ -5176,6 +5262,7 @@ fn legacy_explicit_skill_items_share_one_hard_budget() {
         codex_context_fragments::MAX_MODEL_CONTEXT_TOKENS,
     );
     let skill = |name: &str, contents: String| codex_core_skills::injection::SkillInjection {
+        source_id: None,
         name: name.to_string(),
         path: format!("/skills/{name}/SKILL.md"),
         contents,
@@ -5214,6 +5301,7 @@ fn legacy_skill_truncated_at_budget_edge_stays_contextual() {
         codex_context_fragments::MAX_MODEL_CONTEXT_TOKENS,
     );
     let skill = |name: &str, contents: String| codex_core_skills::injection::SkillInjection {
+        source_id: None,
         name: name.to_string(),
         path: format!("/skills/{name}/SKILL.md"),
         contents,
@@ -6684,6 +6772,144 @@ async fn projected_pressure_retirement_declines_when_the_projected_prompt_still_
         "the accepted retirement records a checkpoint"
     );
     Ok(())
+}
+
+#[test]
+fn failed_local_compaction_falls_back_to_exact_retirement() -> Result<()> {
+    run_turn_multi_thread_test_with_stack(
+        "failed_local_compaction_falls_back_to_exact_retirement",
+        failed_local_compaction_falls_back_to_exact_retirement_impl,
+    )
+}
+
+/// Audit 146: a provider without remote compaction (or a custom compact
+/// prompt) has no remote summary to fall back from. A rejected local summary
+/// gets the exact retirement a rejected remote summary already gets, and the
+/// turn continues only when that retirement clears the measured pressure.
+async fn failed_local_compaction_falls_back_to_exact_retirement_impl() -> Result<()> {
+    crate::test_harness::require_network!();
+    for reachable in [true, false] {
+        let server = responses::start_mock_server().await;
+        // Neither the summary nor its one corrective attempt is a checkpoint.
+        let rejected = || {
+            responses::sse(vec![
+                responses::ev_response_created("compaction"),
+                responses::ev_assistant_message("summary", "not a checkpoint"),
+                responses::ev_completed("compaction"),
+            ])
+        };
+        let requests =
+            responses::mount_sse_sequence(&server, vec![rejected(), rejected()]).await;
+        let home = tempfile::tempdir()?;
+        let provider = non_openai_model_provider(&server);
+        let (session, turn_context, _) =
+            crate::session::tests::make_session_and_context_with_auth_config_home_and_rx(
+                CodexAuth::from_api_key("test key"),
+                Vec::new(),
+                home.path(),
+                move |config| {
+                    config.model_provider = provider;
+                    config.model_provider.stream_max_retries = Some(0);
+                    config.model_auto_compact_token_limit = Some(100_000);
+                    config.model_auto_compact_token_limit_scope =
+                        codex_protocol::config_types::AutoCompactTokenLimitScope::Total;
+                },
+            )
+            .await;
+        // Four single-read generations: routine retirement keeps the newest
+        // three inline, retirement after a failed summary keeps only one.
+        seed_retirable_consumed_outputs(&session, 4).await;
+        let limit = turn_context
+            .model_info
+            .auto_compact_token_limit()
+            .expect("fixture configures an automatic-compaction limit");
+        let (routine, after_failure) = {
+            let state = session.state.lock().await;
+            (
+                state
+                    .history
+                    .pressure_retirement_selection(CONTEXT_PRESSURE_KEPT_GENERATIONS, u64::MAX)
+                    .1,
+                state
+                    .history
+                    .pressure_retirement_selection(FAILED_COMPACTION_KEPT_GENERATIONS, u64::MAX)
+                    .1,
+            )
+        };
+        let (routine, after_failure) = (i64::try_from(routine)?, i64::try_from(after_failure)?);
+        assert!(
+            routine > 0 && after_failure > routine,
+            "fixture must leave more to retire after a failed summary"
+        );
+        // Routine retirement cannot clear either overflow, so the summary runs.
+        let overflow = if reachable {
+            (routine + after_failure) / 2
+        } else {
+            2 * after_failure
+        };
+        let pressure = ProjectedPromptPressure {
+            total_tokens: limit + overflow,
+            auto_compact_scope_tokens: limit + overflow,
+        };
+        let step = session
+            .capture_step_context(Arc::clone(&turn_context))
+            .await
+            .unwrap();
+        let mut client = session.services.model_client.new_session();
+        let result = run_auto_compact(
+            &session,
+            step,
+            None,
+            &mut client,
+            None,
+            None,
+            CompactionReason::ContextLimit,
+            CompactionPhase::PreTurn,
+            ConsumedOutputRetirement::Eligible {
+                projected_pressure: Some(pressure),
+            },
+            &CancellationToken::new(),
+        )
+        .await;
+        assert_eq!(
+            requests.requests().len(),
+            2,
+            "the summary and its corrective attempt were both requested"
+        );
+        let retired = crate::tool_history::ToolHistoryState::has_phase_checkpoint(
+            session.state.lock().await.history.raw_items(),
+        );
+        if reachable {
+            assert_eq!(
+                result.expect("exact retirement continues the turn"),
+                ContextPressureRelief::Compaction
+            );
+            assert!(retired, "the fallback records its retirement checkpoint");
+        } else {
+            let error = result.expect_err("retirement cannot clear this pressure");
+            assert!(
+                error
+                    .to_string()
+                    .contains("default compaction requires structured checkpoint sections"),
+                "the summary failure is reported unchanged: {error}"
+            );
+            assert!(!retired, "a declined fallback must not retire evidence");
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn recovered_compaction_failure_does_not_tell_the_user_to_start_over() {
+    let overflow = recovered_compaction_failure(&CodexErr::ContextWindowExceeded);
+    assert!(!overflow.contains("Start a new thread"), "{overflow}");
+    assert!(overflow.contains("context window"), "{overflow}");
+    // Negative control: other failures keep their own text, without the
+    // doubled period the caller's sentence would otherwise add.
+    assert_eq!(
+        recovered_compaction_failure(&CodexErr::Fatal("summary rejected.".into())),
+        "Fatal error: summary rejected"
+    );
 }
 
 #[test]
@@ -11518,6 +11744,12 @@ async fn audit115_failing_validation_turn(changes_sources: bool) -> Result<()> {
         .collect::<Vec<_>>();
     if changes_sources {
         assert_eq!(sent.len(), 4, "{completion:?}");
+        let early = sent[2].message_input_texts("developer").into_iter()
+            .filter(|text| text.contains("Known completion blockers before sampling"))
+            .collect::<Vec<_>>();
+        assert_eq!(early.len(), 1, "owned failures must be visible before the first report");
+        assert!(early[0].contains("Resolve current failed validation"));
+        assert!(early[0].contains("does not authorize tests"));
         assert!(
             repairs[..3].iter().all(std::vec::Vec::is_empty),
             "{repairs:?}"
@@ -11539,6 +11771,9 @@ async fn audit115_failing_validation_turn(changes_sources: bool) -> Result<()> {
     } else {
         assert!(completion.error.is_none(), "{completion:?}");
         assert_eq!(sent.len(), 2, "no repair request: {repairs:?}");
+        assert!(sent.iter().all(|request| !request.message_input_texts("developer").iter()
+            .any(|text| text.contains("Known completion blockers before sampling"))),
+            "a no-source-change report must not acquire an early validation-repair instruction");
         let assessment = completion
             .timing
             .as_ref()
@@ -11800,6 +12035,131 @@ fn audit_provider_overflow_recovers_once_in_the_same_turn() -> Result<()> {
             }
             assert_eq!(requests.requests().len(), 3);
         }
+        Ok(())
+    })
+}
+
+/// Sampling admission refuses a projected prompt before dispatch; the provider
+/// never measured it. Each crossing is relieved like a limit found after
+/// sampling instead of spending the turn's one provider-overflow recovery, so
+/// a second crossing in a long turn compacts again rather than failing it.
+#[test]
+fn admission_refusal_is_relieved_at_each_crossing_in_the_same_turn() -> Result<()> {
+    run_turn_multi_thread_test_with_stack("admission_refusal_relief", || async {
+        crate::test_harness::require_network!();
+        let server = responses::start_mock_server().await;
+        // Usage reports almost nothing after sampling. Only admission's
+        // projection of the next prompt charges the long commentary, which
+        // compaction does not retain, so the next prompt crosses the limit.
+        let crossing = |id: &str, fill: &str| {
+            responses::sse(vec![
+                responses::ev_assistant_message(&format!("{id}-progress"), &fill.repeat(400_000)),
+                responses::ev_function_call(&format!("{id}-call"), "unknown_test_tool", "{}"),
+                responses::ev_completed_with_tokens(id, 1_000),
+            ])
+        };
+        let summary = |id: &str| {
+            responses::sse(vec![
+                responses::ev_assistant_message(id, &complete_compaction_summary("continue")),
+                responses::ev_completed_with_tokens(id, 1_000),
+            ])
+        };
+        let requests = responses::mount_sse_sequence(
+            &server,
+            vec![
+                crossing("first", "a"),
+                summary("first-compaction"),
+                crossing("second", "b"),
+                summary("second-compaction"),
+                responses::sse(vec![
+                    responses::ev_assistant_message("answer", "recovered answer"),
+                    responses::ev_completed_with_tokens("done", 1_000),
+                ]),
+            ],
+        )
+        .await;
+        let provider = non_openai_model_provider(&server);
+        let test = test_codex()
+            .with_config(move |config| {
+                config.model_provider = provider;
+                config.model_provider.stream_max_retries = Some(0);
+                config.model_auto_compact_token_limit = Some(60_000);
+                config.model_context_window = Some(400_000);
+            })
+            .build(&server)
+            .await?;
+        let completion = test
+            .submit_turn_and_capture_completion("Run the task")
+            .await?;
+        assert!(completion.error.is_none(), "{completion:?}");
+        assert_eq!(
+            completion.last_agent_message.as_deref(),
+            Some("recovered answer")
+        );
+        assert_eq!(requests.requests().len(), 5);
+        Ok(())
+    })
+}
+
+/// A summary leaves no smaller history to summarize. When the summarized
+/// prompt still overflows before any request completes, the turn ends rather
+/// than spending another summary on the same history.
+#[test]
+fn overflow_after_an_unsampled_summary_ends_the_turn() -> Result<()> {
+    run_turn_multi_thread_test_with_stack("overflow_after_unsampled_summary", || async {
+        crate::test_harness::require_network!();
+        let server = responses::start_mock_server().await;
+        responses::mount_sse_sequence(
+            &server,
+            vec![
+                // Admission refuses the follow-up, and a summary relieves it.
+                responses::sse(vec![
+                    responses::ev_assistant_message("progress", &"a".repeat(400_000)),
+                    responses::ev_function_call("call", "unknown_test_tool", "{}"),
+                    responses::ev_completed_with_tokens("first", 1_000),
+                ]),
+                responses::sse(vec![
+                    responses::ev_assistant_message(
+                        "summary",
+                        &complete_compaction_summary("continue"),
+                    ),
+                    responses::ev_completed_with_tokens("compaction", 1_000),
+                ]),
+                // The provider still rejects the summarized prompt.
+                responses::sse_failed(
+                    "overflow",
+                    "context_length_exceeded",
+                    "context window exceeded",
+                ),
+            ],
+        )
+        .await;
+        let provider = non_openai_model_provider(&server);
+        let test = test_codex()
+            .with_config(move |config| {
+                config.model_provider = provider;
+                config.model_provider.stream_max_retries = Some(0);
+                config.model_auto_compact_token_limit = Some(60_000);
+                config.model_context_window = Some(400_000);
+            })
+            .build(&server)
+            .await?;
+        let completion = test
+            .submit_turn_and_capture_completion("Run the task")
+            .await?;
+        assert_eq!(
+            completion.error.as_ref().map(|error| error.message.as_str()),
+            Some(CodexErr::ContextWindowExceeded.to_string().as_str()),
+            "{completion:?}"
+        );
+        let model_requests = server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|request| request.url.path() == "/v1/responses")
+            .count();
+        assert_eq!(model_requests, 3, "the summarized history was summarized again");
         Ok(())
     })
 }
@@ -12280,4 +12640,57 @@ fn accepted_final_identity_is_scoped_to_the_accepted_completion_attempt() -> Res
         );
         Ok(())
     })
+}
+
+#[tokio::test]
+async fn audit143_slow_history_commit_keeps_later_admitted_tools_polled() {
+    let (session, turn) = crate::session::tests::make_session_and_context().await;
+    let session = Arc::new(session);
+    let commit = session.durable_history_commit_gate.acquire().await.unwrap();
+    let (later_tx, mut later_rx) = tokio::sync::oneshot::channel();
+    let mut in_flight: FuturesOrdered<BoxFuture<'static, InFlightToolResult>> = FuturesOrdered::new();
+    in_flight.push_back(Box::pin(InFlightToolCall::from_test_future("first", Box::pin(async {
+        Err(CodexErr::Fatal("first".into()))
+    })).into_future()));
+    in_flight.push_back(Box::pin(InFlightToolCall::from_test_future("second", Box::pin(async move {
+        // A real asynchronous boundary makes this future pending on the first
+        // collection poll; it must be polled again while the commit is blocked.
+        tokio::task::yield_now().await;
+        let _ = later_tx.send(());
+        Err(CodexErr::Fatal("second".into()))
+    })).into_future()));
+    let drain = drain_in_flight(&mut in_flight, Arc::clone(&session), Arc::new(turn));
+    tokio::pin!(drain);
+    tokio::select! {
+        result = &mut drain => panic!("commit must still be blocked: {result:?}"),
+        _ = &mut later_rx => {}
+        _ = tokio::time::sleep(Duration::from_secs(2)) => panic!("later tool was starved by commit"),
+    }
+    drop(commit);
+    assert!(matches!(drain.await, Err(CodexErr::Fatal(message)) if message == "first"));
+    let history = session.clone_history().await;
+    let calls = history.raw_items().iter().filter_map(|item| match item {
+        ResponseItem::FunctionCallOutput { call_id, .. } if call_id == "first" || call_id == "second" => Some(call_id.as_str()),
+        _ => None,
+    }).collect::<Vec<_>>();
+    assert_eq!(calls, ["first", "second"]);
+}
+#[test]
+fn audit150_skill_revisions_are_owner_bound_and_append_only_until_compaction() {
+    let skill = |owner: char, body: &str| codex_core_skills::injection::SkillInjection {
+        source_id:Some(owner.to_string().repeat(24)), name:"selected".into(),
+        path:"/skills/shared/SKILL.md".into(),contents:body.into(),scope:codex_protocol::protocol::SkillScope::User,
+    };
+    let items=build_bounded_skill_context_items([
+        &skill('a',"v1"),&skill('a',"v2"),&skill('b',"independent-provider"),&skill('a',"v1"),
+    ]);
+    assert!(items.iter().all(crate::stable_context::is_trusted_selected_skill_item));
+    let sampling=crate::stable_context::project_sampling_history_context(items.clone().into());
+    assert_eq!(sampling,items);
+    let compacted=crate::stable_context::project_compaction_context(items.into());
+    assert_eq!(compacted.len(),2);
+    let text=response_input_texts(&compacted);
+    assert!(text.iter().any(|body|body.contains("independent-provider")));
+    assert!(text.iter().any(|body|body.contains("\nv1\n")));
+    assert!(!text.iter().any(|body|body.contains("\nv2\n")));
 }

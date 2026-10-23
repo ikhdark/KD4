@@ -14,6 +14,7 @@ pub struct CommandValidation {
     pub declared: Option<codex_protocol::validation::ValidationCommandContext>,
     pub classification: ValidationClassification,
     pub receipt_runner: Option<String>,
+    pub admission_runner: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
@@ -89,7 +90,9 @@ impl CommandValidation {
 fn validation_signals_require_executing_or_checking_modes() {
     for (command, proof, tests, mode) in [
         ("cargo test", true, true, "execution"),
-        ("cargo bench --no-run", false, false, "compilation_only"),
+        ("cargo bench --no-run", true, false, "compilation_only"),
+        ("cargo check --tests", true, false, "checking"),
+        ("cargo test --no-run", true, false, "compilation_only"),
         ("cargo test -- --list", false, false, "listing"),
         ("cargo test -- --help", false, false, "listing"),
         ("cargo test -- -h", false, false, "listing"),
@@ -100,7 +103,7 @@ fn validation_signals_require_executing_or_checking_modes() {
         ("just --dry-run test", false, false, "dry_run"),
         (
             "cargo nextest run --no-run",
-            false,
+            true,
             false,
             "compilation_only",
         ),
@@ -109,6 +112,7 @@ fn validation_signals_require_executing_or_checking_modes() {
             execution_context: None,
             declared: None,
             receipt_runner: None,
+            admission_runner: None,
             classification: classify_validation_script(command),
         };
         let signal = validation.signal();
@@ -147,6 +151,7 @@ fn syntax_only_shell_wrappers_do_not_prove_validation() {
                 declared: None,
                 classification: classify_validation(&invocation),
                 receipt_runner: None,
+                admission_runner: None,
             };
             assert_eq!(validation.signal()["proof"], proof, "{program} {args:?}");
         }
@@ -176,6 +181,7 @@ fn validation_shell_mode_proof_bounded_benchmark() {
                 declared: None,
                 classification: classify_validation(std::hint::black_box(&invocation)),
                 receipt_runner: None,
+                admission_runner: None,
             };
             proofs += usize::from(std::hint::black_box(validation.signal())["proof"] == true);
         }
@@ -284,6 +290,10 @@ fn parse_repository_runners(bytes: &[u8]) -> Runners {
                 .passthrough_after
                 .as_ref()
                 .is_some_and(|separator| separator.is_empty() || runner.receipt_runner.is_some())
+                || runner.passthrough_args.is_some_and(|skip| {
+                    skip == 0 || skip > 16 || runner.receipt_runner.is_some()
+                        || runner.passthrough_after.is_some()
+                })
         })
     {
         return Vec::new();
@@ -485,6 +495,19 @@ pub async fn resolve_command_validation_with_shell(
     cwd: Option<&std::path::Path>,
     declared: Option<codex_protocol::validation::ValidationCommandContext>,
 ) -> Option<CommandValidation> {
+    resolve_command_launch_analysis_with_shell(invocation, shell_type, cwd, declared)
+        .await
+        .0
+}
+
+/// Keep native syntax work on the analysis worker, including observation policy.
+/// Argument decoding and Code Mode preflight must remain structural only.
+pub async fn resolve_command_launch_analysis_with_shell(
+    invocation: &CommandInvocation,
+    shell_type: Option<codex_shell_command::shell_detect::ShellType>,
+    cwd: Option<&std::path::Path>,
+    declared: Option<codex_protocol::validation::ValidationCommandContext>,
+) -> (Option<CommandValidation>, bool) {
     let invocation = match invocation {
         CommandInvocation::Script(script)
             if shell_type == Some(codex_shell_command::shell_detect::ShellType::PowerShell) =>
@@ -538,18 +561,26 @@ pub async fn resolve_command_validation_with_shell(
             .and_then(|argv| argv.split_first())
             .and_then(|(program, args)| runners.iter().find(|runner| runner.matches(program, args)))
             .and_then(|runner| runner.receipt_runner.clone());
-        (declared.is_some()
+        let admission_runner = argv
+            .as_ref()
+            .and_then(|argv| argv.split_first())
+            .and_then(|(program, args)| runners.iter().find(|runner| runner.matches(program, args)))
+            .and_then(|runner| runner.admission_runner.clone());
+        let long_running = matches!(classification, ValidationClassification::Validation { .. })
+            || prefers_long_observation_wait(&invocation);
+        let validation = (declared.is_some()
             || matches!(classification, ValidationClassification::Validation { .. }))
         .then_some(CommandValidation {
             execution_context: None,
             declared,
             classification,
             receipt_runner,
-        })
+            admission_runner,
+        });
+        (validation, long_running)
     })
     .await
-    .ok()
-    .flatten()
+    .unwrap_or_default()
 }
 
 pub fn classify_validation(invocation: &CommandInvocation) -> ValidationClassification {
@@ -1382,8 +1413,8 @@ mod tests {
                     operation: ValidationOperation::Check,
                     mode: codex_shell_command::validation::ValidationExecutionMode::Checking,
                 }],
-                has_unclassified_targets: false,
-                exit_code_is_authoritative: true,
+                has_unclassified_targets: true,
+                exit_code_is_authoritative: false,
             },
         );
     }
@@ -1410,6 +1441,7 @@ mod audit36_validation_regressions {
             execution_context: None,
             declared: None,
             receipt_runner: None,
+            admission_runner: None,
             classification: classify_validation(&invocation),
         }
         .signal()["proof"]

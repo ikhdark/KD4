@@ -187,6 +187,9 @@ impl GitWorkspaceMetadata {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub(crate) struct WorkspaceEvidenceIdentity {
+    // These fingerprints combine independent observations. Equality is useful
+    // for invalidation, but never proves current bytes or one coherent snapshot
+    // against arbitrary external writers. Consumers must retain that scope.
     /// Repository discovery or capture failed. Unlike a proven non-Git `None`, this
     /// value never authorizes reuse, even when two failed captures are equal.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -431,11 +434,13 @@ pub(crate) async fn git_ignored_paths(root: &Path, paths: &[PathBuf]) -> BTreeSe
             continue;
         }
         if bytes + len > 8 * 1024 {
-            ignored.extend(
-                git_ignored_path_batch(root, &batch)
-                    .await
-                    .unwrap_or_default(),
-            );
+            let Some(excluded) = git_ignored_path_batch(root, &batch).await else {
+                // A failed Git query proves nothing about the remaining paths.
+                // Keep earlier proofs, but do not repeat a failing timeout for
+                // every batch while workspace evidence waits on the watcher.
+                return ignored;
+            };
+            ignored.extend(excluded);
             batch.clear();
             bytes = 0;
         }
@@ -603,6 +608,19 @@ async fn capture_remote_workspace_evidence(
     environment: &codex_exec_server::Environment,
     cwd: &PathUri,
 ) -> Option<Option<WorkspaceEvidenceIdentity>> {
+    // A status/read sequence is an observation, not an atomic snapshot. Two
+    // matching bounded passes reject detected membership/content interleavings.
+    tokio::time::timeout(WORKSPACE_GENERATION_DEADLINE, async {
+        let first = capture_remote_workspace_evidence_once(environment, cwd).await?;
+        let second = capture_remote_workspace_evidence_once(environment, cwd).await?;
+        (first == second).then_some(second)
+    }).await.ok()?
+}
+
+async fn capture_remote_workspace_evidence_once(
+    environment: &codex_exec_server::Environment,
+    cwd: &PathUri,
+) -> Option<Option<WorkspaceEvidenceIdentity>> {
     let fs = environment.get_filesystem();
     let cwd = fs.canonicalize(cwd, None).await.ok()?;
     if !fs.get_metadata(&cwd, None).await.ok()?.is_directory {
@@ -664,8 +682,11 @@ async fn capture_remote_workspace_evidence(
     // Only independent files overlap. Each file retains its metadata/read/
     // metadata chain, and all workers share one allowance. Return digests rather
     // than file bodies so ordered assembly cannot retain N large buffers.
+    // Refill from whichever file finishes first; restore canonical path order
+    // only after all observations succeed.
     let mut observations = futures::stream::iter(paths)
-        .map(|observation| {
+        .enumerate()
+        .map(|(index, observation)| {
             let fs = &fs;
             let root = &root;
             let remaining = &remaining;
@@ -676,7 +697,7 @@ async fn capture_remote_workspace_evidence(
                     Ok(metadata) if !observation.deleted => metadata,
                     Err(error) if error.kind() == ErrorKind::NotFound && observation.deleted => {
                         entry.extend_from_slice(b"\0deleted\0\n");
-                        return Some((entry, Some(path)));
+                        return Some((index, entry, Some(path)));
                     }
                     _ => return None,
                 };
@@ -699,12 +720,16 @@ async fn capture_remote_workspace_evidence(
                 entry.push(0);
                 entry.extend_from_slice(hex::encode(Sha256::digest(&contents)).as_bytes());
                 entry.push(b'\n');
-                Some((entry, None))
+                Some((index, entry, None))
             }
         })
-        .buffered(8);
+        .buffer_unordered(8);
+    let mut completed = Vec::new();
     while let Some(observation) = observations.next().await {
-        let (entry, deletion) = observation?;
+        completed.push(observation?);
+    }
+    completed.sort_unstable_by_key(|(index, _, _)| *index);
+    for (_, entry, deletion) in completed {
         manifest.extend_from_slice(&entry);
         if let Some(path) = deletion {
             deletions.push(path);
@@ -775,7 +800,12 @@ async fn capture_workspace_generation_marker(
     };
     let (status, paths) = workspace_generation_status(&repo_root).await?;
     let head_identity = workspace_head_identity(&status)?;
-    let metadata = capture_workspace_metadata(repo_root.clone(), paths, control).await?;
+    let epoch = SHARED_WORKSPACE_CAPTURE_EPOCH.load(Ordering::Acquire);
+    let config = workspace_generation_git_output(&repo_root, &["config", "--null", "--list", "--show-origin"]).await?;
+    let metadata = shared_workspace_metadata(repo_root.clone(), paths, &status, &config).await?;
+    if !control.active() || SHARED_WORKSPACE_CAPTURE_EPOCH.load(Ordering::Acquire) != epoch {
+        return None;
+    }
 
     let mut index_hasher = Sha256::new();
     index_hasher.update(b"KD4_WORKSPACE_INDEX_GENERATION_V1\n");
@@ -788,9 +818,9 @@ async fn capture_workspace_generation_marker(
     let mut reader = WorkspaceStatusReader::new();
     reader.push(&status)?;
     let mut path_fingerprints = reader.path_status;
-    for (path, content) in metadata.path_fingerprints {
+    for (path, content) in &metadata.path_fingerprints {
         path_fingerprints
-            .entry(path)
+            .entry(path.clone())
             .or_default()
             .push_str(&content);
     }
@@ -990,9 +1020,69 @@ fn workspace_head_identity(status: &[u8]) -> Option<Option<String>> {
     (!head.is_empty()).then(|| Some(head.to_string()))
 }
 
+#[derive(Clone)]
 struct WorkspaceGenerationMetadata {
     manifest: Vec<u8>,
     path_fingerprints: BTreeMap<String, String>,
+}
+
+static SHARED_WORKSPACE_CAPTURE_EPOCH: AtomicU64 = AtomicU64::new(0);
+
+struct SharedWorkspaceMetadata {
+    future: Shared<BoxFuture<'static, Option<Arc<WorkspaceGenerationMetadata>>>>,
+}
+
+/// Share active local read AND verification work, never attribution or receipts.
+/// Weak entries retain no completed result and cannot keep abandoned I/O alive.
+async fn shared_workspace_metadata(
+    root: PathBuf,
+    paths: Vec<WorkspaceGenerationPath>,
+    status: &[u8],
+    config: &[u8],
+) -> Option<Arc<WorkspaceGenerationMetadata>> {
+    type Key = (PathBuf, String, u64);
+    static ACTIVE: std::sync::LazyLock<StdMutex<HashMap<Key, std::sync::Weak<SharedWorkspaceMetadata>>>> =
+        std::sync::LazyLock::new(|| StdMutex::new(HashMap::new()));
+    let mut fingerprint = Sha256::new();
+    fingerprint.update(b"local-workspace-metadata-v1\0");
+    fingerprint.update(status.len().to_le_bytes());
+    fingerprint.update(status);
+    fingerprint.update(config);
+    let epoch = SHARED_WORKSPACE_CAPTURE_EPOCH.load(Ordering::Acquire);
+    let key = (root.clone(), hex::encode(fingerprint.finalize()), epoch);
+    let shared = {
+        let mut active = ACTIVE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        active.retain(|_, value| value.strong_count() > 0);
+        if let Some(existing) = active.get(&key).and_then(std::sync::Weak::upgrade) {
+            existing
+        } else {
+            let status = status.to_vec();
+            let config = config.to_vec();
+            let future = async move {
+                let cancellation = CancellationToken::new();
+                let _cancel = cancellation.clone().drop_guard();
+                let control = WorkspaceCaptureControl { deadline: Instant::now() + WORKSPACE_GENERATION_DEADLINE, cancellation };
+                tokio::time::timeout(WORKSPACE_GENERATION_DEADLINE, async {
+                    let metadata = capture_workspace_metadata(root.clone(), paths, control.clone()).await?;
+                    let (after_status, after_paths) = workspace_generation_status(&root).await?;
+                    if status != after_status || !control.active() { return None; }
+                    let verified = capture_workspace_metadata(root.clone(), after_paths, control.clone()).await?;
+                    let (final_status, _) = workspace_generation_status(&root).await?;
+                    // Bounded stable observation, not an atomic filesystem
+                    // snapshot. Detected changes make evidence unavailable.
+                    if status != final_status || metadata.manifest != verified.manifest
+                        || SHARED_WORKSPACE_CAPTURE_EPOCH.load(Ordering::Acquire) != epoch
+                        || config != workspace_generation_git_output(&root, &["config", "--null", "--list", "--show-origin"]).await?
+                    { return None; }
+                    Some(Arc::new(metadata))
+                }).await.ok().flatten()
+            }.boxed().shared();
+            let shared = Arc::new(SharedWorkspaceMetadata { future });
+            if active.len() < 64 { active.insert(key, Arc::downgrade(&shared)); }
+            shared
+        }
+    };
+    shared.future.clone().await
 }
 
 #[derive(Clone)]
@@ -1257,9 +1347,8 @@ fn non_git_tree_entries(
     Some((directories, files))
 }
 
-#[cfg(test)]
 async fn workspace_generation_git_output(repo_root: &Path, args: &[&str]) -> Option<Vec<u8>> {
-    let mut command = Command::new("git");
+    let mut command = Command::new(codex_git_utils::git_executable_async().await);
     command
         .arg("-c")
         .arg(format!("core.hooksPath={DISABLED_HOOKS_PATH}"))
@@ -1268,9 +1357,19 @@ async fn workspace_generation_git_output(repo_root: &Path, args: &[&str]) -> Opt
         .args(args)
         .env("GIT_OPTIONAL_LOCKS", "0")
         .current_dir(repo_root)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
         .kill_on_drop(true);
-    let output = command.output().await.ok()?;
-    output.status.success().then_some(output.stdout)
+    let mut child = command.spawn().ok()?;
+    let mut bytes = Vec::new();
+    child.stdout.take()?.take(1024 * 1024 + 1).read_to_end(&mut bytes).await.ok()?;
+    if bytes.len() > 1024 * 1024 {
+        let _ = child.kill().await;
+        let _ = child.wait().await;
+        return None;
+    }
+    child.wait().await.ok()?.success().then_some(bytes)
 }
 
 impl GitWorkspaceMetadataSource {
@@ -1915,6 +2014,7 @@ struct SourceChangeEvent {
 
 #[derive(Default)]
 struct SourceChangeJournal {
+    pending_mutations: BTreeSet<uuid::Uuid>,
     retained_floor: u64,
     latest_generation: u64,
     events: VecDeque<SourceChangeEvent>,
@@ -2950,6 +3050,7 @@ impl GitWorkspaceCache {
             .saturating_add(1);
         journal.record(generation, changed_paths);
         if affects_capture {
+            SHARED_WORKSPACE_CAPTURE_EPOCH.fetch_add(1, Ordering::AcqRel);
             self.source_capture_generation
                 .fetch_add(1, Ordering::AcqRel);
         }
@@ -3210,7 +3311,8 @@ impl GitWorkspaceCache {
             .source_change_journal
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if (journal.retained_floor != 0 && observation.watcher_generation <= journal.retained_floor)
+        if !journal.pending_mutations.is_empty()
+            || (journal.retained_floor != 0 && observation.watcher_generation <= journal.retained_floor)
             || journal.latest_generation != current_generation
             || journal
                 .coarse_generations
@@ -3233,6 +3335,18 @@ impl GitWorkspaceCache {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         std::mem::take(&mut journal.freshness_lookup_count)
+    }
+
+    pub(crate) fn begin_host_workspace_mutation(self: &Arc<Self>) -> PendingSourceMutation {
+        let id = uuid::Uuid::new_v4();
+        self.source_change_journal.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .pending_mutations.insert(id);
+        self.host_mutation_generation.fetch_add(1, Ordering::AcqRel);
+        self.watcher_generation.fetch_add(1, Ordering::AcqRel);
+        SHARED_WORKSPACE_CAPTURE_EPOCH.fetch_add(1, Ordering::AcqRel);
+        self.source_capture_generation.fetch_add(1, Ordering::AcqRel);
+        PendingSourceMutation { cache: Arc::clone(self), id, settled: false }
     }
 
     pub(crate) fn note_host_workspace_mutation(&self) {
@@ -3706,3 +3820,33 @@ fn stable_file_identity(file: &File) -> Option<StableFileIdentity> {
 #[cfg(test)]
 #[path = "git_workspace_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "git_workspace_audit147_tests.rs"]
+mod audit147_tests;
+
+/// Admission blocks freshness without inventing an observed path change. The
+/// runtime settles only after publishing the committed delta; abandoned work
+/// becomes coarse uncertainty. Each token removes only its own admission.
+pub(crate) struct PendingSourceMutation {
+    cache: Arc<GitWorkspaceCache>,
+    id: uuid::Uuid,
+    settled: bool,
+}
+
+impl PendingSourceMutation {
+    pub(crate) fn settle(mut self) {
+        self.settled = true;
+    }
+}
+
+impl Drop for PendingSourceMutation {
+    fn drop(&mut self) {
+        if !self.settled {
+            self.cache.note_host_workspace_mutation();
+        }
+        self.cache.source_change_journal.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .pending_mutations.remove(&self.id);
+    }
+}

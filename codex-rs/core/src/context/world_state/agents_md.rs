@@ -4,7 +4,11 @@ use crate::agents_md::AgentsMdFreshness;
 use crate::agents_md::LoadedAgentsMd;
 use crate::agents_md::RepositoryStableContextBundle;
 use crate::context::ContextualUserFragment;
+use crate::context::InternalContextSource;
+use crate::context::InternalModelContextFragment;
 use crate::context::UserInstructions;
+use codex_protocol::models::ContentItem;
+use codex_protocol::models::ResponseItem;
 use serde::Deserialize;
 use serde::Serialize;
 use sha2::Digest;
@@ -13,6 +17,15 @@ use sha2::Sha256;
 const REPLACEMENT_NOTICE: &str =
     "These AGENTS.md instructions replace all previously provided AGENTS.md instructions.";
 const GLOBAL_SUPERSESSION_NOTICE: &str = "The current host/global snapshot supersedes any global instructions in the retained aggregate, including when the current snapshot supplies no global instructions. Retained project restrictions keep their original scope.";
+/// A line diff is hidden context, not the repository slot: retiring superseded
+/// slots must keep the complete body it applies to.
+const UPDATE_SOURCE: &str = "agents_md_update";
+const UPDATE_OPEN: &str = "<codex_internal_context source=\"agents_md_update\">";
+const UPDATE_CLOSE: &str = "</codex_internal_context>";
+const UPDATE_IDENTITY: &str = "(diff identity: base ";
+/// A changed body is sent as a line diff only when the diff is at most this
+/// large and at most half the size of the body.
+const MAX_UPDATE_BYTES: usize = 4 * 1024;
 
 /// The AGENTS.md instructions currently visible to the model.
 #[derive(Clone, Debug)]
@@ -52,6 +65,12 @@ struct LegacyAgentsMd {
 impl AgentsMdState {
     pub(crate) const REMOVAL_NOTICE: &str =
         "The previously provided AGENTS.md instructions no longer apply.";
+
+    /// Whether `text` is an AGENTS.md line diff as delivered. Compaction drops
+    /// these together with the complete body they apply to.
+    pub(crate) fn is_update_text(text: &str) -> bool {
+        text.starts_with(UPDATE_OPEN)
+    }
 
     #[cfg(test)]
     pub(crate) fn new(loaded: Option<&LoadedAgentsMd>) -> Self {
@@ -173,6 +192,48 @@ impl AgentsMdState {
             ),
         })
     }
+
+    /// A body change within one verified scope as a bounded line diff from the
+    /// accepted body, so a mid-turn edit does not append another complete copy.
+    /// `None` selects the complete replacement: unverified, recovered or legacy
+    /// state, a changed scope, or a diff that is large or not much smaller than
+    /// the body.
+    fn render_update(
+        &self,
+        previous: &AgentsMdSnapshot,
+        current: &AgentsMdSnapshot,
+    ) -> Option<Box<dyn ContextualUserFragment>> {
+        if previous.freshness != AgentsMdFreshness::Refreshed
+            || current.freshness != AgentsMdFreshness::Refreshed
+            || previous.legacy_retained.is_some()
+            || current.legacy_retained.is_some()
+            || self.instructions_are_recovered_aggregate
+            || previous.directory != current.directory
+        {
+            return None;
+        }
+        let (old, new) = (instruction_body(previous)?, instruction_body(current)?);
+        let limit = MAX_UPDATE_BYTES.min(UserInstructions::escaped_text_len(new) / 2);
+        if old.len().abs_diff(new.len()) > limit {
+            return None;
+        }
+        let scope = current
+            .directory
+            .as_deref()
+            .map(|directory| format!(" for {directory}"))
+            .unwrap_or_default();
+        let update = InternalModelContextFragment::new(
+            InternalContextSource::from_static(UPDATE_SOURCE),
+            format!(
+                "AGENTS.md changed. Apply this line diff to the most recent complete AGENTS.md instructions{scope} above, after any earlier diffs to them: \"-\" lines no longer apply, \"+\" lines now apply, and all other lines are unchanged.\n{}\n{UPDATE_IDENTITY}{}, result {})",
+                line_diff(old, new)?,
+                state_digest(previous.directory.as_deref(), old),
+                state_digest(current.directory.as_deref(), new),
+            ),
+        );
+        (update.render().len() <= limit)
+            .then(|| Box::new(update) as Box<dyn ContextualUserFragment>)
+    }
 }
 
 impl WorldStateSection for AgentsMdState {
@@ -201,7 +262,7 @@ impl WorldStateSection for AgentsMdState {
     }
 
     fn matches_legacy_fragment(role: &str, text: &str) -> bool {
-        role == "user" && UserInstructions::matches_text(text)
+        role == "user" && (UserInstructions::matches_text(text) || parse_update(text).is_some())
     }
 
     fn required() -> bool {
@@ -213,10 +274,8 @@ impl WorldStateSection for AgentsMdState {
         items: &[codex_protocol::models::ResponseItem],
     ) -> bool {
         // Freshness-only notices do not replace the last substantive instruction body.
-        let latest = super::retained_texts(items, "user").rev().find(|text| {
-            UserInstructions::matches_text(text) && !text.contains("<INSTRUCTIONS>\nThe previously provided instruction body is unchanged.\n</INSTRUCTIONS>")
-        });
-        let Some(text) = latest else {
+        let deliveries = retained_deliveries(items);
+        let Some(&(_, text)) = deliveries.last() else {
             if previous.text.is_some() {
                 return false;
             }
@@ -230,26 +289,33 @@ impl WorldStateSection for AgentsMdState {
                 observation.is_some_and(|text| text == expected)
             };
         };
-        let expected_body = instruction_body(previous).unwrap_or(Self::REMOVAL_NOTICE);
-        let instructions = UserInstructions {
-            directory: previous.directory.clone(),
-            text: expected_body.to_string(),
-        };
-        let rendered = instructions.render();
-        // Unframed renders cannot be matched against retained text; resend them.
-        let Some((header, body)) = rendered.split_once("<INSTRUCTIONS>\n") else {
-            return false;
-        };
-        let header = header.trim_end();
-        let body_retained = text.starts_with(&format!("{header}\n\n"))
-            && text
-                .split_once("<INSTRUCTIONS>\n")
-                .is_some_and(|(_, actual)| {
-                    actual == body
-                        || actual.strip_prefix(&format!("{REPLACEMENT_NOTICE}\n\n")) == Some(body)
-                });
-        if !body_retained {
-            return false;
+        if parse_update(text).is_some() {
+            if !update_chain_supported(previous, items, &deliveries) {
+                return false;
+            }
+        } else {
+            let expected_body = instruction_body(previous).unwrap_or(Self::REMOVAL_NOTICE);
+            let instructions = UserInstructions {
+                directory: previous.directory.clone(),
+                text: expected_body.to_string(),
+            };
+            let rendered = instructions.render();
+            // Unframed renders cannot be matched against retained text; resend them.
+            let Some((header, body)) = rendered.split_once("<INSTRUCTIONS>\n") else {
+                return false;
+            };
+            let header = header.trim_end();
+            let body_retained = text.starts_with(&format!("{header}\n\n"))
+                && text
+                    .split_once("<INSTRUCTIONS>\n")
+                    .is_some_and(|(_, actual)| {
+                        actual == body
+                            || actual.strip_prefix(&format!("{REPLACEMENT_NOTICE}\n\n"))
+                                == Some(body)
+                    });
+            if !body_retained {
+                return false;
+            }
         }
         // A warning from an older body must not certify the retained replacement.
         let expected = observation_text(previous);
@@ -311,6 +377,12 @@ impl WorldStateSection for AgentsMdState {
                     observation_text(&current),
                 ),
             ));
+        }
+
+        if let PreviousSectionState::Known(previous) = previous
+            && let Some(update) = self.render_update(previous, &current)
+        {
+            return Some(update);
         }
 
         let previous_may_contain_instructions = match previous {
@@ -384,6 +456,153 @@ fn instruction_body(snapshot: &AgentsMdSnapshot) -> Option<&str> {
             .and_then(|text| text.strip_prefix("\n\n"))
             .unwrap_or(text),
     )
+}
+
+/// Unified-diff hunks with one line of context and no file headers.
+fn line_diff(old: &str, new: &str) -> Option<String> {
+    let mut config = similar::TextDiff::configure();
+    // Past the deadline the diff is coarser but still exact; the size limit
+    // then selects the complete body.
+    config.timeout(std::time::Duration::from_millis(100));
+    let diff = config.diff_lines(old, new);
+    let hunks = diff
+        .grouped_ops(1)
+        .iter()
+        .filter_map(|group| {
+            let (first, last) = (group.first()?, group.last()?);
+            let mut hunk = format!(
+                "@@ -{} +{} @@",
+                hunk_range(first.old_range().start, last.old_range().end),
+                hunk_range(first.new_range().start, last.new_range().end),
+            );
+            for change in group.iter().flat_map(|op| diff.iter_changes(op)) {
+                hunk.push('\n');
+                hunk.push(match change.tag() {
+                    similar::ChangeTag::Equal => ' ',
+                    similar::ChangeTag::Delete => '-',
+                    similar::ChangeTag::Insert => '+',
+                });
+                hunk.push_str(change.value().trim_end_matches(['\r', '\n']));
+            }
+            Some(hunk)
+        })
+        .collect::<Vec<_>>();
+    (!hunks.is_empty()).then(|| hunks.join("\n"))
+}
+
+/// A unified-diff line range: the 1-based first line and the line count, or
+/// the preceding line for an empty range.
+fn hunk_range(start: usize, end: usize) -> String {
+    match end - start {
+        0 => format!("{start},0"),
+        1 => (start + 1).to_string(),
+        len => format!("{},{len}", start + 1),
+    }
+}
+
+/// Short identity of a complete rendered body; line diffs chain through it.
+fn rendered_digest(rendered: &str) -> String {
+    hex::encode(&Sha256::digest(rendered.as_bytes())[..8])
+}
+
+fn state_digest(directory: Option<&str>, body: &str) -> String {
+    rendered_digest(
+        &UserInstructions {
+            directory: directory.map(str::to_string),
+            text: body.to_string(),
+        }
+        .render(),
+    )
+}
+
+/// The base and result identities of a retained line diff.
+fn parse_update(text: &str) -> Option<(&str, &str)> {
+    let body = text
+        .trim()
+        .strip_prefix(UPDATE_OPEN)?
+        .strip_suffix(UPDATE_CLOSE)?
+        .trim_end();
+    let identity = body.rsplit_once('\n').map_or(body, |(_, line)| line);
+    identity
+        .strip_prefix(UPDATE_IDENTITY)?
+        .strip_suffix(')')?
+        .split_once(", result ")
+}
+
+/// Substantive deliveries in history order, with their item index: complete
+/// bodies (not freshness-only notices) and line diffs.
+fn retained_deliveries(items: &[ResponseItem]) -> Vec<(usize, &str)> {
+    items
+        .iter()
+        .enumerate()
+        .filter_map(|(index, item)| match item {
+            ResponseItem::Message { role, content, .. } if role == "user" => Some((index, content)),
+            _ => None,
+        })
+        .flat_map(|(index, content)| {
+            content.iter().filter_map(move |part| match part {
+                ContentItem::InputText { text }
+                    if (UserInstructions::matches_text(text)
+                        && !text.contains("<INSTRUCTIONS>\nThe previously provided instruction body is unchanged.\n</INSTRUCTIONS>"))
+                        || parse_update(text).is_some() =>
+                {
+                    Some((index, text.as_str()))
+                }
+                _ => None,
+            })
+        })
+        .collect()
+}
+
+/// Whether retained line diffs lead from a retained complete body to
+/// `previous`. They stand only within the turn that sent them: after a later
+/// real user message (a new turn, or steering) the complete body is sent
+/// again, as it is once the diffs outgrow half of that body.
+fn update_chain_supported(
+    previous: &AgentsMdSnapshot,
+    items: &[ResponseItem],
+    deliveries: &[(usize, &str)],
+) -> bool {
+    let Some(body) = instruction_body(previous) else {
+        return false;
+    };
+    let mut expected = state_digest(previous.directory.as_deref(), body);
+    let mut first_update: Option<usize> = None;
+    let mut update_bytes = 0_usize;
+    for &(index, text) in deliveries.iter().rev() {
+        let Some((base, result)) = parse_update(text) else {
+            return first_update.is_some_and(|first| {
+                rendered_digest(&without_replacement_notice(text)) == expected
+                    && update_bytes.saturating_mul(2) <= text.len()
+                    && !items[first + 1..].iter().any(is_real_user_message)
+            });
+        };
+        if result != expected {
+            return false;
+        }
+        expected = base.to_string();
+        update_bytes = update_bytes.saturating_add(text.len());
+        first_update = Some(index);
+    }
+    false
+}
+
+/// A retained complete body as rendered without its replacement notice.
+fn without_replacement_notice(text: &str) -> std::borrow::Cow<'_, str> {
+    text.split_once("<INSTRUCTIONS>\n")
+        .and_then(|(header, body)| {
+            let body = body.strip_prefix(REPLACEMENT_NOTICE)?.strip_prefix("\n\n")?;
+            Some(std::borrow::Cow::Owned(format!("{header}<INSTRUCTIONS>\n{body}")))
+        })
+        .unwrap_or(std::borrow::Cow::Borrowed(text))
+}
+
+/// A user turn boundary as sampling projection counts one.
+fn is_real_user_message(item: &ResponseItem) -> bool {
+    matches!(item, ResponseItem::Message { role, .. } if role == "user")
+        && codex_context_fragments::is_user_turn_boundary(item)
+        && !crate::compact::is_compaction_summary_item(item)
+        && !crate::stable_context::is_trusted_stable_context_item(item)
 }
 
 #[cfg(test)]

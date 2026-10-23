@@ -2272,6 +2272,7 @@ fn preflight_validation_metadata_does_not_erase_shell_exit_guards() {
             execution_context: None,
             declared: None,
             receipt_runner: None,
+            admission_runner: None,
             classification: crate::validation::classify_validation_invocations(
                 &outcome.validation_invocations,
             ),

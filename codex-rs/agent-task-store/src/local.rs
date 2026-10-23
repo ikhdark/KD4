@@ -1,5 +1,12 @@
+#[cfg(test)]
+#[path = "audit151_tests.rs"]
+mod audit151_tests;
+#[path = "wake_subscriptions.rs"]
+mod wake_subscriptions;
+
 use chrono::Utc;
 use codex_state::StateRuntime;
+use futures::StreamExt;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use sha2::Digest;
@@ -77,11 +84,13 @@ use crate::WakeRead;
 use crate::WakeReadStatus;
 use crate::WorkspaceStrategy;
 use crate::WorkspaceTaskStatus;
+use crate::scope::CandidateScopeCase;
 use crate::scope::RepositoryIdentity;
 use crate::scope::normalize_repo_path_async;
 use crate::scope::normalize_repo_scopes;
 use crate::scope::repository_identity;
 use crate::scope::repository_identity_async;
+use crate::scope::scopes_overlap_observed;
 
 const COORDINATION_DIR: &str = "agent-task-coordination";
 const COLD_REVIEW_REASON_PREFIX: &str = "cold review required: ";
@@ -149,6 +158,9 @@ static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
 tokio::task_local! {
     static TEST_COMPARISON_NOW: chrono::DateTime<Utc>;
     static TEST_SNAPSHOT_CAPTURE_PAUSE: Arc<TestSnapshotCapturePause>;
+    static TEST_LEGACY_UPGRADE_BARRIER: Arc<tokio::sync::Barrier>;
+    pub(crate) static TEST_LEGACY_IDENTITY_RESOLUTIONS: std::cell::Cell<usize>;
+    pub(crate) static TEST_STARTUP_CAPSULE_VALIDATIONS: std::cell::Cell<usize>;
 }
 
 #[cfg(test)]
@@ -165,6 +177,14 @@ impl TestSnapshotCapturePause {
             release: tokio::sync::Semaphore::new(0),
         }
     }
+}
+
+#[cfg(test)]
+pub(crate) async fn with_test_legacy_upgrade_barrier<T>(
+    barrier: Arc<tokio::sync::Barrier>,
+    future: impl Future<Output = T>,
+) -> T {
+    TEST_LEGACY_UPGRADE_BARRIER.scope(barrier, future).await
 }
 
 fn comparison_now() -> chrono::DateTime<Utc> {
@@ -201,7 +221,16 @@ pub struct LocalAgentTaskStore {
 
 pub type TaskStoreFuture<'a, T> = Pin<Box<dyn Future<Output = StoreResult<T>> + Send + 'a>>;
 
+#[derive(Debug)]
+pub struct PendingTerminalOutcome {
+    pub binding: AgentTaskBinding,
+    pub turn_id: String,
+    pub status_json: String,
+    pub event_json: String,
+}
+
 struct DurableWakePoller {
+    subscriptions: Arc<wake_subscriptions::WakeSubscriptions>,
     waiter_count: AtomicUsize,
     active: watch::Sender<bool>,
     shutdown: watch::Sender<bool>,
@@ -222,6 +251,9 @@ impl DurableWakePoller {
         let (poll_progress, _) = watch::channel((0, 0));
         #[cfg(test)]
         let task_poll_progress = poll_progress.clone();
+        let subscriptions = Arc::new(wake_subscriptions::WakeSubscriptions::default());
+        let task_subscriptions = Arc::clone(&subscriptions);
+        let mut local_wake = wake_revision.subscribe();
         let task = tokio::spawn(async move {
             let mut watermark = watermark;
             loop {
@@ -240,46 +272,51 @@ impl DurableWakePoller {
                     }
                 }
 
-                tokio::select! {
+                let locally_notified = tokio::select! {
                     changed = active_rx.changed() => {
                         if changed.is_err() {
                             return;
                         }
+                        true
                     }
                     changed = shutdown_rx.changed() => {
                         if changed.is_err() || *shutdown_rx.borrow() {
                             return;
                         }
+                        continue;
+                    }
+                    changed = local_wake.changed() => {
+                        if changed.is_err() {
+                            return;
+                        }
+                        true
                     }
                     _ = tokio::time::sleep(EXTERNAL_WAKE_RECHECK_INTERVAL) => {
                         #[cfg(test)]
                         task_poll_progress.send_modify(|(_, polls)| *polls += 1);
-                        match durable_wake_watermark(&mut connection).await {
-                            Ok(next_watermark) if next_watermark != watermark => {
-                                watermark = next_watermark;
-                                wake_revision.send_modify(|revision| {
-                                    *revision = revision.saturating_add(1);
-                                });
-                            }
-                            Ok(_) => {}
-                            Err(error) => {
-                                tracing::warn!(
-                                    target: "codex_agent_task_store::wake",
-                                    %error,
-                                    "durable wake poll failed"
-                                );
-                                // Wake consumers so their normal durable read
-                                // observes and reports a persistent database error.
-                                wake_revision.send_modify(|revision| {
-                                    *revision = revision.saturating_add(1);
-                                });
-                            }
-                        }
+                        false
                     }
+                };
+                let refresh = match durable_wake_watermark(&mut connection).await {
+                    Ok(next) => {
+                        let changed = next != watermark;
+                        watermark = next;
+                        changed || locally_notified
+                    }
+                    Err(error) => {
+                        tracing::warn!(%error, "durable wake poll failed");
+                        task_subscriptions.notify_error();
+                        continue;
+                    }
+                };
+                if refresh && let Err(error) = task_subscriptions.refresh(&mut connection).await {
+                    tracing::warn!(%error, "root wake refresh failed");
+                    task_subscriptions.notify_error();
                 }
             }
         });
         Arc::new(Self {
+            subscriptions,
             waiter_count: AtomicUsize::new(0),
             active,
             shutdown,
@@ -289,7 +326,8 @@ impl DurableWakePoller {
         })
     }
 
-    fn register(self: &Arc<Self>) -> DurableWakeWaiter {
+    fn register(self: &Arc<Self>, root: &str) -> DurableWakeWaiter {
+        let wake_rx = self.subscriptions.register(root);
         if self.waiter_count.fetch_add(1, Ordering::AcqRel) == 0 {
             self.active.send_replace(true);
         }
@@ -297,6 +335,8 @@ impl DurableWakePoller {
         self.poll_progress.send_modify(|(waiters, _)| *waiters += 1);
         DurableWakeWaiter {
             poller: Arc::clone(self),
+            root: root.into(),
+            wake_rx,
         }
     }
 
@@ -311,10 +351,13 @@ impl DurableWakePoller {
 
 struct DurableWakeWaiter {
     poller: Arc<DurableWakePoller>,
+    root: String,
+    wake_rx: watch::Receiver<u64>,
 }
 
 impl Drop for DurableWakeWaiter {
     fn drop(&mut self) {
+        self.poller.subscriptions.unregister(&self.root);
         #[cfg(test)]
         self.poller
             .poll_progress
@@ -517,6 +560,10 @@ impl LocalAgentTaskStore {
         self.pool.close().await;
     }
 
+    pub(crate) fn is_closed(&self) -> bool {
+        self.pool.is_closed()
+    }
+
     fn notify_wake_waiters(&self) {
         self.wake_revision
             .send_modify(|revision| *revision = revision.saturating_add(1));
@@ -527,8 +574,8 @@ impl LocalAgentTaskStore {
         root_session_id: String,
         after_event_id: Option<WakeEventId>,
     ) -> StoreResult<WakeRead> {
-        let _durable_waiter = self.durable_wake_poller.register();
-        let mut wake_rx = self.wake_revision.subscribe();
+        let waiter = self.durable_wake_poller.register(&root_session_id);
+        let mut wake_rx = waiter.wake_rx.clone();
         let mut shutdown_rx = self.durable_wake_poller.shutdown.subscribe();
         loop {
             if *shutdown_rx.borrow() {
@@ -555,6 +602,15 @@ impl LocalAgentTaskStore {
                 .fetch_one(&self.pool)
                 .await?,
         )
+    }
+
+    /// Durable, dependency-aware freshness fence for one wait owner.
+    pub async fn task_state_revision_for_root(&self, root: &str) -> StoreResult<i64> {
+        Ok(sqlx::query_scalar("SELECT revision FROM root_task_state_revision WHERE root_session_id = ?")
+            .bind(root)
+            .fetch_optional(&self.pool)
+            .await?
+            .unwrap_or(0))
     }
 
     #[cfg(test)]
@@ -596,8 +652,16 @@ impl LocalAgentTaskStore {
         launch: Option<(String, String, String)>,
     ) -> StoreResult<AdmittedAssignment> {
         let root = repo_root.to_path_buf();
-        let (repository, mut assignment) = tokio::task::spawn_blocking(move || {
-            Ok::<_, StoreError>((repository_identity(&root)?, draft.normalize(&root)?))
+        let (repository, mut assignment, scope_case) = tokio::task::spawn_blocking(move || {
+            let repository = repository_identity(&root)?;
+            let assignment = draft.normalize(&root)?;
+            // Observed before the admission transaction, which must not wait on the filesystem.
+            let scope_case = if selective {
+                CandidateScopeCase::observe(&root, &assignment.read_scope, &assignment.write_scope)
+            } else {
+                CandidateScopeCase::default()
+            };
+            Ok::<_, StoreError>((repository, assignment, scope_case))
         })
         .await
         .map_err(|error| {
@@ -653,8 +717,13 @@ impl LocalAgentTaskStore {
         )
         .await?;
         let (overlaps, integration_plan) = if selective {
-            selective_admission_tx(&mut transaction, &assignment, isolated_integrator_available)
-                .await?
+            selective_admission_tx(
+                &mut transaction,
+                &assignment,
+                &scope_case,
+                isolated_integrator_available,
+            )
+            .await?
         } else {
             (
                 AdmissionOverlapSummary::default(),
@@ -694,6 +763,21 @@ impl LocalAgentTaskStore {
                 return Err(StoreError::InvalidAssignment(
                     "launch path and name cannot be empty".into(),
                 ));
+            }
+            // A durable owner the in-memory registry no longer reserves (an
+            // unavailable cold child, or a launch whose cleanup failed) is the
+            // caller's name conflict, not a storage failure. UNIQUE stays the guard.
+            let bound = sqlx::query_scalar::<_, String>(
+                "SELECT assignment_id FROM agent_task_bindings WHERE root_session_id = ? AND agent_path = ?",
+            )
+            .bind(&assignment.root_session_id)
+            .bind(&agent_path)
+            .fetch_optional(&mut *transaction)
+            .await?;
+            if let Some(bound) = bound {
+                return Err(StoreError::InvalidAssignment(format!(
+                    "task name `{task_name}` (agent path {agent_path}) is already bound to assignment {bound} in this root session; choose a different task name"
+                )));
             }
             // None is the unstarted phase; binding the actual thread precedes input.
             sqlx::query("INSERT INTO agent_task_bindings (assignment_id, attempt_id, root_session_id, agent_path, task_name, thread_id, bound_at, updated_at, launch_owner) VALUES (?, ?, ?, ?, ?, NULL, ?, ?, ?)")
@@ -774,19 +858,26 @@ impl LocalAgentTaskStore {
             ));
         }
 
+        let capsule_path = task_capsule_path(&self.coordination_root, assignment_id);
+        // Capsule publication/recovery share a per-assignment OS lease. Never
+        // wait for storage ownership while holding the home-wide SQL writer.
+        let lease_deadline = tokio::time::Instant::now() + DATABASE_BUSY_TIMEOUT;
+        let capsule_lease = loop {
+            if let Some(lease) = try_capsule_lease(capsule_path.with_extension("lock")).await? { break lease; }
+            if tokio::time::Instant::now() >= lease_deadline {
+                return Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "task capsule publication is busy").into());
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        };
         let mut transaction = self.pool.begin().await?;
         lock_assignment_tx(&mut transaction, assignment_id).await?;
         let mut assignment = load_assignment_tx(&mut transaction, assignment_id).await?;
-        if capsule.integration_plan != assignment.integration_plan {
-            return Err(StoreError::InvalidTaskCapsule(
-                "integration plan does not match the admitted assignment".to_string(),
-            ));
-        }
+        validate_capsule_contract_tx(&mut transaction, &assignment, &capsule).await
+            .map_err(|error| StoreError::InvalidTaskCapsule(error.to_string()))?;
         let attempt = load_current_attempt_tx(&mut transaction, assignment_id).await?;
         if attempt.attempt_id != attempt_id || attempt.state != AttemptState::Active {
             return Err(StoreError::AttemptNotActive(attempt_id));
         }
-        let capsule_path = task_capsule_path(&self.coordination_root, assignment_id);
         if assignment.task_capsule.is_some() || tokio::fs::try_exists(&capsule_path).await? {
             return Err(StoreError::TaskCapsuleAlreadyAttached(assignment_id));
         }
@@ -799,6 +890,7 @@ impl LocalAgentTaskStore {
         // authoritative copy. The worker owns publication AND DB commit through
         // observer cancellation; the sidecar alone is not an attachment receipt.
         tokio::task::spawn_blocking(move || -> StoreResult<()> {
+            let _capsule_lease = capsule_lease;
             if let Some(parent) = staging_path.parent() {
                 std::fs::create_dir_all(parent)?;
             }
@@ -861,22 +953,36 @@ impl LocalAgentTaskStore {
         let mut transaction = self.pool.begin().await?;
         let mut assignment = load_assignment_tx(&mut transaction, assignment_id).await?;
         let current_attempt = load_current_attempt_tx(&mut transaction, assignment_id).await?;
-        let receipt: Option<AgentReceipt> =
-            sqlx::query_scalar::<_, String>("SELECT body_json FROM receipts WHERE attempt_id = ?")
-                .bind(current_attempt.attempt_id.to_string())
-                .fetch_optional(&mut *transaction)
-                .await?
-                .map(|value| decode(&value))
-                .transpose()?;
+        let receipt = load_receipt_tx(&mut transaction, &current_attempt).await?
+            .map(|(receipt, _)| receipt);
         let gate_rows =
             sqlx::query("SELECT body_json FROM gates WHERE assignment_id = ? ORDER BY kind")
                 .bind(assignment_id.to_string())
                 .fetch_all(&mut *transaction)
                 .await?;
-        let gates: Vec<AgentGate> = gate_rows
+        let mut gates: Vec<AgentGate> = gate_rows
             .into_iter()
             .map(|row| decode(row.get::<String, _>("body_json").as_str()))
             .collect::<StoreResult<Vec<_>>>()?;
+        // Sealed verdicts authorize exactly the attempt recorded in history.
+        // This also fails closed for corrections persisted by older runtimes.
+        for gate in &mut gates {
+            if matches!(gate.kind, GateKind::Review | GateKind::Verification)
+                && gate.status.is_sealed() {
+                let verdict = sqlx::query_scalar::<_, String>(
+                    "SELECT body_json FROM gate_verdicts WHERE attempt_id = ? AND kind = ?",
+                )
+                .bind(current_attempt.attempt_id.to_string())
+                .bind(encode(&gate.kind)?)
+                .fetch_optional(&mut *transaction)
+                .await?;
+                if verdict.as_deref() != Some(encode(gate)?.as_str()) {
+                    gate.status = GateStatus::Pending;
+                    gate.sealed_at = None;
+                    gate.reason = "current attempt has no matching gate verdict".into();
+                }
+            }
+        }
         let validation_calls: Vec<ValidationCall> = sqlx::query(
             "SELECT body_json FROM validation_calls WHERE attempt_id = ? ORDER BY julianday(json_extract(recorded_at, '$')), call_id",
         )
@@ -997,10 +1103,13 @@ impl LocalAgentTaskStore {
             .filter(|gate| gate.status == GateStatus::Pending)
             .map(|gate| gate.kind)
             .collect::<Vec<_>>();
-        let next_required_action = (assignment.admission_origin
+        let mut next_required_action = (assignment.admission_origin
             == crate::AssignmentAdmissionOrigin::Typed
             && !pending_gates.is_empty())
         .then(|| "resolve pending gates before completion".to_string());
+        if assignment.integration_plan == IntegrationPlan::TypedIntegratorRequired {
+            next_required_action = Some("required destination-bound integration evidence is unavailable; isolated completion is not integration".into());
+        }
         let dependency_admissions = sqlx::query_scalar::<_, String>(
             "SELECT body_json FROM dependency_admissions WHERE assignment_id = ? ORDER BY dependency_id",
         ).bind(assignment_id.to_string()).fetch_all(&mut *transaction).await?
@@ -1020,7 +1129,7 @@ impl LocalAgentTaskStore {
             Vec::new()
         };
         transaction.commit().await?;
-        hydrate_task_capsule(&self.coordination_root, &mut assignment).await?;
+        hydrate_task_capsule(&self.pool, &self.coordination_root, &mut assignment).await?;
         Ok(AgentTask {
             assignment,
             dependency_admissions,
@@ -1631,6 +1740,16 @@ LIMIT 1
                 "receipt summary cannot be empty".to_string(),
             ));
         }
+        let capsule_snapshot = if draft.status == AgentStatusClaim::Completed && !host_legacy_outcome {
+            let body: String = sqlx::query_scalar("SELECT assignments.body_json FROM assignments JOIN attempts USING (assignment_id) WHERE attempt_id = ?")
+                .bind(attempt_id.to_string()).fetch_optional(&self.pool).await?
+                .ok_or(StoreError::AttemptNotFound(attempt_id))?;
+            let mut assignment: Assignment = decode(&body)?;
+            let lease = try_capsule_lease(task_capsule_path(&self.coordination_root, assignment.assignment_id).with_extension("lock")).await?
+                .ok_or_else(|| StoreError::InvalidTaskCapsule("capsule publication or recovery is still active".into()))?;
+            hydrate_task_capsule(&self.pool, &self.coordination_root, &mut assignment).await?;
+            Some((assignment, lease))
+        } else { None };
         let mut transaction = self.pool.begin().await?;
         lock_attempt_tx(&mut transaction, attempt_id).await?;
         let attempt = load_attempt_tx(&mut transaction, attempt_id).await?;
@@ -1650,6 +1769,9 @@ LIMIT 1
             return Err(StoreError::ReceiptAlreadySealed(attempt_id));
         }
         let assignment = load_assignment_tx(&mut transaction, attempt.assignment_id).await?;
+        if capsule_snapshot.as_ref().is_some_and(|(snapshot, _)| snapshot.task_capsule != assignment.task_capsule) {
+            return Err(StoreError::InvalidTaskCapsule("capsule authority changed before completion".into()));
+        }
         if host_legacy_outcome {
             if !matches!(
                 assignment.admission_origin,
@@ -1903,6 +2025,10 @@ LIMIT 1
         if assignment.role != AgentRole::Worker {
             return Err(StoreError::WorkerCorrectionRequired(assignment_id));
         }
+        crate::model::validate_criterion_bindings(
+            assignment.effective_criteria(Some(&amendment)),
+            &assignment.required_evidence,
+        )?;
         let current = load_current_attempt_tx(&mut transaction, assignment_id).await?;
         if !host_legacy_followup && current.ordinal != 0 {
             return Err(StoreError::AmendmentLimitReached(assignment_id));
@@ -1988,29 +2114,25 @@ LIMIT 1
         if !host_legacy_followup {
             let gate_now = Utc::now();
             let gate_epoch = 0;
+            for kind in [GateKind::Review, GateKind::Verification] {
             let correction_gate = AgentGate {
                 assignment_id,
-                kind: GateKind::Review,
+                kind,
                 status: GateStatus::Pending,
-                reason: "correction attempt requires a new review verdict".to_string(),
+                reason: "correction attempt requires a new current-attempt verdict".to_string(),
                 waiver_reason: None,
                 evidence_epoch: gate_epoch,
                 updated_at: gate_now,
                 sealed_at: None,
             };
-            let reset_gate = sqlx::query("UPDATE gates SET status = ?, body_json = ?, updated_at = ?, sealed_at = NULL WHERE assignment_id = ? AND kind = ? AND status = ?")
+            sqlx::query("INSERT INTO gates (assignment_id, kind, status, body_json, updated_at, sealed_at) VALUES (?, ?, ?, ?, ?, NULL) ON CONFLICT(assignment_id, kind) DO UPDATE SET status = excluded.status, body_json = excluded.body_json, updated_at = excluded.updated_at, sealed_at = NULL")
+            .bind(assignment_id.to_string())
+            .bind(encode(&kind)?)
             .bind(encode(&GateStatus::Pending)?)
             .bind(encode(&correction_gate)?)
             .bind(encode(&gate_now)?)
-            .bind(assignment_id.to_string())
-            .bind(encode(&GateKind::Review)?)
-            .bind(encode(&GateStatus::ChangesRequested)?)
             .execute(&mut *transaction)
             .await?;
-            if reset_gate.rows_affected() != 1 {
-                return Err(StoreError::CorruptData(format!(
-                    "assignment {assignment_id} review gate changed during amendment"
-                )));
             }
         }
         append_observation_tx(
@@ -2170,9 +2292,16 @@ LIMIT 1
         {
             let existing: AgentGate = decode(&existing_json)?;
             if existing.status.is_sealed() {
-                return Err(StoreError::GateAlreadySealed {
-                    gate: kind.to_string(),
-                });
+                let current_verdict = sqlx::query_scalar::<_, String>(
+                    "SELECT body_json FROM gate_verdicts WHERE attempt_id = ? AND kind = ?",
+                ).bind(attempt.attempt_id.to_string()).bind(encode(&kind)?)
+                    .fetch_optional(&mut *transaction).await?;
+                if !matches!(kind, GateKind::Review | GateKind::Verification)
+                    || current_verdict.as_deref() == Some(existing_json.as_str()) {
+                    return Err(StoreError::GateAlreadySealed { gate: kind.to_string() });
+                }
+                // An authorized current verdict can replace a historical gate,
+                // but immutable current-attempt history cannot be rewritten.
             }
         }
         let now = Utc::now();
@@ -2369,7 +2498,9 @@ LIMIT 1
             0
         };
         let start_sequence = (after_sequence + 1).max(retained_from);
-        let rows = sqlx::query("SELECT body_json FROM wake_events WHERE root_session_id = ? AND wake_sequence >= ? ORDER BY wake_sequence LIMIT ?")
+        // Cursors and payloads come from the same append-only authority. A
+        // damaged derived cache must never manufacture an unusable watermark.
+        let rows = sqlx::query("SELECT body_json, assignment_id, attempt_id, wake_event_id FROM observations WHERE root_session_id = ? AND wake_sequence >= ? ORDER BY wake_sequence LIMIT ?")
             .bind(&root_session_id)
             .bind(start_sequence)
             .bind(MAX_WAKE_EVENTS_PER_READ as i64)
@@ -2377,7 +2508,7 @@ LIMIT 1
             .await?;
         let updated_agents = rows
             .into_iter()
-            .map(|row| decode(row.get::<String, _>("body_json").as_str()))
+            .map(|row| wake_event_from_observation_row(&row))
             .collect::<StoreResult<Vec<WakeEvent>>>()?;
         let lost_to_retention = (retained_from - after_sequence - 1).max(0) as u64;
         let available = (latest_sequence - start_sequence + 1).max(0) as u64;
@@ -2635,11 +2766,20 @@ LIMIT 1
         &self,
         assignment_id: AssignmentId,
         no_progress_before: chrono::DateTime<Utc>,
+        unstarted_owner: Option<Option<String>>,
     ) -> StoreResult<NonproductiveRecovery> {
         let mut transaction = self.pool.begin().await?;
         lock_assignment_tx(&mut transaction, assignment_id).await?;
         let assignment = load_assignment_tx(&mut transaction, assignment_id).await?;
         let attempt = load_current_attempt_tx(&mut transaction, assignment_id).await?;
+        if let Some(owner) = &unstarted_owner {
+            let eligible: i64 = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM agent_task_bindings WHERE assignment_id = ? AND attempt_id = ? AND thread_id IS NULL AND launch_owner IS ?)")
+                .bind(assignment_id.to_string()).bind(attempt.attempt_id.to_string())
+                .bind(owner).fetch_one(&mut *transaction).await?;
+            if eligible == 0 {
+                return Ok(NonproductiveRecovery::NotEligible);
+            }
+        }
         if attempt.state != AttemptState::Active || attempt.sealed_at.is_some() {
             transaction.commit().await?;
             return Ok(NonproductiveRecovery::NotEligible);
@@ -2795,6 +2935,12 @@ LIMIT 1
         )
         .await?;
 
+        if let Some(owner) = unstarted_owner {
+            sqlx::query("DELETE FROM agent_task_bindings WHERE assignment_id = ? AND attempt_id = ? AND thread_id IS NULL AND launch_owner IS ?")
+                .bind(assignment_id.to_string()).bind(attempt.attempt_id.to_string())
+                .bind(owner).execute(&mut *transaction).await?;
+        }
+
         transaction.commit().await?;
         Ok(NonproductiveRecovery::Recovered {
             receipt: Box::new(receipt),
@@ -2826,7 +2972,6 @@ LIMIT 1
     }
 
     async fn reconcile_task_capsules(&self) -> StoreResult<()> {
-        let mut transaction = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let capsule_dir = self.coordination_root.join("task_capsules");
         tokio::fs::create_dir_all(&capsule_dir).await?;
         let mut entries = tokio::fs::read_dir(&capsule_dir).await?;
@@ -2839,10 +2984,39 @@ LIMIT 1
             if !is_stage && (name.starts_with('.') || !name.ends_with(".json")) {
                 continue;
             }
+            let stem = if is_stage {
+                name.strip_prefix('.').and_then(|name| name.strip_suffix(".staged.json"))
+            } else { name.strip_suffix(".json") };
+            let Some(stem) = stem else { continue; };
+            if !is_stage {
+                // A committed copy is immutable (0031) and every read checks its
+                // sidecar against it, so only stages and uncommitted publications
+                // are crash leftovers to settle here.
+                let committed = sqlx::query_scalar::<_, i64>(
+                    "SELECT 1 FROM assignments WHERE assignment_id = ? AND CASE WHEN json_valid(body_json) THEN json_extract(body_json, '$.task_capsule') END IS NOT NULL",
+                )
+                .bind(stem)
+                .fetch_optional(&self.pool)
+                .await?;
+                if committed.is_some() {
+                    continue;
+                }
+            }
+            #[cfg(test)]
+            let _ = TEST_STARTUP_CAPSULE_VALIDATIONS.try_with(|count| count.set(count.get() + 1));
+            let Some(_capsule_lease) = try_capsule_lease(capsule_dir.join(format!("{stem}.lock"))).await? else {
+                // A live publisher owns recovery; unrelated roots need not wait.
+                continue;
+            };
             // Each incomplete publication is isolated. Retain its bytes and
             // make the affected assignment fail closed, not the entire store.
             let mut invalid_payload = false;
             let result: StoreResult<()> = async {
+                #[cfg(test)]
+                if let Ok(pause) = audit151_tests::CAPSULE_READ_PAUSE.try_with(Arc::clone) {
+                    pause.started.add_permits(1);
+                    pause.release.acquire().await.expect("capsule read pause open").forget();
+                }
                 let payload = match tokio::fs::read_to_string(&path).await {
                     Ok(payload) => payload,
                     Err(error) => {
@@ -2863,6 +3037,19 @@ LIMIT 1
                     invalid_payload = true;
                     return Err(StoreError::CorruptData("invalid or noncanonical capsule".into()));
                 }
+                // Acquire payloads before the shared writer. Another publisher
+                // holds that writer through commit, so revalidate its durable
+                // authority after admission instead of trusting this snapshot.
+                let final_payload = if is_stage {
+                    match tokio::fs::read(task_capsule_path(&self.coordination_root, capsule.assignment_id)).await {
+                        Ok(bytes) => Some(bytes),
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                        Err(error) => return Err(error.into()),
+                    }
+                } else {
+                    None
+                };
+                let mut transaction = self.pool.begin().await?;
                 let assignment = match load_assignment_tx(&mut transaction, capsule.assignment_id).await {
                     Ok(assignment) => assignment,
                     Err(error) => {
@@ -2870,6 +3057,10 @@ LIMIT 1
                         return Err(error);
                     }
                 };
+                if let Err(error) = validate_capsule_contract_tx(&mut transaction, &assignment, &capsule).await {
+                    invalid_payload = matches!(error, StoreError::CorruptData(_) | StoreError::AttemptNotFound(_));
+                    return Err(error);
+                }
                 let expected_path = if is_stage {
                     task_capsule_staging_path(&self.coordination_root, capsule.assignment_id)
                 } else { task_capsule_path(&self.coordination_root, capsule.assignment_id) };
@@ -2881,10 +3072,11 @@ LIMIT 1
                     invalid_payload = true;
                     return Err(StoreError::CorruptData("capsule conflicts with authoritative assignment copy".into()));
                 }
+                transaction.rollback().await?;
                 if is_stage {
                     let final_path = task_capsule_path(&self.coordination_root, capsule.assignment_id);
-                    if tokio::fs::try_exists(&final_path).await? {
-                        if tokio::fs::read(&final_path).await? != payload.as_bytes() {
+                    if let Some(final_payload) = final_payload {
+                        if final_payload != payload.as_bytes() {
                             invalid_payload = true;
                             return Err(StoreError::CorruptData("capsule stage conflicts with published bytes".into()));
                         }
@@ -2893,31 +3085,58 @@ LIMIT 1
                         tokio::fs::rename(&path, final_path).await?;
                     }
                 }
-                if assignment.task_capsule.is_none() {
+                let mut transaction = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+                let current = load_assignment_tx(&mut transaction, capsule.assignment_id).await?;
+                validate_capsule_contract_tx(&mut transaction, &current, &capsule).await?;
+                if current.task_capsule.as_ref().is_some_and(|expected| expected != &payload) {
+                    return Err(StoreError::CorruptData("capsule authority changed during recovery".into()));
+                }
+                if current.task_capsule.is_none() {
                     sqlx::query("UPDATE assignments SET body_json = json_set(body_json, '$.task_capsule', ?) WHERE assignment_id = ?")
                         .bind(&payload).bind(capsule.assignment_id.to_string())
                         .execute(&mut *transaction).await?;
                 }
+                transaction.commit().await?;
                 Ok(())
             }.await;
             if let Err(error) = result {
-                // Only provisional payload damage is recoverable here. A failed
-                // database query, filesystem operation, or authoritative final
-                // capsule must not be presented as a successful initialization.
-                if !is_stage || !invalid_payload {
+                // A sidecar's access failure is assignment-local, just like
+                // payload damage. Never erase it or certify that task as read.
+                // Database failures still invalidate the initialization.
+                if matches!(error, StoreError::Io(_)) && !invalid_payload {
+                    tracing::warn!(path = %path.display(), %error, "inaccessible task capsule retained; its assignment remains unavailable");
+                    continue;
+                }
+                if !invalid_payload {
                     return Err(error);
+                }
+                if !is_stage {
+                    // One damaged published capsule must not fail every store
+                    // open, and with it every session start. Its bytes stay in
+                    // place: attach cannot substitute them, nothing is
+                    // backfilled, and each read of that assignment fails closed.
+                    tracing::warn!(path = %path.display(), %error, "invalid published task capsule retained; its assignment fails closed and unrelated tasks remain available");
+                    continue;
                 }
                 // Keep one diagnostic payload per staging name without making
                 // it a candidate on every subsequent startup. Never overwrite
                 // an earlier quarantined payload.
                 let quarantine = path.with_extension("invalid");
-                if !tokio::fs::try_exists(&quarantine).await? {
-                    tokio::fs::rename(&path, &quarantine).await?;
+                let quarantine_result: std::io::Result<()> = async {
+                    if !tokio::fs::try_exists(&quarantine).await? {
+                        tokio::fs::rename(&path, &quarantine).await?;
+                    }
+                    Ok(())
+                }.await;
+                if let Err(error) = quarantine_result {
+                    // Another initializer may have moved it already, or its
+                    // access mode may permit reads but forbid rename. Neither
+                    // case invalidates unrelated assignments.
+                    tracing::warn!(path = %path.display(), %error, "invalid task capsule could not be quarantined; unrelated tasks remain available");
                 }
                 tracing::warn!(path = %path.display(), %error, "invalid unpublished task capsule retained; unrelated tasks remain available");
             }
         }
-        transaction.commit().await?;
         Ok(())
     }
 
@@ -2993,7 +3212,32 @@ LIMIT 1
         .bind(MAX_WAKE_EVENTS_PER_ROOT as i64)
         .fetch_one(&self.pool)
         .await?;
-        Ok(mismatch == 0)
+        if mismatch != 0 {
+            return Ok(false);
+        }
+        let rows = sqlx::query("SELECT o.body_json, o.assignment_id, o.attempt_id, o.wake_event_id, w.body_json AS cached_body FROM observations o JOIN wake_events w ON w.root_session_id = o.root_session_id AND w.wake_sequence = o.wake_sequence")
+            .fetch_all(&self.pool).await?;
+        for row in rows {
+            // Undecodable authority cannot validate its cache. Its root's reads
+            // decode the same row and fail closed; other roots stay available.
+            let expected = match wake_event_from_observation_row(&row) {
+                Ok(expected) => expected,
+                Err(error) => {
+                    let wake_event_id: String = row.get("wake_event_id");
+                    tracing::warn!(
+                        %wake_event_id,
+                        %error,
+                        "undecodable authoritative wake observation retained; its root's wake reads fail closed"
+                    );
+                    continue;
+                }
+            };
+            let cached = decode::<WakeEvent>(&row.get::<String, _>("cached_body"));
+            if cached.as_ref().ok() != Some(&expected) {
+                return Ok(false);
+            }
+        }
+        Ok(true)
     }
 
     async fn rebuild_wake_streams(&self) -> StoreResult<()> {
@@ -3010,7 +3254,7 @@ LIMIT 1
         .fetch_all(&mut *transaction)
         .await?;
         for root in roots {
-            let mut rows = sqlx::query("SELECT wake_sequence, body_json FROM observations WHERE root_session_id = ? ORDER BY wake_sequence DESC LIMIT ?")
+            let mut rows = sqlx::query("SELECT wake_sequence, body_json, assignment_id, attempt_id, wake_event_id FROM observations WHERE root_session_id = ? ORDER BY wake_sequence DESC LIMIT ?")
                 .bind(&root)
                 .bind(MAX_WAKE_EVENTS_PER_ROOT as i64)
                 .fetch_all(&mut *transaction)
@@ -3021,16 +3265,7 @@ LIMIT 1
             let mut latest_event_id = None;
             for row in rows {
                 let wake_sequence = row.get::<i64, _>("wake_sequence");
-                let observation: RuntimeObservation =
-                    decode(row.get::<String, _>("body_json").as_str())?;
-                let event = WakeEvent {
-                    event_id: observation.wake_event_id,
-                    assignment_id: observation.assignment_id,
-                    attempt_id: observation.attempt_id,
-                    reason: observation.kind,
-                    summary: observation.summary,
-                    created_at: observation.created_at,
-                };
+                let event = wake_event_from_observation_row(&row)?;
                 if latest_event_id.is_none() {
                     retained_from = wake_sequence;
                 }
@@ -3085,8 +3320,15 @@ impl LocalAgentTaskStore {
     ) -> TaskStoreFuture<'a, Option<AssignmentId>> {
         Box::pin(async move {
             let root = repo_root.to_path_buf();
-            let (repository, mut assignment) = tokio::task::spawn_blocking(move || {
-                Ok::<_, StoreError>((repository_identity(&root)?, draft.normalize(&root)?))
+            let (repository, mut assignment, scope_case) = tokio::task::spawn_blocking(move || {
+                let repository = repository_identity(&root)?;
+                let assignment = draft.normalize(&root)?;
+                let scope_case = CandidateScopeCase::observe(
+                    &root,
+                    &assignment.read_scope,
+                    &assignment.write_scope,
+                );
+                Ok::<_, StoreError>((repository, assignment, scope_case))
             })
             .await
             .map_err(|error| StoreError::CorruptData(error.to_string()))??;
@@ -3111,7 +3353,8 @@ impl LocalAgentTaskStore {
                 None,
             )
             .await?;
-            let result = selective_admission_tx(&mut transaction, &assignment, false).await;
+            let result =
+                selective_admission_tx(&mut transaction, &assignment, &scope_case, false).await;
             transaction.rollback().await?;
             match result {
                 // Only an investigation still in flight can be shared. Sealed
@@ -3167,22 +3410,31 @@ impl LocalAgentTaskStore {
         {
             return Ok(false);
         }
-        let existing = sqlx::query_scalar::<_, String>(
-            "SELECT binding_json FROM pending_terminal_outcomes WHERE attempt_id = ?",
+        let existing = sqlx::query(
+            "SELECT binding_json, status_json, event_json FROM pending_terminal_outcomes WHERE attempt_id = ? AND turn_id = ?",
         )
         .bind(binding.attempt_id.to_string())
+        .bind(&turn_id)
         .fetch_optional(&mut *tx)
         .await?;
         let encoded = encode(&binding)?;
+        let prior_binding = sqlx::query_scalar::<_, String>(
+            "SELECT binding_json FROM pending_terminal_outcomes WHERE attempt_id = ? LIMIT 1",
+        ).bind(binding.attempt_id.to_string()).fetch_optional(&mut *tx).await?;
+        if prior_binding.as_ref().is_some_and(|prior| prior != &encoded) {
+            return Err(StoreError::CorruptData("terminal outcome binding changed across turns".into()));
+        }
         if existing
             .as_ref()
-            .is_some_and(|existing| existing != &encoded)
+            .is_some_and(|existing| existing.get::<String, _>("binding_json") != encoded
+                || existing.get::<String, _>("status_json") != status_json
+                || existing.get::<String, _>("event_json") != event_json)
         {
             return Err(StoreError::CorruptData(
-                "terminal outcome binding changed".into(),
+                "terminal outcome identity has a conflicting binding or payload".into(),
             ));
         }
-        sqlx::query("INSERT INTO pending_terminal_outcomes (attempt_id, assignment_id, binding_json, turn_id, status_json, event_json) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(attempt_id) DO NOTHING")
+        sqlx::query("INSERT INTO pending_terminal_outcomes (attempt_id, assignment_id, binding_json, turn_id, status_json, event_json) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(attempt_id, turn_id) DO NOTHING")
             .bind(binding.attempt_id.to_string()).bind(binding.assignment_id.to_string())
             .bind(encoded).bind(turn_id).bind(status_json).bind(event_json).execute(&mut *tx).await?;
         tx.commit().await?;
@@ -3192,15 +3444,36 @@ impl LocalAgentTaskStore {
     pub async fn pending_terminal_outcomes(
         &self,
         root: &str,
-    ) -> StoreResult<Vec<(crate::AgentTaskBinding, String)>> {
-        sqlx::query("SELECT p.binding_json, p.status_json FROM pending_terminal_outcomes p JOIN assignments a USING (assignment_id) WHERE a.root_session_id = ? ORDER BY p.attempt_id")
-            .bind(root).fetch_all(&self.pool).await?.into_iter()
-            .map(|row| Ok((decode(row.get::<String, _>("binding_json").as_str())?, row.get("status_json")))).collect()
+    ) -> StoreResult<Vec<StoreResult<PendingTerminalOutcome>>> {
+        let rows = sqlx::query("SELECT p.* FROM pending_terminal_outcomes p JOIN assignments a USING (assignment_id) WHERE a.root_session_id = ? AND p.acknowledged = 0 AND NOT EXISTS (SELECT 1 FROM pending_terminal_outcomes newer WHERE newer.attempt_id = p.attempt_id AND newer.sequence > p.sequence) ORDER BY p.sequence")
+            .bind(root).fetch_all(&self.pool).await?;
+        Ok(rows
+            .into_iter()
+            .map(|row| {
+                let binding: AgentTaskBinding =
+                    decode(row.get::<String, _>("binding_json").as_str())?;
+                if binding.root_session_id != root
+                    || binding.assignment_id.to_string() != row.get::<String, _>("assignment_id")
+                    || binding.attempt_id.to_string() != row.get::<String, _>("attempt_id")
+                {
+                    return Err(StoreError::CorruptData(
+                        "pending terminal binding identity mismatch".into(),
+                    ));
+                }
+                Ok(PendingTerminalOutcome {
+                    binding,
+                    turn_id: row.get("turn_id"),
+                    status_json: row.get("status_json"),
+                    event_json: row.get("event_json"),
+                })
+            })
+            .collect())
     }
 
-    pub async fn acknowledge_terminal_outcome(&self, attempt: AttemptId) -> StoreResult<()> {
-        sqlx::query("DELETE FROM pending_terminal_outcomes WHERE attempt_id = ?")
+    pub async fn acknowledge_terminal_outcome(&self, attempt: AttemptId, turn_id: &str) -> StoreResult<()> {
+        sqlx::query("UPDATE pending_terminal_outcomes SET acknowledged = 1 WHERE attempt_id = ? AND turn_id = ?")
             .bind(attempt.to_string())
+            .bind(turn_id)
             .execute(&self.pool)
             .await?;
         Ok(())
@@ -3883,13 +4156,26 @@ impl LocalAgentTaskStore {
     ) -> TaskStoreFuture<'_, NonproductiveRecovery> {
         Box::pin(async move {
             let result = self
-                .recover_nonproductive_assignment_impl(assignment_id, no_progress_before)
+                .recover_nonproductive_assignment_impl(assignment_id, no_progress_before, None)
                 .await;
             if matches!(&result, Ok(NonproductiveRecovery::Recovered { .. })) {
                 self.notify_wake_waiters();
             }
             result
         })
+    }
+
+    /// Caller must establish that this launch owner is no longer live. The
+    /// transaction rechecks its exact attempt/owner and never retires a worker.
+    pub async fn recover_unstarted_assignment(
+        &self,
+        assignment_id: AssignmentId,
+        no_progress_before: chrono::DateTime<Utc>,
+        owner: Option<String>,
+    ) -> StoreResult<NonproductiveRecovery> {
+        let result = self.recover_nonproductive_assignment_impl(assignment_id, no_progress_before, Some(owner)).await;
+        if matches!(&result, Ok(NonproductiveRecovery::Recovered { .. })) { self.notify_wake_waiters(); }
+        result
     }
 
     pub fn release_stalled_nudge(&self, assignment_id: AssignmentId) -> TaskStoreFuture<'_, bool> {
@@ -3956,6 +4242,19 @@ enum StoredValidationTerminalStatus {
     Failed,
 }
 
+/// A native execution observation has no caller-authored coverage requirement.
+/// It can establish historical execution, never current input binding or scope.
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct StoredNativeCommandResult {
+    kind: String,
+    argv: Vec<String>,
+    call_id: String,
+    status: StoredValidationTerminalStatus,
+    #[serde(rename = "durationMs")]
+    _duration_ms: u64,
+}
+
 fn validation_call_has_successful_result(call: &ValidationCall) -> bool {
     verified_evidence_kind(call).is_some()
 }
@@ -3983,6 +4282,21 @@ pub(crate) fn verified_evidence_kind(
                 .bytes()
                 .all(|byte| byte.is_ascii_hexdigit()))
         .then_some(crate::CriterionEvidenceKind::SourceInspection);
+    }
+    if let Some(result) =
+        call.evidence.validation_result.as_ref().and_then(|value| {
+            serde_json::from_value::<StoredNativeCommandResult>(value.clone()).ok()
+        })
+    {
+        return (result.kind == "native_command_execution_v1"
+            && result.call_id == call.call_id
+            && !result.call_id.trim().is_empty()
+            && result.status == StoredValidationTerminalStatus::Succeeded
+            && result
+                .argv
+                .first()
+                .is_some_and(|value| !value.trim().is_empty()))
+        .then_some(crate::CriterionEvidenceKind::ValidationExecution);
     }
     let result = call
         .evidence
@@ -4118,12 +4432,58 @@ async fn load_assignment_tx(
     Ok(assignment)
 }
 
+/// Marks a workspace row whose canonical-root claim was moved aside. The original
+/// root follows the row's own workspace ID, so the marker stays unique and recoverable.
+const RETIRED_FOLDED_ROOT_PREFIX: &str = "retired-folded-identity:";
+
 // Compatibility metadata for durable task identities, not a workspace scanner.
 async fn ensure_task_workspace_tx(
     transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     repository: &RepositoryIdentity,
 ) -> StoreResult<()> {
     let now = Utc::now();
+    // Rows written before exact identities hold this root under its case-folded
+    // ID, and `canonical_root` is UNIQUE, so the exact row could never be added:
+    // every admission in that checkout failed. Move only that historical claim
+    // aside; the row and everything referencing its ID stay intact, unmerged.
+    let holder = sqlx::query_scalar::<_, String>(
+        "SELECT workspace_id FROM workspace_repositories
+         WHERE canonical_root = ? AND workspace_id <> ?",
+    )
+    .bind(&repository.canonical_path)
+    .bind(&repository.workspace_id)
+    .fetch_optional(&mut **transaction)
+    .await?;
+    if let Some(holder) = holder {
+        if !crate::scope::is_legacy_workspace_id(&repository.canonical_root, &holder) {
+            return Err(StoreError::CorruptData(format!(
+                "workspace root {} is already bound to another workspace identity",
+                repository.canonical_path
+            )));
+        }
+        let retired = sqlx::query(
+            "UPDATE workspace_repositories SET canonical_root = ?
+             WHERE workspace_id = ? AND canonical_root = ?",
+        )
+        .bind(format!(
+            "{RETIRED_FOLDED_ROOT_PREFIX}{holder}:{}",
+            repository.canonical_path
+        ))
+        .bind(&holder)
+        .bind(&repository.canonical_path)
+        .execute(&mut **transaction)
+        .await?;
+        if retired.rows_affected() != 1 {
+            return Err(StoreError::CorruptData(
+                "legacy workspace root changed during retirement".to_string(),
+            ));
+        }
+        tracing::info!(
+            legacy_workspace_id = %holder,
+            root = %repository.canonical_path,
+            "retired a case-folded legacy workspace root claim; its history is retained"
+        );
+    }
     sqlx::query(
         "INSERT INTO workspace_repositories (
             workspace_id, repository_id, canonical_root, epoch, updated_at
@@ -4185,15 +4545,30 @@ async fn upgrade_legacy_repository_bindings(pool: &SqlitePool) -> StoreResult<()
     )
     .fetch_all(pool)
     .await?;
+    #[cfg(test)]
+    if let Ok(barrier) = TEST_LEGACY_UPGRADE_BARRIER.try_with(Arc::clone) {
+        barrier.wait().await;
+    }
+    // Non-Git roots legitimately retain repository_id == workspace_id. Resolve
+    // each distinct root once per open, not once per historical assignment.
+    let mut identities = std::collections::HashMap::new();
     for row in rows {
         let assignment_id = row.get::<String, _>("assignment_id");
         let legacy_repository_id = row.get::<String, _>("repository_id");
         let workspace_id = row.get::<String, _>("workspace_id");
         let canonical_root = row.get::<String, _>("canonical_root");
-        let repository = match repository_identity_async(Path::new(&canonical_root)).await {
-            Ok(repository) => repository,
-            Err(StoreError::InvalidScope(_)) => continue,
-            Err(error) => return Err(error),
+        if !identities.contains_key(&canonical_root) {
+            #[cfg(test)]
+            let _ = TEST_LEGACY_IDENTITY_RESOLUTIONS.try_with(|count| count.set(count.get() + 1));
+            let identity = match repository_identity_async(Path::new(&canonical_root)).await {
+                Ok(repository) => Some(repository),
+                Err(StoreError::InvalidScope(_)) => None,
+                Err(error) => return Err(error),
+            };
+            identities.insert(canonical_root.clone(), identity);
+        }
+        let Some(repository) = identities.get(&canonical_root).and_then(Option::as_ref) else {
+            continue;
         };
         if repository.workspace_id != workspace_id {
             if crate::scope::is_legacy_workspace_id(&repository.canonical_root, &workspace_id) {
@@ -4222,9 +4597,23 @@ async fn upgrade_legacy_repository_bindings(pool: &SqlitePool) -> StoreResult<()
         .execute(&mut *transaction)
         .await?;
         if binding_update.rows_affected() != 1 {
-            return Err(StoreError::CorruptData(format!(
-                "legacy repository binding changed during upgrade for assignment {assignment_id}"
-            )));
+            let current: Option<(String, String, String)> = sqlx::query_as(
+                "SELECT repository_id, workspace_id, canonical_root FROM assignment_repositories WHERE assignment_id = ?",
+            )
+            .bind(&assignment_id)
+            .fetch_optional(&mut *transaction)
+            .await?;
+            if current
+                != Some((
+                    repository.id.clone(),
+                    workspace_id.clone(),
+                    canonical_root.clone(),
+                ))
+            {
+                return Err(StoreError::CorruptData(format!(
+                    "legacy repository binding changed during upgrade for assignment {assignment_id}"
+                )));
+            }
         }
         sqlx::query(
             "UPDATE workspace_repositories
@@ -4256,6 +4645,139 @@ async fn upgrade_legacy_repository_bindings(pool: &SqlitePool) -> StoreResult<()
         transaction.commit().await?;
     }
     Ok(())
+}
+
+/// Receipt bodies are evidence only when they agree with their relational seal.
+async fn load_receipt_tx(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    attempt: &Attempt,
+) -> StoreResult<Option<(AgentReceipt, String)>> {
+    let row = sqlx::query("SELECT attempt_id, assignment_id, status, body_json, sealed_at FROM receipts WHERE attempt_id = ?")
+        .bind(attempt.attempt_id.to_string()).fetch_optional(&mut **transaction).await?;
+    let Some(row) = row else {
+        if attempt.state.is_terminal() || attempt.sealed_at.is_some() {
+            return Err(StoreError::CorruptData("sealed attempt has no receipt".into()));
+        }
+        return Ok(None);
+    };
+    let body: String = row.get("body_json");
+    let receipt: AgentReceipt = decode(&body)?;
+    let status: AgentStatusClaim = decode(&row.get::<String, _>("status"))?;
+    let sealed_at: chrono::DateTime<Utc> = decode(&row.get::<String, _>("sealed_at"))?;
+    // Failed host review can downgrade lifecycle state without rewriting the
+    // worker's immutable completed claim or its relational seal.
+    let mut state_matches = status.attempt_state() == attempt.state;
+    if !state_matches
+        && status == AgentStatusClaim::Completed
+        && attempt.state == AttemptState::NeedsMain
+    {
+        let verdicts = sqlx::query("SELECT assignment_id, kind, status, body_json, updated_at, sealed_at FROM gate_verdicts WHERE attempt_id = ?")
+            .bind(attempt.attempt_id.to_string())
+            .fetch_all(&mut **transaction)
+            .await?;
+        for verdict in verdicts {
+            let gate: AgentGate = decode(&verdict.get::<String, _>("body_json"))?;
+            let gate_sealed_at: chrono::DateTime<Utc> = decode(&verdict.get::<String, _>("sealed_at"))?;
+            let gate_updated_at: chrono::DateTime<Utc> =
+                decode(&verdict.get::<String, _>("updated_at"))?;
+            if verdict.get::<String, _>("assignment_id") != attempt.assignment_id.to_string()
+                || gate.assignment_id != attempt.assignment_id
+                || verdict.get::<String, _>("kind") != encode(&gate.kind)?
+                || verdict.get::<String, _>("status") != encode(&gate.status)?
+                || gate.sealed_at != Some(gate_sealed_at)
+                || gate.updated_at != gate_updated_at
+            {
+                return Err(StoreError::CorruptData(
+                    "gate verdict does not match its relational seal".into(),
+                ));
+            }
+            state_matches |= gate_sealed_at >= sealed_at
+                && gate.status.is_sealed()
+                && gate_requires_main_intervention(attempt, gate.kind, gate.status);
+        }
+    }
+    if row.get::<String, _>("attempt_id") != attempt.attempt_id.to_string()
+        || row.get::<String, _>("assignment_id") != attempt.assignment_id.to_string()
+        || receipt.assignment_id != attempt.assignment_id
+        || receipt.attempt_id != attempt.attempt_id
+        || receipt.status != status || !state_matches
+        || receipt.sealed_at != sealed_at || attempt.sealed_at != Some(sealed_at)
+    {
+        return Err(StoreError::CorruptData("receipt identity or seal does not match its attempt".into()));
+    }
+    Ok(Some((receipt, body)))
+}
+
+async fn validate_capsule_contract_tx(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    assignment: &Assignment,
+    capsule: &TaskCapsuleV1,
+) -> StoreResult<()> {
+    let attempt = load_attempt_tx(transaction, capsule.attempt_id).await?;
+    // Missing legacy strategy means Auto, which admission resolves to Shared.
+    let workspace_strategy = match capsule.workspace_strategy.unwrap_or_default() {
+        WorkspaceStrategy::Auto => WorkspaceStrategy::Shared,
+        strategy => strategy,
+    };
+    // Corrections keep the original immutable capsule, not the current attempt.
+    if capsule.schema_version != 1 || capsule.assignment_id != assignment.assignment_id
+        || attempt.assignment_id != assignment.assignment_id || attempt.ordinal != 0
+        || capsule.role != assignment.role
+        || capsule.capability_profile != assignment.capability_profile
+        || capsule.objective != assignment.objective
+        || capsule.requirements != assignment.acceptance_criteria
+        || capsule.read_scope != assignment.read_scope || capsule.write_scope != assignment.write_scope
+        || capsule.stop_condition != assignment.stop_condition
+        || capsule.dependencies != assignment.dependencies || capsule.risk_hints != assignment.risk_hints
+        || capsule.contract_claims != assignment.contract_claims
+        || workspace_strategy != assignment.workspace_strategy
+        || capsule.relation != assignment.relation
+        || capsule.architecture_contract_ref != assignment.architecture_contract_ref
+        || capsule.integration_plan != assignment.integration_plan
+        || capsule.prohibited_changes != assignment.prohibited_changes
+        || capsule.required_evidence != assignment.required_evidence
+    {
+        return Err(StoreError::CorruptData("capsule does not match its original admitted contract".into()));
+    }
+    Ok(())
+}
+
+fn wake_event_from_observation_row(row: &sqlx::sqlite::SqliteRow) -> StoreResult<WakeEvent> {
+    let observation: RuntimeObservation = decode(&row.get::<String, _>("body_json"))?;
+    if observation.assignment_id.to_string() != row.get::<String, _>("assignment_id")
+        || observation.attempt_id.to_string() != row.get::<String, _>("attempt_id")
+        || observation.wake_event_id.to_string() != row.get::<String, _>("wake_event_id")
+    {
+        return Err(StoreError::CorruptData("authoritative wake observation identity mismatch".into()));
+    }
+    Ok(WakeEvent { event_id: observation.wake_event_id, assignment_id: observation.assignment_id,
+        attempt_id: observation.attempt_id, reason: observation.kind,
+        summary: observation.summary, created_at: observation.created_at })
+}
+
+async fn restore_missing_capsule(path: PathBuf, payload: String) -> StoreResult<()> {
+    tokio::task::spawn_blocking(move || -> StoreResult<()> {
+        let temporary = path.with_extension(format!("{}.repair", AttemptId::new()));
+        let result = (|| -> StoreResult<()> {
+            let mut file = std::fs::OpenOptions::new().write(true).create_new(true).open(&temporary)?;
+            file.write_all(payload.as_bytes())?;
+            file.sync_all()?;
+            drop(file);
+            // Atomic no-clobber publication: never overwrite conflicting evidence.
+            match std::fs::hard_link(&temporary, &path) {
+                Ok(()) => tracing::info!("restored missing capsule from validated immutable authority"),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    if std::fs::read(&path)? != payload.as_bytes() {
+                        return Err(StoreError::CorruptData("capsule repair conflicts with existing sidecar".into()));
+                    }
+                }
+                Err(error) => return Err(error.into()),
+            }
+            Ok(())
+        })();
+        let _ = std::fs::remove_file(temporary);
+        result
+    }).await.map_err(std::io::Error::other)?
 }
 
 async fn load_attempt_tx(
@@ -4365,7 +4887,7 @@ async fn assess_criteria_tx(
             // Bounded local acquisition only. Slow/inaccessible storage yields
             // unknown, never a pass, and cannot indefinitely hold the DB writer.
             let observed = tokio::time::timeout(std::time::Duration::from_secs(2), async {
-                let mut hashes = std::collections::HashMap::new();
+                let hashes = std::collections::HashMap::new();
                 let Ok(identity) = repository_identity_async(Path::new(&root)).await else {
                     return hashes;
                 };
@@ -4374,38 +4896,11 @@ async fn assess_criteria_tx(
                 {
                     return hashes;
                 }
-                for path in paths.iter().take(64) {
-                    if normalize_repo_path_async(Path::new(&root), path)
-                        .await
-                        .as_ref()
-                        .ok()
-                        != Some(path)
-                    {
-                        continue;
-                    }
-                    let Ok(file) = tokio::fs::File::open(Path::new(&root).join(path)).await else {
-                        continue;
-                    };
-                    if !file
-                        .metadata()
-                        .await
-                        .is_ok_and(|metadata| metadata.is_file())
-                    {
-                        continue;
-                    }
-                    use tokio::io::AsyncReadExt;
-                    let mut bytes = Vec::new();
-                    if file
-                        .take(8 * 1024 * 1024 + 1)
-                        .read_to_end(&mut bytes)
-                        .await
-                        .is_ok()
-                        && bytes.len() <= 8 * 1024 * 1024
-                    {
-                        hashes.insert(path.clone(), hex::encode(Sha256::digest(&bytes)));
-                    }
-                }
-                hashes
+                let root = Path::new(&root);
+                collect_current_source_hashes(&paths, |path| async move {
+                    read_current_source_hash(root, &path).await
+                })
+                .await
             })
             .await;
             if let Ok(hashes) = observed {
@@ -4485,14 +4980,8 @@ async fn validate_dependencies_tx(
             });
             continue;
         }
-        let receipt_json = sqlx::query_scalar::<_, Option<String>>(
-            "SELECT r.body_json FROM attempts t LEFT JOIN receipts r ON r.attempt_id = t.attempt_id WHERE t.assignment_id = ? ORDER BY t.ordinal DESC LIMIT 1",
-        )
-        .bind(dependency.to_string())
-        .fetch_optional(&mut **transaction)
-        .await?
-        .flatten();
-        let Some(receipt_json) = receipt_json else {
+        let dependency_attempt = load_current_attempt_tx(transaction, *dependency).await?;
+        let Some((receipt, receipt_json)) = load_receipt_tx(transaction, &dependency_attempt).await? else {
             blockers.push(DependencyBlocker {
                 assignment_id: *dependency,
                 state: DependencyState::Incomplete,
@@ -4500,7 +4989,14 @@ async fn validate_dependencies_tx(
             });
             continue;
         };
-        let receipt: AgentReceipt = decode(&receipt_json)?;
+        if dependency_attempt.state == AttemptState::NeedsMain {
+            blockers.push(DependencyBlocker {
+                assignment_id: *dependency,
+                state: DependencyState::Blocked,
+                detail: "dependency requires main intervention".to_string(),
+            });
+            continue;
+        }
         if !receipt.status.is_success() {
             blockers.push(DependencyBlocker {
                 assignment_id: *dependency,
@@ -4924,15 +5420,55 @@ async fn verification_proof_tx(
             });
         }
         if validation_call_has_successful_result(&call) {
-            summaries.insert(call.command_summary);
-            calls.push(call.call_id);
+            summaries.insert(call.command_summary.clone());
+            calls.push(call);
         }
     }
     let obligations = missing_evidence_obligations(&assignment, &summaries);
     if !obligations.is_empty() {
         return Err(StoreError::RequiredEvidenceMissing { obligations });
     }
-    Ok(calls)
+    let call_ids = calls.iter().map(|call| call.call_id.clone()).collect::<Vec<_>>();
+    // The verifier is still active: derive owned references without requiring a
+    // sealed receipt (which would deadlock the gate-before-completion workflow).
+    let results = assignment.effective_criteria(attempt.amendment.as_ref()).iter().map(|criterion| {
+        let evidence_ref = criterion.evidence_policy.as_ref().and_then(|policy| {
+            let kind = match policy.kind {
+                crate::CriterionEvidenceRequirement::SourceInspection => crate::CriterionEvidenceKind::SourceInspection,
+                crate::CriterionEvidenceRequirement::ValidationExecution => crate::CriterionEvidenceKind::ValidationExecution,
+                crate::CriterionEvidenceRequirement::ReportOnly => return None,
+            };
+            let call = calls.iter().filter(|call| {
+                Some(&call.command_summary) == policy.required_evidence.as_ref()
+                    && call.verified_evidence_kind() == Some(kind)
+            }).max_by_key(|call| call.recorded_at)?;
+            Some(crate::CriterionEvidenceRef {
+                call_id: call.call_id.clone(),
+                workspace_id: assignment.workspace_id.clone(),
+                evidence_epoch: call.evidence.end_epoch?,
+                kind,
+            })
+        });
+        crate::CriterionResult {
+            criterion_id: criterion.id.clone(),
+            status: CriterionStatus::Passed,
+            evidence: None,
+            evidence_ref,
+        }
+    }).collect::<Vec<_>>();
+    let assessments = assess_criteria_tx(transaction, &assignment, attempt.amendment.as_ref(),
+        evaluator, &results, &call_ids, &calls).await?;
+    let obligations = assessments.into_iter().filter(|criterion| !criterion.satisfied
+        && assignment.effective_criteria(attempt.amendment.as_ref()).iter().any(|declared|
+            declared.id == criterion.criterion_id && declared.evidence_policy.is_some()))
+        .map(|criterion| MissingEvidenceObligation {
+            id: format!("criterion:v1:{}:{}", assignment.assignment_id, criterion.criterion_id),
+            requirement: format!("{}: {}", criterion.criterion_id, criterion.reason),
+        }).collect::<Vec<_>>();
+    if !obligations.is_empty() {
+        return Err(StoreError::RequiredEvidenceMissing { obligations });
+    }
+    Ok(call_ids)
 }
 
 async fn record_gate_verdict_tx(
@@ -5269,6 +5805,7 @@ pub(crate) async fn heartbeat_typed_workspace_actor_tx(
 async fn selective_admission_tx(
     transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     assignment: &Assignment,
+    scope_case: &CandidateScopeCase,
     isolated_integrator_available: bool,
 ) -> StoreResult<(AdmissionOverlapSummary, IntegrationPlan)> {
     let rows = sqlx::query(
@@ -5278,7 +5815,7 @@ async fn selective_admission_tx(
          JOIN assignment_repositories repositories USING (assignment_id)
          JOIN attempts ON attempts.assignment_id = assignments.assignment_id
          WHERE repositories.repository_id = ?
-           AND assignments.root_session_id = ?
+           AND attempts.state = ? AND attempts.sealed_at IS NULL
            AND attempts.ordinal = (
                SELECT MAX(current.ordinal)
                FROM attempts current
@@ -5287,31 +5824,26 @@ async fn selective_admission_tx(
          ORDER BY assignments.assignment_id",
     )
     .bind(&assignment.repository_id)
-    .bind(&assignment.root_session_id)
+    .bind(encode(&AttemptState::Active)?)
     .fetch_all(&mut **transaction)
     .await?;
 
-    let candidate_identity = assignment.primary_investigation_identity();
     let mut overlaps = AdmissionOverlapSummary::default();
     let mut conflicting_writer_count = 0_u32;
     let mut conflicting_writer_in_another_workspace = false;
     for row in rows {
         let existing: Assignment = decode(row.get::<String, _>("body_json").as_str())?;
         let existing_workspace_id = row.get::<String, _>("workspace_id");
+        let same_root = existing.root_session_id == assignment.root_session_id;
+        if !same_root && existing_workspace_id != assignment.workspace_id {
+            continue;
+        }
         let existing_state: AttemptState = decode(row.get::<String, _>("state").as_str())?;
         let existing_is_active = existing_state == AttemptState::Active
             && row.try_get::<Option<String>, _>("sealed_at")?.is_none();
-        // In-flight work in this checkout can be shared outright.
-        if existing_is_active
-            && candidate_identity.is_some()
-            && candidate_identity == existing.primary_investigation_identity()
-            && existing_workspace_id == assignment.workspace_id
-        {
-            return Err(StoreError::AdmissionRejected {
-                reason: AdmissionRejectionReason::DuplicateExplorerInvestigation,
-                reusable_assignment_id: Some(existing.assignment_id),
-            });
-        }
+        // An identical task description is not an observed-input contract.
+        // Active producers may already have read obsolete bytes. Until source
+        // generations and dependency receipts are bound, admit fresh reads.
 
         if !existing_is_active {
             // Even persisted seal-time fingerprints cannot prove what the
@@ -5323,20 +5855,28 @@ async fn selective_admission_tx(
             assignment
                 .read_scope
                 .iter()
-                .any(|scope| existing_scope.overlaps(scope))
+                .enumerate()
+                .any(|(index, scope)| {
+                    scopes_overlap_observed(existing_scope, scope, scope_case.read(index))
+                })
         });
         if read_overlaps {
             overlaps.benign_read_overlap_count =
                 overlaps.benign_read_overlap_count.saturating_add(1);
         }
-        if existing.write_scope.is_empty() {
+        // Only a candidate that writes can conflict with a writer. A read-only
+        // candidate's contract claims stay advisory, like its read overlap.
+        if existing.write_scope.is_empty() || assignment.write_scope.is_empty() {
             continue;
         }
         let write_scope_overlaps = existing.write_scope.iter().any(|existing_scope| {
             assignment
                 .write_scope
                 .iter()
-                .any(|scope| existing_scope.overlaps(scope))
+                .enumerate()
+                .any(|(index, scope)| {
+                    scopes_overlap_observed(existing_scope, scope, scope_case.write(index))
+                })
         });
         let contract_overlaps = existing.contract_claims.iter().any(|existing_contract| {
             assignment
@@ -5345,6 +5885,14 @@ async fn selective_admission_tx(
                 .any(|contract| contract == existing_contract)
         });
         if write_scope_overlaps || contract_overlaps {
+            if !same_root {
+                // Detect shared-checkout conflicts without exposing another
+                // root's task identity or borrowing its result authority.
+                return Err(StoreError::AdmissionRejected {
+                    reason: AdmissionRejectionReason::ExternalWorkspaceWriter,
+                    reusable_assignment_id: None,
+                });
+            }
             conflicting_writer_count = conflicting_writer_count.saturating_add(1);
             conflicting_writer_in_another_workspace |=
                 existing_workspace_id != assignment.workspace_id;
@@ -5425,7 +5973,7 @@ async fn transition_attempt_to_needs_main_tx(
                 .to_string(),
         ));
     }
-    Ok(())
+    finish_task_actor(transaction, attempt.assignment_id).await
 }
 
 pub(crate) fn binding_from_row(row: &sqlx::sqlite::SqliteRow) -> StoreResult<AgentTaskBinding> {
@@ -5447,6 +5995,20 @@ fn task_capsule_path(coordination_root: &Path, assignment_id: AssignmentId) -> P
         .join(format!("{assignment_id}.json"))
 }
 
+/// Lock files are retained: deleting an unlocked pathname can erase a live
+/// successor's lock. File drop releases the OS lease, including process death.
+async fn try_capsule_lease(path: PathBuf) -> StoreResult<Option<std::fs::File>> {
+    tokio::task::spawn_blocking(move || -> std::io::Result<Option<std::fs::File>> {
+        if let Some(parent) = path.parent() { std::fs::create_dir_all(parent)?; }
+        let file = std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(false).open(path)?;
+        match file.try_lock() {
+            Ok(()) => Ok(Some(file)),
+            Err(std::fs::TryLockError::WouldBlock) => Ok(None),
+            Err(std::fs::TryLockError::Error(error)) => Err(error),
+        }
+    }).await.map_err(std::io::Error::other)?.map_err(StoreError::from)
+}
+
 fn task_capsule_staging_path(coordination_root: &Path, assignment_id: AssignmentId) -> PathBuf {
     coordination_root
         .join("task_capsules")
@@ -5454,11 +6016,12 @@ fn task_capsule_staging_path(coordination_root: &Path, assignment_id: Assignment
 }
 
 async fn hydrate_task_capsule(
+    pool: &SqlitePool,
     coordination_root: &Path,
     assignment: &mut Assignment,
 ) -> StoreResult<()> {
     let capsule_path = task_capsule_path(coordination_root, assignment.assignment_id);
-    let canonical_payload = match tokio::fs::read_to_string(capsule_path).await {
+    let canonical_payload = match tokio::fs::read_to_string(&capsule_path).await {
         Ok(payload) => payload,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             // The committed assignment copy is the attachment authority. A stage
@@ -5467,20 +6030,33 @@ async fn hydrate_task_capsule(
             // assignment lock, so a concurrent read can observe the stage before
             // the published file. Startup reconciliation settles crash leftovers,
             // and attach still refuses to publish over an unresolved stage.
-            if assignment.task_capsule.is_some() {
-                return Err(StoreError::CorruptData(format!(
-                    "attached task capsule is unavailable for {}",
-                    assignment.assignment_id
-                )));
+            let Some(payload) = assignment.task_capsule.as_ref() else { return Ok(()); };
+            let capsule: TaskCapsuleV1 = decode(payload)?;
+            let mut transaction = pool.begin().await?;
+            validate_capsule_contract_tx(&mut transaction, assignment, &capsule).await?;
+            transaction.commit().await?;
+            if !is_canonical_persisted_task_capsule(&capsule, payload)? {
+                return Err(StoreError::CorruptData("noncanonical authoritative capsule".into()));
             }
-            return Ok(());
+            restore_missing_capsule(capsule_path.clone(), payload.clone()).await?;
+            payload.clone()
         }
         Err(error) => return Err(error.into()),
     };
     let capsule: TaskCapsuleV1 = serde_json::from_str(&canonical_payload)?;
+    let mut transaction = pool.begin().await?;
+    validate_capsule_contract_tx(&mut transaction, assignment, &capsule).await?;
+    transaction.commit().await?;
     if capsule.schema_version != 1 || capsule.assignment_id != assignment.assignment_id {
         return Err(StoreError::CorruptData(
             "persisted TaskCapsuleV1 identity or schema version is invalid".to_string(),
+        ));
+    }
+    // Startup retains a mismatched published capsule instead of failing the
+    // store, so reads must reject it here rather than rely on reconciliation.
+    if capsule.integration_plan != assignment.integration_plan {
+        return Err(StoreError::CorruptData(
+            "persisted TaskCapsuleV1 integration plan does not match its assignment".to_string(),
         ));
     }
     if !is_canonical_persisted_task_capsule(&capsule, &canonical_payload)? {
@@ -5497,7 +6073,9 @@ async fn hydrate_task_capsule(
             "task capsule does not match its authoritative assignment copy".to_string(),
         ));
     }
-    assignment.task_capsule = Some(canonical_payload);
+    // Publication precedes commit. A sidecar without the authoritative copy
+    // cannot turn this database snapshot into an attachment receipt. Startup
+    // reconciliation may settle crash leftovers under the assignment writer.
     Ok(())
 }
 
@@ -5790,6 +6368,51 @@ fn missing_evidence_obligations(
         .map(|(ordinal, requirement)| evidence_obligation(assignment, ordinal, requirement))
         .collect()
 }
+
+/// Own the read futures so a deadline drops unfinished reads, rather than
+/// detaching tasks that could publish a partial proof after assessment ends.
+fn collect_current_source_hashes<'a, F, Fut>(
+    paths: &BTreeSet<String>,
+    read: F,
+) -> impl Future<Output = std::collections::HashMap<String, String>> + Send + 'a
+where
+    F: Fn(String) -> Fut + Send + 'a,
+    Fut: Future<Output = Option<String>> + Send + 'a,
+{
+    let paths = paths.iter().take(64).cloned().collect::<Vec<_>>();
+    async move {
+        futures::stream::iter(paths)
+            .map(move |path| {
+                let reading = read(path.clone());
+                async move { reading.await.map(|hash| (path, hash)) }
+            })
+            .buffer_unordered(8)
+            .filter_map(std::future::ready)
+            .collect()
+            .await
+    }
+}
+
+async fn read_current_source_hash(root: &Path, path: &str) -> Option<String> {
+    if normalize_repo_path_async(root, path).await.as_deref().ok() != Some(path) {
+        return None;
+    }
+    let file = tokio::fs::File::open(root.join(path)).await.ok()?;
+    if !file.metadata().await.ok()?.is_file() {
+        return None;
+    }
+    use tokio::io::AsyncReadExt;
+    let mut bytes = Vec::new();
+    file.take(8 * 1024 * 1024 + 1)
+        .read_to_end(&mut bytes)
+        .await
+        .ok()?;
+    (bytes.len() <= 8 * 1024 * 1024).then(|| hash_bytes(&bytes))
+}
+
+#[cfg(test)]
+#[path = "local_source_tests.rs"]
+mod source_tests;
 
 fn hash_bytes(bytes: &[u8]) -> String {
     hex::encode(Sha256::digest(bytes))

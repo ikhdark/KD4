@@ -236,27 +236,42 @@ impl ApplyPatchArgumentDiffConsumer {
 }
 
 fn convert_apply_patch_hunks_to_protocol(hunks: &[Hunk]) -> HashMap<PathBuf, FileChange> {
-    hunks
-        .iter()
-        .map(|hunk| {
-            let path = hunk_source_path(hunk).to_path_buf();
-            let change = match hunk {
-                Hunk::AddFile { contents, .. } => FileChange::Add {
-                    content: contents.clone(),
-                },
-                Hunk::DeleteFile { .. } => FileChange::Delete {
-                    content: String::new(),
-                },
-                Hunk::UpdateFile {
-                    chunks, move_path, ..
-                } => FileChange::Update {
-                    unified_diff: format_update_chunks_for_progress(chunks),
-                    move_path: move_path.clone(),
-                },
-            };
-            (path, change)
-        })
-        .collect()
+    let mut changes = HashMap::new();
+    for hunk in hunks {
+        let path = hunk_source_path(hunk).to_path_buf();
+        let change = match hunk {
+            Hunk::AddFile { contents, .. } => FileChange::Add {
+                content: contents.clone(),
+            },
+            Hunk::DeleteFile { .. } => FileChange::Delete {
+                content: String::new(),
+            },
+            Hunk::UpdateFile {
+                chunks, move_path, ..
+            } => FileChange::Update {
+                unified_diff: format_update_chunks_for_progress(chunks),
+                move_path: move_path.clone(),
+            },
+        };
+        // Repeated in-place updates of one file apply in sequence; preview
+        // all of their chunks rather than only the last hunk's.
+        if let (
+            Some(FileChange::Update {
+                unified_diff,
+                move_path: None,
+            }),
+            FileChange::Update {
+                unified_diff: next,
+                move_path: None,
+            },
+        ) = (changes.get_mut(&path), &change)
+        {
+            unified_diff.push_str(next);
+            continue;
+        }
+        changes.insert(path, change);
+    }
+    changes
 }
 
 fn hunk_source_path(hunk: &Hunk) -> &Path {
@@ -381,7 +396,66 @@ async fn concurrent_patch_note(
         turn.cwd().as_path(),
     )
     .await;
-    crate::live_sessions::overlapping_edits(&others, &paths, turn.cwd().as_path())
+    crate::live_sessions::overlapping_edits_in_resource(&others, &paths, turn.cwd().as_path(), &environment.environment.coordination_resource_id())
+}
+
+/// Says whether each mismatched file still has the content of this session's
+/// latest read_file snapshot of it. Only exact snapshot hashes count: shell
+/// reads leave no snapshot, and a hunk that edits an earlier hunk's result has
+/// no file content to compare.
+async fn read_snapshot_note(
+    session: &Session,
+    environment: &TurnEnvironment,
+    mismatches: &[codex_apply_patch::PatchContextMismatch],
+) -> String {
+    let mut targets = Vec::<(PathBuf, &str)>::new();
+    for mismatch in mismatches {
+        let Ok(uri) = PathUri::parse(&mismatch.canonical_path) else {
+            continue;
+        };
+        let path = PathBuf::from(uri.inferred_native_path_string());
+        if mismatch.edits_result_of_hunk.is_none() && !targets.iter().any(|(seen, _)| *seen == path)
+        {
+            targets.push((path, mismatch.current_content_sha256.as_str()));
+        }
+    }
+    targets.truncate(4);
+    if targets.is_empty() {
+        return String::new();
+    }
+    let paths = targets
+        .iter()
+        .map(|(path, _)| path.clone())
+        .collect::<Vec<_>>();
+    let status = session.clone_history().await.read_status_page(
+        &paths,
+        Some(&environment.environment_id),
+        &Default::default(),
+    );
+    let rows = status["paths"]
+        .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    let mut note = String::new();
+    for ((path, current), row) in targets.iter().zip(rows) {
+        // Snapshots are newest first; without recorded recency and source
+        // attribution, the first one is not known to be this file's latest.
+        let latest = &row["snapshots"][0];
+        let Some(read) = latest["source_sha256"].as_str() else {
+            continue;
+        };
+        if latest["observation_recency"] != "recorded" || latest["source_attribution"] != "recorded"
+        {
+            continue;
+        }
+        let finding = if read == *current {
+            "is unchanged since this session's latest read_file snapshot of it; the patch does not match that content"
+        } else {
+            "changed after this session's latest read_file snapshot of it, by this session's own patches or another writer"
+        };
+        note.push_str(&format!("\n{} {finding}.", path.display()));
+    }
+    note
 }
 
 fn hunk_endpoints(hunks: &[Hunk]) -> Vec<PathBuf> {
@@ -632,6 +706,10 @@ impl ApplyPatchHandler {
                 native_addition_paths(&args.hunks).as_deref(),
                 &cancellation_token,
                 &turn.turn_timing_state,
+                crate::scoped_workspace_gate::WorkspaceGateCall {
+                    tool_name: tool_name.to_string(),
+                    call_id: call_id.clone(),
+                },
             )
             .await?;
             if let Some(id) = &retry_id {
@@ -754,8 +832,10 @@ impl ApplyPatchHandler {
                             turn_environment.cwd(), &Default::default(), observed_source);
                     let note =
                         concurrent_patch_note(&session, &turn, turn_environment, &hunk_paths).await;
+                    let read_note =
+                        read_snapshot_note(&session, turn_environment, mismatches).await;
                     Ok(boxed_tool_output(ApplyPatchToolOutput::from_delta(
-                        format!("apply_patch verification failed: {parse_error}"), false,
+                        format!("apply_patch verification failed: {parse_error}{read_note}"), false,
                         &Default::default(), Some(turn_environment.environment_id.clone()),
                     ).with_retry(retry).with_patch_mismatch(mismatch)
                     .with_concurrent_sessions(note)))
@@ -962,19 +1042,28 @@ async fn acquire_patch_workspace(
     additions: Option<&[PathBuf]>,
     cancellation_token: &tokio_util::sync::CancellationToken,
     turn_timing_state: &Arc<crate::turn_timing::TurnTimingState>,
+    holder: crate::scoped_workspace_gate::WorkspaceGateCall,
 ) -> Result<Option<crate::scoped_workspace_gate::WorkspaceLease>, FunctionCallError> {
     // Waiting for another patch is tool activity, not model orchestration or
     // executor setup. Validation has a separate gate.
     let _tool_wait = turn_timing_state.begin_tool_execution();
     let _phase = crate::tools::tool_dispatch_trace::begin_tool_phase("patch_gate_wait");
+    // The admitted lease names this call, so a patch that times out behind it
+    // in any session of this process can attribute its wait.
+    let acquisition = crate::scoped_workspace_gate::WORKSPACE_GATE_CALL.scope(
+        holder,
+        crate::workspace_operation_gate::acquire_patch_additions_with_timeout(
+            &environment.environment,
+            cwd,
+            additions,
+        ),
+    );
     tokio::select! {
         biased;
         _ = cancellation_token.cancelled() => Err(FunctionCallError::RespondToModel(
             "apply_patch cancelled while waiting for the workspace".to_string(),
         )),
-        permit = crate::workspace_operation_gate::acquire_patch_additions_with_timeout(&environment.environment, cwd, additions) => {
-            permit.map(Some).map_err(|error| FunctionCallError::RespondToModel(error.to_string()))
-        }
+        permit = acquisition => permit.map(Some).map_err(FunctionCallError::RespondToModel),
     }
 }
 
@@ -986,6 +1075,11 @@ fn native_addition_paths(hunks: &[Hunk]) -> Option<Vec<PathBuf>> {
         .iter()
         .map(|hunk| match hunk {
             Hunk::AddFile { path, .. } => Some(path.clone()),
+            Hunk::UpdateFile {
+                path,
+                move_path: None,
+                ..
+            } => Some(path.clone()),
             _ => None,
         })
         .collect()
@@ -1158,6 +1252,21 @@ async fn run_owned_patch(
         })?
 }
 
+/// A failed intercepted patch reports what the apply_patch tool reports: the
+/// exactness note, the committed-change inventory and, when the model can use
+/// it through that tool, the retained retry receipt.
+fn intercepted_patch_failure(
+    output: ApplyPatchToolOutput,
+    apply_patch_tool_offered: bool,
+) -> FunctionCallError {
+    let output = if apply_patch_tool_offered {
+        output
+    } else {
+        output.with_retry(None)
+    };
+    FunctionCallError::RespondToModel(output.model_text())
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn intercept_apply_patch(
     is_validation: bool,
@@ -1177,19 +1286,26 @@ pub(crate) async fn intercept_apply_patch(
     }
     // Identify patch commands without reading files so ordinary shell calls do not
     // wait for the patch gate. Verification below must run while holding the permit.
-    let workspace_operation_permit =
-        if let Some(patch_cwd) = codex_apply_patch::apply_patch_command_cwd(command, cwd) {
-            acquire_patch_workspace(
-                &turn_environment,
-                &patch_cwd,
-                None,
-                &cancellation_token,
-                &turn.turn_timing_state,
-            )
-            .await?
-        } else {
-            None
-        };
+    // Like the apply_patch tool, the permit claims only this patch's endpoints when
+    // they are safely narrow, so an approval wait does not hold every other patch.
+    let workspace_operation_permit = if let Some((patch_cwd, hunks)) =
+        codex_apply_patch::apply_patch_command_scope(command, cwd)
+    {
+        acquire_patch_workspace(
+            &turn_environment,
+            &patch_cwd,
+            native_addition_paths(&hunks).as_deref(),
+            &cancellation_token,
+            &turn.turn_timing_state,
+            crate::scoped_workspace_gate::WorkspaceGateCall {
+                tool_name: tool_name.to_string(),
+                call_id: call_id.to_string(),
+            },
+        )
+        .await?
+    } else {
+        None
+    };
     let sandbox = turn.file_system_sandbox_context(/*additional_permissions*/ None, cwd);
     match codex_apply_patch::maybe_parse_apply_patch_verified_for_environment(
         command,
@@ -1258,7 +1374,11 @@ pub(crate) async fn intercept_apply_patch(
                     )
                     .await?;
                     if !output.success {
-                        return Err(FunctionCallError::RespondToModel(output.text).into());
+                        return Err(intercepted_patch_failure(
+                            output,
+                            turn.model_info.apply_patch_tool_type.is_some(),
+                        )
+                        .into());
                     }
                     Ok(Some(FunctionToolOutput::from_text(output.text, Some(true))))
                 }

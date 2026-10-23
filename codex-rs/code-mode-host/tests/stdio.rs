@@ -375,6 +375,7 @@ async fn first_wait_in_replacement_host_recovers_original_receipt() {
             description: "".into(),
             kind: CodeModeToolKind::Function,
             input_schema: None,
+            namespace_description: None,
             default_timeout_ms: None,
             output_schema: None,
         }]
@@ -559,6 +560,7 @@ async fn nested_tool_input_presence_reaches_local_and_remote_delegates() {
                     description: "".into(),
                     kind: CodeModeToolKind::Function,
                     input_schema: None,
+                    namespace_description: None,
                     default_timeout_ms: None,
                     output_schema: None,
                 }]
@@ -683,6 +685,7 @@ async fn remote_dropped_initial_response_keeps_the_cell_available_for_terminatio
                 description: "".into(),
                 kind: CodeModeToolKind::Function,
                 input_schema: None,
+                namespace_description: None,
                 default_timeout_ms: None,
                 output_schema: None,
             }]
@@ -760,6 +763,7 @@ text(result.value);
         description: "".into(),
         kind: CodeModeToolKind::Function,
         input_schema: None,
+        namespace_description: None,
         default_timeout_ms: None,
         output_schema: None,
     }]
@@ -901,6 +905,7 @@ async fn nested_poll_deadlines_survive_stdio_with_and_without_explicit_options()
             description: "".into(),
             kind: CodeModeToolKind::Function,
             input_schema: None,
+            namespace_description: None,
             default_timeout_ms: Some(315_000),
             output_schema: None,
         }]
@@ -1093,6 +1098,7 @@ return;
         description: "".into(),
         kind: CodeModeToolKind::Function,
         input_schema: None,
+        namespace_description: None,
         default_timeout_ms: None,
         output_schema: None,
     })
@@ -1222,6 +1228,7 @@ async fn oversized_delegate_payloads_fail_only_the_tool_call() {
         description: "".into(),
         kind: CodeModeToolKind::Function,
         input_schema: None,
+        namespace_description: None,
         default_timeout_ms: None,
         output_schema: None,
     };

@@ -138,7 +138,10 @@ METADATA_PACKAGES: list[dict[str, Any]] = [
     {
         "name": "codex-windows-sandbox",
         "id": "path+file:///codex-windows-sandbox#0.0.0",
-        "targets": [{"name": "codex-command-runner", "kind": ["bin"]}],
+        "targets": [
+            {"name": "codex-command-runner", "kind": ["bin"]},
+            {"name": "codex-windows-sandbox-setup", "kind": ["bin"]},
+        ],
     },
 ]
 
@@ -377,6 +380,98 @@ class RunnerTestCase(unittest.TestCase):
 
 
 class CriticalPathDiscoveryTest(RunnerTestCase):
+    def test_inventory_recovery_restores_one_complete_scope_and_refuses_changed_inputs(self):
+        manifest_path = self.temp_dir / "manifest.toml"
+        manifest_path.write_text("fixture manifest bytes", encoding="utf-8")
+        inventory_path = self.temp_dir / "failed-tests.log"
+        payload = {
+            "version": 1, "target": "core_lib", "binary_id": "codex-core",
+            "original_selection_known": True, "original_filter_args": ["-E", "test(alpha)"],
+            "allow_all": False, "cargo_profile": "dev-small", "nextest_profile": "default",
+            "declaring_gates": [], "failed": [f"failure_{index}" for index in range(500)],
+            "manifest_sha256": hashlib.sha256(manifest_path.read_bytes()).hexdigest(),
+        }
+        inventory_path.write_text(json.dumps(payload), encoding="utf-8")
+        digest = hashlib.sha256(inventory_path.read_bytes()).hexdigest()
+        def arguments():
+            return rust_test_runner.build_parser().parse_args([
+                "--manifest", str(manifest_path), "rerun-inventory", str(inventory_path), "--sha256", digest,
+            ])
+        with mock.patch.object(Manifest, "load", return_value=self.manifest()):
+            args = arguments()
+            _, filters, no_fail_fast, allow_all, _ = rust_test_runner._preflight_selection(args)
+            self.assertEqual((args.command, args.name, filters), ("run-target", "core_lib", ["-E", "test(alpha)"]))
+            self.assertTrue(no_fail_fast)
+            self.assertFalse(allow_all)
+            self.assertEqual((args.cargo_profile, args.profile), ("dev-small", "default"))
+            inventory_path.write_bytes(inventory_path.read_bytes() + b" ")
+            with self.assertRaisesRegex(RunnerError, "hash mismatch"):
+                rust_test_runner._preflight_selection(arguments())
+            inventory_path.write_text(json.dumps(payload), encoding="utf-8")
+            manifest_path.write_text("changed manifest", encoding="utf-8")
+            with self.assertRaisesRegex(RunnerError, "manifest.*changed"):
+                rust_test_runner._preflight_selection(arguments())
+
+    def test_inventory_recovery_keeps_declaring_gate_helper_contracts(self):
+        manifest_path = self.temp_dir / "manifest.toml"
+        manifest_path.write_text("fixture", encoding="utf-8")
+        path = self.temp_dir / "gates.log"
+        payload = {"version":1, "target":"core_lib", "binary_id":"codex-core",
+            "original_selection_known":True, "declaring_gates":["demo-gate"],
+            "original_filter_args":[], "cargo_profile":None, "nextest_profile":None,
+            "manifest_sha256":hashlib.sha256(manifest_path.read_bytes()).hexdigest()}
+        path.write_text(json.dumps(payload), encoding="utf-8")
+        args = rust_test_runner.build_parser().parse_args(["--manifest",str(manifest_path),
+            "rerun-inventory",str(path),"--sha256",hashlib.sha256(path.read_bytes()).hexdigest()])
+        with mock.patch.object(Manifest, "load", return_value=self.manifest()):
+            rust_test_runner._preflight_selection(args)
+        self.assertEqual((args.command, args.names), ("run-gate", ["demo-gate"]))
+
+    def test_distinct_filters_share_a_build_but_nextest_checks_each_contract(self):
+        gates = {
+            name: {"description": name, "steps": [{
+                "target": "core_lib", "filter": expression,
+                "tests": ["mod::tests::alpha"], "helpers": [],
+            }]}
+            for name, expression in [("one", "test(alpha)"), ("two", "test(/alpha/)")]
+        }
+        runner, fake = self.runner(manifest=self.manifest(gates=gates))
+        commands = []
+
+        def execute(args, **kwargs):
+            commands.append(list(args))
+            self.assertEqual(args[:3], ["cargo", "nextest", "list"])
+            if "--binaries-metadata" in args:
+                retained = json.loads(Path(args[args.index("--binaries-metadata") + 1]).read_text())
+                self.assertEqual(set(retained["rust-binaries"]), {"codex-core"})
+            payload = json.loads(nextest_list_payload(fake.default_listing))
+            suite = next(iter(payload["rust-suites"].values()))
+            suite.update({
+                "binary-id": "codex-core", "binary-name": "codex_core", "kind": "lib",
+                "package-id": "path+file:///codex-core#0.0.0",
+                "binary-path": str(self.target_dir / "debug/core.exe"), "build-platform": "target",
+            })
+            payload["rust-suites"] = {"codex-core": suite}
+            payload["rust-build-meta"] = {"target-directory": str(self.target_dir)}
+            return subprocess.CompletedProcess(args, 0, json.dumps(payload), "")
+
+        runner.executor = execute
+        for _ in range(2):
+            runner.check_gates(["one", "two"], include_generated=False)
+        self.assertEqual(len(commands), 4, "every filter is evaluated by nextest, not a local evaluator")
+        self.assertEqual(["--binaries-metadata" in command for command in commands], [False, True, False, True])
+        self.assertEqual([command[command.index("-E") + 1] for command in commands[:2]], ["test(alpha)", "test(/alpha/)"])
+        gates["two"]["steps"][0]["tests"] = ["different::test"]
+        runner.manifest = self.manifest(gates=gates)
+        with self.assertRaisesRegex(RunnerError, "wrong test-ID set"):
+            runner.check_gates(["one", "two"], include_generated=False)
+        with mock.patch.object(runner, "_retain_text", return_value=None):
+            runner.manifest = self.manifest(gates={"one": gates["one"], "two": {
+                "description": "two", "steps": [{**gates["one"]["steps"][0], "filter": "test(/alpha/)"}],
+            }})
+            runner.check_gates(["one", "two"], include_generated=False)
+        self.assertTrue(all("--binaries-metadata" not in command for command in commands[-2:]))
+
     def test_duplicate_discovery_keeps_each_gate_contract_and_is_invocation_local(self):
         step = copy.deepcopy(MANIFEST_DATA["gates"]["demo-gate"]["steps"][0])
         gates = {
@@ -820,6 +915,75 @@ class WallClockRunnerTest(RunnerTestCase):
         self.assertEqual(command[-2:], list(selection))
         self.assertIn("--no-tests=fail", command)
         self.assertFalse((self.target_dir / "debug").exists())
+
+    def test_data_only_buffer_and_outcome_tests_need_no_helpers(self):
+        manifest = Manifest.load(REPO_ROOT / "codex-rs/.config/kd4-rust-tests.toml")
+        for test in (
+            "unified_exec::head_tail_buffer::tests::keeps_prefix_and_suffix_when_over_budget",
+            "tools::command_execution::outcome_tests::exit_one_without_verified_evidence_never_populates_search_cache",
+        ):
+            with self.subTest(test=test):
+                runner, executor = self.runner(
+                    manifest=manifest,
+                    executor=FakeExecutor(default_listing={test: False}),
+                )
+                runner.run_target("core_lib", ["-E", f"test(={test})"])
+                self.assertEqual(runner._helpers_for_selected_tests(runner.target("core_lib"), [test]), [])
+                self.assertEqual(executor.commands(["cargo", "build"]), [])
+                self.assertEqual(executor.commands(["cargo", "nextest", "list"]), [])
+                self.assertEqual(len(executor.commands(["cargo", "nextest", "run"])), 1)
+        runner, _ = self.runner(manifest=manifest)
+        self.assertTrue(runner._helpers_for_selected_tests(runner.target("core_lib"), ["unreviewed::test"]))
+
+    def test_transport_gate_declarations_share_the_helper_free_selection(self):
+        manifest = Manifest.load(REPO_ROOT / "codex-rs/.config/kd4-rust-tests.toml")
+        steps = [
+            next(step for step in manifest.gates[gate].steps if step.target == "core_transport_telemetry")
+            for gate in ("wall-clock-runtime", "audit140-critical-path")
+        ]
+        self.assertEqual(steps[0].helpers, ())
+        self.assertEqual(steps[1].helpers, ())
+        self.assertEqual(steps[0].filterset, steps[1].filterset)
+
+    def test_large_failure_report_retains_every_id_without_repeating_the_command(self):
+        runner, _ = self.runner()
+        failed = [f"mod::failure_{index:04}_" + "λ" * 100 for index in range(500)]
+        output = io.StringIO()
+        with contextlib.redirect_stderr(output):
+            runner._report_failed_tests("core_lib", [], failed, failed, runs_ignored=False)
+        self.assertLess(len(output.getvalue()), 12_000)
+        inventories = list((runner.target_dir / "test-runner-logs").glob("failed-tests-*.log"))
+        self.assertEqual(len(inventories), 1)
+        inventory = json.loads(inventories[0].read_text(encoding="utf-8"))
+        self.assertEqual(inventory["failed"], failed)
+        self.assertEqual(inventory["not_run"], 0)
+        commands = list((runner.target_dir / "test-runner-logs").glob("failed-only-command-*.log"))
+        self.assertEqual(len(commands), 1)
+        self.assertTrue(all(test in commands[0].read_text(encoding="utf-8") for test in failed))
+        self.assertIn(str(inventories[0]), output.getvalue())
+
+    def test_invalid_managed_selections_fail_before_lane_admission(self):
+        lane_root = self.temp_dir / "managed"
+        lane_root.mkdir()
+        (lane_root / rust_build_status.CARGO_LANES_ROOT_MARKER).write_text(
+            rust_build_status.CARGO_LANES_ROOT_MARKER_CONTENT, encoding="utf-8"
+        )
+        for selection in (
+            ["run-target", "core_lib", "-E", ""],
+            ["run-target", "unknown-target", "-E", "test(known)"],
+            ["run-gate", "unknown-gate"],
+            ["run-target", "--profile", "", "core_lib", "-E", "test(known)"],
+        ):
+            with self.subTest(selection=selection), mock.patch.object(
+                rust_build_status, "run_in_cargo_lane"
+            ) as delegate, mock.patch.object(rust_test_runner, "load_metadata") as metadata:
+                with contextlib.redirect_stderr(io.StringIO()):
+                    result = rust_test_runner.main([
+                        "--target-dir", str(lane_root / "core-tests"), *selection
+                    ])
+                self.assertEqual(result, 2)
+                delegate.assert_not_called()
+                metadata.assert_not_called()
 
     def test_repository_retry_output_gate_avoids_discovery_and_helper_builds(self):
         manifest = Manifest.load(
@@ -1529,8 +1693,24 @@ class RealExecutorTest(RunnerTestCase):
             )
             self.assertNotIn(f'"{child_pid}"', status.stdout)
         else:
+            self.assert_posix_descendant_terminated(child_pid)
+
+    def assert_posix_descendant_terminated(self, child_pid):
+        try:
+            os.kill(child_pid, 0)
+        except ProcessLookupError:
+            return
+        # A terminated, reparented Linux grandchild may remain a zombie
+        # until PID 1 reaps it. Existence alone does not prove a live leak.
+        self.assertTrue(sys.platform.startswith("linux"))
+        try:
+            stat = Path(f"/proc/{child_pid}/stat").read_text()
+        except FileNotFoundError:
+            # Missing procfs is not success: prove that the PID disappeared.
             with self.assertRaises(ProcessLookupError):
                 os.kill(child_pid, 0)
+        else:
+            self.assertEqual(stat.rsplit(")", 1)[1].split()[0], "Z")
 
     def test_metadata_failure_preserves_full_log_recovery(self):
         results = []
@@ -1930,6 +2110,29 @@ class NamedSelectionTest(RunnerTestCase):
                     fingerprint_inputs,
                 ):
                     call.assert_not_called()
+
+    def test_planning_batch_uses_one_metadata_read_without_admission_or_execution(self):
+        with (
+            mock.patch.object(Manifest, "load", return_value=self.manifest()),
+            mock.patch.object(rust_test_runner, "load_metadata", return_value=self.metadata()) as metadata,
+            mock.patch.object(rust_build_status, "reserve_rust_test_target") as lane,
+            mock.patch.object(RustTestRunner, "_execute") as execute,
+            mock.patch.object(RustTestRunner, "gates_for", return_value={"gates": []}) as ownership,
+            contextlib.redirect_stdout(io.StringIO()) as stdout,
+        ):
+            args = rust_test_runner.build_parser().parse_args([
+                "--target-dir", str(self.target_dir), "plan-batch",
+                "--plan", "core_all", "--plan", "demo-gate", "--plan", "core_all",
+                "--gates-for", "codex-rs/core/src/lib.rs",
+            ])
+            self.assertEqual(rust_test_runner._main(args), 0)
+            result = json.loads(stdout.getvalue())
+            self.assertEqual([plan["name"] for plan in result["plans"]], ["core_all", "demo-gate"])
+            self.assertEqual(result["ownership"], {"gates": []})
+            metadata.assert_called_once_with()
+            ownership.assert_called_once_with(["codex-rs/core/src/lib.rs"])
+            lane.assert_not_called()
+            execute.assert_not_called()
 
     def test_valid_cli_names_recheck_only_selected_definitions_after_admission(self):
         manifest = self.manifest()
@@ -2873,6 +3076,17 @@ class TargetDirectoryPropagationTest(RunnerTestCase):
 
 
 class RunTargetTest(RunnerTestCase):
+    def test_explicit_default_ignored_mode_does_not_add_discovery(self):
+        for options in ([], ["--run-ignored", "default"], ["--run-ignored=default"]):
+            with self.subTest(options=options):
+                runner, executor = self.runner(
+                    executor=self.build_executor(default_listing={"alpha": False})
+                )
+                receipt = runner.run_target("core_all", ["-E", "test(=alpha)", *options])
+                self.assertEqual(receipt, {"codex-core::all": ["alpha"]})
+                self.assertEqual(executor.commands(["cargo", "nextest", "list"]), [])
+                self.assertEqual(len(executor.commands(["cargo", "nextest", "run"])), 1)
+
     def test_partial_exact_selection_is_unfulfilled_without_discovery(self):
         manifest = self.manifest()
         executor = self.build_executor(default_listing={"alpha": False})
@@ -2996,14 +3210,19 @@ class RunTargetTest(RunnerTestCase):
         self.assertIn("passed=1, failed=94, not-run=1", rendered)
         for test in failed:
             self.assertIn(f"\ncodex-core::all {test}\n", rendered)
-        rerun = rendered.split("Rerun failed only (from repository root):\n")[1]
+        rerun = rendered.split("Rerun failed only (from repository root):\n")[1].splitlines()[0]
         if os.name == "nt":
             self.assertTrue(rerun.startswith("& 'python' "))
-        self.assertIn("--run-ignored", rerun)
+        self.assertNotIn("--run-ignored", rerun)
         self.assertIn("--ignore-default-filter", rerun)
         self.assertNotIn("test(=suite::passed)", rerun)
         self.assertNotIn("test(=suite::not_run)", rerun)
         self.assertIn(" | ".join(f"test(={test})" for test in failed), rerun)
+        repair = rendered.split("Repair full original selection (from repository root):\n")[1]
+        self.assertIn("test(=suite::passed)", repair)
+        self.assertIn("test(=suite::not_run)", repair)
+        self.assertNotIn("--run-ignored", repair)
+        self.assertIn("diagnostic, not a repair", rendered)
         self.assertEqual(len(executor.commands(["cargo", "nextest", "run"])), 1)
 
     def test_execution_receipt_names_selected_packages_not_source_roots(self):
@@ -3199,7 +3418,7 @@ class RunTargetTest(RunnerTestCase):
                 )
                 self.assertTrue(any(payload in path.read_text() for path in logs))
 
-    def test_phase_report_separates_build_from_tests_without_extra_commands(
+    def test_phase_report_withholds_unframed_test_timings_without_extra_commands(
         self,
     ) -> None:
         runner, executor = self.runner(executor=self.build_executor())
@@ -3218,9 +3437,11 @@ class RunTargetTest(RunnerTestCase):
         self.assertEqual(len(executor.calls), 2)
         self.assertIn("helper upper bound=codex", output.getvalue())
         self.assertIn("Rust phase helper-build:", output.getvalue())
-        self.assertIn(
-            "cargo-reported=217.000s; tests-reported=1.527s", output.getvalue()
-        )
+        # These strings share a stream with displayed test output; neither has
+        # provider provenance. Wall/exit observations still survive unchanged.
+        self.assertNotIn("cargo-reported=217.000s", output.getvalue())
+        self.assertNotIn("tests-reported=1.527s", output.getvalue())
+        self.assertIn("Rust phase build/test: wall=", output.getvalue())
 
     def test_abnormal_process_exit_is_diagnosed_without_retry(self) -> None:
         runner, executor = self.runner()
@@ -4555,9 +4776,12 @@ class RunGateTest(RunnerTestCase):
         self.assertIn("\ncodex-core mod::tests::alpha\n", output.getvalue())
         self.assertIn("passed=0, failed=1, not-run=0", output.getvalue())
         self.assertIn("test(=mod::tests::alpha)", output.getvalue())
-        self.assertNotIn(
-            "test(=suite::mod::beta)", output.getvalue().split("Rerun failed only")[1]
-        )
+        rerun = output.getvalue().split(
+            "Rerun declaring gates (preserves helper contracts; from repository root):\n"
+        )[1]
+        self.assertIn("run-gate", rerun)
+        self.assertIn("demo-gate", rerun)
+        self.assertNotIn("run-target", rerun)
         self.assertEqual(
             detail.count(
                 '"event": "failed", "name": "codex-core::codex_core$mod::tests::alpha"'
@@ -5096,6 +5320,7 @@ class RepositoryManifestTest(unittest.TestCase):
             with (workspace / member / "Cargo.toml").open("rb") as source:
                 package = tomllib.load(source)
             packages[package["package"]["name"]] = (workspace / member, package)
+        declarations = {}
         for gate in self.manifest.gates.values():
             for step in gate.steps:
                 target = self.manifest.targets[step.target]
@@ -5124,7 +5349,7 @@ class RepositoryManifestTest(unittest.TestCase):
                     with self.subTest(gate=gate.name, test=test):
                         self.assertIsNotNone(
                             rust_test_runner._rust_test_source(
-                                binary, identity, REPO_ROOT
+                                binary, identity, REPO_ROOT, declarations=declarations
                             ),
                             "gate declares a test that does not exist",
                         )
@@ -5707,6 +5932,35 @@ class CommandLineTest(unittest.TestCase):
         )
         self.assertIn("just test-fast cannot select codex-core", message)
 
+    def test_compile_only_guard_offers_compile_only_routes(self) -> None:
+        # Under a no-tests instruction the refusal must not steer a compile-only
+        # caller into the named recipes, which execute tests.
+        guard = ["_guard-generic", "--compile-only", "--recipe", "just test-compile", "--"]
+        code, message = self.run_main([*guard, "-p", "codex-core"])
+        self.assertEqual(code, 2)
+        self.assertIn("just test-compile cannot select codex-core", message)
+        self.assertIn("just check-lane codex-core --tests", message)
+        self.assertNotIn("core-test-fast <target>", message)
+        for selection in (["--workspace"], []):
+            with self.subTest(selection=selection):
+                code, message = self.run_main([*guard, *selection])
+                self.assertEqual(code, 2)
+                self.assertIn("just check-lane codex-core --tests", message)
+                self.assertNotIn("core-test-fast core_lib --all", message)
+        self.assertEqual(self.run_main([*guard, "-p", "codex-tui"]), (0, ""))
+        # Negative control: test recipes keep their execution routes.
+        code, message = self.run_main(["_guard-generic", "--", "-p", "codex-core"])
+        self.assertEqual(code, 2)
+        self.assertIn("just core-test-fast <target>", message)
+        self.assertNotIn("check-lane", message)
+
+    def test_justfile_test_compile_declares_its_compile_only_guard(self) -> None:
+        justfile = (REPO_ROOT / "justfile").read_text(encoding="utf-8")
+        body = justfile.split("\ntest-compile *args:\n", 1)[1].split("\n\n", 1)[0]
+        self.assertIn("_guard-generic --compile-only", body)
+        test_fast = justfile.split("\ntest-fast *args:\n", 1)[1].split("\n\n", 1)[0]
+        self.assertNotIn("--compile-only", test_fast)
+
     def test_guard_does_not_read_the_manifest(self) -> None:
         # The guard runs on every generic recipe invocation, so it must not
         # depend on the manifest being readable.
@@ -5913,6 +6167,117 @@ class TestSpeedContractTest(RunnerTestCase):
                 )
         self.assertNotEqual(seeds[0], seeds[1])
         self.assertTrue(all(not seed.exists() for seed in seeds))
+
+    def test_retained_binary_seed_uses_selected_package_and_cleans_up(self):
+        seeds = []
+
+        def execute(args, *, env, **kwargs):
+            seed = Path(env["KD4_AGENT_TASK_FIXTURE_SEED"])
+            self.assertTrue(seed.is_dir())
+            seeds.append(seed)
+            return subprocess.CompletedProcess(args, 0, "", "")
+
+        runner = RustTestRunner(self.manifest(), self.metadata(), executor=execute)
+        for _ in range(2):
+            runner._checked(
+                ["cargo", "nextest", "run", "--binaries-metadata", "retained.json"],
+                env=runner.base_env,
+                capture=rust_test_runner.CAPTURE_BOTH,
+                selected_packages=("codex-agent-task-store",),
+            )
+        self.assertEqual(len(seeds), 2)
+        self.assertNotEqual(seeds[0], seeds[1])
+        self.assertTrue(all(not seed.exists() for seed in seeds))
+
+    def test_retained_binary_entrypoints_keep_seed_on_success_and_failure(self):
+        package = "codex-agent-task-store"
+        test = "mod::tests::alpha"
+        manifest = self.manifest(
+            targets={"store": {"package": package, "lib": True, "helpers": []}},
+            gates={"seed-gate": {"steps": [{"target": "store", "tests": [test]}]}},
+        )
+        metadata = MetadataIndex.from_json(
+            {
+                "target_directory": str(self.temp_dir / "target"),
+                "packages": [
+                    {
+                        "name": package,
+                        "id": f"path+file:///{package}#0.0.0",
+                        "targets": [
+                            {"name": "codex_agent_task_store", "kind": ["lib"]}
+                        ],
+                    }
+                ],
+            }
+        )
+        seeds = []
+        for route in ("target", "gate"):
+            for failed in (False, True):
+                with self.subTest(route=route, failed=failed):
+
+                    def execute(args, *, env, **kwargs):
+                        self.assertIn("--binaries-metadata", args)
+                        self.assertNotIn(package, args)
+                        seed = Path(env["KD4_AGENT_TASK_FIXTURE_SEED"])
+                        self.assertTrue(seed.is_dir())
+                        self.assertEqual(list(seed.iterdir()), [])
+                        seeds.append(seed)
+                        return subprocess.CompletedProcess(
+                            args,
+                            100 if failed else 0,
+                            nextest_run_payload(
+                                [(test, "failed" if failed else "ok")],
+                                package=package,
+                                binary="codex_agent_task_store",
+                            ),
+                            "",
+                        )
+
+                    def discover(target, args, *, discovered_build=None, **kwargs):
+                        # Discovery parsing is covered separately. Retain an
+                        # invocation-local identity so real entrypoints remove -p.
+                        discovered_build.update({"fixture-build": True})
+                        return {test: False}
+
+                    runner = RustTestRunner(manifest, metadata, executor=execute)
+                    with mock.patch.object(runner, "_list_tests", side_effect=discover):
+                        context = (
+                            self.assertRaises(RunnerError)
+                            if failed
+                            else contextlib.nullcontext()
+                        )
+                        with context:
+                            if route == "target":
+                                runner.run_target("store", ["--run-ignored", "all"])
+                            else:
+                                runner.run_gates(["seed-gate"], discover=True)
+        self.assertEqual(len(seeds), 4)
+        self.assertEqual(len(set(seeds)), 4)
+        self.assertTrue(all(not seed.exists() for seed in seeds))
+
+    def test_selected_package_seed_is_only_for_store_execution(self):
+        calls = []
+
+        def execute(args, *, env, **kwargs):
+            calls.append(env)
+            self.assertNotIn("KD4_AGENT_TASK_FIXTURE_SEED", env)
+            return subprocess.CompletedProcess(args, 0, "", "")
+
+        runner = RustTestRunner(self.manifest(), self.metadata(), executor=execute)
+        for command, packages in [
+            (["cargo", "nextest", "list"], ("codex-agent-task-store",)),
+            (
+                ["cargo", "nextest", "run", "--binaries-metadata", "retained.json"],
+                ("codex-core",),
+            ),
+        ]:
+            runner._checked(
+                command,
+                env=runner.base_env,
+                capture=rust_test_runner.CAPTURE_BOTH,
+                selected_packages=packages,
+            )
+        self.assertEqual(len(calls), 2)
 
     def test_app_server_shards_own_each_v2_module_exactly_once(self):
         root = rust_test_runner.CODEX_RS_ROOT / "app-server" / "tests"

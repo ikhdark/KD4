@@ -322,30 +322,16 @@ function Get-AffinityLaneBase {
         [string[]]$CommandArgs
     )
 
-    $signature = ([string]::Join(" ", @($CommandArgs))).Trim()
-    $isRelease = $signature -match "(?:^|\s)(?:--release|-r|--profile(?:=|\s+)release)(?:\s|$)"
-    # Include package selectors inside Cargo watch's --exec/-x command strings.
-    $packages = @(Get-CodexCargoPackageSpecs -CommandArgs ($signature -split "\s+"))
-    if ($packages.Count -gt 0) {
-        # Core package runs share the named gates' warm lane, regardless of
-        # package ordering, just like the Python reservation entrypoint.
-        $base = if ($packages -ccontains "codex-core") { "core-tests" } else { ConvertTo-SafeLaneName $packages[0] }
-        if ($isRelease) {
-            return "$base-release"
-        }
-        return $base
-    }
-
-    if ($CommandArgs.Count -gt 0 -and -not [string]::IsNullOrWhiteSpace($CommandArgs[0])) {
-        $program = [System.IO.Path]::GetFileNameWithoutExtension($CommandArgs[0])
-        $base = ConvertTo-SafeLaneName "$program-$(Get-StableCommandHash $signature)"
-        if ($isRelease) {
-            return "$base-release"
-        }
-        return $base
-    }
-
-    return "auto"
+    # One owner for Cargo/Nextest profiles, separators, wrappers and watch.
+    # JSON stdin preserves each argument through Windows PowerShell 5.1.
+    $python = Get-Command python -CommandType Application -ErrorAction Stop | Select-Object -First 1
+    $payload = ConvertTo-Json -InputObject @($CommandArgs) -Compress
+    $OutputEncoding = [Text.UTF8Encoding]::new($false)
+    $result = $payload | & $python.Source -X utf8 -I -B (Join-Path $PSScriptRoot "rust_build_status.py") lane-affinity
+    if ($LASTEXITCODE -ne 0) { throw "Could not resolve Cargo lane affinity." }
+    $lane = ([string]$result).Trim()
+    Assert-CargoLaneName -Lane $lane
+    return $lane
 }
 
 function Get-ActiveCargoLaneNames {
@@ -369,25 +355,9 @@ function Get-ActiveCargoLaneNames {
         }
     }
 
-    if ($names.Count -gt 0 -or $env:CODEX_CARGO_LANE_WMI_FALLBACK -ne "1") {
-        return @($names)
-    }
-
-    $lines = @()
-    try {
-        $lines = @(Get-CimInstance Win32_Process -ErrorAction Stop |
-            Where-Object { $_.Name -match "^(cargo(?:-[A-Za-z0-9_.-]+)?|clippy-driver|rustc|rustup|just|powershell|pwsh)(\.exe)?$" } |
-            Where-Object { $_.ProcessId -ne $PID } |
-            ForEach-Object { [string]$_.CommandLine })
-    }
-    catch {
-        return @()
-    }
-
-    foreach ($name in @(Get-CargoLaneNamesFromCommandLines -CommandLines $lines)) {
-        [void]$names.Add((ConvertTo-SafeLaneName $name))
-    }
-
+    # Rootless command-line text cannot establish ownership of these lanes.
+    # Reservation rechecks actual locks; Python diagnostics retain unresolved
+    # process ownership as uncertainty rather than matching a foreign basename.
     return @($names)
 }
 
@@ -574,6 +544,10 @@ function Start-CargoLaneTrashCleanup {
         return
     }
 
+    . (Join-Path $PSScriptRoot "cargo-lane-launch-lease.ps1")
+    $launchToken = Invoke-CargoMaintenanceLaunchLease -LanesRoot $LanesRoot
+    if ([string]::IsNullOrEmpty($launchToken)) { return }
+
     try {
         # Start-Process joins -ArgumentList with spaces without quoting under
         # Windows PowerShell 5.1, so paths containing spaces must be quoted
@@ -586,12 +560,14 @@ function Start-CargoLaneTrashCleanup {
             "-File",
             ('"{0}"' -f $workerPath),
             "-LanesRoot",
-            ('"{0}"' -f $LanesRoot)
+            ('"{0}"' -f $LanesRoot),
+            "-LaunchToken", $launchToken
         )
         if ($Prune) { $workerArgs += "-Prune" }
         Start-Process -FilePath $shell -WindowStyle Hidden -ArgumentList $workerArgs | Out-Null
     }
     catch {
+        [void](Invoke-CargoMaintenanceLaunchLease -LanesRoot $LanesRoot -ReleaseToken $launchToken)
         Write-CargoLaneTrashCleanupLog -LogPath $logPath -Message ("failed to start trash cleanup worker: {0}" -f $_.Exception.Message)
     }
 }
@@ -760,6 +736,7 @@ function Try-AcquireCargoLaneReservation {
     $coordinationPath = Join-Path $LaneRoot ".lane-coordination.lock"
     $coordinationStream = $null
     $coordinationDeadline = [DateTime]::UtcNow.AddSeconds($CoordinationWaitSeconds)
+    $retryMilliseconds = 2
     while ($null -eq $coordinationStream) {
         try {
             $coordinationStream = [IO.File]::Open(
@@ -776,7 +753,8 @@ function Try-AcquireCargoLaneReservation {
             if ([DateTime]::UtcNow -ge $coordinationDeadline) {
                 return $null
             }
-            Start-Sleep -Milliseconds ([Math]::Max(1, [Math]::Min(50, ($coordinationDeadline - [DateTime]::UtcNow).TotalMilliseconds)))
+            Start-Sleep -Milliseconds ([Math]::Max(1, [Math]::Min($retryMilliseconds, ($coordinationDeadline - [DateTime]::UtcNow).TotalMilliseconds)))
+            $retryMilliseconds = [Math]::Min(20, $retryMilliseconds * 2)
         }
     }
 
@@ -873,6 +851,7 @@ function Acquire-CargoLaneReservation {
     )
     $watch = [Diagnostics.Stopwatch]::StartNew()
     $announced = $false
+    $retryMilliseconds = 10
     while ($true) {
         $expired = $watch.Elapsed.TotalSeconds -ge $WarmWaitSeconds
         # Match Python admission: unrelated lane probes get a one-second
@@ -889,7 +868,8 @@ function Acquire-CargoLaneReservation {
             $announced = $true
         }
         # Try-Acquire releases coordination before sleeping: owners can finish.
-        Start-Sleep -Milliseconds ([Math]::Max(1, [Math]::Min(250, ($WarmWaitSeconds - $watch.Elapsed.TotalSeconds) * 1000)))
+        Start-Sleep -Milliseconds ([Math]::Max(1, [Math]::Min($retryMilliseconds, ($WarmWaitSeconds - $watch.Elapsed.TotalSeconds) * 1000)))
+        $retryMilliseconds = [Math]::Min(50, $retryMilliseconds * 1.5)
     }
 }
 

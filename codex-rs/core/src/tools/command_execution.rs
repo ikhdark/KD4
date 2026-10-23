@@ -429,6 +429,7 @@ struct CommandTerminalFacts {
     success: bool,
     search_no_match: bool,
     failure_cause: Option<String>,
+    sampling_signal: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone)]
@@ -702,13 +703,18 @@ impl CommandExecutionLedger {
         cwd: &Path,
         identity: Option<crate::git_workspace::WorkspaceEvidenceIdentity>,
     ) {
-        if identity.is_some()
-            && self
-                .persistence
-                .as_ref()
-                .is_some_and(|persistence| persistence.cwd == cwd)
-        {
-            self.observe_repository_revision_with_identity(turn_id, mutation_revision, identity)
+        let Some(identity) = identity.filter(|identity| !identity.unavailable) else { return; };
+        let Some(persistence) = self.persistence.as_ref() else { return; };
+        let (session_cwd, command_cwd) = (persistence.cwd.clone(), cwd.to_path_buf());
+        let roots = tokio::task::spawn_blocking(move || {
+            let root = |cwd: &Path| codex_git_utils::get_git_repo_root(cwd)
+                .and_then(|root| dunce::canonicalize(root).ok());
+            (root(&session_cwd), root(&command_cwd))
+        }).await.ok();
+        if roots.is_some_and(|(session, command)| session.is_some()
+            && session == command
+            && command.as_ref().and_then(|root| root.to_str()) == identity.repository_root.as_deref()) {
+            self.observe_repository_revision_with_identity(turn_id, mutation_revision, Some(identity))
                 .await;
         }
     }
@@ -1082,6 +1088,7 @@ impl CommandExecutionLedger {
             success: failure_cause.is_none() && (exit_code == Some(0) || search_no_match),
             search_no_match,
             failure_cause: failure_cause.map(|cause| cause.chars().take(2048).collect()),
+            sampling_signal: None,
         };
         let mut state = self.state.lock().await;
         let mut search = None;
@@ -1116,6 +1123,7 @@ impl CommandExecutionLedger {
         let mut accepted_no_match = false;
         if let Some(slot) = slot {
             if let Some(previous) = slot.as_ref() {
+                facts.sampling_signal = previous.sampling_signal.clone();
                 // Exit-only and duplicate observers must not erase a known
                 // late failure merely because they have no diagnostic of their own.
                 facts.failure_cause = facts
@@ -1246,21 +1254,13 @@ impl CommandExecutionLedger {
 
     pub(crate) async fn identical_running_process(
         &self,
-        key: &CommandAttemptKey,
+        _key: &CommandAttemptKey,
     ) -> Option<(u32, CommandExecutionId)> {
-        // An epoch alone cannot prove unchanged external inputs. Missing full
-        // workspace evidence must not suppress a requested validation.
-        if !key.execution_context.contains_key("workspace_identity") {
-            return None;
-        }
-        let state = self.state.lock().await;
-        state
-            .process
-            .running
-            .iter()
-            .filter(|(_, running)| running.key == *key && running.completed_exit_code.is_none())
-            .min_by_key(|(id, _)| **id)
-            .map(|(id, running)| (*id, running.execution_id))
+        // Git-visible endpoint equality proves neither complete command inputs
+        // (ignored/external files) nor what a live process consumed during an
+        // A->B->A edit. No immutable/consumed-input witness is available here.
+        // Keep existing handles alive, but never suppress a requested new run.
+        None
     }
 
     pub(crate) async fn completed_process_result(
@@ -1318,6 +1318,9 @@ impl CommandExecutionLedger {
             "terminal_facts_available": facts.is_some(),
             "notice": "Process already completed and was cleaned up. Output is not replayed; recover the retained artifact when needed. Do not restart the command.",
         });
+        if let Some(signal) = facts.and_then(|facts| facts.sampling_signal.as_ref()) {
+            result["_sampling_request_signal"] = signal.clone();
+        }
         if let Some(id) = artifact_id {
             result["raw_output_artifact_id"] = id.to_string().into();
         }
@@ -1335,6 +1338,28 @@ impl CommandExecutionLedger {
             }});
         }
         Some(result)
+    }
+
+    pub(crate) async fn retain_terminal_validation_signal(
+        &self, process_id: u32, parent: &str, incarnation: uuid::Uuid,
+        signal: serde_json::Value,
+    ) {
+        let mut state = self.state.lock().await;
+        let process = &mut state.process;
+        let slot = if let Some(command) = process.running.get_mut(&process_id)
+            .filter(|command| command.incarnation == incarnation && command.parent_tool_execution_id.0 == parent) {
+            command.terminal_facts.as_mut()
+        } else if let Some(pending) = process.pending_by_execution_id.values_mut().find(|pending|
+            pending.process_id == process_id && pending.command.incarnation == incarnation
+                && pending.command.parent_tool_execution_id.0 == parent) {
+            pending.command.terminal_facts.as_mut()
+        } else {
+            process.completion_receipts.values_mut().find(|receipt|
+                receipt.process_id == process_id && receipt.incarnation == incarnation
+                    && receipt.parent_tool_execution_id.0 == parent)
+                .and_then(|receipt| receipt.terminal_facts.as_mut())
+        };
+        if let Some(facts) = slot { facts.sampling_signal = Some(signal); }
     }
 
     pub(crate) async fn process_execution_identity(
@@ -2114,6 +2139,10 @@ pub(crate) fn persist_synced_file(
 mod outcome_tests;
 
 #[cfg(test)]
+#[path = "command_execution_audit149_followup_tests.rs"]
+mod audit149_regressions;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::process::Command;
@@ -2124,7 +2153,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn verified_running_validation_reuse_requires_exact_workspace_and_attempt() {
+    async fn git_identity_alone_never_suppresses_a_requested_validation() {
         let ledger = CommandExecutionLedger::default();
         let original = key("cargo test -p app").with_workspace_identity(Some("revision-a"));
         ledger
@@ -2140,7 +2169,7 @@ mod tests {
                 .identical_running_process(&original)
                 .await
                 .map(|(id, _)| id),
-            Some(42)
+            None
         );
         assert!(
             ledger
@@ -4206,7 +4235,7 @@ mod tests {
             .await
             .expect("track original validation");
 
-        // Another supplied baseline with unchanged inputs may reuse the live run.
+        // Equal endpoint observations are not execution-lifetime input proof.
         ledger
             .observe_workspace_baseline("turn", 0, &repository, Some(first.clone()))
             .await;
@@ -4220,7 +4249,7 @@ mod tests {
                 .identical_running_process(&attempt(&unchanged_hash))
                 .await
                 .map(|(id, _)| id),
-            Some(42)
+            None
         );
 
         // An external write changes the supplied evidence, not the local revision.

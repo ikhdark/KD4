@@ -229,6 +229,23 @@ impl ThreadTraceContext {
     ///
     /// High-volume stream deltas stay out of this wrapper; typed inference,
     /// tool, terminal, and code-mode hooks provide the canonical runtime data.
+    pub fn should_record_protocol_event(&self, event: &EventMsg) -> bool {
+        self.is_enabled() && wrapped_protocol_event_type(event).is_some()
+    }
+
+    /// Whether either runtime recorder can produce a record for this event.
+    pub fn should_record_runtime_event(&self, default_turn_id: &str, event: &EventMsg) -> bool {
+        let ThreadTraceContextState::Enabled(context) = &self.state else {
+            return false;
+        };
+        codex_turn_trace_event(&context.thread_id, default_turn_id, event).is_some()
+            || tool_runtime_trace_event(event).is_some()
+    }
+
+    pub fn should_record_tool_call_event(&self, event: &EventMsg) -> bool {
+        self.is_enabled() && tool_runtime_trace_event(event).is_some()
+    }
+
     pub fn record_protocol_event(&self, event: &EventMsg) {
         let ThreadTraceContextState::Enabled(context) = &self.state else {
             return;
@@ -379,13 +396,22 @@ impl ThreadTraceContext {
         &self,
         invocation: impl FnOnce() -> Option<ToolDispatchInvocation>,
     ) -> ToolDispatchTraceContext {
+        self.start_tool_dispatch_trace_at(invocation, crate::TraceOccurrence::now())
+    }
+
+    /// Carries the producer clock across deferred diagnostic persistence.
+    pub fn start_tool_dispatch_trace_at(
+        &self,
+        invocation: impl FnOnce() -> Option<ToolDispatchInvocation>,
+        occurrence: crate::TraceOccurrence,
+    ) -> ToolDispatchTraceContext {
         let ThreadTraceContextState::Enabled(context) = &self.state else {
             return ToolDispatchTraceContext::disabled();
         };
         let Some(invocation) = invocation() else {
             return ToolDispatchTraceContext::disabled();
         };
-        ToolDispatchTraceContext::start(Arc::clone(&context.writer), invocation)
+        ToolDispatchTraceContext::start_at(Arc::clone(&context.writer), invocation, occurrence)
     }
 
     /// Builds reusable inference trace context for one Codex turn.

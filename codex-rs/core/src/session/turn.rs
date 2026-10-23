@@ -66,7 +66,6 @@ use crate::plugins::PluginCapabilitySummary;
 use crate::plugins::build_plugin_injections;
 use crate::responses_metadata::CodexResponsesMetadata;
 use crate::responses_metadata::CodexResponsesRequestKind;
-use crate::responses_retry::AccountChangeIdentity;
 use crate::responses_retry::AccountChangeWait;
 use crate::responses_retry::ResponsesStreamRequest;
 use crate::responses_retry::ResponsesStreamRetryState;
@@ -472,6 +471,9 @@ pub(crate) fn run_turn(
         let mut seen_stop_repairs = Vec::new();
         let mut completion_evidence = None;
         let mut provider_overflow_recovery_attempted = false;
+        // How the overflow arm last relieved the context, until a request
+        // completes. A summary leaves no smaller history to summarize.
+        let mut unsampled_overflow_relief: Option<ContextPressureRelief> = None;
         let mut final_answer_compaction_deferred = false;
         if run_pending_session_start_hooks(&sess, &turn_context).await {
             return Ok(finish_stopped_session_start(&sess, &turn_context, input).await);
@@ -508,8 +510,16 @@ pub(crate) fn run_turn(
             prewarmed_client_session.unwrap_or_else(|| sess.services.model_client.new_session());
         // Startup-capable clients already have a speculative owner until the first send.
         // Desktop attestation intentionally disables that path, but is available now.
+        // First-send handoff cuts off an unfinished prewarm, so only a finished one owns
+        // the first socket. Otherwise preconnect now rather than dial serially at dispatch.
         let startup_owns_transport = sess.services.model_client.startup_websocket_enabled()
-            && sess.state.lock().await.startup_prewarm.is_some();
+            && sess
+                .state
+                .lock()
+                .await
+                .startup_prewarm
+                .as_ref()
+                .is_some_and(|prewarm| prewarm.is_finished());
         if !startup_owns_transport {
             let metadata = turn_context.turn_metadata_state.to_responses_metadata(
                 sess.installation_id.clone(),
@@ -617,10 +627,12 @@ pub(crate) fn run_turn(
         let mut surfaced_result: Option<SurfacedToolResult> = None;
         let mut output_state = TurnOutputState::default();
         let mut accepted_final_message = None;
-        let mut completion_assessment;
+        let mut completion_assessment: Option<codex_protocol::protocol::TurnCompletionAssessment>;
         let mut stop_hook_active = false;
         let mut pending_continuation_cause = None;
         let mut pending_generation_request: Option<GenerationRequestDisposition> = None;
+        let mut missing_answer_terminal_repair_revision: Option<String> = None;
+        let mut completion_notice_key = None;
         let mut prefetched_workspace_identity: Option<
             Option<crate::git_workspace::WorkspaceEvidenceIdentity>,
         > = None;
@@ -764,6 +776,7 @@ pub(crate) fn run_turn(
 
             let window_id = sess.current_window_id().await;
             // Capture once so context, advertised tools, and tool calls share one request view.
+            let prebuilt_step_context = next_step_context.is_some();
             let mut step_context = match next_step_context.take() {
                 Some(step_context) => step_context,
                 None => sess.capture_step_context(Arc::clone(&turn_context)).await?,
@@ -772,6 +785,13 @@ pub(crate) fn run_turn(
             // recorded input, not a later steering arrival, grants new authority.
             Arc::make_mut(&mut step_context).user_intent_epoch =
                 sess.input_queue.incorporated_user_intent_epoch();
+            if prebuilt_step_context {
+                // Accepting that input resets the derived plan, so a sampling fence
+                // captured before the drain rejected every turn's first plan update.
+                // The model-visible plan is rendered after this point.
+                Arc::make_mut(&mut step_context).plan_sampling_revision =
+                    Some(sess.services.plan_store.sampling_revision().await);
+            }
             let request_baselines = {
                 let tracker = turn_diff_tracker.lock().await;
                 let mut baselines = turn_execution.baselines_with_tool_exposure_revision(
@@ -815,6 +835,14 @@ pub(crate) fn run_turn(
                     }
                 }
             });
+            if let Some(repair_revision) = missing_answer_terminal_repair_revision.take()
+                && repair_revision != request_baselines.relevant_state_fingerprint()
+            {
+                // New input/effects reopen ordinary work, rather than carrying a
+                // delivery-only fence into a different task state.
+                generation_request.terminal_completion_only = false;
+                generation_request.purpose = Some(TurnTimingGenerationPurpose::Repair);
+            }
             if matches!(
                 pending_continuation_cause,
                 Some(ContinuationCause::Compaction)
@@ -877,23 +905,31 @@ pub(crate) fn run_turn(
                     .await
                     .changed_paths()
                     .into_iter()
-                    .map(|(_, path)| path)
+                    .map(|(id, path)| {
+                        let resource = turn_context.environments.turn_environments.iter()
+                            .find(|environment| environment.environment_id == id)
+                            .map_or_else(|| format!("unknown:{id}"), |environment| environment.environment.coordination_resource_id());
+                        (resource, path)
+                    })
                     .collect();
-                // Show other sessions' work before the first edit, then again
-                // after each change to this turn's own edited files.
-                if live_session.publish(edited).await || !concurrent_sessions_checked {
+                // Show other sessions' work before the first edit, then what
+                // changed in it after each change to this turn's own edited files.
+                if live_session.publish_qualified(edited).await || !concurrent_sessions_checked || live_session.peer_refresh_due() {
                     concurrent_sessions_checked = true;
                     let others = live_session.others().await;
-                    record_context_notice_if_changed(
-                        sess.as_ref(),
-                        turn_context.as_ref(),
+                    let retained = retained_context_notices(
+                        sess.clone_history().await.raw_items(),
                         "concurrent_sessions",
-                        &crate::live_sessions::concurrent_sessions_notice(
-                            &others,
-                            live_session.workspace(),
-                        ),
-                    )
-                    .await?;
+                    );
+                    if let Some(notice) = live_session.sessions_notice(&others, &retained) {
+                        record_context_notice_if_changed(
+                            sess.as_ref(),
+                            turn_context.as_ref(),
+                            "concurrent_sessions",
+                            &notice,
+                        )
+                        .await?;
+                    }
                 }
             }
             let generation_id = ModelGenerationId {
@@ -929,6 +965,16 @@ pub(crate) fn run_turn(
                         sess.as_ref(), turn_context.as_ref(), "mcp_catalog_availability",
                         &format!("MCP discovery is incomplete. Already advertised tools remain usable. Pending servers: {:?}. Failed or cancelled servers: {:?}. A later step may discover more capabilities.", mcp_snapshot.pending_servers, mcp_snapshot.failed_servers),
                     ).await?;
+                } else if !mcp_snapshot.temporarily_unavailable {
+                    // A coherent capture with nothing pending or failed supersedes an
+                    // earlier incomplete-discovery notice; a timed-out capture proves nothing.
+                    supersede_context_notice_if_present(
+                        sess.as_ref(),
+                        turn_context.as_ref(),
+                        "mcp_catalog_availability",
+                        MCP_DISCOVERY_COMPLETE_NOTICE,
+                    )
+                    .await?;
                 }
                 record_sampling_notices(
                     sess.as_ref(),
@@ -1023,8 +1069,12 @@ pub(crate) fn run_turn(
             turn_context
                 .turn_timing_state
                 .finish_request_preparation(&mut preparation_timing_guard);
+            let admission_refusal = turn_context
+                .extension_data
+                .remove::<AdmissionRefusedProjection>();
             match sampling_request_result {
                 Ok((sampling_request_output, sampling_request_input)) => {
+                    unsampled_overflow_relief = None;
                     let SamplingRequestResult {
                         needs_follow_up: model_needs_follow_up,
                         last_agent_message: sampling_request_last_agent_message,
@@ -1039,30 +1089,6 @@ pub(crate) fn run_turn(
                     } = sampling_request_output;
                     prefetched_workspace_identity = next_workspace_identity;
                     pending_workspace_prefetch = continuation_workspace_prefetch;
-                    if let Some(required_tool_terminal) = required_tool_terminal {
-                        if required_tool_terminal.cause != RequiredToolTerminalCause::Blocked {
-                            let error = CodexErrorInfo::Other;
-                            sess.emit_turn_error_lifecycle(turn_context.as_ref(), error.clone())
-                                .await;
-                            sess.send_event(
-                                &turn_context,
-                                EventMsg::Error(ErrorEvent {
-                                    message: required_tool_terminal.message.clone(),
-                                    codex_error_info: Some(error),
-                                }),
-                            )
-                            .await;
-                        }
-                        return Ok(TurnTaskResult {
-                            stop_cause: None,
-                            last_agent_message,
-                            accepted_final_message: None,
-                            surfaced_result,
-                            completion_assessment: None,
-                            required_tool_terminal: Some(required_tool_terminal),
-                            defer_pending_input: false,
-                        });
-                    }
                     {
                         let tracker = turn_diff_tracker.lock().await;
                         turn_execution.retain_validation_across_changes(
@@ -1083,15 +1109,52 @@ pub(crate) fn run_turn(
                         &request_signals,
                         &settled_state,
                     );
+                    turn_execution.capture_acceptance_sources(&step_context,
+                        &turn_context.sub_id, settled_state.mutation_revision).await;
                     sess.services.plan_store.publish_acceptance_evidence(
                         turn_execution.acceptance_evidence(
                             &turn_context.sub_id,
                             settled_state.mutation_revision,
                         ),
                     );
-                    turn_extension_data.insert(
-                        turn_execution.completion_readiness(settled_state.mutation_revision),
-                    );
+                    // All owner outcomes have drained. Settle them even when a
+                    // required sibling stops this generation; Drop can retain
+                    // only settled failures and live validation questions.
+                    if let Some(required_tool_terminal) = required_tool_terminal {
+                        if required_tool_terminal.cause != RequiredToolTerminalCause::Blocked {
+                            let error = CodexErrorInfo::Other;
+                            sess.emit_turn_error_lifecycle(turn_context.as_ref(), error.clone()).await;
+                            sess.send_event(&turn_context, EventMsg::Error(ErrorEvent {
+                                message: required_tool_terminal.message.clone(),
+                                codex_error_info: Some(error),
+                            })).await;
+                        }
+                        return Ok(TurnTaskResult {
+                            stop_cause: None,
+                            last_agent_message,
+                            accepted_final_message: None,
+                            surfaced_result,
+                            completion_assessment: None,
+                            required_tool_terminal: Some(required_tool_terminal),
+                            defer_pending_input: false,
+                        });
+                    }
+                    let readiness = turn_execution.completion_readiness(settled_state.mutation_revision);
+                    let (advisory, external) = sess.services.plan_store.completion_advisory(
+                        &turn_context.sub_id, settled_state.mutation_revision,
+                    ).await;
+                    let validation_report_only = finalized_mutation_revision.is_some()
+                        || !turn_execution.changed_sources(settled_state.mutation_revision);
+                    if let Some(text) = readiness.sampling_notice_for_decision(
+                        &mut completion_notice_key, &advisory, &external, validation_report_only,
+                    ) {
+                        sess.record_conversation_items(&turn_context, &[ResponseItem::Message {
+                            id: None, role: "developer".into(),
+                            content: vec![ContentItem::InputText { text }],
+                            phase: None, internal_chat_message_metadata_passthrough: None,
+                        }]).await?;
+                    }
+                    turn_extension_data.insert(readiness);
                     let terminal_feedback = sess
                         .settle_extension_terminal_intents(&turn_extension_data)
                         .or_cancel(&cancellation_token)
@@ -1420,20 +1483,68 @@ pub(crate) fn run_turn(
                                 .await
                             {
                                 output_state.missing_answer_repair_attempted = true;
+                                let repair_revision = turn_diff_tracker.lock().await.current_mutation_revision();
+                                let mut readiness = turn_execution.completion_readiness(repair_revision);
+                                if finalized_mutation_revision.is_some()
+                                    || !turn_execution.changed_sources(repair_revision)
+                                {
+                                    readiness.validation_work.clear();
+                                }
+                                let closure = if turn_context.collaboration_mode.mode == ModeKind::Plan {
+                                    None
+                                } else {
+                                    tokio::select! {
+                                        _ = cancellation_token.cancelled() => return Err(CodexErr::TurnAborted),
+                                        result = tokio::time::timeout(std::time::Duration::from_secs(5), sess.services.plan_store.task_closure(
+                                            &turn_context.sub_id, repair_revision,
+                                            sess.services.agent_control.task_coordinator(),
+                                        )) => result.ok(),
+                                    }
+                                };
+                                // Satisfied criteria account for their mapped checklist rows
+                                // here as on the ordinary final path.
+                                if let Some(decision) = &closure {
+                                    readiness.reconcile_acceptance(decision);
+                                }
+                                let delivery_only = closure.as_ref().is_some_and(|decision| {
+                                    decision.terminal_action != crate::plan_store::acceptance::TerminalAction::Continue
+                                        && readiness.remaining(
+                                            decision.request_state == crate::plan_store::acceptance::RequestState::Blocked,
+                                            &decision.unmet_obligations,
+                                        ).is_empty()
+                                }) && turn_diff_tracker.lock().await.current_mutation_revision() == repair_revision;
                                 sess.record_conversation_items(
                                     &turn_context,
                                     &[ResponseItem::Message {
                                         id: None,
                                         role: "developer".to_string(),
                                         content: vec![ContentItem::InputText {
-                                            text: MISSING_ANSWER_REPAIR_DIRECTIVE.to_string(),
+                                            text: if delivery_only {
+                                                MISSING_ANSWER_REPAIR_DIRECTIVE.to_string()
+                                            } else {
+                                                "The prior response omitted a final answer, but authoritative work is not established complete. Continue obtainable authorized work; do not repeat completed effects or run unauthorized checks. Deliver the final answer when the existing obligations permit it.".to_string()
+                                            },
                                         }],
                                         phase: None,
                                         internal_chat_message_metadata_passthrough: None,
                                     }],
                                 )
                                 .await?;
-                                pending_generation_request = None;
+                                pending_generation_request = if delivery_only {
+                                    let fingerprint = turn_execution.baselines_with_tool_exposure_revision(
+                                        repair_revision, settled_state.tool_exposure_revision,
+                                    ).relevant_state_fingerprint();
+                                    missing_answer_terminal_repair_revision = Some(fingerprint.clone());
+                                    Some(GenerationRequestDisposition {
+                                        purpose: Some(TurnTimingGenerationPurpose::Repair),
+                                        sampling: SamplingGenerationDisposition::DecisionBearing,
+                                        relevant_state_fingerprint: fingerprint,
+                                        failure_fingerprint: None,
+                                        terminal_completion_only: false,
+                                    }.require_terminal_completion())
+                                } else {
+                                    None
+                                };
                                 pending_continuation_cause = Some(ContinuationCause::StopHook);
                                 continue 'sampling_loop;
                             }
@@ -1463,6 +1574,9 @@ pub(crate) fn run_turn(
                             // is not a request-acceptance verdict.
                             let closure_revision =
                                 turn_diff_tracker.lock().await.current_mutation_revision();
+                            sess.services.plan_store.publish_acceptance_evidence(
+                                turn_execution.fenced_acceptance_evidence(&step_context,
+                                    &turn_context.sub_id, closure_revision).await);
                             let decision = tokio::select! {
                                 _ = cancellation_token.cancelled() => return Err(CodexErr::TurnAborted),
                                 result = tokio::time::timeout(std::time::Duration::from_secs(5), sess.services.plan_store.task_closure(
@@ -1477,6 +1591,9 @@ pub(crate) fn run_turn(
                                 },
                             };
                             let decision_text = serde_json::json!(decision).to_string();
+                            completion_assessment.get_or_insert_with(Default::default)
+                                .task_disposition = Some(decision.disposition());
+                            turn_context.extension_data.insert(decision.disposition());
                             if decision.terminal_action
                                 == crate::plan_store::acceptance::TerminalAction::Continue
                                 && budget_forced_terminal.is_none()
@@ -1522,8 +1639,31 @@ pub(crate) fn run_turn(
                             }
                             initial_task_decision = Some(decision);
                         }
+                        // Collect writer overlap as an advisory, never causal
+                        // proof that this turn's consumer failure is external.
+                        if turn_execution.has_external_validation_candidates()
+                            && !matches!(
+                                turn_context.session_source,
+                                SessionSource::SubAgent(_) | SessionSource::Internal(_)
+                            )
+                        {
+                            let thread_id = sess.thread_id.to_string();
+                            let others = tokio::select! {
+                                _ = cancellation_token.cancelled() => return Err(CodexErr::TurnAborted),
+                                others = crate::live_sessions::others_in_checkout(
+                                    turn_context.config.codex_home.as_path(),
+                                    &thread_id,
+                                    turn_context.cwd().as_path(),
+                                ) => others,
+                            };
+                            turn_execution
+                                .observe_concurrent_writers(&others, turn_context.cwd().as_path());
+                        }
                         let mut readiness =
                             turn_execution.completion_readiness(settled_state.mutation_revision);
+                        if let Some(decision) = &initial_task_decision {
+                            readiness.reconcile_acceptance(decision);
+                        }
                         if finalized_mutation_revision.is_some()
                             || !turn_execution.changed_sources(settled_state.mutation_revision)
                         {
@@ -1560,7 +1700,7 @@ pub(crate) fn run_turn(
                             {
                                 sess.record_conversation_items(&turn_context, &[ResponseItem::Message {
                                     id: None, role: "developer".into(), content: vec![ContentItem::InputText {
-                                        text: format!("Known current work prevents final acceptance: {}. Continue only obtainable work the task already authorizes; this notice adds no authorization. When test execution is authorized, resolve a failed check by rerunning it, after any needed fix, through its runner or test command itself, not a wrapper script; otherwise record why it is blocked. Do not launch a duplicate of validation that is still running, or treat a stored process number as a capability. Reconcile legitimate blockers and user-approved scope changes through the current task state.", remaining.join(" ")),
+                                        text: format!("Known current work prevents final acceptance: {}. Continue only obtainable work the task already authorizes; this notice adds no authorization. When test execution is authorized, resolve a failed check by rerunning it, after any needed fix, through its runner or test command itself, not a wrapper script; otherwise record why it is blocked. Do not launch a duplicate of validation that is still running, or treat a stored process number as a capability. Reconcile legitimate blockers and user-approved scope changes with update_plan. No tool reports validation status beyond the evidence quoted here.", remaining.join(" ")),
                                     }], phase: None, internal_chat_message_metadata_passthrough: None,
                                 }]).await?;
                                 output_state.invalidate_for_repair();
@@ -1680,6 +1820,7 @@ pub(crate) fn run_turn(
                                     unattributed_paths,
                                     changed_existing,
                                     uncertain_contents,
+                                    made_attributed_edits,
                                 ) = {
                                     let tracker = turn_diff_tracker.lock().await;
                                     (
@@ -1688,6 +1829,7 @@ pub(crate) fn run_turn(
                                         tracker.unattributed_display_paths(),
                                         tracker.changed_existing_contents(),
                                         tracker.uncertain_content_paths(),
+                                        tracker.attributed_mutation_revision() > 0,
                                     )
                                 };
                                 // Parsing is CPU work bounded by its own deadline.
@@ -1717,7 +1859,7 @@ pub(crate) fn run_turn(
                                     has_untracked_changes,
                                     &runtime_inputs,
                                 );
-                                if let Some(advisory) = unattributed_changes_advisory(&unattributed_paths) {
+                                if let Some(advisory) = unattributed_changes_advisory(&unattributed_paths, made_attributed_edits) {
                                     assessment.advisories.push(advisory);
                                 }
                                 if let Some(advisory) = changed_tests_advisory(&changed_tests.changed) {
@@ -1893,9 +2035,12 @@ pub(crate) fn run_turn(
                             ).await;
                             return Ok(after_agent_abort_result(None, None, defer_pending_input));
                         }
-                        if let Some(mut initial_decision) = initial_task_decision {
+                        if let Some(mut initial_decision) = initial_task_decision.clone() {
                             let revision =
                                 turn_diff_tracker.lock().await.current_mutation_revision();
+                            sess.services.plan_store.publish_acceptance_evidence(
+                                turn_execution.fenced_acceptance_evidence(&step_context,
+                                    &turn_context.sub_id, revision).await);
                             let decision = tokio::select! {
                                 _ = cancellation_token.cancelled() => return Err(CodexErr::TurnAborted),
                                 result = tokio::time::timeout(std::time::Duration::from_secs(5),
@@ -1908,6 +2053,9 @@ pub(crate) fn run_turn(
                                     }
                                 },
                             };
+                            completion_assessment.get_or_insert_with(Default::default)
+                                .task_disposition = Some(decision.disposition());
+                            turn_context.extension_data.insert(decision.disposition());
                             // Only a declared contract that remains open is a host
                             // observation. A no-contract (unknown) or satisfied
                             // disposition is not an advisory for the turn or its parent.
@@ -1947,8 +2095,37 @@ pub(crate) fn run_turn(
                                     defer_pending_input,
                                 ));
                             }
+                            initial_task_decision = Some(decision);
+                        }
+                        if let Some(decision) = &initial_task_decision {
+                            let owner = Arc::clone(&sess);
+                            let persistence_owner = Arc::clone(&sess);
+                            let decision = decision.clone();
+                            let result = sess.terminal_tasks.spawn(async move {
+                                owner.services.plan_store.archive_completed_scope(&decision, |item| async move {
+                                    persistence_owner.persist_rollout_items_durable(&[
+                                        codex_protocol::protocol::RolloutItem::ResponseItem(item),
+                                    ]).await
+                                }).await
+                            }).await;
+                            match result.unwrap_or_else(|error| Err(std::io::Error::other(error.to_string()))) {
+                                // Archival can complete lagging mapped rows; publish the
+                                // durable checklist after persistence, as update_plan does.
+                                Ok(Some(plan)) => {
+                                    sess.send_event(turn_context.as_ref(), EventMsg::PlanUpdate(plan)).await;
+                                }
+                                Ok(None) => {}
+                                Err(error) => {
+                                    emit_status_affecting_turn_error(sess.as_ref(), turn_context.as_ref(),
+                                        &format!("Completed task scope could not be archived: {error}; final acceptance remains uncommitted.")).await;
+                                    return Ok(after_agent_abort_result(last_agent_message, surfaced_result, defer_pending_input));
+                                }
+                            }
                         }
                         surfaced_result = candidate;
+                        if surfaced_result.is_some() {
+                            turn_context.turn_timing_state.record_surfaced_final_answer();
+                        }
                         accepted_final_message = if surfaced_result.is_none() {
                             last_agent_message = output_state.answer_text();
                             output_state.take_answer()
@@ -1975,8 +2152,31 @@ pub(crate) fn run_turn(
                 Err(err @ CodexErr::TurnAborted) => {
                     return Err(err);
                 }
-                Err(CodexErr::ContextWindowExceeded) if !provider_overflow_recovery_attempted => {
-                    provider_overflow_recovery_attempted = true;
+                Err(CodexErr::ContextWindowExceeded)
+                    if unsampled_overflow_relief != Some(ContextPressureRelief::Compaction)
+                        && (admission_refusal.is_some()
+                            || !provider_overflow_recovery_attempted) =>
+                {
+                    let retire_consumed_outputs = match admission_refusal.as_deref() {
+                        // Admission refused this projection before dispatch. Like a
+                        // limit found after sampling, it is relieved for each crossing,
+                        // first by exact retirement judged against that projection.
+                        Some(AdmissionRefusedProjection(projected_pressure))
+                            if unsampled_overflow_relief.is_none() =>
+                        {
+                            ConsumedOutputRetirement::Eligible {
+                                projected_pressure: Some(*projected_pressure),
+                            }
+                        }
+                        // Retirement did not make room for this prompt.
+                        Some(_) => ConsumedOutputRetirement::Unavailable,
+                        // The provider rejected the prompt, so the local estimate
+                        // already failed; only a real summary can be trusted here.
+                        None => {
+                            provider_overflow_recovery_attempted = true;
+                            ConsumedOutputRetirement::Unavailable
+                        }
+                    };
                     if !admit_regular_follow_up(
                         sess.as_ref(),
                         turn_context.as_ref(),
@@ -1995,7 +2195,7 @@ pub(crate) fn run_turn(
                         &cancellation_token,
                     )
                     .await?;
-                    if let Err(err) = run_auto_compact(
+                    let relief = match run_auto_compact(
                         &sess,
                         Arc::clone(&step_context),
                         None,
@@ -2004,33 +2204,40 @@ pub(crate) fn run_turn(
                         Some(Arc::clone(&world_state)),
                         CompactionReason::ContextLimit,
                         CompactionPhase::MidTurn,
-                        // The provider rejected the prompt, so the local estimate
-                        // already failed; only a real summary can be trusted here.
-                        ConsumedOutputRetirement::Unavailable,
+                        retire_consumed_outputs,
                         &cancellation_token,
                     )
                     .await
                     {
-                        if matches!(err, CodexErr::TurnAborted) {
-                            return Err(err);
-                        }
-                        sess.emit_turn_error_lifecycle(
-                            turn_context.as_ref(),
-                            err.to_codex_protocol_error(),
-                        )
-                        .await;
-                        sess.track_turn_codex_error(turn_context.as_ref(), &err);
-                        sess.send_event(&turn_context, EventMsg::Error(err.to_error_event(None)))
+                        Ok(relief) => relief,
+                        Err(err) => {
+                            if matches!(err, CodexErr::TurnAborted) {
+                                return Err(err);
+                            }
+                            sess.emit_turn_error_lifecycle(
+                                turn_context.as_ref(),
+                                err.to_codex_protocol_error(),
+                            )
                             .await;
-                        break;
-                    }
+                            sess.track_turn_codex_error(turn_context.as_ref(), &err);
+                            sess.send_event(
+                                &turn_context,
+                                EventMsg::Error(err.to_error_event(None)),
+                            )
+                            .await;
+                            break;
+                        }
+                    };
+                    unsampled_overflow_relief = Some(relief);
                     pending_generation_request = None;
                     pending_continuation_cause = Some(ContinuationCause::Compaction);
-                    subagent_context_budget_reached |= observe_context_pressure_event(
-                        &turn_context.session_source,
-                        &mut context_pressure_events,
-                        logical_generation_budget,
-                    );
+                    if relief == ContextPressureRelief::Compaction {
+                        subagent_context_budget_reached |= observe_context_pressure_event(
+                            &turn_context.session_source,
+                            &mut context_pressure_events,
+                            logical_generation_budget,
+                        );
+                    }
                     continue;
                 }
                 Err(codex_error @ CodexErr::InvalidImageRequest()) => {
@@ -2360,12 +2567,20 @@ fn turn_input_first_text(input: &[TurnInput]) -> Option<&str> {
 }
 
 /// Names observed changes the turn did not make, without counting them as its own.
-fn unattributed_changes_advisory(paths: &[String]) -> Option<String> {
+/// A turn without attributed edits is told so: its commands remain a possible
+/// cause, but the useful action is re-reading evidence gathered before the change.
+fn unattributed_changes_advisory(paths: &[String], made_attributed_edits: bool) -> Option<String> {
     (!paths.is_empty()).then(|| {
-        format!(
-            "Workspace changes observed during this turn were not attributed to it (another writer, or an undeclared command effect): {}.",
-            crate::session::turn_execution::bounded_path_list(paths)
-        )
+        let paths = crate::session::turn_execution::bounded_path_list(paths);
+        if made_attributed_edits {
+            format!(
+                "Workspace changes observed during this turn were not attributed to it (another writer, or an undeclared command effect): {paths}. Re-read these paths before relying on evidence gathered earlier."
+            )
+        } else {
+            format!(
+                "This turn made no attributed edits, but these paths changed during it (another writer, or an undeclared effect of a command it ran): {paths}. Evidence read from them earlier may be stale; re-read before relying on it."
+            )
+        }
     })
 }
 
@@ -2502,6 +2717,51 @@ async fn record_context_notice_if_changed(
     };
     sess.record_conversation_items(turn, &[item]).await?;
     Ok(true)
+}
+
+/// Settled state that supersedes an earlier incomplete-discovery notice.
+const MCP_DISCOVERY_COMPLETE_NOTICE: &str = "MCP discovery is complete: no servers are pending, failed, or cancelled. Earlier incomplete-discovery notices no longer apply.";
+
+/// Supersede a delivered `<marker>` notice with `text`. Records nothing when
+/// history holds no such notice, so a session never told otherwise sees nothing.
+async fn supersede_context_notice_if_present(
+    sess: &Session,
+    turn: &TurnContext,
+    marker: &str,
+    text: &str,
+) -> CodexResult<bool> {
+    let opening = format!("<{marker}>");
+    let delivered = sess.clone_history().await.raw_items().iter().any(|item| {
+        matches!(item, ResponseItem::Message { role, content, .. }
+            if role == "developer"
+                && content.iter().any(|content| matches!(content,
+                    ContentItem::InputText { text: body } if body.starts_with(&opening))))
+    });
+    if !delivered {
+        return Ok(false);
+    }
+    record_context_notice_if_changed(sess, turn, marker, text).await
+}
+
+/// Bodies of the `<marker>` notices in history, oldest first, as
+/// `record_context_notice_if_changed` renders them.
+fn retained_context_notices(items: &[ResponseItem], marker: &str) -> Vec<String> {
+    let (opening, closing) = (format!("<{marker}>\n"), format!("\n</{marker}>"));
+    items
+        .iter()
+        .filter_map(|item| match item {
+            ResponseItem::Message { role, content, .. } if role == "developer" => Some(content),
+            _ => None,
+        })
+        .flatten()
+        .filter_map(|content| match content {
+            ContentItem::InputText { text } => text
+                .strip_prefix(&opening)?
+                .strip_suffix(&closing)
+                .map(str::to_string),
+            _ => None,
+        })
+        .collect()
 }
 
 /// Rough text capacity illustration, not a measured token or timing model.
@@ -4069,9 +4329,12 @@ fn defer_compaction_for_final_answer(
 fn build_bounded_skill_context_items<'a>(
     skill_fragments: impl IntoIterator<Item = &'a codex_core_skills::injection::SkillInjection>,
 ) -> Vec<ResponseItem> {
+    use sha2::Digest;
     let fragments = skill_fragments.into_iter().collect::<Vec<_>>();
     let notices = fragments.iter().map(|skill| {
         let mut notice = (*skill).clone();
+        // An undelivered replacement cannot retire successfully delivered rules.
+        notice.source_id = None;
         notice.contents = "INCOMPLETE MODEL DELIVERY: instructions were loaded by the host but not delivered. Before using this selected skill, use read_file with the exact path above to read the complete instructions. Do not infer permission from an excerpt.".to_string();
         notice.render()
     }).collect::<Vec<_>>();
@@ -4086,13 +4349,24 @@ fn build_bounded_skill_context_items<'a>(
         .zip(notices)
         .map(|(fragment, notice)| {
             let full = fragment.render();
+            let complete = full.len() <= notice.len()
+                || budget.try_take_bytes(full.len() - notice.len());
             let text =
-                if full.len() <= notice.len() || budget.try_take_bytes(full.len() - notice.len()) {
+                if complete {
                     full
                 } else {
                     notice
                 };
-            ContextualUserFragment::into(RenderedContextFragment::new(fragment.role(), text))
+            let mut item: ResponseItem = ContextualUserFragment::into(
+                RenderedContextFragment::new(fragment.role(), text),
+            );
+            if complete && let Some(source) = &fragment.source_id {
+                let revision = hex::encode(sha2::Sha256::digest(fragment.contents.as_bytes()));
+                if let ResponseItem::Message { id, .. } = &mut item {
+                    *id = Some(ResponseItemId::new(&format!("msg_sctx_skill_revision_v1_{source}_{revision}")));
+                }
+            }
+            item
         })
         .collect()
 }
@@ -4802,6 +5076,54 @@ async fn retire_consumed_tool_outputs_for_context_pressure(
     true
 }
 
+/// Describes a compaction failure the turn recovers from. The overflow error's
+/// own text tells the user to start a new thread, which is wrong while local
+/// compaction or exact retirement continues the turn.
+fn recovered_compaction_failure(error: &CodexErr) -> String {
+    match error {
+        CodexErr::ContextWindowExceeded => {
+            "the compaction input exceeds the model's context window".to_string()
+        }
+        error => error.to_string().trim_end_matches('.').to_string(),
+    }
+}
+
+/// A failed local-only summary gets the exact retirement a failed remote
+/// summary already gets: only the newest generation stays inline, and the
+/// turn continues only when that alone clears the pressure its caller measured.
+async fn retire_after_failed_local_compaction(
+    sess: &Session,
+    turn_context: &TurnContext,
+    retire_consumed_outputs: ConsumedOutputRetirement,
+    local_error: CodexErr,
+) -> CodexResult<ContextPressureRelief> {
+    let ConsumedOutputRetirement::Eligible { projected_pressure } = retire_consumed_outputs else {
+        return Err(local_error);
+    };
+    if matches!(local_error, CodexErr::Interrupted | CodexErr::TurnAborted)
+        || !retire_consumed_tool_outputs_for_context_pressure(
+            sess,
+            turn_context,
+            FAILED_COMPACTION_KEPT_GENERATIONS,
+            projected_pressure,
+        )
+        .await
+    {
+        return Err(local_error);
+    }
+    sess.send_event(
+        turn_context,
+        EventMsg::Warning(WarningEvent {
+            message: format!(
+                "Local compaction failed: {}. Retired consumed tool results to recovery pins instead; the turn continues.",
+                recovered_compaction_failure(&local_error)
+            ),
+        }),
+    )
+    .await;
+    Ok(ContextPressureRelief::Compaction)
+}
+
 #[instrument(
     level = "trace",
     skip_all,
@@ -4894,7 +5216,8 @@ fn run_auto_compact<'a>(
                         turn_context,
                         EventMsg::Warning(WarningEvent {
                             message: format!(
-                                "Remote compaction failed: {remote_error}. Retired consumed tool results to recovery pins instead; the turn continues."
+                                "Remote compaction failed: {}. Retired consumed tool results to recovery pins instead; the turn continues.",
+                                recovered_compaction_failure(&remote_error)
                             ),
                         }),
                     )
@@ -4917,7 +5240,8 @@ fn run_auto_compact<'a>(
                     turn_context,
                     EventMsg::Warning(WarningEvent {
                         message: format!(
-                            "Remote compaction failed: {remote_error}. Compacting locally instead."
+                            "Remote compaction failed: {}. Compacting locally instead.",
+                            recovered_compaction_failure(&remote_error)
                         ),
                     }),
                 )
@@ -4952,7 +5276,17 @@ fn run_auto_compact<'a>(
                 Ok(()) => {}
                 Err(previous_error) => {
                     let Some(fallback_step_context) = fallback_step_context else {
-                        return Err(previous_error);
+                        // A remote failure already tried this retirement above.
+                        if remote_compaction {
+                            return Err(previous_error);
+                        }
+                        return retire_after_failed_local_compaction(
+                            sess,
+                            turn_context,
+                            retire_consumed_outputs,
+                            previous_error,
+                        )
+                        .await;
                     };
                     if !should_retry_with_current_model(&previous_error) {
                         return Err(previous_error);
@@ -5680,6 +6014,9 @@ fn run_sampling_request<'a>(
         drop(worker_preparation_guard);
         let max_retries = turn_context.provider.info().stream_max_retries();
         let mut retry_state = ResponsesStreamRetryState::default();
+        let recovery_episode_id = format!("{}:{}", generation_id.turn_id, generation_id.ordinal);
+        let mut outer_attempt_ordinal = 0_u64;
+        let mut outer_retry_reason = "initial";
         let mut account_wait_deadline = None;
         let mut accepted_attempt_input = prepared_input.shared_items();
         sess.services
@@ -5721,11 +6058,6 @@ fn run_sampling_request<'a>(
                 continue;
             }
             let mut attempt_progress = SamplingAttemptProgress::default();
-            let request_account = turn_context
-                .provider
-                .auth_manager()
-                .and_then(|manager| manager.auth_cached())
-                .and_then(|auth| AccountChangeIdentity::from_auth(&auth));
             // The streaming/tool state machine is large in debug builds. Keep its
             // storage off the enclosing turn future without changing poll ownership.
             let err = match Box::pin(try_run_sampling_request(
@@ -5745,6 +6077,9 @@ fn run_sampling_request<'a>(
             ))
             .instrument(trace_span!("try_run_sampling_request",
                 turn_id = %turn_context.sub_id,
+                recovery_episode_id = %recovery_episode_id,
+                outer_attempt_ordinal,
+                outer_retry_reason,
                 model = %turn_context.model_info.slug))
             .await
             {
@@ -5763,7 +6098,7 @@ fn run_sampling_request<'a>(
                     // An account switch or limit reset makes the same request
                     // succeed; it does not spend the stream retry budget.
                     if !wait_for_account_change(
-                        AccountChangeWait::UsageLimit(&e, request_account.as_ref()),
+                        AccountChangeWait::UsageLimit(&e, client_session.dispatched_account()),
                         &mut account_wait_deadline,
                         sess.as_ref(),
                         turn_context.as_ref(),
@@ -5797,6 +6132,13 @@ fn run_sampling_request<'a>(
                 retry_result?;
             }
             turn_context.turn_timing_state.record_sampling_retry();
+            outer_attempt_ordinal = outer_attempt_ordinal.saturating_add(1);
+            outer_retry_reason = "response_stream_or_account_recovery";
+            if !attempt_progress.requires_authoritative_retry_input() {
+                // Nothing was accepted, so the next dispatch replays the same logical
+                // request rather than continuing the turn.
+                client_session.note_logical_request_replay();
+            }
             if attempt_progress.requires_authoritative_retry_input() {
                 // Accepted output has changed authoritative state. Revalidate the
                 // whole request snapshot while retaining this recovery episode's budget.
@@ -7265,10 +7607,22 @@ async fn drain_in_flight_with_buffer(
             };
         let mut response_items = vec![response_input.into()];
         response_items.extend(failure_detail);
-        if let Err(err) = sess
-            .record_tool_completion_ordered(&turn_context, &completion.call_id, &response_items)
-            .await
-        {
+        let commit = sess.record_tool_completion_ordered(
+            &turn_context, &completion.call_id, &response_items,
+        );
+        tokio::pin!(commit);
+        let commit_result = loop {
+            tokio::select! {
+                biased;
+                result = &mut commit => break result,
+                Some(result) = in_flight.next(), if !in_flight.is_empty() => {
+                    // Keep admitted work progressing, but never deliver a
+                    // successor before this durable ordered commit finishes.
+                    completed.push_back(result);
+                }
+            }
+        };
+        if let Err(err) = commit_result {
             let interrupt_terminal = sess
                 .active_turn
                 .lock()
@@ -7480,20 +7834,25 @@ pub(crate) async fn service_tier_for_sampling(
     )
 }
 
-/// Admit immutable prepared inputs, including every eligible transport fallback.
+/// Token estimates for the largest transport representation of a prepared prompt.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct PromptTokenEstimates {
+    /// The content-based local estimate, with no provider calibration.
+    pub(crate) local_tokens: i64,
+    /// The local estimate with an observed prompt prefix calibrated to its
+    /// provider measurement; content past that prefix keeps its local cost.
+    pub(crate) calibrated_tokens: i64,
+}
+
+/// Estimates immutable prepared inputs, including every eligible transport fallback.
 /// No session lock is held while estimating content or preparing Lite images.
-async fn admit_prepared_prompt(
+pub(crate) async fn prompt_token_estimates(
     sess: &Session,
     turn: &TurnContext,
     prompt: &Prompt,
-) -> CodexResult<()> {
+) -> PromptTokenEstimates {
     let lite = turn.model_info.use_responses_lite;
-    let inputs = [
-        prompt.get_formatted_input_for_request(lite),
-        prompt.get_formatted_fallback_input_for_request(lite),
-        prompt.get_formatted_tool_history_fallback_input_for_request(lite, false),
-        prompt.get_formatted_tool_history_fallback_input_for_request(lite, true),
-    ];
+    let inputs = prompt.get_formatted_admission_inputs(lite);
     let mut bases = Vec::new();
     for (index, input) in inputs.iter().enumerate() {
         if inputs[..index]
@@ -7504,7 +7863,12 @@ async fn admit_prepared_prompt(
         }
         bases.push(prompt.calibration_basis(Arc::clone(input)));
     }
-    let total = {
+    let local_tokens = bases
+        .iter()
+        .map(|basis| basis.local_tokens)
+        .max()
+        .unwrap_or(0);
+    let calibrated_tokens = {
         let state = sess.state.lock().await;
         bases
             .iter()
@@ -7518,8 +7882,30 @@ async fn admit_prepared_prompt(
             .max()
             .unwrap_or(0)
     };
-    let scope = match turn.config.model_auto_compact_token_limit_scope {
-        AutoCompactTokenLimitScope::Total => total,
+    PromptTokenEstimates {
+        local_tokens,
+        calibrated_tokens,
+    }
+}
+
+/// A prompt that sampling admission refused before dispatch, so the provider
+/// never measured it. The projection uses local estimates: relief rewrites the
+/// observed prefix, after which admission has no calibration for the prompt.
+#[derive(Clone, Copy, Debug)]
+struct AdmissionRefusedProjection(ProjectedPromptPressure);
+
+/// Admit immutable prepared inputs, including every eligible transport fallback.
+async fn admit_prepared_prompt(
+    sess: &Session,
+    turn: &TurnContext,
+    prompt: &Prompt,
+) -> CodexResult<()> {
+    let PromptTokenEstimates {
+        local_tokens,
+        calibrated_tokens: total,
+    } = prompt_token_estimates(sess, turn, prompt).await;
+    let (scope, local_scope) = match turn.config.model_auto_compact_token_limit_scope {
+        AutoCompactTokenLimitScope::Total => (total, local_tokens),
         // The window's first server-observed request input is its prefix. Until one is
         // observed, the admitted request establishes it: an estimated baseline covers
         // history only, so subtracting it from this full prepared request would charge
@@ -7532,7 +7918,10 @@ async fn admit_prepared_prompt(
                 .lock()
                 .await
                 .auto_compact_window_server_observed_prefill();
-            server_prefill.map_or(0, |prefill| total.saturating_sub(prefill))
+            (
+                server_prefill.map_or(0, |prefill| total.saturating_sub(prefill)),
+                server_prefill.map_or(0, |prefill| local_tokens.saturating_sub(prefill)),
+            )
         }
     };
     let status =
@@ -7543,6 +7932,13 @@ async fn admit_prepared_prompt(
     if status.full_context_window_limit_reached
         || (status.token_limit_reached && !prompt.tool_calls_disabled)
     {
+        // The turn relieves this projection instead of treating the refusal as
+        // a provider overflow.
+        turn.extension_data
+            .insert(AdmissionRefusedProjection(ProjectedPromptPressure {
+                total_tokens: local_tokens,
+                auto_compact_scope_tokens: local_scope,
+            }));
         return Err(CodexErr::ContextWindowExceeded);
     }
     Ok(())
@@ -7845,6 +8241,34 @@ fn try_run_sampling_request<'a>(
                         &identity.physical_attempt_id,
                     )
                     .await;
+                // Notices accumulate in the prompt, so persisting every text at every
+                // boundary grows the rollout quadratically. Persist each text once
+                // per rollout; later boundaries keep its position as a digest reference.
+                let notice_digests = workspace_freshness_notices
+                    .iter()
+                    .map(|notice| {
+                        hex::encode(<sha2::Sha256 as sha2::Digest>::digest(notice.as_bytes()))
+                    })
+                    .collect::<Vec<_>>();
+                let workspace_freshness_notices = {
+                    let persisted = sess
+                        .persisted_freshness_notice_digests
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    workspace_freshness_notices
+                        .into_iter()
+                        .zip(&notice_digests)
+                        .map(|(notice, digest)| {
+                            if persisted.contains(digest) {
+                                format!(
+                                    "<workspace_evidence_invalidation_ref sha256=\"{digest}\"/>"
+                                )
+                            } else {
+                                notice
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                };
                 persist_sampling_prefix_before_dispatch(
                     sess.as_ref(),
                     manifest,
@@ -7863,6 +8287,10 @@ fn try_run_sampling_request<'a>(
                 // Their all-commits barrier belongs to terminalization; requiring
                 // quiescence here can starve sampling while background tools poll.
                 sess.flush_rollout().await?;
+                sess.persisted_freshness_notice_digests
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .extend(notice_digests);
                 drop(persistence_guard);
                 if bound_context {
                     bound_context_attempts
@@ -7938,6 +8366,7 @@ fn try_run_sampling_request<'a>(
             .any(|contributor| contributor.mutates_assistant_text());
         let mut active_item_is_streaming_to_client = false;
         let receiving_span = trace_span!("receiving_stream");
+        let mut model_stream_processing_handoff: Option<TurnTimingGuard> = None;
         let outcome: CodexResult<UnsettledSamplingRequestResult> = loop {
             let handle_responses = trace_span!(
                 parent: &receiving_span,
@@ -7955,6 +8384,10 @@ fn try_run_sampling_request<'a>(
 
             let model_stream_wait_timing_guard =
                 turn_context.turn_timing_state.begin_model_stream_wait();
+            // Close the previous event's processing only after this wait opens. A gap
+            // between the two guards records an orchestration interval for every
+            // streamed event, which fills the exact activity timeline within minutes.
+            drop(model_stream_processing_handoff.take());
             let stream_event = if in_flight.is_empty() {
                 Either::Left(
                     stream
@@ -7972,10 +8405,10 @@ fn try_run_sampling_request<'a>(
                     completion = in_flight.next() => Either::Right(completion),
                 }
             };
-            drop(model_stream_wait_timing_guard);
             let stream_event = match stream_event {
                 Either::Left(stream_event) => stream_event,
                 Either::Right(Some(completion)) => {
+                    drop(model_stream_wait_timing_guard);
                     // Poll eager work while the provider is still streaming, but
                     // defer model-visible delivery until the response has closed.
                     // FuturesOrdered makes this buffer provider-call ordered.
@@ -7992,6 +8425,7 @@ fn try_run_sampling_request<'a>(
             let event = match event {
                 Some(Ok(event)) => event,
                 Some(Err(err)) => {
+                    drop(model_stream_wait_timing_guard);
                     if let Some(token_usage) = err.terminal_usage() {
                         turn_context
                             .turn_timing_state
@@ -8013,9 +8447,11 @@ fn try_run_sampling_request<'a>(
                 }
             };
 
-            let _model_stream_processing_timing_guard = turn_context
+            // Open processing before closing the wait, for the same reason.
+            model_stream_processing_handoff = turn_context
                 .turn_timing_state
                 .begin_model_stream_processing(&event);
+            drop(model_stream_wait_timing_guard);
             sess.services
                 .session_telemetry
                 .record_responses(&handle_responses, &event);
@@ -8287,6 +8723,7 @@ fn try_run_sampling_request<'a>(
                     ..
                 } => {
                     if let Some(identity) = attempt_identity.as_ref() {
+                        turn_context.extension_data.insert(identity.clone());
                         turn_context
                             .turn_timing_state
                             .record_model_response_id(&identity.physical_attempt_id, &response_id);
@@ -8554,6 +8991,7 @@ fn try_run_sampling_request<'a>(
                 }
             }
         };
+        drop(model_stream_processing_handoff);
         drop(sampling_timing_guard);
 
         let remaining_deltas = flush_assistant_text_segments_all(

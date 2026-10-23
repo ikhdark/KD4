@@ -33,6 +33,95 @@ use tokio::time::Instant;
 
 const TEST_MAX_OUTPUT_TOKENS: usize = 10_000;
 
+#[cfg(unix)]
+#[tokio::test]
+async fn direct_observations_retain_exited_roots_with_inherited_output() -> anyhow::Result<()> {
+    for poll_after_exit in [false, true] {
+        let (session, turn) = test_session_and_turn().await;
+        let dir = tempfile::tempdir()?;
+        if !poll_after_exit {
+            std::fs::write(dir.path().join("exit"), b"exit")?;
+        }
+        let command = vec![
+            "/bin/sh".into(), "-c".into(),
+            "(while [ ! -e \"$1/release\" ]; do sleep 0.01; done; printf late) & while [ ! -e \"$1/exit\" ]; do sleep 0.01; done; printf parent".into(),
+            "inherited-output".into(), dir.path().to_string_lossy().into_owned(),
+        ];
+        let initial = tokio::time::timeout(
+            Duration::from_secs(2),
+            exec_argv(
+                &session,
+                &turn,
+                command,
+                "inherited-output",
+                250,
+                None,
+                false,
+                None,
+                &tokio_util::sync::CancellationToken::new(),
+            ),
+        )
+        .await;
+        if initial.is_err() {
+            std::fs::write(dir.path().join("release"), b"release")?;
+        }
+        let initial = initial??;
+        let process_id = initial
+            .process_id
+            .expect("output custody must retain a session");
+        let mut bytes = initial.raw_output.clone();
+        let observed = if poll_after_exit {
+            std::fs::write(dir.path().join("exit"), b"exit")?;
+            let process = Arc::clone(
+                &session
+                    .services
+                    .unified_exec_manager
+                    .process_store
+                    .lock()
+                    .await
+                    .processes[&process_id]
+                    .process,
+            );
+            let exited = process.cancellation_token();
+            tokio::time::timeout(Duration::from_secs(2), exited.cancelled()).await?;
+            tokio::time::timeout(
+                Duration::from_secs(2),
+                write_stdin_within(&session, process_id, "", 250, None),
+            )
+            .await
+        } else {
+            Ok(Ok(initial))
+        };
+        // Always let the owned descendant finish before asserting the response.
+        std::fs::write(dir.path().join("release"), b"release")?;
+        let observed = observed??;
+        if poll_after_exit {
+            bytes.extend_from_slice(&observed.raw_output);
+        }
+        assert_eq!(observed.process_id, Some(process_id));
+        assert!(observed.process_exited);
+        assert!(
+            observed
+                .repair_notice
+                .as_deref()
+                .is_some_and(|notice| notice.contains("bookkeeping is pending"))
+        );
+        let completed = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let output = write_stdin_within(&session, process_id, "", 250, None).await?;
+                bytes.extend_from_slice(&output.raw_output);
+                if output.process_id.is_none() {
+                    return Ok::<_, UnifiedExecError>(output);
+                }
+            }
+        })
+        .await??;
+        assert_eq!(completed.exit_code, Some(0));
+        assert_eq!(String::from_utf8(bytes)?, "parentlate");
+    }
+    Ok(())
+}
+
 #[tokio::test]
 async fn process_ids_exclude_history_and_released_handles() {
     let manager = UnifiedExecProcessManager::default();

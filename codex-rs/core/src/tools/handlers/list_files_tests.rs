@@ -408,15 +408,14 @@ async fn listing_filters_cover_nested_files_and_leave_an_unfiltered_audit_mode()
     ] {
         std::fs::write(root.path().join(name), "content").unwrap();
     }
-    for (extra, expected_entries) in [
+    for (extra, expected_entries, expected_directories) in [
         (
             json!({"include":["*.rs"],"exclude":["drop*"],"exclude_directories":["target"],"include_hidden":true}),
-            vec![
-                (".hidden", "directory"),
-                (".hidden/secret.rs", "file"),
-                ("src", "directory"),
-                ("src/keep.rs", "file"),
-            ],
+            // Include patterns list matching files only; directories are
+            // traversed (both files are found) but not listed, so listed
+            // entries no longer bound the default traversal budget.
+            vec![(".hidden/secret.rs", "file"), ("src/keep.rs", "file")],
+            10_000,
         ),
         (
             json!({"include_hidden":true}),
@@ -430,6 +429,7 @@ async fn listing_filters_cover_nested_files_and_leave_an_unfiltered_audit_mode()
                 ("target", "directory"),
                 ("target/build.rs", "file"),
             ],
+            2000,
         ),
     ] {
         let mut args = json!({"path":"."});
@@ -447,6 +447,10 @@ async fn listing_filters_cover_nested_files_and_leave_an_unfiltered_audit_mode()
         assert_eq!(
             result["effective_walk_options"]["max_response_bytes"],
             codex_exec_server::MAX_WALK_RESPONSE_BYTES
+        );
+        assert_eq!(
+            result["effective_walk_options"]["max_directories"],
+            expected_directories
         );
         assert_listing_entries(root.path(), &result, &expected_entries);
     }

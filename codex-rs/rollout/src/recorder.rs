@@ -1136,7 +1136,7 @@ impl RolloutRecorder {
         .map_err(IoError::other)??;
         let mut items = Vec::new();
         let mut manifests = crate::ToolManifestDictionary::default();
-        let (thread_id, errors, partial_tail, _) =
+        let (thread_id, errors, partial_tail, unresolved_payloads) =
             Self::for_each_rollout_item_with_integrity(&path, true, |item, _| {
                 if let RolloutItem::ToolManifest(manifest) = &item
                     && let Err(error) = manifests.apply(manifest)
@@ -1151,7 +1151,7 @@ impl RolloutRecorder {
                 "resume rollout belongs to a different thread",
             ));
         }
-        Self::append_reconstruction_notice(&mut items, errors, partial_tail);
+        Self::append_reconstruction_notice(&mut items, errors, partial_tail, unresolved_payloads);
         let recorder = Self::new_with_resume_state(
             config,
             RolloutRecorderParams::resume(path),
@@ -1489,7 +1489,7 @@ impl RolloutRecorder {
         path: &Path,
     ) -> std::io::Result<(Vec<RolloutItem>, Option<ThreadId>, usize)> {
         let mut items = Vec::new();
-        let (thread_id, parse_errors, trailing_partial_records, _) =
+        let (thread_id, parse_errors, trailing_partial_records, unresolved_payloads) =
             Self::for_each_rollout_item_with_integrity(path, false, |item, _| items.push(item))
                 .await?;
         tracing::debug!(
@@ -1498,7 +1498,12 @@ impl RolloutRecorder {
             thread_id,
             parse_errors,
         );
-        Self::append_reconstruction_notice(&mut items, parse_errors, trailing_partial_records);
+        Self::append_reconstruction_notice(
+            &mut items,
+            parse_errors,
+            trailing_partial_records,
+            unresolved_payloads,
+        );
         Ok((items, thread_id, parse_errors))
     }
 
@@ -1506,16 +1511,30 @@ impl RolloutRecorder {
         items: &mut Vec<RolloutItem>,
         parse_errors: usize,
         trailing_partial_records: usize,
+        unresolved_payloads: usize,
     ) {
         if parse_errors > 0 {
-            let malformed_records = parse_errors.saturating_sub(trailing_partial_records);
+            // A reference whose payload body is unreadable keeps its slot as a parse
+            // error, but restoring that body restores the record: it is not malformed.
+            let malformed_records = parse_errors
+                .saturating_sub(trailing_partial_records)
+                .saturating_sub(unresolved_payloads);
+            let (skipped, payload_integrity, payload_guidance) = if unresolved_payloads == 0 {
+                ("malformed", String::new(), "")
+            } else {
+                (
+                    "unreadable",
+                    format!(", unresolved_payload_artifacts={unresolved_payloads}"),
+                    " Unresolved payload artifacts are record bodies under rollout-payloads/ that are missing or failed verification; restoring those exact files restores the records.",
+                )
+            };
             items.push(RolloutItem::ResponseItem(
                 codex_protocol::models::ResponseItem::Message {
                     id: Some(codex_protocol::ResponseItemId::new(RECONSTRUCTION_NOTICE_ID_BASE)),
                     role: "developer".to_string(),
                     content: vec![codex_protocol::models::ContentItem::InputText {
                         text: format!(
-                            "<rollout_reconstruction_gap>\nHistory is incomplete: {parse_errors} malformed rollout records were skipped. Integrity: malformed_records={malformed_records}, trailing_partial_records={trailing_partial_records}, complete=false. A trailing partial record indicates an interrupted append; other gaps may omit interior tool results or rollback markers. Missing records may include user constraints, context, rollback markers, or tool results. Do not treat this reconstruction as complete evidence or assume external effects were undone; reconcile affected work before relying on it.\n</rollout_reconstruction_gap>"
+                            "<rollout_reconstruction_gap>\nHistory is incomplete: {parse_errors} {skipped} rollout records were skipped. Integrity: malformed_records={malformed_records}, trailing_partial_records={trailing_partial_records}{payload_integrity}, complete=false.{payload_guidance} A trailing partial record indicates an interrupted append; other gaps may omit interior tool results or rollback markers. Missing records may include user constraints, context, rollback markers, or tool results. Do not treat this reconstruction as complete evidence or assume external effects were undone; reconcile affected work before relying on it.\n</rollout_reconstruction_gap>"
                         ),
                     }],
                     phase: None,

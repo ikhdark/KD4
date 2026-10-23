@@ -798,3 +798,17 @@ fn usage_limit_reached_with_promo_message() {
         assert_eq!(err.to_string(), expected);
     });
 }
+
+#[test]
+fn exhausted_429_keeps_too_many_failed_attempts_info() {
+    assert_eq!(
+        unexpected_response(StatusCode::TOO_MANY_REQUESTS).to_codex_protocol_error(),
+        CodexErrorInfo::ResponseTooManyFailedAttempts {
+            http_status_code: Some(429)
+        }
+    );
+    assert_eq!(
+        unexpected_response(StatusCode::BAD_GATEWAY).to_codex_protocol_error(),
+        CodexErrorInfo::Other
+    );
+}

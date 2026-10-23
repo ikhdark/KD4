@@ -320,6 +320,7 @@ async fn immutable_catalog_reuse_preserves_revision_identity_and_short_cell_resu
             kind: CodeModeToolKind::Function,
             input_schema: None,
             output_schema: None,
+            namespace_description: None,
             default_timeout_ms: None,
         })
         .collect();

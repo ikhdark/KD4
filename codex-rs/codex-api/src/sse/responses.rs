@@ -1068,6 +1068,38 @@ mod tests {
         );
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn duplicate_summary_done_does_not_renew_sse_progress_deadline() {
+        for text in ["", "thinking"] {
+            let chunks = stream::iter(0..9).then(move |index| async move {
+                tokio::time::sleep(Duration::from_millis(30)).await;
+                let event = if index == 0 {
+                    json!({"type":"response.output_item.added","item":{"type":"reasoning","id":"r","summary":[]}})
+                } else {
+                    json!({"type":"response.reasoning_summary_text.done","item_id":"r","summary_index":0,"text":text})
+                };
+                Ok::<_, TransportError>(Bytes::from(format!("data: {event}\n\n")))
+            });
+            let (tx, mut rx) = response_event_channel(32);
+            let started = Instant::now();
+            process_sse(Box::pin(chunks), tx, Duration::from_millis(80), None).await;
+            // Added at 30ms, first finality at 60ms: duplicates must not
+            // extend that genuine progress's 140ms deadline.
+            assert_eq!(started.elapsed(), Duration::from_millis(140));
+            let mut finalities = 0;
+            let mut timed_out = false;
+            while let Some(event) = rx.recv().await {
+                match event {
+                    Ok(ResponseEvent::ReasoningSummaryDone { .. }) => finalities += 1,
+                    Err(ApiError::Stream(message)) => timed_out = message.contains("timeout"),
+                    _ => {}
+                }
+            }
+            assert_eq!(finalities, 1);
+            assert!(timed_out);
+        }
+    }
+
     #[tokio::test]
     async fn error_when_missing_completed() {
         let item1 = json!({

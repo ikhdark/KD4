@@ -129,6 +129,7 @@ pub struct TurnProfileFact {
 #[serde(rename_all = "snake_case")]
 pub enum TurnDeliveryStatus {
     NotTargeted,
+    Filtered,
     Success,
     Failure,
     Timeout,
@@ -141,6 +142,7 @@ pub struct TurnDeliveryFact {
     pub turn_id: String,
     pub target_count: u32,
     pub success_count: u32,
+    pub filtered_count: u32,
     pub failure_count: u32,
     pub timeout_count: u32,
     pub shutdown_cancelled_count: u32,
@@ -229,7 +231,7 @@ impl From<&CodexErr> for CodexErrKind {
     fn from(error: &CodexErr) -> Self {
         match error {
             CodexErr::TurnAborted => CodexErrKind::TurnAborted,
-            CodexErr::Stream(..) => CodexErrKind::Stream,
+            CodexErr::Stream(..) | CodexErr::WebsocketRejected { .. } => CodexErrKind::Stream,
             CodexErr::IncompleteResponse(_) => CodexErrKind::IncompleteResponse,
             CodexErr::TerminalResponse { source, .. } => Self::from(source.as_ref()),
             CodexErr::ProviderFailure { .. } => CodexErrKind::ProviderFailure,

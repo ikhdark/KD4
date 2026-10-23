@@ -577,6 +577,9 @@ enum FailureMode {
     Fatal,
     ReturnedError,
     EmittedError,
+    /// The worker observes a cancellation that no terminal owner sent it and
+    /// returns `TurnAborted` itself.
+    ReturnedTurnAborted,
 }
 
 struct FailureOnReleaseTask(CancellationToken, FailureMode);
@@ -605,6 +608,9 @@ impl SessionTask for FailureOnReleaseTask {
                 FailureMode::Fatal => Err(codex_protocol::error::CodexErr::Fatal(message)),
                 FailureMode::ReturnedError => {
                     Err(codex_protocol::error::CodexErr::InvalidRequest(message))
+                }
+                FailureMode::ReturnedTurnAborted => {
+                    Err(codex_protocol::error::CodexErr::TurnAborted)
                 }
                 FailureMode::EmittedError => {
                     session
@@ -1575,7 +1581,7 @@ async fn concurrent_start_task_calls_install_exactly_one_worker() {
 #[tokio::test]
 async fn shutdown_abort_retains_checkpoint_and_plan_without_claiming_user_interrupt() {
     for shutdown in [false, true] {
-        let (session, mut turn, _events) = make_session_and_context_with_rx().await;
+        let (session, mut turn, events) = make_session_and_context_with_rx().await;
         Arc::make_mut(
             &mut Arc::get_mut(&mut turn)
                 .expect("unshared turn fixture")
@@ -1640,6 +1646,66 @@ async fn shutdown_abort_retains_checkpoint_and_plan_without_claiming_user_interr
             assert!(marker.contains("interrupted"));
             assert!(!marker.contains("session was shutting down"));
         }
+        // The recorded reason, not only the marker text, must separate a
+        // shutdown from a user interruption, and cancelled nested tools must
+        // report the same cause instead of "aborted by user".
+        let expected = if shutdown {
+            TurnAbortReason::SessionShutdown
+        } else {
+            TurnAbortReason::Interrupted
+        };
+        let aborted = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let EventMsg::TurnAborted(aborted) = events.recv().await.unwrap().msg {
+                    break aborted;
+                }
+            }
+        })
+        .await
+        .expect("abort publishes a terminal event");
+        assert_eq!(aborted.reason, expected);
+        assert_eq!(
+            turn.cancellation_cause.get(),
+            Some(&codex_code_mode::CancellationCause::TurnAborted { reason: expected })
+        );
+    }
+}
+
+#[tokio::test]
+async fn worker_observed_cancellation_during_shutdown_is_not_reported_as_user_interrupt() {
+    for shutdown in [false, true] {
+        let (session, turn, events) = make_session_and_context_with_rx().await;
+        let release = CancellationToken::new();
+        session
+            .start_task(
+                Arc::clone(&turn),
+                Vec::new(),
+                FailureOnReleaseTask(release.clone(), FailureMode::ReturnedTurnAborted),
+            )
+            .await;
+        if shutdown {
+            session.begin_shutdown().await;
+        }
+        // The worker returns before any abort claims the terminal, as when
+        // shutdown cancels startup work that a first turn is waiting on.
+        release.cancel();
+        let aborted = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let EventMsg::TurnAborted(aborted) = events.recv().await.unwrap().msg {
+                    break aborted;
+                }
+            }
+        })
+        .await
+        .expect("worker-returned abort publishes a terminal event");
+        assert_eq!(
+            aborted.reason,
+            if shutdown {
+                TurnAbortReason::SessionShutdown
+            } else {
+                TurnAbortReason::Interrupted
+            }
+        );
     }
 }
 

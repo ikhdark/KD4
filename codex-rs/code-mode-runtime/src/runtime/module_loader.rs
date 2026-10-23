@@ -75,6 +75,13 @@ pub(super) fn resolve_tool_response(
         state.pending_tool_calls.remove(id)
     }
     .ok_or_else(|| format!("unknown tool call `{id}`"))?;
+    tracing::info!(
+        event.name = "codex.code_mode_nested_tool.runtime_receipt",
+        runtime_tool_call_id = %id,
+        tool_name = %tool_name,
+        transport_success = response.is_ok(),
+        "runtime received nested result before resolving JavaScript promise"
+    );
 
     let tc = std::pin::pin!(v8::TryCatch::new(scope));
     let mut tc = tc.init();
@@ -109,6 +116,12 @@ pub(super) fn resolve_tool_response(
             .map(|exception| value_to_error_text(&mut tc, exception))
             .unwrap_or_else(|| "unknown code mode exception".to_string()));
     }
+    tracing::info!(
+        event.name = "codex.code_mode_nested_tool.promise_settled",
+        runtime_tool_call_id = %id,
+        tool_name = %tool_name,
+        "nested result promise settled; JavaScript continuation has not yet run"
+    );
     Ok(())
 }
 

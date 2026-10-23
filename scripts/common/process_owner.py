@@ -201,19 +201,24 @@ class WindowsJob:
 
 
 @contextlib.contextmanager
-def owned_process(args, *, preserve_descendants_on_success=False, **kwargs):
+def owned_process(args, *, preserve_descendants_on_success=False, on_spawn=None, on_spawn_error=None, **kwargs):
     job = WindowsJob() if os.name == "nt" else None
     process = None
     preserve = False
     try:
         kwargs.pop("start_new_session", None)
         flags = kwargs.pop("creationflags", 0)
-        process = subprocess.Popen(
-            args,
-            start_new_session=os.name != "nt",
-            creationflags=(flags | 0x4 | subprocess.CREATE_NO_WINDOW) if job else flags,
-            **kwargs,
-        )
+        try:
+            process = subprocess.Popen(
+                args,
+                start_new_session=os.name != "nt",
+                creationflags=(flags | 0x4 | subprocess.CREATE_NO_WINDOW) if job else flags,
+                **kwargs,
+            )
+        except OSError:
+            if on_spawn_error is not None:
+                on_spawn_error()
+            raise
         if job:
             try:
                 job.assign_and_resume(process)
@@ -222,6 +227,10 @@ def owned_process(args, *, preserve_descendants_on_success=False, **kwargs):
                 process.wait(timeout=5)
                 raise
             process._codex_owned_job = job
+        # Callback errors still pass through process-tree cleanup. A failed Job
+        # assignment has no no-start receipt: possible creation remains spent.
+        if on_spawn is not None:
+            on_spawn(process)
         yield process
         # Git may start a persistent FSMonitor daemon. Only an explicitly opted-in,
         # successful command may leave descendants; exceptions still clean up.

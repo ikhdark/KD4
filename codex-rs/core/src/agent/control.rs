@@ -69,6 +69,7 @@ pub(crate) struct AgentJobBinding {
     pub(crate) state_db: Arc<codex_state::StateRuntime>,
     pub(crate) job_id: String,
     pub(crate) item_id: String,
+    pub(crate) runtime_timeout: Option<tokio::time::Duration>,
 }
 
 impl std::fmt::Debug for AgentJobBinding {
@@ -96,6 +97,7 @@ pub(crate) struct LiveAgent {
     pub(crate) thread_id: ThreadId,
     pub(crate) metadata: AgentMetadata,
     pub(crate) status: AgentStatus,
+    pub(crate) execution_started_at: tokio::time::Instant,
 }
 
 /// Model usage for one thread, separated by token class.
@@ -509,6 +511,18 @@ impl AgentControl {
             .unwrap_or_else(std::sync::PoisonError::into_inner) = barrier;
     }
 
+    #[cfg(test)]
+    pub(crate) fn set_before_spawn_rollback_barrier(
+        &self,
+        barrier: Option<Arc<AgentControlTestBarrier>>,
+    ) {
+        *self
+            .test_hooks
+            .before_spawn_rollback
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = barrier;
+    }
+
     /// Registers an already-running thread as one of this tree's agents, as a
     /// committed spawn would, without starting a turn on it.
     #[cfg(test)]
@@ -762,6 +776,21 @@ impl AgentControl {
         }
     }
 
+    /// Unlike get_status, durable Active state never proves a loaded producer.
+    pub(crate) async fn has_running_agent(&self, agent_id: ThreadId) -> bool {
+        let Ok(state) = self.upgrade() else {
+            return false;
+        };
+        let Ok(thread) = state.get_thread(agent_id).await else {
+            return false;
+        };
+        thread.is_running()
+            && matches!(
+                thread.agent_status().await,
+                AgentStatus::PendingInit | AgentStatus::Running
+            )
+    }
+
     pub(crate) fn register_session_root(
         &self,
         current_thread_id: ThreadId,
@@ -976,13 +1005,24 @@ impl AgentControl {
                         "repeated cold agent edge to {child}"
                     )));
                 }
-                let stored = state
+                let stored = match state
                     .read_stored_thread(ReadThreadParams {
                         thread_id: child,
                         include_archived: false,
                         include_history: false,
                     })
-                    .await?;
+                    .await
+                {
+                    Ok(stored) => stored,
+                    Err(CodexErr::ThreadNotFound(_)) => {
+                        // Keep the graph edge and obligation; do not resurrect an
+                        // archived worker or block healthy sibling restoration.
+                        self.task_coordinator().record_unavailable_descendant(child, true);
+                        continue;
+                    }
+                    Err(error) => return Err(error),
+                };
+                self.task_coordinator().record_unavailable_descendant(child, false);
                 let path = stored.source.get_agent_path().ok_or_else(|| {
                     CodexErr::InvalidRequest(format!(
                         "retained agent {child} has no canonical path"
@@ -1060,7 +1100,19 @@ impl AgentControl {
         let current = coordinator
             .get_agent_task_authorization(binding.assignment_id)
             .await
-            .map_err(|error| CodexErr::Fatal(error.to_string()))?;
+            .map_err(|error| {
+                if matches!(&error, codex_agent_task_store::StoreError::Json(_)
+                    | codex_agent_task_store::StoreError::CorruptData(_)
+                    | codex_agent_task_store::StoreError::Io(_)
+                    | codex_agent_task_store::StoreError::AssignmentNotFound(_)
+                    | codex_agent_task_store::StoreError::AttemptNotFound(_))
+                {
+                    tracing::warn!(assignment_id = %binding.assignment_id, %error, "retained task identity is unavailable");
+                    CodexErr::UnsupportedOperation(format!("assignment {} is unavailable; its obligation remains unresolved", binding.assignment_id))
+                } else {
+                    CodexErr::Fatal(error.to_string())
+                }
+            })?;
         if current.current_attempt.attempt_id != binding.attempt_id {
             return Err(CodexErr::ThreadNotFound(thread_id));
         }

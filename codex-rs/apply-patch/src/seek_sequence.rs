@@ -36,90 +36,164 @@ pub(crate) fn seek_sequence(
     }
     let search_start = if eof { last_start } else { start };
 
-    // ------------------------------------------------------------------
-    // Final, most permissive pass – attempt to match after *normalising*
-    // common Unicode punctuation to their ASCII equivalents so that diffs
-    // authored with plain ASCII characters can still be applied to source
-    // files that contain typographic dashes / quotes, etc.
-    // ------------------------------------------------------------------
-
-    fn normalise(s: &str) -> impl Iterator<Item = char> + '_ {
-        s.trim().chars().map(|c| match c {
-            // Various dash / hyphen code-points → ASCII '-'
-            '\u{2010}' | '\u{2011}' | '\u{2012}' | '\u{2013}' | '\u{2014}' | '\u{2015}'
-            | '\u{2212}' => '-',
-            // Fancy single quotes → '\''
-            '\u{2018}' | '\u{2019}' | '\u{201A}' | '\u{201B}' => '\'',
-            // Fancy double quotes → '"'
-            '\u{201C}' | '\u{201D}' | '\u{201E}' | '\u{201F}' => '"',
-            // Non-breaking space and other odd spaces → normal space
-            '\u{00A0}' | '\u{2002}' | '\u{2003}' | '\u{2004}' | '\u{2005}' | '\u{2006}'
-            | '\u{2007}' | '\u{2008}' | '\u{2009}' | '\u{200A}' | '\u{202F}' | '\u{205F}'
-            | '\u{3000}' => ' ',
-            other => other,
-        })
-    }
-
-    type NormalizeLine = fn(&str) -> &str;
-    let tiers: [(&str, NormalizeLine); 4] = [
-        ("exact", |line| line),
-        ("trailing-whitespace", str::trim_end),
-        ("whitespace", str::trim),
-        ("Unicode-normalized", str::trim),
-    ];
-    for (strictness, prepare) in tiers {
-        // Borrow trimmed views once per tier instead of trimming each line pair
-        // again for every overlapping candidate. Keep the exact pass allocation-free.
-        let prepared = matches!(strictness, "trailing-whitespace" | "whitespace").then(|| {
-            (
-                lines[search_start..]
-                    .iter()
-                    .map(|line| prepare(line))
-                    .collect::<Vec<_>>(),
-                pattern.iter().map(|line| prepare(line)).collect::<Vec<_>>(),
-            )
-        });
-        let normalized_pattern = (strictness == "Unicode-normalized").then(|| {
-            pattern
-                .iter()
-                .map(|line| normalise(line).collect::<Vec<_>>())
-                .collect::<Vec<_>>()
-        });
-        let mut found = None;
-        for index in search_start..=last_start {
-            if lines[index..index + pattern.len()]
-                .iter()
-                .zip(pattern)
-                .enumerate()
-                .all(|(offset, (line, pattern))| match &normalized_pattern {
-                    Some(normalized) => normalise(line).eq(normalized[offset].iter().copied()),
-                    None => match &prepared {
-                        Some((lines, pattern)) => {
-                            lines[index - search_start + offset] == pattern[offset]
-                        }
-                        None => line == pattern,
-                    },
-                })
-            {
-                if let Some(first) = found {
-                    return Err(AmbiguousMatch {
-                        first_line: first + 1,
-                        second_line: index + 1,
-                        strictness,
-                    });
-                }
-                if anchored {
-                    return Ok(Some(index));
-                }
-                found = Some(index);
+    for strictness in TIERS {
+        let limit = if anchored { 1 } else { 2 };
+        match tier_matches(lines, pattern, search_start, last_start, strictness, limit).as_slice() {
+            [] => {}
+            [only] => return Ok(Some(*only)),
+            [first, second, ..] => {
+                return Err(AmbiguousMatch {
+                    first_line: first + 1,
+                    second_line: second + 1,
+                    strictness,
+                });
             }
-        }
-        if found.is_some() {
-            return Ok(found);
         }
     }
 
     Ok(None)
+}
+
+/// Zero-based starts of up to `limit` matches, in file order, at the tier that
+/// `seek_sequence` reported as ambiguous for the same arguments.
+pub(crate) fn ambiguous_candidates(
+    lines: &[String],
+    pattern: &[String],
+    start: usize,
+    eof: bool,
+    ambiguity: &AmbiguousMatch,
+    limit: usize,
+) -> Vec<usize> {
+    let Some(last_start) = lines.len().checked_sub(pattern.len()) else {
+        return Vec::new();
+    };
+    if pattern.is_empty() || start > last_start {
+        return Vec::new();
+    }
+    let search_start = if eof { last_start } else { start };
+    tier_matches(
+        lines,
+        pattern,
+        search_start,
+        last_start,
+        ambiguity.strictness,
+        limit,
+    )
+}
+
+/// Zero-based starts of up to `limit` matches anywhere in `lines` at the most
+/// permissive tier. Every stricter tier matches a subset of these starts, so a
+/// single start leaves no tier or search start able to select another site.
+pub(crate) fn candidate_starts_at_any_tier(
+    lines: &[String],
+    pattern: &[String],
+    limit: usize,
+) -> Vec<usize> {
+    match lines.len().checked_sub(pattern.len()) {
+        Some(last_start) if !pattern.is_empty() => {
+            tier_matches(lines, pattern, 0, last_start, TIERS[TIERS.len() - 1], limit)
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// Matching tiers in decreasing strictness: exact match, then ignoring trailing
+/// whitespace, then ignoring leading and trailing whitespace, then normalizing
+/// Unicode punctuation and whitespace.
+const TIERS: [&str; 4] = [
+    "exact",
+    "trailing-whitespace",
+    "whitespace",
+    "Unicode-normalized",
+];
+
+// ------------------------------------------------------------------
+// Final, most permissive pass – attempt to match after *normalising*
+// common Unicode punctuation to their ASCII equivalents so that diffs
+// authored with plain ASCII characters can still be applied to source
+// files that contain typographic dashes / quotes, etc.
+// ------------------------------------------------------------------
+fn normalise(s: &str) -> impl Iterator<Item = char> + '_ {
+    s.trim().chars().map(|c| match c {
+        // Various dash / hyphen code-points → ASCII '-'
+        '\u{2010}' | '\u{2011}' | '\u{2012}' | '\u{2013}' | '\u{2014}' | '\u{2015}'
+        | '\u{2212}' => '-',
+        // Fancy single quotes → '\''
+        '\u{2018}' | '\u{2019}' | '\u{201A}' | '\u{201B}' => '\'',
+        // Fancy double quotes → '"'
+        '\u{201C}' | '\u{201D}' | '\u{201E}' | '\u{201F}' => '"',
+        // Non-breaking space and other odd spaces → normal space
+        '\u{00A0}' | '\u{2002}' | '\u{2003}' | '\u{2004}' | '\u{2005}' | '\u{2006}'
+        | '\u{2007}' | '\u{2008}' | '\u{2009}' | '\u{200A}' | '\u{202F}' | '\u{205F}'
+        | '\u{3000}' => ' ',
+        other => other,
+    })
+}
+
+/// Zero-based starts in `search_start..=last_start` where `pattern` matches at
+/// one tier, stopping after `limit` matches.
+fn tier_matches(
+    lines: &[String],
+    pattern: &[String],
+    search_start: usize,
+    last_start: usize,
+    strictness: &str,
+    limit: usize,
+) -> Vec<usize> {
+    let mut found = Vec::new();
+    let mut record = |index| {
+        found.push(index);
+        found.len() >= limit.max(1)
+    };
+    match strictness {
+        "trailing-whitespace" | "whitespace" => {
+            // Borrow trimmed views once per tier instead of trimming each line
+            // pair again for every overlapping candidate.
+            let prepare: fn(&str) -> &str = if strictness == "whitespace" {
+                str::trim
+            } else {
+                str::trim_end
+            };
+            let prepared_lines = lines[search_start..]
+                .iter()
+                .map(|line| prepare(line))
+                .collect::<Vec<_>>();
+            let prepared_pattern = pattern.iter().map(|line| prepare(line)).collect::<Vec<_>>();
+            for index in search_start..=last_start {
+                let offset = index - search_start;
+                if prepared_lines[offset..offset + pattern.len()] == prepared_pattern[..]
+                    && record(index)
+                {
+                    break;
+                }
+            }
+        }
+        "Unicode-normalized" => {
+            let normalized_pattern = pattern
+                .iter()
+                .map(|line| normalise(line).collect::<Vec<_>>())
+                .collect::<Vec<_>>();
+            for index in search_start..=last_start {
+                if lines[index..index + pattern.len()]
+                    .iter()
+                    .zip(&normalized_pattern)
+                    .all(|(line, normalized)| normalise(line).eq(normalized.iter().copied()))
+                    && record(index)
+                {
+                    break;
+                }
+            }
+        }
+        // Keep the exact pass allocation-free.
+        _ => {
+            for index in search_start..=last_start {
+                if lines[index..index + pattern.len()] == *pattern && record(index) {
+                    break;
+                }
+            }
+        }
+    }
+    found
 }
 
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]
@@ -129,12 +203,13 @@ pub(crate) fn seek_sequence(
 pub(crate) struct AmbiguousMatch {
     pub(crate) first_line: usize,
     pub(crate) second_line: usize,
-    strictness: &'static str,
+    pub(crate) strictness: &'static str,
 }
 
 #[cfg(test)]
 mod tests {
     use super::AmbiguousMatch;
+    use super::ambiguous_candidates;
     use super::seek_sequence;
     use std::string::ToString;
 
@@ -183,6 +258,36 @@ mod tests {
                 Ok(Some(3))
             );
         }
+    }
+
+    #[test]
+    fn ambiguous_candidates_list_every_match_at_the_reported_tier() {
+        // Three whitespace-tier matches and one exact match: the exact match
+        // wins, so only the whitespace tier is ambiguous when it is absent.
+        let lines = to_vec(&["  old", "x", " old", "y", "\told", "old"]);
+        let pattern = to_vec(&["old"]);
+        assert_eq!(seek_sequence(&lines, &pattern, 0, false, false), Ok(Some(5)));
+        let ambiguity = seek_sequence(&lines[..5], &pattern, 0, false, false).unwrap_err();
+        assert_eq!(
+            ambiguity,
+            AmbiguousMatch {
+                first_line: 1,
+                second_line: 3,
+                strictness: "whitespace",
+            }
+        );
+        assert_eq!(
+            ambiguous_candidates(&lines[..5], &pattern, 0, false, &ambiguity, 8),
+            vec![0, 2, 4]
+        );
+        assert_eq!(
+            ambiguous_candidates(&lines[..5], &pattern, 1, false, &ambiguity, 8),
+            vec![2, 4]
+        );
+        assert_eq!(
+            ambiguous_candidates(&lines[..5], &pattern, 0, false, &ambiguity, 2),
+            vec![0, 2]
+        );
     }
 
     #[test]

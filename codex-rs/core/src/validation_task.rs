@@ -15,22 +15,27 @@ use std::path::Path;
 pub(crate) const METADATA_KEY: &str = "codex.validation_task.v1";
 
 #[derive(Default)]
-struct AdmissionRefusals(std::sync::Mutex<std::collections::HashSet<String>>);
+struct AdmissionRefusals(std::sync::Mutex<HashMap<String, bool>>);
 
-pub(crate) fn record_admission_refusal(ctx: &ToolCtx) {
+/// `validation_proof` is the launch owner's repository-runner-aware proof
+/// capability. Settlement cannot recover it: call-argument classification has
+/// no runner manifest, so a refused `just`/runner validation would otherwise
+/// vanish. `false` defers to that call-argument classification.
+pub(crate) fn record_admission_refusal(ctx: &ToolCtx, validation_proof: bool) {
     ctx.turn
         .extension_data
         .get_or_init(AdmissionRefusals::default)
         .0
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .insert(ctx.call_id.clone());
+        .insert(ctx.call_id.clone(), validation_proof);
 }
 
-pub(crate) fn take_admission_refusal(turn: &TurnContext, call: &str) -> bool {
+/// `Some(validation_proof)` when this call was refused before launch.
+pub(crate) fn take_admission_refusal(turn: &TurnContext, call: &str) -> Option<bool> {
     turn.extension_data
         .get::<AdmissionRefusals>()
-        .is_some_and(|refusals| {
+        .and_then(|refusals| {
             refusals
                 .0
                 .lock()
@@ -87,23 +92,59 @@ pub(crate) async fn accept_metadata(
         .map_err(|error| error.to_string())
 }
 
+/// The owner's acknowledgement channel for one local full-suite launch.
+pub(crate) struct FullSuiteDispatch {
+    path: std::path::PathBuf,
+    attempt: String,
+}
+
+impl FullSuiteDispatch {
+    /// Only for a launch whose process creation definitely failed: no child
+    /// exists to own this record, so the next reservation may refund the
+    /// attempt. First write wins; an existing record is never replaced.
+    pub(crate) async fn acknowledge_not_spawned(self) {
+        use tokio::io::AsyncWriteExt as _;
+
+        let record = serde_json::json!({
+            "version": 1,
+            "attempt": self.attempt,
+            "status": "not_started",
+        })
+        .to_string();
+        let Ok(mut file) = tokio::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&self.path)
+            .await
+        else {
+            return;
+        };
+        // A partial record does not parse, so a failed write stays spent.
+        if file.write_all(record.as_bytes()).await.is_ok() {
+            let _ = file.sync_all().await;
+        }
+    }
+}
+
 /// Called only after owner preflight/admission and immediately before possible
 /// spawn. No Rust lock is held across storage; a lost/uncertain commit fails closed.
+/// Returns the local acknowledgement channel when this call started a reserved suite.
 pub(crate) async fn begin_dispatch(
     ctx: &ToolCtx,
     env: &mut HashMap<String, String>,
     local: bool,
-) -> Result<(), String> {
+) -> Result<Option<FullSuiteDispatch>, String> {
     let owner = reservation_owner(&ctx.session, &ctx.turn, &ctx.call_id);
     let budget = &ctx.turn.full_suite_budget;
     if budget.started_for(&owner) {
         return Err("full-suite launch blocked: this tool call already crossed the possible-start boundary; sandbox retries cannot create another suite".into());
     }
     if !budget.reserved_for(&owner) {
-        return Ok(());
+        return Ok(None);
     }
     let Some((task, grant)) = budget.task_scope() else {
-        return budget.start(&owner, None); // isolated, nonpersistent test contexts
+        // isolated, nonpersistent test contexts
+        return budget.start(&owner, None).map(|()| None);
     };
     let store = ctx
         .session
@@ -151,12 +192,47 @@ pub(crate) async fn begin_dispatch(
     }
     budget.start(&owner, local.then(|| (path.to_path_buf(), attempt.clone())))?;
     // Remote/opaque starts stay spent when their dispatch cannot be observed.
-    if local {
-        env.insert(
-            "CODEX_FULL_SUITE_ACK_PATH".into(),
-            path.to_string_lossy().into_owned(),
-        );
-        env.insert("CODEX_FULL_SUITE_ATTEMPT".into(), attempt);
+    if !local {
+        return Ok(None);
     }
-    Ok(())
+    env.insert(
+        "CODEX_FULL_SUITE_ACK_PATH".into(),
+        path.to_string_lossy().into_owned(),
+    );
+    env.insert("CODEX_FULL_SUITE_ATTEMPT".into(), attempt.clone());
+    Ok(Some(FullSuiteDispatch { path: path.to_path_buf(), attempt }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn unspawned_dispatch_acknowledges_nonexecution_without_replacing_owner_records() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("attempt.json");
+        FullSuiteDispatch {
+            path: path.clone(),
+            attempt: "nonce".into(),
+        }
+        .acknowledge_not_spawned()
+        .await;
+        assert!(owned_suite_nonexecution(&path, "nonce"));
+        assert!(!owned_suite_nonexecution(&path, "other"));
+
+        // A child that reached its dispatch boundary first keeps the suite spent.
+        let started = root.path().join("started.json");
+        std::fs::write(
+            &started,
+            r#"{"version":1,"attempt":"nonce","status":"started"}"#,
+        )
+        .unwrap();
+        FullSuiteDispatch {
+            path: started.clone(),
+            attempt: "nonce".into(),
+        }
+        .acknowledge_not_spawned()
+        .await;
+        assert!(!owned_suite_nonexecution(&started, "nonce"));
+    }
 }

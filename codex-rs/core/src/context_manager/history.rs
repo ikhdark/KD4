@@ -663,12 +663,15 @@ impl ContextManager {
                 keep
             });
         }
-        // A newly accepted plan is the projection boundary; continuations with
-        // no plan update retain the same projected prefix.
-        project_update_plan_history(Arc::make_mut(&mut self.items));
+        // Provider-held assistant calls and their outputs must remain verbatim
+        // until an explicit reset. Compact plan history only for reset prompts.
+        if stable_context_target != StableContextTarget::Sampling {
+            project_update_plan_history(Arc::make_mut(&mut self.items));
+        }
         self.normalize_history(input_modalities);
         let mut normalized_items = Arc::unwrap_or_clone(self.items);
         retire_expired_turn_advice(&mut normalized_items);
+        let mut filtering_receipts: Arc<[crate::stable_context::StableContextComponent]> = Arc::from([]);
         if stable_context_target == StableContextTarget::Sampling {
             // Remove identical reinjections before latest-wins retirement. If
             // retirement runs first, it deletes the original prefix item even
@@ -687,16 +690,19 @@ impl ContextManager {
                     && !crate::stable_context::is_trusted_stable_context_item(item)
             }) {
                 let tail = normalized_items.split_off(boundary + 1);
-                normalized_items = crate::stable_context::project_sampling_history_context(
+                let filtered = crate::stable_context::project_sampling_history_with_receipt(
                     normalized_items.into(),
                 );
+                filtering_receipts = Arc::from(filtered.manifest.components());
+                normalized_items = filtered.items.to_vec();
                 normalized_items.extend(tail);
             }
         }
         let normalized_items: Arc<[ResponseItem]> = normalized_items.into();
         // Keep context updates at their original positions. Hoisting the latest
         // value into an earlier message invalidates the cached session prefix.
-        let projection = project_stable_context(normalized_items, StableContextTarget::FailOpen);
+        let mut projection = project_stable_context(normalized_items, StableContextTarget::FailOpen);
+        projection.manifest = projection.manifest.with_filtering_receipts(filtering_receipts);
         debug_assert_eq!(projection.items, projection.fallback_items);
         let items = projection.items;
         let prompt_provenance =
@@ -791,6 +797,28 @@ impl ContextManager {
             self.prepare_for_prompt_target(input_modalities, StableContextTarget::FailOpen);
         tool_history
             .project_workspace_freshness_with_cache(
+                prepared.shared_items(),
+                workspace_identity,
+                git_workspace,
+            )
+            .items
+    }
+
+    /// Local summarizer input with phase-checkpoint pins applied, as sampling
+    /// and the compaction trigger measured it. Only for an exact input that
+    /// cannot fit the model window: retired outputs stay exactly recoverable
+    /// through their pins and the compaction source archive.
+    pub(crate) fn for_local_compaction_prompt_with_checkpoint_pins(
+        self,
+        input_modalities: &[InputModality],
+        workspace_identity: Option<&WorkspaceEvidenceIdentity>,
+        git_workspace: &crate::git_workspace::GitWorkspaceCache,
+    ) -> Arc<[ResponseItem]> {
+        let tool_history = Arc::clone(&self.tool_history);
+        let prepared =
+            self.prepare_for_prompt_target(input_modalities, StableContextTarget::FailOpen);
+        tool_history
+            .project_sampling_with_workspace_cache(
                 prepared.shared_items(),
                 workspace_identity,
                 git_workspace,
@@ -924,6 +952,10 @@ impl ContextManager {
 
     pub(crate) fn tool_history_state(&self) -> ToolHistoryState {
         (*self.tool_history).clone()
+    }
+
+    pub(crate) fn tool_history_state_ref(&self) -> &ToolHistoryState {
+        &self.tool_history
     }
 
     pub(crate) fn read_status_page(
@@ -2468,7 +2500,7 @@ fn estimate_original_image_bytes(image_url: &str) -> Option<i64> {
     })
 }
 
-fn estimate_image_bytes(image_url: &str, detail: Option<ImageDetail>) -> i64 {
+pub(crate) fn estimate_image_bytes(image_url: &str, detail: Option<ImageDetail>) -> i64 {
     match detail {
         Some(ImageDetail::Original) => {
             estimate_original_image_bytes(image_url).unwrap_or(RESIZED_IMAGE_BYTES_ESTIMATE)

@@ -133,6 +133,11 @@ impl TokenCountEstimate {
         Self { bytes: text.len() }
     }
 
+    /// Price an already counted serialized fragment without allocating its bytes.
+    pub fn from_byte_count(bytes: usize) -> Self {
+        Self { bytes }
+    }
+
     pub fn tokens(self) -> usize {
         token_byte_estimate(self.bytes)
     }

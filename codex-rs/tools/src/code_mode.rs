@@ -3,7 +3,6 @@ use crate::ToolName;
 use crate::ToolSpec;
 use codex_code_mode::CodeModeToolKind;
 use codex_code_mode::ToolDefinition as CodeModeToolDefinition;
-use sha2::Digest;
 
 const CODE_MODE_TOOL_SEARCH_RESULT_GUIDANCE: &str = "In code mode, this returns a structured result. Inspect `status` before using `tools`: `completed` is complete, `incomplete` reports an exact `omitted_result_count` when known, and `aborted` has `omitted_result_count: null`. A null count means the lower layer did not provide an exact count. `activated_omitted_tools` lists callable names activated without a returned schema; use `resolve_tool(name)` rather than repeating the search. A returned namespace tool is callable as `resolve_tool(\"<namespace>.<name>\")`.";
 
@@ -93,6 +92,7 @@ pub fn augment_tool_spec_for_code_mode(spec: ToolSpec) -> ToolSpec {
                             description: tool.description.clone().into(),
                             kind: CodeModeToolKind::Function,
                             input_schema: serde_json::to_value(&tool.parameters).ok(),
+                            namespace_description: None,
                             default_timeout_ms: None,
                             output_schema: tool
                                 .output_schema
@@ -125,19 +125,7 @@ pub fn collect_code_mode_tool_definitions<'a>(
 ) -> Vec<CodeModeToolDefinition> {
     let mut tool_definitions = specs
         .into_iter()
-        .flat_map(|spec| {
-            let mut definitions = code_mode_tool_definitions_for_spec(spec);
-            if let ToolSpec::Namespace(namespace) = spec {
-                let namespace_description = namespace.description.trim();
-                if !namespace_description.is_empty() {
-                    for definition in &mut definitions {
-                        definition.description =
-                            format!("{namespace_description}\n\n{}", definition.description).into();
-                    }
-                }
-            }
-            definitions
-        })
+        .flat_map(code_mode_tool_definitions_for_spec)
         .filter(|definition| codex_code_mode::is_code_mode_nested_tool(&definition.name))
         .collect::<Vec<_>>();
     tool_definitions.sort_by(|left, right| {
@@ -176,6 +164,7 @@ fn code_mode_tool_definitions_for_spec(spec: &ToolSpec) -> Vec<CodeModeToolDefin
                 description: tool.description.clone().into(),
                 kind: CodeModeToolKind::Function,
                 input_schema: serde_json::to_value(&tool.parameters).ok(),
+                namespace_description: None,
                 default_timeout_ms: None,
                 output_schema: tool
                     .output_schema
@@ -192,6 +181,7 @@ fn code_mode_tool_definitions_for_spec(spec: &ToolSpec) -> Vec<CodeModeToolDefin
                 description: tool.description.clone().into(),
                 kind: CodeModeToolKind::Freeform,
                 input_schema: None,
+                namespace_description: None,
                 default_timeout_ms: None,
                 output_schema: None,
             }]
@@ -205,6 +195,8 @@ fn code_mode_tool_definitions_for_spec(spec: &ToolSpec) -> Vec<CodeModeToolDefin
                     name: code_mode_name_for_tool_name(&tool_name),
                     tool_name,
                     description: tool.description.clone().into(),
+                    namespace_description: (!namespace.description.trim().is_empty())
+                        .then(|| namespace.description.trim().into()),
                     kind: CodeModeToolKind::Function,
                     input_schema: serde_json::to_value(&tool.parameters).ok(),
                     default_timeout_ms: None,
@@ -229,6 +221,7 @@ fn code_mode_tool_definitions_for_spec(spec: &ToolSpec) -> Vec<CodeModeToolDefin
             .into(),
             kind: CodeModeToolKind::Function,
             input_schema: serde_json::to_value(parameters).ok(),
+            namespace_description: None,
             default_timeout_ms: None,
             output_schema: Some(code_mode_tool_search_output_schema()),
         }],
@@ -237,23 +230,7 @@ fn code_mode_tool_definitions_for_spec(spec: &ToolSpec) -> Vec<CodeModeToolDefin
 }
 
 pub fn code_mode_name_for_tool_name(tool_name: &ToolName) -> String {
-    let raw = match tool_name.namespace.as_deref() {
-        Some(namespace) => format!("{namespace}__{}", tool_name.name),
-        None => tool_name.name.clone(),
-    };
-    let normalized = codex_code_mode::normalize_code_mode_identifier(&raw);
-    if tool_name.namespace.is_none() && normalized == raw {
-        return raw;
-    }
-    #[expect(
-        clippy::expect_used,
-        reason = "ToolName derives Serialize over String and Option<String>; preserve its exact JSON bytes for dispatch identity"
-    )]
-    let identity = serde_json::to_vec(tool_name).expect("tool identity serializes");
-    format!(
-        "{normalized}__{}",
-        hex::encode(sha2::Sha256::digest(identity))
-    )
+    codex_code_mode::legacy_code_mode_identifier(tool_name)
 }
 
 #[cfg(test)]

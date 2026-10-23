@@ -137,6 +137,7 @@ fn runtime_metrics_summary_collects_tool_api_and_streaming_metrics() -> Result<(
         responses_api_engine_service_tbt_ms: 399,
         turn_ttft_ms: 95,
         turn_ttfm_ms: 180,
+        duration_sample_counts: [1, 1, 1, 1, 2, 1, 1, 1, 1, 1, 1, 1, 1],
         ..RuntimeMetricsSummary::default()
     };
     assert_eq!(summary, expected);
@@ -177,7 +178,8 @@ async fn wrapper_counts_include_abandonment_exactly_once() -> Result<()> {
         >()
     };
     drop(manager.log_request(1, pending));
-    assert!(manager.runtime_metrics_summary().is_none());
+    // The unpolled future did no work, but the runtime reader is available.
+    assert_eq!(manager.runtime_metrics_summary(), Some(RuntimeMetricsSummary::default()));
     let mut request = Box::pin(manager.log_request(1, pending));
     assert!(
         request

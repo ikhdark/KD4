@@ -2217,17 +2217,67 @@ fn resume_notice_bounds_handle_evidence_and_reports_omissions() {
         32
     );
     assert_eq!(evidence["omitted_handle_count"], 8);
-    for (id, handle) in evidence["recorded_process_handles"]
+    // The bound keeps the newest records, oldest first.
+    for (index, handle) in evidence["recorded_process_handles"]
         .as_array()
         .unwrap()
         .iter()
         .enumerate()
     {
+        let id = index + 8;
         assert_eq!(
             handle,
             &json!({"session_id": id, "raw_output_artifact_id": format!("output-{id}")})
         );
     }
+}
+
+#[test]
+fn resume_notice_bound_keeps_latest_observed_handles_not_lowest_ids() {
+    let evidence = |history: &[ResponseItem]| -> serde_json::Value {
+        let Some(ResponseItem::Message { content, .. }) = history.last() else {
+            panic!("missing notice")
+        };
+        let [ContentItem::InputText { text }] = content.as_slice() else {
+            panic!("missing text")
+        };
+        serde_json::from_str(text.lines().find(|line| line.starts_with('{')).unwrap()).unwrap()
+    };
+    let handle =
+        |id: u32| json!({"session_id": id, "raw_output_artifact_id": format!("output-{id}")});
+    // Production process IDs are random, so observation order is not ID order.
+    let ids = (0..40u32).map(|n| 1_000 + n * 37 % 40).collect::<Vec<_>>();
+    let mut rollout = ids
+        .iter()
+        .map(|id| native_command_record(*id, Some(&format!("output-{id}"))))
+        .collect::<Vec<_>>();
+    // A later record without an artifact renews recency and keeps the reference.
+    rollout.push(native_command_record(ids[0], None));
+    let mut history = Vec::new();
+    super::rollout_reconstruction::append_unified_exec_resume_invalidation_with_rollout(
+        &mut history,
+        &rollout,
+    );
+    let mut expected = ids[9..].iter().copied().map(handle).collect::<Vec<_>>();
+    expected.push(handle(ids[0]));
+    assert_eq!(
+        evidence(&history),
+        json!({"recorded_process_handles": expected, "omitted_handle_count": 8})
+    );
+
+    // Negative control: within the bound every handle survives in order.
+    let mut history = Vec::new();
+    super::rollout_reconstruction::append_unified_exec_resume_invalidation_with_rollout(
+        &mut history,
+        &rollout[..32],
+    );
+    assert_eq!(
+        evidence(&history),
+        json!({
+            "recorded_process_handles": ids[..32].iter().copied().map(handle).collect::<Vec<_>>(),
+            "omitted_handle_count": 0,
+        })
+    );
 }
 
 #[test]

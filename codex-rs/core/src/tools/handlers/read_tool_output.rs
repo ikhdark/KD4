@@ -7,6 +7,7 @@ use crate::tools::command_output_artifact::ToolOutputSelector;
 use crate::tools::command_output_artifact::ToolOutputSelectorResult;
 use crate::tools::command_output_artifact::ToolOutputSelectorStatus;
 use crate::tools::command_output_artifact::ToolOutputSnapshot;
+use crate::tools::command_output_artifact::find_other_thread_artifact_owner;
 use crate::tools::command_output_artifact::load_tool_output_snapshot;
 #[cfg(test)]
 use crate::tools::command_output_artifact::read_tool_output_selectors_with_ceiling_and_reuse;
@@ -577,6 +578,16 @@ impl RecoveryContinuationState {
             self.record_stop(ContinuationStopReason::Budget, Some(checkpoint.selector));
         }
         merge_adjacent_recovery_pages(&mut self.output.results);
+        if self.output.complete
+            && self.continuation_stop.as_ref().is_some_and(|stop| {
+                stop.reason == ContinuationStopReason::Budget
+            })
+            && recovery_envelope_fits(&self.output, None, self.token_ceiling)
+        {
+            // Reconstruction can satisfy overlapping owners from bytes already
+            // delivered. Do not advertise those bytes as pending work.
+            self.continuation_stop = None;
+        }
         DrainedRecoveryTransaction {
             output: self.output,
             drained_continuation_pages: self.drained_continuation_pages,
@@ -1052,9 +1063,31 @@ impl CoreToolRuntime for ReadToolOutputHandler {
     }
 }
 
+struct RecoveryAttemptObservation {
+    started: std::time::Instant,
+    phase: &'static str,
+    completed: bool,
+}
+
+impl Drop for RecoveryAttemptObservation {
+    fn drop(&mut self) {
+        tracing::info!(event.name = "codex.tool_output_recovery.attempt_finished",
+            phase = self.phase, completed = self.completed,
+            elapsed_ms = u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX),
+            "output recovery attempt settled (including failed and abandoned attempts)");
+        if let Some(metrics) = codex_otel::global() {
+            let _ = metrics.counter("codex.tool_output_recovery.attempt", 1,
+                &[("phase", self.phase), ("completed", if self.completed { "true" } else { "false" })]);
+        }
+    }
+}
+
 async fn handle_read_tool_output(
     invocation: ToolInvocation,
 ) -> Result<Box<dyn crate::tools::context::ToolOutput>, FunctionCallError> {
+    let mut attempt = RecoveryAttemptObservation {
+        started: std::time::Instant::now(), phase: "arguments", completed: false,
+    };
     let ToolPayload::Function { ref arguments } = invocation.payload else {
         return Err(FunctionCallError::RespondToModel(
             "read_tool_output received unsupported payload".to_string(),
@@ -1092,13 +1125,27 @@ async fn handle_read_tool_output(
     } else {
         RECOVERY_AGGREGATE_TOKEN_CEILING
     };
-    let snapshot = load_tool_output_snapshot(
+    attempt.phase = "snapshot_load";
+    let snapshot = match load_tool_output_snapshot(
         invocation.step_context.turn.config.codex_home.as_path(),
         &invocation.session.thread_id.to_string(),
         &args.artifact_id,
     )
     .await
-    .map_err(|err| FunctionCallError::RespondToModel(err.for_model()))?;
+    {
+        Ok(snapshot) => snapshot,
+        Err(ReadToolOutputError::Expired) => {
+            let error = missing_artifact_error(&invocation, &args.artifact_id).await;
+            return Err(FunctionCallError::RespondToModel(error.for_model()));
+        }
+        Err(err) => return Err(FunctionCallError::RespondToModel(err.for_model())),
+    };
+    // The persisted counter keeps its "reread" name but has artifact-read
+    // semantics: one per call that loaded the artifact snapshot, whether or not
+    // its selections succeed or repeat earlier deliveries. Prior delivery is
+    // tracked only by the session's tool-history recovery ledger.
+    invocation.step_context.turn.turn_timing_state.record_tool_output_artifact_reread();
+    attempt.phase = "selection";
     let transaction = drain_recovery_snapshot_for_delivery(
         &snapshot,
         selectors,
@@ -1121,13 +1168,11 @@ async fn handle_read_tool_output(
         drained_continuation_pages,
         continuation_stop,
     } = transaction;
-    invocation
-        .step_context
-        .turn
-        .turn_timing_state
-        .record_tool_output_artifact_reread();
     // Typed overflow reports an incomplete selection without losing retained
-    // evidence. Recovery bypasses recursive spilling, so no retruncation occurs.
+    // evidence. Recovery bypasses recursive spilling, and a direct recovery is
+    // exempt from generic re-projection, so this delivery is never truncated
+    // again. An in-cell recovery reaches the model only through its cell's
+    // output budget; that delivery attributes any re-truncation.
     // This is an explicit tool invocation, even when wrapped in model-authored
     // JS. Nesting alone does not prove recovery avoided a model handoff.
     // Automatic continuation pages are tracked separately by the transaction.
@@ -1136,6 +1181,13 @@ async fn handle_read_tool_output(
         .turn
         .turn_timing_state
         .record_tool_output_recovery(/*retruncation_count*/ 0);
+    if let ToolCallSource::CodeMode { cell_id, .. } = &invocation.source {
+        invocation
+            .session
+            .services
+            .code_mode_service
+            .record_packet_tool_output_recovery(cell_id);
+    }
 
     let exact_recovery_receipt = exact_code_mode_recovery_receipt(
         code_mode_recovery,
@@ -1218,11 +1270,53 @@ async fn handle_read_tool_output(
         }
     }
     let inner = recovery_tool_output(output, successful, evidence);
+    attempt.phase = "delivery";
     crate::tools::context::ensure_exact_model_delivery(&inner, &invocation)?;
+    attempt.completed = true;
     Ok(boxed_tool_output(ReadToolOutputToolOutput {
         inner,
         exact_recovery: exact_recovery_receipt,
     }))
+}
+
+// Ownership diagnosis must not turn a failed lookup into a long wait.
+const ARTIFACT_OWNER_RELATION_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// A handle missing from this thread may still be retained by the thread that
+/// produced it, such as a subagent. Name that owner instead of reporting
+/// expiry; recovery itself stays confined to the calling thread.
+async fn missing_artifact_error(
+    invocation: &ToolInvocation,
+    artifact_id: &str,
+) -> ReadToolOutputError {
+    let Some(owner_thread_id) = find_other_thread_artifact_owner(
+        invocation.step_context.turn.config.codex_home.as_path(),
+        &invocation.session.thread_id.to_string(),
+        artifact_id,
+    )
+    .await
+    else {
+        return ReadToolOutputError::Expired;
+    };
+    // Report only positive membership: retained spawn edges cannot certify a
+    // complete subtree, and an unavailable or slow graph is not evidence.
+    let owner = codex_protocol::ThreadId::from_string(&owner_thread_id);
+    let known_descendant = tokio::time::timeout(
+        ARTIFACT_OWNER_RELATION_TIMEOUT,
+        invocation
+            .session
+            .services
+            .agent_control
+            .list_live_agent_subtree_thread_ids(invocation.session.thread_id),
+    )
+    .await
+    .is_ok_and(|subtree| {
+        subtree.is_ok_and(|subtree| owner.as_ref().is_ok_and(|owner| subtree.contains(owner)))
+    });
+    ReadToolOutputError::OwnedByOtherThread {
+        owner_thread_id,
+        known_descendant,
+    }
 }
 
 // Pagination is a successful bounded read, not a terminal selection failure.
@@ -1313,12 +1407,36 @@ fn parse_read_tool_output_args(arguments: &str) -> Result<ReadToolOutputArgs, Fu
             let detail = message
                 .strip_prefix("failed to parse function arguments: ")
                 .unwrap_or(&message);
+            let detail = file_only_selector_hint(arguments).unwrap_or_else(|| detail.to_string());
             FunctionCallError::RespondToModel(format!(
                 "failed to parse read_tool_output arguments: {detail}. Consult the advertised read_tool_output schema."
             ))
         }
         err => err,
     })
+}
+
+/// Shared by the handler and code-mode argument preflight, which otherwise
+/// reports only the schema's accepted selector kinds.
+pub(crate) fn file_only_selector_hint(arguments: &str) -> Option<String> {
+    file_only_selector_kind(arguments).map(|kind| format!(
+        "`{kind}` selectors are read_file-only; snapshots take bytes, lines, section, json_pointer or search selectors. On a Rust/Python snapshot saved with an outline, select {{\"kind\":\"section\",\"id\":\"outline\"}} for item IDs, then {{\"kind\":\"section\",\"id\":\"<item id>\"}}; otherwise search or select lines here, or use read_file on the current file"
+    ))
+}
+
+/// read_file resolves names and lines through its outline parser, which needs
+/// the file path; a snapshot retains only that parser's section IDs. Name the
+/// equivalent section selector instead of an unknown-variant error.
+fn file_only_selector_kind(arguments: &str) -> Option<&'static str> {
+    let arguments: Value = serde_json::from_str(arguments).ok()?;
+    arguments["selectors"]
+        .as_array()?
+        .iter()
+        .find_map(|selector| match selector["kind"].as_str()? {
+            "symbol" => Some("symbol"),
+            "enclosing" => Some("enclosing"),
+            _ => None,
+        })
 }
 
 #[cfg(test)]
@@ -1578,7 +1696,8 @@ async fn drain_recovery_snapshot_with_source_budget(
     );
     let mut complete_output = snapshot.select(selectors.clone(), token_ceiling).await?;
     bound_recovery_source_bytes(&mut complete_output, max_bytes);
-    if complete_output.complete && recovery_envelope_fits(&complete_output, None, token_ceiling) {
+    if complete_output.complete && !cancellation_token.is_cancelled()
+        && recovery_envelope_fits(&complete_output, None, token_ceiling) {
         return Ok(RecoveryContinuationState::new(complete_output, token_ceiling).finish());
     }
     // Reserve stop metadata, including caller-supplied selectors. Byte continuations
@@ -1840,6 +1959,9 @@ fn resolved_max_bytes(max_bytes: Option<usize>) -> Result<usize, FunctionCallErr
 #[cfg(test)]
 #[path = "read_tool_output_paging_tests.rs"]
 mod paging_regressions;
+#[cfg(test)]
+#[path = "read_tool_output_audit145_tests.rs"]
+mod audit145_tests;
 #[cfg(test)]
 #[path = "read_tool_output_tests.rs"]
 mod tests;

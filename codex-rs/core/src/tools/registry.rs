@@ -276,8 +276,9 @@ pub(crate) trait CoreToolRuntime: ToolExecutor<ToolInvocation> {
         false
     }
 
-    /// Native add-only operations whose exact destinations the runtime
-    /// enforces. Admission still proves locality, absence and directory identity.
+    /// Native file mutations whose exact destinations the runtime enforces.
+    /// Admission proves locality and parent/endpoint identity; plain updates
+    /// can claim an existing regular file, while additions claim its parent.
     /// This is never inferred from a public tool name or opaque shell text.
     /// Some(empty) requires global mutation exclusion; None is not an opt-in.
     fn native_addition_paths(&self, _payload: &ToolPayload) -> Option<Vec<std::path::PathBuf>> {
@@ -3352,6 +3353,129 @@ fn fragment_section_heading(kind: ToolOutputProjectionFragmentKind) -> &'static 
     }
 }
 
+/// Room a truncated-cell recovery page leaves in a default cell for the read
+/// result's envelope and the script's own status lines.
+const CELL_RECOVERY_PAGE_RESERVE_TOKENS: usize = 2_000;
+/// Pages one cell raised to the output ceiling prints together; a notice names
+/// at most this many and leaves the rest to `continuation`.
+const CELL_RECOVERY_MAX_PAGES: usize = {
+    let pages = codex_code_mode::MAX_OUTPUT_TOKENS_PER_EXEC_CALL
+        / codex_code_mode::DEFAULT_MAX_OUTPUT_TOKENS_PER_EXEC_CALL;
+    if pages == 0 { 1 } else { pages }
+};
+
+struct CellRecoveryPages {
+    selectors: Vec<Value>,
+    max_bytes: usize,
+    continuation: Option<Value>,
+}
+
+/// Recorded recoveries of truncated cells read the omitted lines whole and were
+/// cut by the cell budget again (audit 2026-10-22 #45). Split the omitted range
+/// of the saved output into contiguous byte pages that each print within a
+/// default cell when read with the shared `max_bytes`.
+fn cell_recovery_pages(
+    canonical: &CanonicalToolResult,
+    selector: &Value,
+) -> Option<CellRecoveryPages> {
+    if selector.get("kind").and_then(Value::as_str) != Some("lines")
+        || u64::try_from(canonical.bytes.len()).ok() != Some(canonical.exact_bytes)
+    {
+        return None;
+    }
+    let first = usize::try_from(selector.get("start")?.as_u64()?).ok()?;
+    let last = usize::try_from(selector.get("end")?.as_u64()?).ok()?;
+    if first == 0 || last < first {
+        return None;
+    }
+    let text = std::str::from_utf8(&canonical.bytes).ok()?;
+    // Byte offset where the 1-based `line` begins.
+    let line_start = |line: usize| {
+        if line == 1 {
+            Some(0)
+        } else {
+            text.match_indices('\n')
+                .nth(line - 2)
+                .map(|(index, _)| index + 1)
+        }
+    };
+    let start = line_start(first)?;
+    let end = line_start(last.saturating_add(1)).unwrap_or(text.len());
+    if start >= end {
+        return None;
+    }
+    let page_tokens = codex_code_mode::DEFAULT_MAX_OUTPUT_TOKENS_PER_EXEC_CALL
+        .saturating_sub(CELL_RECOVERY_PAGE_RESERVE_TOKENS)
+        .max(1);
+    let mut selectors = Vec::new();
+    let mut max_bytes = 0;
+    let mut page_start = start;
+    while page_start < end && selectors.len() < CELL_RECOVERY_MAX_PAGES {
+        let page_end = cell_recovery_page_end(text, page_start, end, page_tokens);
+        max_bytes = max_bytes.max(page_end - page_start);
+        selectors.push(serde_json::json!({"kind":"bytes", "start":page_start, "end":page_end}));
+        page_start = page_end;
+    }
+    let continuation = (page_start < end)
+        .then(|| serde_json::json!({"kind":"bytes", "start":page_start, "end":end}));
+    Some(CellRecoveryPages {
+        selectors,
+        max_bytes,
+        continuation,
+    })
+}
+
+/// End of the page that starts at `start`: the last line boundary (or, inside
+/// one long line, a character boundary) whose JSON-escaped text stays within
+/// `page_tokens`. Prose averages about four UTF-8 bytes per token, so begin
+/// there and shrink in proportion until the page fits.
+fn cell_recovery_page_end(text: &str, start: usize, end: usize, page_tokens: usize) -> usize {
+    let mut candidate = end.min(start.saturating_add(page_tokens.saturating_mul(4)));
+    loop {
+        let page_end = if candidate >= end {
+            end
+        } else {
+            let mut boundary = candidate;
+            while boundary > start && !text.is_char_boundary(boundary) {
+                boundary -= 1;
+            }
+            match text[start..boundary].rfind('\n') {
+                Some(newline) => start + newline + 1,
+                None if boundary > start => boundary,
+                // Always make progress: at least one whole character.
+                None => text[start..end]
+                    .chars()
+                    .next()
+                    .map_or(end, |ch| start + ch.len_utf8()),
+            }
+        };
+        let page = &text[start..page_end];
+        let tokens = serde_json::to_string(page).map_or(usize::MAX, |escaped| {
+            codex_utils_output_truncation::model_token_count(&escaped)
+        });
+        if tokens <= page_tokens || page.chars().nth(1).is_none() {
+            return page_end;
+        }
+        let length = page_end - start;
+        let scaled = (length as u128 * page_tokens as u128 * 9 / (tokens as u128 * 10)) as usize;
+        candidate = start + scaled.clamp(1, length - 1);
+    }
+}
+
+fn cell_recovery_note(pages: usize, has_continuation: bool) -> String {
+    format!(
+        "Read these {pages} pages in order with max_bytes; each prints within a default cell, \
+         and a cell that starts with // @exec: {{\"max_output_tokens\": {}}} prints them all \
+         together.{}",
+        codex_code_mode::MAX_OUTPUT_TOKENS_PER_EXEC_CALL,
+        if has_continuation {
+            " Page `continuation` the same way."
+        } else {
+            ""
+        }
+    )
+}
+
 async fn project_model_output(input: ModelProjectionInput) -> Option<ModelToolProjection> {
     let ModelProjectionInput {
         fragments,
@@ -3402,10 +3526,20 @@ async fn project_model_output(input: ModelProjectionInput) -> Option<ModelToolPr
                 .get("raw_output_artifact_id")
                 .and_then(Value::as_str)
                 .map(str::to_owned);
-            let artifact_created = existing_artifact_id.is_none();
+            let mut artifact_created = existing_artifact_id.is_none();
             let artifact = if let Some(artifact_id) = existing_artifact_id {
-                attach_canonical_output_artifact(&codex_home, &thread_id, &artifact_id, &canonical)
-                    .await
+                let attached = attach_canonical_output_artifact(&codex_home, &thread_id, &artifact_id, &canonical)
+                    .await;
+                if attached.complete && attached.retained_bytes == canonical.exact_bytes {
+                    attached
+                } else {
+                    // A cumulative stream and this poll's packet are different
+                    // coordinate spaces. Never weaken exact-byte attachment.
+                    artifact_created = true;
+                    crate::tools::command_output_artifact::create_tool_history_output_artifact(
+                        &codex_home, &thread_id, &canonical,
+                    ).await
+                }
             } else {
                 crate::tools::command_output_artifact::create_tool_history_output_artifact(
                     &codex_home,
@@ -3558,7 +3692,10 @@ async fn project_model_output(input: ModelProjectionInput) -> Option<ModelToolPr
         }
     };
     let Some((artifact, artifact_id, artifact_created)) = persisted_artifact else {
-        return (materialization == ProjectionMaterialization::AdmissionOnly)
+        return (materialization == ProjectionMaterialization::AdmissionOnly
+            || (essential_inline.get("raw_output_artifact_id").and_then(Value::as_str).is_some()
+                && approx_token_count(&original_output_text).saturating_add(non_text_tokens)
+                    <= total_applied_token_limit))
             .then(admission_only_fallback);
     };
     let supersession_identity = invocation_sha256.map(|invocation_sha256| {
@@ -3573,28 +3710,54 @@ async fn project_model_output(input: ModelProjectionInput) -> Option<ModelToolPr
         // range is recoverable without rerunning the producer.
         let (original_response, original_output_text) = if visible_output_truncated {
             let missing_selector = essential_inline.get("cell_output_recovery_selector");
-            let selector = missing_selector.cloned().unwrap_or_else(|| {
-                serde_json::json!({
-                    "kind":"bytes", "start":0, "end":canonical.exact_bytes.min(4096)
-                })
-            });
+            let pages =
+                missing_selector.and_then(|selector| cell_recovery_pages(&canonical, selector));
             let qualified = original_output_text.replace(
                 "artifact_id={cell_output_artifact_id}",
                 &format!("artifact_id={artifact_id}"),
             );
-            let text = format!(
-                "{qualified}\n{}",
-                serde_json::json!({
-                    "output_truncated": true,
-                    "artifact_id": artifact_id,
-                    "recovery_tool": "read_tool_output",
-                    "recovery_scope": if missing_selector.is_some() { "omitted_output" } else { "prefix_discovery" },
-                    "recovery": {"tool":"read_tool_output", "arguments": {
+            let mut notice = serde_json::json!({
+                "output_truncated": true,
+                "artifact_id": artifact_id,
+                "recovery_tool": "read_tool_output",
+                "recovery_scope": if missing_selector.is_some() { "omitted_output" } else { "prefix_discovery" },
+            });
+            match pages {
+                Some(CellRecoveryPages {
+                    mut selectors,
+                    max_bytes,
+                    continuation,
+                }) => {
+                    let later_pages = selectors.split_off(1);
+                    notice["recovery"] = serde_json::json!({"tool":"read_tool_output", "arguments": {
+                        "artifact_id":artifact_id,
+                        "selectors":selectors,
+                        "max_bytes":max_bytes,
+                    }});
+                    if !later_pages.is_empty() {
+                        notice["note"] = Value::String(cell_recovery_note(
+                            later_pages.len() + 1,
+                            continuation.is_some(),
+                        ));
+                        notice["page_selectors"] = Value::Array(later_pages);
+                    }
+                    if let Some(continuation) = continuation {
+                        notice["continuation"] = continuation;
+                    }
+                }
+                None => {
+                    let selector = missing_selector.cloned().unwrap_or_else(|| {
+                        serde_json::json!({
+                            "kind":"bytes", "start":0, "end":canonical.exact_bytes.min(4096)
+                        })
+                    });
+                    notice["recovery"] = serde_json::json!({"tool":"read_tool_output", "arguments": {
                         "artifact_id":artifact_id,
                         "selectors":[selector]
-                    }},
-                })
-            );
+                    }});
+                }
+            }
+            let text = format!("{qualified}\n{notice}");
             (
                 projected_response_item(original_response, text.clone(), true),
                 text,
@@ -3727,8 +3890,19 @@ async fn project_model_output(input: ModelProjectionInput) -> Option<ModelToolPr
                 .collect(),
         );
     }
-    let mut bounded =
-        serialize_projection_fragments(envelope, &projected_text, &fragments, applied_token_limit)?;
+    // A full untyped fit has not rewritten selection facts or section
+    // inclusions. With no recovered content, the second pass has the same
+    // rendered header and text budget (rendering recomputes its own metrics).
+    // Truncated and typed fits are deliberately excluded: those are not
+    // generally idempotent.
+    let reuse_first_fit = drained_content.is_empty()
+        && fragments.is_empty()
+        && envelope.result["selected_text"].as_str() == Some(projected_text.as_str());
+    let mut bounded = if reuse_first_fit {
+        fitted
+    } else {
+        serialize_projection_fragments(envelope, &projected_text, &fragments, applied_token_limit)?
+    };
     if bounded.envelope().is_none_or(|envelope| {
         !drained_content_survived(envelope, preserved_content_start, &drained_content)
     }) {
@@ -4276,12 +4450,19 @@ fn serialize_projection_with_limit(
     serialize_projection_fragments(envelope, output, &[], token_limit)
 }
 
+#[cfg(test)]
+thread_local! {
+    static PROJECTION_FIT_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 fn serialize_projection_fragments(
     mut envelope: ToolProjectionV1,
     output: &str,
     fragments: &[ToolOutputProjectionFragment],
     token_limit: usize,
 ) -> Option<BoundedModelProjection> {
+    #[cfg(test)]
+    PROJECTION_FIT_CALLS.with(|count| count.set(count.get() + 1));
     // Spillable text remains subject to the requested limit. Structured control
     // state is not spillable, so the smallest typed carrier containing
     // `essential` defines a safe floor when that carrier alone exceeds the
@@ -4596,18 +4777,48 @@ fn schema_property_names(schema: &Value) -> Vec<&str> {
 /// where the pointer itself selects a branch. Returns `None` when the pointer
 /// does not address a schema node, so no guidance is invented.
 fn schema_at<'a>(schema: &'a Value, pointer: &str) -> Option<&'a Value> {
+    fn dereference<'a>(root: &'a Value, mut node: &'a Value, budget: &mut usize) -> Option<&'a Value> {
+        while let Some(reference) = node.get("$ref") {
+            *budget = budget.checked_sub(1)?;
+            // Do not invent a merged shape for constrained reference siblings.
+            if node.as_object()?.keys().any(|key| !matches!(key.as_str(),
+                "$ref" | "$defs" | "definitions" | "$id" | "$schema" | "title" | "description" | "$comment")) {
+                return None;
+            }
+            let reference = reference.as_str()?.strip_prefix('#')?;
+            node = root.pointer(reference)?;
+        }
+        Some(node)
+    }
     let mut node = schema;
-    for segment in pointer.split('/').filter(|segment| !segment.is_empty()) {
+    let mut budget = 64usize;
+    if !pointer.is_empty() && !pointer.starts_with('/') {
+        return None;
+    }
+    for segment in pointer.split('/').skip(1) {
+        node = dereference(schema, node, &mut budget)?;
+        let segment = segment.replace("~1", "/").replace("~0", "~");
         // Instance pointers address data, so an array index maps to the
         // schema's `items`, not to a sibling of the same ordinal.
-        let next = if segment.chars().all(|c| c.is_ascii_digit()) {
-            node.get("items")
-        } else {
-            node.get("properties").and_then(|props| props.get(segment))
+        let index = segment.chars().all(|c| c.is_ascii_digit());
+        let property = node.get("properties").and_then(|props| props.get(&segment));
+        let next = match (property, node.get("items")) {
+            (Some(property), _) => Some(property),
+            (_, Some(items)) if index && !segment.is_empty() => Some(items),
+            // Any other segment, a numeric map key included, is an object key:
+            // a declared property, else the schema every undeclared key of a
+            // map must match. A boolean `additionalProperties` has no shape.
+            _ => node
+                .get("properties")
+                .and_then(|props| props.get(&segment))
+                .or_else(|| {
+                    node.get("additionalProperties")
+                        .filter(|schema| schema.is_object())
+                }),
         };
         node = next?;
     }
-    Some(node)
+    dereference(schema, node, &mut budget)
 }
 
 /// Describe the accepted shape at one rejected pointer.
@@ -4691,6 +4902,32 @@ struct CodeModeArgumentPreflight {
     validation_count: AtomicUsize,
 }
 
+/// Bound formatting itself: truncating `error.to_string()` would first copy the
+/// entire rejected argument, and can hide the constraint behind a huge value.
+fn bounded_preflight_diagnostic(value: impl std::fmt::Display) -> String {
+    struct Bounded(String);
+    impl std::fmt::Write for Bounded {
+        fn write_str(&mut self, value: &str) -> std::fmt::Result {
+            let remaining = 1_024_usize.saturating_sub(self.0.len());
+            if value.len() <= remaining {
+                self.0.push_str(value);
+                return Ok(());
+            }
+            let mut end = remaining;
+            while !value.is_char_boundary(end) {
+                end -= 1;
+            }
+            self.0.push_str(&value[..end]);
+            Err(std::fmt::Error)
+        }
+    }
+    let mut bounded = Bounded(String::new());
+    if std::fmt::write(&mut bounded, format_args!("{value}")).is_err() {
+        bounded.0.push_str("… [diagnostic truncated]");
+    }
+    bounded.0
+}
+
 impl CodeModeArgumentPreflight {
     fn validate(
         &self,
@@ -4713,6 +4950,16 @@ impl CodeModeArgumentPreflight {
             return crate::tools::handlers::validate_read_file_arguments(arguments).map_err(
                 |message| format!("tool `{tool_name}` argument preflight failed: {message}"),
             );
+        }
+        // The schema can only list snapshot selector kinds; name the section
+        // selector that replaces a read_file-only one.
+        if native_compatibility
+            && tool_name.namespace.is_none()
+            && tool_name.name == "read_tool_output"
+            && let Some(hint) =
+                crate::tools::handlers::read_tool_output_file_only_selector_hint(arguments)
+        {
+            return Err(format!("tool `{tool_name}` argument preflight failed: {hint}"));
         }
         let value = parsed_function_arguments
             .and_then(|parsed| parsed.value().ok())
@@ -4749,14 +4996,29 @@ impl CodeModeArgumentPreflight {
                 let path = if pointer.is_empty() {
                     "$".to_string()
                 } else {
-                    format!("${pointer}")
+                    format!("${}", bounded_preflight_diagnostic(pointer))
                 };
                 // Append the accepted shape from the tool's own schema. Without
                 // it the model only learns which key was wrong, not which keys
                 // exist, and a retry can repeat the same rejected call.
+                let message = bounded_preflight_diagnostic(&error);
+                let message = if message.ends_with("[diagnostic truncated]") {
+                    let constraint = bounded_preflight_diagnostic(error.schema_path());
+                    let expected = compiled
+                        .schema
+                        .pointer(error.schema_path().as_str())
+                        .map(bounded_preflight_diagnostic)
+                        .unwrap_or_default();
+                    format!("{message} (constraint {constraint}: {expected})")
+                } else {
+                    message
+                };
                 match accepted_shape(&compiled.schema, pointer) {
-                    Some(shape) => format!("{path}: {error} ({shape})"),
-                    None => format!("{path}: {error}"),
+                    Some(shape) => format!(
+                        "{path}: {message} ({})",
+                        bounded_preflight_diagnostic(shape)
+                    ),
+                    None => format!("{path}: {message}"),
                 }
             })
             .collect::<Vec<_>>();
@@ -4801,6 +5063,10 @@ fn unsupported_tool_call_message(payload: &ToolPayload, tool_name: &ToolName) ->
 #[cfg(test)]
 #[path = "registry_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "registry_audit145_tests.rs"]
+mod audit145_tests;
 
 #[cfg(test)]
 #[path = "typed_validation_tests.rs"]

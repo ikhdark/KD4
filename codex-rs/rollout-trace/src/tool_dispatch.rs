@@ -44,6 +44,7 @@ enum ToolDispatchTraceContextState {
 #[derive(Clone, Debug)]
 struct EnabledToolDispatchTraceContext {
     writer: Arc<TraceWriter>,
+    occurrence: Option<crate::TraceOccurrence>,
     thread_id: AgentThreadId,
     codex_turn_id: CodexTurnId,
     tool_call_id: ToolCallId,
@@ -148,20 +149,39 @@ impl ToolDispatchTraceContext {
 
     /// Starts one dispatch-level lifecycle and returns the handle for its result.
     pub(crate) fn start(writer: Arc<TraceWriter>, invocation: ToolDispatchInvocation) -> Self {
+        Self::start_at(writer, invocation, crate::TraceOccurrence::now())
+    }
+
+    pub(crate) fn start_at(
+        writer: Arc<TraceWriter>,
+        invocation: ToolDispatchInvocation,
+        occurrence: crate::TraceOccurrence,
+    ) -> Self {
         if suppresses_tool_dispatch_trace(&invocation) {
             return Self::disabled();
         }
 
-        let context = EnabledToolDispatchTraceContext {
+        let mut context = EnabledToolDispatchTraceContext {
             writer,
+            occurrence: Some(occurrence),
             thread_id: invocation.thread_id.clone(),
             codex_turn_id: invocation.codex_turn_id.clone(),
             tool_call_id: invocation.tool_call_id.clone(),
         };
         record_started(&context, invocation);
+        context.occurrence = None;
         Self {
             state: ToolDispatchTraceContextState::Enabled(context),
         }
+    }
+
+    /// Records the caller-facing successful or failed tool result.
+    pub fn at_occurrence(&self, occurrence: crate::TraceOccurrence) -> Self {
+        let mut context = self.clone();
+        if let ToolDispatchTraceContextState::Enabled(enabled) = &mut context.state {
+            enabled.occurrence = Some(occurrence);
+        }
+        context
     }
 
     /// Records the caller-facing successful or failed tool result.
@@ -396,14 +416,31 @@ fn append_with_context_best_effort(
         thread_id: Some(context.thread_id.clone()),
         codex_turn_id: Some(context.codex_turn_id.clone()),
     };
-    context
-        .writer
-        .append_with_context_best_effort(event_context, payload);
+    let occurrence = context.occurrence.clone().unwrap_or_else(crate::TraceOccurrence::now);
+    if let Err(error) = context.writer.append_with_context_at(event_context, payload, Some(occurrence)) {
+        tracing::warn!("failed to append rollout tool event: {error:#}");
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn audit151_producer_occurrences_survive_deferred_recording() -> anyhow::Result<()> {
+        let root = tempfile::tempdir()?;
+        let writer = Arc::new(TraceWriter::create(root.path(), "trace".into(), "rollout".into(), "thread-1".into())?);
+        let started = crate::TraceOccurrence::now();
+        let mut ended = started.clone();
+        ended.offset_us += 5;
+        let context = ToolDispatchTraceContext::start_at(writer, invocation("exec_command", None, ToolDispatchRequester::Model { model_visible_call_id: "call-1".into() }, ToolDispatchPayload::Function { arguments: "{}".into() }), started.clone());
+        context.at_occurrence(ended.clone()).record_cancelled("cancelled after cleanup");
+        let rows = std::fs::read_to_string(root.path().join("trace.jsonl"))?.lines().map(serde_json::from_str::<crate::RawTraceEvent>).collect::<Result<Vec<_>, _>>()?;
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].occurrence, Some(started));
+        assert_eq!(rows[1].occurrence, Some(ended));
+        Ok(())
+    }
 
     #[test]
     fn dispatch_records_full_tool_identity_and_typed_payload() -> anyhow::Result<()> {

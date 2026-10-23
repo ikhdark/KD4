@@ -92,22 +92,87 @@ fn orchestration_correctness_stall_timeout_defaults_and_overrides() {
     assert_eq!(effective_stall_timeout_ms(Some(30_000), Some(30_000)), None);
 }
 
+/// Audit 151: only validation launches take the workspace validation gate.
 #[test]
-fn workspace_operation_root_reuses_the_preclassified_inspection_result() {
-    let root = std::path::PathBuf::from("repo");
+fn audit151_workspace_validation_gate_is_scoped_to_validation_launches() {
+    let root = PathBuf::from("repo");
 
     assert_eq!(
-        super::workspace_operation_root_if_needed(false, true, root.clone()),
+        super::workspace_operation_root_if_needed(false, root.clone()),
         None
     );
     assert_eq!(
-        super::workspace_operation_root_if_needed(false, false, root.clone()),
-        Some(root.clone())
-    );
-    assert_eq!(
-        super::workspace_operation_root_if_needed(true, true, root.clone()),
+        super::workspace_operation_root_if_needed(true, root.clone()),
         Some(root)
     );
+}
+
+/// Audit 151: while another session's validation holds this workspace, a
+/// legacy non-validation command runs instead of being refused as pending
+/// validation, and a validation launch is still refused before it starts.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn audit151_held_validation_refuses_only_validation_launches() {
+    let python = which::which("python")
+        .or_else(|_| which::which("python3"))
+        .unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    // Pin the repository root to this workspace rather than an ancestor.
+    std::fs::create_dir(workspace.path().join(".git")).unwrap();
+    let peer = crate::workspace_operation_gate::acquire_workspace_validation(
+        workspace.path(),
+        "cargo test -p peer-session",
+        crate::workspace_operation_gate::ValidationOwner::for_command(
+            codex_protocol::ThreadId::new(),
+            &["cargo".to_string(), "test".to_string()],
+        ),
+    )
+    .await
+    .expect("a peer session holds the workspace validation gate");
+    for (validation, refused) in [(false, false), (true, true)] {
+        let (session, mut turn) = make_session_and_context().await;
+        turn.approval_policy =
+            crate::config::Constrained::allow_any(codex_protocol::protocol::AskForApproval::Never);
+        turn.permission_profile = codex_protocol::models::PermissionProfile::Disabled;
+        let marker = format!("marker-{validation}");
+        let mut arguments = json!({
+            "kind": "argv", "program": python,
+            "args": ["-c", format!("open('{marker}', 'w').write('ran')")],
+            "workdir": workspace.path(),
+        });
+        if validation {
+            arguments["validation"] = json!({"covered_paths": ["src"]});
+        }
+        let payload = ToolPayload::Function {
+            arguments: arguments.to_string(),
+        };
+        let result = ShellCommandHandler::default()
+            .handle(ToolInvocation {
+                session: Arc::new(session),
+                step_context: StepContext::for_test(Arc::new(turn)),
+                cancellation_token: tokio_util::sync::CancellationToken::new(),
+                tracker: Arc::new(Mutex::new(TurnDiffTracker::new())),
+                call_id: format!("audit151-held-validation-{validation}"),
+                tool_name: codex_tools::ToolName::plain("shell_command"),
+                source: ToolCallSource::Direct,
+                payload: payload.clone(),
+            })
+            .await;
+        let text = match &result {
+            Ok(output) => output.code_mode_result(&payload).to_string(),
+            Err(error) => error.to_string(),
+        };
+        assert_eq!(
+            workspace.path().join(&marker).exists(),
+            !refused,
+            "validation={validation}: {text}"
+        );
+        assert_eq!(
+            text.contains("Validation busy"),
+            refused,
+            "validation={validation}: {text}"
+        );
+    }
+    drop(peer);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

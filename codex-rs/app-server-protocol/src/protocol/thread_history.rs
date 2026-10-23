@@ -1437,6 +1437,13 @@ impl ThreadHistoryBuilder {
             return;
         }
         if let Some(turn) = self.current_turn.as_mut() {
+            // An explicit abort already closed this turn; it stays current only
+            // to collect late items. As after `turn_complete`, a later unscoped
+            // error belongs to another request (for example, a rejected
+            // follow-up turn start) and must not relabel the aborted outcome.
+            if turn.opened_explicitly && turn.closed_by_abort {
+                return;
+            }
             turn.status = TurnStatus::Failed;
             turn.error = Some(V2TurnError {
                 message: payload.message.clone(),
@@ -1463,6 +1470,7 @@ impl ThreadHistoryBuilder {
             turn.duration_ms = payload.duration_ms;
             turn.timing = payload.timing.clone();
             turn.surfaced_result = None;
+            turn.closed_by_abort = true;
         };
         if let Some(turn_id) = payload.turn_id.as_deref() {
             // Prefer an exact ID match so we interrupt the turn explicitly targeted by the event.
@@ -1699,6 +1707,7 @@ impl ThreadHistoryBuilder {
             timing: None,
             surfaced_result: None,
             opened_explicitly: false,
+            closed_by_abort: false,
             saw_compaction: false,
             raw_user_boundary: false,
             rollout_start_index: self.current_rollout_index,
@@ -1955,6 +1964,9 @@ struct PendingTurn {
     /// True when this turn originated from an explicit `turn_started`/`turn_complete`
     /// boundary, so we preserve it even if it has no renderable items.
     opened_explicitly: bool,
+    /// True once a `turn_aborted` event closed this turn. It may stay current
+    /// to collect late items, but later unscoped errors belong to other requests.
+    closed_by_abort: bool,
     /// True when this turn includes a persisted `RolloutItem::Compacted`, which
     /// should keep the turn from being dropped even without normal items.
     saw_compaction: bool,
@@ -3688,6 +3700,7 @@ mod tests {
         assert_eq!(
             turns[0].items[2],
             ThreadItem::FileChange {
+                effects: None,
                 environment: None,
                 id: "patch-declined".into(),
                 changes: vec![FileUpdateChange {
@@ -3971,6 +3984,7 @@ mod tests {
                     }],
                 },
                 ThreadItem::FileChange {
+                    effects: None,
                     environment: None,
                     id: "patch-call".into(),
                     changes: vec![FileUpdateChange {
@@ -4042,6 +4056,7 @@ mod tests {
                     }],
                 },
                 ThreadItem::FileChange {
+                    effects: None,
                     environment: None,
                     id: "patch-call".into(),
                     changes: vec![FileUpdateChange {
@@ -5329,6 +5344,37 @@ mod tests {
     }
 
     #[test]
+    fn persisted_session_shutdown_abort_materializes_interrupted_turn_without_error() {
+        // v2 has no abort reason: the persisted shutdown value replays as the
+        // existing interrupted status, not as a failure.
+        let aborted: EventMsg = serde_json::from_value(serde_json::json!({
+            "type": "turn_aborted",
+            "turn_id": "turn-shutdown",
+            "reason": "session_shutdown",
+            "completed_at": 21,
+            "duration_ms": 800,
+        }))
+        .expect("persisted shutdown abort deserializes");
+        let items = vec![
+            RolloutItem::EventMsg(EventMsg::TurnStarted(TurnStartedEvent {
+                turn_id: "turn-shutdown".into(),
+                trace_id: None,
+                started_at: Some(20),
+                model_context_window: None,
+                collaboration_mode_kind: Default::default(),
+            })),
+            RolloutItem::EventMsg(aborted),
+        ];
+
+        let turns = build_turns_from_rollout_items(&items);
+        let turn = turns.first().expect("shutdown materialized turn");
+        assert_eq!(turn.status, TurnStatus::Interrupted);
+        assert_eq!(turn.error, None);
+        assert_eq!(turn.completed_at, Some(21));
+        assert_eq!(turn.duration_ms, Some(800));
+    }
+
+    #[test]
     fn persisted_internal_error_abort_materializes_failed_turn_with_error() {
         let items = vec![
             RolloutItem::EventMsg(EventMsg::TurnStarted(TurnStartedEvent {
@@ -5362,6 +5408,85 @@ mod tests {
         // The preceding Error already marks the turn failed; only the abort supplies these.
         assert_eq!(turn.completed_at, Some(21));
         assert_eq!(turn.duration_ms, Some(800));
+    }
+
+    #[test]
+    fn audit149x_request_error_after_explicit_abort_keeps_the_aborted_outcome() {
+        let started = |turn_id: &str| {
+            RolloutItem::EventMsg(EventMsg::TurnStarted(TurnStartedEvent {
+                turn_id: turn_id.into(),
+                trace_id: None,
+                started_at: None,
+                model_context_window: None,
+                collaboration_mode_kind: Default::default(),
+            }))
+        };
+        let aborted = |turn_id: &str, reason: TurnAbortReason| {
+            RolloutItem::EventMsg(EventMsg::TurnAborted(TurnAbortedEvent {
+                turn_id: Some(turn_id.into()),
+                reason,
+                completed_at: Some(21),
+                duration_ms: Some(800),
+                timing: None,
+            }))
+        };
+        let error_event = |message: &str, codex_error_info: CodexErrorInfo| {
+            RolloutItem::EventMsg(EventMsg::Error(ErrorEvent {
+                message: message.into(),
+                codex_error_info: Some(codex_error_info),
+            }))
+        };
+        let items = vec![
+            started("turn-interrupted"),
+            aborted("turn-interrupted", TurnAbortReason::Interrupted),
+            // A follow-up turn start rejected before its own TurnStarted.
+            error_event("follow-up settings rejected", CodexErrorInfo::BadRequest),
+            started("turn-crashed"),
+            error_event("worker panicked", CodexErrorInfo::InternalServerError),
+            aborted("turn-crashed", TurnAbortReason::InternalError),
+            error_event(
+                "follow-up persistence failed",
+                CodexErrorInfo::InternalServerError,
+            ),
+            started("turn-running"),
+            error_event("stream failed", CodexErrorInfo::Other),
+            RolloutItem::EventMsg(EventMsg::TurnComplete(TurnCompleteEvent {
+                surfaced_result: None,
+                turn_id: "turn-running".into(),
+                last_agent_message: None,
+                error: None,
+                completed_at: None,
+                duration_ms: None,
+                time_to_first_token_ms: None,
+                timing: None,
+            })),
+        ];
+
+        let turns = build_turns_from_rollout_items(&items);
+        let outcome = |turn: &Turn| {
+            (
+                turn.id.clone(),
+                turn.status.clone(),
+                turn.error.as_ref().map(|error| error.message.clone()),
+            )
+        };
+        assert_eq!(
+            turns.iter().map(outcome).collect::<Vec<_>>(),
+            vec![
+                ("turn-interrupted".to_string(), TurnStatus::Interrupted, None),
+                (
+                    "turn-crashed".to_string(),
+                    TurnStatus::Failed,
+                    Some("worker panicked".to_string()),
+                ),
+                // Negative control: an error inside a running explicit turn still fails it.
+                (
+                    "turn-running".to_string(),
+                    TurnStatus::Failed,
+                    Some("stream failed".to_string()),
+                ),
+            ]
+        );
     }
 
     #[test]

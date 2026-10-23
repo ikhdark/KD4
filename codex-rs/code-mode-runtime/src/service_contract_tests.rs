@@ -221,6 +221,7 @@ fn blocking_tool() -> ToolDefinition {
         description: "".into(),
         kind: CodeModeToolKind::Function,
         input_schema: None,
+        namespace_description: None,
         default_timeout_ms: None,
         output_schema: None,
     }
@@ -238,6 +239,7 @@ async fn flattened_tool_identifier_collisions_are_rejected_before_cell_start() {
                     description: "plain tool".into(),
                     kind: CodeModeToolKind::Function,
                     input_schema: None,
+                    namespace_description: None,
                     default_timeout_ms: None,
                     output_schema: None,
                 },
@@ -247,6 +249,7 @@ async fn flattened_tool_identifier_collisions_are_rejected_before_cell_start() {
                     description: "namespaced tool".into(),
                     kind: CodeModeToolKind::Function,
                     input_schema: None,
+                    namespace_description: None,
                     default_timeout_ms: None,
                     output_schema: None,
                 },

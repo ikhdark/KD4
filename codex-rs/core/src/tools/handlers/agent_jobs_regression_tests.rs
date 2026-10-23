@@ -321,6 +321,7 @@ async fn bulk_binding_registers_accounting_and_row_cleanup_drains_descendants() 
                     state_db: db.clone(),
                     job_id: job.id.clone(),
                     item_id: "item-0".into(),
+                    runtime_timeout: None,
                 }),
                 ..Default::default()
             },
@@ -569,6 +570,113 @@ async fn released_spawn_progresses_while_an_existing_worker_is_serviced() -> any
 }
 
 #[tokio::test]
+async fn failed_spawn_settlement_does_not_suspend_a_sibling_initializer() -> anyhow::Result<()> {
+    let (dir, db, job) = create_running_job(2).await;
+    let (mut session, turn, _events) =
+        crate::session::tests::make_session_and_context_with_rx().await;
+    let manager = crate::ThreadManager::with_models_provider_for_tests(
+        codex_login::CodexAuth::from_api_key("dummy"),
+        turn.config.model_provider.clone(),
+        Arc::new(crate::test_support::EmptyUserInstructionsProvider),
+    );
+    let control = manager.agent_control();
+    let parent = manager.start_thread((*turn.config).clone()).await?;
+    Arc::get_mut(&mut session).unwrap().thread_id = parent.thread_id;
+    Arc::get_mut(&mut session).unwrap().services.agent_control = control.clone();
+    let mut connection = sqlx::SqliteConnection::connect_with(
+        &sqlx::sqlite::SqliteConnectOptions::new()
+            .filename(codex_state::state_db_path(&dir.path().join("state"))),
+    )
+    .await?;
+    sqlx::query(
+        "CREATE TRIGGER reject_first_worker BEFORE UPDATE ON agent_job_items \
+         WHEN NEW.item_id = 'item-0' AND NEW.status = 'running' \
+         BEGIN SELECT RAISE(ABORT, 'injected initializer failure'); END",
+    )
+    .execute(&mut connection)
+    .await?;
+    let rollback = Arc::new(crate::agent::control::AgentControlTestBarrier::default());
+    let submission = Arc::new(crate::agent::control::AgentControlTestBarrier::default());
+    control.set_before_spawn_rollback_barrier(Some(rollback.clone()));
+    control.set_before_initial_submission_barrier(Some(submission.clone()));
+    let cancellation = CancellationToken::new();
+    let runner = tokio::spawn({
+        let session = session.clone();
+        let db = db.clone();
+        let job_id = job.id.clone();
+        let cancellation = cancellation.clone();
+        async move {
+            let options = JobRunnerOptions {
+                max_concurrency: 2,
+                spawn_config: (*turn.config).clone(),
+                environments: turn.environments.clone(),
+            };
+            run_agent_job_loop(
+                session,
+                turn,
+                db,
+                job_id,
+                options,
+                cancellation,
+                &mut HashMap::new(),
+            )
+            .await
+        }
+    });
+    timeout(Duration::from_secs(5), rollback.wait_until_reached()).await?;
+    timeout(Duration::from_secs(5), submission.wait_until_reached()).await?;
+    let sibling = db
+        .list_agent_job_items(
+            &job.id,
+            Some(codex_state::AgentJobItemStatus::Running),
+            None,
+        )
+        .await?
+        .into_iter()
+        .next()
+        .and_then(|item| item.assigned_thread_id)
+        .expect("the second initializer must already own its durable row");
+    let sibling = ThreadId::from_string(&sibling)?;
+    // Model the transaction dependency of another initializer: failed-row
+    // settlement cannot acquire this write lock until that sibling advances.
+    // The separate connection keeps the dependency deterministic and avoids
+    // changing the production state-store implementation just for this test.
+    sqlx::query("BEGIN IMMEDIATE")
+        .execute(&mut connection)
+        .await?;
+    rollback.release_one();
+    timeout(Duration::from_secs(5), async {
+        while manager.list_thread_ids().await.len() != 2 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await?;
+    submission.release_one();
+    let submitted = timeout(Duration::from_secs(2), async {
+        while !manager.captured_ops().iter().any(|(id, op)| {
+            *id == sibling && matches!(op, codex_protocol::protocol::Op::UserInput { .. })
+        }) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    // Always release the transaction and owned workers before asserting, even
+    // when a regression leaves the runner parked in failed-row settlement.
+    sqlx::query("ROLLBACK").execute(&mut connection).await?;
+    control.set_before_spawn_rollback_barrier(None);
+    control.set_before_initial_submission_barrier(None);
+    cancellation.cancel();
+    timeout(Duration::from_secs(15), runner).await???;
+    control.shutdown_live_agent(parent.thread_id).await?;
+    assert!(
+        submitted.is_ok(),
+        "failed-row settlement stopped polling the other initializer while awaiting its database lock"
+    );
+    assert_eq!(db.get_agent_job_progress(&job.id).await?.running_items, 0);
+    Ok(())
+}
+
+#[tokio::test]
 async fn revoked_runner_stops_only_its_retained_workers_and_preserves_failure() -> anyhow::Result<()>
 {
     let (dir, db, job) = create_running_job(1).await;
@@ -734,5 +842,76 @@ async fn dropped_job_owner_drains_five_blocked_workers_without_manual_retry() ->
         .agent_control()
         .shutdown_live_agent(unrelated.thread_id)
         .await?;
+    Ok(())
+}
+#[tokio::test]
+async fn free_worker_slots_initialize_together_and_cancel_after_durable_binding()
+-> anyhow::Result<()> {
+    let (_dir, db, job) = create_running_job(3).await;
+    let (mut session, turn, _events) =
+        crate::session::tests::make_session_and_context_with_rx().await;
+    let manager = crate::ThreadManager::with_models_provider_for_tests(
+        codex_login::CodexAuth::from_api_key("dummy"),
+        turn.config.model_provider.clone(),
+        Arc::new(crate::test_support::EmptyUserInstructionsProvider),
+    );
+    let control = manager.agent_control();
+    let parent = manager.start_thread((*turn.config).clone()).await?;
+    Arc::get_mut(&mut session).unwrap().thread_id = parent.thread_id;
+    Arc::get_mut(&mut session).unwrap().services.agent_control = control.clone();
+    let barrier = Arc::new(crate::agent::control::AgentControlTestBarrier::default());
+    control.set_before_initial_submission_barrier(Some(barrier.clone()));
+    let cancellation = CancellationToken::new();
+    let runner = tokio::spawn({
+        let session = session.clone();
+        let db = db.clone();
+        let job_id = job.id.clone();
+        let cancellation = cancellation.clone();
+        async move {
+            let options = JobRunnerOptions {
+                max_concurrency: 2,
+                spawn_config: (*turn.config).clone(),
+                environments: turn.environments.clone(),
+            };
+            run_agent_job_loop(
+                session,
+                turn,
+                db,
+                job_id,
+                options,
+                cancellation,
+                &mut HashMap::new(),
+            )
+            .await
+        }
+    });
+    let admitted = timeout(Duration::from_secs(5), async {
+        barrier.wait_until_reached().await;
+        barrier.wait_until_reached().await;
+    })
+    .await;
+    let progress = db.get_agent_job_progress(&job.id).await?;
+    // Cancel on the bind/submit boundary without releasing either initializer.
+    // Existing spawn rollback and job cleanup must drain both real child owners.
+    cancellation.cancel();
+    timeout(Duration::from_secs(15), runner).await???;
+    control.set_before_initial_submission_barrier(None);
+    assert!(
+        admitted.is_ok(),
+        "a blocked initializer must not occupy another free slot"
+    );
+    assert_eq!(progress.running_items, 2);
+    assert_eq!(
+        progress.pending_items, 1,
+        "initializers must reserve only the two free slots"
+    );
+    assert_eq!(db.get_agent_job_progress(&job.id).await?.running_items, 0);
+    timeout(Duration::from_secs(15), async {
+        while manager.list_thread_ids().await != vec![parent.thread_id] {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await?;
+    control.shutdown_live_agent(parent.thread_id).await?;
     Ok(())
 }

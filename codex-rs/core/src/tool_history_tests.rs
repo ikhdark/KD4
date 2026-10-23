@@ -2702,24 +2702,44 @@ fn child_message_continuation_preserves_the_previous_freshness_layout() {
         "<completed_phase_checkpoint>\n{\"receipts\":{}}\n</completed_phase_checkpoint>",
     );
     let next_task = message("user", "next task");
-    // Explicit checkpoints retire evidence and always rebuild. In this fixture
-    // the notice is most of the prompt, so a user turn consolidates it too.
-    for appended in [&checkpoint, &next_task] {
-        let mut extended = canonical.to_vec();
-        extended.push(appended.clone());
-        assert!(
-            state
-                .project_continuation_with_workspace_cache(
-                    &anchor,
-                    extended.into(),
-                    Some(&changed),
-                    &cache,
-                )
-                .is_none()
-        );
+    // Explicit checkpoints retire evidence and always rebuild.
+    let mut extended = canonical.to_vec();
+    extended.push(checkpoint.clone());
+    assert!(
+        state
+            .project_continuation_with_workspace_cache(
+                &anchor,
+                extended.into(),
+                Some(&changed),
+                &cache,
+            )
+            .is_none()
+    );
+    // The notice is most of this prompt, but a user turn still keeps the cached
+    // layout: re-laying out the prompt re-sends everything after the notice
+    // uncached (audit: the request after each consolidation was nearly cold).
+    let (notice_tokens, total_tokens) = freshness_notice_tokens(&previous.items);
+    assert!(notice_tokens * 2 > total_tokens, "fixture notice share");
+    let mut extended = canonical.to_vec();
+    extended.push(next_task.clone());
+    let continued = state
+        .project_continuation_with_workspace_cache(
+            &anchor,
+            extended.into(),
+            Some(&changed),
+            &cache,
+        )
+        .expect("notice share alone never re-lays out a user turn");
+    for (items, prior) in [
+        (&continued.items, &previous.items),
+        (&continued.unreplaced_items, &previous.unreplaced_items),
+    ] {
+        assert!(items.starts_with(prior));
+        assert_eq!(items.len(), prior.len() + 1, "notice must not repeat");
+        assert_eq!(items.last(), Some(&next_task));
     }
-    // A user turn whose notices are a small share of the prompt keeps the
-    // layout the provider cached and appends the request after it.
+    // So does one whose notices are a small share of the prompt: it appends the
+    // request after the layout the provider cached.
     let earlier_work = message("assistant", &"earlier analysis ".repeat(2_000));
     let padded: Arc<[ResponseItem]> = Arc::from([earlier_work, function_call("read-old"), output]);
     let padded_previous =
@@ -2770,6 +2790,90 @@ fn child_message_continuation_preserves_the_previous_freshness_layout() {
             )
             .is_none()
     );
+}
+
+#[tokio::test]
+async fn user_turn_keeps_notices_a_full_projection_no_longer_sends() {
+    let root = tempfile::tempdir().unwrap();
+    let source = root.path().join("source.rs");
+    std::fs::write(&source, "A").unwrap();
+    let cache = GitWorkspaceCache::with_noop_watcher_for_tests();
+    let mut captured = workspace_identity_at(root.path(), "captured");
+    captured.path_fingerprints = Some(BTreeMap::from([("source.rs".into(), sha256(b"A"))]));
+    let mut edited = captured.clone();
+    edited.worktree_identity = Some("edited".into());
+    edited.path_fingerprints = Some(BTreeMap::from([("source.rs".into(), sha256(b"B"))]));
+    let output = text_output("read", "A".into());
+    let canonical: Arc<[ResponseItem]> = Arc::from([function_call("read"), output.clone()]);
+    let mut state = ToolHistoryState::default();
+    state.register_workspace_evidence(
+        watched(
+            &cache,
+            root.path(),
+            WorkspaceEvidenceObservation::from_response_item(
+                Some(captured.clone()),
+                &output,
+                BTreeSet::from([SourceDependencyV1::new(&source, false)]),
+            )
+            .unwrap(),
+        )
+        .await,
+    );
+    let previous =
+        state.project_sampling_with_workspace_cache(Arc::clone(&canonical), Some(&edited), &cache);
+    assert_eq!(
+        previous
+            .items
+            .iter()
+            .filter(|item| workspace_notice_text(item).is_some())
+            .count(),
+        1,
+        "the captured edit invalidates the read"
+    );
+    let anchor = SamplingProjectionAnchor {
+        prepared_items: Arc::clone(&canonical),
+        projection: previous.clone(),
+    };
+    let message = |role: &str, text: &str| ResponseItem::Message {
+        id: None,
+        role: role.to_string(),
+        content: vec![codex_protocol::models::ContentItem::InputText {
+            text: text.to_string(),
+        }],
+        phase: None,
+        internal_chat_message_metadata_passthrough: None,
+    };
+    // Reverting the edit makes the read current again. Within a turn the sent
+    // layout keeps its conservative notice.
+    let mut in_turn = canonical.to_vec();
+    in_turn.push(message("assistant", "continuing"));
+    let continued = state
+        .project_continuation_with_workspace_cache(&anchor, in_turn.into(), Some(&captured), &cache)
+        .expect("a turn continues its sent layout");
+    assert!(continued.items.starts_with(&previous.items));
+    // So does a user turn. Dropping the notice would re-send everything after
+    // it uncached; phase checkpoints and compaction retire it instead.
+    let next_task = message("user", "next task");
+    let mut next_turn = canonical.to_vec();
+    next_turn.push(next_task.clone());
+    let continued = state
+        .project_continuation_with_workspace_cache(
+            &anchor,
+            next_turn.into(),
+            Some(&captured),
+            &cache,
+        )
+        .expect("a user turn continues its sent layout");
+    for (items, prior) in [
+        (&continued.items, &previous.items),
+        (&continued.unreplaced_items, &previous.unreplaced_items),
+    ] {
+        assert!(items.starts_with(prior));
+        assert_eq!(items.len(), prior.len() + 1, "notice must not repeat");
+        assert_eq!(items.last(), Some(&next_task));
+    }
+    // The full projection those owners run no longer sends it.
+    assert!(freshness_notices(&state, &canonical, Some(&captured), &cache).is_empty());
 }
 
 #[test]
@@ -2831,31 +2935,365 @@ fn sampling_freshness_batches_results_and_only_appends_new_invalidations() {
     assert_eq!(repeated.items, projected.items);
 }
 
+/// The single JSON record line of the freshness notice `item`, expanded.
+fn appended_notice_records(item: &ResponseItem) -> (Vec<String>, Vec<serde_json::Value>) {
+    let text = workspace_notice_text(item).expect("freshness notice");
+    let lines = text.lines().map(str::to_owned).collect::<Vec<_>>();
+    let batch = lines
+        .iter()
+        .find_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .expect("notice JSON");
+    (lines, expand_workspace_notices(batch))
+}
+
+/// Estimated tokens of the freshness notices in `items`, and of all `items`.
+fn freshness_notice_tokens(items: &[ResponseItem]) -> (i64, i64) {
+    let (mut notice_tokens, mut total_tokens) = (0i64, 0i64);
+    for item in items {
+        let tokens = crate::context_manager::estimate_item_token_count(item);
+        total_tokens = total_tokens.saturating_add(tokens);
+        if workspace_notice_text(item).is_some() {
+            notice_tokens = notice_tokens.saturating_add(tokens);
+        }
+    }
+    (notice_tokens, total_tokens)
+}
+
+#[tokio::test]
+async fn continuation_appends_only_added_staleness_as_compact_updates() {
+    // The audited cascade (a79d): a code-mode carrier whose reads go stale one
+    // edit at a time. Each request restated the carrier's full dependency
+    // listings whenever a row was reordered or lost watcher knowledge, so 64%
+    // of notice records repeated a call an earlier notice still showed.
+    let root = tempfile::tempdir().unwrap();
+    let cache = GitWorkspaceCache::with_noop_watcher_for_tests();
+    let captured = workspace_identity_at(root.path(), "captured");
+    let reads = ["a.rs", "b.rs", "c.rs"].map(|name| root.path().join(name));
+    for path in &reads {
+        std::fs::write(path, "before").unwrap();
+    }
+    let carrier = text_output("carrier", "combined reads".into());
+    let canonical: Arc<[ResponseItem]> = Arc::from([function_call("carrier"), carrier.clone()]);
+    let mut state = ToolHistoryState::default();
+    state.register_workspace_evidence(
+        watched(
+            &cache,
+            root.path(),
+            WorkspaceEvidenceObservation::from_response_item(
+                Some(captured.clone()),
+                &carrier,
+                reads
+                    .iter()
+                    .map(|path| SourceDependencyV1::new(path, false))
+                    .collect(),
+            )
+            .unwrap(),
+        )
+        .await,
+    );
+    for (call_id, path) in ["read-a", "read-b", "read-c"].into_iter().zip(&reads) {
+        let nested = text_output(call_id, "before".into());
+        state.register_workspace_evidence(
+            watched(
+                &cache,
+                root.path(),
+                WorkspaceEvidenceObservation::from_response_item(
+                    Some(captured.clone()),
+                    &nested,
+                    BTreeSet::from([SourceDependencyV1::new(path, false)]),
+                )
+                .unwrap(),
+            )
+            .await,
+        );
+        assert!(
+            ToolHistoryMutation::RegisterCodeModeNestedEvidence {
+                parent_call_id: "carrier".into(),
+                call_id: call_id.into(),
+                output: "before".into(),
+            }
+            .apply(&mut state)
+        );
+    }
+    let continuation = |state: &ToolHistoryState, projection: &ToolHistoryProjection| {
+        state
+            .project_continuation_with_workspace_cache(
+                &SamplingProjectionAnchor {
+                    prepared_items: Arc::clone(&canonical),
+                    projection: projection.clone(),
+                },
+                Arc::clone(&canonical),
+                Some(&captured),
+                &cache,
+            )
+            .expect("unchanged history continues the sent layout")
+    };
+
+    std::fs::write(&reads[0], "after").unwrap();
+    cache
+        .note_host_workspace_mutation_paths(root.path(), &["a.rs".into()])
+        .await;
+    let first = state.project_sampling_with_workspace_cache(
+        Arc::clone(&canonical),
+        Some(&captured),
+        &cache,
+    );
+    let (lines, records) = appended_notice_records(first.items.last().unwrap());
+    assert!(lines[1].contains("This is not a request to rerun tests or builds."));
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0]["workspace_evidence_freshness"], "changed");
+    assert_eq!(records[0]["stale_nested_results"][0]["call_id"], "read-a");
+    assert_eq!(
+        records[0]["retained_nested_results"]
+            .as_array()
+            .map(Vec::len),
+        Some(2)
+    );
+
+    // Recording the mutation only degrades the shown rows' watcher knowledge
+    // and rewords the reason; the visible verdict already covers both.
+    assert!(state.invalidate_source_dependencies(
+        Some(&BTreeSet::from([reads[0].clone()])),
+        Some(&captured)
+    ));
+    let second = continuation(&state, &first);
+    assert_eq!(
+        second.items, first.items,
+        "no new staleness, so nothing is restated"
+    );
+
+    // An unattributed mutation leaves no proof for the retained reads.
+    cache.note_host_workspace_mutation();
+    let third = continuation(&state, &second);
+    assert!(third.items.starts_with(&first.items));
+    assert_eq!(third.items.len(), first.items.len() + 1);
+    let (lines, records) = appended_notice_records(third.items.last().unwrap());
+    // The prompt already carries the guidance, so the update carries only its
+    // record and the explanation of updates, which is given once.
+    assert_eq!(lines.len(), 4, "{lines:?}");
+    assert_eq!(lines[1], WORKSPACE_NOTICE_UPDATE_GUIDANCE);
+    assert_eq!(records.len(), 1);
+    let update = &records[0];
+    assert_eq!(update["call_id"], "carrier");
+    assert_eq!(update["updates_earlier_notice"], true);
+    assert_eq!(update["stale_workspace_evidence"], true);
+    assert_eq!(update["valid_for_current_workspace"], false);
+    let all_reads = BTreeSet::from(["read-a", "read-b", "read-c"].map(str::to_owned));
+    let stale = nested_result_ids(update, "stale_nested_results");
+    assert_eq!(stale, all_reads);
+    assert!(update.get("retained_nested_results").is_none(), "{update}");
+    assert!(
+        !update.to_string().contains("\"dependencies\""),
+        "every dependency row was already delivered: {update}"
+    );
+    // A full restatement of the same verdict is what a fresh projection sends.
+    let restated = state
+        .project_workspace_freshness_with_cache(Arc::clone(&canonical), Some(&captured), &cache)
+        .items;
+    let (_, restated) = appended_notice_records(restated.last().unwrap());
+    let restated_stale = nested_result_ids(&restated[0], "stale_nested_results");
+    assert_eq!(restated_stale, all_reads);
+    assert!(
+        update.to_string().len() * 2 < restated[0].to_string().len(),
+        "update {update} vs restatement {}",
+        restated[0]
+    );
+
+    let fourth = continuation(&state, &third);
+    assert_eq!(
+        fourth.items, third.items,
+        "an update is a visible verdict too"
+    );
+}
+
 #[test]
-fn invalidation_reason_changes_do_not_repeat_the_same_evidence_but_nested_changes_do() {
+fn later_notices_refer_to_the_guidance_the_prompt_already_carries() {
+    let cache = GitWorkspaceCache::with_noop_watcher_for_tests();
+    let captured = workspace_identity("captured");
+    let changed = workspace_identity("changed");
+    let mut state = ToolHistoryState::default();
+    let mut register = |call_id: &str| {
+        let output = text_output(call_id, format!("source bytes for {call_id}"));
+        state.register_workspace_evidence(
+            WorkspaceEvidenceObservation::from_response_item(
+                Some(captured.clone()),
+                &output,
+                BTreeSet::new(),
+            )
+            .unwrap(),
+        );
+        [function_call(call_id), output]
+    };
+    let canonical: Arc<[ResponseItem]> = Arc::from(register("first"));
+    let mut extended = canonical.to_vec();
+    extended.extend(register("second"));
+    let mut previous =
+        state.project_sampling_with_workspace_cache(Arc::clone(&canonical), Some(&changed), &cache);
+    // When the layout carries only that guidance, a later notice carries just
+    // its record (audit: every notice repeated a 300-450 character preamble).
+    let plain = state
+        .project_continuation_with_workspace_cache(
+            &SamplingProjectionAnchor {
+                prepared_items: Arc::clone(&canonical),
+                projection: previous.clone(),
+            },
+            extended.clone().into(),
+            Some(&changed),
+            &cache,
+        )
+        .unwrap();
+    assert!(plain.items.starts_with(&previous.items));
+    let (lines, records) = appended_notice_records(plain.items.last().unwrap());
+    assert_eq!(lines.len(), 3, "{lines:?}");
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0]["call_id"], "second");
+    // 20 of 23 audited sessions also carried a carrier-only notice's guidance,
+    // so a bare reference to "the earlier guidance" would be ambiguous.
+    let carrier_records = serde_json::json!({"notices": [{
+        "call_id": "carrier", "historical_authenticity": "authenticated",
+        "reason_code": "carrier_scope_incomplete", "stale_workspace_evidence": true,
+        "valid_for_current_workspace": false, "workspace_evidence_freshness": "unknown",
+    }]});
+    let mut sent = previous.items.to_vec();
+    sent.push(ResponseItem::Message {
+        id: None,
+        role: "developer".to_string(),
+        content: vec![codex_protocol::models::ContentItem::InputText {
+            text: format!(
+                "<workspace_evidence_invalidation>\n{WORKSPACE_CARRIER_GUIDANCE}\n{carrier_records}\n</workspace_evidence_invalidation>"
+            ),
+        }],
+        phase: None,
+        internal_chat_message_metadata_passthrough: None,
+    });
+    previous.items = sent.into();
+    previous.unreplaced_items = Arc::clone(&previous.items);
+    let next = state
+        .project_continuation_with_workspace_cache(
+            &SamplingProjectionAnchor {
+                prepared_items: canonical,
+                projection: previous.clone(),
+            },
+            extended.into(),
+            Some(&changed),
+            &cache,
+        )
+        .unwrap();
+    assert!(next.items.starts_with(&previous.items));
+    let notices = next
+        .items
+        .iter()
+        .filter(|item| workspace_notice_text(item).is_some())
+        .map(appended_notice_records)
+        .collect::<Vec<_>>();
+    assert_eq!(notices.len(), 3);
+    let guidance = &notices[0].0[1];
+    assert!(guidance.contains("This is not a request to rerun tests or builds."));
+    let (lines, records) = &notices[2];
+    assert_eq!(lines.len(), 4);
+    assert_eq!(lines[1], WORKSPACE_NOTICE_GUIDANCE_REFERENCE);
+    // The reference names the guidance it applies, not the carrier guidance.
+    let opening = |guidance: &'static str| guidance.split(',').next().unwrap();
+    assert!(lines[1].contains(opening(WORKSPACE_NOTICE_GUIDANCE)));
+    assert!(!lines[1].contains(opening(WORKSPACE_CARRIER_GUIDANCE)));
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0]["call_id"], "second");
+    assert!(
+        records[0].get("updates_earlier_notice").is_none(),
+        "a call's first notice is complete: {}",
+        records[0]
+    );
+}
+
+#[test]
+fn invalidation_records_repeat_a_call_only_for_added_staleness() {
+    let scope = |rows: serde_json::Value| {
+        serde_json::json!({
+            "omitted_dependencies": 0, "source_scope_complete": true,
+            "dependency_scope": "recorded", "dependencies": rows,
+        })
+    };
+    let row = |path: &str, freshness: &str, watcher: &str| {
+        serde_json::json!({"path": path, "recursive": false, "environment_id": "local",
+            "freshness": freshness, "watcher_knowledge": watcher})
+    };
+    let quiet_row = row("/repo/a.rs", "unknown", "no_observed_change");
+    let quiet = scope(serde_json::json!([quiet_row]));
     let previous = serde_json::json!({
-        "call_id": "read",
+        "call_id": "read", "historical_authenticity": "authenticated",
         "stale_workspace_evidence": true, "valid_for_current_workspace": false,
         "reason": "repository changed", "reason_code": "workspace_identity_changed",
-        "retained_nested_results": [{"call_id": "still-current"}],
+        "workspace_evidence_freshness": "unknown", "source_scope": quiet,
+        "retained_nested_results": [{"call_id": "still-current",
+            "workspace_evidence_freshness": "unknown", "watcher_knowledge": "no_observed_change",
+            "historical_authenticity": "authenticated", "source_scope": quiet}],
     });
+    assert_eq!(stale_workspace_notice_call_id(&previous), Some("read"));
+    let mut visible = VisibleWorkspaceInvalidation::default();
+    visible.record(&previous);
+    // A reworded reason and lost watcher knowledge establish nothing new.
     let mut next = previous.clone();
     next["reason"] = "source dependency changed".into();
     next["reason_code"] = "source_dependencies_invalidated".into();
-    assert!(same_workspace_invalidation(&previous, &next));
-    assert!(same_workspace_invalidation(&next, &previous));
-    next["retained_nested_results"] = serde_json::json!([]);
-    assert!(!same_workspace_invalidation(&previous, &next));
-    next = previous.clone();
-    next["call_id"] = "other".into();
-    assert!(!same_workspace_invalidation(&previous, &next));
-    next = previous.clone();
-    next["valid_for_current_workspace"] = true.into();
-    assert!(!same_workspace_invalidation(&previous, &next));
-    assert!(!same_workspace_invalidation(
-        &serde_json::json!({"reason":"one"}),
-        &serde_json::json!({"reason":"two"})
-    ));
+    let lost_row = row("/repo/a.rs", "unknown", "unknown");
+    next["source_scope"] = scope(serde_json::json!([lost_row]));
+    assert!(!visible.adds_staleness(&next));
+    // A result the carrier no longer vouches for, an observed change, failure
+    // applicability and weaker authenticity each do.
+    let mut dropped = next.clone();
+    dropped["retained_nested_results"] = serde_json::json!([]);
+    let mut changed = next.clone();
+    changed["workspace_evidence_freshness"] = "changed".into();
+    let changed_row = row("/repo/a.rs", "changed", "unknown");
+    changed["source_scope"] = scope(serde_json::json!([changed_row]));
+    let mut failure = next.clone();
+    failure["failure_applicability"] = "unverified".into();
+    let mut unverified = next.clone();
+    unverified["historical_authenticity"] = "unverified".into();
+    for notice in [&dropped, &changed, &failure, &unverified] {
+        assert!(visible.adds_staleness(notice), "{notice}");
+    }
+    // An update restates the verdict but not what was already listed.
+    let update = visible.update(changed.clone());
+    assert_eq!(update["updates_earlier_notice"], true);
+    assert_eq!(update["reason_code"], "source_dependencies_invalidated");
+    assert_eq!(update["workspace_evidence_freshness"], "changed");
+    let rows = update["source_scope"]["dependencies"].as_array();
+    assert_eq!(rows.map(Vec::len), Some(1));
+    let retained = &update["retained_nested_results"][0];
+    assert_eq!(retained["call_id"], "still-current");
+    assert_eq!(retained["workspace_evidence_freshness"], "unknown");
+    assert!(retained.get("source_scope").is_none(), "{update}");
+    visible.record(&update);
+    // Neither the same change nor a later loss of that knowledge repeats.
+    assert!(!visible.adds_staleness(&changed));
+    assert!(!visible.adds_staleness(&next));
+    // Another changed dependency does, and only it is listed.
+    let mut wider = changed.clone();
+    let other_row = row("/repo/b.rs", "changed", "unknown");
+    wider["source_scope"] = scope(serde_json::json!([changed_row, other_row]));
+    assert!(visible.adds_staleness(&wider));
+    let update = visible.update(wider);
+    assert_eq!(
+        update["source_scope"]["dependencies"],
+        serde_json::json!([other_row])
+    );
+    // So does a newly stale nested result, without its already listed scope.
+    let mut nested = changed.clone();
+    nested["retained_nested_results"] = serde_json::json!([]);
+    let stale_row = serde_json::json!({"call_id": "still-current", "source_scope": quiet});
+    nested["stale_nested_results"] = serde_json::json!([stale_row]);
+    assert!(visible.adds_staleness(&nested));
+    let update = visible.update(nested);
+    let stale = &update["stale_nested_results"][0];
+    assert_eq!(stale["call_id"], "still-current");
+    assert!(stale.get("source_scope").is_none(), "{update}");
+    // Only stale call records are compared by verdict; others must match exactly.
+    let mut current = previous.clone();
+    current["valid_for_current_workspace"] = true.into();
+    assert_eq!(stale_workspace_notice_call_id(&current), None);
+    let unrelated = serde_json::json!({"reason": "one"});
+    assert_eq!(stale_workspace_notice_call_id(&unrelated), None);
 }
 
 #[test]
@@ -8331,6 +8769,73 @@ fn verified10_compactor_receives_decisive_evidence_not_only_checkpoint_pins() {
         Some(failure.as_str())
     );
 }
+
+/// Audit 146: when the exact summarizer input cannot fit the model window, the
+/// fallback input applies the same checkpoint pins sampling and the compaction
+/// trigger measured, and only those.
+#[test]
+fn audit146_pinned_local_compaction_input_retires_only_checkpointed_outputs() {
+    fn outputs(prompt: &[ResponseItem]) -> BTreeMap<String, String> {
+        prompt
+            .iter()
+            .filter_map(canonical_textual_output_identity)
+            .map(|(call_id, output)| (call_id.to_string(), output.into_owned()))
+            .collect()
+    }
+    let fact = format!(
+        "{}\nDECISIVE_FACT: use the canonical byte offset\n{}",
+        "source prelude\n".repeat(80),
+        "source suffix\n".repeat(80)
+    );
+    let open = "open evidence the model has not consumed\n".repeat(40);
+    let mut state = ToolHistoryState::default();
+    let mut reviewed = candidate("reviewed", fact.clone());
+    reviewed.consumed_by_generation = Some(ModelGenerationId {
+        turn_id: "review".into(),
+        ordinal: 1,
+    });
+    state.register(reviewed);
+    state.register(candidate("open", open.clone()));
+    for call_id in ["reviewed", "open"] {
+        state.register_non_workspace_code_mode_call(call_id.to_string());
+    }
+    let checkpoint = pressure_retirement_checkpoint(
+        &["reviewed".to_string()],
+        PressureRetirementTrigger::ContextLimit,
+    );
+    let items = [
+        function_call("reviewed"),
+        text_output("reviewed", fact.clone()),
+        checkpoint,
+        function_call("open"),
+        text_output("open", open.clone()),
+    ];
+    let mut history = crate::context_manager::ContextManager::new();
+    history.set_tool_history_state(state);
+    history.record_items(items.iter(), TruncationPolicy::Tokens(100_000));
+    let modalities = [codex_protocol::openai_models::InputModality::Text];
+    let git_workspace = GitWorkspaceCache::with_noop_watcher_for_tests();
+    // Negative control: the default summarizer input keeps the retired result raw.
+    let exact = outputs(&history.clone().for_local_compaction_prompt(
+        &modalities,
+        None,
+        &git_workspace,
+    ));
+    assert_eq!(exact.get("reviewed"), Some(&fact));
+    assert_eq!(exact.get("open"), Some(&open));
+    let pinned = outputs(&history.for_local_compaction_prompt_with_checkpoint_pins(
+        &modalities,
+        None,
+        &git_workspace,
+    ));
+    let pin = pinned
+        .get("reviewed")
+        .expect("the retired result keeps its call with a recovery pin");
+    assert_ne!(pin, &fact);
+    assert!(pin.len() < fact.len());
+    assert_eq!(pinned.get("open"), Some(&open));
+}
+
 #[test]
 fn verified10_typed_receipts_distinguish_scope_and_incomplete_coverage() {
     for (path, complete) in [("owner.rs", true), ("consumer.rs", false)] {
@@ -8686,8 +9191,8 @@ async fn incomplete_source_scope_survives_ledger_restore_and_cannot_hide_in_carr
     assert!(!restored.can_use_root_only_workspace_identity(&items));
 
     // The runtime cannot certify an aggregate using just a path union. An
-    // unretained child can have no nested entry, but exact retained reads still
-    // carry independent current proof within the conservative carrier notice.
+    // unretained child can have no nested entry, so the carrier verdict stays
+    // unverified although its exact retained read has independent current proof.
     state
         .workspace_evidence
         .get_mut("carrier")
@@ -8705,28 +9210,27 @@ async fn incomplete_source_scope_survives_ledger_restore_and_cannot_hide_in_carr
         }
         .apply(&mut state)
     );
-    let notices = freshness_notices(&state, &items, Some(&revision), &cache);
+    let mut checked = ProjectedResponseItems::Shared(Arc::clone(&items));
+    state.invalidate_stale_workspace_evidence(&mut checked, Some(&revision), Some(&cache));
+    let (_, verdict) = canonical_textual_output_identity(&checked[1]).expect("carrier verdict");
+    let verdict: serde_json::Value = serde_json::from_str(&verdict).unwrap();
     assert_eq!(
-        notices.len(),
-        1,
+        verdict["reason_code"], "carrier_scope_incomplete",
         "missing child provenance cannot promote the aggregate"
     );
-    assert_eq!(notices[0]["source_scope"]["source_scope_complete"], false);
-    assert_eq!(notices[0]["reason_code"], "carrier_scope_incomplete");
-    assert_eq!(notices[0]["valid_for_current_workspace"], false);
-    assert!(notices[0]["source_scope"].get("dependencies").is_none());
-    assert!(
-        notices[0]["retained_nested_results"][0]
-            .get("source_scope")
-            .is_none()
-    );
+    assert_eq!(verdict["source_scope"]["source_scope_complete"], false);
+    assert_eq!(verdict["valid_for_current_workspace"], false);
     assert_eq!(
-        notices[0]["retained_nested_results"][0]["call_id"],
+        verdict["retained_nested_results"][0]["call_id"],
         "native-child"
     );
+    // That standing scope limit names no stale or changed dependency and
+    // requests no reread, so sampling does not restate it as a notice.
+    assert!(is_quiet_carrier_notice(&verdict));
+    assert!(freshness_notices(&state, &items, Some(&revision), &cache).is_empty());
 
-    // Cosmetic compaction must not conceal a later real change, even when the
-    // compact notice has already been delivered in the immutable prefix.
+    // Not restating the quiet carrier record must not conceal a later real
+    // change to the same carrier.
     let delivered = state
         .project_workspace_freshness_with_cache(Arc::clone(&items), Some(&revision), &cache)
         .items;
@@ -8818,4 +9322,55 @@ fn paged_source_inspection_requires_bound_identity_attempt_and_complete_ranges()
                 .is_none()
         );
     }
+}
+
+#[tokio::test]
+async fn audit143_known_metadata_locators_are_inline_with_identical_classification() {
+    use futures::FutureExt;
+    for locator in ["skill:catalog", "context:desktop", "context:multi-agent", "context:turn-diff", "context:unsettled-tools/0"] {
+        for key in ["path", "file_path"] {
+            let payload = ToolPayload::Function { arguments: serde_json::json!({key: locator, "cwd":"relative"}).to_string() };
+            let cwd = std::env::current_dir().unwrap();
+            let expected = classify_workspace_tool_call("read_file", &payload, &cwd);
+            let (actual, read_only) = classify_workspace_tool_call_at_admission("read_file".into(), payload, cwd)
+                .now_or_never().expect("pure metadata admission must not wait for blocking analysis").unwrap();
+            assert_eq!(actual.observes_workspace, expected.observes_workspace);
+            assert_eq!(actual.workspace_cwd, expected.workspace_cwd);
+            assert_eq!(actual.source_dependencies, expected.source_dependencies);
+            assert_eq!(actual.source_scope_complete, expected.source_scope_complete);
+            assert!(!actual.observes_workspace);
+            assert!(!read_only);
+        }
+    }
+    let cwd = std::env::current_dir().unwrap();
+    let (local, _) = classify_workspace_tool_call_at_admission("read_file".into(),
+        ToolPayload::Function { arguments: r#"{"path":"source.rs"}"#.into() }, cwd).await.unwrap();
+    assert!(local.observes_workspace);
+    assert!(!local.source_dependencies.is_empty());
+}
+#[test]
+fn audit150_complete_pin_does_not_require_a_tiny_receipt() {
+    let packet = serde_json::json!({"path":"/repo/source.rs", "environment_id":"local",
+        "source_sha256":"a".repeat(64), "complete":true, "file_complete":true,
+        "results": (0..32).map(|index| serde_json::json!({
+            "selector":{"kind":"lines","start":index+1,"end":index+1},
+            "status":"ok","complete":true,"canonical_range":{"start":index*1000,"end":(index+1)*1000},
+            "text":"source evidence ".repeat(500)
+        })).collect::<Vec<_>>()});
+    let mut value = candidate("multi-selector-pin", packet.to_string());
+    value.tool_identity = "functions.read_file".into();
+    value.semantic_class = "source_read".into();
+    value.consumed_by_generation = Some(ModelGenerationId { turn_id:"turn".into(), ordinal:1 });
+    value.refresh_derived();
+    assert!(value.derived.receipt.is_none(), "required evidence must not be cut to fit a tiny receipt");
+    let (pin, _) = value.checkpoint_pin().expect("a complete materially smaller pin");
+    let pin: serde_json::Value = serde_json::from_str(&pin).unwrap();
+    assert_eq!(pin.get("evidence"), value.receipt_evidence().as_ref());
+    assert_eq!(pin["artifact_id"], value.artifact_id);
+    assert_eq!(pin["sha256"], value.artifact_sha256);
+    value.consumed_by_generation = None;
+    assert!(value.checkpoint_pin().is_none());
+    value.consumed_by_generation = Some(ModelGenerationId { turn_id:"turn".into(), ordinal:1 });
+    value.complete = false;
+    assert!(value.checkpoint_pin().is_none());
 }

@@ -20,13 +20,16 @@ import json
 import math
 import os
 from pathlib import Path
+from pathlib import PureWindowsPath
 import re
+import shlex
 import shutil
 import stat
 import subprocess
 import sys
 import time
 import tomllib
+import uuid
 from typing import Callable
 from typing import BinaryIO
 from typing import Iterator
@@ -175,8 +178,24 @@ def max_active_lanes_per_base(env: Mapping[str, str] = os.environ) -> int:
 class RustAdmissionBusy(RuntimeError):
     """Admission did not execute the requested work; obligations remain pending."""
 
-    def __init__(self, message: str, *, resource: Path, wait_option: str):
+    def __init__(
+        self,
+        message: str,
+        *,
+        resource: Path,
+        wait_option: str,
+        blocking_resources: Sequence[Path] = (),
+    ):
+
         super().__init__(message)
+
+        self.blocking_resources = tuple(dict.fromkeys(blocking_resources))
+
+        requested_resource = resource
+
+        if self.blocking_resources:
+            resource = self.blocking_resources[0]
+
         self.status = {
             "kind": "codex_rust_admission_v1",
             "status": "busy",
@@ -198,12 +217,31 @@ class RustAdmissionBusy(RuntimeError):
             ),
         }
 
+        if self.blocking_resources:
+            self.status["requested_resource"] = str(requested_resource.resolve())
+
     def report(self) -> dict[str, object]:
         """Status plus the holder, read after the locks admission raised under."""
-        return {
+
+        blocking = [
+            {"resource": str(path.resolve()), "target_dir": str(path.resolve()), "holder": lane_runner_holder(path)}
+            for path in self.blocking_resources
+        ]
+
+        report = {
             **self.status,
-            "holder": lane_runner_holder(Path(str(self.status["resource"]))),
+            "holder": blocking[0]["holder"]
+            if blocking
+            else lane_runner_holder(Path(str(self.status["resource"]))),
         }
+
+        if blocking:
+            report["resource_kind"] = "lane_family"
+            for entry in blocking:
+                entry["owner_kind"] = "test_runner" if entry["holder"] is not None else "unknown"
+            report["blocking_lanes"] = blocking
+
+        return report
 
 
 def lane_runner_holder(target_dir: Path) -> dict[str, object] | None:
@@ -332,6 +370,8 @@ def validate_cargo_lanes_root(
 class RustProcessClassification:
     is_rust: bool
     lane_name: str | None
+    target_dir: str | None = None
+    checkout_root: str | None = None
 
 
 @dataclass(frozen=True)
@@ -339,6 +379,7 @@ class RustProcess:
     pid: int
     name: str
     command_line: str
+    cwd: str | None = None
     classification: RustProcessClassification = field(
         init=False,
         compare=False,
@@ -407,8 +448,26 @@ class BuildStatusSnapshot:
         lane_names_by_process: dict[tuple[int, str, str], str] = {}
         for process in process_list:
             lane_name = lane_name_for_process(process)
+            observation = process.classification
+            target = observation.target_dir
+            root = observation.checkout_root
+            unresolved_target = False
+            if target is not None:
+                absolute = Path(target).is_absolute() or PureWindowsPath(target).is_absolute()
+                if not absolute and process.cwd:
+                    target = str(Path(process.cwd) / target)
+                    absolute = True
+                if absolute:
+                    lane_name = next((path.name for path in lane_dirs if _process_path_key(path) == _process_path_key(target)), None)
+                else:
+                    lane_name = None
+                    unresolved_target = True
+            elif root is None or _process_path_key(root) != _process_path_key(repo_root):
+                lane_name = None
             if lane_name is not None:
                 lane_names_by_process[rust_process_key(process)] = lane_name
+            elif observation.is_rust and (unresolved_target or target is None and root is None) and process_scan_error is None:
+                process_scan_error = "Rust process checkout/target ownership is unknown; pruning remains unavailable"
         active_lanes = (
             set(lane_names_by_process.values())
             | env_active_lane_names()
@@ -504,7 +563,56 @@ class BuildStatusSnapshot:
 
 
 def active_rust_processes() -> list[RustProcess]:
-    return active_rust_processes_windows()
+    if os.name == "nt":
+        return active_rust_processes_windows()
+    return active_rust_processes_posix()
+
+
+def active_rust_processes_posix() -> list[RustProcess]:
+    """Observe full command lines; a failed or malformed scan is never idle."""
+
+    try:
+        result = subprocess.run(
+            ["ps", "-A", "-o", "pid=", "-o", "comm=", "-o", "args="],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=WINDOWS_PROCESS_SCAN_TIMEOUT_SECONDS,
+            env={**os.environ, "LC_ALL": "C"},
+        )
+
+        if not result.stdout.strip():
+            raise ValueError("empty process snapshot")
+
+        processes = []
+
+        for line in result.stdout.splitlines():
+            if not line.strip():
+                continue
+
+            fields = line.split(None, 2)
+
+            if len(fields) < 2:
+                raise ValueError("missing process fields")
+
+            pid = int(fields[0])
+
+            if pid == os.getpid():
+                continue
+
+            process = RustProcess(
+                pid=pid,
+                name=Path(fields[1]).name,
+                command_line=fields[2] if len(fields) == 3 else "",
+            )
+
+            if process.classification.is_rust:
+                processes.append(process)
+
+        return processes
+
+    except (OSError, ValueError, subprocess.SubprocessError) as exc:
+        raise RustProcessScanError(f"POSIX Rust process scan failed: {exc}") from exc
 
 
 def active_rust_processes_windows() -> list[RustProcess]:
@@ -527,7 +635,7 @@ def active_rust_processes_windows() -> list[RustProcess]:
             capture_output=True,
             text=True,
             timeout=WINDOWS_PROCESS_SCAN_TIMEOUT_SECONDS,
-            creationflags=subprocess.CREATE_NO_WINDOW,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
     except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
         raise RustProcessScanError(f"Windows Rust process scan failed: {exc}") from exc
@@ -569,17 +677,65 @@ def _lane_name_from_command_line(command_line: str) -> str | None:
     return None
 
 
+def _process_path_key(path: str | Path) -> str:
+    value = str(path)
+    if PureWindowsPath(value).is_absolute():
+        return str(PureWindowsPath(value)).replace("\\", "/").rstrip("/").casefold()
+    return str(Path(value).resolve()).replace("\\", "/").rstrip("/")
+
+
 def _classify_rust_process(process: RustProcess) -> RustProcessClassification:
     executable = process.name.lower().removesuffix(".exe")
-    lane_name = _lane_name_from_command_line(process.command_line)
-    contains_rust_command = bool(RUST_PROCESS_TOKEN_RE.search(process.command_line))
-    if executable in RUST_PROCESS_NAMES:
-        is_rust = True
-    elif executable in RUST_WRAPPER_PROCESS_NAMES:
-        is_rust = lane_name is not None or contains_rust_command
-    else:
-        is_rust = contains_rust_command
-    return RustProcessClassification(is_rust=is_rust, lane_name=lane_name)
+    try:
+        tokens = [token.strip('"') for token in shlex.split(process.command_line, posix=False)]
+    except ValueError:
+        tokens = []
+    scripts = {"cargo-lane.ps1", "rust_test_runner.py", "rust_build_status.py"}
+    script = None
+    if executable in {"python", "python3", "pythonw", "powershell", "pwsh"}:
+        for token in tokens[1:]:
+            if token.lower() in {"-command", "-c", "-encodedcommand"}:
+                break
+            if Path(token.replace("\\", "/")).name.lower() in scripts:
+                script = token
+                break
+    is_rust = executable in RUST_PROCESS_NAMES or script is not None or (
+        executable == "just"
+        and (JUST_LANE_RE.search(process.command_line) is not None
+             or JUST_FIXED_LANE_RE.search(process.command_line) is not None)
+    )
+    if executable in {*RUST_WRAPPER_PROCESS_NAMES, "sh", "bash", "zsh", "cmd"}:
+        candidates = tokens
+        for index, token in enumerate(tokens):
+            if token.lower() in {"-command", "-c", "/c"} and index + 1 < len(tokens):
+                try:
+                    candidates = shlex.split(tokens[index + 1].strip("\"'"))[:1]
+                except ValueError:
+                    candidates = []
+                break
+        is_rust = is_rust or any(
+            Path(token.replace("\\", "/")).name.lower().removesuffix(".exe")
+            in RUST_PROCESS_NAMES
+            for token in candidates
+        )
+    if not is_rust:
+        return RustProcessClassification(False, None)
+    target = None
+    for index, token in enumerate(tokens):
+        if token == "--":
+            break
+        if token == "--target-dir" and index + 1 < len(tokens):
+            target = tokens[index + 1]
+        elif token.startswith("--target-dir="):
+            target = token.split("=", 1)[1].strip('"')
+        elif executable == "rustc" and token == "--out-dir" and index + 1 < len(tokens):
+            output = tokens[index + 1]
+            if match := LANE_RE.search(output):
+                target = output[:match.end(1)]
+    root = None
+    if script and (Path(script).is_absolute() or PureWindowsPath(script).is_absolute()):
+        root = str((PureWindowsPath(script) if PureWindowsPath(script).is_absolute() else Path(script)).parents[2])
+    return RustProcessClassification(is_rust, _lane_name_from_command_line(process.command_line), target, root)
 
 
 def observe_rust_process(process: RustProcess) -> RustProcess:
@@ -764,6 +920,7 @@ def cargo_lane_coordination_lock(
     lock_path = lane_root / ".lane-coordination.lock"
     deadline = time.monotonic() + timeout_seconds
     handle = None
+    retry_delay = 0.002
     while handle is None:
         try:
             handle = lock_path.open("a+b")
@@ -774,7 +931,8 @@ def cargo_lane_coordination_lock(
                 raise TimeoutError(
                     f"timed out waiting for lane coordination lock {lock_path}"
                 )
-            time.sleep(0.05)
+            time.sleep(min(retry_delay, max(0.0, deadline - time.monotonic())))
+            retry_delay = min(0.02, retry_delay * 2)
     acquired = False
     try:
         handle.seek(0, os.SEEK_END)
@@ -801,7 +959,8 @@ def cargo_lane_coordination_lock(
                     raise TimeoutError(
                         f"timed out waiting for lane coordination lock {lock_path}"
                     )
-                time.sleep(0.05)
+                time.sleep(min(retry_delay, max(0.0, deadline - time.monotonic())))
+                retry_delay = min(0.02, retry_delay * 2)
         yield
     finally:
         try:
@@ -1041,12 +1200,50 @@ def _safe_lane_name(value: str) -> str:
     return value
 
 
+def _cargo_profile_options(command: Sequence[str]) -> list[str]:
+    """Cargo artifact profile only; never Nextest policy or program arguments."""
+    if len(command) >= 4 and Path(command[0]).stem.lower() == "rustup" and command[1] == "run":
+        cargo_index = 4 if command[2] == "--install" else 3
+        if cargo_index < len(command) and Path(command[cargo_index]).stem.lower() == "cargo":
+            return _cargo_profile_options(command[cargo_index:])
+    recipe = command[1] if len(command) > 1 else None
+    if recipe == "_core-test-small-reserved":
+        return ["--profile", "dev-small"]
+    cargo_index = _cargo_subcommand_index(command) if command and Path(command[0]).stem.lower() == "cargo" else None
+    subcommand = command[cargo_index] if cargo_index is not None else None
+    nextest = (
+        subcommand == "nextest"
+        or _is_named_runner_command(command, allow_interpreter_flags=True)
+        or recipe in {"_core-test-reserved", "_core-gate-reserved"}
+    )
+    profile: list[str] = []
+    tokens = iter(command[(cargo_index + 1) if cargo_index is not None else 1:])
+    for token in tokens:
+        if token == "--":
+            break
+        if subcommand == "watch" and token.startswith("-") and not token.startswith("--"):
+            short = token[1:]
+            flags = len(short) - len(short.lstrip("cqNhV"))
+            if short[flags:flags + 1] == "x":
+                token = "-" + short[flags:]
+        if subcommand == "watch" and (token in {"--exec", "-x"} or token.startswith(("--exec=", "-x"))):
+            value = next(tokens, "") if token in {"--exec", "-x"} else token.split("=", 1)[1] if token.startswith("--exec=") else token[2:].removeprefix("=")
+            embedded = shlex.split(value)
+            profile = _cargo_profile_options(["cargo", *embedded]) or profile
+        elif token in {"--release", "-r"}:
+            profile = ["--profile", "release"]
+        elif token == ("--cargo-profile" if nextest else "--profile"):
+            profile = ["--profile", next(tokens, "")]
+        elif token.startswith(("--cargo-profile=" if nextest else "--profile=")):
+            profile = ["--profile", token.split("=", 1)[1]]
+        elif token in {"--profile", "-P", "--config", "--target", "--features", "-F", "-p", "--package", "--target-dir", "--manifest-path", "-C", "-Z", "--watch", "-w", "--shell", "-s", "--workdir", "--ignore", "-i", "--env", "-E", "--env-file", "--delay", "-d"}:
+            next(tokens, None)
+    return profile
+
+
 def _auto_lane_base(command: Sequence[str]) -> str:
     signature = " ".join(command).strip()
-    release = re.search(
-        r"(?:^|\s)(?:--release|-r|--profile(?:=|\s+)release)(?:\s|$)",
-        signature,
-    )
+    release = _cargo_profile_options(command) == ["--profile", "release"]
     from scripts.build.rust_tool_env import CORE_TEST_PACKAGES, cargo_package_specs
 
     # Affinity also covers Cargo watch's embedded --exec/-x command strings.
@@ -1125,7 +1322,7 @@ def _auto_lane_base(command: Sequence[str]) -> str:
     else:
         base = "auto"
     safe = re.sub(r"[^A-Za-z0-9_.-]", "-", base).strip("-") or "auto"
-    return f"{safe}-release" if release is not None else safe
+    return f"{safe}-release" if release else safe
 
 
 def initialize_cargo_lanes_root(repo_root: Path, lane_root: Path) -> Path:
@@ -1296,15 +1493,19 @@ def _nonnegative_wait_seconds(value: str | float) -> float:
 
 def _lanes_in_use(candidates: Sequence[LaneReservationCandidate]) -> int:
     """Existing lanes of one family that hold a reservation or a Cargo lock."""
-    return sum(
-        1
+    return len(_busy_lane_paths(candidates))
+
+
+def _busy_lane_paths(candidates: Sequence[LaneReservationCandidate]) -> list[Path]:
+    return [
+        candidate.path
         for candidate in candidates
         if candidate.path.is_dir()
         and (
             lane_active_lock_is_held(candidate.path)
             or cargo_lock_is_busy(candidate.path)
         )
-    )
+    ]
 
 
 @contextmanager
@@ -1340,6 +1541,7 @@ def reserve_cargo_lane(
         warm_wait_seconds, lock_timeout_seconds
     )
     announced_wait = False
+    retry_delay = 0.01
     while active_handle is None:
         busy_reusable = False
         deferred_cold = False
@@ -1398,6 +1600,7 @@ def reserve_cargo_lane(
                         f"{base_lane!r} are busy; validation remains pending",
                         resource=root / base_lane,
                         wait_option="--warm-wait-seconds",
+                        blocking_resources=_busy_lane_paths(candidates),
                     )
                 deferred_cold = True
             for candidate in () if at_capacity else candidates:
@@ -1422,6 +1625,7 @@ def reserve_cargo_lane(
                             "Required validation remains pending.",
                             resource=root / base_lane,
                             wait_option="--warm-wait-seconds",
+                            blocking_resources=_busy_lane_paths(candidates),
                         )
                 candidate_dir.mkdir(exist_ok=True)
                 if cargo_lock_is_busy(candidate_dir):
@@ -1445,12 +1649,14 @@ def reserve_cargo_lane(
             announced_wait = True
         # Release the coordination lock while waiting so owners can finish and
         # other work can reserve unrelated lanes.
-        time.sleep(min(0.25, max(0.0, deadline - time.monotonic())))
+        time.sleep(min(retry_delay, max(0.0, deadline - time.monotonic())))
+        retry_delay = min(0.05, retry_delay * 1.5)
     if active_handle is None or target_dir is None or resolved_lane is None:
         raise RustAdmissionBusy(
             f"unable to reserve an idle Cargo lane for {base_lane!r}; validation remains pending",
             resource=root / base_lane,
             wait_option="--warm-wait-seconds",
+            blocking_resources=_busy_lane_paths(candidates),
         )
     stamp = target_dir / LANE_LAST_USED_STAMP
     try:
@@ -1927,9 +2133,12 @@ def _guard_named_runner_args(command: Sequence[str]) -> None:
     Leave wrappers, interpreter options and foreign scripts to their owners.
     The child still performs its normal validation against current inputs.
     """
-    if not _is_named_runner_command(command):
+    if not _is_named_runner_command(command, allow_interpreter_flags=True):
         return
-    arguments = list(command[2:])
+    script_index = 1
+    while command[script_index] in {"-I", "-B"}:
+        script_index += 1
+    arguments = list(command[script_index + 1:])
     if any(argument in {"-h", "--help"} for argument in arguments):
         return
 
@@ -1937,12 +2146,7 @@ def _guard_named_runner_args(command: Sequence[str]) -> None:
 
     try:
         args = rust_test_runner.build_parser().parse_args(arguments)
-        if args.command == "run-target":
-            filters = list(args.filter_args)
-            if filters[:1] == ["--"]:
-                filters = filters[1:]
-            filters = rust_test_runner._split_runner_owned_options(filters)[0]
-            rust_test_runner.validate_filtering_args(filters)
+        rust_test_runner._preflight_selection(args)
     except rust_test_runner.RunnerError as exc:
         raise ValueError(str(exc)) from exc
     except SystemExit as exc:
@@ -2166,6 +2370,48 @@ def maintain_cargo_lanes(repo_root: Path, lane_root: Path) -> None:
             os.environ["CODEX_CARGO_LANES_ROOT"] = previous_root
 
 
+def _maintenance_launch_lease(lane_root: Path, *, release: str | None = None) -> str | bool | None:
+    """Nonblocking generation claim; orphaned startup leases expire after 60s."""
+    guard = _try_acquire_binary_file_lock(lane_root / ".maintenance-launch.lock")
+    if guard is None:
+        return None
+    try:
+        path = lane_root / ".maintenance-launch.json"
+        try:
+            current = json.loads(path.read_text(encoding="utf-8"))
+            if not (
+                isinstance(current, dict)
+                and isinstance(current.get("generation"), str)
+                and current["generation"]
+                and type(current.get("expires_at")) in (int, float)
+                and math.isfinite(current["expires_at"])
+            ):
+                raise ValueError("invalid maintenance startup lease")
+        except FileNotFoundError:
+            current = None
+        except (ValueError, OSError):
+            # A launcher can die during its guarded write. Never retain a
+            # malformed permanent marker; reclaim only after the startup bound.
+            if time.time() - path.stat().st_mtime < 60:
+                return None
+            current = None
+        if release is not None:
+            if current is not None and current.get("generation") == release:
+                path.unlink()
+                return True
+            return False
+        if _binary_file_lock_is_busy(lane_root / ".cargo-lane-trash-cleanup.lock"):
+            return None
+        if current is not None and float(current.get("expires_at", 0)) > time.time():
+            return None
+        generation = str(uuid.uuid4())
+        path.write_text(json.dumps({"generation": generation, "launcher_pid": os.getpid(), "expires_at": time.time() + 60}), encoding="utf-8")
+        return generation
+    finally:
+        _release_binary_file_lock(guard)
+        guard.close()
+
+
 def request_cargo_lane_maintenance(repo_root: Path, lane_root: Path) -> None:
     """Request the shared worker; only explicit administration waits for pruning."""
     if os.environ.get("CODEX_CARGO_LANE_MAINTENANCE_SYNC") == "1":
@@ -2207,20 +2453,31 @@ def request_cargo_lane_maintenance(repo_root: Path, lane_root: Path) -> None:
     ]
     if due:
         command.append("-Prune")
+    generation = _maintenance_launch_lease(lane_root)
+    if not isinstance(generation, str):
+        return
+    command.extend(["-LaunchToken", generation])
     # The worker logs its own failures after acquiring ownership. Opening its
     # log here conflicts with PowerShell's append handle on Windows.
-    child = subprocess.Popen(
-        command,
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-        close_fds=True,
-    )
+    try:
+        child = subprocess.Popen(
+            command,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            close_fds=True,
+        )
+    except OSError:
+        _maintenance_launch_lease(lane_root, release=generation)
+        raise
     # Reap asynchronously if this launcher stays alive; never await pruning.
     import threading
 
-    threading.Thread(target=child.wait, daemon=True).start()
+    def reap() -> None:
+        child.wait()
+        _maintenance_launch_lease(lane_root, release=generation)
+    threading.Thread(target=reap, daemon=True).start()
 
 
 def _read_lane_build_context(target_dir: Path) -> object:
@@ -2307,8 +2564,7 @@ def cargo_build_context(
             "_core-gate-reserved",
         }
     )
-    if reserved_recipe == "_core-test-small-reserved":
-        options.extend(["--profile", "dev-small"])
+    options.extend(_cargo_profile_options(command))
     tokens = iter(command)
     for token in tokens:
         if token == "--":
@@ -2325,16 +2581,15 @@ def cargo_build_context(
             next(tokens, "")
         elif nextest and token.startswith("--profile="):
             continue
-        elif nextest and token == "--cargo-profile":
-            options.extend(["--profile", next(tokens, "")])
-        elif nextest and token.startswith("--cargo-profile="):
-            options.extend(["--profile", token.split("=", 1)[1]])
-        elif token in ("--profile", "--target", "--features", "-F"):
+        elif token in ("--cargo-profile", "--profile"):
+            next(tokens, "")
+        elif token.startswith(("--cargo-profile=", "--profile=")):
+            continue
+        elif token in ("--target", "--features", "-F"):
             options.extend(["--features" if token == "-F" else token, next(tokens, "")])
-        elif token.startswith(("--profile=", "--target=", "--features=")):
+        elif token.startswith(("--target=", "--features=")):
             options.extend(token.split("=", 1))
         elif token in (
-            "--release",
             "--all-features",
             "--no-default-features",
         ) or token.startswith("+"):
@@ -2494,10 +2749,29 @@ def run_in_cargo_lane(
                     file=sys.stderr,
                 )
             next_phase("command")
-            metrics.record["executed"] = True
-            from scripts.build.full_suite_dispatch import record_test_dispatch
+            from scripts.build.full_suite_dispatch import record_dispatch, record_test_dispatch
 
-            record_test_dispatch(child_command, child_env)
+            # Nested runners own their children; only direct Cargo leaves get
+            # a command work row in this envelope.
+            command_metrics = None
+            launched_at = None
+            reaped_at = None
+
+            def child_started(_process):
+                nonlocal command_metrics, launched_at
+                launched_at = time.monotonic()
+                metrics.record["executed"] = True
+                record_test_dispatch(child_command, child_env)
+                if Path(child_command[0]).stem.lower() == "cargo":
+                    subcommand = child_command[1] if len(child_command) > 1 else ""
+                    phase = (
+                        "check" if subcommand in {"check", "c", "clippy"}
+                        else "compile/discover" if "--no-run" in child_command
+                        or child_command[1:3] == ["nextest", "list"]
+                        else "build/test"
+                    )
+                    command_metrics = metrics.command(child_command, phase, 1)
+
             try:
                 try:
                     exit_code = run_owned(
@@ -2509,10 +2783,13 @@ def run_in_cargo_lane(
                             subprocess, "BELOW_NORMAL_PRIORITY_CLASS", 0
                         ),
                         prepare_sccache=True,
+                        on_spawn=child_started,
+                        on_spawn_error=lambda: record_dispatch("not_started", child_env),
                         check=False,
                         stdout=sys.stdout,
                         stderr=sys.stderr,
                     ).returncode
+                    reaped_at = time.monotonic()
                 except CleanupFailed:
                     (target_dir / ".lane-cleanup-unconfirmed").write_text(
                         "Process cleanup was not confirmed; inspect descendants before removing this quarantine.\n"
@@ -2525,7 +2802,7 @@ def run_in_cargo_lane(
                     else (
                         "busy"
                         if exit_code == RUST_ADMISSION_BUSY_EXIT_CODE
-                        and _is_named_runner_command(child_command)
+                        and _is_named_runner_command(child_command, allow_interpreter_flags=True)
                         else "failed"
                     ),
                 )
@@ -2544,6 +2821,12 @@ def run_in_cargo_lane(
                         )
                 return exit_code
             finally:
+                if command_metrics is not None:
+                    command_metrics["wall_seconds"] = (reaped_at if reaped_at is not None else time.monotonic()) - launched_at
+                    command_metrics["exit_code"] = record["exitCode"]
+                    command_metrics["outcome"] = (
+                        "passed" if record["exitCode"] == 0 else "failed"
+                    )
                 next_phase("release")
     except BaseException as error:
         if isinstance(error, TimeoutError) and phase == "reservation":
@@ -3247,6 +3530,9 @@ def prune_stale_lanes_report(
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Inspect local Rust build health.")
     subparsers = parser.add_subparsers(dest="command", required=True)
+    subparsers.add_parser(
+        "lane-affinity", help="Compute Cargo lane affinity from a JSON argument array on stdin."
+    )
     doctor_parser = subparsers.add_parser(
         "doctor", help="Show local Rust build environment and contention."
     )
@@ -3326,7 +3612,12 @@ def main(argv: list[str] | None = None) -> int:
         max_age_days = None
 
     try:
-        if args.command == "doctor":
+        if args.command == "lane-affinity":
+            command = json.load(sys.stdin)
+            if not isinstance(command, list) or not all(isinstance(value, str) for value in command):
+                raise ValueError("lane-affinity requires a JSON array of strings")
+            print(_auto_lane_base(command))
+        elif args.command == "doctor":
             print(build_doctor_report(include_disk=args.include_disk))
         elif args.command == "lanes":
             print(lane_report())

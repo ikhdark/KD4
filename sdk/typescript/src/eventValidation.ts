@@ -71,6 +71,17 @@ function validItem(value: unknown): boolean {
     case "file_change":
       return (
         ["in_progress", "completed", "failed", "declined"].includes(String(value.status)) &&
+        (value.effects === undefined ||
+          (object(value.effects) &&
+            typeof value.effects.exact === "boolean" &&
+            Array.isArray(value.effects.changes) &&
+            value.effects.changes.every(
+              (change) =>
+                object(change) &&
+                identity(change.path) &&
+                (change.before === null || text(change.before)) &&
+                (change.after === null || text(change.after)),
+            ))) &&
         Array.isArray(value.changes) &&
         value.changes.every(
           (change) =>

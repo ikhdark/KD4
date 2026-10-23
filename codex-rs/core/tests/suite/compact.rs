@@ -576,15 +576,30 @@ async fn summarize_context_three_requests_and_instructions() {
         1
     );
 
-    // Manual compact should use the dedicated bounded compaction instructions.
+    // Manual compact keeps the turn's instructions, tool schemas and
+    // parallel-call setting so it can reuse the session's cached prompt
+    // prefix; only tool calls are disabled for the summary request.
     let instr1 = body1.get("instructions").and_then(|v| v.as_str()).unwrap();
     let instr2 = body2.get("instructions").and_then(|v| v.as_str()).unwrap();
     assert_eq!(
-        instr2,
-        COMPACTION_BASE_INSTRUCTIONS.trim(),
-        "manual compact should use the dedicated compaction instructions"
+        instr2, instr1,
+        "manual compact should keep the turn's base instructions"
     );
-    assert_ne!(instr1, instr2);
+    assert_ne!(instr2, COMPACTION_BASE_INSTRUCTIONS.trim());
+    assert!(
+        body1["tools"]
+            .as_array()
+            .is_some_and(|tools| !tools.is_empty())
+    );
+    assert_eq!(
+        body2["tools"], body1["tools"],
+        "manual compact should advertise the turn's tool schemas"
+    );
+    assert_eq!(body2["parallel_tool_calls"], body1["parallel_tool_calls"]);
+    assert_eq!(
+        body2["tool_choice"], "none",
+        "manual compact must not call tools"
+    );
 
     // The summarization request should include the injected user input marker.
     let body2_str = body2.to_string();
@@ -608,6 +623,14 @@ async fn summarize_context_three_requests_and_instructions() {
     assert_eq!(
         text2, SUMMARIZATION_PROMPT,
         "expected summarize trigger, got `{text2}`"
+    );
+    assert_eq!(
+        last2["content"]
+            .as_array()
+            .and_then(|content| content.last())
+            .and_then(|part| part["text"].as_str()),
+        Some(COMPACTION_BASE_INSTRUCTIONS.trim()),
+        "the compaction contract should follow the summarize trigger"
     );
 
     // Third request must contain refreshed instructions, the summary, and the new user message.
@@ -1894,11 +1917,18 @@ async fn auto_compact_openai_provider_with_custom_prompt_uses_local_route() {
         .unwrap_or_default()
         .to_string();
     assert_eq!(
-        instructions,
-        COMPACTION_BASE_INSTRUCTIONS.trim(),
-        "auto compact should use the dedicated compaction instructions",
+        instructions, baseline_instructions,
+        "auto compact should keep the turn's base instructions for prompt-cache reuse",
     );
-    assert_ne!(instructions, baseline_instructions);
+    assert_ne!(instructions, COMPACTION_BASE_INSTRUCTIONS.trim());
+    assert_eq!(
+        body_auto["tools"], body_first["tools"],
+        "auto compact should advertise the turn's tool schemas"
+    );
+    assert_eq!(
+        body_auto["tool_choice"], "none",
+        "auto compact must not call tools"
+    );
 
     let input_auto = body_auto.get("input").and_then(|v| v.as_array()).unwrap();
     let last_auto = input_auto

@@ -723,103 +723,83 @@ fn connection_retry_delay_backs_off_and_is_bounded() {
 }
 
 #[tokio::test]
-async fn connection_recovery_reaches_https_fallback_without_exhausting_network_waits() {
-    let home = tempfile::tempdir().unwrap();
-    let (session, mut turn_context, events) =
-        crate::session::tests::make_session_and_context_with_auth_config_home_and_rx(
-            codex_login::CodexAuth::from_api_key("test key"),
-            Vec::new(),
-            home.path(),
-            |config| config.model_provider.supports_websockets = true,
-        )
-        .await;
-    let mut client_session = session.services.model_client.new_session();
-    let mut retry_state = ResponsesStreamRetryState::default();
-    let cancellation_token = CancellationToken::new();
-    assert!(session.services.model_client.responses_websocket_enabled());
-    // Shared fixtures default to batch Exec; this test is interactive.
-    std::sync::Arc::get_mut(&mut turn_context)
-        .expect("test turn context should be uniquely owned")
-        .session_source = SessionSource::Cli;
-    tokio::time::pause();
-
-    for expected_delay in [Duration::from_millis(500), Duration::from_secs(1)] {
+async fn connection_recovery_tries_https_before_waiting_without_spending_provider_retries() {
+    for max_retries in [0, 2] {
+        let home = tempfile::tempdir().unwrap();
+        let (session, mut turn, events) =
+            crate::session::tests::make_session_and_context_with_auth_config_home_and_rx(
+                codex_login::CodexAuth::from_api_key("test key"),
+                Vec::new(),
+                home.path(),
+                |config| config.model_provider.supports_websockets = true,
+            )
+            .await;
+        std::sync::Arc::get_mut(&mut turn).unwrap().session_source = SessionSource::Cli;
+        let mut client = session.services.model_client.new_session();
+        let mut state = ResponsesStreamRetryState::default();
+        let cancellation = CancellationToken::new();
+        tokio::time::pause();
         let started = tokio::time::Instant::now();
         handle_retryable_response_stream_error(
-            &mut retry_state,
-            2,
+            &mut state,
+            max_retries,
             connection_failed(),
-            &mut client_session,
+            &mut client,
             &session,
-            &turn_context,
+            &turn,
             ResponsesStreamRequest::Sampling,
-            &cancellation_token,
+            &cancellation,
+        )
+        .await
+        .unwrap();
+        assert_eq!(started.elapsed(), Duration::ZERO);
+        assert!(!session.services.model_client.responses_websocket_enabled());
+        assert_eq!(state.retries, 0);
+        assert_eq!(state.connection_retries, 0);
+        let emitted = std::iter::from_fn(|| events.try_recv().ok()).collect::<Vec<_>>();
+        assert_eq!(emitted.len(), 1);
+        assert!(matches!(&emitted[0].msg, EventMsg::Warning(warning)
+            if warning.message.contains("Falling back from WebSockets to HTTPS")));
+
+        // Persistent outages still back off on HTTP, without spending provider retries.
+        let started = tokio::time::Instant::now();
+        handle_retryable_response_stream_error(
+            &mut state,
+            max_retries,
+            connection_failed(),
+            &mut client,
+            &session,
+            &turn,
+            ResponsesStreamRequest::Sampling,
+            &cancellation,
         )
         .await
         .unwrap();
         assert!(
-            (expected_delay..=expected_delay + Duration::from_millis(1))
-                .contains(&started.elapsed())
+            (Duration::from_millis(500)..=Duration::from_millis(501)).contains(&started.elapsed())
         );
-        assert_eq!(retry_state.retries, 0);
-        assert!(session.services.model_client.responses_websocket_enabled());
+        assert_eq!(state.retries, 0);
+        assert_eq!(state.connection_retries, 1);
+
+        // Once HTTP can dispatch, provider errors retain the original budget,
+        // rather than granting a fresh retry window after a transport change.
+        for attempt in 0..=max_retries {
+            let result = handle_retryable_response_stream_error(
+                &mut state,
+                max_retries,
+                CodexErr::RequestTimeout,
+                &mut client,
+                &session,
+                &turn,
+                ResponsesStreamRequest::Sampling,
+                &cancellation,
+            )
+            .await;
+            assert_eq!(result.is_ok(), attempt < max_retries);
+        }
+        assert_eq!(state.retries, max_retries);
+        tokio::time::resume();
     }
-
-    let started = tokio::time::Instant::now();
-    handle_retryable_response_stream_error(
-        &mut retry_state,
-        2,
-        connection_failed(),
-        &mut client_session,
-        &session,
-        &turn_context,
-        ResponsesStreamRequest::Sampling,
-        &cancellation_token,
-    )
-    .await
-    .unwrap();
-    assert_eq!(started.elapsed(), Duration::ZERO);
-    assert!(!session.services.model_client.responses_websocket_enabled());
-    assert_eq!(retry_state.retries, 2);
-    assert_eq!(retry_state.connection_retries, 2);
-    let emitted = std::iter::from_fn(|| events.try_recv().ok()).collect::<Vec<_>>();
-    assert!(emitted.iter().any(|event| matches!(&event.msg,
-        EventMsg::Warning(warning) if warning.message.contains("Falling back from WebSockets to HTTPS"))));
-    assert!(emitted.iter().any(|event| matches!(&event.msg,
-        EventMsg::StreamError(error) if error.message.contains("attempt 1, next retry in 500.0ms"))));
-    assert!(emitted.iter().any(|event| matches!(&event.msg,
-        EventMsg::StreamError(error) if error.message.contains("attempt 2, next retry in 1.0s"))));
-
-    // A real network outage still waits after the transport fallback.
-    let started = tokio::time::Instant::now();
-    handle_retryable_response_stream_error(
-        &mut retry_state,
-        2,
-        connection_failed(),
-        &mut client_session,
-        &session,
-        &turn_context,
-        ResponsesStreamRequest::Sampling,
-        &cancellation_token,
-    )
-    .await
-    .unwrap();
-    assert!((Duration::from_secs(2)..=Duration::from_millis(2_001)).contains(&started.elapsed()));
-    assert_eq!(retry_state.retries, 2);
-    assert_eq!(retry_state.connection_retries, 3);
-
-    let result = handle_retryable_response_stream_error(
-        &mut retry_state,
-        2,
-        CodexErr::RequestTimeout,
-        &mut client_session,
-        &session,
-        &turn_context,
-        ResponsesStreamRequest::Sampling,
-        &cancellation_token,
-    )
-    .await;
-    assert!(matches!(result, Err(CodexErr::RequestTimeout)));
 }
 
 #[test]
@@ -907,6 +887,11 @@ async fn owner_cancellation_interrupts_each_active_retry_wait() {
             std::sync::Arc::get_mut(&mut turn).unwrap().session_source = SessionSource::Cli;
         }
         let mut client = session.services.model_client.new_session();
+        if kind == "network" {
+            // A failed WebSocket dial now switches to HTTPS immediately. The
+            // active offline wait belongs to a subsequent HTTP failure.
+            assert!(client.try_switch_fallback_transport(&turn.session_telemetry));
+        }
         let mut state = ResponsesStreamRetryState::default();
         let cancellation = CancellationToken::new();
         tokio::time::pause();
@@ -1393,4 +1378,87 @@ async fn due_usage_reset_retries_once_then_backs_off_with_the_same_deadline() {
         Err(CodexErr::TurnAborted)
     ));
     tokio::time::resume();
+}
+
+struct Audit143ExternalAuth {
+    key: std::sync::Mutex<String>,
+    held: std::sync::atomic::AtomicBool,
+    calls: std::sync::atomic::AtomicUsize,
+}
+
+impl codex_login::ExternalAuth for Audit143ExternalAuth {
+    fn resolve(&self) -> codex_login::ExternalAuthFuture<'_, codex_login::CodexAuth> {
+        Box::pin(async move {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if self.held.load(std::sync::atomic::Ordering::SeqCst) {
+                std::future::pending::<()>().await;
+            }
+            Ok(codex_login::CodexAuth::from_api_key(&self.key.lock().unwrap()))
+        })
+    }
+
+    fn refresh(&self, _: codex_login::ExternalAuthRefreshContext) -> codex_login::ExternalAuthFuture<'_, codex_login::CodexAuth> {
+        self.resolve()
+    }
+}
+
+#[tokio::test]
+async fn audit143_external_source_rotation_and_stalled_reload_respect_owner_bounds() {
+    for mode in [0, 1, 2] {
+        let home = tempfile::tempdir().unwrap();
+        let (session, mut turn, _events) = crate::session::tests::make_session_and_context_with_auth_config_home_and_rx(
+            codex_login::CodexAuth::from_api_key("test"), Vec::new(), home.path(), |_| {},
+        ).await;
+        let manager = interactive_turn_with_account(&mut turn, home.path());
+        let source = std::sync::Arc::new(Audit143ExternalAuth {
+            key: std::sync::Mutex::new("first-account".into()),
+            held: std::sync::atomic::AtomicBool::new(false),
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        manager.set_configured_external_auth(source.clone()).await.unwrap();
+        if mode == 0 { *source.key.lock().unwrap() = "second-account".into(); }
+        else { source.held.store(true, std::sync::atomic::Ordering::SeqCst); }
+        let failed = AccountChangeIdentity::ApiKey("first-account".into());
+        let error = usage_limit(None);
+        let cancellation = CancellationToken::new();
+        tokio::time::pause();
+        let start = tokio::time::Instant::now();
+        let mut deadline = Some(start + Duration::from_secs(15));
+        let wait = wait_for_account_change(AccountChangeWait::UsageLimit(&error, Some(&failed)),
+            &mut deadline, &session, &turn, &cancellation);
+        tokio::pin!(wait);
+        assert!(futures::poll!(wait.as_mut()).is_pending());
+        tokio::time::advance(ACCOUNT_CHANGE_RELOAD_INTERVAL).await;
+        if mode == 0 {
+            assert!(wait.await.unwrap());
+        } else {
+            assert!(futures::poll!(wait.as_mut()).is_pending());
+            if mode == 1 {
+                cancellation.cancel();
+                assert!(matches!(wait.await, Err(CodexErr::TurnAborted)));
+            } else {
+                tokio::time::advance(Duration::from_secs(5)).await;
+                assert!(!wait.await.unwrap());
+            }
+        }
+        assert_eq!(source.calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert!(start.elapsed() <= Duration::from_secs(15));
+        tokio::time::resume();
+    }
+}
+
+#[tokio::test]
+async fn audit143_explicit_websocket_rejection_has_one_zero_budget_repair() {
+    for reason in [codex_protocol::error::WebsocketRecoveryReason::PreviousResponseNotFound,
+        codex_protocol::error::WebsocketRecoveryReason::ConnectionLimitReached] {
+        let (session, turn) = crate::session::tests::make_session_and_context().await;
+        let mut client = session.services.model_client.new_session();
+        let mut retry = ResponsesStreamRetryState::default();
+        let rejected = || CodexErr::WebsocketRejected { reason, message: "rejected".into(), retry_after: None };
+        handle_retryable_response_stream_error(&mut retry, 0, rejected(), &mut client, &session,
+            &turn, ResponsesStreamRequest::Sampling, &CancellationToken::new()).await.unwrap();
+        assert!(handle_retryable_response_stream_error(&mut retry, 0, rejected(), &mut client, &session,
+            &turn, ResponsesStreamRequest::Sampling, &CancellationToken::new()).await.is_err());
+        assert_eq!(retry.retries, 0);
+    }
 }

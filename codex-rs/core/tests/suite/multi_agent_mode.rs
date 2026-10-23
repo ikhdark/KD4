@@ -881,23 +881,23 @@ async fn assert_registered_wait_item_terminal_with_stalled_store(
     })
     .await
     .context("child entered its delayed normal model request before priming")?;
-    // A normal registered wait drains the Accepted/Starting wake backlog before
-    // testing timeout or cancellation in a separate user turn.
+    // A normal registered wait acknowledges the child's admission backlog before
+    // testing timeout or cancellation in a separate user turn. Admission is not
+    // progress, so the zero-timeout primer consumes it and times out.
     test.submit_turn(PRIME_PROMPT).await?;
     let primed_output = primed_response
         .function_call_output_text(PRIME_ID)
         .expect("normal registered primer returned a model-visible result");
     let primed: Value = serde_json::from_str(&primed_output)?;
-    assert_eq!(
-        primed["message"],
-        "Durable typed-task progress is available."
-    );
-    assert_eq!(primed["timed_out"], false);
     assert!(
-        primed["typed_deltas"]
-            .as_array()
-            .is_some_and(|deltas| !deltas.is_empty())
+        primed["message"]
+            .as_str()
+            .is_some_and(|message| message.starts_with("Wait timed out.")
+                && message.contains("admission-only")),
+        "{primed_output}"
     );
+    assert_eq!(primed["timed_out"], true);
+    assert_eq!(primed["typed_deltas"], json!([]));
     assert!(
         primed["cursor"]
             .as_str()

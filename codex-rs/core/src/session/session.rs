@@ -42,6 +42,24 @@ pub(crate) static SESSION_INIT_PERSISTENCE_TEST_HOOK: std::sync::Mutex<
 const TOOL_HISTORY_JOURNAL_COMPACTION_RECORDS: u64 = 128;
 const TOOL_HISTORY_JOURNAL_COMPACTION_BYTES: u64 = 1024 * 1024;
 
+fn coordination_startup_result(
+    source: &SessionSource,
+    result: codex_agent_task_store::StoreResult<()>,
+) -> anyhow::Result<bool> {
+    match result {
+        Ok(()) => Ok(true),
+        Err(error) if source.is_non_root_agent() => {
+            Err(anyhow::anyhow!("failed to initialize child task coordination: {error}"))
+        }
+        Err(error) => {
+            // Root analysis remains usable. Missing validation scope obtains an
+            // uncertain/spent budget, and spawn still requires durable admission.
+            warn!(%error, "task coordination unavailable; dependent operations remain fail-closed");
+            Ok(false)
+        }
+    }
+}
+
 enum ToolHistoryPersistenceCommand {
     Mutation(Box<crate::tool_history::ToolHistoryMutation>),
     Checkpoint,
@@ -819,6 +837,10 @@ pub(crate) struct Session {
     /// Last tool-surface definition queued for this rollout. Repeated requests persist a compact
     /// reference while the terminal barrier remains the durability owner.
     pub(super) queued_tool_manifest_hash: std::sync::Mutex<Option<String>>,
+    /// SHA-256 digests of freshness notices whose text a sampling boundary in this
+    /// rollout already persisted. Later boundaries reference them by digest.
+    pub(super) persisted_freshness_notice_digests:
+        std::sync::Mutex<std::collections::HashSet<String>>,
     /// Owns terminal coordinators so request cancellation cannot strand a claimed turn.
     pub(crate) terminal_tasks: tokio_util::task::TaskTracker,
     /// Writer retirement can outlive the loop's bounded shutdown observation.
@@ -1755,70 +1777,67 @@ impl Session {
             e
         })?;
         if let Some(state_runtime) = state_db_ctx.as_ref() {
-            if let Err(error) =
-                crate::tools::handlers::agent_jobs::reconcile_orphaned_agent_jobs_after_restart(
-                    Arc::clone(state_runtime),
-                )
-                .await
-            {
-                warn!(%error, "failed to reconcile orphaned agent jobs after restart");
-            }
+            // One shared owner performs historical recovery/export off session
+            // startup. New jobs are fenced by their current runner identity.
             crate::tools::handlers::agent_jobs::start_orphaned_agent_job_reconciler(Arc::clone(
                 state_runtime,
             ));
         }
         let mut runtime_init = SessionRuntimeInitGuard::default();
         let session_result: anyhow::Result<Arc<Self>> = async {
+            let mut coordination_ready = true;
             if initial_multi_agent_version == Some(MultiAgentVersion::V2)
                 && let Some(state_runtime) = state_db_ctx.as_ref()
             {
-                agent_control
-                    .task_coordinator()
-                    .initialize(Arc::clone(state_runtime), session_id.to_string())
-                    .await
-                    .map_err(|error| {
-                        anyhow::anyhow!("failed to initialize typed agent task store: {error}")
-                    })?;
+                coordination_ready = coordination_startup_result(
+                    &session_configuration.session_source,
+                    agent_control
+                        .task_coordinator()
+                        .initialize(Arc::clone(state_runtime), session_id.to_string())
+                        .await,
+                )?;
             }
-            if config.features.enabled(Feature::Kd4Runtime) {
+            if config.features.enabled(Feature::Kd4Runtime) && coordination_ready {
                 let coordinator = agent_control.task_coordinator();
-                coordinator
-                    .initialize_for_workspace_coordination(
-                        state_db_ctx.clone(),
-                        config.sqlite_home.clone(),
-                        config.model_provider_id.clone(),
-                        session_id.to_string(),
-                    )
-                    .await
-                    .map_err(|error| {
-                        anyhow::anyhow!("failed to initialize validation task budgets: {error}")
-                    })?;
-                let parent = parent_thread_id
-                    .or(session_configuration.forked_from_thread_id)
-                    .map(|id| id.to_string());
-                let store = coordinator
-                    .store()
-                    .ok_or_else(|| anyhow::anyhow!("validation task store is unavailable"))?;
-                if let Some((task, grant)) = agent_control.inherited_validation_task_scope.as_ref()
-                {
-                    store
-                        .inherit_validation_task_scope(&thread_id.to_string(), task, grant)
-                        .await
-                        .map_err(|error| {
-                            anyhow::anyhow!("failed to inherit validation task budget: {error}")
-                        })?;
-                } else {
-                    store
-                        .initialize_validation_task(
-                            &thread_id.to_string(),
-                            parent.as_deref(),
-                            matches!(&initial_history, InitialHistory::New) && parent.is_none(),
+                let validation_init: codex_agent_task_store::StoreResult<()> = async {
+                    coordinator
+                        .initialize_for_workspace_coordination(
+                            state_db_ctx.clone(),
+                            config.sqlite_home.clone(),
+                            config.model_provider_id.clone(),
+                            session_id.to_string(),
                         )
-                        .await
-                        .map_err(|error| {
-                            anyhow::anyhow!("failed to bind validation task budget: {error}")
-                        })?;
+                        .await?;
+                    let parent = parent_thread_id
+                        .or(session_configuration.forked_from_thread_id)
+                        .map(|id| id.to_string());
+                    let store = coordinator.store().ok_or_else(|| {
+                        codex_agent_task_store::StoreError::CorruptData(
+                            "validation task store is unavailable".into(),
+                        )
+                    })?;
+                    if let Some((task, grant)) =
+                        agent_control.inherited_validation_task_scope.as_ref()
+                    {
+                        store
+                            .inherit_validation_task_scope(&thread_id.to_string(), task, grant)
+                            .await?;
+                    } else {
+                        store
+                            .initialize_validation_task(
+                                &thread_id.to_string(),
+                                parent.as_deref(),
+                                matches!(&initial_history, InitialHistory::New) && parent.is_none(),
+                            )
+                            .await?;
+                    }
+                    Ok(())
                 }
+                .await;
+                coordination_startup_result(
+                    &session_configuration.session_source,
+                    validation_init,
+                )?;
             }
             let rollout_path = if let Some(live_thread) = live_thread_init.as_ref() {
                 live_thread.local_rollout_path().await?
@@ -2378,6 +2397,7 @@ impl Session {
                 request_scaffold_cache: Default::default(),
                 turn_config_cache: Default::default(),
                 queued_tool_manifest_hash: Default::default(),
+                persisted_freshness_notice_digests: Default::default(),
                 terminal_tasks: tokio_util::task::TaskTracker::new(),
                 persistence_tasks: tokio_util::task::TaskTracker::new(),
                 persistence_retirement_result: Default::default(),

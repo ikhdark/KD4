@@ -99,6 +99,10 @@ impl ExecProcessEvent {
 }
 
 impl ExecProcessEventLog {
+    pub(crate) fn same_instance(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.inner, &other.inner)
+    }
+
     pub(crate) fn new(event_capacity: usize, byte_capacity: usize) -> Self {
         let (live_tx, _live_rx) = broadcast::channel(event_capacity);
         Self {

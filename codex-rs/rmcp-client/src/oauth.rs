@@ -599,7 +599,34 @@ struct OAuthPersistenceState {
     keyring_backend_kind: AuthKeyringBackendKind,
     operation_lock: Arc<Mutex<()>>,
     last_credentials: Arc<Mutex<Option<StoredOAuthTokens>>>,
+    pending_write: Arc<std::sync::Mutex<Option<PendingOAuthWrite>>>,
+    next_write_generation: std::sync::atomic::AtomicU64,
     executor: OAuthPersistenceExecutor,
+}
+
+struct PendingOAuthWrite {
+    generation: u64,
+    credentials: Option<StoredOAuthTokens>,
+}
+
+struct PendingOAuthWriteGuard {
+    pending: Arc<std::sync::Mutex<Option<PendingOAuthWrite>>>,
+    generation: u64,
+}
+
+impl Drop for PendingOAuthWriteGuard {
+    fn drop(&mut self) {
+        let mut pending = self
+            .pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if pending
+            .as_ref()
+            .is_some_and(|write| write.generation == self.generation)
+        {
+            *pending = None;
+        }
+    }
 }
 
 impl OAuthPersistenceState {
@@ -618,6 +645,8 @@ impl OAuthPersistenceState {
             keyring_backend_kind,
             operation_lock: Arc::new(Mutex::new(())),
             last_credentials: Arc::new(Mutex::new(initial_credentials)),
+            pending_write: Arc::default(),
+            next_write_generation: std::sync::atomic::AtomicU64::new(0),
             executor,
         }
     }
@@ -713,13 +742,32 @@ impl OAuthPersistenceState {
     ) -> Result<()> {
         let executor = Arc::clone(&self.executor);
         let last_credentials = Arc::clone(&self.last_credentials);
+        let next_credentials = match &operation {
+            OAuthPersistenceOperation::Save { tokens, .. } => Some(*tokens.clone()),
+            OAuthPersistenceOperation::Delete { .. } => None,
+        };
+        let generation = self
+            .next_write_generation
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        *self
+            .pending_write
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(PendingOAuthWrite {
+            generation,
+            credentials: next_credentials.clone(),
+        });
+        let pending_guard = PendingOAuthWriteGuard {
+            pending: Arc::clone(&self.pending_write),
+            generation,
+        };
         tokio::task::spawn_blocking(move || {
             let _operation_guard = operation_guard;
-            let next_credentials = match &operation {
-                OAuthPersistenceOperation::Save { tokens, .. } => Some(*tokens.clone()),
-                OAuthPersistenceOperation::Delete { .. } => None,
-            };
-            executor(operation)?;
+            let _pending_guard = pending_guard;
+            executor(operation).inspect_err(|error| {
+                // The original observer may have timed out or coalesced. The
+                // admitted owner must still surface a late durability failure.
+                warn!(%error, "OAuth credential persistence failed");
+            })?;
             // The durable write and bookkeeping share ownership even if the waiter is dropped.
             *last_credentials.blocking_lock() = next_credentials;
             Ok(())
@@ -782,6 +830,45 @@ impl OAuthPersistor {
         tokio::time::timeout(OAUTH_PERSISTENCE_TIMEOUT, self.persist_latest())
             .await
             .context("timed out persisting OAuth credentials; durability remains pending")?
+    }
+
+    /// Post-result observation may join an already admitted generation without
+    /// awaiting the same slow write again. This is not a durability receipt:
+    /// initialize/recovery keep persist_if_needed's completion boundary.
+    pub(crate) async fn observe_after_operation(&self) -> Result<()> {
+        tokio::time::timeout(OAUTH_PERSISTENCE_TIMEOUT, async {
+            let stored = self.inner.credential_store.load().await?;
+            let already_admitted = {
+                let pending = self
+                    .inner
+                    .persistence
+                    .pending_write
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                pending
+                    .as_ref()
+                    .is_some_and(|write| match (&write.credentials, &stored) {
+                        (Some(admitted), Some(current)) => {
+                            current.token_response.as_ref().is_some_and(|token| {
+                                admitted.client_id == current.client_id
+                                    && admitted.token_response
+                                        == WrappedOAuthTokenResponse(token.clone())
+                            })
+                        }
+                        (None, None) => true,
+                        (None, Some(current)) => current.token_response.is_none(),
+                        _ => false,
+                    })
+            };
+            if already_admitted {
+                return Ok(());
+            }
+            // Sample again after acquiring write order. A differing old save or
+            // delete must finish before we decide that the latest state is saved.
+            self.persist_latest().await
+        })
+        .await
+        .context("timed out persisting OAuth credentials; durability remains pending")?
     }
 
     /// Persists the latest stored credentials if they have changed.
@@ -1652,6 +1739,83 @@ mod tests {
                 AuthKeyringBackendKind::Direct,
             )?
             .is_none()
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn post_result_observers_coalesce_an_admitted_generation_but_not_a_later_delete()
+    -> Result<()> {
+        use rmcp::transport::auth::StoredCredentials;
+        let tokens = sample_tokens();
+        let store = InMemoryCredentialStore::new();
+        store
+            .save(StoredCredentials::new(
+                tokens.client_id.clone(),
+                Some(tokens.token_response.0.clone()),
+                vec![],
+                None,
+            ))
+            .await?;
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let entered = std::sync::Mutex::new(Some(entered_tx));
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let release = std::sync::Mutex::new(release_rx);
+        let writes = Arc::new(AtomicUsize::new(0));
+        let count = writes.clone();
+        let persistor = OAuthPersistor {
+            inner: Arc::new(OAuthPersistorInner {
+                credential_store: store.clone(),
+                persistence: OAuthPersistenceState::new(
+                    tokens.server_name,
+                    tokens.url,
+                    OAuthCredentialsStoreMode::File,
+                    AuthKeyringBackendKind::Direct,
+                    None,
+                    Arc::new(move |operation| {
+                        count.fetch_add(1, Ordering::SeqCst);
+                        if matches!(operation, OAuthPersistenceOperation::Save { .. }) {
+                            entered.lock().unwrap().take().unwrap().send(()).unwrap();
+                            release
+                                .lock()
+                                .unwrap()
+                                .recv_timeout(Duration::from_secs(5))?;
+                        }
+                        Ok(())
+                    }),
+                ),
+            }),
+        };
+        let saving = tokio::spawn({
+            let persistor = persistor.clone();
+            async move { persistor.persist_if_needed().await }
+        });
+        entered_rx.await?;
+        let observers = tokio::time::timeout(Duration::from_millis(100), async {
+            persistor.observe_after_operation().await?;
+            persistor.observe_after_operation().await
+        })
+        .await;
+        store.clear().await?;
+        let deletion = persistor.observe_after_operation();
+        tokio::pin!(deletion);
+        assert!(
+            futures::poll!(&mut deletion).is_pending(),
+            "old save cannot prove a later deletion durable"
+        );
+        release_tx.send(())?;
+        saving.await??;
+        deletion.await?;
+        observers??;
+        assert_eq!(writes.load(Ordering::SeqCst), 2);
+        assert!(
+            persistor
+                .inner
+                .persistence
+                .last_credentials
+                .lock()
+                .await
+                .is_none()
         );
         Ok(())
     }

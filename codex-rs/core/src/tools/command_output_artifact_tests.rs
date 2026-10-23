@@ -2,6 +2,129 @@ use super::*;
 use codex_utils_string::approx_token_count;
 use std::time::Duration;
 
+#[test]
+fn oversized_search_prices_context_once_and_matches_reference_fitting() {
+    struct ResetReference;
+    impl Drop for ResetReference {
+        fn drop(&mut self) {
+            SEARCH_REFERENCE_FITTER.with(|flag| flag.set(false));
+        }
+    }
+    let _reset = ResetReference;
+    for context_lines in [0, 4] {
+        let source = (0..100).map(|line| {
+            format!("needle {line:03} {}\t\"\\\0é\n", "x".repeat(2_000))
+        }).collect::<String>();
+        let canonical = CanonicalToolResult::text(source);
+        let metadata = producer_snapshot_metadata(&canonical, uuid::Uuid::nil().to_string()).unwrap();
+        let selector = ToolOutputSelector::Search {
+            query: "needle".into(), start_byte: 0, max_results: 100,
+            case_insensitive: false, enclosing: false, context_lines,
+        };
+        for budget in [SearchBudget::SelectorBytes(20_000), SearchBudget::ResponseTokens(5_000)] {
+            SEARCH_REFERENCE_FITTER.with(|flag| flag.set(true));
+            SEARCH_HYDRATED_BYTES.with(|count| count.set(0));
+            let expected = search_logical_artifact(&metadata, &canonical.bytes, selector.clone(), budget, &[], None);
+            let reference_bytes = SEARCH_HYDRATED_BYTES.with(std::cell::Cell::get);
+            SEARCH_REFERENCE_FITTER.with(|flag| flag.set(false));
+            SEARCH_HYDRATED_BYTES.with(|count| count.set(0));
+            let actual = search_logical_artifact(&metadata, &canonical.bytes, selector.clone(), budget, &[], None);
+            let optimized_bytes = SEARCH_HYDRATED_BYTES.with(std::cell::Cell::get);
+            assert_eq!(serde_json::to_value(&actual).unwrap(), serde_json::to_value(&expected).unwrap());
+            assert!(optimized_bytes * 4 < reference_bytes, "context copying must not grow with every fitted prefix");
+            let value = actual.value.as_ref().unwrap();
+            assert!(value["matches_returned"].as_u64().unwrap() > 0);
+            assert!(value["matches_returned"].as_u64().unwrap() < 100);
+            assert!(actual.continuation.is_some());
+        }
+    }
+}
+
+#[test]
+fn batched_search_pages_reuse_exact_counts_without_rescanning_the_suffix() {
+    let canonical = CanonicalToolResult::text("needle\n".repeat(10_000));
+    let metadata = producer_snapshot_metadata(&canonical, uuid::Uuid::nil().to_string()).unwrap();
+    let search = |start_byte| ToolOutputSelector::Search {
+        query: "needle".into(),
+        case_insensitive: false,
+        start_byte,
+        max_results: 2,
+        context_lines: 0,
+        enclosing: false,
+    };
+    SEARCH_MATCH_STEPS.with(|count| count.set(0));
+    let output = select_tool_output_snapshot(
+        &metadata,
+        &canonical.bytes,
+        vec![search(0), search(14)],
+        9_000,
+    )
+    .unwrap();
+    assert!(output.complete);
+    let first = output.results[0].value.as_ref().unwrap();
+    let second = output.results[1].value.as_ref().unwrap();
+    assert_eq!(first["total_matches"], 10_000);
+    assert_eq!(second["total_matches"], 9_998);
+    assert_eq!(second["remaining_match_count"], 9_996);
+    assert_eq!(second["matches"][0]["start_byte"], 14);
+    assert_eq!(second["matches"][1]["start_byte"], 21);
+    SEARCH_MATCH_STEPS.with(|count| assert_eq!(count.get(), 10_002));
+
+    // Starting inside a previous non-overlapping match must perform its own
+    // scan: "aa" in "aaaaa" starts at 1, not the cached match at 2.
+    let canonical = CanonicalToolResult::text("aaaaa");
+    let metadata = producer_snapshot_metadata(&canonical, uuid::Uuid::nil().to_string()).unwrap();
+    let overlapping = |start_byte| ToolOutputSelector::Search {
+        query: "aa".into(),
+        case_insensitive: false,
+        start_byte,
+        max_results: 1,
+        context_lines: 0,
+        enclosing: false,
+    };
+    let output = select_tool_output_snapshot(
+        &metadata,
+        &canonical.bytes,
+        vec![overlapping(0), overlapping(1)],
+        9_000,
+    )
+    .unwrap();
+    assert_eq!(
+        output.results[1].value.as_ref().unwrap()["total_matches"],
+        2
+    );
+    assert_eq!(
+        output.results[1].value.as_ref().unwrap()["matches"][0]["start_byte"],
+        1
+    );
+}
+
+#[tokio::test]
+async fn validated_snapshot_opens_each_segment_once_without_skipping_integrity() {
+    let home = tempfile::tempdir().unwrap();
+    let canonical = CanonicalToolResult::text("λ first\r\n😀 second\r\n".repeat(2_000));
+    let artifact = create_canonical_output_artifact(home.path(), "open-once", &canonical).await;
+    let id: ToolOutputArtifactId = artifact.artifact_id().unwrap().parse().unwrap();
+    let path = home
+        .path()
+        .join("tool-output/open-once")
+        .join(format!("{id}.log"));
+    let (metadata, _lease) = load_logical_metadata(&path, id).unwrap();
+    REGULAR_ARTIFACT_OPEN_COUNT.with(|count| count.set(0));
+    let recovered = load_validated_logical_snapshot(&path, &metadata).unwrap();
+    assert_eq!(recovered, canonical.bytes);
+    REGULAR_ARTIFACT_OPEN_COUNT.with(|count| assert_eq!(count.get(), metadata.segments.len()));
+    drop(_lease);
+    let segment = logical_segment_path(&path, metadata.segments[0].index);
+    let mut changed = std::fs::read(&segment).unwrap();
+    changed[0] ^= 1;
+    std::fs::write(&segment, &changed).unwrap();
+    assert!(load_validated_logical_snapshot(&path, &metadata).is_err());
+    changed.push(b'!');
+    std::fs::write(&segment, changed).unwrap();
+    assert!(load_validated_logical_snapshot(&path, &metadata).is_err());
+}
+
 #[tokio::test]
 async fn all_raw_producers_reject_equal_length_substituted_bytes_after_reopen() {
     let home = tempfile::tempdir().unwrap();
@@ -7742,4 +7865,134 @@ async fn audit63_segmented_snapshot_owns_the_whole_family_until_copy_finishes() 
         InactiveRemovalOutcome::RemovedOrAbsent
     ));
     assert!(!path.exists());
+}
+
+/// Audit 145 (A145-05): a newline-dense file keeps its default page and exact
+/// byte selection on the producer path; only line selection fails, explicitly.
+/// The control at the cap keeps its dense line index.
+#[test]
+fn audit145_claude_newline_dense_file_snapshot_keeps_byte_selection() {
+    let dense = CanonicalToolResult::text("1\n".repeat(MAX_CANONICAL_LINE_OFFSETS + 1));
+    let (page, continuation) = select_file_snapshot_with_ceiling(&dense, None, 2_000)
+        .expect("a default page needs no line index");
+    assert!(page.complete);
+    assert!(
+        page.results[0]
+            .text
+            .as_deref()
+            .is_some_and(|text| text.starts_with("1\n1\n"))
+    );
+    assert!(matches!(
+        continuation,
+        Some(ToolOutputSelector::Bytes { end, .. }) if end == dense.exact_bytes
+    ));
+
+    let (selected, _) = select_file_snapshot_with_ceiling(
+        &dense,
+        Some(vec![
+            ToolOutputSelector::Bytes { start: 0, end: 4 },
+            ToolOutputSelector::Lines { start: 1, end: 1 },
+        ]),
+        2_000,
+    )
+    .expect("explicit selection of a newline-dense file");
+    assert!(!selected.complete);
+    let bytes = selected
+        .results
+        .iter()
+        .find(|result| matches!(result.selector, ToolOutputSelector::Bytes { .. }))
+        .expect("byte result");
+    assert_eq!(bytes.status, ToolOutputSelectorStatus::Ok);
+    assert_eq!(bytes.text.as_deref(), Some("1\n1\n"));
+    let lines = selected
+        .results
+        .iter()
+        .find(|result| matches!(result.selector, ToolOutputSelector::Lines { .. }))
+        .expect("line result");
+    assert_eq!(lines.status, ToolOutputSelectorStatus::Invalid);
+    assert!(lines.text.is_none());
+    assert!(
+        lines
+            .message
+            .as_deref()
+            .is_some_and(|message| message.contains("line indexing"))
+    );
+
+    let control = CanonicalToolResult::text("1\n".repeat(MAX_CANONICAL_LINE_OFFSETS));
+    let (selected, _) = select_file_snapshot_with_ceiling(
+        &control,
+        Some(vec![ToolOutputSelector::Lines { start: 1, end: 1 }]),
+        2_000,
+    )
+    .expect("cap-sized control keeps its line index");
+    assert_eq!(selected.results[0].status, ToolOutputSelectorStatus::Ok);
+    assert_eq!(selected.results[0].text.as_deref(), Some("1\n"));
+}
+
+/// Audit 145 (A145-05): canonical creation retains a newline-dense result
+/// without a dense index, and validated loading still authenticates bytes.
+#[tokio::test]
+#[serial_test::serial(command_output_artifact)]
+async fn audit145_claude_newline_dense_canonical_artifact_is_retained_and_byte_recoverable() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let dense = CanonicalToolResult::text("1\n".repeat(MAX_CANONICAL_LINE_OFFSETS + 1));
+    let artifact = create_canonical_output_artifact(temp.path(), "thread", &dense).await;
+    assert!(artifact.complete, "{:?}", artifact.error);
+    assert_eq!(artifact.retained_bytes, dense.exact_bytes);
+    let artifact_id = artifact.artifact_id().expect("canonical artifact ID");
+    let recovered = read_tool_output_selectors(
+        temp.path(),
+        "thread",
+        &artifact_id,
+        vec![
+            ToolOutputSelector::Bytes { start: 0, end: 4 },
+            ToolOutputSelector::Lines { start: 1, end: 1 },
+        ],
+    )
+    .await
+    .expect("a validated dense snapshot loads without a line index");
+    let bytes = recovered
+        .results
+        .iter()
+        .find(|result| matches!(result.selector, ToolOutputSelector::Bytes { .. }))
+        .expect("byte result");
+    assert_eq!(bytes.text.as_deref(), Some("1\n1\n"));
+    let lines = recovered
+        .results
+        .iter()
+        .find(|result| matches!(result.selector, ToolOutputSelector::Lines { .. }))
+        .expect("line result");
+    assert_eq!(lines.status, ToolOutputSelectorStatus::Invalid);
+
+    // Negative control: storing no index must not weaken byte authentication.
+    let corrupted = create_canonical_output_artifact(temp.path(), "thread", &dense).await;
+    let corrupted_id = corrupted.artifact_id().expect("canonical artifact ID");
+    let path = temp
+        .path()
+        .join("tool-output/thread")
+        .join(format!("{corrupted_id}.log"));
+    let mut stale = std::fs::read(&path).expect("read artifact segment");
+    stale[0] ^= 1;
+    std::fs::write(&path, stale).expect("replace artifact with same-sized stale bytes");
+    let error = read_tool_output_selectors(
+        temp.path(),
+        "thread",
+        &corrupted_id,
+        vec![ToolOutputSelector::Bytes { start: 0, end: 4 }],
+    )
+    .await
+    .expect_err("stale SHA must fail");
+    assert!(matches!(
+        error,
+        ReadToolOutputError::Io(message) if message.contains("SHA identity")
+    ));
+}
+
+/// Audit 145 (A145-08): a running command's writer holds its artifact until
+/// exit, so the retry guidance must name exit and never a yielded poll.
+#[test]
+fn audit145_claude_still_writing_guidance_names_exit_not_a_yield() {
+    let message = ReadToolOutputError::StillWriting.for_model();
+    assert!(message.contains("after the command exits"), "{message}");
+    assert!(!message.contains("retry after the command yields"), "{message}");
 }

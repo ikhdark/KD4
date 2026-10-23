@@ -812,6 +812,7 @@ async fn http_network_approval_preserves_foreign_environment_cwd_uri() -> anyhow
         env: std::collections::HashMap::new(),
         exec_server_env_config: None,
         explicit_env_overrides: std::collections::HashMap::new(),
+        has_command_env_overrides: false,
         network: Some(proxy_owner.proxy()),
         tty: false,
         sandbox_permissions: SandboxPermissions::UseDefault,

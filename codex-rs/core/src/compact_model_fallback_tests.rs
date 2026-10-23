@@ -102,3 +102,34 @@ fn local_compaction_does_not_bypass_provider_or_storage_failures() {
         &CodexErr::InvalidRequest("unsupported compaction format".into(),)
     ));
 }
+
+#[test]
+fn rejected_checkpoints_fall_back_but_harness_failures_do_not() {
+    use super::is_compaction_contract_violation;
+    use super::should_retry_with_local_compaction;
+    for message in [
+        "compaction completed without a checkpoint handoff",
+        "default compaction requires structured checkpoint sections",
+        "compaction handoff is incomplete; missing non-empty sections: ## Evidence",
+        "remote compaction v2 expected exactly one compaction output item, got 0 from 1 output items",
+        "remote compaction v2 returned an empty checkpoint",
+    ] {
+        let error = CodexErr::Fatal(message.to_string());
+        assert!(is_compaction_contract_violation(&error), "{message}");
+        assert!(should_retry_with_current_model(&error), "{message}");
+        assert!(should_retry_with_local_compaction(&error), "{message}");
+    }
+    for message in [
+        "Compaction recovery artifact is unavailable; original history was retained.",
+        "Compaction could not preserve exact unresolved text; original history was retained.",
+        "Compaction source retention failed; original history was retained: disk full",
+        "Compaction did not bring the context below its configured token limit.",
+        // A diagnostic that quotes a rejection is not that rejection.
+        "recovery failed after: remote compaction v2 returned an empty checkpoint",
+    ] {
+        let error = CodexErr::Fatal(message.to_string());
+        assert!(!is_compaction_contract_violation(&error), "{message}");
+        assert!(!should_retry_with_current_model(&error), "{message}");
+        assert!(!should_retry_with_local_compaction(&error), "{message}");
+    }
+}

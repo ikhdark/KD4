@@ -2078,6 +2078,7 @@ mod tests {
         cwd: Option<&str>,
     ) -> EnvironmentInfo {
         EnvironmentInfo {
+            resource_id: None,
             operating_system: operating_system.map(str::to_string),
             shell: ShellInfo {
                 name: shell.to_string(),

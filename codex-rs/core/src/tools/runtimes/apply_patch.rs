@@ -71,6 +71,7 @@ pub struct ApplyPatchRuntime {
     workspace_tracking_finished: bool,
     mutation_repo_root: Option<PathBuf>,
     mutation_repo_paths: Vec<String>,
+    pending_source_mutation: Option<crate::git_workspace::PendingSourceMutation>,
     workspace_operation_permit: Option<crate::scoped_workspace_gate::WorkspaceLease>,
     mutation_in_progress: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
@@ -173,17 +174,11 @@ impl ApplyPatchRuntime {
         )?;
         let repo_paths = mutation_paths.paths;
 
-        if repo_paths.is_empty() || !mutation_paths.complete {
-            ctx.session
-                .services
-                .git_workspace
-                .note_host_workspace_mutation();
-        } else {
-            ctx.session
-                .services
-                .git_workspace
-                .note_host_workspace_mutation_paths(&repo_root, &repo_paths)
-                .await;
+        // Admission is uncertainty, not evidence that an intended path changed.
+        if self.pending_source_mutation.is_none() {
+            self.pending_source_mutation = Some(
+                ctx.session.services.git_workspace.begin_host_workspace_mutation(),
+            );
         }
 
         self.mutation_repo_root = Some(repo_root);
@@ -194,7 +189,7 @@ impl ApplyPatchRuntime {
 
     async fn finish_workspace_tracking(&mut self, ctx: &ToolCtx, finish_tracking: bool) {
         self.workspace_tracking_started = false;
-        let (repo_root, repo_paths) = if finish_tracking {
+        let (repo_root, _repo_paths) = if finish_tracking {
             (
                 self.mutation_repo_root.take(),
                 std::mem::take(&mut self.mutation_repo_paths),
@@ -209,13 +204,21 @@ impl ApplyPatchRuntime {
             )
         };
         if let Some(repo_root) = repo_root.as_ref() {
-            if self.committed_delta.is_exact() && !repo_paths.is_empty() {
+            if self.committed_delta.is_exact() && !self.committed_delta.is_empty() {
+                let paths = self.committed_delta.changes().iter().flat_map(|change| {
+                    let destination = match &change.change {
+                        codex_apply_patch::AppliedPatchFileChange::Update { move_path, .. } => move_path.as_ref(),
+                        _ => None,
+                    };
+                    std::iter::once(&change.path).chain(destination)
+                        .map(|path| path.to_string_lossy().into_owned())
+                }).collect::<Vec<_>>();
                 ctx.session
                     .services
                     .git_workspace
-                    .note_host_workspace_mutation_paths(repo_root, &repo_paths)
+                    .note_host_workspace_mutation_paths(repo_root, &paths)
                     .await;
-            } else if !self.committed_delta.is_empty() {
+            } else if !self.committed_delta.is_exact() {
                 ctx.session
                     .services
                     .git_workspace
@@ -224,6 +227,9 @@ impl ApplyPatchRuntime {
         }
 
         if finish_tracking {
+            if let Some(pending) = self.pending_source_mutation.take() {
+                pending.settle();
+            }
             self.workspace_tracking_finished = true;
         }
     }
@@ -448,7 +454,7 @@ impl ToolRuntime<ApplyPatchRequest, ApplyPatchRuntimeOutput> for ApplyPatchRunti
                     permit = crate::workspace_operation_gate::acquire_patch_operation_with_timeout(
                         &req.turn_environment.environment,
                         &req.action.cwd,
-                    ) => permit.map_err(|error| ToolError::Denied(error.to_string()))?,
+                    ) => permit.map_err(ToolError::Denied)?,
                 });
             }
             if let Err(error) = self.begin_workspace_tracking(req, ctx).await {
@@ -460,9 +466,8 @@ impl ToolRuntime<ApplyPatchRequest, ApplyPatchRuntimeOutput> for ApplyPatchRunti
             let sandbox = Self::file_system_sandbox_context_for_attempt(req, attempt);
             let mut stdout = Vec::new();
             let mut stderr = Vec::new();
-            let result = codex_apply_patch::apply_patch_with_cancellation(
-                &req.action.patch,
-                &req.action.cwd,
+            let result = codex_apply_patch::apply_verified_patch_with_cancellation(
+                &req.action,
                 &mut stdout,
                 &mut stderr,
                 fs.as_ref(),

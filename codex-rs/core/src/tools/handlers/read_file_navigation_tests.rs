@@ -320,6 +320,93 @@ struct NotFunction;
     }
 }
 
+/// Recorded cells asked for `{kind:"outline"}` and argument preflight failed
+/// the whole cell with "data did not match any variant of untagged enum".
+#[tokio::test]
+async fn outline_kind_reads_the_outline_section_and_unknown_kinds_name_valid_ones() {
+    let arguments = |selectors: serde_json::Value| json!({"path":"source.rs","selectors":selectors}).to_string();
+    validate_read_file_arguments(&arguments(json!([{"kind":"outline"}]))).unwrap();
+    assert_eq!(canonical_read_file_arguments(&arguments(json!([{"kind":"outline"}]))).unwrap()["selectors"],
+        json!([{"kind":"section","id":"outline"}]), "the alias selects the advertised section");
+    let unknown = validate_read_file_arguments(&arguments(json!([{"kind":"heading"}]))).unwrap_err();
+    for expected in ["`heading`", "bytes", "lines", "search", "section", "json_pointer", "symbol", "enclosing", "\"outline\""] {
+        assert!(unknown.contains(expected), "{expected} missing from {unknown}");
+    }
+    // Extra fields are not silently reinterpreted as the outline.
+    assert!(validate_read_file_arguments(&arguments(json!([{"kind":"outline","id":"outline:2"}]))).is_err());
+    // A known kind names its own missing field rather than an untagged-enum miss.
+    for (selector, field) in [(json!({"kind":"lines","start":1}), "`end`"), (json!({"kind":"symbol"}), "`name`")] {
+        let error = validate_read_file_arguments(&arguments(json!([selector]))).unwrap_err();
+        assert!(error.contains("missing field") && error.contains(field), "{error}");
+    }
+    // Previously accepted shapes keep their variant (structure before exact) and fields.
+    for (selector, structure) in [(json!({"kind":"bytes","start":0,"end":4}), false),
+        (json!({"kind":"lines","start":1,"end":2}), false), (json!({"kind":"section","id":"outline:3"}), false),
+        (json!({"kind":"json_pointer","pointer":"/a"}), false), (json!({"kind":"search","query":"S"}), true),
+        (json!({"kind":"search","query":"S","enclosing":true,"max_results":2}), true),
+        (json!({"kind":"symbol","name":"S::make"}), true), (json!({"kind":"enclosing","line":4}), true)] {
+        validate_read_file_arguments(&arguments(json!([selector.clone()]))).unwrap();
+        let parsed = serde_json::from_value::<FileSelector>(selector.clone()).unwrap();
+        assert_eq!(matches!(parsed, FileSelector::Structure(_)), structure, "{selector}");
+        let encoded = serde_json::to_value(&parsed).unwrap();
+        for (key, value) in selector.as_object().unwrap() { assert_eq!(&encoded[key], value, "{selector}"); }
+    }
+    for script in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("navigation.rs");
+        std::fs::write(&path, SEMNAV_SOURCE).unwrap();
+        let mut outputs = Vec::new();
+        for selectors in [json!([{"kind":"outline"}]), json!([{"kind":"section","id":"outline"}])] {
+            let mut call = invocation(&path, selectors, false).await;
+            if script { call.source = ToolCallSource::CodeMode { cell_id:"outline-alias".into(), parent_call_id:None,
+                runtime_tool_call_id:"outline-alias".into(), nested_deadline:None, cancellation_cause:None }; }
+            outputs.push(ReadFileHandler.handle(call.clone()).await.unwrap().code_mode_result(&call.payload));
+        }
+        assert_eq!(outputs[0]["complete"], true);
+        assert!(!outputs[0]["results"][0]["value"]["details"]["items"].as_array().unwrap().is_empty());
+        assert_eq!(outputs[0]["results"], outputs[1]["results"]);
+    }
+}
+
+/// A rejected selector names the accepted forms of the advertised schema, in
+/// code-mode preflight and direct calls alike.
+#[tokio::test]
+async fn rejected_selectors_name_their_accepted_schema_forms() {
+    let arguments = |selectors: serde_json::Value| json!({"path":"source.rs","selectors":selectors}).to_string();
+    let lines = r#"{"kind":"lines","start":<integer>,"end":<integer>}"#;
+    // A known kind with a bad shape names only its own form.
+    let error = validate_read_file_arguments(&arguments(json!([{"kind":"lines","start":1}]))).unwrap_err();
+    assert!(error.contains("missing field `end`") && error.contains(&format!("Accepted form: {lines}")), "{error}");
+    assert!(!error.contains(r#""kind":"bytes""#), "{error}");
+    // An unknown kind, a missing kind or a non-array value lists every form.
+    for selectors in [json!([{"kind":"heading"}]), json!([{"id":"outline"}]), json!({"kind":"section","id":"outline"})] {
+        let error = validate_read_file_arguments(&arguments(selectors)).unwrap_err();
+        for form in [r#"{"kind":"bytes","start":<integer>,"end":<integer>}"#, lines,
+            r#"{"kind":"section","id":<string>}"#, r#"{"kind":"json_pointer","pointer":<string>}"#,
+            r#"{"kind":"search","query":<string>} (optional case_insensitive, context_lines, enclosing, max_results, start_byte)"#,
+            r#"{"kind":"symbol","name":<string>}"#, r#"{"kind":"enclosing","line":<integer>}"#] {
+            assert!(error.contains(form), "{form} missing from {error}");
+        }
+    }
+    // Failures outside selectors keep their own message.
+    let error = validate_read_file_arguments(&json!({"selectors":[{"kind":"lines","start":1,"end":2}]}).to_string()).unwrap_err();
+    assert!(error.contains("missing field `path`") && !error.contains("<integer>"), "{error}");
+    let call = invocation(Path::new("source.rs"), json!([{"kind":"lines","start":1}]), false).await;
+    let Err(FunctionCallError::RespondToModel(message)) = ReadFileHandler.handle(call).await else {
+        panic!("a rejected selector must not read");
+    };
+    assert!(message.contains(&format!("Accepted form: {lines}")), "{message}");
+}
+
+#[test]
+fn selector_description_names_the_outline_section_selector() {
+    // Recorded sessions read "the outline parser" as a symbol named outline.
+    let ToolSpec::Function(spec) = ReadFileHandler.spec() else { panic!("function"); };
+    let parameters = serde_json::to_value(&spec.parameters).unwrap();
+    let description = parameters["properties"]["selectors"]["description"].as_str().unwrap();
+    assert!(description.contains(r#"{"kind":"section","id":"outline"}"#), "{description}");
+}
+
 #[tokio::test]
 #[ignore = "opt-in matched navigation wall-clock benchmark; no model latency simulation"]
 #[expect(clippy::print_stdout, reason = "report measured navigation latency and call counts")]

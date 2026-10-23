@@ -243,17 +243,26 @@ impl PlanHandler {
                 "provide exactly one of plan or set".to_string(),
             ));
         }
-        if requested_args
+        let active = requested_args
             .plan
             .iter()
             .flatten()
-            .filter(|item| item.status == codex_protocol::plan_tool::StepStatus::InProgress)
-            .count()
-            > 1
-        {
-            return Err(FunctionCallError::RespondToModel(
-                "update_plan permits at most one in_progress step at a time".to_string(),
-            ));
+            .enumerate()
+            .filter(|(_, item)| item.status == codex_protocol::plan_tool::StepStatus::InProgress)
+            .map(|(index, item)| {
+                format!(
+                    "index {index} {}",
+                    crate::plan_store::quoted_step(&item.step)
+                )
+            })
+            .collect::<Vec<_>>();
+        if active.len() > 1 {
+            // Name the conflicting steps; the bare rule left callers guessing.
+            return Err(FunctionCallError::RespondToModel(format!(
+                "update_plan permits at most one in_progress step at a time; no changes were made. This plan marks {} steps in_progress: {}. Keep exactly one in_progress and mark each other step completed if it is finished or pending if it is not",
+                active.len(),
+                active.join("; ")
+            )));
         }
         if cancellation_token.is_cancelled() {
             return Err(FunctionCallError::RespondToModel(
@@ -273,7 +282,11 @@ impl PlanHandler {
                     .get_agent_task(*assignment_id, Some(0))
                     .await
                     .map_err(|error| FunctionCallError::RespondToModel(error.to_string()))?;
-                if task.assignment.root_session_id != session.thread_id.to_string() {
+                // Assignments carry the tree's shared session ID; a spawned
+                // agent's own thread ID never equals it.
+                if task.assignment.root_session_id
+                    != session.services.agent_control.session_id().to_string()
+                {
                     return Err(FunctionCallError::RespondToModel(
                         "workflow assignments must belong to this root session".into(),
                     ));

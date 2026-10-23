@@ -2955,6 +2955,7 @@ fn core_turn_item_into_thread_item_converts_supported_variants() {
     );
 
     let file_change_item = TurnItem::FileChange(FileChangeItem {
+        effects: None,
         environment: None,
         id: "patch-1".to_string(),
         changes: [(
@@ -2974,6 +2975,7 @@ fn core_turn_item_into_thread_item_converts_supported_variants() {
     assert_eq!(
         ThreadItem::from(file_change_item),
         ThreadItem::FileChange {
+            effects: None,
             environment: None,
             id: "patch-1".to_string(),
             changes: vec![FileUpdateChange {
@@ -4564,4 +4566,29 @@ fn image_provenance_survives_canonical_and_legacy_projection() {
     }))
     .unwrap();
     assert_eq!(old.environment, None);
+}
+
+#[test]
+fn failed_file_change_preserves_partial_effects_separately_from_intent() {
+    use codex_protocol::items::{FileChangeEffect, FileChangeEffects};
+    let path = PathUri::from_abs_path(&test_path_buf("/tmp/committed").abs());
+    let effects = FileChangeEffects { exact: false, changes: vec![FileChangeEffect {
+        path: path.clone(), before: None, after: Some("committed\n".into()),
+    }] };
+    let core = TurnItem::FileChange(FileChangeItem {
+        id: "partial-patch".into(), environment: None, effects: Some(effects.clone()),
+        changes: [(PathBuf::from("committed"), codex_protocol::protocol::FileChange::Add { content: "committed\n".into() }),
+            (PathBuf::from("not-committed"), codex_protocol::protocol::FileChange::Add { content: "intended\n".into() })].into_iter().collect(),
+        status: Some(codex_protocol::protocol::PatchApplyStatus::Failed), auto_approved: None,
+        stdout: None, stderr: Some("later operation failed".into()),
+    });
+    let converted = ThreadItem::from(core);
+    assert!(matches!(&converted, ThreadItem::FileChange { effects: Some(actual), status: PatchApplyStatus::Failed, changes, .. }
+        if actual == &effects && changes.len() == 2));
+    let wire = serde_json::to_value(converted).unwrap();
+    assert_eq!(wire["status"], "failed");
+    assert_eq!(wire["effects"]["exact"], false);
+    assert_eq!(wire["effects"]["changes"][0]["path"], path.to_string());
+    assert_eq!(wire["effects"]["changes"].as_array().unwrap().len(), 1);
+    assert_eq!(wire["changes"].as_array().unwrap().len(), 2);
 }

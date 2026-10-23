@@ -20,10 +20,60 @@ const CATEGORY_HASH_DOMAIN: &[u8] = b"codex.prompt-context-category.v1";
 // the domain, so no length prefix or serialized buffer is needed.
 const RESPONSE_ITEM_FINGERPRINT_DOMAIN: &[u8] = b"codex.prompt-response-item.v2";
 
+/// byte_div_4_image_budget_v1: retain JSON envelopes and text, replace image
+/// URLs with empty strings and add the history owner's detail-aware image
+/// estimate. Transport byte counts and hashes always use the original bytes.
+pub(crate) fn content_aware_serialized_tokens(serialized: &[u8]) -> u64 {
+    let ordinary = || u64::try_from(approx_token_count(
+        std::str::from_utf8(serialized).unwrap_or_default())).unwrap_or(u64::MAX);
+    if !serialized.windows(b"\"input_image\"".len()).any(|part| part == b"\"input_image\"") {
+        return ordinary();
+    }
+    fn strip_images(value: &mut serde_json::Value) -> u64 {
+        match value {
+            serde_json::Value::Array(items) => items.iter_mut().fold(0u64, |sum, item|
+                sum.saturating_add(strip_images(item))),
+            serde_json::Value::Object(object) => {
+                if object.get("type").and_then(serde_json::Value::as_str) == Some("input_image") {
+                    let detail = object.get("detail").cloned()
+                        .and_then(|detail| serde_json::from_value(detail).ok());
+                    if let Some(url) = object.get_mut("image_url")
+                        && let Some(text) = url.as_str()
+                    {
+                        let bytes = crate::context_manager::estimate_image_bytes(text, detail);
+                        *url = serde_json::Value::String(String::new());
+                        return (bytes.max(0) as u64).div_ceil(4);
+                    }
+                    return 0;
+                }
+                // Only actual request/content envelopes, never schema examples
+                // or a tool's argument JSON, can confer modality semantics.
+                let kind = object.get("type").and_then(serde_json::Value::as_str);
+                let fields: &[&str] = match kind {
+                    Some("message") => &["content"],
+                    Some("function_call_output" | "custom_tool_call_output") => &["output"],
+                    None if object.contains_key("input") => &["input"],
+                    _ => &[],
+                };
+                fields.iter().fold(0u64, |sum, key| sum.saturating_add(
+                    object.get_mut(*key).map_or(0, strip_images)))
+            }
+            _ => 0,
+        }
+    }
+    let Ok(mut value) = serde_json::from_slice::<serde_json::Value>(serialized) else {
+        return ordinary();
+    };
+    let images = strip_images(&mut value);
+    if images == 0 { return ordinary(); }
+    (approx_token_count(&value.to_string()) as u64).saturating_add(images)
+}
+
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub(crate) enum PromptContextCategory {
     BaseSystem,
     ToolSchemas,
+    DiscoveredToolSchemas,
     Repository,
     AgentRole,
     Skills,
@@ -35,13 +85,17 @@ pub(crate) enum PromptContextCategory {
     EnvironmentPermissions,
     TaskInput,
     History,
+    /// Client-executed tool results returned to the model (command output,
+    /// file bodies, MCP results). Their calls and other items stay `History`.
+    ToolOutputs,
     OtherInjected,
 }
 
 impl PromptContextCategory {
-    pub(crate) const ALL: [Self; 14] = [
+    pub(crate) const ALL: [Self; 16] = [
         Self::BaseSystem,
         Self::ToolSchemas,
+        Self::DiscoveredToolSchemas,
         Self::Repository,
         Self::AgentRole,
         Self::Skills,
@@ -53,6 +107,7 @@ impl PromptContextCategory {
         Self::EnvironmentPermissions,
         Self::TaskInput,
         Self::History,
+        Self::ToolOutputs,
         Self::OtherInjected,
     ];
 
@@ -75,6 +130,7 @@ impl PromptContextCategory {
         match self {
             Self::BaseSystem => "base_system",
             Self::ToolSchemas => "tool_schemas",
+            Self::DiscoveredToolSchemas => "discovered_tool_schemas",
             Self::Repository => "repository",
             Self::AgentRole => "agent_role",
             Self::Skills => "skills",
@@ -86,6 +142,7 @@ impl PromptContextCategory {
             Self::EnvironmentPermissions => "environment_permissions",
             Self::TaskInput => "task_input",
             Self::History => "history",
+            Self::ToolOutputs => "tool_outputs",
             Self::OtherInjected => "other_injected",
         }
     }
@@ -108,6 +165,7 @@ impl PromptContextCategory {
                 | Self::EnvironmentPermissions
                 | Self::TaskInput
                 | Self::History
+                | Self::ToolOutputs
         )
     }
 }
@@ -590,10 +648,7 @@ impl PromptContextBreakdown {
 
     pub(crate) fn record_serialized(&mut self, category: PromptContextCategory, serialized: &[u8]) {
         let serialized_bytes = u64::try_from(serialized.len()).unwrap_or(u64::MAX);
-        let estimated_tokens = u64::try_from(approx_token_count(
-            std::str::from_utf8(serialized).unwrap_or_default(),
-        ))
-        .unwrap_or(u64::MAX);
+        let estimated_tokens = content_aware_serialized_tokens(serialized);
         self.record(category, serialized_bytes, estimated_tokens, serialized);
     }
 
@@ -666,8 +721,20 @@ impl PromptContextBreakdown {
             self.record_serialized(PromptContextCategory::ToolSchemas, serialized_item);
             return Ok(());
         }
+        if contains_discovered_tool_schemas(item) {
+            self.record_serialized(
+                PromptContextCategory::DiscoveredToolSchemas,
+                serialized_item,
+            );
+            return Ok(());
+        }
         let ResponseItem::Message { role, content, .. } = item else {
-            self.record_serialized(PromptContextCategory::History, serialized_item);
+            let category = if is_tool_output_item(item) {
+                PromptContextCategory::ToolOutputs
+            } else {
+                PromptContextCategory::History
+            };
+            self.record_serialized(category, serialized_item);
             return Ok(());
         };
         let fallback = if role == "user"
@@ -723,8 +790,20 @@ impl PromptContextBreakdown {
             self.record_serialized(PromptContextCategory::ToolSchemas, serialized_item);
             return Ok(());
         }
+        if contains_discovered_tool_schemas(item) {
+            self.record_serialized(
+                PromptContextCategory::DiscoveredToolSchemas,
+                serialized_item,
+            );
+            return Ok(());
+        }
         let ResponseItem::Message { role, content, .. } = item else {
-            self.record_serialized(PromptContextCategory::History, serialized_item);
+            let category = if is_tool_output_item(item) {
+                PromptContextCategory::ToolOutputs
+            } else {
+                PromptContextCategory::History
+            };
+            self.record_serialized(category, serialized_item);
             return Ok(());
         };
         let fallback = if role == "user" && provenance.is_some_and(|value| value.current_input) {
@@ -838,6 +917,24 @@ impl PromptContextBreakdown {
 fn sequence_envelope_bytes(item_count: usize) -> u64 {
     let separators = item_count.saturating_sub(1);
     u64::try_from(2_usize.saturating_add(separators)).unwrap_or(u64::MAX)
+}
+
+fn contains_discovered_tool_schemas(item: &ResponseItem) -> bool {
+    // Retired discovery receipts are history, not callable definitions. Keep
+    // definitions separate from the request-level schema prefix so appending a
+    // search result cannot falsely invalidate that unchanged prefix.
+    matches!(item, ResponseItem::ToolSearchOutput { tools, .. }
+        if tools.iter().any(|tool|
+            codex_tools::LoadableToolSpec::callable_names_from_value(tool).is_some()))
+}
+
+/// Results of client-executed tools. Their calls, reasoning and retired
+/// discovery receipts stay history, so repeated tool output is attributable.
+fn is_tool_output_item(item: &ResponseItem) -> bool {
+    matches!(
+        item,
+        ResponseItem::FunctionCallOutput { .. } | ResponseItem::CustomToolCallOutput { .. }
+    )
 }
 
 fn response_item_fingerprint(item: &ResponseItem) -> Option<[u8; 32]> {
@@ -1589,5 +1686,137 @@ mod tests {
             measured.bytes(PromptContextCategory::TaskInput),
             serde_json::to_vec(&items[2]).unwrap().len() as u64
         );
+    }
+}
+#[cfg(test)]
+mod audit150_modality_tests {
+    use super::*;
+    #[test]
+    fn encoded_image_length_changes_bytes_and_hashes_not_text_token_estimates() {
+        let message = |count| serde_json::to_vec(&serde_json::json!({
+            "type":"message","role":"user","content":[
+                {"type":"input_text","text":"Inspect the image"},
+                {"type":"input_image","image_url":format!("data:image/png;base64,{}", "A".repeat(count))}]
+        })).unwrap();
+        let small = message(8);
+        let large = message(2 * 1024 * 1024);
+        let mut a = PromptContextBreakdown::default();
+        let mut b = PromptContextBreakdown::default();
+        a.record_serialized(PromptContextCategory::TaskInput, &small);
+        b.record_serialized(PromptContextCategory::TaskInput, &large);
+        assert_ne!(a.total_bytes(), b.total_bytes());
+        assert_ne!(a.measurements()[12].sha256, b.measurements()[12].sha256);
+        assert_eq!(a.total_estimated_tokens(), b.total_estimated_tokens());
+        let text = br#"{"type":"message","role":"user","content":[{"type":"input_text","text":"ordinary"}]}"#;
+        assert_eq!(content_aware_serialized_tokens(text), approx_token_count(std::str::from_utf8(text).unwrap()) as u64);
+    }
+}
+
+#[cfg(test)]
+mod audit150_tool_output_category_tests {
+    use super::*;
+    use codex_protocol::models::FunctionCallOutputPayload;
+
+    /// Measures through both the logical and the transport-serialized recorder.
+    fn measure_both(items: &[ResponseItem]) -> [PromptContextBreakdown; 2] {
+        let sidecar = PromptProvenanceSidecar::default();
+        let encoded = serde_json::to_string(items).unwrap();
+        let raw_items: Vec<&RawValue> = serde_json::from_str(&encoded).unwrap();
+        let logical = PromptContextBreakdown::from_response_items(items, &sidecar).unwrap();
+        let wire = PromptContextBreakdown::from_serialized_response_items(
+            items, &raw_items, &sidecar, None,
+        )
+        .unwrap();
+        assert_eq!(logical.total_bytes(), encoded.len() as u64);
+        assert_eq!(wire.total_bytes(), encoded.len() as u64);
+        [logical, wire]
+    }
+
+    fn item_bytes(item: &ResponseItem) -> u64 {
+        serde_json::to_vec(item).unwrap().len() as u64
+    }
+
+    fn assistant(text: &str) -> ResponseItem {
+        ResponseItem::Message {
+            id: None,
+            role: "assistant".to_string(),
+            content: vec![ContentItem::OutputText {
+                text: text.to_string(),
+            }],
+            phase: None,
+            internal_chat_message_metadata_passthrough: None,
+        }
+    }
+
+    fn function_call(call_id: &str) -> ResponseItem {
+        ResponseItem::FunctionCall {
+            id: None,
+            name: "shell".to_string(),
+            namespace: None,
+            arguments: r#"{"command":["cat","src/lib.rs"]}"#.to_string(),
+            call_id: call_id.to_string(),
+            internal_chat_message_metadata_passthrough: None,
+        }
+    }
+
+    #[test]
+    fn tool_results_are_attributed_separately_from_history() {
+        let items = vec![
+            assistant("Reading the source."),
+            function_call("call-1"),
+            ResponseItem::FunctionCallOutput {
+                id: None,
+                call_id: "call-1".to_string(),
+                output: FunctionCallOutputPayload::from_text("pub fn body() {}\n".repeat(64)),
+                internal_chat_message_metadata_passthrough: None,
+            },
+            ResponseItem::CustomToolCallOutput {
+                id: None,
+                call_id: "call-2".to_string(),
+                name: Some("apply_patch".to_string()),
+                output: FunctionCallOutputPayload::from_text(
+                    "Success. Updated src/lib.rs".to_string(),
+                ),
+                internal_chat_message_metadata_passthrough: None,
+            },
+        ];
+        for measured in measure_both(&items) {
+            assert_eq!(
+                measured.bytes(PromptContextCategory::ToolOutputs),
+                item_bytes(&items[2]) + item_bytes(&items[3])
+            );
+            assert!(measured.estimated_tokens(PromptContextCategory::ToolOutputs) > 0);
+            assert_eq!(
+                measured.bytes(PromptContextCategory::History),
+                item_bytes(&items[0]) + item_bytes(&items[1])
+            );
+        }
+    }
+
+    #[test]
+    fn history_without_tool_results_has_no_tool_output_bytes() {
+        let items = vec![assistant("No tool was needed."), function_call("call-1")];
+        for measured in measure_both(&items) {
+            assert_eq!(measured.bytes(PromptContextCategory::ToolOutputs), 0);
+            assert_eq!(
+                measured.estimated_tokens(PromptContextCategory::ToolOutputs),
+                0
+            );
+            assert_eq!(
+                measured.bytes(PromptContextCategory::History),
+                item_bytes(&items[0]) + item_bytes(&items[1])
+            );
+        }
+    }
+
+    #[test]
+    fn tool_outputs_category_is_named_selected_and_outside_the_fixed_prefix() {
+        let category = PromptContextCategory::ToolOutputs;
+        assert_eq!(category.as_str(), "tool_outputs");
+        assert!(PromptContextCategory::ALL.contains(&category));
+        // Previously counted through History, so the producer-selected total
+        // is unchanged by the split.
+        assert!(category.is_producer_selected_context());
+        assert!(!PromptContextCategory::FIXED_PREFIX.contains(&category));
     }
 }

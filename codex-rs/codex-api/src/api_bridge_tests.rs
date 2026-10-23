@@ -11,7 +11,8 @@ async fn retry_after_survives_mapping_and_exhaustion_without_restarting() {
     for (status, body, retryable) in [
         (500, None, true),
         (503, None, true),
-        (429, None, false),
+        // Generic throttling was never retried below the turn owner.
+        (429, None, true),
         (
             503,
             Some(r#"{"error":{"code":"server_error","message":"retry"}}"#),
@@ -482,5 +483,74 @@ fn audit_usage_limit_identity_survives_malformed_optional_fields() {
         };
         assert!(error.resets_at.is_none());
         assert!(error.plan_type.is_none());
+    }
+}
+
+#[tokio::test]
+async fn unrecognized_429_is_retryable_and_keeps_retry_after() {
+    use codex_http_client::RetryAfter;
+    use codex_protocol::protocol::CodexErrorInfo;
+    use std::time::Duration;
+
+    let advice = RetryAfter::from_delay(Duration::from_secs(2)).unwrap();
+    for body in [
+        // Azure OpenAI throttling carries a numeric-string code.
+        r#"{"error":{"code":"429","message":"Requests have exceeded the token rate limit. Please retry after 2 seconds."}}"#,
+        // A wrapped WebSocket error frame without a provider code.
+        r#"{"type":"error","status":429,"error":{"message":"slow down"}}"#,
+        "Too Many Requests",
+    ] {
+        let mut headers = HeaderMap::new();
+        headers.insert(REQUEST_ID_HEADER, http::HeaderValue::from_static("req-429"));
+        let mapped = map_api_error(ApiError::Transport(TransportError::Http {
+            retry_after: Some(advice),
+            status: http::StatusCode::TOO_MANY_REQUESTS,
+            url: Some("https://example.test/v1/responses".to_string()),
+            headers: Some(headers),
+            body: Some(body.to_string()),
+        }));
+        assert!(mapped.is_retryable(), "{body}");
+        assert_eq!(mapped.retry_after(), Some(advice));
+        assert_eq!(
+            mapped.to_codex_protocol_error(),
+            CodexErrorInfo::ResponseTooManyFailedAttempts {
+                http_status_code: Some(429)
+            }
+        );
+        let CodexErr::UnexpectedStatus(error) = mapped else {
+            panic!("expected a retryable unexpected status for {body}");
+        };
+        assert_eq!(error.status, http::StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(error.request_id.as_deref(), Some("req-429"));
+        assert_eq!(error.body, body);
+    }
+
+    // Usage and quota rejections keep their non-retryable identities.
+    for (body, usage_limit) in [
+        (
+            r#"{"error":{"type":"usage_limit_reached","message":"limit"}}"#,
+            true,
+        ),
+        (
+            r#"{"error":{"code":"insufficient_quota","message":"quota"}}"#,
+            false,
+        ),
+    ] {
+        let mapped = map_api_error(ApiError::Transport(TransportError::Http {
+            retry_after: Some(advice),
+            status: http::StatusCode::TOO_MANY_REQUESTS,
+            url: None,
+            headers: None,
+            body: Some(body.to_string()),
+        }));
+        assert!(!mapped.is_retryable(), "{body}");
+        if usage_limit {
+            assert!(
+                matches!(mapped, CodexErr::UsageLimitReached(_)),
+                "{mapped:?}"
+            );
+        } else {
+            assert!(matches!(mapped, CodexErr::QuotaExceeded), "{mapped:?}");
+        }
     }
 }

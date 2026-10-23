@@ -24,6 +24,8 @@ export type {
   CommandExecutionItem,
   CodeModeCellItem,
   FileChangeItem,
+  FileChangeEffect,
+  FileChangeEffects,
   McpToolCallItem,
   CollabToolCallItem,
   CollabAgentState,

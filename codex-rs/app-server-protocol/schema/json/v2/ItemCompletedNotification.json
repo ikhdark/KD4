@@ -345,6 +345,48 @@
       ],
       "type": "object"
     },
+    "FileChangeEffect": {
+      "properties": {
+        "after": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "before": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "path": {
+          "$ref": "#/definitions/PathUri"
+        }
+      },
+      "required": [
+        "path"
+      ],
+      "type": "object"
+    },
+    "FileChangeEffects": {
+      "description": "Ordered committed endpoint receipts. `exact=false` means additional effects may be unknown; an empty list then is not proof that nothing changed.",
+      "properties": {
+        "changes": {
+          "items": {
+            "$ref": "#/definitions/FileChangeEffect"
+          },
+          "type": "array"
+        },
+        "exact": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "changes",
+        "exact"
+      ],
+      "type": "object"
+    },
     "FileUpdateChange": {
       "properties": {
         "diff": {
@@ -633,6 +675,9 @@
           "type": "object"
         }
       ]
+    },
+    "PathUri": {
+      "type": "string"
     },
     "ReasoningEffort": {
       "description": "A non-empty reasoning effort value advertised by the model.",
@@ -997,6 +1042,16 @@
                 "$ref": "#/definitions/FileUpdateChange"
               },
               "type": "array"
+            },
+            "effects": {
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/FileChangeEffects"
+                },
+                {
+                  "type": "null"
+                }
+              ]
             },
             "environment": {
               "anyOf": [

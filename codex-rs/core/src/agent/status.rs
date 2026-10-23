@@ -42,7 +42,8 @@ pub(crate) fn agent_status_from_event(msg: &EventMsg) -> Option<AgentStatus> {
         }
         EventMsg::TurnAborted(ev) => match ev.reason {
             codex_protocol::protocol::TurnAbortReason::Interrupted
-            | codex_protocol::protocol::TurnAbortReason::BudgetLimited => {
+            | codex_protocol::protocol::TurnAbortReason::BudgetLimited
+            | codex_protocol::protocol::TurnAbortReason::SessionShutdown => {
                 Some(AgentStatus::Interrupted)
             }
             codex_protocol::protocol::TurnAbortReason::Replaced => Some(AgentStatus::Errored(
@@ -184,6 +185,35 @@ fn append_host_observation(status: &mut AgentStatus, summary: &str) {
     }
 }
 
+/// The current attempt's terminal host observation, selected exactly as in
+/// `completion_diagnostics_from_task`. The live terminal status, and a legacy
+/// receipt sealed from it, already start with this text.
+fn terminal_host_observation_summary(task: &AgentTask) -> Option<&str> {
+    task.observations
+        .iter()
+        .rev()
+        .find(|observation| {
+            observation.attempt_id == task.current_attempt.attempt_id
+                && observation.kind == codex_agent_task_store::ObservationKind::HostCompletion
+                && observation
+                    .call_id
+                    .as_deref()
+                    .is_some_and(|origin| !origin.ends_with(":parent-delivery"))
+        })
+        .map(|observation| observation.summary.as_str())
+        .filter(|summary| !summary.is_empty() && *summary != NO_COMPLETION_DIAGNOSTICS)
+}
+
+/// Removes only an exact leading copy of the host observation (as written by
+/// `append_host_observation`); `agent_status_from_task` prepends it once.
+fn without_host_observation<'a>(message: &'a str, summary: Option<&str>) -> &'a str {
+    match summary.and_then(|summary| message.strip_prefix(summary)) {
+        Some("") => "",
+        Some(rest) => rest.strip_prefix("\n\n").unwrap_or(message),
+        None => message,
+    }
+}
+
 fn agent_status_from_task_inner(
     task: &AgentTask,
     observed_status: Option<(codex_agent_task_store::AttemptId, &AgentStatus)>,
@@ -192,6 +222,10 @@ fn agent_status_from_task_inner(
     if receipt.attempt_id != task.current_attempt.attempt_id {
         return None;
     }
+    // The live status, and a receipt sealed from it, already start with the
+    // terminal host observation; `agent_status_from_task` prepends it once.
+    let host_observation = terminal_host_observation_summary(task);
+    let receipt_summary = without_host_observation(&receipt.summary, host_observation);
     let plain_message = matches!(
         task.assignment.admission_origin,
         AssignmentAdmissionOrigin::LegacyMessage { .. }
@@ -221,7 +255,7 @@ fn agent_status_from_task_inner(
         };
         return Some(AgentStatus::Errored(format!(
             "Agent execution completed; acceptance {acceptance}. {failures}\n\nAgent-reported result (not verification evidence): {}",
-            receipt.summary
+            receipt_summary
         )));
     }
     let observed_status = observed_status
@@ -252,8 +286,8 @@ fn agent_status_from_task_inner(
                     ..
                 },
             ),
-        ) => message.as_str(),
-        _ => receipt.summary.as_str(),
+        ) => without_host_observation(message, host_observation),
+        _ => receipt_summary,
     };
     if !plain_message
         && receipt.status == AgentStatusClaim::Completed
@@ -279,7 +313,15 @@ fn agent_status_from_task_inner(
                 Some(AgentStatus::CompletedWithSurface { .. })
             ) =>
         {
-            observed_status.cloned()
+            let mut status = observed_status.cloned();
+            if let Some(AgentStatus::CompletedWithSurface {
+                last_agent_message: Some(message),
+                ..
+            }) = status.as_mut()
+            {
+                *message = without_host_observation(message.as_str(), host_observation).to_string();
+            }
+            status
         }
         AgentStatusClaim::Completed if plain_message => {
             let evidence_note = if receipt.risks.is_empty() {
@@ -289,7 +331,7 @@ fn agent_status_from_task_inner(
             };
             Some(AgentStatus::Completed(Some(format!(
                 "Agent-reported result (behavior unverified): {}{evidence_note}",
-                receipt.summary
+                receipt_summary
             ))))
         }
         AgentStatusClaim::Completed => Some(AgentStatus::Completed(Some(format!(
@@ -298,15 +340,18 @@ fn agent_status_from_task_inner(
             reported_message
         )))),
         AgentStatusClaim::NeedsMain | AgentStatusClaim::Blocked => {
-            Some(receipt_error_status(receipt))
+            Some(receipt_error_status(receipt, receipt_summary))
         }
         AgentStatusClaim::Failed | AgentStatusClaim::Violated | AgentStatusClaim::Abandoned => {
-            Some(receipt_error_status(receipt))
+            Some(receipt_error_status(receipt, receipt_summary))
         }
     }
 }
 
-fn receipt_error_status(receipt: &codex_agent_task_store::AgentReceipt) -> AgentStatus {
+fn receipt_error_status(
+    receipt: &codex_agent_task_store::AgentReceipt,
+    summary: &str,
+) -> AgentStatus {
     let status = match receipt.status {
         AgentStatusClaim::Completed => "completed",
         AgentStatusClaim::NeedsMain => "needs_main",
@@ -315,10 +360,7 @@ fn receipt_error_status(receipt: &codex_agent_task_store::AgentReceipt) -> Agent
         AgentStatusClaim::Violated => "violated",
         AgentStatusClaim::Abandoned => "abandoned",
     };
-    AgentStatus::Errored(format!(
-        "durable typed receipt status: {status}: {}",
-        receipt.summary
-    ))
+    AgentStatus::Errored(format!("durable typed receipt status: {status}: {summary}"))
 }
 
 pub(crate) fn is_final(status: &AgentStatus) -> bool {
@@ -400,6 +442,7 @@ mod tests {
         for (reason, expected) in [
             (TurnAbortReason::Interrupted, AgentStatus::Interrupted),
             (TurnAbortReason::BudgetLimited, AgentStatus::Interrupted),
+            (TurnAbortReason::SessionShutdown, AgentStatus::Interrupted),
             (
                 TurnAbortReason::Replaced,
                 AgentStatus::Errored("The turn was replaced by another turn.".to_string()),
@@ -916,5 +959,110 @@ mod tests {
         assert!(
             matches!(agent_status_from_task(&task, Some((attempt_id, &observed))), Some(AgentStatus::Completed(Some(message))) if message.contains("pending gates"))
         );
+    }
+
+    #[test]
+    fn audit149x_terminal_host_observation_is_reported_once_in_projected_completions() {
+        let assessment = codex_protocol::protocol::TurnCompletionAssessment {
+            verification_gaps: vec!["final workspace not verified".into()],
+            ..Default::default()
+        };
+        let summary = assessment
+            .bounded_summary("child-turn")
+            .expect("nonempty host observation");
+        let live = agent_status_from_event(&EventMsg::TurnComplete(TurnCompleteEvent {
+            turn_id: "child-turn".into(),
+            last_agent_message: Some("authored report".into()),
+            surfaced_result: None,
+            error: None,
+            completed_at: None,
+            duration_ms: None,
+            time_to_first_token_ms: None,
+            timing: Some(codex_protocol::protocol::TurnTiming {
+                completion_assessment: Some(assessment),
+                ..Default::default()
+            }),
+        }))
+        .expect("terminal status");
+        let AgentStatus::Completed(Some(live_message)) = live.clone() else {
+            panic!("the live completion keeps its report");
+        };
+        assert!(live_message.starts_with(&summary));
+        // The session records the same text as the attempt's terminal observation.
+        let observation = |task: &AgentTask| codex_agent_task_store::RuntimeObservation {
+            execution_stop_cause: None,
+            event_id: codex_agent_task_store::MutationEventId::new(),
+            wake_event_id: codex_agent_task_store::WakeEventId::new(),
+            assignment_id: task.assignment.assignment_id,
+            attempt_id: task.current_attempt.attempt_id,
+            kind: codex_agent_task_store::ObservationKind::HostCompletion,
+            summary: summary.clone(),
+            call_id: Some("thread:child-turn".into()),
+            created_at: chrono::Utc::now(),
+        };
+        let occurrences = |text: &str| text.matches(summary.as_str()).count();
+
+        let mut typed = typed_task_with_receipt(AgentStatusClaim::Completed, false);
+        let recorded = observation(&typed);
+        typed.observations.push(recorded);
+        let attempt_id = typed.current_attempt.attempt_id;
+        let Some(AgentStatus::Completed(Some(message))) =
+            agent_status_from_task(&typed, Some((attempt_id, &live)))
+        else {
+            panic!("typed completion keeps its lifecycle");
+        };
+        assert_eq!(occurrences(message.as_str()), 1, "{message}");
+        assert!(message.starts_with(&summary));
+        assert!(
+            message.contains("Agent-reported summary (not verification evidence): authored report")
+        );
+
+        typed.workspace_status.pending_gates = vec![codex_agent_task_store::GateKind::Review];
+        let Some(AgentStatus::Completed(Some(message))) =
+            agent_status_from_task(&typed, Some((attempt_id, &live)))
+        else {
+            panic!("pending gates keep execution completion");
+        };
+        assert_eq!(occurrences(message.as_str()), 1, "{message}");
+        assert!(
+            message.contains("Agent-reported result (not verification evidence): authored report")
+        );
+
+        // A plain-message receipt sealed from the live status carries the same prefix.
+        let mut plain = typed_task_with_receipt(AgentStatusClaim::Completed, false);
+        plain.assignment.admission_origin = AssignmentAdmissionOrigin::LegacyMessage {
+            parent_assignment_id: None,
+        };
+        plain.receipt.as_mut().unwrap().summary = live_message.clone();
+        let recorded = observation(&plain);
+        plain.observations.push(recorded);
+        let Some(AgentStatus::Completed(Some(message))) = agent_status_from_task(&plain, None)
+        else {
+            panic!("plain completion keeps its lifecycle");
+        };
+        assert_eq!(occurrences(message.as_str()), 1, "{message}");
+        assert!(message.contains("Agent-reported result (behavior unverified): authored report"));
+
+        // Negative controls: without the durable observation the live report is
+        // kept verbatim, and text that only begins like the observation is not cut.
+        let unrecorded = typed_task_with_receipt(AgentStatusClaim::Completed, false);
+        let Some(AgentStatus::Completed(Some(message))) = agent_status_from_task(
+            &unrecorded,
+            Some((unrecorded.current_attempt.attempt_id, &live)),
+        ) else {
+            panic!("typed completion keeps its lifecycle");
+        };
+        assert!(message.contains(&format!(
+            "Agent-reported summary (not verification evidence): {live_message}"
+        )));
+        plain.receipt.as_mut().unwrap().summary =
+            format!("{summary} continued without a separator");
+        let Some(AgentStatus::Completed(Some(message))) = agent_status_from_task(&plain, None)
+        else {
+            panic!("plain completion keeps its lifecycle");
+        };
+        assert!(message.contains(&format!(
+            "Agent-reported result (behavior unverified): {summary} continued without a separator"
+        )));
     }
 }

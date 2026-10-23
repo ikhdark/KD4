@@ -309,6 +309,7 @@ fn rust_admission_busy_requires_trusted_producer_and_actual_refusal() {
         "automatic_retry":false, "automatic_resume":false, "resource":"fixture-lane"});
     for (runner, exit, terminal, valid) in [
         (Some("rust_test_runner"), 75, true, true),
+        (Some("rust_build_status"), 75, true, true),
         (None, 75, true, false),
         (Some("other"), 75, true, false),
         (Some("rust_test_runner"), 2, true, false),
@@ -317,8 +318,18 @@ fn rust_admission_busy_requires_trusted_producer_and_actual_refusal() {
         let validation = crate::validation::CommandValidation {
             execution_context: None,
             declared: None,
-            classification: crate::validation::classify_validation_script("cargo test"),
-            receipt_runner: runner.map(str::to_owned),
+            classification: crate::validation::classify_validation_script(
+                if runner == Some("rust_build_status") {
+                    "cargo check --tests"
+                } else {
+                    "cargo test"
+                },
+            ),
+            receipt_runner: runner
+                .filter(|runner| *runner != "rust_build_status")
+                .map(str::to_owned),
+            admission_runner: (runner == Some("rust_build_status"))
+                .then(|| "rust_build_status".into()),
         };
         let mut signal = json!({"outcome":"failure", "failure_signature":"old"});
         attach_command_validation(
@@ -415,6 +426,7 @@ fn evidence_salience_successful_validation_preserves_owners_and_exact_values() {
         declared: None,
         classification: crate::validation::classify_validation_script("cargo check"),
         receipt_runner: None,
+        admission_runner: None,
     };
     for (first, second) in [
         (
@@ -806,6 +818,7 @@ fn verified_evidence_failed_command_preserves_unknown_owner_and_whitespace() {
         declared: None,
         classification: crate::validation::classify_validation_script("cargo check"),
         receipt_runner: None,
+        admission_runner: None,
     };
     let evidence = |bytes: &[u8]| {
         let mut signal = serde_json::json!({});
@@ -2977,6 +2990,7 @@ fn final_test_summaries_attribute_counts_without_execution_receipts() {
             execution_context: None,
             declared: None,
             receipt_runner: None,
+            admission_runner: None,
             classification: crate::validation::classify_validation_script(command),
         };
         let mut signal = json!({});
@@ -3006,6 +3020,145 @@ fn final_test_summaries_attribute_counts_without_execution_receipts() {
 }
 
 #[test]
+fn managed_summaries_attribute_execution_without_minting_receipts() {
+    for (output, expected) in [
+        ("Summary [0.2s] 3 tests run: 3 passed, 4 skipped\n", Some(3)),
+        ("Summary [0.2s] 3 tests run: 2 passed, 1 failed\n", None),
+        ("Summary [0.2s] 3 tests run: 2 passed\n", None),
+        ("Summary [0.2s] 0 tests run: 0 passed\n", None),
+        ("Summary [0.2s] 3 tests run: 3 passed\nunknown tail\n", None),
+        (
+            "Summary [0.2s] 3 tests run: 3 passed\n{\"kind\":\"codex_validation_metrics_ref_v1\"}\n",
+            Some(3),
+        ),
+        (
+            "Ran 4 tests in 1s\n\nOK (skipped=1)\nSelection (scripts): 4 test(s); started=4; unrun=0; complete=True; successful=True\n",
+            Some(3),
+        ),
+        (
+            "Ran 4 tests in 1s\n\nOK\nSelection (scripts): 4 test(s); started=3; unrun=0; complete=True; successful=True\n",
+            None,
+        ),
+        (
+            "Ran 4 tests in 1s\n\nOK\nSelection (scripts): 4 test(s); started=4; unrun=0; complete=False; successful=True\n",
+            None,
+        ),
+        (
+            "Ran 4 tests in 1s\n\nOK (skipped=4)\nSelection (scripts): 4 test(s); started=4; unrun=0; complete=True; successful=True\n",
+            None,
+        ),
+    ] {
+        let validation = crate::validation::CommandValidation {
+            execution_context: None,
+            declared: None,
+            receipt_runner: None,
+            admission_runner: None,
+            classification: crate::validation::classify_validation_script("cargo nextest run"),
+        };
+        for (terminal, exit) in [(true, 0), (true, 1), (false, 0)] {
+            let mut signal = json!({});
+            attach_command_validation(
+                &mut signal,
+                output.as_bytes(),
+                Some(&validation),
+                Some(exit),
+                terminal,
+            );
+            assert_eq!(
+                signal["validation_summary_tests"].as_u64(),
+                if terminal && exit == 0 {
+                    expected
+                } else {
+                    None
+                },
+                "{output}"
+            );
+            assert!(signal.get("runner_execution_receipt").is_none());
+        }
+    }
+}
+
+#[test]
+fn maintenance_json_requires_complete_consistent_nonzero_body_execution() {
+    let report = json!({
+        "schema_version": 1, "runner": "root_maintenance.unittest",
+        "complete": true, "successful": true, "tests_run": 1, "errors": [],
+        "reusable_validation_receipt": false,
+        "environments": [{"environment": "scripts", "exit_code": 0, "report": {
+            "complete": true, "successful": true, "errors": [], "tests_run": 1,
+            "selection": {"names": ["fixture.actual"], "selected_count": 1, "duplicates": [], "unrun": []},
+            "tests": [{"name": "fixture.actual", "started": true, "body_started": true, "outcome": "success"}],
+        }}],
+    });
+    for scenario in [
+        "complete",
+        "partial",
+        "mismatched",
+        "unrun",
+        "zero_body",
+        "duplicate",
+        "failed",
+    ] {
+        let mut candidate = report.clone();
+        match scenario {
+            "partial" => candidate["complete"] = json!(false),
+            "mismatched" => candidate["tests_run"] = json!(2),
+            "unrun" => {
+                candidate["environments"][0]["report"]["selection"]["unrun"] =
+                    json!(["fixture.actual"])
+            }
+            "zero_body" => {
+                candidate["environments"][0]["report"]["tests"][0]["body_started"] = json!(false);
+                candidate["environments"][0]["report"]["tests"][0]["outcome"] = json!("skipped");
+            }
+            "duplicate" => {
+                let environment = candidate["environments"][0].clone();
+                candidate["environments"]
+                    .as_array_mut()
+                    .unwrap()
+                    .push(environment);
+                candidate["tests_run"] = json!(2);
+            }
+            "failed" => {
+                candidate["environments"][0]["report"]["tests"][0]["outcome"] = json!("failure")
+            }
+            _ => {}
+        }
+        assert_eq!(
+            validation_summary_test_count(candidate.to_string().as_bytes()),
+            (scenario == "complete").then_some(1),
+            "{scenario}"
+        );
+        let bytes = candidate.to_string().into_bytes();
+        let observation =
+            producer_test_execution_observation(&bytes, Some("root_maintenance.unittest"));
+        assert_eq!(observation.is_some(), scenario == "complete", "{scenario}");
+        assert!(producer_test_execution_observation(&bytes, None).is_none());
+        assert!(producer_test_execution_observation(&bytes, Some("rust_test_runner")).is_none());
+        if let Some(observation) = observation {
+            assert_eq!(
+                observation["executions"],
+                json!([{"environment":"scripts", "test":"fixture.actual"}])
+            );
+            assert_eq!(observation["automatic_replay_allowed"], false);
+            assert!(observation.get("runner_input_fingerprint").is_none());
+            for tail in [
+                "unknown trailing output",
+                "Summary [0.2s] 1 test run: 1 passed",
+            ] {
+                assert!(
+                    producer_test_execution_observation(
+                        format!("{}\n{tail}", candidate).as_bytes(),
+                        Some("root_maintenance.unittest")
+                    )
+                    .is_none()
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn runner_receipts_preserve_execution_tuples_and_partial_failures() {
     let pure = json!({"binary": "core", "helpers": [], "test": "same"});
     let helper = json!({"binary": "core", "helpers": ["helper"], "test": "same"});
@@ -3028,6 +3181,7 @@ fn runner_receipts_preserve_execution_tuples_and_partial_failures() {
         declared: None,
         classification: crate::validation::classify_validation_script("cargo test"),
         receipt_runner: Some("rust_test_runner".into()),
+        admission_runner: None,
     };
     let mut signal = json!({});
     attach_command_validation(
@@ -3069,6 +3223,103 @@ fn runner_receipts_preserve_execution_tuples_and_partial_failures() {
     );
 }
 
+#[test]
+fn runner_receipts_resolve_retained_references_by_digest() {
+    // Command output keeps a 1 MiB head/tail window, so the runner retains a
+    // large receipt and prints one hash-bound reference line instead.
+    let pure = json!({"binary": "core", "helpers": [], "test": "same"});
+    let receipt = json!({
+        "kind": "codex_test_execution_v1", "runner": "rust_test_runner",
+        "runner_input_fingerprint": "a".repeat(64), "selected_targets": ["a"],
+        "completed_tests": {"core": ["same"]}, "executed_tests": 1,
+        "executions": [pure], "required_executions": [pure],
+        "satisfied_gates": {"a": ["same"]}, "exit_code": 0,
+    });
+    let root = tempfile::tempdir().unwrap();
+    let logs = root.path().join("test-runner-logs");
+    std::fs::create_dir(&logs).unwrap();
+    let retained = receipt.to_string().into_bytes();
+    let path = logs.join("execution-receipt-fixture.log");
+    std::fs::write(&path, &retained).unwrap();
+    let elsewhere = root.path().join("execution-receipt-fixture.log");
+    std::fs::write(&elsewhere, &retained).unwrap();
+    let digest = crate::tool_history::sha256(&retained);
+    let reference = |runner: &str, location: &std::path::Path, bytes: usize, sha256: &str| {
+        json!({
+            "kind": "codex_test_execution_ref_v1", "runner": runner,
+            "path": location.to_string_lossy(), "bytes": bytes, "sha256": sha256,
+            "executed_tests": 1, "exit_code": 0, "selected_targets": ["a"],
+        })
+        .to_string()
+    };
+    let valid = reference(
+        "rust_test_runner",
+        path.as_path(),
+        retained.len(),
+        digest.as_str(),
+    );
+    let output = format!("Rust phase build/test: wall=1.0s; exit=0\n{valid}\n");
+    assert_eq!(
+        runner_execution_receipt(output.as_bytes(), Some("rust_test_runner")),
+        Some(receipt.clone())
+    );
+    // A reference is a locator, never evidence on its own.
+    let wrong_digest = "b".repeat(64);
+    for (case, candidate) in [
+        (
+            "digest",
+            reference(
+                "rust_test_runner",
+                path.as_path(),
+                retained.len(),
+                wrong_digest.as_str(),
+            ),
+        ),
+        (
+            "size",
+            reference(
+                "rust_test_runner",
+                path.as_path(),
+                retained.len() + 1,
+                digest.as_str(),
+            ),
+        ),
+        (
+            "runner",
+            reference("other_runner", path.as_path(), retained.len(), digest.as_str()),
+        ),
+        (
+            "directory",
+            reference(
+                "rust_test_runner",
+                elsewhere.as_path(),
+                retained.len(),
+                digest.as_str(),
+            ),
+        ),
+        ("inline beside reference", format!("{receipt}\n{valid}")),
+        ("two references", format!("{valid}\n{valid}")),
+    ] {
+        assert!(
+            runner_execution_receipt(candidate.as_bytes(), Some("rust_test_runner")).is_none(),
+            "{case}"
+        );
+    }
+    assert!(
+        runner_execution_receipt(output.as_bytes(), None).is_none(),
+        "untrusted producer"
+    );
+    assert!(
+        inline_runner_execution_receipt(output.as_bytes(), Some("rust_test_runner")).is_none(),
+        "display compaction never resolves references"
+    );
+    std::fs::remove_file(&path).unwrap();
+    assert!(
+        runner_execution_receipt(output.as_bytes(), Some("rust_test_runner")).is_none(),
+        "a missing retained receipt is no evidence"
+    );
+}
+
 #[tokio::test]
 async fn exec_validation_compacts_receipts_without_changing_exact_streams_or_proof() {
     let tests = (0..160)
@@ -3091,9 +3342,11 @@ async fn exec_validation_compacts_receipts_without_changing_exact_streams_or_pro
         declared: None,
         classification: crate::validation::classify_validation_script("cargo test --lib"),
         receipt_runner: Some("rust_test_runner".into()),
+        admission_runner: None,
     });
     output.process_output = Some(std::sync::Arc::new(
         crate::unified_exec::ProcessOutputSnapshot {
+            process_duration: None,
             aggregated_output: raw.as_bytes().to_vec(),
             stdout: raw.as_bytes().to_vec(),
             stderr: Vec::new(),
@@ -3172,6 +3425,7 @@ async fn exec_passing_validation_is_compact_even_when_it_fits_the_output_budget(
         declared: None,
         classification: crate::validation::classify_validation_script("cargo test --lib"),
         receipt_runner: None,
+        admission_runner: None,
     });
     let summary = output
         .summarized_output(&raw, 10_000)
@@ -3235,6 +3489,7 @@ async fn exec_code_mode_preserves_empty_output_and_explicit_lifecycle() {
     // Completeness requires the process-owned exact (here empty) output.
     output.process_output = Some(std::sync::Arc::new(
         crate::unified_exec::ProcessOutputSnapshot {
+            process_duration: None,
             aggregated_output: Vec::new(),
             stdout: Vec::new(),
             stderr: Vec::new(),
@@ -3311,6 +3566,7 @@ async fn fork91_empty_terminal_drain_preserves_chunk_and_cumulative_stream_contr
     ] {
         output.process_output = Some(std::sync::Arc::new(
             crate::unified_exec::ProcessOutputSnapshot {
+                process_duration: None,
                 aggregated_output: raw.to_vec(),
                 stdout: raw.to_vec(),
                 stderr: Vec::new(),
@@ -3405,6 +3661,7 @@ async fn fork91_no_match_requires_exact_error_free_terminal_streams() {
     ] {
         output.process_output = Some(std::sync::Arc::new(
             crate::unified_exec::ProcessOutputSnapshot {
+                process_duration: None,
                 aggregated_output: stderr.as_bytes().to_vec(),
                 stdout: Vec::new(),
                 stderr: stderr.as_bytes().to_vec(),
@@ -3424,6 +3681,7 @@ async fn fork91_no_match_requires_exact_error_free_terminal_streams() {
     // running or its output has not been drained.
     output.process_output = Some(std::sync::Arc::new(
         crate::unified_exec::ProcessOutputSnapshot {
+            process_duration: None,
             aggregated_output: Vec::new(),
             stdout: Vec::new(),
             stderr: Vec::new(),
@@ -3463,6 +3721,7 @@ async fn nested_command_output_uses_cell_budget_and_preserves_explicit_caps() {
     // Completeness requires the process-owned exact output, not the display chunk.
     output.process_output = Some(std::sync::Arc::new(
         crate::unified_exec::ProcessOutputSnapshot {
+            process_duration: None,
             aggregated_output: raw.as_bytes().to_vec(),
             stdout: raw.as_bytes().to_vec(),
             stderr: Vec::new(),
@@ -3645,4 +3904,44 @@ async fn exec_projection_retains_diagnostics_outside_generic_cut_regions() {
     assert!(metadata.predetermined_ranges.is_empty());
     let ranges = predetermined_validation_ranges(&raw, Some("cargo check"));
     assert_eq!(ranges[0].start_line, 2001);
+}
+
+/// Audit 145 (A145-06): a live capture's length lags the producer's coalesced
+/// bytes, so a reduced poll names the chunk's whole omitted extent. Only a
+/// finalized capture clips selectors to its retained length.
+#[tokio::test]
+async fn audit145_claude_live_capture_recovery_selector_is_not_clipped_to_received_bytes() {
+    use crate::unified_exec::head_tail_buffer::OutputChunkRanges;
+    let raw = "exact λ evidence\r\n".repeat(1000);
+    // The writer has received only this prefix; the rest is still coalesced.
+    let received = &raw.as_bytes()[..raw.len() / 2];
+    let (mut output, _, _, _root) = artifact_backed_exec_output(received, Some(80)).await;
+    let received = received.len() as u64;
+    output.raw_output = raw.as_bytes().to_vec();
+    output.output_ranges = Some(OutputChunkRanges {
+        range: 0..raw.len() as u64,
+        gap: None,
+    });
+    let finalized = output.raw_output_artifact.clone();
+    let mut live = finalized.clone().expect("stored artifact");
+    let RawOutputArtifact::Stored {
+        finalized: state, ..
+    } = &mut live
+    else {
+        panic!("stored artifact");
+    };
+    *state = false;
+    output.raw_output_artifact = Some(live);
+    let line_bytes = "exact λ evidence\r\n".len() as u64;
+    assert_eq!(
+        output.missing_output_selector(&raw, "", Some((2, 900)), false, Some(received)),
+        Some(json!({"kind":"bytes", "start":line_bytes, "end":900 * line_bytes}))
+    );
+
+    // Negative control: a finalized capture of the same length still clips.
+    output.raw_output_artifact = finalized;
+    assert_eq!(
+        output.missing_output_selector(&raw, "", Some((2, 900)), false, Some(received)),
+        Some(json!({"kind":"bytes", "start":line_bytes, "end":received}))
+    );
 }

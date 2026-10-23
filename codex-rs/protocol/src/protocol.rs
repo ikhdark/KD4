@@ -1977,6 +1977,11 @@ pub enum TurnExecutionStopCause {
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]
 pub struct TurnCompletionAssessment {
+    /// Versioned declared-scope verdict, independent of diagnostic severity.
+    /// Missing on older records means unavailable, never inferred complete.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub task_disposition: Option<TurnTaskDisposition>,
     /// Bounded unresolved questions for resume. Never passing proof or live handles.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
@@ -1984,6 +1989,22 @@ pub struct TurnCompletionAssessment {
     pub failed_checks: Vec<String>,
     pub verification_gaps: Vec<String>,
     pub advisories: Vec<String>,
+}
+
+/// Host assessment of a finite declared contract, not all natural-language intent.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
+#[ts(export_to = "v2/")]
+pub struct TurnTaskDisposition {
+    pub schema_version: u32,
+    pub plan_revision: Option<String>,
+    pub input_revision: Option<String>,
+    pub mutation_revision: u64,
+    pub request_state: String,
+    pub artifact_state: String,
+    pub terminal_action: String,
+    pub unmet_obligations: Vec<String>,
+    pub evidence_refs: Vec<String>,
+    pub authority: String,
 }
 
 impl TurnCompletionAssessment {
@@ -2629,6 +2650,13 @@ pub enum TurnTimingRequestDiagnosticsStatus {
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]
 pub struct TurnTimingModelRequest {
+    /// Host queue observations by physical attempt, then api_to_mapper or
+    /// mapper_to_turn stage. Missing stages are unknown, not zero. Queue sums
+    /// overlap provider work and each other; never subtract them from model wait
+    /// to invent provider computation time.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub response_queue_timing_by_attempt:
+        BTreeMap<String, BTreeMap<String, crate::timing::ResponseQueueTiming>>,
     /// Named setup-phase union durations in nanoseconds, frozen at dispatch.
     /// Measured from request preparation (or attempt start for retries), not
     /// cumulative across the turn. Phases can overlap and must not be summed.
@@ -3316,6 +3344,18 @@ pub struct TurnTimingLocal {
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]
 pub struct TurnTimingMilestones {
+    /// Worker entry after the task-installation barrier, from turn start.
+    /// Absent is unknown; it must not be reconstructed from wall timestamps.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    #[ts(type = "number")]
+    pub turn_worker_started_ms: Option<u64>,
+    /// First ordinary request-preparation entry before any provider dispatch.
+    /// The preceding span includes initial turn setup, not provider work.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    #[ts(type = "number")]
+    pub first_request_preparation_started_ms: Option<u64>,
     /// Time from turn start until the first user input begins durable recording.
     #[serde(default)]
     #[ts(type = "number | null")]
@@ -3376,6 +3416,20 @@ pub struct TurnTimingMilestones {
     #[serde(default)]
     #[ts(type = "number | null")]
     pub first_agent_message_ms: Option<u64>,
+    /// First nonempty assistant text accepted by the post-filter host queue;
+    /// reasoning, completed messages and native paint are separate milestones.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    #[ts(type = "number")]
+    pub first_assistant_text_ms: Option<u64>,
+    /// Item identity when supplied by the published event.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub first_assistant_text_item_id: Option<String>,
+    /// Phase when supplied by the published event; absent is unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub first_assistant_text_phase: Option<MessagePhase>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
@@ -3527,7 +3581,9 @@ pub struct TurnTimingCounters {
     pub attributable_recovery_generation_count: u32,
     /// Tool-result generations immediately following provider-visible output
     /// that actually omitted or truncated canonical tool information.
-    #[serde(default)]
+    /// Temporal succession only: this does not establish an extra generation
+    /// caused by truncation. Historical causal spelling is accepted on input.
+    #[serde(default, rename = "continuationAfterTruncationCount", alias = "truncationInducedContinuationCount")]
     pub truncation_induced_continuation_count: u32,
     pub invalid_transition_count: u32,
     pub clock_regression_count: u32,
@@ -3811,7 +3867,14 @@ impl TokenUsageCoverage {
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
 pub struct TokenUsageInfo {
+    /// Cumulative known consumption, including compaction. Missing receipts are
+    /// represented by coverage, not by an assertion that the work was free.
     pub total_token_usage: TokenUsage,
+    /// Latest published provider receipt, not a ledger of every provider
+    /// request. After a compaction it is that compaction's usage, while
+    /// `estimated_context_tokens` keeps the conversation's context size; the
+    /// next conversation receipt replaces it. Consumption reconstruction must
+    /// use cumulative deltas together with coverage, not sum this field per event.
     pub last_token_usage: TokenUsage,
     /// Local active-context estimate, not observed provider consumption.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -3844,9 +3907,7 @@ impl TokenUsageInfo {
         if let Some(last) = last {
             info.append_last_usage(last);
         }
-        if let Some(model_context_window) = model_context_window {
-            info.model_context_window = Some(model_context_window);
-        }
+        info.model_context_window = model_context_window;
         Some(info)
     }
 
@@ -4010,11 +4071,17 @@ impl TokenUsage {
         self.known(self.total_tokens, |c| c.total_tokens)
     }
     pub fn known_visible_output(&self) -> Option<i64> {
+        if self.coverage.as_ref()?.invalid_receipts != 0 {
+            return None;
+        }
         self.known_output()?
             .checked_sub(self.known_reasoning_output()?)
             .filter(|tokens| *tokens >= 0)
     }
     pub fn known_non_cached_input(&self) -> Option<i64> {
+        if self.coverage.as_ref()?.invalid_receipts != 0 {
+            return None;
+        }
         self.known_input()?
             .checked_sub(self.known_cached_input()?)
             .filter(|tokens| *tokens >= 0)
@@ -6440,6 +6507,9 @@ pub enum TurnAbortReason {
     InternalError,
     /// Recovery found an open turn after its owning process disappeared.
     ProcessLost,
+    /// The session shut down (application exit, thread unload, or delegate
+    /// teardown) while the turn was running; the user did not interrupt it.
+    SessionShutdown,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, JsonSchema, TS)]
@@ -6818,6 +6888,7 @@ mod tests {
             "toolOutputRecoveryRetruncationCount",
             "toolOutputRecursiveSpillCount",
             "attributableRecoveryGenerationCount",
+            "continuationAfterTruncationCount",
             "truncationInducedContinuationCount",
         ] {
             counters.remove(field);
@@ -7652,6 +7723,7 @@ mod tests {
             turn_id: "turn-1".into(),
             started_at_ms: 0,
             item: TurnItem::FileChange(FileChangeItem {
+                effects: None,
                 environment: None,
                 id: "patch-1".into(),
                 changes: [(
@@ -7770,6 +7842,7 @@ mod tests {
             turn_id: "turn-1".into(),
             completed_at_ms: 0,
             item: TurnItem::FileChange(FileChangeItem {
+                effects: None,
                 environment: None,
                 id: "patch-1".into(),
                 changes: [(
@@ -8151,6 +8224,19 @@ mod tests {
         assert_eq!(
             serde_json::from_value::<TurnAbortReason>(value)?,
             TurnAbortReason::InternalError
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn session_shutdown_abort_reason_has_stable_wire_value() -> Result<()> {
+        // Persisted rollouts and analysis tools key on this value to tell a
+        // shutdown apart from a user interruption.
+        let value = serde_json::to_value(TurnAbortReason::SessionShutdown)?;
+        assert_eq!(value, json!("session_shutdown"));
+        assert_eq!(
+            serde_json::from_value::<TurnAbortReason>(value)?,
+            TurnAbortReason::SessionShutdown
         );
         Ok(())
     }
@@ -8931,7 +9017,7 @@ mod tests {
     }
 
     #[test]
-    fn token_usage_info_new_or_append_preserves_context_window_when_not_provided() {
+    fn token_usage_info_new_or_append_clears_unknown_model_context_window() {
         let initial = Some(TokenUsageInfo {
             estimated_context_tokens: None,
             total_token_usage: TokenUsage::default(),
@@ -8951,7 +9037,7 @@ mod tests {
             TokenUsageInfo::new_or_append(&initial, &last, /*model_context_window*/ None)
                 .expect("new_or_append should return info");
 
-        assert_eq!(info.model_context_window, Some(258_400));
+        assert_eq!(info.model_context_window, None);
     }
 
     #[test]

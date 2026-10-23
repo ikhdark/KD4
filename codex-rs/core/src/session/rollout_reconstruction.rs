@@ -322,10 +322,10 @@ pub(super) fn append_unified_exec_resume_invalidation_with_rollout(
             _ => None,
         })
         .collect::<HashSet<_>>();
-    let mut handles = std::collections::BTreeMap::new();
+    let mut handles = ResumeHandles::new();
     // Canonical lifecycle items are host-produced and persisted independently
     // of script text. Never infer nested handles/artifacts from printed JSON.
-    for item in rollout {
+    for (position, item) in rollout.iter().enumerate() {
         let item = match item {
             RolloutItem::EventMsg(EventMsg::ItemStarted(event)) => &event.item,
             RolloutItem::EventMsg(EventMsg::ItemCompleted(event)) => &event.item,
@@ -345,32 +345,35 @@ pub(super) fn append_unified_exec_resume_invalidation_with_rollout(
             .output_metadata
             .as_ref()
             .and_then(|metadata| metadata.raw_output_artifact_id.clone());
-        let retained = handles.entry(id).or_insert(None);
-        if artifact.is_some() {
-            *retained = artifact;
-        }
+        record_resume_handle(&mut handles, id, artifact, (true, position));
     }
-    let has_old_sessions = history.iter().fold(false, |found, item| {
-        let current = match item {
-            ResponseItem::FunctionCallOutput {
-                call_id, output, ..
-            } if unified_exec_call_ids.contains(call_id.as_str()) => output
-                .body
-                .to_text()
-                .is_some_and(|output| collect_resume_handles(&output, false, &mut handles)),
-            ResponseItem::CustomToolCallOutput {
-                call_id, output, ..
-            }
-            | ResponseItem::FunctionCallOutput {
-                call_id, output, ..
-            } if code_mode_call_ids.contains(call_id.as_str()) => output
-                .body
-                .to_text()
-                .is_some_and(|text| collect_resume_handles(&text, true, &mut handles)),
-            _ => false,
-        };
-        found || current
-    });
+    let has_old_sessions = history
+        .iter()
+        .enumerate()
+        .fold(false, |found, (position, item)| {
+            let observed_at = (false, position);
+            let current = match item {
+                ResponseItem::FunctionCallOutput {
+                    call_id, output, ..
+                } if unified_exec_call_ids.contains(call_id.as_str()) => {
+                    output.body.to_text().is_some_and(|output| {
+                        collect_resume_handles(&output, false, observed_at, &mut handles)
+                    })
+                }
+                ResponseItem::CustomToolCallOutput {
+                    call_id, output, ..
+                }
+                | ResponseItem::FunctionCallOutput {
+                    call_id, output, ..
+                } if code_mode_call_ids.contains(call_id.as_str()) => {
+                    output.body.to_text().is_some_and(|text| {
+                        collect_resume_handles(&text, true, observed_at, &mut handles)
+                    })
+                }
+                _ => false,
+            };
+            found || current
+        });
     // Replace earlier runtime notices so this notice scopes invalidation to the
     // current resume boundary. Historical process IDs are excluded at admission.
     let mut had_notice = false;
@@ -382,8 +385,14 @@ pub(super) fn append_unified_exec_resume_invalidation_with_rollout(
     if !has_old_sessions && !had_notice && handles.is_empty() {
         return;
     }
+    // Process IDs are random, so ID order is not recency. Keep the most
+    // recently observed handles and list them chronologically.
     let omitted = handles.len().saturating_sub(32);
-    let recorded_handles = handles.into_iter().take(32).map(|(session_id, artifact_id)| {
+    let mut recorded_handles = handles.into_iter().collect::<Vec<_>>();
+    recorded_handles.sort_by_key(|(_, (_, observed_at))| std::cmp::Reverse(*observed_at));
+    recorded_handles.truncate(32);
+    recorded_handles.reverse();
+    let recorded_handles = recorded_handles.into_iter().map(|(session_id, (artifact_id, _))| {
         serde_json::json!({"session_id": session_id, "raw_output_artifact_id": artifact_id})
     }).collect::<Vec<_>>();
     let evidence = serde_json::json!({"recorded_process_handles": recorded_handles,
@@ -412,9 +421,29 @@ Recorded process handles and saved output references (historical evidence, not a
     });
 }
 
+/// Saved-output reference and latest observation of each recorded process
+/// handle. Lifecycle records `(true, rollout position)` order after receipts
+/// seen only in history `(false, history position)`; only rollouts predating
+/// lifecycle process IDs lack those records.
+type ResumeHandles = std::collections::BTreeMap<u32, (Option<String>, (bool, usize))>;
+
+fn record_resume_handle(
+    handles: &mut ResumeHandles,
+    id: u32,
+    artifact: Option<String>,
+    observed_at: (bool, usize),
+) {
+    let retained = handles.entry(id).or_insert((None, observed_at));
+    retained.1 = retained.1.max(observed_at);
+    if artifact.is_some() {
+        retained.0 = artifact;
+    }
+}
+
 fn collect_command_receipt_handle(
     value: &serde_json::Value,
-    handles: &mut std::collections::BTreeMap<u32, Option<String>>,
+    observed_at: (bool, usize),
+    handles: &mut ResumeHandles,
 ) -> bool {
     // Raw command receipts omit these fields. Explicitly different owners are
     // not process handles, even when their JSON happens to contain session_id.
@@ -442,17 +471,15 @@ fn collect_command_receipt_handle(
         .as_str()
         .filter(|id| id.len() <= 160)
         .map(str::to_string);
-    let retained = handles.entry(id).or_default();
-    if artifact.is_some() {
-        *retained = artifact;
-    }
+    record_resume_handle(handles, id, artifact, observed_at);
     true
 }
 
 fn collect_resume_handles(
     text: &str,
     nested: bool,
-    handles: &mut std::collections::BTreeMap<u32, Option<String>>,
+    observed_at: (bool, usize),
+    handles: &mut ResumeHandles,
 ) -> bool {
     if nested {
         // Legacy code-mode text has no authenticated subrecord boundaries.
@@ -461,7 +488,7 @@ fn collect_resume_handles(
     }
     // Only the direct native envelope owns these fields; stdout is nested data.
     if let Ok(value) = serde_json::from_str::<serde_json::Value>(text) {
-        return collect_command_receipt_handle(&value, handles);
+        return collect_command_receipt_handle(&value, observed_at, handles);
     }
     // Compatibility with the native legacy status header, never stdout lines.
     let Some(status) = text
@@ -473,7 +500,7 @@ fn collect_resume_handles(
     };
     let id = status.split_once(';').map_or(status, |(id, _)| id);
     if let Ok(id) = id.trim().parse::<u32>() {
-        handles.entry(id).or_default();
+        record_resume_handle(handles, id, None, observed_at);
         true
     } else {
         false

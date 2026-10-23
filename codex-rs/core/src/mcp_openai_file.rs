@@ -22,7 +22,11 @@ use codex_api::upload_openai_file_with_pool;
 #[cfg(test)]
 use codex_login::CodexAuth;
 use codex_utils_path_uri::PathConvention;
+use futures::StreamExt;
+use futures::stream::FuturesUnordered;
 use serde_json::Value as JsonValue;
+
+const MAX_CONCURRENT_OPENAI_FILE_UPLOADS: usize = 4;
 
 struct StagedOpenAiFile {
     field_name: String,
@@ -87,20 +91,32 @@ struct OpenAiUploadCleanup {
 
 impl OpenAiUploadCleanup {
     async fn rollback(&mut self) {
-        while let Some(file_id) = self.file_ids.last() {
-            if let Err(error) = delete_openai_file_with_pool(
-                &self.base_url,
-                self.auth.as_ref(),
-                &self.clients,
-                file_id,
-            )
-            .await
-            {
-                tracing::warn!(%error, "uploaded file cleanup failed; retaining cleanup ownership");
-                return;
+        // Remote IDs are independent and deletion is idempotent. Keep each ID
+        // in the guard until its own delete is confirmed, even if this waiter
+        // is dropped; Drop can then retry all unconfirmed work safely.
+        let pending = self.file_ids.iter().rev().cloned().collect::<Vec<_>>();
+        let base_url = &self.base_url;
+        let auth = &self.auth;
+        let clients = &self.clients;
+        let deletes = futures::stream::iter(pending.into_iter().map(|file_id| async move {
+            let result =
+                delete_openai_file_with_pool(base_url, auth.as_ref(), clients, &file_id).await;
+            (file_id, result)
+        }))
+        .buffer_unordered(MAX_CONCURRENT_OPENAI_FILE_UPLOADS);
+        tokio::pin!(deletes);
+        let mut deleted = std::collections::HashSet::new();
+        while let Some((file_id, result)) = deletes.next().await {
+            match result {
+                Ok(()) => {
+                    deleted.insert(file_id);
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "uploaded file cleanup failed; retaining cleanup ownership")
+                }
             }
-            self.file_ids.pop();
         }
+        self.file_ids.retain(|file_id| !deleted.contains(file_id));
     }
 }
 
@@ -194,26 +210,72 @@ pub(crate) async fn prepare_mcp_tool_arguments_for_openai_files(
     let (tx, rx) = tokio::sync::oneshot::channel();
     sess.terminal_tasks.spawn(async move {
         let result = async {
+            let mut fields = Vec::new();
+            let mut pending = Vec::new();
             for (field_name, staged_argument) in staged_arguments {
                 let (files, is_array) = match staged_argument {
                     StagedOpenAiArgument::Single(file) => (vec![file], false),
                     StagedOpenAiArgument::Array(files) => (files, true),
                 };
-                let mut values = Vec::new();
-                for staged in files {
-                    if tx.is_closed() {
-                        return Err("file preparation cancelled before MCP dispatch".to_string());
-                    }
-                    let (value, file_id) = upload_staged_openai_file(
-                        &owner.base_url,
-                        owner.auth.as_ref(),
-                        &owner.clients,
-                        staged,
-                    )
-                    .await?;
-                    owner.file_ids.push(file_id);
-                    values.push(value);
+                let field_index = fields.len();
+                let values = vec![JsonValue::Null; files.len()];
+                fields.push((field_name, is_array, values));
+                pending.extend(
+                    files
+                        .into_iter()
+                        .enumerate()
+                        .map(|(index, file)| (field_index, index, file)),
+                );
+            }
+            let mut pending = pending.into_iter();
+            let mut uploads = FuturesUnordered::new();
+            let mut failure = None;
+            loop {
+                if tx.is_closed() && failure.is_none() {
+                    failure = Some("file preparation cancelled before MCP dispatch".to_string());
                 }
+                while failure.is_none() && uploads.len() < MAX_CONCURRENT_OPENAI_FILE_UPLOADS {
+                    let Some((field_index, index, staged)) = pending.next() else {
+                        break;
+                    };
+                    let base_url = owner.base_url.clone();
+                    let auth = owner.auth.clone();
+                    let clients = owner.clients.clone();
+                    uploads.push(async move {
+                        let result =
+                            upload_staged_openai_file(&base_url, auth.as_ref(), &clients, staged)
+                                .await;
+                        (field_index, index, result)
+                    });
+                }
+                let Some((field_index, index, result)) = uploads.next().await else {
+                    break;
+                };
+                match result {
+                    Ok((value, file_id)) => {
+                        owner.file_ids.push(file_id);
+                        fields[field_index].2[index] = value;
+                    }
+                    Err((error, cleanup_file_id)) => {
+                        if let Some(file_id) = cleanup_file_id {
+                            owner.file_ids.push(file_id);
+                        }
+                        match &mut failure {
+                            Some(message) => {
+                                message.push('\n');
+                                message.push_str(&error);
+                            }
+                            None => failure = Some(error),
+                        }
+                    }
+                }
+                // Never drop an in-flight allocation/upload on error or caller
+                // cancellation. Drain it into this session-owned rollback guard.
+            }
+            if let Some(error) = failure {
+                return Err(error);
+            }
+            for (field_name, is_array, mut values) in fields {
                 let value = if is_array {
                     JsonValue::Array(values)
                 } else {
@@ -404,7 +466,7 @@ async fn upload_staged_openai_file(
     auth: &dyn codex_api::AuthProvider,
     http_clients: &codex_http_client::RouteAwareClientPool,
     staged: StagedOpenAiFile,
-) -> Result<(JsonValue, String), String> {
+) -> Result<(JsonValue, String), (String, Option<String>)> {
     let StagedOpenAiFile {
         field_name,
         index,
@@ -418,8 +480,8 @@ async fn upload_staged_openai_file(
         }
         None => format!("failed to upload `{file_path}` for `{field_name}`: {error}"),
     };
-    let file_size_bytes =
-        u64::try_from(contents.len()).map_err(|error| contextualize_error(error.to_string()))?;
+    let file_size_bytes = u64::try_from(contents.len())
+        .map_err(|error| (contextualize_error(error.to_string()), None))?;
     let contents = futures::stream::once(async move { Ok::<_, std::io::Error>(contents.into()) });
     let uploaded = upload_openai_file_with_pool(
         base_url,
@@ -430,7 +492,13 @@ async fn upload_staged_openai_file(
         contents,
     )
     .await
-    .map_err(|error| contextualize_error(error.to_string()))?;
+    .map_err(|error| {
+        let cleanup_file_id = match &error {
+            codex_api::OpenAiFileError::RollbackFailed { file_id, .. } => Some(file_id.clone()),
+            _ => None,
+        };
+        (contextualize_error(error.to_string()), cleanup_file_id)
+    })?;
     let file_id = uploaded.file_id.clone();
     Ok((
         serde_json::json!({
@@ -471,6 +539,47 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn rollback_retries_only_unconfirmed_ids_after_draining_independent_deletes() {
+        use wiremock::Mock;
+        use wiremock::MockServer;
+        use wiremock::ResponseTemplate;
+        use wiremock::matchers::method;
+        use wiremock::matchers::path;
+
+        let server = MockServer::start().await;
+        for (id, status) in [("one", 204), ("failed", 500), ("three", 204)] {
+            Mock::given(method("DELETE"))
+                .and(path(format!("/backend-api/files/{id}")))
+                .respond_with(ResponseTemplate::new(status))
+                .expect(1)
+                .mount(&server)
+                .await;
+        }
+        let (session, turn) = make_session_and_context().await;
+        let auth = CodexAuth::create_dummy_chatgpt_auth_for_testing();
+        let mut owner = OpenAiUploadCleanup {
+            tasks: session.terminal_tasks.clone(),
+            base_url: format!("{}/backend-api", server.uri()),
+            auth: codex_model_provider::auth_provider_from_auth(&auth),
+            clients: openai_file_http_client_pool(&turn.config.http_client_factory()),
+            file_ids: vec!["one".into(), "failed".into(), "three".into()],
+        };
+        owner.rollback().await;
+        assert_eq!(owner.file_ids, ["failed"]);
+        server.verify().await;
+        server.reset().await;
+        Mock::given(method("DELETE"))
+            .and(path("/backend-api/files/failed"))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+        owner.rollback().await;
+        assert!(owner.file_ids.is_empty());
+        server.verify().await;
+    }
+
     #[test]
     fn openai_file_paths_must_be_confined_relative_paths() {
         let dir = tempdir().expect("temp dir");
@@ -494,6 +603,162 @@ mod tests {
                 "C:secret.txt",
             ] {
                 assert!(validate_relative_file_path(&cwd, path).is_err(), "{path}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn parallel_file_preparation_preserves_order_and_drains_rollback() {
+        use std::time::Duration;
+        use wiremock::Mock;
+        use wiremock::MockServer;
+        use wiremock::ResponseTemplate;
+        use wiremock::matchers::{body_json, method, path};
+
+        for scenario in ["success", "failure", "rollback-failure", "cancelled"] {
+            let server = MockServer::start().await;
+            let dir = tempdir().unwrap();
+            let count = MAX_CONCURRENT_OPENAI_FILE_UPLOADS + 2;
+            for index in 0..count {
+                let file_name = format!("{index}.csv");
+                std::fs::write(dir.path().join(&file_name), b"data").unwrap();
+                let allocation = if scenario == "failure" && index == 1 {
+                    ResponseTemplate::new(500)
+                } else {
+                    ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                        "file_id": format!("file_{index}"),
+                        "upload_url": format!("{}/upload/{index}", server.uri()),
+                    }))
+                };
+                Mock::given(method("POST"))
+                    .and(path("/backend-api/files"))
+                    .and(body_json(serde_json::json!({"file_name": file_name, "file_size": 4, "use_case": "codex"})))
+                    .respond_with(allocation)
+                    .mount(&server).await;
+                Mock::given(method("PUT"))
+                    .and(path(format!("/upload/{index}")))
+                    .respond_with(if scenario == "rollback-failure" && index == 1 {
+                        ResponseTemplate::new(500)
+                    } else {
+                        ResponseTemplate::new(200).set_delay(Duration::from_millis(200))
+                    })
+                    .mount(&server)
+                    .await;
+                Mock::given(method("POST"))
+                    .and(path(format!("/backend-api/files/file_{index}/uploaded")))
+                    .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                        "status": "success", "download_url": format!("{}/download/{index}", server.uri()),
+                        "file_name": file_name, "mime_type": "text/csv", "file_size_bytes": 4,
+                    })))
+                    .mount(&server).await;
+                let delete_attempts = std::sync::atomic::AtomicUsize::new(0);
+                Mock::given(method("DELETE"))
+                    .and(path(format!("/backend-api/files/file_{index}")))
+                    .respond_with(move |_: &wiremock::Request| {
+                        let first =
+                            delete_attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0;
+                        ResponseTemplate::new(
+                            if scenario == "rollback-failure" && index == 1 && first {
+                                500
+                            } else {
+                                204
+                            },
+                        )
+                    })
+                    .mount(&server)
+                    .await;
+            }
+            let (mut session, mut turn) = make_session_and_context().await;
+            session.services.auth_manager = crate::test_support::auth_manager_from_auth(
+                CodexAuth::create_dummy_chatgpt_auth_for_testing(),
+            );
+            set_primary_environment_cwd(&mut turn, dir.path());
+            let mut config = (*turn.config).clone();
+            config.chatgpt_base_url = format!("{}/backend-api", server.uri());
+            turn.config = Arc::new(config);
+            let session = Arc::new(session);
+            let worker_session = Arc::clone(&session);
+            let task = tokio::spawn(async move {
+                let step = StepContext::for_test(Arc::new(turn));
+                prepare_mcp_tool_arguments_for_openai_files(&worker_session, &step,
+                    Some(serde_json::json!({"files": (0..count).map(|i| format!("{i}.csv")).collect::<Vec<_>>(), "unrelated": 42})),
+                    Some(&["files".to_string()]),
+                ).await
+            });
+            if scenario == "cancelled" {
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    loop {
+                        let requests = server.received_requests().await.unwrap();
+                        if requests.iter().filter(|r| r.method == "PUT").count()
+                            == MAX_CONCURRENT_OPENAI_FILE_UPLOADS
+                        {
+                            break;
+                        }
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("initial upload cohort must overlap before cancellation");
+                task.abort();
+                assert!(matches!(task.await, Err(error) if error.is_cancelled()));
+            } else {
+                let result = tokio::time::timeout(Duration::from_secs(5), task)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                if scenario == "success" {
+                    let arguments = result.unwrap().dispatched().unwrap();
+                    assert_eq!(arguments["unrelated"], 42);
+                    for index in 0..count {
+                        assert_eq!(
+                            arguments["files"][index]["file_id"],
+                            format!("file_{index}")
+                        );
+                    }
+                } else {
+                    assert!(result.err().unwrap().contains("500"));
+                }
+            }
+            session.terminal_tasks.close();
+            tokio::time::timeout(Duration::from_secs(5), session.terminal_tasks.wait())
+                .await
+                .unwrap();
+            let requests = server.received_requests().await.unwrap();
+            let allocations = requests
+                .iter()
+                .filter(|r| r.method == "POST" && r.url.path() == "/backend-api/files")
+                .count();
+            if scenario == "success" {
+                assert_eq!(allocations, count);
+                let second_allocation = requests
+                    .iter()
+                    .position(|r| {
+                        r.method == "POST"
+                            && r.body_json::<JsonValue>()
+                                .is_ok_and(|body| body["file_name"] == "1.csv")
+                    })
+                    .unwrap();
+                let first_finalize = requests
+                    .iter()
+                    .position(|r| r.url.path() == "/backend-api/files/file_0/uploaded")
+                    .unwrap();
+                assert!(
+                    second_allocation < first_finalize,
+                    "the second file must start before the first file finishes"
+                );
+                assert!(!requests.iter().any(|r| r.method == "DELETE"));
+            } else {
+                assert_eq!(
+                    allocations, MAX_CONCURRENT_OPENAI_FILE_UPLOADS,
+                    "failure/cancellation must not admit another cohort"
+                );
+                let deleted = requests.iter().filter(|r| r.method == "DELETE").count();
+                assert_eq!(
+                    deleted,
+                    allocations - usize::from(scenario == "failure")
+                        + usize::from(scenario == "rollback-failure"),
+                    "every late successful upload must be rolled back"
+                );
             }
         }
     }

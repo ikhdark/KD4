@@ -21,6 +21,51 @@ paths = ["codex-rs/shell-command/src/validation.rs"]
 required_gates = ["validation-command-recognition", "validation-bloat-contracts"]
 consumer = "Core exec observation policy consumes shell-command validation classification; recognized validation must retain its waiting and output contracts."
 
+[contracts.obligations.command-exec-consumers]
+paths = ["codex-rs/app-server-protocol/src/protocol/v2/command_exec.rs"]
+required_gates = ["app-server-command-exec"]
+consumer = "Command/exec wire types require sibling literal-JSON oracles and the app-server output-cap transport consumer, not only module ownership advice."
+
+[contracts.obligations.config-schema-fixture]
+paths = ["codex-rs/core/config.schema.json", "codex-rs/config/src/schema.rs", "codex-rs/config/src/schema_fixture_tests.rs"]
+required_gates = ["config-schema-protocol"]
+consumer = "The config crate embeds the core schema fixture and checks generated JSON and the public writer against it."
+
+[contracts.obligations.validation-protocol]
+paths = ["codex-rs/protocol/src/validation.rs"]
+required_gates = ["validation-protocol"]
+consumer = "Shared direct-validation types must preserve exact wire statuses, required fields, argument identity, and normalized repository scopes."
+
+[contracts.obligations.validation-analysis-consumers]
+paths = ["codex-rs/command-analysis/src/validation.rs"]
+required_gates = ["validation-bloat-contracts"]
+consumer = "Core exec and shell handlers consume command-analysis validation classification and must preserve waiting, output, and accounting contracts."
+
+[contracts.obligations.thread-start-schema-consumers]
+paths = ["codex-rs/app-server-protocol/src/protocol/v2/thread.rs"]
+required_gates = ["app-server-schema-fixtures"]
+consumer = "ThreadStartParams is exported through the request protocol into committed JSON and TypeScript schemas; library ownership alone does not check generated fixtures."
+
+[contracts.obligations.completion-filter-consumers]
+paths = ["codex-rs/core/src/session/turn.rs", "codex-rs/core/src/session/turn_execution.rs", "codex-rs/core/src/task_acceptance.rs"]
+required_gates = ["completion-path-evidence"]
+consumer = "Turn completion and acceptance feed ordinary and direct final delivery; retain the filter-declared completion evidence gate in source-based planning."
+
+[contracts.obligations.registry-filter-consumers]
+paths = ["codex-rs/core/src/tools/registry.rs"]
+required_gates = ["completion-path-evidence"]
+consumer = "Registry typed validation receipts participate in the completion evidence contract, beyond direct module ownership."
+
+[contracts.obligations.transport-filter-consumers]
+paths = ["codex-rs/core/src/client.rs", "codex-rs/core/tests/suite/client_websockets.rs"]
+required_gates = ["wall-clock-runtime"]
+consumer = "Model transport preconnect and recovery are consumed by the filter-only WebSocket transport regressions."
+
+[contracts.obligations.code-mode-filter-consumers]
+paths = ["codex-rs/code-mode-host/src/peer.rs", "codex-rs/code-mode-runtime/src/session_runtime/mod.rs"]
+required_gates = ["wall-clock-runtime"]
+consumer = "Code Mode peer admission and durable session results feed host and runtime filter/exact steps in the wall-clock gate."
+
 [gates.multi-session-transport]
 description = "Concurrent auth refresh, shared HTTP request isolation, and WebSocket disconnect/shutdown under saturated ingress."
 
@@ -222,6 +267,13 @@ helpers = [
 # Unknown test modules retain the conservative helper set above. Nextest
 # resolves caller filters before the helper set is narrowed.
 [targets.core_lib.helpers_by_test_prefix]
+# Buffer and outcome ledgers operate only on in-memory data.
+"unified_exec::head_tail_buffer::tests::" = []
+"tools::command_execution::outcome_tests::" = []
+# Output projection is pure data; workspace gates use in-process leases and the
+# installed Python interpreter, not runner-built host or sandbox executables.
+"tools::shell_output_summary_projection_tests::" = []
+"workspace_operation_gate::tests::" = []
 "tools::handlers::context_checkpoint::tests::" = []
 "session::context_window::tests::" = []
 "session::turn::tests::request_latency::" = []
@@ -385,6 +437,11 @@ package = "codex-app-server-protocol"
 lib = true
 helpers = []
 
+[targets.protocol_lib]
+package = "codex-protocol"
+lib = true
+helpers = []
+
 [targets.app_server_schema_fixtures]
 package = "codex-app-server-protocol"
 test = "schema_fixtures"
@@ -493,6 +550,11 @@ helpers = []
 
 [targets.rollout_lib]
 package = "codex-rollout"
+lib = true
+helpers = []
+
+[targets.rollout_trace_lib]
+package = "codex-rollout-trace"
 lib = true
 helpers = []
 
@@ -713,7 +775,7 @@ tests = [
   "responses_retry::tests::connection_recovery_wait_is_limited_to_user_facing_sessions",
   "responses_retry::tests::compaction_waits_out_an_outage_longer_than_its_retry_budget",
   "responses_retry::tests::connection_retry_delay_backs_off_and_is_bounded",
-  "responses_retry::tests::connection_recovery_reaches_https_fallback_without_exhausting_network_waits",
+  "responses_retry::tests::connection_recovery_tries_https_before_waiting_without_spending_provider_retries",
   "responses_retry::tests::batch_and_subagent_sources_do_not_opt_into_unlimited_recovery",
   "responses_retry::tests::audit_declared_incompletion_and_unknown_failures_do_not_retry_or_switch_transport",
   "responses_retry::tests::provider_retry_preserves_jitter_and_prioritizes_cancellation",
@@ -730,6 +792,8 @@ tests = [
   "responses_retry::tests::missing_credentials_wait_rechecks_a_login_that_already_completed",
   "responses_retry::tests::usage_limit_rechecks_the_failed_attempt_account_before_waiting",
   "responses_retry::tests::due_usage_reset_retries_once_then_backs_off_with_the_same_deadline",
+  "responses_retry::tests::audit143_external_source_rotation_and_stalled_reload_respect_owner_bounds",
+  "responses_retry::tests::audit143_explicit_websocket_rejection_has_one_zero_budget_repair",
   "unified_exec::process_tests::output_chunk_updates_are_cancellation_atomic",
 ]
 
@@ -753,7 +817,7 @@ description = "Focused runtime waiting, output, schema, and attempt-accounting c
 target = "core_lib"
 helpers = []
 tests = [
-  "tools::handlers::unified_exec::tests::exec_command_boundary_uses_validation_wait_unless_explicitly_overridden",
+  "tools::handlers::unified_exec::tests::exec_command_analysis_uses_validation_wait_unless_explicitly_overridden",
   "tools::handlers::unified_exec::tests::identical_tagged_validation_rg_misses_both_launch",
   "tools::handlers::shell_spec::tests::exec_command_tool_matches_expected_spec",
   "tools::handlers::shell::tests::pure::shell_failure_sampling_signal_is_stable_and_distinguishes_outcomes",
@@ -796,6 +860,19 @@ tests = [
   "suite::v2::account::set_auth_token_cancels_active_chatgpt_login",
   "suite::v2::account::login_account_chatgpt_includes_forced_workspace_query_param",
   "suite::v2::account::login_account_chatgpt_includes_forced_workspace_allowlist_query_param",
+]
+
+[gates.validation-protocol]
+description = "Exact direct-validation wire and scope contracts in the shared protocol crate."
+
+[[gates.validation-protocol.steps]]
+target = "protocol_lib"
+tests = [
+  "validation::tests::terminal_status_wire_contract_is_lean_and_exact",
+  "validation::tests::lean_context_and_result_round_trip_and_reject_legacy_fields",
+  "validation::tests::lean_context_and_result_require_nonempty_paths_and_argv",
+  "validation::tests::validation_result_preserves_empty_and_whitespace_arguments",
+  "validation::tests::validation_result_rejects_non_normalized_or_duplicate_paths",
 ]
 
 [gates.config-schema-protocol]
@@ -1259,7 +1336,7 @@ description = "Evidence-backed direct completion, explicit obligation state, ret
 
 [[gates.completion-path-evidence.steps]]
 target = "core_lib"
-helpers = []
+helpers = ["codex-code-mode-host"]
 filter = "test(plan_store::tests::) | test(plan_store::acceptance::tests::) | test(plan_store::obligation_regressions::) | test(tools::handlers::plan::tests::) | test(context::world_state::task_state::tests::) | test(audit32_) | test(completion_audit_) | test(explicit_delivery_requires_consumed_process_and_complete_evidence) | test(native_receipt_requires_settled_success_not_plan_bookkeeping) | test(tools::registry::typed_validation_tests::) | test(agent_snapshot_projection_owner_recovery_prioritizes_actionable_exact_fields) | test(cooperative_cleanup_preserves_one_registry_terminal_trace) | test(cancellation_returns_before_supervised_runtime_cleanup_deadline)"
 
 [[gates.completion-path-evidence.steps]]
@@ -1267,6 +1344,8 @@ target = "agent_task_store_lib"
 tests = [
   "tests::criterion_policy_keeps_legacy_claims_unresolved_and_rejects_inapplicable_reads",
   "tests::current_source_policy_reassesses_seal_reads_and_dependency_admission",
+  "tests::current_execution_policy_is_rejected_before_assignment_admission",
+  "tests::native_execution_observation_supports_historical_proof_without_coverage_claims",
   "tests::explicitly_report_only_criteria_need_no_execution_or_source_proof",
 ]
 
@@ -1316,6 +1395,7 @@ filter = "test(host::codec::tests::)"
 
 [[gates.wall-clock-runtime.steps]]
 target = "core_transport_telemetry"
+helpers = []
 filter = "test(suite::client_websockets::responses_websocket_owned_preconnect_preserves_zero_retry_recovery) | test(suite::client_websockets::responses_websocket_turn_preconnect_is_owned_and_reused) | test(suite::client_websockets::responses_websocket_forbidden_handshake_uses_http)"
 
 [[gates.wall-clock-runtime.steps]]

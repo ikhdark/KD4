@@ -116,11 +116,33 @@ impl RequestContext {
 }
 
 #[derive(Debug)]
+pub(crate) struct OutgoingWriteReceipt {
+    pub(crate) writer: oneshot::Sender<Instant>,
+    pub(crate) filtered: Option<oneshot::Sender<()>>,
+}
+
+impl From<oneshot::Sender<Instant>> for OutgoingWriteReceipt {
+    fn from(writer: oneshot::Sender<Instant>) -> Self {
+        Self {
+            writer,
+            filtered: None,
+        }
+    }
+}
+
+impl OutgoingWriteReceipt {
+    #[cfg(test)]
+    pub(crate) fn send(self, at: Instant) -> std::result::Result<(), Instant> {
+        self.writer.send(at)
+    }
+}
+
+#[derive(Debug)]
 pub(crate) enum OutgoingEnvelope {
     ToConnection {
         connection_id: ConnectionId,
         message: OutgoingMessage,
-        write_complete_tx: Option<oneshot::Sender<Instant>>,
+        write_complete_tx: Option<OutgoingWriteReceipt>,
     },
     Broadcast {
         message: OutgoingMessage,
@@ -274,12 +296,14 @@ enum TakeCallbackResult {
 struct PendingTurnDeliveryReceipt {
     connection_id: ConnectionId,
     receiver: Option<oneshot::Receiver<Instant>>,
+    filtered: Option<oneshot::Receiver<()>>,
     immediate_outcome: Option<TurnDeliveryOutcomeKind>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum TurnDeliveryOutcomeKind {
     Success,
+    Filtered,
     Failure,
     Timeout,
     ShutdownCancelled,
@@ -1609,30 +1633,33 @@ impl OutgoingMessageSender {
 
         for connection_id in target_connection_ids {
             let (write_complete_tx, write_complete_rx) = oneshot::channel();
+            let (filtered_tx, filtered_rx) = oneshot::channel();
             let send = self
                 .notification_sender()
                 .send(OutgoingEnvelope::ToConnection {
                     connection_id,
                     message: outgoing_message.clone(),
-                    write_complete_tx: Some(write_complete_tx),
+                    write_complete_tx: Some(OutgoingWriteReceipt {
+                        writer: write_complete_tx,
+                        filtered: Some(filtered_tx),
+                    }),
                 });
             let send_result = tokio::select! {
                 biased;
                 _ = self.delivery_shutdown.cancelled() => None,
                 result = tokio::time::timeout_at(delivery_deadline, send) => Some(result),
             };
-            let immediate_outcome = if !matches!(send_result, Some(Ok(Ok(())))) {
+            let immediate_outcome = turn_enqueue_outcome(&send_result);
+            if immediate_outcome.is_some() {
                 warn!(
                     "failed to dispatch terminal notification to {connection_id:?}: {send_result:?}"
                 );
                 self.fail_connection_delivery(connection_id).await;
-                Some(TurnDeliveryOutcomeKind::Failure)
-            } else {
-                None
-            };
+            }
             receipts.push(PendingTurnDeliveryReceipt {
                 connection_id,
                 receiver: immediate_outcome.is_none().then_some(write_complete_rx),
+                filtered: immediate_outcome.is_none().then_some(filtered_rx),
                 immediate_outcome,
             });
         }
@@ -1736,7 +1763,7 @@ impl OutgoingMessageSender {
             .send(OutgoingEnvelope::ToConnection {
                 connection_id,
                 message: outgoing_message,
-                write_complete_tx: Some(write_complete_tx),
+                write_complete_tx: Some(write_complete_tx.into()),
             });
         match tokio::select! {
             biased;
@@ -1906,6 +1933,19 @@ impl OutgoingMessageSender {
     }
 }
 
+fn turn_enqueue_outcome(
+    result: &Option<
+        std::result::Result<std::result::Result<(), mpsc::error::SendError<OutgoingEnvelope>>, tokio::time::error::Elapsed>,
+    >,
+) -> Option<TurnDeliveryOutcomeKind> {
+    match result {
+        Some(Ok(Ok(()))) => None,
+        None => Some(TurnDeliveryOutcomeKind::ShutdownCancelled),
+        Some(Err(_)) => Some(TurnDeliveryOutcomeKind::Timeout),
+        Some(Ok(Err(_))) => Some(TurnDeliveryOutcomeKind::Failure),
+    }
+}
+
 async fn collect_turn_delivery_outcomes(
     receipts: Vec<PendingTurnDeliveryReceipt>,
     dispatch_started: Instant,
@@ -1933,13 +1973,31 @@ async fn collect_turn_delivery_outcomes(
                     post_core_delivery_latency_ms: None,
                 };
             };
+            // A filter acknowledgement is distinct from a writer timestamp.
+            // Dropping the optional filter sender on the ordinary write path
+            // must not turn a still-pending physical write into a failure.
+            let receiver = async move {
+                let mut receiver = receiver;
+                if let Some(filtered) = receipt.filtered {
+                    tokio::select! {
+                        biased;
+                        result = filtered => {
+                            if result.is_ok() {
+                                return Ok(None);
+                            }
+                        }
+                        result = &mut receiver => return result.map(Some),
+                    }
+                }
+                receiver.await.map(Some)
+            };
             let receipt_result = tokio::select! {
                 biased;
                 result = tokio::time::timeout_at(receipt_deadline, receiver) => Some(result),
                 _ = delivery_shutdown.cancelled() => None,
             };
             match receipt_result {
-                Some(Ok(Ok(delivered_at))) => {
+                Some(Ok(Ok(Some(delivered_at)))) => {
                     let successful_elapsed_ms = u64::try_from(
                         delivered_at
                             .saturating_duration_since(dispatch_started)
@@ -1957,6 +2015,12 @@ async fn collect_turn_delivery_outcomes(
                             .map(|elapsed| u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)),
                     }
                 }
+                Some(Ok(Ok(None))) => TurnDeliveryOutcome {
+                    connection_id: receipt.connection_id,
+                    kind: TurnDeliveryOutcomeKind::Filtered,
+                    successful_elapsed_ms: None,
+                    post_core_delivery_latency_ms: None,
+                },
                 Some(Ok(Err(_))) => TurnDeliveryOutcome {
                     connection_id: receipt.connection_id,
                     kind: TurnDeliveryOutcomeKind::Failure,
@@ -2002,6 +2066,7 @@ fn aggregate_turn_delivery(
     let origin_delivery_status = match origin_outcome.map(|outcome| outcome.kind) {
         None => TurnDeliveryStatus::NotTargeted,
         Some(TurnDeliveryOutcomeKind::Success) => TurnDeliveryStatus::Success,
+        Some(TurnDeliveryOutcomeKind::Filtered) => TurnDeliveryStatus::Filtered,
         Some(TurnDeliveryOutcomeKind::Failure) => TurnDeliveryStatus::Failure,
         Some(TurnDeliveryOutcomeKind::Timeout) => TurnDeliveryStatus::Timeout,
         Some(TurnDeliveryOutcomeKind::ShutdownCancelled) => TurnDeliveryStatus::ShutdownCancelled,
@@ -2018,6 +2083,10 @@ fn aggregate_turn_delivery(
                 TurnDeliveryOutcomeKind::Failure | TurnDeliveryOutcomeKind::ShutdownCancelled
             )
         })
+        .count();
+    let filtered_count = outcomes
+        .iter()
+        .filter(|outcome| outcome.kind == TurnDeliveryOutcomeKind::Filtered)
         .count();
     let timeout_count = outcomes
         .iter()
@@ -2049,11 +2118,12 @@ fn aggregate_turn_delivery(
     // dispatch-relative, not the later receipt-collection wall time.
     tracing::info!(target: "codex_task_observation", schema_version = 1,
         %thread_id, %turn_id, phase = "server_notification_receipts_collected",
+        endpoint = "transport_writer_flush", client_visible = false,
         origin_status = ?origin_delivery_status,
         origin_dispatch_elapsed_ms = origin_outcome.and_then(|outcome| outcome.successful_elapsed_ms),
         first_dispatch_elapsed_ms = first_successful_elapsed_ms,
         last_dispatch_elapsed_ms = last_successful_elapsed_ms,
-        success_count, failure_count, timeout_count,
+        success_count, failure_count, timeout_count, filtered_count,
         "task boundary observation");
 
     TurnDeliveryFact {
@@ -2061,6 +2131,7 @@ fn aggregate_turn_delivery(
         turn_id,
         target_count: count_u32(outcomes.len()),
         success_count: count_u32(success_count),
+        filtered_count: count_u32(filtered_count),
         failure_count: count_u32(failure_count),
         timeout_count: count_u32(timeout_count),
         shutdown_cancelled_count: count_u32(shutdown_cancelled_count),
@@ -2790,6 +2861,191 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn turn_delivery_filter_receipt_is_not_a_writer_failure_or_success() {
+        use crate::transport::OutboundConnectionState;
+        use crate::transport::OutboundNotificationOptOuts;
+        use crate::transport::route_outgoing_envelope;
+
+        let connection_id = ConnectionId(7);
+        for (opted_out, connected, expected) in [
+            (true, true, TurnDeliveryOutcomeKind::Filtered),
+            (false, true, TurnDeliveryOutcomeKind::Success),
+            (false, false, TurnDeliveryOutcomeKind::Failure),
+        ] {
+            let (writer, mut reader) = mpsc::channel(1);
+            let methods = if opted_out {
+                std::collections::HashSet::from(["turn/completed".to_string()])
+            } else {
+                std::collections::HashSet::new()
+            };
+            let mut connections = std::collections::HashMap::new();
+            if connected {
+                connections.insert(
+                    connection_id,
+                    OutboundConnectionState::new(
+                        writer,
+                        Arc::new(AtomicBool::new(true)),
+                        Arc::new(AtomicBool::new(true)),
+                        Arc::new(OutboundNotificationOptOuts::new(methods)),
+                        None,
+                        CancellationToken::new(),
+                    ),
+                );
+            }
+            let (written_tx, written_rx) = oneshot::channel();
+            let (filtered_tx, filtered_rx) = oneshot::channel();
+            let started = Instant::now();
+            route_outgoing_envelope(
+                &mut connections,
+                OutgoingEnvelope::ToConnection {
+                    connection_id,
+                    message: OutgoingMessage::AppServerNotification(turn_completed_notification(
+                        ThreadId::new(),
+                        "filtered-turn",
+                    )),
+                    write_complete_tx: Some(OutgoingWriteReceipt {
+                        writer: written_tx,
+                        filtered: Some(filtered_tx),
+                    }),
+                },
+            )
+            .await;
+            if expected == TurnDeliveryOutcomeKind::Success {
+                let queued = timeout(Duration::from_secs(1), reader.recv())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                queued
+                    .write_complete_tx
+                    .unwrap()
+                    .send(Instant::now())
+                    .unwrap();
+            } else {
+                assert!(
+                    reader.try_recv().is_err(),
+                    "filtered/disconnected output must not be written"
+                );
+            }
+            let outcomes = collect_turn_delivery_outcomes(
+                vec![PendingTurnDeliveryReceipt {
+                    connection_id,
+                    receiver: Some(written_rx),
+                    filtered: Some(filtered_rx),
+                    immediate_outcome: None,
+                }],
+                started,
+                tokio::time::Instant::now() + Duration::from_secs(1),
+                Some(started),
+                CancellationToken::new(),
+            )
+            .await;
+            assert_eq!(outcomes[0].kind, expected);
+            let fact = aggregate_turn_delivery(
+                ThreadId::new(),
+                "turn".into(),
+                Some(connection_id),
+                outcomes,
+            );
+            assert_eq!(fact.filtered_count, u32::from(opted_out));
+            assert_eq!(fact.failure_count, u32::from(!connected));
+            assert_eq!(fact.success_count, u32::from(connected && !opted_out));
+            if opted_out {
+                assert_eq!(fact.origin_delivery_status, TurnDeliveryStatus::Filtered);
+                assert_eq!(fact.origin_successful_elapsed_ms, None);
+                assert_eq!(fact.first_post_core_delivery_latency_ms, None);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn receipt_filter_channel_closure_still_waits_for_physical_writer() {
+        let (written_tx, written_rx) = oneshot::channel();
+        let (filtered_tx, filtered_rx) = oneshot::channel();
+        drop(filtered_tx);
+        let shutdown = CancellationToken::new();
+        let collection = collect_turn_delivery_outcomes(
+            vec![PendingTurnDeliveryReceipt {
+                connection_id: ConnectionId(1),
+                receiver: Some(written_rx),
+                filtered: Some(filtered_rx),
+                immediate_outcome: None,
+            }],
+            Instant::now(),
+            tokio::time::Instant::now() + Duration::from_secs(30),
+            None,
+            shutdown.clone(),
+        );
+        tokio::pin!(collection);
+        assert!(futures::poll!(&mut collection).is_pending());
+        shutdown.cancel();
+        let outcomes = timeout(Duration::from_secs(1), collection).await.unwrap();
+        assert_eq!(outcomes[0].kind, TurnDeliveryOutcomeKind::ShutdownCancelled);
+        assert!(
+            written_tx.send(Instant::now()).is_err(),
+            "shutdown must release the writer receiver"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn turn_delivery_enqueue_classification_preserves_timeout_shutdown_and_closed() {
+        let notification = || OutgoingEnvelope::Broadcast {
+            message: OutgoingMessage::AppServerNotification(turn_completed_notification(
+                ThreadId::new(),
+                "enqueue-turn",
+            )),
+        };
+        let (sender, receiver) = mpsc::channel(1);
+        sender.try_send(notification()).unwrap();
+        let timed_out =
+            Some(tokio::time::timeout(Duration::from_millis(1), sender.send(notification())).await);
+        assert_eq!(
+            turn_enqueue_outcome(&timed_out),
+            Some(TurnDeliveryOutcomeKind::Timeout)
+        );
+        let cancelled = CancellationToken::new();
+        cancelled.cancel();
+        let shutdown = tokio::select! {
+            biased;
+            _ = cancelled.cancelled() => None,
+            result = tokio::time::timeout(Duration::from_secs(1), sender.send(notification())) => Some(result),
+        };
+        assert_eq!(
+            turn_enqueue_outcome(&shutdown),
+            Some(TurnDeliveryOutcomeKind::ShutdownCancelled)
+        );
+        drop(receiver);
+        let closed =
+            Some(tokio::time::timeout(Duration::from_secs(1), sender.send(notification())).await);
+        assert_eq!(
+            turn_enqueue_outcome(&closed),
+            Some(TurnDeliveryOutcomeKind::Failure)
+        );
+        for kind in [
+            TurnDeliveryOutcomeKind::Timeout,
+            TurnDeliveryOutcomeKind::ShutdownCancelled,
+            TurnDeliveryOutcomeKind::Failure,
+        ] {
+            let outcomes = collect_turn_delivery_outcomes(
+                vec![PendingTurnDeliveryReceipt {
+                    connection_id: ConnectionId(1),
+                    receiver: None,
+                    filtered: None,
+                    immediate_outcome: Some(kind),
+                }],
+                Instant::now(),
+                tokio::time::Instant::now(),
+                None,
+                CancellationToken::new(),
+            )
+            .await;
+            assert_eq!(
+                outcomes[0].kind, kind,
+                "receipt collection must retain enqueue outcome"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn receipt_latency_uses_writer_time_even_when_later_enqueue_delays_collection() {
         let started = Instant::now() - Duration::from_secs(1);
         let (first_tx, first_rx) = oneshot::channel();
@@ -2803,11 +3059,13 @@ mod tests {
                 PendingTurnDeliveryReceipt {
                     connection_id: ConnectionId(1),
                     receiver: Some(first_rx),
+                    filtered: None,
                     immediate_outcome: None,
                 },
                 PendingTurnDeliveryReceipt {
                     connection_id: ConnectionId(2),
                     receiver: Some(second_rx),
+                    filtered: None,
                     immediate_outcome: None,
                 },
             ],
@@ -2833,6 +3091,7 @@ mod tests {
             vec![PendingTurnDeliveryReceipt {
                 connection_id: ConnectionId(9),
                 receiver: Some(write_complete_rx),
+                filtered: None,
                 immediate_outcome: None,
             }],
             Instant::now(),

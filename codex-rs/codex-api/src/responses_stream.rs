@@ -248,6 +248,16 @@ impl ResponsesEventInterpreter {
             self.safety_buffering_treatment = updated_treatment;
         }
 
+        if let Some(response) = event.response.as_ref()
+            && let Some(reported_model) = response.model.as_ref().and_then(Value::as_str)
+        {
+            let header_model = response.headers.as_ref().and_then(header_openai_model_value_from_json)
+                .or_else(|| event.headers.as_ref().and_then(header_openai_model_value_from_json));
+            tracing::info!(event.name = "codex.provider_reported_model",
+                response_id = response.id.as_ref().and_then(|value| value.as_str()).unwrap_or_default(),
+                reported_model, provenance = "response.model", header_model,
+                "provider-reported identity; not an inferred reroute reason");
+        }
         if let Some(model) = event.response_model()
             && self.last_server_model.as_deref() != Some(model)
         {
@@ -266,13 +276,18 @@ impl ResponsesEventInterpreter {
         if let Some(buffering) = event.safety_buffering(&self.safety_buffering_treatment) {
             self.events.push(ResponseEvent::SafetyBuffering(buffering));
         }
+        let completion_usage = if event.kind == "response.completed" {
+            parse_usage(event.response.as_mut().and_then(|response| response.usage.take()))
+        } else {
+            None
+        };
         let rejected_completion_usage = if event.kind == "response.completed" {
             event.response.as_ref().and_then(|response| {
                 let response_id = response.id.as_ref().and_then(Value::as_str);
                 if !self.lifecycle.owns_terminal_observation(response_id) {
                     return None;
                 }
-                parse_usage(response.usage.clone())
+                completion_usage.clone()
                     .map(|usage| (response_id.map(str::to_owned), usage))
             })
         } else {
@@ -280,7 +295,7 @@ impl ResponsesEventInterpreter {
         };
         let interpreted = self
             .lifecycle
-            .process(event, payload.len())
+            .process(event, payload.len(), completion_usage)
             .map_err(|error| match (error, rejected_completion_usage) {
                 (ResponsesEventError::Api(source), Some((response_id, usage))) => {
                     ResponsesEventError::Api(ApiError::TerminalResponse {
@@ -339,6 +354,7 @@ pub(crate) struct ResponsesStreamEvent<'a> {
 #[derive(Debug, Deserialize)]
 struct ResponseEnvelope {
     id: Option<Value>,
+    model: Option<Value>,
     usage: Option<Value>,
     end_turn: Option<Value>,
     error: Option<Value>,
@@ -379,10 +395,29 @@ pub(crate) fn decode_diagnostic(context: &str, error: &serde_json::Error) -> Str
     )
 }
 
+#[cfg(test)]
+thread_local! {
+    static USAGE_PAYLOAD_PARSE_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 fn parse_usage(value: Option<Value>) -> Option<TokenUsage> {
     use codex_protocol::protocol::TokenUsageCoverage;
     let value = value?;
-    let object = value.as_object()?;
+    #[cfg(test)]
+    USAGE_PAYLOAD_PARSE_COUNT.with(|count| count.set(count.get() + 1));
+    if value.is_null() {
+        return None;
+    }
+    let Some(object) = value.as_object() else {
+        return Some(TokenUsage {
+            coverage: Some(TokenUsageCoverage {
+                invalid_receipts: 1,
+                reported_receipts: Some(1),
+                ..TokenUsage::missing_receipt().coverage.expect("missing receipt coverage")
+            }),
+            ..Default::default()
+        });
+    };
     let mut invalid = false;
     let mut count = |value: Option<&Value>| {
         let parsed = value.and_then(Value::as_i64).filter(|value| *value >= 0);
@@ -417,6 +452,9 @@ fn parse_usage(value: Option<Value>) -> Option<TokenUsage> {
     invalid |= input
         .zip(cached)
         .is_some_and(|(input, cached)| cached > input);
+    invalid |= output
+        .zip(reasoning)
+        .is_some_and(|(output, reasoning)| reasoning > output);
     invalid |= input
         .zip(cached)
         .zip(cache_write)
@@ -640,6 +678,7 @@ fn json_value_as_string(value: &Value) -> Option<&str> {
 
 fn process_responses_event(
     event: ResponsesStreamEvent<'_>,
+    completion_usage: Option<TokenUsage>,
 ) -> Result<Option<ResponseEvent>, ResponsesEventError> {
     match event.kind.as_ref() {
         "response.output_item.done" => {
@@ -765,7 +804,7 @@ fn process_responses_event(
             })?;
             return Ok(Some(ResponseEvent::Completed {
                 response_id,
-                token_usage: parse_usage(response.usage),
+                token_usage: completion_usage.or_else(|| parse_usage(response.usage)),
                 end_turn,
             }));
         }
@@ -883,15 +922,21 @@ fn try_parse_retry_after(error: &Error) -> Option<Duration> {
         return None;
     }
     let captures = rate_limit_regex().captures(error.message.as_ref()?)?;
-    let value = captures.get(1)?.as_str().parse::<f64>().ok()?;
-    let unit = captures.get(2)?.as_str().to_ascii_lowercase();
-    if unit == "s" || unit.starts_with("second") {
-        Duration::try_from_secs_f64(value).ok()
-    } else if unit == "ms" {
-        Duration::try_from_secs_f64(value / 1000.0).ok()
-    } else {
-        None
+    // Long waits arrive as compound durations such as `1m30s` or `1h2m3.5s`;
+    // an unparseable or overflowing component discards the whole advice.
+    let mut delay = Duration::ZERO;
+    for component in retry_delay_component_regex().captures_iter(captures.get(1)?.as_str()) {
+        let value = component.get(1)?.as_str().parse::<f64>().ok()?;
+        let seconds = match component.get(2)?.as_str().to_ascii_lowercase().as_str() {
+            "ms" | "millisecond" | "milliseconds" => value / 1000.0,
+            "s" | "sec" | "secs" | "second" | "seconds" => value,
+            "m" | "min" | "mins" | "minute" | "minutes" => value * 60.0,
+            "h" | "hr" | "hrs" | "hour" | "hours" => value * 3600.0,
+            _ => return None,
+        };
+        delay = delay.checked_add(Duration::try_from_secs_f64(seconds).ok()?)?;
     }
+    Some(delay)
 }
 
 fn cyber_policy_message(message: Option<String>) -> String {
@@ -904,8 +949,20 @@ fn rate_limit_regex() -> &'static regex_lite::Regex {
     static RE: OnceLock<regex_lite::Regex> = OnceLock::new();
     #[expect(clippy::unwrap_used)]
     RE.get_or_init(|| {
-        regex_lite::Regex::new(r"(?i)try again in\s*(\d+(?:\.\d+)?)\s*(s|ms|seconds?)").unwrap()
+        regex_lite::Regex::new(&format!(r"(?i)try again in\s*((?:{RETRY_DELAY_COMPONENT}\s*)+)\b"))
+            .unwrap()
     })
+}
+
+/// One `<number><unit>` part of a retry delay. Alternation is ordered, so
+/// longer units precede their prefixes (`ms` before `m`, `mins` before `m`).
+const RETRY_DELAY_COMPONENT: &str =
+    r"(\d+(?:\.\d+)?)\s*(ms|milliseconds?|seconds?|secs?|s|minutes?|mins?|m|hours?|hrs?|h)";
+
+fn retry_delay_component_regex() -> &'static regex_lite::Regex {
+    static RE: OnceLock<regex_lite::Regex> = OnceLock::new();
+    #[expect(clippy::unwrap_used)]
+    RE.get_or_init(|| regex_lite::Regex::new(&format!("(?i){RETRY_DELAY_COMPONENT}")).unwrap())
 }
 
 #[cfg(test)]
@@ -1163,7 +1220,7 @@ mod tests {
     fn transport_audit_item_fields_and_completion_moves_identity() {
         let payload = r#"{"type":"response.output_item.done","item":{"type":"function_call","name":"test","call_id":"call","arguments":"{\"text\":\"hello\"}"}}"#;
         let event: ResponsesStreamEvent<'_> = serde_json::from_str(payload).unwrap();
-        assert!(matches!(process_responses_event(event).unwrap(),
+        assert!(matches!(process_responses_event(event, None).unwrap(),
             Some(ResponseEvent::OutputItemDone(ResponseItem::FunctionCall { name, arguments, .. }))
             if name == "test" && arguments == r#"{"text":"hello"}"#));
 
@@ -1185,7 +1242,7 @@ mod tests {
             response_id,
             end_turn,
             ..
-        }) = process_responses_event(event).unwrap()
+        }) = process_responses_event(event, None).unwrap()
         else {
             panic!("completion");
         };
@@ -1211,7 +1268,7 @@ mod tests {
                 item_id,
                 call_id: actual_call_id,
                 delta,
-            }) = process_responses_event(event).unwrap()
+            }) = process_responses_event(event, None).unwrap()
             else {
                 panic!("expected tool input delta");
             };
@@ -1795,6 +1852,58 @@ mod tests {
             );
         }
     }
+
+    #[tokio::test(start_paused = true)]
+    async fn parses_compound_retry_after_durations() {
+        let failed = |code: &str, message: &str| {
+            json!({
+                "type": "response.failed",
+                "response": { "error": { "code": code, "message": message } },
+            })
+            .to_string()
+        };
+        for (message, expected) in [
+            ("Please try again in 1m30s.", Some(Duration::from_secs(90))),
+            ("Please try again in 6m0s.", Some(Duration::from_secs(360))),
+            (
+                "Please try again in 1h2m3.5s.",
+                Some(Duration::from_millis(3_723_500)),
+            ),
+            (
+                "Please try again in 20m10.4s.",
+                Some(Duration::from_millis(1_210_400)),
+            ),
+            ("Try again in 2 minutes.", Some(Duration::from_secs(120))),
+            // Unknown units and unit-like words keep the generic backoff.
+            ("Please try again in 3 days.", None),
+            ("Please try again in 5 moments.", None),
+        ] {
+            let mut interpreter =
+                ResponsesEventInterpreter::new(&ResponsesStreamMetadata::default(), None);
+            let error = interpreter
+                .process_payload(&failed("rate_limit_exceeded", message))
+                .unwrap_err();
+            let ResponsesEventError::Api(ApiError::Retryable { delay, .. }) = error else {
+                panic!("expected a retryable rate limit for {message}");
+            };
+            assert_eq!(
+                delay.map(|delay| delay.remaining_delay()),
+                expected,
+                "{message}"
+            );
+        }
+
+        // Only rate limits carry parseable advice.
+        let mut interpreter =
+            ResponsesEventInterpreter::new(&ResponsesStreamMetadata::default(), None);
+        let error = interpreter
+            .process_payload(&failed("server_error", "Please try again in 1m30s."))
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            ResponsesEventError::Api(ApiError::Retryable { delay: None, .. })
+        ));
+    }
 }
 #[cfg(test)]
 mod component_receipt_regressions {
@@ -1920,5 +2029,52 @@ mod component_receipt_regressions {
         let mut ledger = TokenUsage::empty_ledger();
         ledger.add_assign(&usage);
         assert_eq!(ledger.known_total(), Some(2));
+    }
+}
+#[cfg(test)]
+mod harness_usage_regressions {
+    use super::*;
+
+    #[test]
+    fn invalid_relationships_cannot_be_laundered_by_later_valid_receipts() {
+        let invalid = parse_usage(Some(serde_json::json!({
+            "input_tokens":10,"input_tokens_details":{"cached_tokens":20},
+            "output_tokens":2,"output_tokens_details":{"reasoning_tokens":5},"total_tokens":12
+        }))).unwrap();
+        let valid = parse_usage(Some(serde_json::json!({
+            "input_tokens":100,"input_tokens_details":{"cached_tokens":0},
+            "output_tokens":10,"output_tokens_details":{"reasoning_tokens":0},"total_tokens":110
+        }))).unwrap();
+        let mut ledger = TokenUsage::empty_ledger();
+        ledger.add_assign(&invalid);
+        ledger.add_assign(&valid);
+        assert_eq!(ledger.known_input(), Some(110));
+        assert_eq!(ledger.known_output(), Some(12));
+        assert_eq!(ledger.coverage.unwrap().invalid_receipts, 1);
+        assert_eq!(ledger.known_non_cached_input(), None);
+        assert_eq!(ledger.known_visible_output(), None);
+    }
+
+    #[test]
+    fn malformed_whole_usage_remains_an_invalid_reported_receipt() {
+        for value in [serde_json::json!(42), serde_json::json!("bad"), serde_json::json!([])] {
+            let usage = parse_usage(Some(value)).unwrap();
+            let coverage = usage.coverage.unwrap();
+            assert_eq!(coverage.receipts, 1);
+            assert_eq!(coverage.reported_receipts, Some(1));
+            assert_eq!(coverage.invalid_receipts, 1);
+            assert_eq!(usage.known_total(), None);
+        }
+        assert_eq!(parse_usage(Some(Value::Null)), None);
+        assert_eq!(parse_usage(None), None);
+    }
+
+    #[test]
+    fn normal_completion_interprets_usage_once_without_losing_usage() {
+        let mut interpreter = ResponsesEventInterpreter::new(&ResponsesStreamMetadata::default(), None);
+        USAGE_PAYLOAD_PARSE_COUNT.with(|count| count.set(0));
+        let events = interpreter.process_payload(r#"{"type":"response.completed","response":{"id":"response-1","usage":{"input_tokens":10,"output_tokens":2,"total_tokens":12}}}"#).unwrap().collect::<Vec<_>>();
+        assert!(matches!(events.as_slice(), [ResponseEvent::Completed { token_usage: Some(usage), .. }] if usage.known_total() == Some(12)));
+        USAGE_PAYLOAD_PARSE_COUNT.with(|count| assert_eq!(count.get(), 1));
     }
 }
