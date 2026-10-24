@@ -40,6 +40,17 @@ impl Reporter {
 }
 
 #[test]
+fn empty_root_still_reports_ancestor_ignore_parse_errors() {
+    let parent = tempfile::tempdir().unwrap();
+    fs::write(parent.path().join(".ignore"), "[z-a]\n").unwrap();
+    let root = parent.path().join("empty");
+    fs::create_dir(&root).unwrap();
+    let result = run("absent", vec![root], FileSearchOptions::default(), None).unwrap();
+    assert!(!result.walk_complete);
+    assert!(result.matches.is_empty());
+}
+
+#[test]
 fn reused_syntax_changing_query_finds_the_same_literal_as_a_fresh_search() {
     let root = tempfile::tempdir().unwrap();
     fs::write(root.path().join("foo$bar.txt"), "target").unwrap();

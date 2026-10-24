@@ -472,6 +472,12 @@ fn walker_worker(
         // ignore::Walk::next may otherwise consume an entire ignored directory
         // without returning to our cancellation observation.
         let mut ignore = builder.build_matchers().remove(0);
+        // The incremental matcher skips an empty relative path. Initialize
+        // its root/ancestor ignore state even when the root has no children.
+        // This synthetic name is matched only; no source path is opened.
+        if ignore.matched_with_errors(".codex-ignore-initialization", true).1.is_some() {
+            complete = false;
+        }
         let mut walk = walkdir::WalkDir::new(&root)
             .follow_links(true)
             .max_depth(limits.max_depth.saturating_add(1))
