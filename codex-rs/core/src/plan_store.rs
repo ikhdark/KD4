@@ -14,6 +14,8 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 use tokio::sync::Mutex;
 
+#[path = "plan_store_legacy.rs"]
+mod legacy;
 
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -59,6 +61,10 @@ pub(crate) struct PlanLineage {
     pub(crate) step_revisions: BTreeMap<String, u64>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub(crate) accepted_supersessions: BTreeMap<String, serde_json::Value>,
+    /// Read-only historical fields, used only to authenticate pre-retirement
+    /// revisions. Reconciliation drops them; no retired behavior is executed.
+    #[serde(flatten)]
+    legacy_metadata: BTreeMap<String, serde_json::Value>,
 }
 
 
@@ -122,6 +128,7 @@ impl PlanLineage {
             && self.resolved_requirements.is_empty()
             && self.step_revisions.is_empty()
             && self.accepted_supersessions.is_empty()
+            && self.legacy_metadata.is_empty()
 
     }
 
@@ -219,6 +226,7 @@ impl PlanLineage {
     /// original obligations even when they are no longer mapped to a step.
     /// A partial lineage must not make a pending checklist appear resolved.
     fn reconcile_restored(mut self, plan: Option<&UpdatePlanArgs>) -> Self {
+        self.legacy_metadata.clear();
         let Some(plan) = plan else {
             return self;
         };
@@ -366,9 +374,19 @@ impl PlanToolResponse {
             return None;
         }
         let lineage = self.lineage.clone().reconcile_restored(Some(plan));
+        // Authenticate the saved representation before retiring executable
+        // workflow metadata. Compact snapshots need their reconstructible rows
+        // restored, but their historical workflow still participates in CAS.
+        let mut historical = lineage.clone();
+        historical.workflow = self.lineage.workflow.clone();
+        historical.legacy_metadata = self.lineage.legacy_metadata.clone();
         if let Some(revision) = revision
             && (self.revision != revision
-                || plan_revision_with_lineage(Some(plan), &lineage) != revision)
+                || (plan_revision_with_lineage(Some(plan), &lineage) != revision
+                    && plan_revision_with_lineage(Some(plan), &self.lineage) != revision
+                    && plan_revision_with_lineage(Some(plan), &historical) != revision
+                    && legacy::revision(plan, &self.lineage).as_deref() != Some(revision)
+                    && legacy::revision(plan, &historical).as_deref() != Some(revision)))
         {
             return None;
         }
@@ -1455,6 +1473,25 @@ mod tests {
         .unwrap_err();
         assert!(error.contains("12345678aaaa: \"one\""));
         assert!(error.contains("12345678bbbb: \"two\""));
+    }
+
+    #[test]
+    fn authentic_historical_lineage_is_checked_before_retired_metadata_projection() {
+        let text_key = plan_step_id("renamed");
+        // Literal historical field order, independent of the compatibility
+        // serializer under test (JSON Value sorts these nested object keys).
+        let original = format!(r#"[{{"explanation":null,"plan":[{{"step":"renamed","status":"pending"}}]}},{{"requirements":{{"r":{{"text":"renamed","status":"pending"}}}},"step_requirements":{{"old-id":["r"]}},"step_identities":{{"{text_key}":"old-id"}},"workflow":{{"old-id":{{"assignment_id":"assignment","dependencies":[],"capability_profile":"read_search"}}}},"step_revisions":{{"old-id":3}},"acceptance":{{"scope":{{"text":"inspect","origin":{{"turn_id":"u","sha256":"h"}},"requirement":{{"kind":"inspection","environment_id":"local","path":"src.rs","start":0,"end":1}}}}}}}}]"#);
+        let values: Vec<serde_json::Value> = serde_json::from_str(&original).unwrap();
+        let revision = hex::encode(Sha256::digest(original.as_bytes()));
+        let mut response: PlanToolResponse = serde_json::from_value(serde_json::json!({
+            "current_plan":values[0], "lineage":values[1], "revision":revision,
+        })).unwrap();
+        let restored = response.full_lineage_for(&response.current_plan, Some(&revision)).unwrap();
+        assert_eq!(restored.step_id("renamed"), "old-id");
+        assert_eq!(restored.step_revisions["old-id"], 3);
+        assert!(restored.workflow.is_empty() && restored.legacy_metadata.is_empty());
+        response.lineage.requirements.get_mut("r").unwrap().text = "tampered".into();
+        assert!(response.full_lineage_for(&response.current_plan, Some(&revision)).is_none());
     }
 
     #[test]

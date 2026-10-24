@@ -51,7 +51,8 @@ impl PlanToolOutput {
         }
         if let Some(fields) = response.as_object_mut() {
             fields.remove("lineage");
-            fields.remove("lineage_complete");
+            // This is a display projection, not a full replay authority.
+            fields.insert("lineage_complete".into(), JsonValue::Bool(false));
         }
         response
     }
