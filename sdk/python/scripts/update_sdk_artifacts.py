@@ -74,15 +74,15 @@ def _publish_staged_paths(pairs: list[tuple[Path, Path]]) -> None:
     except BaseException:
         committed = False
         for destination, backup, existed in reversed(backups):
-            if destination in installed and ((backup / "old").exists() or not existed):
+            if destination in installed and (os.path.lexists(backup / "old") or not existed):
                 _remove_owned_path(destination)
-            if (backup / "old").exists():
+            if os.path.lexists(backup / "old"):
                 os.replace(backup / "old", destination)
         raise
     finally:
         for _, backup, _ in backups:
             # Never erase the sole recoverable copy if restoration failed.
-            if committed or not (backup / "old").exists():
+            if committed or not os.path.lexists(backup / "old"):
                 shutil.rmtree(backup)
 
 
