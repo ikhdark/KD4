@@ -2,6 +2,32 @@ use super::*;
 use pretty_assertions::assert_eq;
 
 #[tokio::test]
+async fn admitted_read_only_roles_can_acquire_their_bound_source_evidence() {
+    use sha2::Digest;
+    for role in [AgentRole::Explorer, AgentRole::Architect, AgentRole::Reviewer] {
+        let fixture = Fixture::new().await;
+        initialize_validation_repository(fixture.repo.path());
+        let mut draft = explorer_draft("read-only-proof", "src", "inspect source");
+        draft.role = role;
+        draft.required_evidence = vec!["inspect:src/lib.rs".into()];
+        draft.acceptance_criteria[0].evidence_policy = Some(CriterionEvidencePolicy {
+            kind: CriterionEvidenceRequirement::SourceInspection,
+            required_evidence: Some("inspect:src/lib.rs".into()), freshness: EvidenceFreshness::Current,
+        });
+        let (_, attempt) = fixture.store.create_assignment(fixture.repo.path(), draft).await.unwrap();
+        let path = fixture.repo.path().join("src/lib.rs");
+        let pending = fixture.store.prepare_source_inspection(attempt.attempt_id,
+            path.to_string_lossy().into_owned()).await.unwrap().unwrap();
+        let bytes = std::fs::read(path).unwrap();
+        let reference = fixture.store.record_source_inspection(pending, "read-only-acquisition".into(),
+            hex::encode(sha2::Sha256::digest(&bytes)), bytes.len() as u64).await.unwrap();
+        let mut receipt = completed_receipt(vec![reference.call_id.clone()]);
+        receipt.criterion_results[0].evidence_ref = Some(reference);
+        fixture.store.submit_agent_receipt(attempt.attempt_id, receipt).await.unwrap();
+    }
+}
+
+#[tokio::test]
 async fn correction_rejects_unbound_policy_without_consuming_slot_and_resets_verification() {
     let fixture = Fixture::new().await;
     let (assignment, attempt) = fixture.store.create_assignment(fixture.repo.path(), worker_draft("audit149", "src")).await.unwrap();

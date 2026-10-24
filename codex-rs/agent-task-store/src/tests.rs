@@ -2199,6 +2199,10 @@ async fn native_execution_observation_supports_historical_proof_without_coverage
         command,
     )
     .await;
+    assert!(matches!(fixture.store.submit_agent_receipt(
+        attempt.attempt_id, completed_receipt(Vec::new()),
+    ).await, Err(StoreError::CriterionResultsInvalid(_))),
+        "historical policy cannot pass on a bare reported result");
     call.status = ValidationCallStatus::Succeeded;
     call.evidence.validation_result = Some(serde_json::json!({
         "kind": "native_command_execution_v1",

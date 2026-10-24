@@ -1356,7 +1356,7 @@ impl AgentTask {
         if self.assignment.effective_criteria(self.current_attempt.amendment.as_ref()).iter()
             .find(|criterion| criterion.id == id)
             .and_then(|criterion| criterion.evidence_policy.as_ref())
-            .is_some_and(|policy| policy.kind == CriterionEvidenceRequirement::SourceInspection)
+            .is_some_and(|policy| policy.kind != CriterionEvidenceRequirement::ReportOnly)
         {
             return self.criterion_assessments.iter()
                 .any(|assessment| assessment.criterion_id == id && assessment.satisfied);

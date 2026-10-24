@@ -3577,12 +3577,6 @@ impl LocalAgentTaskStore {
     ) -> TaskStoreFuture<'_, Option<crate::SourceInspectionStart>> {
         Box::pin(async move {
             let context = validation_context(&self.pool, attempt_id).await?;
-            if !matches!(
-                context.assignment.role,
-                AgentRole::Worker | AgentRole::Verifier | AgentRole::Integrator
-            ) {
-                return Ok(None);
-            }
             if !context
                 .assignment
                 .required_evidence

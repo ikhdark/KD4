@@ -55,7 +55,7 @@ pub(super) async fn assess_tx(
 ) -> StoreResult<Vec<CriterionAssessment>> {
     if !effective_criteria(assignment, attempt.amendment.as_ref()).iter()
         .any(|criterion| criterion.evidence_policy.as_ref()
-            .is_some_and(|policy| policy.kind == CriterionEvidenceRequirement::SourceInspection))
+            .is_some_and(|policy| policy.kind != CriterionEvidenceRequirement::ReportOnly))
     {
         return Ok(Vec::new());
     }
@@ -80,12 +80,15 @@ pub(super) async fn assess_with_calls_tx(
 ) -> StoreResult<Vec<CriterionAssessment>> {
     let criteria = effective_criteria(assignment, attempt.amendment.as_ref()).iter()
         .filter(|criterion| criterion.evidence_policy.as_ref()
-            .is_some_and(|policy| policy.kind == CriterionEvidenceRequirement::SourceInspection))
+            .is_some_and(|policy| policy.kind != CriterionEvidenceRequirement::ReportOnly))
         .collect::<Vec<_>>();
     if criteria.is_empty() { return Ok(Vec::new()); }
-    let root = sqlx::query_scalar::<_, String>(
+    let root = if criteria.iter().any(|criterion| criterion.evidence_policy.as_ref()
+        .is_some_and(|policy| policy.kind == CriterionEvidenceRequirement::SourceInspection)) {
+        sqlx::query_scalar::<_, String>(
         "SELECT canonical_root FROM assignment_repositories WHERE assignment_id = ?",
-    ).bind(assignment.assignment_id.to_string()).fetch_optional(&mut **transaction).await?;
+        ).bind(assignment.assignment_id.to_string()).fetch_optional(&mut **transaction).await?
+    } else { None };
     let mut fingerprints = BTreeMap::new();
     let mut assessments = Vec::with_capacity(criteria.len());
     for criterion in criteria {
@@ -94,6 +97,44 @@ pub(super) async fn assess_with_calls_tx(
         let requirement = policy.required_evidence.as_deref().unwrap_or_default();
         let result = results.iter().find(|result| result.criterion_id == criterion.id);
         let reference = result.and_then(|result| result.evidence_ref.as_ref());
+        if policy.kind == CriterionEvidenceRequirement::ValidationExecution {
+            let expected = crate::required_command_argv(requirement);
+            let owned = |call: &&ValidationCall| {
+                call.attempt_id == attempt.attempt_id
+                    && call.verified_evidence_kind() == Some(CriterionEvidenceKind::ValidationExecution)
+                    && expected.as_ref().is_some_and(|expected| {
+                        call.evidence.validation_result.as_ref()
+                            .and_then(|value| value.get("argv"))
+                            .and_then(|value| serde_json::from_value::<Vec<String>>(value.clone()).ok())
+                            .as_ref() == Some(expected)
+                    })
+            };
+            let call = if let Some(reference) = reference {
+                calls.iter().filter(owned).find(|call| {
+                    call.call_id == reference.call_id
+                        && cited_call_ids.contains(&call.call_id)
+                        && reference.workspace_id == assignment.workspace_id
+                        && reference.kind == CriterionEvidenceKind::ValidationExecution
+                        && call.evidence.end_epoch == Some(reference.evidence_epoch)
+                })
+            } else if allow_uncited {
+                calls.iter().filter(owned).next_back()
+            } else { None };
+            let satisfied = policy.freshness == EvidenceFreshness::Historical
+                && (allow_uncited || result.is_some_and(|result| result.status == CriterionStatus::Passed))
+                && assignment.required_evidence.iter().any(|required| required == requirement)
+                && call.is_some();
+            assessments.push(CriterionAssessment {
+                criterion_id: criterion.id.clone(),
+                satisfied,
+                reason: if satisfied {
+                    "successful owned exact-command execution; historical applicability only".into()
+                } else {
+                    "validation_execution requires a cited successful owned exact-command receipt; current input binding is unsupported".into()
+                },
+            });
+            continue;
+        }
         let call = if let Some(reference) = reference {
             calls.iter().find(|call| call.call_id == reference.call_id
                 && cited_call_ids.contains(&call.call_id)
