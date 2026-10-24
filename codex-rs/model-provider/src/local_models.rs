@@ -97,12 +97,7 @@ impl ModelsEndpointClient for LocalModelsEndpoint {
             let url = model_list_url(self.info.kind, base)?;
             let kind = self.info.kind;
             let ids = tokio::time::timeout(Duration::from_secs(10), async {
-                let client = self
-                    .pool_for(factory)
-                    .client_for_url(&url)
-                    .await
-                    .map_err(std::io::Error::other)?;
-                let response = client
+                let response = self.pool_for(factory)
                     .get(url)
                     .send()
                     .await
@@ -210,6 +205,31 @@ mod tests {
     use wiremock::ResponseTemplate;
     use wiremock::matchers::method;
     use wiremock::matchers::path;
+
+    #[tokio::test]
+    async fn redirected_local_catalogs_use_the_route_aware_request_owner() {
+        for (id, api_path, body) in [
+            ("ollama", "/prefix/api/tags", json!({"models":[{"name":"redirected"}]})),
+            ("lmstudio", "/prefix/v1/models", json!({"data":[{"id":"redirected"}]})),
+        ] {
+            for status in [302, 307, 308] {
+                let server = MockServer::start().await;
+                Mock::given(method("GET")).and(path(api_path))
+                    .respond_with(ResponseTemplate::new(status).insert_header("Location", "/catalog"))
+                    .expect(1).mount(&server).await;
+                Mock::given(method("GET")).and(path("/catalog"))
+                    .respond_with(ResponseTemplate::new(200).set_body_json(body.clone()))
+                    .expect(1).mount(&server).await;
+                let mut info = built_in_model_providers(None).remove(id).unwrap();
+                info.base_url = Some(format!("{}/prefix/v1", server.uri()));
+                let home = tempfile::tempdir().unwrap();
+                let catalog = manager(id, info, home.path().to_path_buf());
+                let models = catalog.list_models(RefreshStrategy::Online,
+                    HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault)).await.unwrap();
+                assert_eq!(models[0].model, "redirected");
+            }
+        }
+    }
 
     #[tokio::test]
     async fn discovered_membership_reaches_consumers_and_readiness_is_reused() {
