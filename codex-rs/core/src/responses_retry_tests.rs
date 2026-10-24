@@ -3,6 +3,23 @@ use codex_protocol::error::ConnectionFailedError;
 use codex_protocol::error::UnexpectedResponseError;
 use codex_protocol::protocol::InternalSessionSource;
 
+#[test]
+fn header_auth_account_switches_and_opaque_credential_scopes_have_recovery_identities() {
+    let auth = |account: Option<&str>, credential: &str| {
+        let mut headers = http::HeaderMap::new();
+        headers.insert("authorization", credential.parse().unwrap());
+        if let Some(account) = account {
+            headers.insert("chatgpt-account-id", account.parse().unwrap());
+        }
+        codex_login::CodexAuth::Headers(codex_login::AuthHeaders::new(headers))
+    };
+    let identity = |account, key| AccountChangeIdentity::from_auth(&auth(account, key));
+    assert!(identity(Some("a"), "first") == identity(Some("a"), "refreshed"));
+    assert!(identity(Some("a"), "first") != identity(Some("b"), "second"));
+    assert!(identity(None, "first") != identity(None, "second"));
+    assert!(identity(None, "first").is_some());
+}
+
 fn connection_failed() -> CodexErr {
     CodexErr::ConnectionFailed(ConnectionFailedError {
         message: "network is unreachable".to_string(),
