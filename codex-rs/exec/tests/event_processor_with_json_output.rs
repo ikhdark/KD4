@@ -154,7 +154,6 @@ fn session_configured_produces_thread_started_event() {
         cwd: test_path_buf("/tmp/project").abs(),
         reasoning_effort: None,
         initial_messages: None,
-        network_proxy: None,
         rollout_path: None,
     };
 

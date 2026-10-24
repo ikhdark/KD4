@@ -113,15 +113,18 @@ pub(super) fn format_tool_result_callback(
     args: v8::FunctionCallbackArguments,
     mut retval: v8::ReturnValue<v8::Value>,
 ) {
-    let Some(name) = args
-        .get(0)
-        .to_string(scope)
-        .map(|name| name.to_rust_string_lossy(scope))
-    else {
+    let Some(name) = args.get(0).to_string(scope) else {
         throw_type_error(
             scope,
             "format_tool_result requires an enabled tool name and a result",
         );
+        return;
+    };
+    let max_name_bytes = scope.get_slot::<RuntimeState>().map_or(0, |state| {
+        state.enabled_tools.by_global_name.keys().map(String::len).max().unwrap_or(0)
+    });
+    let Ok(name) = super::value::bounded_string(scope, name, max_name_bytes) else {
+        throw_type_error(scope, "format_tool_result requires an enabled tool name");
         return;
     };
     let tool = scope.get_slot::<RuntimeState>().and_then(|state| {
@@ -410,7 +413,10 @@ pub(super) fn store_callback(
             .total_stored_value_bytes
             .checked_sub(previous_bytes.unwrap_or(0))
             .and_then(|total| total.checked_add(stored.bytes));
-        if state.stored_values.len() + usize::from(previous_bytes.is_none())
+        // Serialization may run user toJSON methods and reenter storage.
+        if (state.stored_value_writes.contains_key(&key)
+            || state.stored_value_writes.len() < 2 * MAX_SESSION_STORED_VALUES)
+            && state.stored_values.len() + usize::from(previous_bytes.is_none())
             <= MAX_SESSION_STORED_VALUES
             && let Some(total_bytes) =
                 total_bytes.filter(|total| *total <= MAX_SESSION_STORED_VALUE_BYTES)
@@ -443,7 +449,13 @@ pub(super) fn load_callback(
     mut retval: v8::ReturnValue<v8::Value>,
 ) {
     let key = match args.get(0).to_string(scope) {
-        Some(key) => key.to_rust_string_lossy(scope),
+        Some(key) => match super::value::bounded_string(scope, key, MAX_SESSION_STORED_VALUE_BYTES) {
+            Ok(key) => key,
+            Err(_) => {
+                throw_type_error(scope, "load key exceeds the session storage byte limit");
+                return;
+            }
+        },
         None => {
             throw_type_error(scope, "load key must be a string");
             return;
@@ -787,6 +799,11 @@ fn tool_timeout_ms(
         .ok_or_else(|| "failed to read nested tool timeout_ms".to_string())?;
     if value.is_undefined() {
         return Ok(default_timeout_ms);
+    }
+    // Control options are typed, not JavaScript-coercible inputs. In particular
+    // do not invoke user valueOf/toString code before dispatch admission.
+    if !value.is_number() {
+        return Err("nested tool timeout_ms must be a primitive number".to_string());
     }
     let timeout_ms = value
         .number_value(scope)

@@ -34,6 +34,7 @@ pub async fn run_main_with_telemetry(
     transport::run_transport(listen_url, runtime_paths, telemetry).await
 }
 
+#[tracing::instrument(name = "codex.exec_server", skip_all, fields(otel.kind = "internal"))]
 pub async fn run_main_with_shutdown(
     listen_url: &str,
     runtime_paths: ExecServerRuntimePaths,
@@ -74,6 +75,12 @@ mod tests {
             )
             .await
             .expect_err("invalid listen URL should fail");
+            super::run_main_with_shutdown(
+                "invalid",
+                ExecServerRuntimePaths::new(std::env::current_exe().expect("current executable")).expect("runtime paths"),
+                ExecServerTelemetry::default(),
+                crate::ExecServerShutdown::new(),
+            ).await.expect_err("invalid listen URL should fail");
         }
         .with_subscriber(subscriber)
         .await;
@@ -81,7 +88,7 @@ mod tests {
         provider.force_flush().expect("flush traces");
         let spans = exporter.get_finished_spans().expect("span export");
         assert!(
-            spans.iter().any(|span| span.name == "codex.exec_server"),
+            spans.iter().filter(|span| span.name == "codex.exec_server").count() == 2,
             "root exec-server span missing: {spans:?}"
         );
     }

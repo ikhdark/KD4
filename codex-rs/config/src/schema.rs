@@ -48,15 +48,6 @@ pub fn features_schema(schema_gen: &mut SchemaGenerator) -> Schema {
             );
             continue;
         }
-        if feature.id == codex_features::Feature::NetworkProxy {
-            validation.properties.insert(
-                feature.key.to_string(),
-                schema_gen.subschema_for::<codex_features::FeatureToml<
-                    codex_features::NetworkProxyConfigToml,
-                >>(),
-            );
-            continue;
-        }
         validation
             .properties
             .insert(feature.key.to_string(), schema_gen.subschema_for::<bool>());
@@ -162,6 +153,14 @@ mod tests {
         assert!(!feature_properties.contains_key("experimental_use_unified_exec_tool"));
         assert!(!feature_properties.contains_key("terminal_resize_reflow"));
         assert!(!feature_properties.contains_key("chronicle"));
+        assert!(!feature_properties.contains_key("goals"));
+        assert!(!feature_properties.contains_key("network_proxy"));
+
+        let network_properties = schema["definitions"]["NetworkToml"]["properties"]
+            .as_object()
+            .expect("platform network permissions");
+        assert_eq!(network_properties.len(), 1);
+        assert!(network_properties.contains_key("enabled"));
 
         let notice_properties = schema["definitions"]["Notice"]["properties"]
             .as_object()

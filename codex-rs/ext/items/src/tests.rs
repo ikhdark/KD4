@@ -11,7 +11,8 @@ fn completed_image_generation_item() -> ExtensionItem {
         id: "image-1".to_string(),
         status: "completed".to_string(),
         revised_prompt: Some("A blue square".to_string()),
-        result: "cG5n".to_string(),
+        result: Some("cG5n".to_string()),
+        error: None,
         saved_path: None,
         provider_usage: None,
     })
@@ -36,6 +37,32 @@ fn image_generation_item_preserves_stable_wire_shape() {
         serde_json::from_value::<ExtensionItem>(value).expect("deserialize extension item"),
         item
     );
+}
+
+#[test]
+fn image_generation_item_preserves_absence_and_failure_details() {
+    for result in [None, Some(serde_json::Value::Null)] {
+        let mut value = json!({
+            "kind": "image_gen.generation", "id": "image-failed", "status": "failed",
+            "revisedPrompt": null, "error": {"message":"Generation failed"},
+        });
+        if let Some(result) = result {
+            value["result"] = result;
+        }
+        let item: ExtensionItem = serde_json::from_value(value).expect("unavailable image");
+        let ExtensionItem::ImageGeneration(image) = &item else {
+            panic!("image")
+        };
+        assert!(image.result.is_none());
+        assert!(image.saved_path.is_none());
+        assert_eq!(
+            image.error.as_ref().unwrap()["message"],
+            "Generation failed"
+        );
+        let serialized = serde_json::to_value(item).unwrap();
+        assert!(serialized["result"].is_null());
+        assert_eq!(serialized["error"]["message"], "Generation failed");
+    }
 }
 
 #[test]
@@ -79,8 +106,8 @@ fn invalid_extension_payloads_are_rejected_for_the_expected_reason() {
             "unknown variant `image_gen.unknown`",
         ),
         (
-            json!({"kind": "image_gen.generation", "id": "image-1", "status": "completed"}),
-            "missing field `result`",
+            json!({"kind": "image_gen.generation", "id": "image-1"}),
+            "missing field `status`",
         ),
     ] {
         let error = serde_json::from_value::<ExtensionItem>(value).unwrap_err();

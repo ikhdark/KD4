@@ -280,3 +280,6 @@ mod store_error_tests {
         assert!(buffer.lock().unwrap().is_empty());
     }
 }
+#[cfg(test)]
+#[path = "multi_agents_tests.rs"]
+mod tests;

@@ -322,6 +322,15 @@ impl CodexThread {
         self.codex.session.flush_rollout().await
     }
 
+    /// A live writer can prove queued input custody after its persistence
+    /// barrier. Unknown/ambiguous history requires the caller's replay fallback.
+    pub async fn durable_input_recorded(&self, turn_id: &str) -> ThreadStoreResult<Option<bool>> {
+        let Some(live_thread) = self.codex.session.live_thread() else {
+            return Ok(None);
+        };
+        live_thread.durable_input_recorded(turn_id).await
+    }
+
     pub(crate) async fn fork_history_snapshot(
         &self,
     ) -> ThreadStoreResult<Option<Arc<StoredThreadHistory>>> {
@@ -856,6 +865,22 @@ impl CodexThread {
         self.codex
             .session
             .refresh_runtime_config_features(next_config, refreshed_features)
+            .await;
+    }
+
+    /// Batch refresh after the caller invalidated the shared discovery managers
+    /// once. Per-thread config layers and refresh serialization are unchanged.
+    pub async fn refresh_runtime_config_features_after_discovery_invalidation(
+        &self,
+        next_config: crate::config::Config,
+        refreshed_features: &[Feature],
+    ) {
+        self.codex
+            .session
+            .refresh_runtime_config_features_after_discovery_invalidation(
+                next_config,
+                refreshed_features,
+            )
             .await;
     }
 

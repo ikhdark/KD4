@@ -48,6 +48,7 @@ use async_channel::Sender;
 use codex_api::SharedAuthProvider;
 use codex_config::Constrained;
 use codex_config::McpServerAuth;
+use codex_config::McpServerConfig;
 use codex_config::McpServerTransportConfig;
 use codex_config::types::AuthKeyringBackendKind;
 use codex_config::types::OAuthCredentialsStoreMode;
@@ -449,16 +450,13 @@ impl McpConnectionManager {
                     .client_reuse_context
                     .is_compatible_with(&client_reuse_context)
                 && previous.tool_plugin_provenance.as_ref() == tool_plugin_provenance.as_ref()
+                && previous.elicitation_requests.approval_policy.lock()
+                    .is_ok_and(|policy| *policy == approval_policy.value())
+                && previous.elicitation_requests.permission_profile.lock()
+                    .is_ok_and(|profile| *profile == initial_permission_profile)
         });
         let elicitation_requests = if let Some(previous) = reusable_previous_manager {
-            let requests = previous.elicitation_requests.clone();
-            if let Ok(mut policy) = requests.approval_policy.lock() {
-                *policy = approval_policy.value();
-            }
-            if let Ok(mut profile) = requests.permission_profile.lock() {
-                *profile = initial_permission_profile;
-            }
-            requests
+            previous.elicitation_requests.clone()
         } else {
             ElicitationRequestManager::new(
                 approval_policy.value(),
@@ -533,9 +531,8 @@ impl McpConnectionManager {
                 Some(_) => None,
                 None => None,
             };
-            if let Some(client) = reusable_client {
-                client.retain_for_manager();
-                manager.clients.insert(server_name.clone(), client.clone());
+            if let Some(client) = reusable_client.and_then(AsyncManagedClient::retain_for_manager) {
+                manager.clients.insert(server_name.clone(), client);
                 reused_server_names.push(server_name);
                 continue;
             }
@@ -563,11 +560,7 @@ impl McpConnectionManager {
                 });
             let shares_codex_apps_tools_cache =
                 should_share_codex_apps_tools_cache(&server_name, uses_env_bearer_token)
-                    && configured_config.is_some_and(|config| {
-                        matches!(&config.transport,
-                        McpServerTransportConfig::StreamableHttp { env_http_headers, .. }
-                        if env_http_headers.as_ref().is_none_or(HashMap::is_empty))
-                    });
+                    && configured_config.is_some_and(cache_transport_has_only_account_auth);
             let codex_apps_tools_cache_context = if shares_codex_apps_tools_cache
                 && let Some(configured_config) = configured_config
             {
@@ -1264,6 +1257,7 @@ impl McpConnectionManager {
             let async_managed_client = async_managed_client.clone();
             let task_server = server_name.clone();
             let abort_handle = join_set.spawn(async move {
+                async_managed_client.reconnect_failed_startup().await;
                 let managed_client = match async_managed_client.client().await {
                     Ok(client) => client,
                     Err(err) => {
@@ -1368,6 +1362,7 @@ impl McpConnectionManager {
             let async_managed_client = async_managed_client.clone();
             let task_server = server_name.clone();
             let abort_handle = join_set.spawn(async move {
+                async_managed_client.reconnect_failed_startup().await;
                 let managed_client = match async_managed_client.client().await {
                     Ok(client) => client,
                     Err(err) => {
@@ -1448,6 +1443,7 @@ impl McpConnectionManager {
             let async_managed_client = async_managed_client.clone();
             let task_server = server_name.clone();
             let abort_handle = join_set.spawn(async move {
+                async_managed_client.reconnect_failed_startup().await;
                 let managed_client = match async_managed_client.client().await {
                     Ok(client) => client,
                     Err(err) => {
@@ -1556,6 +1552,7 @@ impl McpConnectionManager {
             let async_managed_client = async_managed_client.clone();
             let task_server = server_name.clone();
             let abort_handle = join_set.spawn(async move {
+                async_managed_client.reconnect_failed_startup().await;
                 let managed_client = match async_managed_client.client().await {
                     Ok(client) => client,
                     Err(err) => {
@@ -1756,10 +1753,11 @@ impl McpConnectionManager {
     }
 
     async fn client_by_name(&self, name: &str) -> Result<ManagedClient> {
-        self.clients
+        let client = self.clients
             .get(name)
-            .ok_or_else(|| anyhow!("unknown MCP server '{name}'"))?
-            .client()
+            .ok_or_else(|| anyhow!("unknown MCP server '{name}'"))?;
+        client.reconnect_failed_startup().await;
+        client.client()
             .await
             .context("failed to get client")
     }
@@ -1802,6 +1800,15 @@ fn chatgpt_auth_provider_for_server(
         return None;
     }
     chatgpt_auth_provider
+}
+
+fn cache_transport_has_only_account_auth(config: &McpServerConfig) -> bool {
+    matches!(&config.transport,
+        McpServerTransportConfig::StreamableHttp { env_http_headers, http_headers, .. }
+        if env_http_headers.as_ref().is_none_or(HashMap::is_empty)
+            && http_headers.as_ref().is_none_or(|headers| headers.keys().all(|name|
+                name.eq_ignore_ascii_case("x-openai-product-sku")
+                    || name.eq_ignore_ascii_case("originator"))))
 }
 
 fn should_share_codex_apps_tools_cache(server_name: &str, uses_env_bearer_token: bool) -> bool {

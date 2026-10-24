@@ -38,6 +38,7 @@ pub(super) struct ResponseLifecycle {
     active: Option<ItemIdentity>,
     active_wire_bytes: usize,
     admitted: Vec<ResponseItem>,
+    admitted_output_indices: Vec<Option<u64>>,
     identities: HashMap<String, usize>,
     retained_wire_bytes: usize,
     connection: ConnectionResponseHistory,
@@ -61,13 +62,14 @@ fn invalid(message: &str) -> ResponsesEventError {
 impl ItemIdentity {
     fn from_event(event: &ResponsesStreamEvent<'_>) -> Option<Self> {
         let item = event.item.as_ref()?;
+        let kind = item.get("type").and_then(Value::as_str)?;
         Some(Self {
             id: item.get("id").and_then(Value::as_str).map(str::to_owned),
-            call_id: item
-                .get("call_id")
-                .and_then(Value::as_str)
+            call_id: matches!(kind, "function_call" | "custom_tool_call" | "local_shell_call" | "tool_search_call" | "tool_search_output")
+                .then(|| item.get("call_id").and_then(Value::as_str))
+                .flatten()
                 .map(str::to_owned),
-            kind: item.get("type").and_then(Value::as_str)?.to_owned(),
+            kind: kind.to_owned(),
             output_index: event.output_index,
         })
     }
@@ -129,13 +131,11 @@ impl ResponseLifecycle {
         self.connection
     }
 
-    pub(super) fn process(
-        &mut self,
-        mut event: ResponsesStreamEvent<'_>,
-        wire_bytes: usize,
-        completion_usage: Option<codex_protocol::protocol::TokenUsage>,
-    ) -> Result<Option<ResponseEvent>, ResponsesEventError> {
-        let mut identity = ItemIdentity::from_event(&event);
+    pub(super) fn validate_ownership(
+        &self,
+        event: &ResponsesStreamEvent<'_>,
+    ) -> Result<(), ResponsesEventError> {
+        let identity = ItemIdentity::from_event(event);
         let supplied_response_id = event
             .response
             .as_ref()
@@ -160,6 +160,23 @@ impl ResponseLifecycle {
         {
             return Err(invalid("event has a different response id"));
         }
+        Ok(())
+    }
+
+    pub(super) fn process(
+        &mut self,
+        mut event: ResponsesStreamEvent<'_>,
+        wire_bytes: usize,
+        completion_usage: Option<codex_protocol::protocol::TokenUsage>,
+    ) -> Result<Option<ResponseEvent>, ResponsesEventError> {
+        self.validate_ownership(&event)?;
+        if matches!(event.kind.as_ref(), "response.output_item.added" | "response.output_item.done")
+            && event.item.as_ref().and_then(|item| item.get("id"))
+            .is_some_and(|id| !id.is_null() && !id.is_string())
+        {
+            return Err(invalid("output item id must be a string or null"));
+        }
+        let mut identity = ItemIdentity::from_event(&event);
         if !self.connection.responses.is_empty()
             && self.response_id.is_none()
             && matches!(
@@ -167,6 +184,8 @@ impl ResponseLifecycle {
                 "response.output_item.added"
                     | "response.output_item.done"
                     | "response.output_text.delta"
+                    | "response.refusal.delta"
+                    | "response.refusal.done"
                     | "response.function_call_arguments.delta"
                     | "response.custom_tool_call_input.delta"
                     | "response.reasoning_text.delta"
@@ -234,6 +253,7 @@ impl ResponseLifecycle {
             }
             kind if super::is_known_event(kind)
                 && (kind.ends_with(".delta")
+                    || kind == "response.refusal.done"
                     || kind.starts_with("response.reasoning_summary_")) =>
             {
                 if event.summary_index.is_some_and(|index| index < 0)
@@ -243,7 +263,7 @@ impl ResponseLifecycle {
                 }
                 if let Some(active) = &self.active {
                     let expected_kind = match kind {
-                        "response.output_text.delta" | "response.refusal.delta" => Some("message"),
+                        "response.output_text.delta" | "response.refusal.delta" | "response.refusal.done" => Some("message"),
                         "response.function_call_arguments.delta" => Some("function_call"),
                         "response.custom_tool_call_input.delta" => Some("custom_tool_call"),
                         kind if kind.starts_with("response.reasoning_") => Some("reasoning"),
@@ -263,6 +283,12 @@ impl ResponseLifecycle {
                 }
             }
             _ => {}
+        }
+        if matches!(event.kind.as_ref(),
+            "response.reasoning_summary_text.delta" | "response.reasoning_summary_part.added")
+            && event.summary_index.is_some_and(|index| self.finalized_summaries.contains_key(&index))
+        {
+            return Err(invalid("reasoning summary fragment received after finalization"));
         }
         if event.kind == "response.reasoning_summary_text.done"
             && let (Some(index), Some(text), Some(_)) =
@@ -288,7 +314,8 @@ impl ResponseLifecycle {
             && active.matches(done)
         {
             // Core used to fill an omitted done ID after client history had
-            // already captured it. Normalize once before either consumer.
+            // already captured it. Null is also an absent optional ID in the
+            // protocol schema; other JSON types were rejected above.
             if done.id.is_none()
                 && let Some(id) = &active.id
             {
@@ -308,20 +335,57 @@ impl ResponseLifecycle {
                 self.active_wire_bytes = wire_bytes;
             }
             Some(ResponseEvent::OutputItemDone(item)) => {
+                if let ResponseItem::Reasoning { summary, .. } = item
+                    && self.active.is_some()
+                {
+                    for (index, text) in &self.finalized_summaries {
+                        let Some(codex_protocol::models::ReasoningItemReasoningSummary::SummaryText {
+                            text: final_text,
+                        }) = usize::try_from(*index).ok().and_then(|index| summary.get(index)) else {
+                            return Err(invalid("final reasoning item omits a finalized summary"));
+                        };
+                        if final_text != text {
+                            return Err(invalid("final reasoning item conflicts with a finalized summary"));
+                        }
+                    }
+                }
                 let keys = identity
                     .as_ref()
                     .map(|item| item.keys().collect::<Vec<_>>())
                     .unwrap_or_default();
-                let mut replay = false;
+                let mut replay = None;
                 for key in &keys {
                     if let Some(index) = self.identities.get(key) {
                         if self.admitted[*index] != *item {
                             return Err(invalid("conflicting finalized output item identity"));
                         }
-                        replay = true;
+                        if matches!((self.admitted_output_indices[*index], identity.as_ref().and_then(|item| item.output_index)),
+                            (Some(previous), Some(current)) if previous != current)
+                        {
+                            return Err(invalid("finalized output item changed output index"));
+                        }
+                        if replay.is_some_and(|previous| previous != *index) {
+                            return Err(invalid("conflicting finalized output item aliases"));
+                        }
+                        replay = Some(*index);
                     }
                 }
-                if replay {
+                let new_keys = keys.iter().filter(|key| !self.identities.contains_key(*key));
+                let (new_count, new_bytes) = new_keys.fold((0usize, 0usize), |(count, bytes), key| {
+                    (count.saturating_add(1), bytes.saturating_add(key.len()))
+                });
+                if self.identities.len().saturating_add(new_count) > MAX_ITEMS * 3
+                    || new_bytes > MAX_RETAINED_WIRE_BYTES.saturating_sub(self.retained_wire_bytes)
+                {
+                    return Err(invalid("response item identity budget exceeded"));
+                }
+                if let Some(index) = replay {
+                    self.admitted_output_indices[index] = self.admitted_output_indices[index]
+                        .or(identity.as_ref().and_then(|item| item.output_index));
+                    for key in keys {
+                        self.identities.insert(key, index);
+                    }
+                    self.retained_wire_bytes += new_bytes;
                     return Ok(None);
                 }
                 if let (Some(active), Some(done)) = (&self.active, &identity)
@@ -331,7 +395,7 @@ impl ResponseLifecycle {
                         "finalized item does not match the active output item",
                     ));
                 }
-                let charged_bytes = wire_bytes.saturating_add(self.active_wire_bytes);
+                let charged_bytes = wire_bytes.saturating_add(self.active_wire_bytes).saturating_add(new_bytes);
                 if self.admitted.len() >= MAX_ITEMS
                     || charged_bytes
                         > MAX_RETAINED_WIRE_BYTES.saturating_sub(self.retained_wire_bytes)
@@ -343,6 +407,7 @@ impl ResponseLifecycle {
                     self.identities.insert(key, self.admitted.len());
                 }
                 self.retained_wire_bytes += charged_bytes;
+                self.admitted_output_indices.push(identity.as_ref().and_then(|item| item.output_index));
                 self.admitted.push(item.clone());
                 self.active = None;
                 self.active_wire_bytes = 0;
@@ -620,5 +685,148 @@ mod audit143_tests {
             let conflict = json!({"type":"response.reasoning_summary_text.done","item_id":"r","summary_index":0,"text":"different"});
             assert!(stream.process_payload(&conflict.to_string()).is_err());
         }
+    }
+}
+
+#[cfg(test)]
+mod stream_audit_regressions {
+    use super::super::ResponsesEventInterpreter;
+    use super::super::ResponsesStreamMetadata;
+    use super::*;
+    use serde_json::json;
+
+    fn send(
+        stream: &mut ResponsesEventInterpreter,
+        event: Value,
+    ) -> Result<Vec<ResponseEvent>, ResponsesEventError> {
+        stream
+            .process_payload(&event.to_string())
+            .map(Iterator::collect)
+    }
+
+    fn reasoning_stream() -> ResponsesEventInterpreter {
+        let mut stream = ResponsesEventInterpreter::new(&ResponsesStreamMetadata::default(), None);
+        for event in [
+            json!({"type":"response.created","response":{"id":"response"}}),
+            json!({"type":"response.output_item.added","item":{"type":"reasoning","id":"reason","summary":[]}}),
+            json!({"type":"response.reasoning_summary_text.done","item_id":"reason","summary_index":0,"text":"A"}),
+        ] {
+            send(&mut stream, event).unwrap();
+        }
+        stream
+    }
+
+    #[test]
+    fn finalized_reasoning_summary_rejects_later_deltas_and_part_additions() {
+        for event in [
+            json!({"type":"response.reasoning_summary_text.delta","item_id":"reason","summary_index":0,"delta":"B"}),
+            json!({"type":"response.reasoning_summary_part.added","item_id":"reason","summary_index":0}),
+        ] {
+            let mut stream = reasoning_stream();
+            assert!(send(&mut stream, event).is_err());
+            assert!(send(&mut stream, json!({"type":"response.reasoning_summary_text.done","item_id":"reason","summary_index":0,"text":"A"})).unwrap().is_empty());
+        }
+    }
+
+    #[test]
+    fn final_reasoning_item_must_preserve_every_finalized_summary() {
+        for summary in [json!([]), json!([{"type":"summary_text","text":"C"}])] {
+            let mut stream = reasoning_stream();
+            let item = json!({"type":"reasoning","id":"reason","summary":summary});
+            assert!(
+                send(
+                    &mut stream,
+                    json!({"type":"response.output_item.done","item":item})
+                )
+                .is_err()
+            );
+            // Matching a rejected final item in a terminal snapshot cannot
+            // rehabilitate it or turn the contradictory sequence into success.
+            assert!(send(&mut stream, json!({"type":"response.completed","response":{"id":"response","output":[item]}})).is_err());
+            let item = json!({"type":"reasoning","id":"reason","summary":[{"type":"summary_text","text":"A"}]});
+            send(
+                &mut stream,
+                json!({"type":"response.output_item.done","item":item}),
+            )
+            .unwrap();
+            assert!(matches!(send(&mut stream, json!({"type":"response.completed","response":{"id":"response","output":[item]}})).unwrap().as_slice(), [ResponseEvent::Completed { .. }]));
+        }
+    }
+
+    #[test]
+    fn present_malformed_item_ids_are_never_normalized_from_active_item() {
+        for id in [json!(123), json!(true), json!([]), json!({})] {
+            for phase in ["response.output_item.added", "response.output_item.done"] {
+                let mut stream =
+                    ResponsesEventInterpreter::new(&ResponsesStreamMetadata::default(), None);
+                if phase.ends_with("done") {
+                    send(&mut stream, json!({"type":"response.output_item.added","item":{"type":"message","id":"m","role":"assistant","content":[]}})).unwrap();
+                }
+                assert!(send(&mut stream, json!({"type":phase,"item":{"type":"message","id":id,"role":"assistant","content":[]}})).is_err());
+                if phase.ends_with("done") {
+                    let events = send(&mut stream, json!({"type":phase,"item":{"type":"message","role":"assistant","content":[]}})).unwrap();
+                    assert!(
+                        matches!(&events[0], ResponseEvent::OutputItemDone(ResponseItem::Message { id: Some(id), .. }) if id.as_str() == "m")
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn explicit_null_final_id_uses_optional_id_compatibility() {
+        let mut stream = ResponsesEventInterpreter::new(&ResponsesStreamMetadata::default(), None);
+        send(&mut stream, json!({"type":"response.output_item.added","item":{"type":"message","id":"m","role":"assistant","content":[]}})).unwrap();
+        let events = send(&mut stream, json!({"type":"response.output_item.done","item":{"type":"message","id":null,"role":"assistant","content":[]}})).unwrap();
+        assert!(
+            matches!(&events[0], ResponseEvent::OutputItemDone(ResponseItem::Message { id: Some(id), .. }) if id.as_str() == "m")
+        );
+    }
+
+    #[test]
+    fn replay_cannot_change_an_explicit_output_index() {
+        let mut stream = ResponsesEventInterpreter::new(&ResponsesStreamMetadata::default(), None);
+        let item = json!({"type":"message","id":"m","role":"assistant","content":[]});
+        send(
+            &mut stream,
+            json!({"type":"response.output_item.done","output_index":0,"item":item}),
+        )
+        .unwrap();
+        assert!(
+            send(
+                &mut stream,
+                json!({"type":"response.output_item.done","output_index":1,"item":item})
+            )
+            .is_err()
+        );
+        for index in [Some(0), None] {
+            let mut event = json!({"type":"response.output_item.done","item":item});
+            if let Some(index) = index {
+                event["output_index"] = json!(index);
+            }
+            assert!(send(&mut stream, event).unwrap().is_empty());
+        }
+        // An index first supplied on replay also establishes a stable position.
+        let mut stream = ResponsesEventInterpreter::new(&ResponsesStreamMetadata::default(), None);
+        send(
+            &mut stream,
+            json!({"type":"response.output_item.done","item":item}),
+        )
+        .unwrap();
+        assert!(
+            send(
+                &mut stream,
+                json!({"type":"response.output_item.done","output_index":0,"item":item})
+            )
+            .unwrap()
+            .is_empty()
+        );
+        assert!(
+            send(
+                &mut stream,
+                json!({"type":"response.output_item.done","output_index":1,"item":item})
+            )
+            .is_err()
+        );
     }
 }

@@ -14,10 +14,7 @@ use crate::session::turn_context::TurnEnvironment;
 use crate::shell::ShellType;
 use crate::tools::command_output_artifact::RawOutputArtifact;
 use crate::tools::context::SharedTurnDiffTracker;
-use crate::tools::network_approval::NetworkApprovalMode;
-use crate::tools::network_approval::NetworkApprovalSpec;
 use crate::tools::runtimes::ShellCommandPreparation;
-use crate::tools::runtimes::exec_env_for_sandbox_permissions;
 use crate::tools::runtimes::prepare_shell_command;
 use crate::tools::runtimes::shell_snapshot_additional_read_roots;
 use crate::tools::sandboxing::Approvable;
@@ -29,16 +26,12 @@ use crate::tools::sandboxing::Sandboxable;
 use crate::tools::sandboxing::ToolCtx;
 use crate::tools::sandboxing::ToolError;
 use crate::tools::sandboxing::ToolRuntime;
-use crate::tools::sandboxing::managed_network_for_sandbox_permissions;
-use crate::tools::sandboxing::sandbox_permissions_preserving_denied_reads;
 use crate::tools::sandboxing::with_cached_approval;
 use crate::unified_exec::NoopSpawnLifecycle;
 use crate::unified_exec::ObservedSpawnLifecycle;
 use crate::unified_exec::PendingSpawnRegistration;
 use crate::unified_exec::UnifiedExecProcess;
 use crate::unified_exec::UnifiedExecProcessManager;
-use codex_network_proxy::ManagedNetworkSandboxContext;
-use codex_network_proxy::NetworkProxy;
 use codex_protocol::error::CodexErr;
 use codex_protocol::models::AdditionalPermissionProfile;
 use codex_protocol::protocol::ReviewDecision;
@@ -114,7 +107,6 @@ pub struct UnifiedExecRequest {
     pub exec_server_env_config: Option<ExecServerEnvConfig>,
     pub explicit_env_overrides: HashMap<String, String>,
     pub has_command_env_overrides: bool,
-    pub network: Option<NetworkProxy>,
     pub tty: bool,
     pub sandbox_permissions: SandboxPermissions,
     pub additional_permissions: Option<AdditionalPermissionProfile>,
@@ -174,16 +166,10 @@ pub struct UnifiedExecRuntime<'a> {
     tracker: Option<SharedTurnDiffTracker>,
 }
 
-fn unified_exec_options(
-    network_denial_cancellation_token: Option<CancellationToken>,
-) -> ExecOptions {
-    let mut expiration = ExecExpiration::DefaultTimeout;
-    if let Some(cancellation) = network_denial_cancellation_token {
-        expiration = expiration.with_cancellation(cancellation);
-    }
+fn unified_exec_options() -> ExecOptions {
     ExecOptions {
-        expiration,
-        capture_policy: ExecCapturePolicy::ShellTool,
+        expiration: ExecExpiration::DefaultTimeout,
+        capture_policy: ExecCapturePolicy::default(),
     }
 }
 
@@ -191,7 +177,6 @@ fn build_unified_exec_sandbox_command(
     command: &[String],
     cwd: &PathUri,
     env: &HashMap<String, String>,
-    managed_network: Option<ManagedNetworkSandboxContext>,
     additional_permissions: Option<AdditionalPermissionProfile>,
 ) -> Result<SandboxCommand, ToolError> {
     let (program, args) = command
@@ -202,7 +187,6 @@ fn build_unified_exec_sandbox_command(
         args: args.to_vec(),
         cwd: cwd.clone(),
         env: env.clone(),
-        managed_network,
         additional_permissions,
     })
 }
@@ -342,38 +326,12 @@ impl Approvable<UnifiedExecRequest> for UnifiedExecRuntime<'_> {
     }
 }
 
-impl UnifiedExecRuntime<'_> {}
 
 impl<'a> ToolRuntime<UnifiedExecRequest, Arc<UnifiedExecProcess>> for UnifiedExecRuntime<'a> {
     fn sandbox_cwd<'b>(&self, req: &'b UnifiedExecRequest) -> Option<&'b PathUri> {
         Some(&req.sandbox_cwd)
     }
 
-    fn network_approval_spec(
-        &self,
-        req: &UnifiedExecRequest,
-        ctx: &ToolCtx,
-    ) -> Option<NetworkApprovalSpec> {
-        let file_system_sandbox_policy = ctx.turn.file_system_sandbox_policy();
-        let sandbox_permissions = sandbox_permissions_preserving_denied_reads(
-            req.sandbox_permissions,
-            &file_system_sandbox_policy,
-        );
-        let network =
-            managed_network_for_sandbox_permissions(req.network.as_ref(), sandbox_permissions)?;
-        Some(NetworkApprovalSpec {
-            network: Some(network.clone()),
-            mode: NetworkApprovalMode::Deferred,
-            cwd: req.cwd.clone(),
-            command: req.hook_command.clone(),
-            environment_id: req.turn_environment.environment_id.clone(),
-            approval_scope_id: req
-                .turn_environment
-                .environment
-                .approval_scope_id()
-                .to_string(),
-        })
-    }
 
     async fn run(
         &mut self,
@@ -392,69 +350,14 @@ impl<'a> ToolRuntime<UnifiedExecRequest, Arc<UnifiedExecProcess>> for UnifiedExe
         {
             return Err(ToolError::Codex(crate::exec::unavailable_sandbox_error()));
         }
-        // Serialize validations with legacy shell validation, never with patches.
-        // Reject busy admission before process creation instead of hiding an
-        // unbounded wait before the caller can receive a resumable handle.
-        // Arbitrary long-lived servers and opaque scripts do not use this gate.
-        let pending_spawns = if validation_workspace_required(&req.command_for_approval) {
-            let _tool_wait = ctx.turn.turn_timing_state.begin_tool_execution();
-            let _phase =
-                crate::tools::tool_dispatch_trace::begin_tool_phase("validation_gate_wait");
-            let permit = crate::workspace_operation_gate::acquire_validation_operation(
-                &req.turn_environment.environment,
-                &req.cwd,
-                &req.hook_command,
-                crate::workspace_operation_gate::ValidationOwner::for_command(
-                    ctx.session.thread_id(),
-                    &req.command_for_approval,
-                ),
-            )
-            .await
-            .map_err(|reason| {
-                // Gate admission is argument-classified; settlement re-derives it.
-                crate::validation_task::record_admission_refusal(ctx, false);
-                ToolError::Rejected(reason)
-            })?;
-            self.pending_spawns.with_workspace_operation(permit)
-        } else {
-            self.pending_spawns.clone()
-        };
+        let pending_spawns = self.pending_spawns.clone();
         let setup_timing = ctx
             .turn
             .turn_timing_state
             .begin_local_phase(crate::turn_timing::TurnLocalPhase::ExecutorReadinessWait);
         let setup_phase = crate::tools::tool_dispatch_trace::begin_tool_phase("command_setup");
         let native_cwd = req.cwd.to_abs_path().ok();
-        let classification_phase =
-            crate::tools::tool_dispatch_trace::begin_tool_phase("command_mutation_classification");
-        let mutation = if req.has_command_env_overrides {
-            // Loader/config/PATH overrides invalidate an argv-only read proof.
-            crate::turn_diff_tracker::CommandMutation::Uncertain
-        } else {
-            crate::tools::events::command_mutation_for_exec(
-                &req.command_for_approval,
-                native_cwd
-                    .as_ref()
-                    .map(codex_utils_absolute_path::AbsolutePathBuf::as_path),
-            )
-            .await
-            .map_err(ToolError::Codex)?
-        };
-        drop(classification_phase);
-        let event_ctx = crate::tools::events::ToolEventCtx::new(
-            ctx.session.as_ref(),
-            ctx.turn.as_ref(),
-            &ctx.call_id,
-            self.tracker.as_ref(),
-        );
-        // Begin is published only after the spawn, too late for this snapshot.
-        crate::tools::events::begin_uncertain_command_baseline(
-            event_ctx,
-            &req.cwd,
-            &req.turn_environment.environment_id,
-            &mutation,
-        )
-        .await;
+
         #[cfg(test)]
         test_observation::record_process_launch();
         let base_command = &req.command;
@@ -468,34 +371,8 @@ impl<'a> ToolRuntime<UnifiedExecRequest, Arc<UnifiedExecProcess>> for UnifiedExe
             .turn_environment
             .shell_snapshot_for_config(&req.cwd, &ctx.turn.config)
             .await;
-        let (file_system_sandbox_policy, _) = attempt.permissions.to_runtime_permissions();
-        let launch_sandbox_permissions = sandbox_permissions_preserving_denied_reads(
-            req.sandbox_permissions,
-            &file_system_sandbox_policy,
-        );
-        let managed_network = attempt.network_proxy(managed_network_for_sandbox_permissions(
-            req.network.as_ref(),
-            launch_sandbox_permissions,
-        ));
-        let env = exec_env_for_sandbox_permissions(&req.env, launch_sandbox_permissions);
-        let (mut env, managed_network_context) = match managed_network {
-            Some(network) => {
-                let prepared = network
-                    .prepare_for_optional_environment_async(
-                        env,
-                        Some(&req.turn_environment.environment_id),
-                    )
-                    .await
-                    .map_err(|err| {
-                        ToolError::Codex(CodexErr::Io(io::Error::other(format!(
-                            "failed to prepare network proxy for environment `{}`: {err}",
-                            req.turn_environment.environment_id
-                        ))))
-                    })?;
-                (prepared.env, Some(prepared.sandbox_context))
-            }
-            None => (env, None),
-        };
+        let env = req.env.clone();
+        let mut env = env;
         let command = prepare_shell_command(ShellCommandPreparation {
             command: base_command,
             command_for_approval: &req.command_for_approval,
@@ -507,7 +384,7 @@ impl<'a> ToolRuntime<UnifiedExecRequest, Arc<UnifiedExecProcess>> for UnifiedExe
             sandbox_shell_type: Some(&req.shell_type),
             sandbox: attempt.sandbox,
             windows_sandbox_level: attempt.windows_sandbox_level,
-            enforce_managed_network: attempt.enforce_managed_network,
+            enforce_managed_network: false,
             approved_powershell_direct_argv: req.approved_powershell_direct_argv.as_ref(),
             proof_cwd: req.normalization_cwd.as_deref(),
         })
@@ -527,12 +404,7 @@ impl<'a> ToolRuntime<UnifiedExecRequest, Arc<UnifiedExecProcess>> for UnifiedExe
                 &env,
             )
             .await
-            .map_err(|reason| {
-                // Nothing was launched: required validation remains pending.
-                // Raw Cargo is argument-classified; settlement re-derives it.
-                crate::validation_task::record_admission_refusal(ctx, false);
-                ToolError::Rejected(reason)
-            })?;
+            .map_err(ToolError::Rejected)?;
         }
 
         let additional_read_roots = shell_snapshot_additional_read_roots(
@@ -544,7 +416,6 @@ impl<'a> ToolRuntime<UnifiedExecRequest, Arc<UnifiedExecProcess>> for UnifiedExe
             &command,
             &req.cwd,
             &env,
-            managed_network_context,
             permissions
                 .clone()
                 .and_then(|permissions| AdditionalPermissionProfile::try_from(permissions).ok()),
@@ -555,16 +426,10 @@ impl<'a> ToolRuntime<UnifiedExecRequest, Arc<UnifiedExecProcess>> for UnifiedExe
             }
             error @ (ToolError::Denied(_) | ToolError::Codex(_)) => error,
         })?;
-        let options = unified_exec_options(attempt.network_denial_cancellation_token.clone());
+        let options = unified_exec_options();
         drop(setup_phase);
         drop(setup_timing);
-        let full_suite_dispatch = crate::validation_task::begin_dispatch(
-            ctx,
-            &mut command.env,
-            !req.turn_environment.environment.is_remote(),
-        )
-        .await
-        .map_err(ToolError::Rejected)?;
+        crate::validation_task::begin_policy_attempt(ctx).await.map_err(ToolError::Rejected)?;
         let spawned = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let result = self
             .manager
@@ -575,15 +440,10 @@ impl<'a> ToolRuntime<UnifiedExecRequest, Arc<UnifiedExecProcess>> for UnifiedExe
                 options,
                 permissions.as_ref(),
                 attempt,
-                managed_network,
                 /*environment_id*/ Some(&req.turn_environment.environment_id),
                 req.exec_server_env_config.clone(),
                 req.tty,
-                if full_suite_dispatch.is_some() {
-                    Box::new(ObservedSpawnLifecycle::new(Arc::clone(&spawned)))
-                } else {
-                    Box::new(NoopSpawnLifecycle)
-                },
+                Box::new(ObservedSpawnLifecycle::new(Arc::clone(&spawned))),
                 Some(req.raw_output_artifact.clone()),
                 req.turn_environment.environment.as_ref(),
                 Some(req.turn_environment.exec_backend()),
@@ -596,38 +456,13 @@ impl<'a> ToolRuntime<UnifiedExecRequest, Arc<UnifiedExecProcess>> for UnifiedExe
         if result.is_err()
             && !spawned.load(std::sync::atomic::Ordering::Acquire)
             && attempt.sandbox != codex_sandboxing::SandboxType::WindowsRestrictedToken
-            && let Some(dispatch) = full_suite_dispatch
         {
-            dispatch.acknowledge_not_spawned().await;
+            crate::validation_task::policy_attempt_not_started(ctx).await;
         }
         result
     }
 }
 
-fn validation_workspace_required(command: &[String]) -> bool {
-    use codex_shell_command::validation::ValidationClassification;
-    use codex_shell_command::validation::ValidationOperation;
-
-    let Some((program, arguments)) = command.split_first() else {
-        return false;
-    };
-    // Nothing to queue behind: a format check never waits on the build lock.
-    if codex_shell_command::validation::is_standalone_cargo_fmt_check(program, arguments) {
-        return false;
-    }
-    matches!(
-        codex_shell_command::validation::classify_argv(program, arguments),
-        ValidationClassification::Validation {
-            leaves,
-            has_unclassified_targets: false,
-            exit_code_is_authoritative: true,
-        } if !leaves.is_empty()
-            && leaves.iter().all(|leaf| matches!(
-                leaf.operation,
-                ValidationOperation::Test | ValidationOperation::Check | ValidationOperation::Lint
-            ))
-    )
-}
 
 #[cfg(test)]
 mod tests {
@@ -642,272 +477,13 @@ mod tests {
     use std::time::Duration;
     use tempfile::tempdir;
 
-    #[test]
-    fn workspace_admission_only_recognizes_bounded_validation_commands() {
-        for (command, expected) in [
-            (vec!["cargo", "test", "-p", "example"], true),
-            (vec!["cargo", "check"], true),
-            (vec!["cargo", "clippy"], true),
-            (vec!["cargo", "fmt"], true),
-            (vec!["cargo", "fmt", "--check"], false),
-            (vec!["cargo", "+nightly", "fmt", "--", "--check"], false),
-            (
-                vec![
-                    "pwsh.exe",
-                    "-NoProfile",
-                    "-Command",
-                    "cargo fmt --all --check",
-                ],
-                false,
-            ),
-            (
-                vec!["pwsh", "-Command", "cargo fmt --check && cargo test"],
-                true,
-            ),
-            (vec!["python", "-m", "pytest", "tests"], true),
-            (vec!["cargo", "run"], false),
-            (vec!["cargo", "fuzz", "run", "target"], false),
-            (vec!["python", "server.py"], false),
-            (
-                vec!["pwsh", "-Command", "cargo test; python server.py"],
-                false,
-            ),
-        ] {
-            let command = command.into_iter().map(str::to_owned).collect::<Vec<_>>();
-            assert_eq!(
-                validation_workspace_required(&command),
-                expected,
-                "{command:?}"
-            );
-        }
-    }
 
-    #[tokio::test]
-    async fn busy_validation_returns_before_launch_without_waiting_for_owner() {
-        let temp = tempdir().unwrap();
-        let root = AbsolutePathBuf::try_from(temp.path().to_path_buf()).unwrap();
-        let cwd = PathUri::from_abs_path(&root);
-        let owner_command = "cargo test -p held-validation";
-        let holder = crate::workspace_operation_gate::ValidationOwner::for_command(
-            codex_protocol::ThreadId::new(),
-            &["cargo".to_string(), "test".to_string()],
-        );
-        let owner = crate::workspace_operation_gate::acquire_workspace_validation(
-            &root,
-            owner_command,
-            holder,
-        )
-        .await
-        .unwrap();
-        let manager = UnifiedExecProcessManager::default();
-        let mut runtime = UnifiedExecRuntime::new(&manager);
-        let mut request = test_request(
-            SandboxPermissions::UseDefault,
-            ExecApprovalRequirement::Skip {
-                bypass_sandbox: false,
-                proposed_execpolicy_amendment: None,
-            },
-        );
-        // The actual command must never reach setup or spawning while busy.
-        request.command = vec!["must-not-launch-validation-fixture".into()];
-        request.command_for_approval = vec!["cargo".into(), "test".into()];
-        request.cwd = cwd.clone();
-        request.sandbox_cwd = cwd.clone();
-        request.turn_environment = test_turn_environment(cwd.clone());
-        let (session, mut turn) = crate::session::tests::make_session_and_context().await;
-        // Dispatch must reach admission rather than wait for an approval that
-        // this fixture has no user/event consumer to answer.
-        turn.approval_policy
-            .set(codex_protocol::protocol::AskForApproval::Never)
-            .unwrap();
-        turn.permission_profile = codex_protocol::models::PermissionProfile::Disabled;
-        Arc::make_mut(&mut turn.config).cwd = root.clone();
-        turn.environments.turn_environments = vec![test_turn_environment(cwd.clone())];
-        let ctx = ToolCtx {
-            session: Arc::new(session),
-            turn: Arc::new(turn),
-            call_id: "busy-validation".into(),
-            tool_name: codex_tools::ToolName::plain("exec_command"),
-        };
-        let permissions = codex_protocol::models::PermissionProfile::Disabled;
-        let attempt = SandboxAttempt {
-            codex_home: &root,
-            sandbox: codex_sandboxing::SandboxType::None,
-            sandbox_requested: false,
-            permissions: &permissions,
-            exec_server_permissions: &permissions,
-            enforce_managed_network: false,
-            sandbox_cwd: &cwd,
-            workspace_roots: std::slice::from_ref(&root),
-            windows_sandbox_level: codex_protocol::config_types::WindowsSandboxLevel::Disabled,
-            windows_sandbox_private_desktop: false,
-            network_denial_cancellation_token: None,
-            network_proxy: None,
-        };
-        for tty in [false, true] {
-            request.tty = tty;
-            let (result, observed) = test_observation::observe(tokio::time::timeout(
-                Duration::from_secs(1),
-                runtime.run(&request, &attempt, &ctx),
-            ))
-            .await;
-            let result = result.expect("busy admission must not wait for the held owner");
-            assert!(
-                matches!(result, Err(ToolError::Rejected(message))
-                if message.contains("No process was started or queued")
-                    && message.contains(owner_command)
-                    && message.contains("held for ")
-                    && message.contains("This validation did not run")),
-                "tty={tty}"
-            );
-            assert_eq!(observed.process_launches, 0, "tty={tty}");
-        }
-        // Exercise the real dispatch/error conversion and validation ledger,
-        // not a synthetic success=false result constructed by this test.
-        use crate::session::step_context::StepContext;
-        use crate::session::turn_execution::SamplingRequestSettledState;
-        use crate::session::turn_execution::TurnExecutionControl;
-        use crate::tools::context::ToolPayload;
-        use crate::tools::parallel::ToolCallRuntime;
-        use crate::tools::registry::ToolRegistry;
-        use crate::tools::router::ToolCall;
-        use crate::tools::router::ToolRouter;
-        use codex_protocol::models::FunctionCallOutputBody;
-        use codex_protocol::models::ResponseInputItem;
-
-        let router = Arc::new(ToolRouter::from_parts(
-            ToolRegistry::from_tools([
-                Arc::new(crate::tools::handlers::ExecCommandHandler::default())
-                    as Arc<dyn crate::tools::registry::CoreToolRuntime>,
-            ]),
-            Vec::new(),
-        ));
-        let step = StepContext::for_test(Arc::clone(&ctx.turn)).with_tool_router_for_test(router);
-        let mut control = TurnExecutionControl::new();
-        let baseline = control.baselines(0);
-        let collector = control.collector(&baseline);
-        let dispatch = ToolCallRuntime::new(
-            Arc::clone(&ctx.session),
-            step,
-            Arc::new(tokio::sync::Mutex::new(
-                crate::turn_diff_tracker::TurnDiffTracker::new(),
-            )),
-        )
-        .with_sampling_request_signals(collector.clone());
-        let (response, observed) = test_observation::observe(tokio::time::timeout(
-            Duration::from_secs(10),
-            dispatch.handle_tool_call(
-                ToolCall {
-                    tool_name: codex_tools::ToolName::plain("exec_command"),
-                    call_id: "busy-validation-dispatch".into(),
-                    payload: ToolPayload::Function {
-                        arguments: serde_json::json!({
-                            "program": "cargo", "args": ["test", "busy_fixture"],
-                            "workdir": root.as_path(),
-                        })
-                        .to_string(),
-                    },
-                },
-                CancellationToken::new(),
-            ),
-        ))
-        .await;
-        let ResponseInputItem::FunctionCallOutput { output, .. } = response
-            .expect("busy dispatch must settle without waiting for the owner")
-            .unwrap()
-        else {
-            panic!("busy rejection must be a function failure");
-        };
-        assert_eq!(output.success, Some(false));
-        let FunctionCallOutputBody::Text(message) = output.body else {
-            panic!("busy rejection must contain its diagnostic");
-        };
-        assert!(message.contains(owner_command), "{message}");
-        assert!(message.contains("This validation did not run"), "{message}");
-        assert!(
-            message.contains("No process was started or queued"),
-            "{message}"
-        );
-        assert_eq!(observed.process_launches, 0);
-        control.settle(
-            &baseline,
-            &collector,
-            &SamplingRequestSettledState {
-                mutation_revision: 0,
-                attributed_mutation_revision: 0,
-                tool_exposure_revision: 0,
-            },
-        );
-        let assessment = control.completion_assessment_with_changed_paths(
-            0,
-            Some(&[(
-                LOCAL_ENVIRONMENT_ID.into(),
-                root.as_path().join("changed.rs"),
-            )]),
-            false,
-        );
-        assert!(
-            assessment.failed_checks.is_empty(),
-            "owner-confirmed nonexecution is pending, not a failed check"
-        );
-        assert!(
-            !assessment
-                .validation_uncertainty
-                .as_ref()
-                .unwrap()
-                .pending_checks
-                .is_empty()
-        );
-        assert!(
-            !assessment
-                .bounded_summary("busy-validation")
-                .unwrap()
-                .contains("failed")
-        );
-        assert!(
-            assessment
-                .verification_gaps
-                .iter()
-                .any(|gap| gap.contains("No passing validation"))
-        );
-        assert!(
-            assessment.advisories.is_empty(),
-            "no passing test or check may be attributed"
-        );
-        let counters = ctx
-            .turn
-            .turn_timing_state
-            .complete_snapshot()
-            .protocol_timing()
-            .counters;
-        assert_eq!(counters.executed_validation_count, 0);
-        assert_eq!(counters.executed_validation_duration_ns, 0);
-        assert!(
-            crate::workspace_operation_gate::acquire_workspace_validation(
-                &root,
-                "cargo check",
-                holder
-            )
-            .await
-            .is_err()
-        );
-        drop(owner);
-        assert!(
-            crate::workspace_operation_gate::acquire_workspace_validation(
-                &root,
-                "cargo check",
-                holder
-            )
-            .await
-            .is_ok()
-        );
-    }
 
     /// Audit 2026-10-22 #24: a raw Cargo validation rejected by the lane check
     /// never started. Through a nested code-mode call into either runtime it
-    /// stays pending, never a failed check or repair work.
+    /// remains a tool failure, not a pending validation or a completion blocker.
     #[tokio::test]
-    async fn raw_cargo_rejected_nested_validation_is_pending_without_repair_work() {
+    async fn raw_cargo_rejected_nested_validation_does_not_create_pending_work() {
         use crate::session::step_context::StepContext;
         use crate::session::turn_execution::SamplingRequestSettledState;
         use crate::session::turn_execution::TurnExecutionControl;
@@ -1047,44 +623,18 @@ mod tests {
                 false,
             );
             assert!(assessment.failed_checks.is_empty(), "{tool}: {assessment:?}");
-            assert!(
-                assessment
-                    .verification_gaps
-                    .iter()
-                    .any(|gap| gap.contains("refused admission before execution")),
-                "{tool}: {assessment:?}"
-            );
-            assert_eq!(
-                assessment
-                    .validation_uncertainty
-                    .as_ref()
-                    .map(|uncertainty| uncertainty.pending_checks.len()),
-                Some(1),
-                "{tool}: {assessment:?}"
-            );
+            assert!(assessment.verification_gaps.is_empty(), "{tool}: {assessment:?}");
+            assert!(assessment.validation_uncertainty.is_none(), "{tool}: {assessment:?}");
         }
     }
 
     /// Like `build_exec_request`, a local launch under managed network whose policy requested a
-    /// sandbox this host cannot provide is refused before any setup. A held validation owner
-    /// stops every other launch at admission, so the controls show the refusal applies to no
-    /// other case without starting a process.
+    /// sandbox this host cannot provide is refused before any setup.
     #[tokio::test]
-    async fn managed_network_launch_without_available_sandbox_is_refused_before_setup() {
+    async fn restricted_launch_without_available_sandbox_is_refused_before_setup() {
         let temp = tempdir().unwrap();
         let root = AbsolutePathBuf::try_from(temp.path().to_path_buf()).unwrap();
         let cwd = PathUri::from_abs_path(&root);
-        let holder = crate::workspace_operation_gate::ValidationOwner::for_command(
-            codex_protocol::ThreadId::new(),
-            &["cargo".to_string(), "test".to_string()],
-        );
-        let _owner = crate::workspace_operation_gate::acquire_workspace_validation(
-            &root,
-            "cargo test -p held-validation",
-            holder,
-        )
-        .await
-        .unwrap();
         let manager = UnifiedExecProcessManager::default();
         let mut runtime = UnifiedExecRuntime::new(&manager);
         let mut request = test_request(
@@ -1113,35 +663,25 @@ mod tests {
             tool_name: codex_tools::ToolName::plain("exec_command"),
         };
         let permissions = codex_protocol::models::PermissionProfile::Disabled;
-        for (enforce_managed_network, sandbox_requested, refused) in [
-            (true, true, true),
-            // Restrictions still require enforcement without a managed proxy.
-            (false, true, true),
-            // A launch whose policy requested no sandbox (an explicit bypass) is unchanged.
-            (true, false, false),
-            (false, false, false),
-        ] {
-            let case = (enforce_managed_network, sandbox_requested);
+        for (sandbox_requested, refused) in [(true, true), (false, false)] {
+            let case = sandbox_requested;
             let attempt = SandboxAttempt {
                 codex_home: &root,
                 sandbox: codex_sandboxing::SandboxType::None,
                 sandbox_requested,
                 permissions: &permissions,
                 exec_server_permissions: &permissions,
-                enforce_managed_network,
                 sandbox_cwd: &cwd,
                 workspace_roots: std::slice::from_ref(&root),
                 windows_sandbox_level: codex_protocol::config_types::WindowsSandboxLevel::Disabled,
                 windows_sandbox_private_desktop: false,
-                network_denial_cancellation_token: None,
-                network_proxy: None,
             };
             let (result, observed) = test_observation::observe(tokio::time::timeout(
                 Duration::from_secs(1),
                 runtime.run(&request, &attempt, &ctx),
             ))
             .await;
-            let result = result.expect("no case may wait for the held validation owner");
+            let result = result.expect("sandbox admission must remain bounded");
             if refused {
                 let Err(ToolError::Codex(CodexErr::Io(error))) = result else {
                     panic!("{case:?}: expected the unavailable-sandbox refusal");
@@ -1153,13 +693,9 @@ mod tests {
                     "{case:?}"
                 );
             } else {
-                assert!(
-                    matches!(&result, Err(ToolError::Rejected(message))
-                        if message.contains("No process was started or queued")),
-                    "{case:?}: the launch must reach validation admission"
-                );
+                assert!(result.is_err(), "{case:?}: the fixture executable does not exist");
             }
-            assert_eq!(observed.process_launches, 0, "{case:?}");
+            assert_eq!(observed.process_launches, if refused { 0 } else { 1 }, "{case:?}");
         }
     }
 
@@ -1172,27 +708,6 @@ mod tests {
         )
     }
 
-    #[test]
-    fn unified_exec_options_combines_default_timeout_with_network_denial_cancellation() {
-        let cancellation = CancellationToken::new();
-        let options = unified_exec_options(Some(cancellation.clone()));
-
-        assert_eq!(options.capture_policy, ExecCapturePolicy::ShellTool);
-        match options.expiration {
-            ExecExpiration::TimeoutOrCancellation {
-                timeout,
-                cancellation: actual,
-            } => {
-                assert_eq!(
-                    timeout,
-                    Duration::from_millis(DEFAULT_EXEC_COMMAND_TIMEOUT_MS)
-                );
-                cancellation.cancel();
-                assert!(actual.is_cancelled());
-            }
-            other => panic!("expected timeout-or-cancellation expiration, got {other:?}"),
-        }
-    }
 
     #[tokio::test]
     async fn approval_key_includes_environment_id_and_approval_scope() {
@@ -1344,7 +859,6 @@ mod tests {
             exec_server_env_config: None,
             explicit_env_overrides: HashMap::new(),
             has_command_env_overrides: false,
-            network: None,
             tty: false,
             sandbox_permissions: SandboxPermissions::UseDefault,
             additional_permissions: None,
@@ -1433,7 +947,6 @@ mod tests {
             exec_server_env_config: None,
             explicit_env_overrides: HashMap::new(),
             has_command_env_overrides: false,
-            network: None,
             tty: false,
             sandbox_permissions,
             additional_permissions: None,

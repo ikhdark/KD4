@@ -45,6 +45,7 @@ use crate::rpc::invalid_request;
 use crate::rpc::not_found;
 
 const MAX_FILE_READ_HANDLE_ID_BYTES: usize = 32;
+const MAX_DIRECTORY_ENTRIES: usize = 16_384;
 
 #[derive(Clone)]
 pub(crate) struct FileSystemHandler {
@@ -257,11 +258,23 @@ impl FileSystemHandler {
         &self,
         params: FsReadDirectoryParams,
     ) -> Result<FsReadDirectoryResponse, JSONRPCErrorError> {
-        let entries = self
+        self.read_directory_with_limit(params, MAX_DIRECTORY_ENTRIES).await
+    }
+
+    async fn read_directory_with_limit(
+        &self,
+        params: FsReadDirectoryParams,
+        max_entries: usize,
+    ) -> Result<FsReadDirectoryResponse, JSONRPCErrorError> {
+        let outcome = self
             .file_system
-            .read_directory(&params.path, params.sandbox.as_ref())
+            .read_directory_bounded(&params.path, max_entries, params.sandbox.as_ref())
             .await
-            .map_err(map_fs_error)?
+            .map_err(map_fs_error)?;
+        if outcome.limit_reached {
+            return Err(invalid_request("directory RPC entry limit reached; use fs/walk with explicit bounds".into()));
+        }
+        let entries = outcome.entries
             .into_iter()
             .map(|entry| FsReadDirectoryEntry {
                 file_name: entry.file_name,
@@ -513,5 +526,17 @@ mod tests {
 
             assert_eq!(response.data_base64, STANDARD.encode("ok"));
         }
+    }
+
+    #[tokio::test]
+    async fn directory_limit_returns_an_error_not_a_partial_listing() {
+        let home = tempfile::tempdir().unwrap();
+        for name in ["a", "b", "c"] { std::fs::write(home.path().join(name), b"").unwrap(); }
+        let handler = FileSystemHandler::new(ExecServerRuntimePaths::new(std::env::current_exe().unwrap()).unwrap());
+        let params = FsReadDirectoryParams { path: PathUri::from_host_native_path(home.path()).unwrap(), sandbox: None };
+        let error = handler.read_directory_with_limit(params.clone(), 2).await.unwrap_err();
+        assert!(error.message.contains("entry limit"));
+        let response = handler.read_directory_with_limit(params, 4).await.unwrap();
+        assert_eq!(response.entries.len(), 3);
     }
 }

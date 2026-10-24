@@ -119,14 +119,3 @@ def repository_lock(
             handle.close()
 
 
-@contextlib.contextmanager
-def generated_output_lock(
-    root: Path, owner: str, *, timeout: float = 0, resource: str = "generated-output"
-) -> Iterator[Path]:
-    if resource not in {"generated-output", "app-server-schema", "config-schema"}:
-        raise ValueError(f"unknown generated output resource: {resource}")
-    lock_path = root / ".codex" / "locks" / f"{resource}.lock"
-    with repository_lock(
-        lock_path, owner, f"generated outputs ({resource})", timeout=timeout
-    ) as acquired:
-        yield acquired

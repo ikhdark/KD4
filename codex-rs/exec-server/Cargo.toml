@@ -25,7 +25,6 @@ codex-api = { workspace = true }
 codex-http-client = { workspace = true }
 codex-exec-server-protocol = { workspace = true }
 codex-file-system = { workspace = true }
-codex-network-proxy = { workspace = true }
 codex-otel = { workspace = true }
 codex-protocol = { workspace = true }
 codex-sandboxing = { workspace = true }
@@ -35,6 +34,7 @@ codex-utils-pty = { workspace = true }
 codex-utils-rustls-provider = { workspace = true }
 futures = { workspace = true }
 http = { workspace = true }
+indexmap = { workspace = true }
 prost = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }

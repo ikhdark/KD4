@@ -20,6 +20,34 @@ use crate::session_runtime::ToolName;
 
 struct PanickingCallbackHost;
 
+#[tokio::test]
+async fn overdue_ready_callback_keeps_completed_evidence_and_rejects_success() {
+    for (setup, first_poll) in [
+        (Duration::from_millis(50), Duration::ZERO),
+        (Duration::ZERO, Duration::from_millis(50)),
+    ] {
+        let mut tasks = JoinSet::new();
+        let (runtime_tx, runtime_rx) = std_mpsc::channel();
+        let (ready, _ready_rx) = std_mpsc::channel();
+        let cancellation = NestedCancellation::new(CancellationToken::new());
+        let evidence = serde_json::json!({"effect":"done", "recovery_handle":"unique-late"});
+        spawn_tool(&mut tasks, Arc::new(SlowSetupCallbackHost {
+            setup, first_poll, ready, completed: Some(evidence.clone()),
+        }), CellToolCall {
+            id: "late".into(),
+            name: ToolName { name: "fixture".into(), namespace: None },
+            kind: ToolKind::Function, input: None, timeout: Duration::from_millis(20),
+            buffered_output_bytes: 0, deadline: None,
+        }, runtime_tx, cancellation.clone(), None);
+        tasks.join_next().await.unwrap().unwrap();
+        let RuntimeCommand::ToolResponseAfterDeadline { result, error_text, .. } = runtime_rx.try_recv().unwrap() else { panic!("late receipt must not be success"); };
+        assert_eq!(result, evidence);
+        assert!(error_text.contains("do not replay"));
+        assert_eq!(cancellation.cause(), Some(CancellationCause::NestedDeadline));
+        assert!(runtime_rx.try_recv().is_err());
+    }
+}
+
 #[derive(Default)]
 struct NonCooperativeCallbackHost {
     notify_token: std::sync::Mutex<Option<CancellationToken>>,
@@ -27,6 +55,7 @@ struct NonCooperativeCallbackHost {
 
 struct SlowSetupCallbackHost {
     setup: Duration,
+    first_poll: Duration,
     ready: std_mpsc::Sender<Option<std::time::Instant>>,
     completed: Option<JsonValue>,
 }
@@ -42,7 +71,9 @@ impl CellHost for SlowSetupCallbackHost {
         std::thread::sleep(self.setup);
         self.ready.send(invocation.deadline).unwrap();
         let completed = self.completed.clone();
+        let first_poll = self.first_poll;
         async move {
+            std::thread::sleep(first_poll);
             match completed {
                 Some(value) => Ok(value),
                 None => std::future::pending().await,
@@ -82,6 +113,7 @@ async fn callback_setup_does_not_restart_the_published_deadline() {
             &mut tasks,
             Arc::new(SlowSetupCallbackHost {
                 setup,
+                first_poll: Duration::ZERO,
                 ready: ready_tx,
                 completed: timeout
                     .is_zero()

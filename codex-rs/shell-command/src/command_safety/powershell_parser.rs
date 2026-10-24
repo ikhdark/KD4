@@ -1078,6 +1078,34 @@ mod tests {
     use crate::powershell::try_find_powershell_executable_blocking;
     use pretty_assertions::assert_eq;
 
+    #[cfg(windows)]
+    #[test]
+    fn preference_writes_and_commands_invalidate_cached_argv_proofs() {
+        let host = try_find_powershell_executable_blocking().expect("Windows PowerShell");
+        let mut parser = PowershellParserProcess::spawn(host.as_path().to_str().unwrap()).unwrap();
+        for script in [
+            "$PSDefaultParameterValues=@{'Write-Output:OutVariable'='x'}; $x='--list'; Write-Output '-D','victim'; git branch $x",
+            "$psdefaultparametervalues=@{}; Get-Content Cargo.toml",
+            "foreach ($i in @(1)) { $PSDefaultParameterValues=@{} }; Get-Content Cargo.toml",
+            "$values=@($PSDefaultParameterValues=@{}); Get-Content Cargo.toml",
+            "$values=@{a=($PSDefaultParameterValues=@{})}; Get-Content Cargo.toml",
+            "$LASTEXITCODE='--list'; git branch --list; git branch $LASTEXITCODE",
+            "$x='--list'; Write-Output value; git branch $x",
+        ] {
+            assert_eq!(
+                parser.parse(script).unwrap(),
+                PowershellParseOutcome::Unsupported,
+                "{script}"
+            );
+        }
+        assert!(matches!(
+            parser
+                .parse("$path='Cargo.toml'; Get-Content $path")
+                .unwrap(),
+            PowershellParseOutcome::Analysis(_)
+        ));
+    }
+
     #[test]
     fn invocation_scope_shares_failed_syntax_but_not_later_invocations_or_repairs() {
         use std::sync::atomic::AtomicUsize;

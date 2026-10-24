@@ -585,11 +585,18 @@ const REMOVED_FEATURE_KEYS: &[&str] = &[
     "context_management",
 ];
 
-fn migrate_config_toml(mut value: TomlValue, path: &Path) -> io::Result<TomlValue> {
+fn migrate_config_toml(value: TomlValue, path: &Path) -> io::Result<TomlValue> {
+    migrate_config_toml_for_source(value, &path.display().to_string())
+}
+
+pub(crate) fn migrate_config_toml_for_source(
+    mut value: TomlValue,
+    source: &str,
+) -> io::Result<TomlValue> {
     let table = value.as_table_mut().ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidData,
-            format!("config file {} must contain a TOML table", path.display()),
+            format!("config source {source} must contain a TOML table"),
         )
     })?;
     let version = match table.get("config_version") {
@@ -598,7 +605,7 @@ fn migrate_config_toml(mut value: TomlValue, path: &Path) -> io::Result<TomlValu
         Some(_) => {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!("config_version in {} must be an integer", path.display()),
+                format!("config_version in {source} must be an integer"),
             ));
         }
     };
@@ -610,8 +617,7 @@ fn migrate_config_toml(mut value: TomlValue, path: &Path) -> io::Result<TomlValu
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!(
-                "unsupported config_version {version} in {}; this build supports version {}",
-                path.display(),
+                "unsupported config_version {version} in {source}; this build supports version {}",
                 crate::config_toml::CURRENT_CONFIG_VERSION
             ),
         ));

@@ -51,7 +51,9 @@ impl<T: HttpTransport> SearchClient<T> {
             )
             .await?;
         serde_json::from_slice(&resp.body)
-            .map_err(|e| ApiError::Stream(format!("failed to decode search response: {e}")))
+            .map_err(|error| ApiError::invalid_response(crate::responses_stream::decode_diagnostic(
+                "failed to decode search response", &error,
+            )))
     }
 }
 
@@ -136,6 +138,20 @@ mod tests {
                 retry_transport: true,
             },
             stream_idle_timeout: Duration::from_secs(1),
+        }
+    }
+
+    #[tokio::test]
+    async fn malformed_search_bodies_are_permanent_and_content_free() {
+        let request = SearchRequest { id: "test".into(), model: "test".into(), reasoning: None,
+            input: None, commands: None, settings: None, max_output_tokens: None };
+        for body in [b"{".to_vec(), b"{}".to_vec(), serde_json::to_vec(&json!("private-proxy-content".repeat(4096))).unwrap(),
+            serde_json::to_vec(&json!({"output": "private-proxy-content".repeat(4096), "encrypted_output": 12})).unwrap()] {
+            let client = SearchClient::new(CapturingTransport::new(body), provider(), Arc::new(DummyAuth));
+            let error = client.search(&request, HeaderMap::new()).await.unwrap_err();
+            assert!(!error.to_string().contains("private-proxy-content"));
+            assert!(error.to_string().len() < 512);
+            assert!(!crate::api_bridge::map_api_error(error).is_retryable());
         }
     }
 

@@ -55,6 +55,7 @@ fn config_error_from_ignored_toml_value_fields_for_source<T: DeserializeOwned>(
     value: TomlValue,
 ) -> Option<ConfigError> {
     let unknown_feature_path = unknown_feature_toml_value_path(&value);
+    let unknown_flattened_path = unknown_flattened_toml_value_path::<T>(&value);
     let mut first_ignored_path = None;
     let mut ignored_callback = |ignored_path: serde_ignored::Path<'_>| {
         record_first_ignored_path(&mut first_ignored_path, &ignored_path);
@@ -64,7 +65,8 @@ fn config_error_from_ignored_toml_value_fields_for_source<T: DeserializeOwned>(
 
     match result {
         Ok(_) => unknown_field_error_from_path(source, contents, first_ignored_path)
-            .or_else(|| unknown_field_error_from_path(source, contents, unknown_feature_path)),
+            .or_else(|| unknown_field_error_from_path(source, contents, unknown_feature_path))
+            .or_else(|| unknown_field_error_from_path(source, contents, unknown_flattened_path)),
         Err(err) => {
             let path_hint = err.path().clone();
             let toml_err = err.into_inner();
@@ -82,15 +84,90 @@ fn config_error_from_ignored_toml_value_fields_for_source<T: DeserializeOwned>(
 }
 
 pub(crate) fn ignored_toml_value_field<T: DeserializeOwned>(value: TomlValue) -> Option<String> {
+    let flattened_path = unknown_flattened_toml_value_path::<T>(&value);
+    first_ignored_toml_value_path::<T>(value)
+        .ok()?
+        .or(flattened_path)
+        .map(|path| path.join("."))
+}
+
+fn first_ignored_toml_value_path<T: DeserializeOwned>(
+    value: TomlValue,
+) -> Result<Option<Vec<String>>, ()> {
     let mut first_ignored_path = None;
     let result: Result<T, _> = serde_ignored::deserialize(value, |ignored_path| {
         record_first_ignored_path(&mut first_ignored_path, &ignored_path);
     });
     if result.is_err() {
-        return None;
+        return Err(());
     }
 
-    first_ignored_path.map(|path_segments| path_segments.join("."))
+    Ok(first_ignored_path)
+}
+
+// Serde replays flattened fields outside serde_ignored's wrapper. Validate
+// those boundaries separately, using the owning types rather than duplicating
+// their fixed field lists. Ordinary config deserialization remains permissive.
+fn unknown_flattened_toml_value_path<T>(value: &TomlValue) -> Option<Vec<String>> {
+    // The public helper is also used directly with these flattened owner types.
+    // Route those through the same validator without adding a Serialize/Schema
+    // bound to the existing generic deserialization API.
+    let owner = std::any::type_name::<T>();
+    let prefix: &[&str] = if owner == std::any::type_name::<crate::types::AppsConfigToml>() { &["apps"] }
+        else if owner == std::any::type_name::<crate::types::AppConfig>() { &["apps", "_strict"] }
+        else if owner == std::any::type_name::<crate::types::AppToolsConfig>() { &["apps", "_strict", "tools"] }
+        else if owner == std::any::type_name::<crate::types::Tui>() { &["tui"] }
+        else { return unknown_flattened_config_path(value); };
+    let mut wrapped = value.clone();
+    for component in prefix.iter().rev() {
+        wrapped = TomlValue::Table(toml::map::Map::from_iter([(component.to_string(), wrapped)]));
+    }
+    unknown_flattened_config_path(&wrapped).map(|path| path.into_iter().skip(prefix.len()).collect())
+}
+
+fn unknown_flattened_config_path(value: &TomlValue) -> Option<Vec<String>> {
+    if let Some(apps) = value.get("apps").and_then(TomlValue::as_table) {
+        for (app_id, app) in apps {
+            if app_id == "_default" {
+                continue;
+            }
+            if let Ok(Some(path)) =
+                first_ignored_toml_value_path::<crate::types::AppConfig>(app.clone())
+            {
+                return Some([vec!["apps".to_string(), app_id.clone()], path].concat());
+            }
+            if let Some(tools) = app.get("tools").and_then(TomlValue::as_table) {
+                for (tool_name, tool) in tools {
+                    if let Ok(Some(path)) =
+                        first_ignored_toml_value_path::<crate::types::AppToolConfig>(tool.clone())
+                    {
+                        return Some(
+                            [
+                                vec![
+                                    "apps".to_string(),
+                                    app_id.clone(),
+                                    "tools".to_string(),
+                                    tool_name.clone(),
+                                ],
+                                path,
+                            ]
+                            .concat(),
+                        );
+                    }
+                }
+            }
+        }
+    }
+    if let Some(tui) = value.get("tui").and_then(TomlValue::as_table) {
+        // Tui serializes every fixed field, including flattened notifications
+        // and optional fields, so this stays aligned with its public contract.
+        let known = serde_json::to_value(crate::types::Tui::default()).ok()?;
+        let known = known.as_object()?;
+        if let Some(key) = tui.keys().find(|key| !known.contains_key(*key)) {
+            return Some(vec!["tui".to_string(), key.clone()]);
+        }
+    }
+    None
 }
 
 pub(crate) fn unknown_feature_toml_value_field(value: &TomlValue) -> Option<String> {

@@ -1094,7 +1094,6 @@ if ($null -eq $reservation) {
         automatic_resume = $false; working_directory = (Get-Location).Path
         invocation = @((Get-Process -Id $PID).Path, "-NoProfile", "-File", $PSCommandPath) + @($args)
         wait_option = "-WarmWaitSeconds"; pending_command = @($commandArgs)
-        next_action = "Keep required validation pending. Do not poll by relaunching, switch lanes, or start duplicate checks. Resume any already-live validation operation. Otherwise leave validation pending for a later explicit invocation; a short bounded wait is opt-in, not required. If that wait expires, report blocked validation rather than retrying or completing."
     }
     [Console]::Error.WriteLine(($status | ConvertTo-Json -Compress -Depth 4))
     exit 75
@@ -1188,7 +1187,6 @@ try {
         if (-not [string]::IsNullOrWhiteSpace($env:CARGO_HOME)) {
             Write-Output "CARGO_HOME=$env:CARGO_HOME"
         }
-        Write-Output "Core test example: just core-test-lane core_lib"
         Write-Output "Generic package example: just test-lane-package codex-exec"
         Write-Output "Check example: just check-lane codex-core"
         exit 0

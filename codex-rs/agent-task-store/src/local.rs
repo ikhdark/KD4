@@ -1,12 +1,15 @@
 #[cfg(test)]
-#[path = "audit151_tests.rs"]
-mod audit151_tests;
+#[path = "workspace_coordination_tests.rs"]
+mod workspace_coordination_tests;
 #[path = "wake_subscriptions.rs"]
 mod wake_subscriptions;
+#[path = "source_inspection.rs"]
+mod source_inspection;
 
 use chrono::Utc;
 use codex_state::StateRuntime;
 use futures::StreamExt;
+use futures::TryStreamExt;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use sha2::Digest;
@@ -62,7 +65,6 @@ use crate::MAX_BINDING_LIMIT;
 use crate::MAX_OBSERVATION_LIMIT;
 use crate::MAX_WAKE_EVENTS_PER_READ;
 use crate::MAX_WAKE_EVENTS_PER_ROOT;
-use crate::MissingEvidenceObligation;
 use crate::MutationEventId;
 use crate::NonproductiveRecovery;
 use crate::ObservationKind;
@@ -217,6 +219,60 @@ pub struct LocalAgentTaskStore {
     coordination_root: Arc<PathBuf>,
     wake_revision: Arc<watch::Sender<u64>>,
     durable_wake_poller: Arc<DurableWakePoller>,
+}
+
+/// Own bounded host evidence until it can share a receipt's transaction. No
+/// observation or durable wake is visible before that boundary. The session's
+/// pending terminal record retains crash recovery; Drop handles observer loss.
+pub struct DeferredHostCompletionWake {
+    store: LocalAgentTaskStore,
+    attempt_id: AttemptId,
+    pending: Option<(String, String)>,
+}
+
+impl DeferredHostCompletionWake {
+    pub async fn publish(&mut self) -> StoreResult<()> {
+        let Some((origin, summary)) = self.pending.as_ref() else {
+            return Ok(());
+        };
+        self.store
+            .record_host_completion_observation(self.attempt_id, origin.clone(), summary.clone())
+            .await?;
+        self.pending = None;
+        Ok(())
+    }
+
+    pub async fn seal_receipt(
+        &mut self,
+        receipt: ReceiptDraft,
+        host_legacy_outcome: bool,
+    ) -> StoreResult<AgentReceipt> {
+        let receipt = self.store.submit_agent_receipt_impl(
+            self.attempt_id, receipt, None, host_legacy_outcome, self.pending.clone(),
+        ).await?;
+        self.pending = None;
+        self.store.notify_wake_waiters();
+        Ok(receipt)
+    }
+}
+
+impl Drop for DeferredHostCompletionWake {
+    fn drop(&mut self) {
+        let Some((origin, summary)) = self.pending.take() else {
+            return;
+        };
+        let store = self.store.clone();
+        let attempt_id = self.attempt_id;
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move {
+                // The normal writer fences the exact attempt and deduplicates
+                // the origin, including a receipt commit racing cancellation.
+                if let Err(error) = store.record_host_completion_observation(attempt_id, origin, summary).await {
+                    tracing::warn!(%attempt_id, %error, "deferred host completion remains pending for terminal recovery");
+                }
+            });
+        }
+    }
 }
 
 pub type TaskStoreFuture<'a, T> = Pin<Box<dyn Future<Output = StoreResult<T>> + Send + 'a>>;
@@ -385,122 +441,6 @@ impl std::fmt::Debug for LocalAgentTaskStore {
 }
 
 impl LocalAgentTaskStore {
-    /// Bind new roots once, inherit children once, and never reset on resume.
-    pub async fn initialize_validation_task(
-        &self,
-        thread: &str,
-        parent: Option<&str>,
-        new_root: bool,
-    ) -> StoreResult<()> {
-        let inherited: Option<(String, String)> =
-            match parent {
-                Some(parent) => sqlx::query_as(
-                    "SELECT task_key, grant_id FROM validation_task_threads WHERE thread_id = ?",
-                )
-                .bind(parent)
-                .fetch_optional(&self.pool)
-                .await?,
-                None => None,
-            };
-        let (task, grant) = inherited
-            .clone()
-            .unwrap_or_else(|| (format!("legacy:{thread}"), "initial".into()));
-        let mut tx = self.pool.begin().await?;
-        sqlx::query("INSERT OR IGNORE INTO validation_task_threads VALUES (?, ?, ?)")
-            .bind(thread)
-            .bind(&task)
-            .bind(&grant)
-            .execute(&mut *tx)
-            .await?;
-        sqlx::query("INSERT OR IGNORE INTO validation_suite_grants (task_key, grant_id, state) VALUES (?, ?, ?)")
-            .bind(&task).bind(&grant).bind(if inherited.is_some() || new_root { "unused" } else { "uncertain" })
-            .execute(&mut *tx).await?;
-        tx.commit().await?;
-        Ok(())
-    }
-
-    pub async fn validation_task_scope(
-        &self,
-        thread: &str,
-    ) -> StoreResult<Option<(String, String)>> {
-        Ok(sqlx::query_as(
-            "SELECT task_key, grant_id FROM validation_task_threads WHERE thread_id = ?",
-        )
-        .bind(thread)
-        .fetch_optional(&self.pool)
-        .await?)
-    }
-
-    pub async fn inherit_validation_task_scope(
-        &self,
-        thread: &str,
-        task: &str,
-        grant: &str,
-    ) -> StoreResult<()> {
-        let inserted = sqlx::query("INSERT OR IGNORE INTO validation_task_threads SELECT ?, task_key, grant_id FROM validation_suite_grants WHERE task_key=? AND grant_id=?")
-            .bind(thread).bind(task).bind(grant).execute(&self.pool).await?.rows_affected();
-        if inserted == 0 && self.validation_task_scope(thread).await?.is_none() {
-            return Err(StoreError::CorruptData(
-                "captured validation task grant is missing".into(),
-            ));
-        }
-        Ok(())
-    }
-
-    /// Only accepted root-client metadata calls this; replaying an ID cannot reset it.
-    pub async fn accept_validation_task_grant(
-        &self,
-        thread: &str,
-        task: &str,
-        grant: &str,
-    ) -> StoreResult<()> {
-        let mut tx = self.pool.begin().await?;
-        sqlx::query("INSERT OR IGNORE INTO validation_suite_grants (task_key, grant_id, state) VALUES (?, ?, 'unused')")
-            .bind(task).bind(grant).execute(&mut *tx).await?;
-        sqlx::query("INSERT INTO validation_task_threads VALUES (?, ?, ?) ON CONFLICT(thread_id) DO UPDATE SET task_key=excluded.task_key, grant_id=excluded.grant_id")
-            .bind(thread).bind(task).bind(grant).execute(&mut *tx).await?;
-        tx.commit().await?;
-        Ok(())
-    }
-
-    pub async fn validation_suite_attempt(
-        &self,
-        task: &str,
-        grant: &str,
-    ) -> StoreResult<Option<(String, String)>> {
-        Ok(sqlx::query_as("SELECT attempt_id, acknowledgement_path FROM validation_suite_grants WHERE task_key=? AND grant_id=? AND attempt_id IS NOT NULL AND acknowledgement_path IS NOT NULL")
-            .bind(task).bind(grant).fetch_optional(&self.pool).await?)
-    }
-
-    pub async fn reserve_validation_suite(
-        &self,
-        task: &str,
-        grant: &str,
-        attempt: &str,
-        acknowledgement: &str,
-        refunded_attempt: Option<&str>,
-    ) -> StoreResult<bool> {
-        let mut tx = self.pool.begin().await?;
-        if let Some(previous) = refunded_attempt {
-            sqlx::query("UPDATE validation_suite_grants SET state='unused' WHERE task_key=? AND grant_id=? AND attempt_id=?")
-                .bind(task).bind(grant).bind(previous).execute(&mut *tx).await?;
-        }
-        let claimed = sqlx::query("UPDATE validation_suite_grants SET state='reserved', attempt_id=?, acknowledgement_path=? WHERE task_key=? AND grant_id=? AND state='unused'")
-            .bind(attempt).bind(acknowledgement).bind(task).bind(grant).execute(&mut *tx).await?.rows_affected() == 1;
-        tx.commit().await?;
-        Ok(claimed)
-    }
-
-    pub async fn start_validation_suite(
-        &self,
-        task: &str,
-        grant: &str,
-        attempt: &str,
-    ) -> StoreResult<bool> {
-        Ok(sqlx::query("UPDATE validation_suite_grants SET state='started' WHERE task_key=? AND grant_id=? AND attempt_id=? AND state='reserved'")
-            .bind(task).bind(grant).bind(attempt).execute(&self.pool).await?.rows_affected() == 1)
-    }
-
     pub async fn initialize(state_runtime: &StateRuntime) -> StoreResult<Self> {
         let coordination_root = state_runtime.codex_home().join(COORDINATION_DIR);
         tokio::fs::create_dir_all(&coordination_root).await?;
@@ -869,27 +809,16 @@ impl LocalAgentTaskStore {
             }
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         };
-        let mut transaction = self.pool.begin().await?;
-        lock_assignment_tx(&mut transaction, assignment_id).await?;
-        let mut assignment = load_assignment_tx(&mut transaction, assignment_id).await?;
-        validate_capsule_contract_tx(&mut transaction, &assignment, &capsule).await
-            .map_err(|error| StoreError::InvalidTaskCapsule(error.to_string()))?;
-        let attempt = load_current_attempt_tx(&mut transaction, assignment_id).await?;
-        if attempt.attempt_id != attempt_id || attempt.state != AttemptState::Active {
-            return Err(StoreError::AttemptNotActive(attempt_id));
-        }
-        if assignment.task_capsule.is_some() || tokio::fs::try_exists(&capsule_path).await? {
-            return Err(StoreError::TaskCapsuleAlreadyAttached(assignment_id));
-        }
         let staging_path = task_capsule_staging_path(&self.coordination_root, assignment_id);
         let staging_payload = canonical_payload.clone();
         let durable_payload = canonical_payload.clone();
+        let pool = self.pool.clone();
         #[cfg(test)]
         let publication_pause = TEST_SNAPSHOT_CAPTURE_PAUSE.try_with(Arc::clone).ok();
         // Reuse Assignment's existing immutable capsule slot as an independent
         // authoritative copy. The worker owns publication AND DB commit through
         // observer cancellation; the sidecar alone is not an attachment receipt.
-        tokio::task::spawn_blocking(move || -> StoreResult<()> {
+        tokio::task::spawn_blocking(move || -> StoreResult<Assignment> {
             let _capsule_lease = capsule_lease;
             if let Some(parent) = staging_path.parent() {
                 std::fs::create_dir_all(parent)?;
@@ -913,6 +842,30 @@ impl LocalAgentTaskStore {
                 return Err(error.into());
             }
             drop(file);
+            // Staging/fsync owns only the capsule lease. Acquire the shared
+            // database writer afterwards, then recheck all durable authority.
+            let authority = tokio::runtime::Handle::current().block_on(async {
+                let mut transaction = pool.begin().await?;
+                lock_assignment_tx(&mut transaction, assignment_id).await?;
+                let assignment = load_assignment_tx(&mut transaction, assignment_id).await?;
+                validate_capsule_contract_tx(&mut transaction, &assignment, &capsule).await
+                    .map_err(|error| StoreError::InvalidTaskCapsule(error.to_string()))?;
+                let attempt = load_current_attempt_tx(&mut transaction, assignment_id).await?;
+                if attempt.attempt_id != attempt_id || attempt.state != AttemptState::Active {
+                    return Err(StoreError::AttemptNotActive(attempt_id));
+                }
+                if assignment.task_capsule.is_some() || capsule_path.try_exists()? {
+                    return Err(StoreError::TaskCapsuleAlreadyAttached(assignment_id));
+                }
+                Ok::<_, StoreError>((assignment, transaction))
+            });
+            let (mut assignment, mut transaction) = match authority {
+                Ok(authority) => authority,
+                Err(error) => {
+                    let _ = std::fs::remove_file(&writing_path);
+                    return Err(error);
+                }
+            };
             std::fs::rename(&writing_path, &staging_path)?;
             #[cfg(test)]
             if let Some(pause) = publication_pause {
@@ -932,13 +885,13 @@ impl LocalAgentTaskStore {
                     .bind(durable_payload).bind(assignment_id.to_string())
                     .execute(&mut *transaction).await?;
                 transaction.commit().await?;
-                Ok(())
-            })
+                Ok::<_, StoreError>(())
+            })?;
+            assignment.task_capsule = Some(canonical_payload);
+            Ok(assignment)
         })
         .await
-        .map_err(std::io::Error::other)??;
-        assignment.task_capsule = Some(canonical_payload.clone());
-        Ok(assignment)
+        .map_err(std::io::Error::other)?
     }
 
     async fn get_agent_task_impl(
@@ -1105,7 +1058,7 @@ impl LocalAgentTaskStore {
             .collect::<Vec<_>>();
         let mut next_required_action = (assignment.admission_origin
             == crate::AssignmentAdmissionOrigin::Typed
-            && !pending_gates.is_empty())
+            && pending_gates.iter().any(|kind| !kind.is_waivable()))
         .then(|| "resolve pending gates before completion".to_string());
         if assignment.integration_plan == IntegrationPlan::TypedIntegratorRequired {
             next_required_action = Some("required destination-bound integration evidence is unavailable; isolated completion is not integration".into());
@@ -1114,20 +1067,17 @@ impl LocalAgentTaskStore {
             "SELECT body_json FROM dependency_admissions WHERE assignment_id = ? ORDER BY dependency_id",
         ).bind(assignment_id.to_string()).fetch_all(&mut *transaction).await?
             .into_iter().map(|body| decode(&body)).collect::<StoreResult<Vec<crate::DependencyAdmission>>>()?;
-        let criterion_assessments = if let Some(receipt) = &receipt {
-            assess_criteria_tx(
-                &mut transaction,
-                &assignment,
-                current_attempt.amendment.as_ref(),
-                receipt.attempt_id,
-                &receipt.criterion_results,
-                &receipt.validation_call_ids,
-                &validation_calls,
-            )
-            .await?
-        } else {
-            Vec::new()
-        };
+        let criterion_assessments = source_inspection::assess_with_calls_tx(
+            &mut transaction, &assignment, &current_attempt,
+            receipt.as_ref().map_or(&[], |receipt| receipt.criterion_results.as_slice()),
+            receipt.as_ref().map_or(&[], |receipt| receipt.validation_call_ids.as_slice()), false,
+            &validation_calls,
+        ).await?;
+        if receipt.as_ref().is_some_and(|receipt| receipt.status.is_success())
+            && criterion_assessments.iter().any(|assessment| !assessment.satisfied)
+        {
+            next_required_action = Some("source-inspection evidence is no longer applicable; recover the criterion assessment before consuming this result".into());
+        }
         transaction.commit().await?;
         hydrate_task_capsule(&self.pool, &self.coordination_root, &mut assignment).await?;
         Ok(AgentTask {
@@ -1509,7 +1459,15 @@ LIMIT 1
         Ok(observation)
     }
 
-    async fn record_validation_call_impl(&self, mut call: ValidationCall) -> StoreResult<()> {
+    async fn record_validation_call_impl(&self, call: ValidationCall) -> StoreResult<()> {
+        self.record_validation_call_transaction(call, false).await
+    }
+
+    async fn record_validation_call_transaction(
+        &self,
+        mut call: ValidationCall,
+        completed_inspection: bool,
+    ) -> StoreResult<()> {
         if call.call_id.trim().is_empty() {
             return Err(StoreError::InvalidAssignment(
                 "validation call id cannot be empty".to_string(),
@@ -1547,6 +1505,12 @@ LIMIT 1
                     "validation call {} has inconsistent persisted identity or status",
                     call.call_id
                 )));
+            }
+            if completed_inspection {
+                call.recorded_at = existing.recorded_at;
+                call.evidence.start_epoch = existing.evidence.start_epoch;
+                call.evidence.end_epoch = existing.evidence.end_epoch;
+                call.evidence.lease_expires_at = existing.evidence.lease_expires_at;
             }
             if existing == call {
                 transaction.commit().await?;
@@ -1587,7 +1551,7 @@ LIMIT 1
             if !attempt_is_active {
                 return Err(StoreError::AttemptNotActive(call.attempt_id));
             }
-            if call.status != crate::ValidationCallStatus::Running {
+            if call.status != crate::ValidationCallStatus::Running && !completed_inspection {
                 return Err(StoreError::ValidationCallImmutable(call.call_id));
             }
             let assignment = load_assignment_tx(&mut transaction, attempt.assignment_id).await?;
@@ -1611,8 +1575,8 @@ LIMIT 1
                 )));
             }
             call.evidence.start_epoch = 0;
-            call.evidence.end_epoch = None;
-            call.evidence.lease_expires_at = Some(
+            call.evidence.end_epoch = completed_inspection.then_some(0);
+            call.evidence.lease_expires_at = (!completed_inspection).then(||
                 comparison_now() + chrono::Duration::seconds(crate::MAX_VALIDATION_LEASE_SECONDS),
             );
             sqlx::query("INSERT INTO validation_calls (call_id, attempt_id, body_json, status, recorded_at) VALUES (?, ?, ?, ?, ?)")
@@ -1732,9 +1696,13 @@ LIMIT 1
         &self,
         attempt_id: AttemptId,
         mut draft: ReceiptDraft,
-        review_reason: Option<String>,
+        _review_reason: Option<String>,
         host_legacy_outcome: bool,
+        host_completion: Option<(String, String)>,
     ) -> StoreResult<AgentReceipt> {
+        if let Some((origin, summary)) = &host_completion {
+            validate_host_completion_observation(origin, summary, None)?;
+        }
         if draft.summary.trim().is_empty() {
             return Err(StoreError::InvalidAssignment(
                 "receipt summary cannot be empty".to_string(),
@@ -1796,142 +1764,14 @@ LIMIT 1
                 .collect();
         } else {
             validate_criterion_results(&assignment, attempt.amendment.as_ref(), &draft)?;
-        }
-        let mut invalid_calls = Vec::new();
-        let mut invalid_statuses = Vec::new();
-        let mut seen_calls = HashSet::new();
-        let mut validation_summaries = HashSet::new();
-        let mut successful_calls = std::collections::HashMap::new();
-        let mut observed_calls = Vec::new();
-        for call_id in &draft.validation_call_ids {
-            if !seen_calls.insert(call_id.as_str()) {
-                invalid_calls.push(call_id.clone());
-                continue;
-            }
-            let call_row = sqlx::query(
-                "SELECT attempt_id, body_json, status FROM validation_calls WHERE call_id = ?",
-            )
-            .bind(call_id)
-            .fetch_optional(&mut *transaction)
-            .await?;
-            let Some(call_row) = call_row else {
-                invalid_calls.push(call_id.clone());
-                continue;
-            };
-            if call_row.get::<String, _>("attempt_id") != attempt_id.to_string() {
-                invalid_calls.push(call_id.clone());
-                continue;
-            }
-            let call: ValidationCall = decode(call_row.get::<String, _>("body_json").as_str())?;
-            let stored_status: crate::ValidationCallStatus =
-                decode(call_row.get::<String, _>("status").as_str())?;
-            if call.attempt_id != attempt_id || call.status != stored_status {
-                return Err(StoreError::CorruptData(format!(
-                    "validation call {call_id} has inconsistent persisted identity or status"
-                )));
-            }
-            let completion_proof = validation_call_has_successful_result(&call);
-            if !call.status.is_terminal()
-                || draft.status == AgentStatusClaim::Completed && !completion_proof
-            {
-                invalid_statuses.push(call_id.clone());
-            }
-            if completion_proof {
-                validation_summaries.insert(call.command_summary.clone());
-                if let Some(end_epoch) = call.evidence.end_epoch {
-                    successful_calls
-                        .insert(call_id.as_str(), (end_epoch, call.verified_evidence_kind()));
-                }
-            }
-            observed_calls.push(call);
-        }
-        if !invalid_calls.is_empty() {
-            return Err(StoreError::ValidationCallOwnership {
-                call_ids: invalid_calls,
-            });
-        }
-        if !invalid_statuses.is_empty() {
-            return Err(StoreError::ValidationCallStatusInvalid {
-                call_ids: invalid_statuses,
-            });
-        }
-        for result in &draft.criterion_results {
-            if let Some(reference) = &result.evidence_ref
-                && (result.status != crate::CriterionStatus::Passed
-                    || reference.workspace_id != assignment.workspace_id
-                    || successful_calls.get(reference.call_id.as_str())
-                        != Some(&(reference.evidence_epoch, Some(reference.kind))))
-            {
-                return Err(StoreError::CriterionResultsInvalid(format!(
-                    "criterion {} must reference its workspace and an owned successful validation in this receipt at the recorded epoch",
-                    result.criterion_id
-                )));
-            }
-        }
-        let running_call_ids = sqlx::query_scalar::<_, String>(
-            "SELECT call_id FROM validation_calls WHERE attempt_id = ? AND status = ? ORDER BY call_id",
-        )
-        .bind(attempt_id.to_string())
-        .bind(encode(&crate::ValidationCallStatus::Running)?)
-        .fetch_all(&mut *transaction)
-        .await?;
-        if !running_call_ids.is_empty() {
-            return Err(StoreError::ValidationCallStatusInvalid {
-                call_ids: running_call_ids,
-            });
+            let assessments = source_inspection::assess_tx(
+                &mut transaction, &assignment, &attempt, &draft.criterion_results,
+                &draft.validation_call_ids, false,
+            ).await?;
+            source_inspection::require_passed(&assessments, &draft.criterion_results, draft.status)?;
         }
         if draft.status == AgentStatusClaim::Completed && !host_legacy_outcome {
-            let assessments = assess_criteria_tx(
-                &mut transaction,
-                &assignment,
-                attempt.amendment.as_ref(),
-                attempt_id,
-                &draft.criterion_results,
-                &draft.validation_call_ids,
-                &observed_calls,
-            )
-            .await?;
-            for assessment in assessments
-                .iter()
-                .filter(|assessment| !assessment.satisfied)
-            {
-                // Legacy claims may finish their lifecycle but never become
-                // proved obligations or ordinary dependency authorization.
-                if effective_criteria(&assignment, attempt.amendment.as_ref())
-                    .iter()
-                    .any(|criterion| {
-                        criterion.id == assessment.criterion_id
-                            && criterion.evidence_policy.is_some()
-                    })
-                {
-                    return Err(StoreError::CriterionResultsInvalid(format!(
-                        "{}: {}",
-                        assessment.criterion_id, assessment.reason
-                    )));
-                }
-            }
-            let missing_obligations =
-                missing_evidence_obligations(&assignment, &validation_summaries);
-            if !missing_obligations.is_empty() {
-                return Err(StoreError::RequiredEvidenceMissing {
-                    obligations: missing_obligations,
-                });
-            }
             validate_declared_changes_tx(&mut transaction, &assignment, &mut draft).await?;
-        }
-        if let Some(review_reason) = review_reason.as_deref() {
-            if draft.status != AgentStatusClaim::Completed {
-                return Err(StoreError::InvalidAssignment(
-                    "cold review may be required only for a completed receipt".to_string(),
-                ));
-            }
-            insert_risk_review_gates_tx(
-                &mut transaction,
-                attempt.assignment_id,
-                attempt_id,
-                review_reason,
-            )
-            .await?;
         }
         let evidence_epoch = 0;
         let architecture_contract = seal_architecture_contract_for_receipt_tx(
@@ -1985,6 +1825,11 @@ LIMIT 1
         {
             finish_task_actor(&mut transaction, attempt.assignment_id).await?;
         }
+        if let Some((origin, summary)) = host_completion {
+            append_host_completion_tx(
+                &mut transaction, &assignment, attempt_id, origin, summary, None,
+            ).await?;
+        }
         append_observation_tx(
             &mut transaction,
             &assignment,
@@ -2007,11 +1852,11 @@ LIMIT 1
         host_legacy_followup: bool,
     ) -> StoreResult<(Attempt, Option<AgentTaskBinding>)> {
         actor.require_root()?;
-        amendment.validate()?;
         let mut transaction = self.pool.begin().await?;
         lock_assignment_tx(&mut transaction, assignment_id).await?;
         let assignment = load_assignment_tx(&mut transaction, assignment_id).await?;
         actor.require_root_for(&assignment.root_session_id)?;
+        amendment.validate_for_assignment(&assignment)?;
         if host_legacy_followup
             && (!matches!(
                 assignment.admission_origin,
@@ -2022,13 +1867,11 @@ LIMIT 1
                 "host follow-up attempts require a shared plain-message assignment".to_string(),
             ));
         }
-        if assignment.role != AgentRole::Worker {
+        if assignment.role != AgentRole::Worker
+            && !(host_legacy_followup && assignment.role == AgentRole::Explorer)
+        {
             return Err(StoreError::WorkerCorrectionRequired(assignment_id));
         }
-        crate::model::validate_criterion_bindings(
-            assignment.effective_criteria(Some(&amendment)),
-            &assignment.required_evidence,
-        )?;
         let current = load_current_attempt_tx(&mut transaction, assignment_id).await?;
         if !host_legacy_followup && current.ordinal != 0 {
             return Err(StoreError::AmendmentLimitReached(assignment_id));
@@ -2270,18 +2113,6 @@ LIMIT 1
         if attempt.attempt_id != expected_attempt_id {
             return Err(StoreError::AttemptNotActive(expected_attempt_id));
         }
-        let verification_proof = if kind == GateKind::Verification && status == GateStatus::Passed {
-            if let TaskActor::Attempt(evaluator) = actor {
-                Some((
-                    evaluator,
-                    verification_proof_tx(&mut transaction, evaluator).await?,
-                ))
-            } else {
-                None // Explicit, reasoned root override.
-            }
-        } else {
-            None
-        };
         if let Some(existing_json) = sqlx::query_scalar::<_, String>(
             "SELECT body_json FROM gates WHERE assignment_id = ? AND kind = ?",
         )
@@ -2303,6 +2134,20 @@ LIMIT 1
                 // An authorized current verdict can replace a historical gate,
                 // but immutable current-attempt history cannot be rewritten.
             }
+        }
+        if kind == GateKind::Verification && status == GateStatus::Passed
+            && let TaskActor::Attempt(actor_attempt_id) = &actor
+        {
+            let actor_attempt = load_attempt_tx(&mut transaction, *actor_attempt_id).await?;
+            let actor_assignment = load_assignment_tx(&mut transaction, actor_attempt.assignment_id).await?;
+            let actor_receipt = load_receipt_tx(&mut transaction, &actor_attempt).await?.map(|(receipt, _)| receipt);
+            let assessments = source_inspection::assess_tx(
+                &mut transaction, &actor_assignment, &actor_attempt,
+                actor_receipt.as_ref().map_or(&[], |receipt| receipt.criterion_results.as_slice()),
+                actor_receipt.as_ref().map_or(&[], |receipt| receipt.validation_call_ids.as_slice()),
+                actor_receipt.is_none(),
+            ).await?;
+            source_inspection::require_passed(&assessments, &[], AgentStatusClaim::Completed)?;
         }
         let now = Utc::now();
         let evidence_epoch = 0;
@@ -2327,21 +2172,6 @@ LIMIT 1
             .await?;
         if gate.status.is_sealed() {
             record_gate_verdict_tx(&mut transaction, attempt.attempt_id, &gate).await?;
-            if let Some((evaluator, calls)) = verification_proof {
-                sqlx::query("INSERT INTO verification_proofs (target_attempt_id, evaluator_attempt_id, validation_call_ids_json) VALUES (?, ?, ?)")
-                    .bind(attempt.attempt_id.to_string())
-                    .bind(evaluator.to_string())
-                    .bind(encode(&calls)?)
-                    .execute(&mut *transaction)
-                    .await?;
-            }
-        }
-        let needs_main = gate_requires_main_intervention(&attempt, kind, status);
-        if needs_main {
-            transition_attempt_to_needs_main_tx(&mut transaction, &attempt).await?;
-        }
-        if kind == GateKind::Review && status == GateStatus::Passed {
-            ensure_pending_verification_for_risk_review_tx(&mut transaction, assignment_id).await?;
         }
         finish_successful_task_if_unblocked_tx(&mut transaction, assignment_id).await?;
         append_observation_tx(
@@ -2353,18 +2183,6 @@ LIMIT 1
             None,
         )
         .await?;
-        if needs_main {
-            append_observation_tx(
-                &mut transaction,
-                &assignment,
-                attempt.attempt_id,
-                ObservationKind::NeedsMain,
-                "review or verification could not be resolved within the bounded workflow"
-                    .to_string(),
-                None,
-            )
-            .await?;
-        }
 
         transaction.commit().await?;
         Ok(gate)
@@ -2393,20 +2211,21 @@ LIMIT 1
         let assignment = load_assignment_tx(&mut transaction, assignment_id).await?;
         actor.require_root_for(&assignment.root_session_id)?;
         let attempt = load_current_attempt_tx(&mut transaction, assignment_id).await?;
-        if let Some(existing_json) = sqlx::query_scalar::<_, String>(
+        let existing_json = sqlx::query_scalar::<_, String>(
             "SELECT body_json FROM gates WHERE assignment_id = ? AND kind = ?",
         )
         .bind(assignment_id.to_string())
         .bind(encode(&kind)?)
         .fetch_optional(&mut *transaction)
         .await?
-        {
-            let existing: AgentGate = decode(&existing_json)?;
-            if existing.status.is_sealed() {
-                return Err(StoreError::GateAlreadySealed {
-                    gate: kind.to_string(),
-                });
-            }
+        .ok_or_else(|| StoreError::GateNotPending {
+            gate: kind.to_string(),
+        })?;
+        let existing: AgentGate = decode(&existing_json)?;
+        if existing.status != GateStatus::Pending {
+            return Err(StoreError::GateAlreadySealed {
+                gate: kind.to_string(),
+            });
         }
         let now = Utc::now();
         let evidence_epoch = 0;
@@ -2430,9 +2249,6 @@ LIMIT 1
             .execute(&mut *transaction)
             .await?;
         record_gate_verdict_tx(&mut transaction, attempt.attempt_id, &gate).await?;
-        if kind == GateKind::Review {
-            ensure_pending_verification_for_risk_review_tx(&mut transaction, assignment_id).await?;
-        }
         finish_successful_task_if_unblocked_tx(&mut transaction, assignment_id).await?;
         append_observation_tx(
             &mut transaction,
@@ -3013,7 +2829,7 @@ LIMIT 1
             let mut invalid_payload = false;
             let result: StoreResult<()> = async {
                 #[cfg(test)]
-                if let Ok(pause) = audit151_tests::CAPSULE_READ_PAUSE.try_with(Arc::clone) {
+                if let Ok(pause) = workspace_coordination_tests::CAPSULE_READ_PAUSE.try_with(Arc::clone) {
                     pause.started.add_permits(1);
                     pause.release.acquire().await.expect("capsule read pause open").forget();
                 }
@@ -3215,9 +3031,9 @@ LIMIT 1
         if mismatch != 0 {
             return Ok(false);
         }
-        let rows = sqlx::query("SELECT o.body_json, o.assignment_id, o.attempt_id, o.wake_event_id, w.body_json AS cached_body FROM observations o JOIN wake_events w ON w.root_session_id = o.root_session_id AND w.wake_sequence = o.wake_sequence")
-            .fetch_all(&self.pool).await?;
-        for row in rows {
+        let mut rows = sqlx::query("SELECT o.body_json, o.assignment_id, o.attempt_id, o.wake_event_id, w.body_json AS cached_body FROM observations o JOIN wake_events w ON w.root_session_id = o.root_session_id AND w.wake_sequence = o.wake_sequence")
+            .fetch(&self.pool);
+        while let Some(row) = rows.try_next().await? {
             // Undecodable authority cannot validate its cache. Its root's reads
             // decode the same row and fail closed; other roots stay available.
             let expected = match wake_event_from_observation_row(&row) {
@@ -3237,6 +3053,8 @@ LIMIT 1
                 return Ok(false);
             }
         }
+        // Release the stream's connection before the caller can rebuild the cache.
+        drop(rows);
         Ok(true)
     }
 
@@ -3265,12 +3083,19 @@ LIMIT 1
             let mut latest_event_id = None;
             for row in rows {
                 let wake_sequence = row.get::<i64, _>("wake_sequence");
-                let event = wake_event_from_observation_row(&row)?;
                 if latest_event_id.is_none() {
                     retained_from = wake_sequence;
                 }
-                latest_event_id = Some(event.event_id);
+                latest_event_id = Some(row.get::<String, _>("wake_event_id"));
                 next_sequence = wake_sequence + 1;
+                let event = match wake_event_from_observation_row(&row) {
+                    Ok(event) => event,
+                    Err(error) => {
+                        tracing::warn!(root_session_id = %root, %error,
+                            "retaining corrupt wake authority while rebuilding healthy roots");
+                        continue;
+                    }
+                };
                 sqlx::query("INSERT INTO wake_events (root_session_id, wake_sequence, event_id, assignment_id, attempt_id, reason, body_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)")
                     .bind(&root)
                     .bind(wake_sequence)
@@ -3287,7 +3112,7 @@ LIMIT 1
                 .bind(root)
                 .bind(next_sequence)
                 .bind(retained_from)
-                .bind(latest_event_id.map(|id| id.to_string()))
+                .bind(latest_event_id)
                 .execute(&mut *transaction)
                 .await?;
         }
@@ -3421,18 +3246,26 @@ impl LocalAgentTaskStore {
         let prior_binding = sqlx::query_scalar::<_, String>(
             "SELECT binding_json FROM pending_terminal_outcomes WHERE attempt_id = ? LIMIT 1",
         ).bind(binding.attempt_id.to_string()).fetch_optional(&mut *tx).await?;
-        if prior_binding.as_ref().is_some_and(|prior| prior != &encoded) {
-            return Err(StoreError::CorruptData("terminal outcome binding changed across turns".into()));
+        if let Some(prior) = prior_binding {
+            let mut prior: AgentTaskBinding = decode(&prior)?;
+            prior.updated_at = binding.updated_at;
+            prior.bound_at = binding.bound_at;
+            if prior != binding {
+                return Err(StoreError::CorruptData("terminal outcome binding changed across turns".into()));
+            }
         }
-        if existing
-            .as_ref()
-            .is_some_and(|existing| existing.get::<String, _>("binding_json") != encoded
+        if let Some(existing) = existing {
+            let mut prior: AgentTaskBinding = decode(&existing.get::<String, _>("binding_json"))?;
+            prior.updated_at = binding.updated_at;
+            prior.bound_at = binding.bound_at;
+            if prior != binding
                 || existing.get::<String, _>("status_json") != status_json
-                || existing.get::<String, _>("event_json") != event_json)
-        {
-            return Err(StoreError::CorruptData(
-                "terminal outcome identity has a conflicting binding or payload".into(),
-            ));
+                || existing.get::<String, _>("event_json") != event_json
+            {
+                return Err(StoreError::CorruptData(
+                    "terminal outcome identity has a conflicting binding or payload".into(),
+                ));
+            }
         }
         sqlx::query("INSERT INTO pending_terminal_outcomes (attempt_id, assignment_id, binding_json, turn_id, status_json, event_json) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(attempt_id, turn_id) DO NOTHING")
             .bind(binding.attempt_id.to_string()).bind(binding.assignment_id.to_string())
@@ -3679,24 +3512,32 @@ impl LocalAgentTaskStore {
         summary: String,
         stop_cause: Option<String>,
     ) -> TaskStoreFuture<'_, ()> {
+        self.record_host_completion_impl(attempt_id, origin, summary, stop_cause)
+    }
+
+    pub fn record_host_completion_deferred(
+        &self,
+        attempt_id: AttemptId,
+        origin: String,
+        summary: String,
+    ) -> TaskStoreFuture<'_, DeferredHostCompletionWake> {
         Box::pin(async move {
-            if stop_cause
-                .as_ref()
-                .is_some_and(|cause| cause.is_empty() || cause.len() > 128)
-            {
-                return Err(StoreError::InvalidAssignment(
-                    "invalid bounded execution stop cause".into(),
-                ));
-            }
-            if origin.is_empty()
-                || origin.len() > 256
-                || summary.is_empty()
-                || summary.len() > 64 * 1024
-            {
-                return Err(StoreError::InvalidAssignment(
-                    "invalid bounded host completion observation".into(),
-                ));
-            }
+            validate_host_completion_observation(&origin, &summary, None)?;
+            Ok(DeferredHostCompletionWake {
+                store: self.clone(), attempt_id, pending: Some((origin, summary)),
+            })
+        })
+    }
+
+    fn record_host_completion_impl(
+        &self,
+        attempt_id: AttemptId,
+        origin: String,
+        summary: String,
+        stop_cause: Option<String>,
+    ) -> TaskStoreFuture<'_, ()> {
+        Box::pin(async move {
+            validate_host_completion_observation(&origin, &summary, stop_cause.as_deref())?;
             let mut transaction = self.pool.begin().await?;
             lock_attempt_tx(&mut transaction, attempt_id).await?;
             let attempt = load_attempt_tx(&mut transaction, attempt_id).await?;
@@ -3707,24 +3548,10 @@ impl LocalAgentTaskStore {
             {
                 return Err(StoreError::AttemptNotActive(attempt_id));
             }
-            let existing = sqlx::query_scalar::<_, String>(
-                "SELECT body_json FROM observations WHERE attempt_id = ? AND kind = ? AND json_extract(body_json, '$.call_id') = ? LIMIT 1")
-                .bind(attempt_id.to_string()).bind(encode(&ObservationKind::HostCompletion)?).bind(&origin)
-                .fetch_optional(&mut *transaction).await?;
-            if existing.is_none() {
-                let assignment =
-                    load_assignment_tx(&mut transaction, attempt.assignment_id).await?;
-                append_observation_with_stop_cause_tx(
-                    &mut transaction,
-                    &assignment,
-                    attempt_id,
-                    ObservationKind::HostCompletion,
-                    summary,
-                    Some(origin),
-                    stop_cause,
-                )
-                .await?;
-            }
+            let assignment = load_assignment_tx(&mut transaction, attempt.assignment_id).await?;
+            append_host_completion_tx(
+                &mut transaction, &assignment, attempt_id, origin, summary, stop_cause,
+            ).await?;
             transaction.commit().await?;
             self.notify_wake_waiters();
             Ok(())
@@ -3816,7 +3643,7 @@ impl LocalAgentTaskStore {
                 source_sha256,
                 bytes,
             };
-            let mut call = ValidationCall {
+            let call = ValidationCall {
                 call_id: call_id.clone(),
                 attempt_id: start.attempt_id,
                 command_summary: format!("inspect:{}", start.path),
@@ -3827,13 +3654,12 @@ impl LocalAgentTaskStore {
                     ),
                     ..Default::default()
                 },
-                status: ValidationCallStatus::Running,
+                status: ValidationCallStatus::Succeeded,
                 recorded_at: Utc::now(),
             };
-            self.record_validation_call(call.clone()).await?;
-            call.status = ValidationCallStatus::Succeeded;
-            call.recorded_at = Utc::now();
-            self.record_validation_call(call).await?;
+            // The read already completed. Publish its result atomically; a
+            // cancelled publisher must never leave a durable Running row.
+            self.record_validation_call_transaction(call, true).await?;
             let recorded = self
                 .get_validation_call(call_id.clone())
                 .await?
@@ -3879,7 +3705,7 @@ impl LocalAgentTaskStore {
     ) -> TaskStoreFuture<'_, AgentReceipt> {
         Box::pin(async move {
             let result = self
-                .submit_agent_receipt_impl(attempt_id, receipt, None, false)
+                .submit_agent_receipt_impl(attempt_id, receipt, None, false, None)
                 .await;
             if result.is_ok() {
                 self.notify_wake_waiters();
@@ -3909,7 +3735,7 @@ impl LocalAgentTaskStore {
                 architecture_contract: None,
             };
             let result = self
-                .submit_agent_receipt_impl(attempt_id, receipt, None, true)
+                .submit_agent_receipt_impl(attempt_id, receipt, None, true, None)
                 .await;
             if result.is_ok() {
                 self.notify_wake_waiters();
@@ -3926,7 +3752,7 @@ impl LocalAgentTaskStore {
     ) -> TaskStoreFuture<'_, AgentReceipt> {
         Box::pin(async move {
             let result = self
-                .submit_agent_receipt_impl(attempt_id, receipt, Some(review_reason), false)
+                .submit_agent_receipt_impl(attempt_id, receipt, Some(review_reason), false, None)
                 .await;
             if result.is_ok() {
                 self.notify_wake_waiters();
@@ -4331,6 +4157,7 @@ fn is_normalized_repository_relative_scope(path: &str) -> bool {
         return true;
     }
     if path.is_empty()
+        || path.contains('\0')
         || path.trim() != path
         || path.contains('\\')
         || path.starts_with('/')
@@ -4693,7 +4520,11 @@ async fn load_receipt_tx(
             }
             state_matches |= gate_sealed_at >= sealed_at
                 && gate.status.is_sealed()
-                && gate_requires_main_intervention(attempt, gate.kind, gate.status);
+                && (matches!((gate.kind, gate.status),
+                    (GateKind::Review, GateStatus::Failed)
+                    | (GateKind::Verification, GateStatus::Failed | GateStatus::ChangesRequested))
+                    || gate.kind == GateKind::Review
+                        && gate.status == GateStatus::ChangesRequested && attempt.ordinal > 0);
         }
     }
     if row.get::<String, _>("attempt_id") != attempt.attempt_id.to_string()
@@ -4849,75 +4680,6 @@ async fn dependency_reaches_tx(
     Ok(false)
 }
 
-async fn assess_criteria_tx(
-    transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
-    assignment: &Assignment,
-    amendment: Option<&AttemptAmendment>,
-    attempt_id: AttemptId,
-    results: &[crate::CriterionResult],
-    listed_calls: &[String],
-    calls: &[ValidationCall],
-) -> StoreResult<Vec<crate::CriterionAssessment>> {
-    let mut current_sources = std::collections::HashMap::new();
-    let paths = assignment
-        .effective_criteria(amendment)
-        .iter()
-        .filter_map(|criterion| {
-            let policy = criterion.evidence_policy.as_ref()?;
-            if policy.kind != crate::CriterionEvidenceRequirement::SourceInspection
-                || policy.freshness != crate::EvidenceFreshness::Current
-            {
-                return None;
-            }
-            policy
-                .required_evidence
-                .as_deref()?
-                .strip_prefix("inspect:")
-                .map(str::to_owned)
-        })
-        .collect::<BTreeSet<_>>();
-    if !paths.is_empty() {
-        let root = sqlx::query_scalar::<_, String>(
-            "SELECT canonical_root FROM assignment_repositories WHERE assignment_id = ?",
-        )
-        .bind(assignment.assignment_id.to_string())
-        .fetch_optional(&mut **transaction)
-        .await?;
-        if let Some(root) = root {
-            // Bounded local acquisition only. Slow/inaccessible storage yields
-            // unknown, never a pass, and cannot indefinitely hold the DB writer.
-            let observed = tokio::time::timeout(std::time::Duration::from_secs(2), async {
-                let hashes = std::collections::HashMap::new();
-                let Ok(identity) = repository_identity_async(Path::new(&root)).await else {
-                    return hashes;
-                };
-                if identity.id != assignment.repository_id
-                    || identity.workspace_id != assignment.workspace_id
-                {
-                    return hashes;
-                }
-                let root = Path::new(&root);
-                collect_current_source_hashes(&paths, |path| async move {
-                    read_current_source_hash(root, &path).await
-                })
-                .await
-            })
-            .await;
-            if let Ok(hashes) = observed {
-                current_sources = hashes;
-            }
-        }
-    }
-    Ok(crate::proof::assess_criteria(
-        assignment,
-        amendment,
-        attempt_id,
-        results,
-        listed_calls,
-        calls,
-        &current_sources,
-    ))
-}
 
 async fn validate_dependencies_tx(
     transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
@@ -5005,40 +4767,16 @@ async fn validate_dependencies_tx(
             });
             continue;
         }
-        // A review/verification relation intentionally consumes a claim to
-        // evaluate it. Ordinary dependencies require satisfied obligations.
-        if allowed_pending_gate.is_none_or(|(target, _)| target != *dependency) {
-            let attempt = load_attempt_tx(transaction, receipt.attempt_id).await?;
-            let calls = sqlx::query_scalar::<_, String>(
-                "SELECT body_json FROM validation_calls WHERE attempt_id = ?",
-            )
-            .bind(receipt.attempt_id.to_string())
-            .fetch_all(&mut **transaction)
-            .await?
-            .into_iter()
-            .map(|body| decode(&body))
-            .collect::<StoreResult<Vec<ValidationCall>>>()?;
-            let assessments = assess_criteria_tx(
-                transaction,
-                &dependency_assignment,
-                attempt.amendment.as_ref(),
-                receipt.attempt_id,
-                &receipt.criterion_results,
-                &receipt.validation_call_ids,
-                &calls,
-            )
-            .await?;
-            if let Some(unverified) = assessments.iter().find(|assessment| !assessment.satisfied) {
-                blockers.push(DependencyBlocker {
-                    assignment_id: *dependency,
-                    state: DependencyState::Incomplete,
-                    detail: format!(
-                        "dependency criterion {} is unverified: {}",
-                        unverified.criterion_id, unverified.reason
-                    ),
-                });
-                continue;
-            }
+        let assessments = source_inspection::assess_tx(
+            transaction, &dependency_assignment, &dependency_attempt,
+            &receipt.criterion_results, &receipt.validation_call_ids, false,
+        ).await?;
+        if let Some(assessment) = assessments.iter().find(|assessment| !assessment.satisfied) {
+            blockers.push(DependencyBlocker {
+                assignment_id: *dependency, state: DependencyState::Blocked,
+                detail: format!("{}: {}", assessment.criterion_id, assessment.reason),
+            });
+            continue;
         }
         let gate_rows =
             sqlx::query("SELECT body_json FROM gates WHERE assignment_id = ? ORDER BY kind")
@@ -5054,10 +4792,10 @@ async fn validate_dependencies_tx(
                     "gate identity does not match dependency {dependency}"
                 )));
             }
-            let allowed_for_relation = gate.status == GateStatus::Pending
-                && allowed_pending_gate == Some((*dependency, gate.kind));
-            if !allowed_for_relation
-                && !matches!(gate.status, GateStatus::Passed | GateStatus::Waived)
+            if matches!(gate.kind, GateKind::Review | GateKind::Verification) {
+                continue;
+            }
+            if !matches!(gate.status, GateStatus::Passed | GateStatus::Waived)
             {
                 blocking_gates.push((gate.kind, gate.status));
             }
@@ -5394,82 +5132,6 @@ async fn require_gate_actor_tx(
     Ok(())
 }
 
-async fn verification_proof_tx(
-    transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
-    evaluator: AttemptId,
-) -> StoreResult<Vec<String>> {
-    let attempt = require_active_current_attempt_tx(transaction, evaluator).await?;
-    let assignment = load_assignment_tx(transaction, attempt.assignment_id).await?;
-    let rows =
-        sqlx::query("SELECT body_json FROM validation_calls WHERE attempt_id = ? ORDER BY call_id")
-            .bind(evaluator.to_string())
-            .fetch_all(&mut **transaction)
-            .await?;
-    let mut summaries = HashSet::new();
-    let mut calls = Vec::new();
-    for row in rows {
-        let call: ValidationCall = decode(row.get::<String, _>("body_json").as_str())?;
-        if call.attempt_id != evaluator {
-            return Err(StoreError::ValidationCallOwnership {
-                call_ids: vec![call.call_id],
-            });
-        }
-        if !call.status.is_terminal() {
-            return Err(StoreError::ValidationCallStatusInvalid {
-                call_ids: vec![call.call_id],
-            });
-        }
-        if validation_call_has_successful_result(&call) {
-            summaries.insert(call.command_summary.clone());
-            calls.push(call);
-        }
-    }
-    let obligations = missing_evidence_obligations(&assignment, &summaries);
-    if !obligations.is_empty() {
-        return Err(StoreError::RequiredEvidenceMissing { obligations });
-    }
-    let call_ids = calls.iter().map(|call| call.call_id.clone()).collect::<Vec<_>>();
-    // The verifier is still active: derive owned references without requiring a
-    // sealed receipt (which would deadlock the gate-before-completion workflow).
-    let results = assignment.effective_criteria(attempt.amendment.as_ref()).iter().map(|criterion| {
-        let evidence_ref = criterion.evidence_policy.as_ref().and_then(|policy| {
-            let kind = match policy.kind {
-                crate::CriterionEvidenceRequirement::SourceInspection => crate::CriterionEvidenceKind::SourceInspection,
-                crate::CriterionEvidenceRequirement::ValidationExecution => crate::CriterionEvidenceKind::ValidationExecution,
-                crate::CriterionEvidenceRequirement::ReportOnly => return None,
-            };
-            let call = calls.iter().filter(|call| {
-                Some(&call.command_summary) == policy.required_evidence.as_ref()
-                    && call.verified_evidence_kind() == Some(kind)
-            }).max_by_key(|call| call.recorded_at)?;
-            Some(crate::CriterionEvidenceRef {
-                call_id: call.call_id.clone(),
-                workspace_id: assignment.workspace_id.clone(),
-                evidence_epoch: call.evidence.end_epoch?,
-                kind,
-            })
-        });
-        crate::CriterionResult {
-            criterion_id: criterion.id.clone(),
-            status: CriterionStatus::Passed,
-            evidence: None,
-            evidence_ref,
-        }
-    }).collect::<Vec<_>>();
-    let assessments = assess_criteria_tx(transaction, &assignment, attempt.amendment.as_ref(),
-        evaluator, &results, &call_ids, &calls).await?;
-    let obligations = assessments.into_iter().filter(|criterion| !criterion.satisfied
-        && assignment.effective_criteria(attempt.amendment.as_ref()).iter().any(|declared|
-            declared.id == criterion.criterion_id && declared.evidence_policy.is_some()))
-        .map(|criterion| MissingEvidenceObligation {
-            id: format!("criterion:v1:{}:{}", assignment.assignment_id, criterion.criterion_id),
-            requirement: format!("{}: {}", criterion.criterion_id, criterion.reason),
-        }).collect::<Vec<_>>();
-    if !obligations.is_empty() {
-        return Err(StoreError::RequiredEvidenceMissing { obligations });
-    }
-    Ok(call_ids)
-}
 
 async fn record_gate_verdict_tx(
     transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
@@ -5492,201 +5154,9 @@ async fn record_gate_verdict_tx(
     Ok(())
 }
 
-async fn insert_risk_review_gates_tx(
-    transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
-    assignment_id: AssignmentId,
-    attempt_id: AttemptId,
-    review_reason: &str,
-) -> StoreResult<()> {
-    if review_reason.trim().is_empty() {
-        return Err(StoreError::InvalidAssignment(
-            "cold-review reason cannot be empty".to_string(),
-        ));
-    }
 
-    let now = Utc::now();
-    let evidence_epoch = 0;
-    let risk_gate = AgentGate {
-        assignment_id,
-        kind: GateKind::Risk,
-        status: GateStatus::Passed,
-        reason: review_reason.to_string(),
-        waiver_reason: None,
-        evidence_epoch,
-        updated_at: now,
-        sealed_at: Some(now),
-    };
-    let existing_risk = sqlx::query_scalar::<_, String>(
-        "SELECT body_json FROM gates WHERE assignment_id = ? AND kind = ?",
-    )
-    .bind(assignment_id.to_string())
-    .bind(encode(&GateKind::Risk)?)
-    .fetch_optional(&mut **transaction)
-    .await?
-    .map(|value| decode::<AgentGate>(&value))
-    .transpose()?;
-    match existing_risk {
-        Some(mut existing) if existing.status == GateStatus::Passed => {
-            if cold_review_reason_contains(review_reason, CONCURRENT_DRIFT_REASON)
-                && !cold_review_reason_contains(&existing.reason, CONCURRENT_DRIFT_REASON)
-            {
-                existing.reason = format!("{}; {CONCURRENT_DRIFT_REASON}", existing.reason);
-                existing.updated_at = now;
-                existing.sealed_at = Some(now);
-                let updated = sqlx::query("UPDATE gates SET body_json = ?, updated_at = ?, sealed_at = ? WHERE assignment_id = ? AND kind = ? AND status = ?")
-                    .bind(encode(&existing)?)
-                    .bind(encode(&now)?)
-                    .bind(encode(&now)?)
-                    .bind(assignment_id.to_string())
-                    .bind(encode(&GateKind::Risk)?)
-                    .bind(encode(&GateStatus::Passed)?)
-                    .execute(&mut **transaction)
-                    .await?;
-                if updated.rows_affected() != 1 {
-                    return Err(StoreError::CorruptData(format!(
-                        "assignment {assignment_id} risk gate changed while aggregating correction-attempt drift"
-                    )));
-                }
-            }
-        }
-        Some(existing) => {
-            return Err(StoreError::CorruptData(format!(
-                "assignment {assignment_id} has incompatible risk gate {:?}",
-                existing.status
-            )));
-        }
-        None => {
-            sqlx::query("INSERT INTO gates (assignment_id, kind, status, body_json, updated_at, sealed_at) VALUES (?, ?, ?, ?, ?, ?)")
-                .bind(assignment_id.to_string())
-                .bind(encode(&GateKind::Risk)?)
-                .bind(encode(&GateStatus::Passed)?)
-                .bind(encode(&risk_gate)?)
-                .bind(encode(&now)?)
-                .bind(encode(&now)?)
-                .execute(&mut **transaction)
-                .await?;
-        }
-    }
-    record_gate_verdict_tx(transaction, attempt_id, &risk_gate).await?;
 
-    let review_gate = AgentGate {
-        assignment_id,
-        kind: GateKind::Review,
-        status: GateStatus::Pending,
-        reason: review_reason.to_string(),
-        waiver_reason: None,
-        evidence_epoch,
-        updated_at: now,
-        sealed_at: None,
-    };
-    let existing_review = sqlx::query_scalar::<_, String>(
-        "SELECT body_json FROM gates WHERE assignment_id = ? AND kind = ?",
-    )
-    .bind(assignment_id.to_string())
-    .bind(encode(&GateKind::Review)?)
-    .fetch_optional(&mut **transaction)
-    .await?
-    .map(|value| decode::<AgentGate>(&value))
-    .transpose()?;
-    match existing_review {
-        Some(existing) if existing.status == GateStatus::Pending => {
-            sqlx::query("UPDATE gates SET status = ?, body_json = ?, updated_at = ?, sealed_at = NULL WHERE assignment_id = ? AND kind = ?")
-                .bind(encode(&GateStatus::Pending)?)
-                .bind(encode(&review_gate)?)
-                .bind(encode(&now)?)
-                .bind(assignment_id.to_string())
-                .bind(encode(&GateKind::Review)?)
-                .execute(&mut **transaction)
-                .await?;
-        }
-        Some(existing) => {
-            return Err(StoreError::CorruptData(format!(
-                "assignment {assignment_id} has incompatible review gate {:?}",
-                existing.status
-            )));
-        }
-        None => {
-            sqlx::query("INSERT INTO gates (assignment_id, kind, status, body_json, updated_at, sealed_at) VALUES (?, ?, ?, ?, ?, NULL)")
-                .bind(assignment_id.to_string())
-                .bind(encode(&GateKind::Review)?)
-                .bind(encode(&GateStatus::Pending)?)
-                .bind(encode(&review_gate)?)
-                .bind(encode(&now)?)
-                .execute(&mut **transaction)
-                .await?;
-        }
-    }
-    Ok(())
-}
 
-fn cold_review_reason_contains(reason: &str, expected: &str) -> bool {
-    reason
-        .strip_prefix(COLD_REVIEW_REASON_PREFIX)
-        .unwrap_or(reason)
-        .split("; ")
-        .any(|reason| reason == expected)
-}
-
-async fn ensure_pending_verification_for_risk_review_tx(
-    transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
-    assignment_id: AssignmentId,
-) -> StoreResult<()> {
-    let risk_gate = sqlx::query_scalar::<_, String>(
-        "SELECT body_json FROM gates WHERE assignment_id = ? AND kind = ?",
-    )
-    .bind(assignment_id.to_string())
-    .bind(encode(&GateKind::Risk)?)
-    .fetch_optional(&mut **transaction)
-    .await?
-    .map(|value| decode::<AgentGate>(&value))
-    .transpose()?;
-    if risk_gate
-        .as_ref()
-        .is_none_or(|gate| gate.status != GateStatus::Passed)
-    {
-        return Ok(());
-    }
-
-    let existing = sqlx::query_scalar::<_, String>(
-        "SELECT body_json FROM gates WHERE assignment_id = ? AND kind = ?",
-    )
-    .bind(assignment_id.to_string())
-    .bind(encode(&GateKind::Verification)?)
-    .fetch_optional(&mut **transaction)
-    .await?
-    .map(|value| decode::<AgentGate>(&value))
-    .transpose()?;
-    if let Some(existing) = existing {
-        if existing.status == GateStatus::Pending {
-            return Ok(());
-        }
-        return Err(StoreError::GateAlreadySealed {
-            gate: GateKind::Verification.to_string(),
-        });
-    }
-
-    let now = Utc::now();
-    let evidence_epoch = 0;
-    let gate = AgentGate {
-        assignment_id,
-        kind: GateKind::Verification,
-        status: GateStatus::Pending,
-        reason: "independent verification required after risk-gated cold review".to_string(),
-        waiver_reason: None,
-        evidence_epoch,
-        updated_at: now,
-        sealed_at: None,
-    };
-    sqlx::query("INSERT INTO gates (assignment_id, kind, status, body_json, updated_at, sealed_at) VALUES (?, ?, ?, ?, ?, NULL)")
-        .bind(assignment_id.to_string())
-        .bind(encode(&GateKind::Verification)?)
-        .bind(encode(&GateStatus::Pending)?)
-        .bind(encode(&gate)?)
-        .bind(encode(&now)?)
-        .execute(&mut **transaction)
-        .await?;
-    Ok(())
-}
 
 async fn validate_declared_changes_tx(
     transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
@@ -5808,6 +5278,8 @@ async fn selective_admission_tx(
     scope_case: &CandidateScopeCase,
     isolated_integrator_available: bool,
 ) -> StoreResult<(AdmissionOverlapSummary, IntegrationPlan)> {
+    // Admission and integration planning concern this root's team only.
+    // Other sessions in the checkout do not constrain spawning.
     let rows = sqlx::query(
         "SELECT assignments.body_json, repositories.workspace_id, attempts.state,
                 attempts.sealed_at
@@ -5815,6 +5287,7 @@ async fn selective_admission_tx(
          JOIN assignment_repositories repositories USING (assignment_id)
          JOIN attempts ON attempts.assignment_id = assignments.assignment_id
          WHERE repositories.repository_id = ?
+           AND assignments.root_session_id = ?
            AND attempts.state = ? AND attempts.sealed_at IS NULL
            AND attempts.ordinal = (
                SELECT MAX(current.ordinal)
@@ -5824,6 +5297,7 @@ async fn selective_admission_tx(
          ORDER BY assignments.assignment_id",
     )
     .bind(&assignment.repository_id)
+    .bind(&assignment.root_session_id)
     .bind(encode(&AttemptState::Active)?)
     .fetch_all(&mut **transaction)
     .await?;
@@ -5834,10 +5308,6 @@ async fn selective_admission_tx(
     for row in rows {
         let existing: Assignment = decode(row.get::<String, _>("body_json").as_str())?;
         let existing_workspace_id = row.get::<String, _>("workspace_id");
-        let same_root = existing.root_session_id == assignment.root_session_id;
-        if !same_root && existing_workspace_id != assignment.workspace_id {
-            continue;
-        }
         let existing_state: AttemptState = decode(row.get::<String, _>("state").as_str())?;
         let existing_is_active = existing_state == AttemptState::Active
             && row.try_get::<Option<String>, _>("sealed_at")?.is_none();
@@ -5885,14 +5355,6 @@ async fn selective_admission_tx(
                 .any(|contract| contract == existing_contract)
         });
         if write_scope_overlaps || contract_overlaps {
-            if !same_root {
-                // Detect shared-checkout conflicts without exposing another
-                // root's task identity or borrowing its result authority.
-                return Err(StoreError::AdmissionRejected {
-                    reason: AdmissionRejectionReason::ExternalWorkspaceWriter,
-                    reusable_assignment_id: None,
-                });
-            }
             conflicting_writer_count = conflicting_writer_count.saturating_add(1);
             conflicting_writer_in_another_workspace |=
                 existing_workspace_id != assignment.workspace_id;
@@ -5944,16 +5406,6 @@ async fn finish_successful_task_if_unblocked_tx(
     Ok(())
 }
 
-fn gate_requires_main_intervention(attempt: &Attempt, kind: GateKind, status: GateStatus) -> bool {
-    matches!(
-        (kind, status),
-        (GateKind::Review, GateStatus::Failed)
-            | (
-                GateKind::Verification,
-                GateStatus::Failed | GateStatus::ChangesRequested
-            )
-    ) || kind == GateKind::Review && status == GateStatus::ChangesRequested && attempt.ordinal > 0
-}
 
 async fn transition_attempt_to_needs_main_tx(
     transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
@@ -6129,6 +5581,41 @@ async fn append_observation_tx(
     .await
 }
 
+fn validate_host_completion_observation(
+    origin: &str,
+    summary: &str,
+    stop_cause: Option<&str>,
+) -> StoreResult<()> {
+    if stop_cause.is_some_and(|cause| cause.is_empty() || cause.len() > 128) {
+        return Err(StoreError::InvalidAssignment("invalid bounded execution stop cause".into()));
+    }
+    if origin.is_empty() || origin.len() > 256 || summary.is_empty() || summary.len() > 64 * 1024 {
+        return Err(StoreError::InvalidAssignment("invalid bounded host completion observation".into()));
+    }
+    Ok(())
+}
+
+async fn append_host_completion_tx(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    assignment: &Assignment,
+    attempt_id: AttemptId,
+    origin: String,
+    summary: String,
+    stop_cause: Option<String>,
+) -> StoreResult<()> {
+    let existing = sqlx::query_scalar::<_, String>(
+        "SELECT body_json FROM observations WHERE attempt_id = ? AND kind = ? AND json_extract(body_json, '$.call_id') = ? LIMIT 1")
+        .bind(attempt_id.to_string()).bind(encode(&ObservationKind::HostCompletion)?).bind(&origin)
+        .fetch_optional(&mut **transaction).await?;
+    if existing.is_none() {
+        append_observation_with_stop_cause_tx(
+            transaction, assignment, attempt_id, ObservationKind::HostCompletion,
+            summary, Some(origin), stop_cause,
+        ).await?;
+    }
+    Ok(())
+}
+
 async fn append_observation_with_stop_cause_tx(
     transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     assignment: &Assignment,
@@ -6247,10 +5734,12 @@ async fn pending_gate_count(
     assignment_id: AssignmentId,
 ) -> StoreResult<i64> {
     Ok(sqlx::query_scalar::<_, i64>(
-        "SELECT COUNT(*) FROM gates WHERE assignment_id = ? AND status = ?",
+        "SELECT COUNT(*) FROM gates WHERE assignment_id = ? AND status = ? AND kind NOT IN (?, ?)",
     )
     .bind(assignment_id.to_string())
     .bind(encode(&GateStatus::Pending)?)
+    .bind(encode(&GateKind::Review)?)
+    .bind(encode(&GateKind::Verification)?)
     .fetch_one(&mut **transaction)
     .await?)
 }
@@ -6335,84 +5824,11 @@ fn receipt_observation_kind(status: AgentStatusClaim) -> ObservationKind {
     }
 }
 
-fn normalized_requirement_identity(requirement: &str) -> String {
-    requirement.split_whitespace().collect::<Vec<_>>().join(" ")
-}
 
-fn evidence_obligation(
-    assignment: &Assignment,
-    ordinal: usize,
-    requirement: &str,
-) -> MissingEvidenceObligation {
-    let canonical_requirement = normalized_requirement_identity(requirement);
-    MissingEvidenceObligation {
-        id: format!(
-            "required_evidence:v1:{}:{:04}:{}",
-            assignment.assignment_id,
-            ordinal + 1,
-            hash_bytes(canonical_requirement.as_bytes())
-        ),
-        requirement: requirement.to_string(),
-    }
-}
 
-fn missing_evidence_obligations(
-    assignment: &Assignment,
-    validation_summaries: &HashSet<String>,
-) -> Vec<MissingEvidenceObligation> {
-    assignment
-        .required_evidence
-        .iter()
-        .enumerate()
-        .filter(|(_, requirement)| !validation_summaries.contains(requirement.as_str()))
-        .map(|(ordinal, requirement)| evidence_obligation(assignment, ordinal, requirement))
-        .collect()
-}
 
-/// Own the read futures so a deadline drops unfinished reads, rather than
-/// detaching tasks that could publish a partial proof after assessment ends.
-fn collect_current_source_hashes<'a, F, Fut>(
-    paths: &BTreeSet<String>,
-    read: F,
-) -> impl Future<Output = std::collections::HashMap<String, String>> + Send + 'a
-where
-    F: Fn(String) -> Fut + Send + 'a,
-    Fut: Future<Output = Option<String>> + Send + 'a,
-{
-    let paths = paths.iter().take(64).cloned().collect::<Vec<_>>();
-    async move {
-        futures::stream::iter(paths)
-            .map(move |path| {
-                let reading = read(path.clone());
-                async move { reading.await.map(|hash| (path, hash)) }
-            })
-            .buffer_unordered(8)
-            .filter_map(std::future::ready)
-            .collect()
-            .await
-    }
-}
 
-async fn read_current_source_hash(root: &Path, path: &str) -> Option<String> {
-    if normalize_repo_path_async(root, path).await.as_deref().ok() != Some(path) {
-        return None;
-    }
-    let file = tokio::fs::File::open(root.join(path)).await.ok()?;
-    if !file.metadata().await.ok()?.is_file() {
-        return None;
-    }
-    use tokio::io::AsyncReadExt;
-    let mut bytes = Vec::new();
-    file.take(8 * 1024 * 1024 + 1)
-        .read_to_end(&mut bytes)
-        .await
-        .ok()?;
-    (bytes.len() <= 8 * 1024 * 1024).then(|| hash_bytes(&bytes))
-}
 
-#[cfg(test)]
-#[path = "local_source_tests.rs"]
-mod source_tests;
 
 fn hash_bytes(bytes: &[u8]) -> String {
     hex::encode(Sha256::digest(bytes))

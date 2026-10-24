@@ -42,10 +42,8 @@ struct DiscoveryHttpClient {
 }
 
 impl DiscoveryHttpClient {
-    fn new(default_headers: HeaderMap) -> Result<Self> {
-        let builder = HttpClientBuilder::new()
-            .default_headers(default_headers)
-            .timeout(DISCOVERY_TIMEOUT);
+    fn new() -> Result<Self> {
+        let builder = HttpClientBuilder::new().timeout(DISCOVERY_TIMEOUT);
         Ok(Self {
             follow_redirects: builder.clone().build_direct()?,
             stop_redirects: builder.without_redirects().build_direct()?,
@@ -377,12 +375,12 @@ async fn discover_streamable_http_oauth_with_headers(
     // Use no_proxy to avoid a bug in the system-configuration crate that
     // can result in a panic. See #8912.
     let default_headers = default_headers.clone();
-    let http_client =
-        tokio::task::spawn_blocking(move || DiscoveryHttpClient::new(default_headers)).await??;
+    let http_client = tokio::task::spawn_blocking(DiscoveryHttpClient::new).await??;
     let mut authorization_manager = AuthorizationManager::new_with_oauth_http_client(
         url,
         Arc::new(
-            OAuthHttpClientAdapter::new(Arc::new(http_client), HeaderMap::new())
+            OAuthHttpClientAdapter::new(Arc::new(http_client), url, default_headers)
+                .map_err(anyhow::Error::from_boxed)?
                 .with_buffered_responses(),
         ),
     )
@@ -402,7 +400,8 @@ async fn discover_streamable_http_oauth_with_headers_and_http_client(
     let mut authorization_manager = AuthorizationManager::new_with_oauth_http_client(
         url,
         Arc::new(
-            OAuthHttpClientAdapter::new(http_client, default_headers)
+            OAuthHttpClientAdapter::new(http_client, url, default_headers)
+                .map_err(anyhow::Error::from_boxed)?
                 .with_timeout_cap(DISCOVERY_TIMEOUT),
         ),
     )
@@ -497,7 +496,7 @@ mod tests {
         let server = tokio::spawn(async move {
             axum::serve(listener, app).await.unwrap();
         });
-        let client = DiscoveryHttpClient::new(HeaderMap::new()).unwrap();
+        let client = DiscoveryHttpClient::new().unwrap();
         let result = tokio::time::timeout(
             Duration::from_secs(2),
             client.http_request(HttpRequestParams {
@@ -692,7 +691,7 @@ mod tests {
                     None,
                     OAuthCredentialsStoreMode::File,
                     AuthKeyringBackendKind::Direct,
-                    Arc::new(DiscoveryHttpClient::new(HeaderMap::new())?),
+                    Arc::new(DiscoveryHttpClient::new()?),
                 )
                 .boxed()
             } else {
@@ -771,14 +770,20 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial(auth_status_env)]
     async fn oauth_discovery_reports_invalid_custom_ca_before_network_access() {
-        let temp_dir = tempfile::tempdir().expect("tempdir");
-        let missing_ca = temp_dir.path().join("missing-ca.pem");
-        let _guard = EnvVarGuard::set(
-            "CODEX_CA_CERTIFICATE",
-            missing_ca.to_string_lossy().as_ref(),
-        );
+        const CHILD: &str = "CODEX_TEST_INVALID_CA_DISCOVERY_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let temp_dir = tempfile::tempdir().expect("tempdir");
+            let output = std::process::Command::new(std::env::current_exe().expect("test executable"))
+                .args(["--exact", "auth_status::tests::oauth_discovery_reports_invalid_custom_ca_before_network_access", "--nocapture"])
+                .env(CHILD, "1")
+                .env("CODEX_CA_CERTIFICATE", temp_dir.path().join("missing-ca.pem"))
+                .output()
+                .expect("run isolated CA test");
+            assert!(output.status.success(), "child failed: {}{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+            assert!(String::from_utf8_lossy(&output.stdout).contains("invalid CA discovery asserted"));
+            return;
+        }
 
         let error = discover_streamable_http_oauth("https://example.invalid/mcp", None, None)
             .await
@@ -789,6 +794,7 @@ mod tests {
                 .to_string()
                 .contains("Failed to read CA certificate file")
         );
+        println!("invalid CA discovery asserted");
     }
 
     #[tokio::test]
@@ -828,22 +834,28 @@ mod tests {
             "x-rmcp-discovery",
             HeaderValue::from_static("shared-direct-client"),
         );
-        let client =
-            DiscoveryHttpClient::new(default_headers).expect("discovery HTTP client should build");
+        let url = format!("http://{address}/discovery-client");
+        let client = OAuthHttpClientAdapter::new(
+            Arc::new(DiscoveryHttpClient::new().unwrap()),
+            &url,
+            default_headers,
+        )
+        .unwrap()
+        .with_buffered_responses();
 
-        client
-            .http_request(HttpRequestParams {
-                method: "GET".to_string(),
-                url: format!("http://{address}/discovery-client"),
-                headers: Vec::new(),
-                body: None,
-                timeout_ms: Some(200),
-                redirect_policy: HttpRedirectPolicy::Follow,
-                request_id: "discovery-timeout-test".to_string(),
-                stream_response: false,
-            })
-            .await
-            .expect_err("request should use its shorter timeout");
+        rmcp::transport::auth::OAuthHttpClient::execute(
+            &client,
+            rmcp::transport::auth::OAuthHttpRequest {
+                request: oauth2::http::Request::builder()
+                    .uri(&url)
+                    .body(Vec::new())
+                    .unwrap(),
+                timeout: Some(Duration::from_millis(200)),
+                redirect_policy: rmcp::transport::auth::OAuthHttpRedirectPolicy::Follow,
+            },
+        )
+        .await
+        .expect_err("request should use its shorter timeout");
         assert_eq!(
             tokio::time::timeout(Duration::from_secs(1), observed_header_rx.recv())
                 .await

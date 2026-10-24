@@ -176,7 +176,11 @@ pub fn generate_ts_with_options(
         && let Some(prettier_bin) = prettier
         && !ts_files.is_empty()
     {
-        for batch in prettier_file_batches(prettier_bin, &ts_files)? {
+        let prettier_files = match std::env::current_dir() {
+            Ok(current_dir) => prettier_file_arguments(&ts_files, &current_dir),
+            Err(_) => ts_files.clone(),
+        };
+        for batch in prettier_file_batches(prettier_bin, &prettier_files)? {
             let status = Command::new(prettier_bin)
                 .arg("--write")
                 .arg("--log-level")
@@ -195,6 +199,27 @@ pub fn generate_ts_with_options(
     trim_trailing_whitespace_in_ts_files(&ts_files)?;
 
     Ok(())
+}
+
+fn prettier_file_arguments(files: &[PathBuf], current_dir: &Path) -> Vec<PathBuf> {
+    files
+        .iter()
+        .map(|file| {
+            // Keep the process cwd unchanged: executable, config, and ignore-file
+            // resolution must not change merely to shorten repeated prefixes.
+            let Ok(relative) = file.strip_prefix(current_dir) else {
+                return file.clone();
+            };
+            let relative = Path::new(".").join(relative);
+            if relative.as_os_str().as_encoded_bytes().len()
+                < file.as_os_str().as_encoded_bytes().len()
+            {
+                relative
+            } else {
+                file.clone()
+            }
+        })
+        .collect()
 }
 
 // Conservative allowance for Windows quoting/escaping, below the process limit.
@@ -233,17 +258,23 @@ pub fn generate_internal_json_schema(out_dir: &Path) -> Result<()> {
 
 pub fn generate_json_with_experimental(out_dir: &Path, experimental_api: bool) -> Result<()> {
     ensure_dir(out_dir)?;
+    let mut generated_paths = HashSet::new();
     for (relative_path, bytes) in generate_json_schema_tree(experimental_api)? {
-        let path = out_dir.join(relative_path);
+        let path = out_dir.join(&relative_path);
         if let Some(parent) = path.parent() {
             ensure_dir(parent)?;
         }
         fs::write(&path, bytes).with_context(|| format!("Failed to write {}", path.display()))?;
+        if !experimental_api {
+            generated_paths.insert(relative_path);
+        }
     }
     if !experimental_api {
-        // Preserve filtering of files already present in a reused output tree.
+        // Freshly generated values were already filtered. Preserve cleanup only
+        // for other files that remain in a reused output tree.
         filter_experimental_json_files(
             out_dir,
+            &generated_paths,
             &experimental_fields(),
             &experimental_methods(),
             &experimental_method_types(),
@@ -255,6 +286,13 @@ pub fn generate_json_with_experimental(out_dir: &Path, experimental_api: bool) -
 /// Generate exactly the JSON fixture bytes without materializing a scratch tree.
 #[doc(hidden)]
 pub fn generate_json_schema_tree(experimental_api: bool) -> Result<BTreeMap<PathBuf, Vec<u8>>> {
+    generate_json_schema_values(experimental_api)?
+        .into_iter()
+        .map(|(path, value)| Ok((path, pretty_json_value_bytes(value)?)))
+        .collect()
+}
+
+pub(crate) fn generate_json_schema_values(experimental_api: bool) -> Result<BTreeMap<PathBuf, Value>> {
     let envelope_emitters: Vec<JsonSchemaEmitter> = vec![
         || generate_json_schema::<crate::RequestId>("RequestId"),
         || generate_json_schema::<crate::JSONRPCMessage>("JSONRPCMessage"),
@@ -326,9 +364,7 @@ pub fn generate_json_schema_tree(experimental_api: bool) -> Result<BTreeMap<Path
         PathBuf::from("codex_app_server_protocol.v2.schemas.json"),
         flat_v2_bundle,
     );
-    tree.into_iter()
-        .map(|(path, value)| Ok((path, pretty_json_bytes(&value)?)))
-        .collect()
+    Ok(tree)
 }
 
 fn filter_experimental_ts(out_dir: &Path) -> Result<()> {
@@ -635,12 +671,16 @@ fn is_experimental_method_variant(value: &Value, experimental_methods: &HashSet<
 
 fn filter_experimental_json_files(
     out_dir: &Path,
+    generated_paths: &HashSet<PathBuf>,
     registered_fields: &[&'static crate::experimental_api::ExperimentalField],
     methods: &HashSet<&str>,
     method_types: &HashSet<String>,
 ) -> Result<()> {
     for path in json_files_in_recursive(out_dir)? {
-        if path == out_dir.join("codex_app_server_protocol.schemas.json")
+        if path
+            .strip_prefix(out_dir)
+            .is_ok_and(|relative| generated_paths.contains(relative))
+            || path == out_dir.join("codex_app_server_protocol.schemas.json")
             || path == out_dir.join("codex_app_server_protocol.v2.schemas.json")
         {
             continue;
@@ -1730,7 +1770,10 @@ fn write_pretty_json(path: PathBuf, value: &impl Serialize) -> Result<()> {
 }
 
 fn pretty_json_bytes(value: &impl Serialize) -> Result<Vec<u8>> {
-    let mut value = serde_json::to_value(value)?;
+    pretty_json_value_bytes(serde_json::to_value(value)?)
+}
+
+fn pretty_json_value_bytes(mut value: Value) -> Result<Vec<u8>> {
     // Workspace feature unification can enable serde_json/preserve_order.
     // Fixtures must retain the same canonical ordering in either build.
     value.sort_all_objects();
@@ -2683,7 +2726,7 @@ mod tests {
             })
             .collect();
         let batches = prettier_file_batches(Path::new("prettier"), &files)?;
-        assert!(batches.len() > 1);
+        assert_eq!(batches.len(), 6);
         assert_eq!(
             batches
                 .iter()
@@ -2702,6 +2745,70 @@ mod tests {
         assert_eq!(
             prettier_file_batches(Path::new("prettier"), &files[..2])?,
             vec![&files[..2]]
+        );
+        let current_dir = files[0].parent().context("formatter output parent")?;
+        let relative_files = prettier_file_arguments(&files, current_dir);
+        assert_eq!(
+            prettier_file_batches(Path::new("prettier"), &relative_files)?.len(),
+            1
+        );
+        for (file, argument) in files.iter().zip(relative_files) {
+            assert_eq!(
+                current_dir.join(argument).components().collect::<Vec<_>>(),
+                file.components().collect::<Vec<_>>()
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn prettier_arguments_preserve_relative_external_and_unicode_paths() {
+        let current_dir = Path::new("/checkout with spaces");
+        let files = vec![
+            current_dir.join("nested/-Type ü.ts"),
+            PathBuf::from("relative/Type ü.ts"),
+            PathBuf::from("/outside/Type.ts"),
+        ];
+        assert_eq!(
+            prettier_file_arguments(&files, current_dir),
+            vec![
+                PathBuf::from("./nested/-Type ü.ts"),
+                files[1].clone(),
+                files[2].clone(),
+            ]
+        );
+    }
+
+    #[test]
+    fn stable_json_cleanup_does_not_parse_or_rewrite_generated_paths() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let generated = PathBuf::from("generated.json");
+        // Parsing this sentinel would fail, and rewriting it would change bytes.
+        fs::write(dir.path().join(&generated), "already generated bytes")?;
+        filter_experimental_json_files(
+            dir.path(),
+            &HashSet::from([generated.clone()]),
+            &[],
+            &HashSet::new(),
+            &HashSet::new(),
+        )?;
+        assert_eq!(
+            fs::read_to_string(dir.path().join(generated))?,
+            "already generated bytes"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn owned_json_serialization_sorts_objects_without_reordering_arrays() -> Result<()> {
+        let value: Value = serde_json::from_str(r#"{"z":[2,1],"a":{"z":0,"a":1}}"#)?;
+        assert_eq!(
+            pretty_json_value_bytes(value.clone())?,
+            b"{\n  \"a\": {\n    \"a\": 1,\n    \"z\": 0\n  },\n  \"z\": [\n    2,\n    1\n  ]\n}"
+        );
+        assert_eq!(
+            pretty_json_value_bytes(value.clone())?,
+            pretty_json_bytes(&value)?
         );
         Ok(())
     }
@@ -3174,7 +3281,25 @@ permissionProfile?: string | null};
     fn generate_json_filters_experimental_fields_and_methods() -> Result<()> {
         let output_dir = std::env::temp_dir().join(format!("codex_schema_{}", Uuid::now_v7()));
         fs::create_dir(&output_dir)?;
+        fs::create_dir(output_dir.join("v2"))?;
+        fs::write(
+            output_dir.join("v2/MockExperimentalMethodParams.json"),
+            "{}",
+        )?;
+        let legacy_path = output_dir.join("LegacyThreadStartParams.json");
+        fs::write(
+            &legacy_path,
+            r#"{"title":"ThreadStartParams","properties":{"mockExperimentalField":{"type":"string"},"keep":{"type":"string"}},"required":["mockExperimentalField","keep"]}"#,
+        )?;
         generate_json_with_experimental(&output_dir, /*experimental_api*/ false)?;
+        let legacy_schema = read_json_value(&legacy_path)?;
+        assert!(
+            legacy_schema["properties"]
+                .get("mockExperimentalField")
+                .is_none()
+        );
+        assert_eq!(legacy_schema["properties"]["keep"]["type"], "string");
+        assert_eq!(legacy_schema["required"], serde_json::json!(["keep"]));
 
         let thread_start_json =
             fs::read_to_string(output_dir.join("v2").join("ThreadStartParams.json"))?;

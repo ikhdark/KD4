@@ -1,289 +1,7 @@
 use super::*;
-use codex_protocol::plan_tool::UpdatePlanArgs;
 use codex_rollout::RolloutRecorder;
 
-#[tokio::test]
-async fn unapplied_correction_replays_through_later_status_query_without_reauthorizing_old_text() {
-    use crate::plan_store::AcceptedPlanInput;
-    use codex_protocol::items::TurnItem;
-    use codex_protocol::items::UserMessageItem;
-    use codex_protocol::user_input::UserInput;
-    let (session, turn) = make_session_and_context().await;
-    let accepted = |id: &str, text: &str| {
-        let mut message = UserMessageItem::new(&[UserInput::Text {
-            text: text.into(),
-            text_elements: Vec::new(),
-        }]);
-        message.id = format!("msg_user_{id}");
-        RolloutItem::EventMsg(EventMsg::ItemCompleted(
-            codex_protocol::protocol::ItemCompletedEvent {
-                thread_id: session.thread_id,
-                turn_id: id.into(),
-                item: TurnItem::UserMessage(message),
-                completed_at_ms: 0,
-            },
-        ))
-    };
-    for compact in [false, true] {
-        let mut context = accepted_context(turn.to_turn_context_item());
-        context.turn_id = Some("original".into());
-        let plan: UpdatePlanArgs =
-            serde_json::from_value(json!({"plan":[{"step":"Deploy", "status":"pending"}]}))
-                .unwrap();
-        let mut rollout = completed_user_turn_rollout(
-            context.clone(),
-            vec![
-                accepted("original", "Deploy"),
-                RolloutItem::EventMsg(EventMsg::PlanUpdate(plan.clone())),
-            ],
-        );
-        context.turn_id = Some("correction".into());
-        rollout.extend(completed_user_turn_rollout(
-            context.clone(),
-            vec![accepted("correction", "Cancel deployment")],
-        ));
-        for index in 0..140 {
-            let id = format!("status-{index}");
-            context.turn_id = Some(id.clone());
-            rollout.extend(completed_user_turn_rollout(
-                context.clone(),
-                vec![accepted(&id, "Progress?")],
-            ));
-        }
-        context.turn_id = Some("status".into());
-        let mut status = vec![
-            accepted("status", "What is your progress?"),
-            RolloutItem::EventMsg(EventMsg::PlanUpdate(plan)),
-        ];
-        if compact {
-            status.push(RolloutItem::Compacted(CompactedItem {
-                message: "summary is not input authority".into(),
-                replacement_history: Some(Vec::new()),
-                window_number: Some(1),
-                first_window_id: None,
-                previous_window_id: None,
-                window_id: None,
-            }));
-        }
-        rollout.extend(completed_user_turn_rollout(context, status));
-        session
-            .apply_rollout_reconstruction(&turn, &rollout, false)
-            .await;
-        let rebuilt = session
-            .reconstruct_history_from_rollout(&turn, &rollout)
-            .await;
-        let input = rebuilt.accepted_input.unwrap();
-        assert!(input.references().len() > 128);
-        let correction =
-            AcceptedPlanInput::from_texts("correction", ["Cancel deployment"].into_iter())
-                .references()
-                .remove(0);
-        assert!(input.references().contains(&correction));
-        let store = &session.services.plan_store;
-        let id = crate::plan_store::plan_step_id("Deploy");
-        let mut args = json!({"plan":[], "expected_revision":store.execution_snapshot().await.unwrap().revision,
-            "superseded":[{"step_id":id,"reason":"User cancelled deployment"}],
-            "scope_change_refs":{id.clone():correction}});
-        assert!(
-            store
-                .stage_tool(serde_json::from_value(args.clone()).unwrap())
-                .await
-                .is_err()
-        );
-        args["scope_change_reviewed_revision"] = json!(input.review_revision());
-        store
-            .stage_tool(serde_json::from_value(args).unwrap())
-            .await
-            .unwrap()
-            .commit();
-        assert_eq!(
-            store
-                .execution_snapshot()
-                .await
-                .unwrap()
-                .obligations
-                .superseded,
-            1
-        );
-    }
-}
 
-#[tokio::test]
-async fn accepted_correction_authority_replays_and_rollback_clears_discarded_input() {
-    use crate::context::ContextualUserFragment;
-    use crate::plan_store::AcceptedPlanInput;
-    use codex_protocol::items::TurnItem;
-    use codex_protocol::items::UserMessageItem;
-    use codex_protocol::user_input::UserInput;
-    let (session, turn) = make_session_and_context().await;
-    let plan: UpdatePlanArgs = serde_json::from_value(json!({"plan":[
-        {"step":"Keep A", "status":"pending"}, {"step":"Check B", "status":"pending"}
-    ]}))
-    .unwrap();
-    let accepted = |turn_id: &str, parts: &[&str]| {
-        let mut message = UserMessageItem::new(
-            &parts
-                .iter()
-                .map(|text| UserInput::Text {
-                    text: (*text).into(),
-                    text_elements: Vec::new(),
-                })
-                .collect::<Vec<_>>(),
-        );
-        message.id = format!("msg_user_{turn_id}");
-        let event = EventMsg::ItemCompleted(codex_protocol::protocol::ItemCompletedEvent {
-            thread_id: session.thread_id,
-            turn_id: turn_id.into(),
-            item: TurnItem::UserMessage(message),
-            completed_at_ms: 0,
-        });
-        assert!(codex_rollout::should_persist_event_msg(
-            &event,
-            codex_protocol::protocol::ThreadHistoryMode::Legacy
-        ));
-        serde_json::from_value::<RolloutItem>(
-            serde_json::to_value(RolloutItem::EventMsg(event)).unwrap(),
-        )
-        .unwrap()
-    };
-    let text = "Skip B; retain A.\r\n保持 A";
-    for checkpoint in [false, true] {
-        let mut context = accepted_context(turn.to_turn_context_item());
-        context.turn_id = Some("first".into());
-        let mut first = completed_user_turn_rollout(
-            context.clone(),
-            vec![
-                accepted("first", &["Keep A and B"]),
-                RolloutItem::EventMsg(EventMsg::PlanUpdate(plan.clone())),
-            ],
-        );
-        context.turn_id = Some("correction".into());
-        let mut correction = vec![accepted("correction", &[text, "second exact part"])];
-        if checkpoint {
-            correction.push(RolloutItem::Compacted(CompactedItem {
-                message: "summary is not authority".into(),
-                replacement_history: Some(Vec::new()),
-                window_number: Some(1),
-                first_window_id: None,
-                previous_window_id: None,
-                window_id: None,
-            }));
-        }
-        first.extend(completed_user_turn_rollout(context.clone(), correction));
-        // Cross the real canonical -> legacy persistence ordering too.
-        let mut with_legacy_fanout = Vec::new();
-        for item in first {
-            let fanout = match &item {
-                RolloutItem::EventMsg(event @ EventMsg::ItemCompleted(_)) => {
-                    event.as_legacy_events(false)
-                }
-                _ => Vec::new(),
-            };
-            with_legacy_fanout.push(item);
-            with_legacy_fanout.extend(fanout.into_iter().map(RolloutItem::EventMsg));
-        }
-        let mut first = with_legacy_fanout;
-        session
-            .apply_rollout_reconstruction(&turn, &first, false)
-            .await;
-        let rebuilt = session
-            .reconstruct_history_from_rollout(&turn, &first)
-            .await;
-        let mut expected =
-            AcceptedPlanInput::from_texts("correction", [text, "second exact part"].into_iter());
-        expected.retain_earlier(&AcceptedPlanInput::from_texts(
-            "first",
-            ["Keep A and B"].into_iter(),
-        ));
-        assert_eq!(rebuilt.accepted_input, Some(expected));
-        let store = &session.services.plan_store;
-        let (_, lineage) = store.snapshot_with_lineage().await.unwrap();
-        let b = lineage.step_id("Check B");
-        let revision = store.execution_snapshot().await.unwrap().revision;
-        let mut retire = json!({"expected_revision":revision,"plan":[{"step":"Keep A","status":"pending"}],
-            "superseded":[{"step_id":b,"reason":"User removed B"}],
-            "scope_change_instructions":{b.clone():text}});
-        assert!(
-            store
-                .stage_tool(serde_json::from_value(retire.clone()).unwrap())
-                .await
-                .is_ok()
-        );
-        first.push(RolloutItem::EventMsg(EventMsg::ThreadRolledBack(
-            codex_protocol::protocol::ThreadRolledBackEvent { num_turns: 1 },
-        )));
-        session
-            .apply_rollout_reconstruction(&turn, &first, false)
-            .await;
-        retire["expected_revision"] = json!(store.execution_snapshot().await.unwrap().revision);
-        let error = store
-            .stage_tool(serde_json::from_value(retire).unwrap())
-            .await
-            .err()
-            .unwrap();
-        assert!(error.contains("scope change"), "{error}");
-        let rebuilt = session
-            .reconstruct_history_from_rollout(&turn, &first)
-            .await;
-        assert_eq!(
-            rebuilt.accepted_input,
-            Some(AcceptedPlanInput::from_texts(
-                "first",
-                ["Keep A and B"].into_iter()
-            ))
-        );
-        // A truly newer legacy-only correction has no trustworthy original
-        // text-part provenance; it must not resurrect the prior native input.
-        first.extend(completed_user_turn_rollout(
-            {
-                let mut context = accepted_context(turn.to_turn_context_item());
-                context.turn_id = Some("legacy-only".into());
-                context
-            },
-            Vec::new(),
-        ));
-        session
-            .apply_rollout_reconstruction(&turn, &first, false)
-            .await;
-        assert!(
-            !store
-                .task_state(false)
-                .await
-                .body()
-                .contains("accepted_input_refs")
-        );
-        // Image-only/empty accepted input supersedes old text; context and
-        // summary-only messages never acquire authorization.
-        context.turn_id = Some("empty".into());
-        first.extend(completed_user_turn_rollout(
-            context,
-            vec![
-                accepted("empty", &[]),
-                RolloutItem::ResponseItem(user_message(text)),
-            ],
-        ));
-        session
-            .apply_rollout_reconstruction(&turn, &first, false)
-            .await;
-        assert!(
-            !store
-                .task_state(false)
-                .await
-                .body()
-                .contains("accepted_input_refs")
-        );
-        session
-            .apply_rollout_reconstruction(&turn, &[], false)
-            .await;
-        assert!(
-            !store
-                .task_state(false)
-                .await
-                .body()
-                .contains("accepted_input_refs")
-        );
-    }
-}
 
 use super::tests::build_world_state_from_turn_context;
 use super::tests::make_session_and_context;
@@ -884,7 +602,6 @@ async fn reconstruct_history_ignores_tool_manifest_records() {
         history,
         plan: _,
         plan_lineage: _,
-        accepted_input: _,
         previous_turn_settings: _,
         reference_context_item: _,
         world_state_baseline: _,
@@ -1641,7 +1358,7 @@ async fn active_plan_output_cannot_replace_durable_lineage_on_resume() {
             .revision;
         let durable = json!({"current_plan":plan,"lineage":lineage.compact_for_plan(&plan),
             "lineage_complete":true,"revision":revision});
-        let active = json!({"current_plan":plan,"lineage":lineage.active_for_plan(&plan),
+        let active = json!({"current_plan":plan,"lineage":lineage.checklist_metadata(),
             "lineage_complete":false,"revision":revision});
         assert!(active["lineage"]["requirements"].get("retired").is_none());
         let records = vec![
@@ -2607,6 +2324,10 @@ async fn record_initial_history_resumed_bare_turn_context_does_not_hydrate_previ
         multi_agent_version: None,
         multi_agent_mode: None,
         effort: turn_context.reasoning_effort.clone(),
+        validation_mode: None,
+        validation_full_budget: None,
+        validation_root_turn: None,
+        validation_attempts: Vec::new(),
         context_provenance: None,
     };
     let rollout_items = vec![RolloutItem::TurnContext(previous_context_item)];
@@ -2651,6 +2372,10 @@ async fn record_initial_history_resumed_hydrates_previous_turn_settings_from_lif
         multi_agent_version: None,
         multi_agent_mode: None,
         effort: turn_context.reasoning_effort.clone(),
+        validation_mode: None,
+        validation_full_budget: None,
+        validation_root_turn: None,
+        validation_attempts: Vec::new(),
         context_provenance: None,
     };
     let turn_id = previous_context_item
@@ -3887,6 +3612,10 @@ async fn record_initial_history_resumed_turn_context_after_compaction_reestablis
         multi_agent_version: None,
         multi_agent_mode: None,
         effort: turn_context.reasoning_effort.clone(),
+        validation_mode: None,
+        validation_full_budget: None,
+        validation_root_turn: None,
+        validation_attempts: Vec::new(),
         context_provenance: None,
     });
     let previous_turn_id = previous_context_item
@@ -3980,6 +3709,10 @@ async fn record_initial_history_resumed_turn_context_after_compaction_reestablis
             multi_agent_version: None,
             multi_agent_mode: None,
             effort: turn_context.reasoning_effort.clone(),
+            validation_mode: None,
+            validation_full_budget: None,
+            validation_root_turn: None,
+            validation_attempts: Vec::new(),
             context_provenance: None,
         })))
         .expect("serialize expected reference context item")
@@ -4009,6 +3742,10 @@ async fn record_initial_history_resumed_aborted_turn_without_id_clears_active_tu
         multi_agent_version: None,
         multi_agent_mode: None,
         effort: turn_context.reasoning_effort.clone(),
+        validation_mode: None,
+        validation_full_budget: None,
+        validation_root_turn: None,
+        validation_attempts: Vec::new(),
         context_provenance: None,
     });
     let previous_turn_id = previous_context_item
@@ -4152,6 +3889,10 @@ async fn record_initial_history_resumed_unmatched_abort_preserves_active_turn_fo
         multi_agent_version: None,
         multi_agent_mode: None,
         effort: turn_context.reasoning_effort.clone(),
+        validation_mode: None,
+        validation_full_budget: None,
+        validation_root_turn: None,
+        validation_attempts: Vec::new(),
         context_provenance: None,
     });
 
@@ -4284,6 +4025,10 @@ async fn record_initial_history_resumed_trailing_incomplete_turn_compaction_clea
         multi_agent_version: None,
         multi_agent_mode: None,
         effort: turn_context.reasoning_effort.clone(),
+        validation_mode: None,
+        validation_full_budget: None,
+        validation_root_turn: None,
+        validation_attempts: Vec::new(),
         context_provenance: None,
     });
     let previous_turn_id = previous_context_item
@@ -4467,6 +4212,10 @@ async fn record_initial_history_resumed_replaced_incomplete_compacted_turn_clear
         multi_agent_version: None,
         multi_agent_mode: None,
         effort: turn_context.reasoning_effort.clone(),
+        validation_mode: None,
+        validation_full_budget: None,
+        validation_root_turn: None,
+        validation_attempts: Vec::new(),
         context_provenance: None,
     });
     let previous_turn_id = previous_context_item

@@ -14,6 +14,9 @@ fn main() -> Result<(), String> {
     let manifest_dir = env::var_os("CARGO_MANIFEST_DIR")
         .ok_or_else(|| "CARGO_MANIFEST_DIR should be set for build scripts".to_string())?;
     let manifest_path = PathBuf::from(manifest_dir).join(SETUP_MANIFEST);
+    // Link arguments below retain an absolute path. Invalidate a relocated
+    // build cache when that original input disappears, not just on byte edits.
+    println!("cargo:rerun-if-changed={}", manifest_path.display());
     let manifest_path = manifest_path.display();
 
     // Keep this scoped to the setup helper so Codex binaries that link the

@@ -36,6 +36,7 @@ pub(crate) struct Stopped;
 
 struct ClientState {
     connection_id: ConnectionId,
+    writer: mpsc::Sender<QueuedOutgoingMessage>,
     disconnect_token: CancellationToken,
     last_activity_at: Instant,
     last_inbound_seq_id: Option<u64>,
@@ -46,6 +47,7 @@ pub(crate) struct ClientTracker {
     clients: HashMap<(ClientId, StreamId), ClientState>,
     legacy_stream_ids: HashMap<ClientId, StreamId>,
     join_set: JoinSet<(ClientId, StreamId, ConnectionId)>,
+    cleanup: Vec<JoinHandle<Result<(), Stopped>>>,
     server_event_tx: mpsc::Sender<QueuedServerEnvelope>,
     transport_event_tx: mpsc::Sender<TransportEvent>,
     // Unlike the child below, this is not cancelled by tracker-only shutdown.
@@ -63,6 +65,7 @@ impl ClientTracker {
             clients: HashMap::new(),
             legacy_stream_ids: HashMap::new(),
             join_set: JoinSet::new(),
+            cleanup: Vec::new(),
             server_event_tx,
             transport_event_tx,
             transport_shutdown_token: shutdown_token.clone(),
@@ -94,11 +97,31 @@ impl ClientTracker {
     }
 
     pub(super) async fn close_all_clients(&mut self) {
-        while let Some(client_key) = self.clients.keys().next().cloned() {
-            let _ = self.close_client(&client_key).await;
-        }
-
+        self.retire_clients();
         self.drain_join_set().await;
+        let _ = self.wait_for_cleanup().await;
+    }
+
+    // Detach and cancel the entire old set before any reliable delivery can wait.
+    // Cleanup tasks remain owned by the tracker across connection-worker aborts.
+    pub(super) fn retire_clients(&mut self) {
+        while let Some(client_key) = self.clients.keys().next().cloned() {
+            if let Some(client) = self.remove_client(&client_key) {
+                client.disconnect_token.cancel();
+                let cleanup = self.spawn_connection_closed(client.connection_id);
+                self.cleanup.push(cleanup);
+            }
+        }
+    }
+
+    async fn wait_for_cleanup(&mut self) -> Result<(), Stopped> {
+        while let Some(cleanup) = self.cleanup.last_mut() {
+            // Do not remove its owner before awaiting: cancellation must preserve it.
+            let result = cleanup.await;
+            self.cleanup.pop();
+            result.map_err(|_| Stopped)??;
+        }
+        Ok(())
     }
 
     pub(super) fn contains_client_stream(
@@ -121,6 +144,8 @@ impl ClientTracker {
         &mut self,
         client_envelope: ClientEnvelope,
     ) -> Result<(), Stopped> {
+        // Account retirement and same-stream replacement cannot overtake closes.
+        self.wait_for_cleanup().await?;
         let ClientEnvelope {
             client_id,
             event,
@@ -194,7 +219,7 @@ impl ClientTracker {
                 self.send_transport_event(TransportEvent::ConnectionOpened {
                     connection_id,
                     origin: ConnectionOrigin::RemoteControl,
-                    writer: writer_tx,
+                    writer: writer_tx.clone(),
                     disconnect_sender: Some(disconnect_token.clone()),
                 })
                 .await?;
@@ -213,6 +238,7 @@ impl ClientTracker {
                     client_key.clone(),
                     ClientState {
                         connection_id,
+                        writer: writer_tx,
                         disconnect_token,
                         last_activity_at: Instant::now(),
                         last_inbound_seq_id: None,
@@ -233,7 +259,8 @@ impl ClientTracker {
                         client.disconnect_token.cancel();
                         // The initialize send already timed out on this queue; preserve close
                         // delivery without blocking reconnect on the same backpressure.
-                        drop(self.spawn_connection_closed(client.connection_id));
+                        let cleanup = self.spawn_connection_closed(client.connection_id);
+                        self.cleanup.push(cleanup);
                     }
                     return Err(err);
                 }
@@ -318,18 +345,22 @@ impl ClientTracker {
     pub(crate) async fn close_expired_clients(
         &mut self,
     ) -> Result<Vec<(ClientId, StreamId)>, Stopped> {
+        let expired_client_ids = self.expired_client_keys();
+        for client_key in &expired_client_ids {
+            self.close_client(client_key).await?;
+        }
+        Ok(expired_client_ids)
+    }
+
+    pub(super) fn expired_client_keys(&self) -> Vec<(ClientId, StreamId)> {
         let now = Instant::now();
-        let expired_client_ids: Vec<(ClientId, StreamId)> = self
+        self
             .clients
             .iter()
             .filter_map(|(client_key, client)| {
                 (!remote_control_client_is_alive(client, now)).then_some(client_key.clone())
             })
-            .collect();
-        for client_key in &expired_client_ids {
-            self.close_client(client_key).await?;
-        }
-        Ok(expired_client_ids)
+            .collect()
     }
 
     pub(super) async fn close_client(
@@ -340,10 +371,9 @@ impl ClientTracker {
             return Ok(());
         };
         client.disconnect_token.cancel();
-        self.send_transport_event(TransportEvent::ConnectionClosed {
-            connection_id: client.connection_id,
-        })
-        .await
+        let cleanup = self.spawn_connection_closed(client.connection_id);
+        self.cleanup.push(cleanup);
+        self.wait_for_cleanup().await
     }
 
     fn remove_client(&mut self, client_key: &(ClientId, StreamId)) -> Option<ClientState> {
@@ -366,32 +396,20 @@ impl ClientTracker {
             event => event,
         };
 
-        let event_name = transport_event_name(&event);
         if let TransportEvent::IncomingMessage {
+            connection_id,
             message: JSONRPCMessage::Request(_),
             ..
         } = &event
         {
-            let control = match &event {
-                TransportEvent::IncomingMessage { message, .. } => {
-                    crate::transport::ingress_message_is_control(message)
-                }
-                _ => false,
+            let Some(client) = self.clients.values().find(|client| client.connection_id == *connection_id) else {
+                return Err(Stopped);
             };
-            return crate::transport::try_send_with_control_reserve(
-                &self.transport_event_tx,
-                event,
-                control,
-                crate::transport::ingress_reserve(&self.transport_event_tx),
-            )
-            .map_err(|_| {
-                warn!(
-                    transport_event = event_name,
-                    "remote control ingress capacity exhausted or closed"
-                );
-                Stopped
-            });
+            let TransportEvent::IncomingMessage { connection_id, message } = event else { unreachable!() };
+            return if crate::transport::enqueue_incoming_message(&self.transport_event_tx, &client.writer,
+                connection_id, message).await { Ok(()) } else { Err(Stopped) };
         }
+        let event_name = transport_event_name(&event);
         match timeout(
             REMOTE_CONTROL_TRANSPORT_EVENT_SEND_TIMEOUT,
             self.transport_event_tx.send(event),
@@ -1001,6 +1019,33 @@ mod tests {
             } => assert_eq!(closed_connection_id, connection_id),
             other => panic!("expected connection closed, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn retirement_cancels_all_clients_before_reliable_cleanup_capacity() {
+        let (outgoing, _outgoing_rx) = mpsc::channel(CHANNEL_CAPACITY);
+        let (events, mut receiver) = mpsc::channel(2);
+        let shutdown = CancellationToken::new();
+        let mut tracker = ClientTracker::new(outgoing, events.clone(), &shutdown);
+        let mut writers = Vec::new();
+        for stream in ["a", "b", "c"] {
+            tracker.handle_message(initialize_envelope_with_stream_id("client", Some(stream))).await.unwrap();
+            match receiver.recv().await.unwrap() {
+                TransportEvent::ConnectionOpened { writer, .. } => writers.push(writer),
+                other => panic!("unexpected {other:?}"),
+            }
+            receiver.recv().await.unwrap();
+        }
+        for _ in 0..2 { events.try_send(TransportEvent::ConnectionClosed { connection_id: next_connection_id() }).unwrap(); }
+        tracker.retire_clients();
+        assert!(tracker.clients.is_empty());
+        timeout(Duration::from_secs(1), tracker.drain_join_set()).await.unwrap();
+        assert!(writers.iter().all(mpsc::Sender::is_closed));
+        assert_eq!(tracker.cleanup.len(), 3);
+        for _ in 0..5 { receiver.recv().await.unwrap(); }
+        tracker.wait_for_cleanup().await.unwrap();
+        assert!(tracker.cleanup.is_empty());
+        assert!(!shutdown.is_cancelled());
     }
 
     #[tokio::test]

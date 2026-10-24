@@ -574,7 +574,9 @@ fn agent_message_text(message: &str) -> Option<String> {
 
 fn content_item_text(item: &ContentItem) -> Option<&str> {
     match item {
-        ContentItem::InputText { text } | ContentItem::OutputText { text } => Some(text.as_str()),
+        ContentItem::InputText { text }
+        | ContentItem::OutputText { text }
+        | ContentItem::Refusal { refusal: text } => Some(text.as_str()),
         ContentItem::InputImage { .. } => None,
     }
 }

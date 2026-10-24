@@ -117,7 +117,7 @@ async fn standalone_image_generation_returns_saved_path_hint_to_model() -> Resul
     };
     assert_eq!(status, "completed");
     assert_eq!(revised_prompt.as_deref(), Some("paint a blue whale"));
-    assert_eq!(result, RESULT);
+    assert_eq!(result.as_deref(), Some(RESULT));
     assert_eq!(std::fs::read(&saved_path)?, TINY_PNG_BYTES);
 
     let requests = response_mock.requests();
@@ -206,7 +206,8 @@ async fn standalone_image_generation_failure_emits_terminal_item() -> Result<()>
             id: call_id.to_string(),
             status: "failed".to_string(),
             revised_prompt: Some("paint a blue whale".to_string()),
-            result: String::new(),
+            result: None,
+            error: None,
             saved_path: None,
             provider_usage: None,
         })
@@ -343,7 +344,7 @@ generatedImage(result);
         panic!("expected image generation item");
     };
     assert_eq!(image.status, "completed");
-    assert_eq!(image.result, RESULT);
+    assert_eq!(image.result.as_deref(), Some(RESULT));
     assert_eq!(
         std::fs::read(image.saved_path.context("image must be saved")?)?,
         TINY_PNG_BYTES

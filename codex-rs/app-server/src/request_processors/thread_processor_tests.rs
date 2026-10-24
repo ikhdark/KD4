@@ -710,6 +710,40 @@ mod thread_processor_behavior_tests {
     }
 
     #[test]
+    fn resume_projection_preserves_views_and_moves_owned_summary_payloads() {
+        let user = ThreadItem::UserMessage {
+            id: "user".into(), client_id: None,
+            content: vec![V2UserInput::Text { text: "u".repeat(1024 * 1024), text_elements: Vec::new() }],
+        };
+        let agent = ThreadItem::AgentMessage { id: "agent".into(), text: "a".repeat(1024 * 1024), phase: None };
+        let turn = Turn {
+            id: "turn".into(), items: vec![agent.clone(), user.clone(), ThreadItem::Plan { id: "omitted".into(), text: "x".repeat(1024 * 1024) }],
+            items_view: TurnItemsView::Full, status: TurnStatus::Completed, error: None,
+            started_at: Some(1), completed_at: Some(2), duration_ms: Some(1000), timing: None, surfaced_result: None,
+        };
+        for view in [TurnItemsView::NotLoaded, TurnItemsView::Summary, TurnItemsView::Full] {
+            for direction in [SortDirection::Asc, SortDirection::Desc] {
+                let mut expected = turn.clone();
+                expected.items_view = view;
+                expected.items = match view { TurnItemsView::NotLoaded => Vec::new(), TurnItemsView::Summary => vec![user.clone(), agent.clone()], TurnItemsView::Full => turn.items.clone() };
+                let page = build_thread_resume_initial_turns_page(std::slice::from_ref(&turn), &ThreadResumeInitialTurnsPageParams { limit: Some(1), sort_direction: Some(direction), items_view: Some(view) }).unwrap();
+                assert_eq!(page.data, vec![expected]);
+                assert!(page.next_cursor.is_none());
+            }
+        }
+        let mut owned = turn;
+        let ThreadItem::AgentMessage { text, .. } = &owned.items[0] else { panic!("agent") };
+        let allocation = text.as_ptr();
+        apply_thread_turns_items_view(std::slice::from_mut(&mut owned), TurnItemsView::Summary);
+        let ThreadItem::AgentMessage { text, .. } = &owned.items[1] else { panic!("agent ordered after user") };
+        assert_eq!(text.as_ptr(), allocation, "owned projection must move, not clone, the retained payload");
+        owned.items.push(ThreadItem::AgentMessage { id: "user".into(), text: "same-id".into(), phase: None });
+        let projected = clone_turn_with_items_view(&owned, TurnItemsView::Summary);
+        assert_eq!(projected.items.len(), 1, "same-ID summary collapses to the user");
+        assert!(clone_turn_with_items_view(&Turn { items: Vec::new(), ..owned }, TurnItemsView::Summary).items.is_empty());
+    }
+
+    #[test]
     fn resume_initial_page_still_reconstructs_when_full_turns_are_excluded() {
         let items = vec![RolloutItem::EventMsg(EventMsg::UserMessage(
             codex_protocol::protocol::UserMessageEvent {

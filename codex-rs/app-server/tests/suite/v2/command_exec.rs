@@ -323,68 +323,6 @@ async fn command_exec_permission_profile_runs_sandboxed_or_fails_closed() -> Res
     Ok(())
 }
 
-#[tokio::test]
-async fn command_exec_legacy_policy_danger_full_access_does_not_reuse_default_network_proxy()
--> Result<()> {
-    let server = create_mock_responses_server_sequence_unchecked(Vec::new()).await;
-    let codex_home = TempDir::new()?;
-    create_config_toml(codex_home.path(), &server.uri(), "never")?;
-    insert_networked_permission_profile_config(codex_home.path(), Some("networked"))?;
-    let mut mcp = TestAppServer::builder()
-        .with_codex_home(codex_home.path())
-        .without_auto_env()
-        .build()
-        .await?;
-    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
-
-    let command_request_id = mcp
-        .send_command_exec_request(CommandExecParams {
-            command: powershell(
-                "$value = if ($null -eq $env:CODEX_NETWORK_PROXY_ACTIVE) { 'unset' } else { $env:CODEX_NETWORK_PROXY_ACTIVE }; [Console]::Out.Write($value)",
-            ),
-            process_id: None,
-            tty: false,
-            stream_stdin: false,
-            stream_stdout_stderr: false,
-            output_bytes_cap: None,
-            disable_output_cap: false,
-            disable_timeout: false,
-            timeout_ms: None,
-            cwd: None,
-            env: None,
-            size: None,
-            sandbox_policy: Some(SandboxPolicy::DangerFullAccess),
-            permission_profile: None,
-        })
-        .await?;
-
-    let response = mcp
-        .read_stream_until_response_message(RequestId::Integer(command_request_id))
-        .await?;
-    let response: CommandExecResponse = to_response(response)?;
-    assert_eq!(
-        response,
-        CommandExecResponse {
-            exit_code: 0,
-            stdout_base64: None,
-            stderr_base64: None,
-            stdout_capture: Some(codex_app_server_protocol::ProcessOutputCaptureState {
-                reached_eof: true,
-                cap_reached: false,
-                drain_timed_out: false
-            }),
-            stderr_capture: Some(codex_app_server_protocol::ProcessOutputCaptureState {
-                reached_eof: true,
-                cap_reached: false,
-                drain_timed_out: false
-            }),
-            stdout: "unset".to_string(),
-            stderr: String::new(),
-        }
-    );
-
-    Ok(())
-}
 
 #[tokio::test]
 async fn command_exec_returns_error_when_local_environment_is_disabled() -> Result<()> {
@@ -1096,30 +1034,6 @@ fn decode_delta_notification(
     serde_json::from_value(params).context("deserialize command/exec/outputDelta notification")
 }
 
-fn insert_networked_permission_profile_config(
-    codex_home: &Path,
-    default_permissions: Option<&str>,
-) -> Result<()> {
-    let default_permissions = default_permissions
-        .map(|default_permissions| format!("default_permissions = \"{default_permissions}\"\n\n"))
-        .unwrap_or_default();
-    let inserted_config = format!(
-        r#"{default_permissions}[features]
-network_proxy = true
-
-[permissions.networked.filesystem]
-":root" = "read"
-
-[permissions.networked.network]
-enabled = true
-proxy_url = "http://127.0.0.1:0"
-enable_socks5 = false
-
-"#
-    );
-    insert_command_exec_config(codex_home, &inserted_config)?;
-    Ok(())
-}
 
 fn insert_command_exec_config(codex_home: &Path, inserted_config: &str) -> Result<()> {
     let config_path = codex_home.join("config.toml");

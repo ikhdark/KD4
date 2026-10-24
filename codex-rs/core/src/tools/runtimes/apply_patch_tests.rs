@@ -131,13 +131,10 @@ async fn typed_patch_commits_without_mutation_snapshots() {
         sandbox_requested: false,
         permissions: &permissions,
         exec_server_permissions: &permissions,
-        enforce_managed_network: false,
         sandbox_cwd: &cwd,
         workspace_roots: std::slice::from_ref(&workspace_root),
         windows_sandbox_level: WindowsSandboxLevel::Disabled,
         windows_sandbox_private_desktop: false,
-        network_denial_cancellation_token: None,
-        network_proxy: None,
     };
     let mut runtime = ApplyPatchRuntime::new();
     let output = runtime.run(&req, &attempt, &ctx).await.unwrap();
@@ -492,13 +489,10 @@ async fn file_system_sandbox_context_uses_active_attempt() {
         sandbox_requested: true,
         permissions: &permissions,
         exec_server_permissions: &permissions,
-        enforce_managed_network: false,
         sandbox_cwd: &sandbox_policy_cwd,
         workspace_roots: std::slice::from_ref(&path),
         windows_sandbox_level: WindowsSandboxLevel::RestrictedToken,
         windows_sandbox_private_desktop: true,
-        network_denial_cancellation_token: None,
-        network_proxy: None,
     };
 
     let sandbox = ApplyPatchRuntime::file_system_sandbox_context_for_attempt(&req, &attempt)
@@ -559,13 +553,10 @@ async fn no_sandbox_attempt_has_no_file_system_context() {
         sandbox_requested: false,
         permissions: &permissions,
         exec_server_permissions: &permissions,
-        enforce_managed_network: false,
         sandbox_cwd: &sandbox_policy_cwd,
         workspace_roots: std::slice::from_ref(&path),
         windows_sandbox_level: WindowsSandboxLevel::Disabled,
         windows_sandbox_private_desktop: false,
-        network_denial_cancellation_token: None,
-        network_proxy: None,
     };
 
     assert_eq!(

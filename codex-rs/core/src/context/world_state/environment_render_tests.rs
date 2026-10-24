@@ -45,7 +45,6 @@ fn environment_state(
     environments: impl IntoIterator<Item = (String, EnvironmentState)>,
     current_date: Option<String>,
     timezone: Option<String>,
-    network: Option<NetworkContext>,
     subagents: Option<String>,
 ) -> EnvironmentsState {
     EnvironmentsState {
@@ -53,7 +52,6 @@ fn environment_state(
         environments: environments.into_iter().collect(),
         current_date,
         timezone,
-        network,
         filesystem: None,
         subagents,
     }
@@ -70,7 +68,6 @@ fn serialize_environment_context_with_shell_date_and_timezone() {
         )],
         Some("2026-02-26".to_string()),
         Some("America/Los_Angeles".to_string()),
-        /*network*/ None,
         /*subagents*/ None,
     );
 
@@ -97,7 +94,6 @@ fn serialize_environment_context_with_foreign_windows_cwd() {
         )],
         /*current_date*/ None,
         /*timezone*/ None,
-        /*network*/ None,
         /*subagents*/ None,
     );
 
@@ -110,59 +106,8 @@ fn serialize_environment_context_with_foreign_windows_cwd() {
     );
 }
 
-#[test]
-fn serialize_environment_context_with_network() {
-    let network = NetworkContext::new(
-        /*enabled*/ true,
-        vec!["api.example.com".to_string(), "*.openai.com".to_string()],
-        vec!["blocked.example.com".to_string()],
-    );
-    let context = environment_state(
-        [environment(
-            "local",
-            PathUri::from_abs_path(&test_abs_path("/repo")),
-            fake_shell_name(),
-        )],
-        Some("2026-02-26".to_string()),
-        Some("America/Los_Angeles".to_string()),
-        Some(network),
-        /*subagents*/ None,
-    );
 
-    let expected = format!(
-        r#"<environment_context>
-  <cwd>{}</cwd>
-  <shell>bash</shell>
-  <current_date>2026-02-26</current_date>
-  <timezone>America/Los_Angeles</timezone>
-  <managed_network_proxy configured_enabled="true"><required_allowed>api.example.com,*.openai.com</required_allowed><required_denied>blocked.example.com</required_denied></managed_network_proxy>
-</environment_context>"#,
-        test_path_buf("/repo").display()
-    );
 
-    assert_eq!(context.render(), expected);
-}
-
-#[test]
-fn serialize_disabled_network_context() {
-    assert_eq!(
-        NetworkContext::new(/*enabled*/ false, vec![], vec![]).render(),
-        r#"<managed_network_proxy configured_enabled="false"></managed_network_proxy>"#
-    );
-}
-
-#[test]
-fn serialize_network_context_escapes_domain_values() {
-    assert_eq!(
-        NetworkContext::new(
-            /*enabled*/ true,
-            vec!["api&<example>.com".to_string()],
-            vec!["\"blocked'.example.com".to_string()],
-        )
-        .render(),
-        r#"<managed_network_proxy configured_enabled="true"><required_allowed>api&amp;&lt;example&gt;.com</required_allowed><required_denied>"blocked'.example.com</required_denied></managed_network_proxy>"#
-    );
-}
 
 fn workspace_write_permission_profile_with_private_denials() -> PermissionProfile {
     PermissionProfile::from_runtime_permissions(
@@ -208,7 +153,6 @@ fn serialize_environment_context_with_full_filesystem_profile() {
         )],
         /*current_date*/ None,
         /*timezone*/ None,
-        /*network*/ None,
         /*subagents*/ None,
     );
     context.filesystem = Some(FileSystemContext::from_permission_profile(
@@ -240,7 +184,6 @@ fn serialize_environment_context_with_date_and_timezone_only() {
         Vec::new(),
         Some("2026-02-26".to_string()),
         Some("America/Los_Angeles".to_string()),
-        /*network*/ None,
         /*subagents*/ None,
     );
 
@@ -263,7 +206,6 @@ fn serialize_environment_context_with_multiple_selected_environments() {
         ],
         Some("2026-02-26".to_string()),
         Some("America/Los_Angeles".to_string()),
-        /*network*/ None,
         /*subagents*/ None,
     );
 
@@ -304,7 +246,6 @@ fn serialize_environment_context_prefers_environment_shell_when_present() {
         ],
         /*current_date*/ None,
         /*timezone*/ None,
-        /*network*/ None,
         /*subagents*/ None,
     );
 

@@ -90,12 +90,12 @@ pub(crate) const ARTIFACT_SEARCH_MAX_QUERY_BYTES: usize = 1_024;
 const LOGICAL_ARTIFACT_METADATA_VERSION: u8 = 1;
 
 #[cfg(test)]
-#[path = "command_output_artifact_audit145_tests.rs"]
-mod audit145_tests;
+#[path = "command_output_artifact_recovery_fidelity_tests.rs"]
+mod recovery_fidelity_tests;
 
 #[cfg(test)]
-#[path = "command_output_artifact_audit147_tests.rs"]
-mod audit147_tests;
+#[path = "command_output_artifact_deferred_retention_tests.rs"]
+mod deferred_retention_tests;
 const LOGICAL_ARTIFACT_TRANSACTION_EXTENSION: &str = "transaction";
 const LOGICAL_ARTIFACT_CREATE_TRANSACTION_BYTES: &[u8] =
     b"KD4_LOGICAL_ARTIFACT_CREATE_TRANSACTION_V1\n";
@@ -1409,20 +1409,7 @@ impl PartialEq for RawOutputArtifact {
 
 impl Eq for RawOutputArtifact {}
 
-pub(crate) struct RawOutputArtifactWriter {
-    id: Option<ToolOutputArtifactId>,
-    path: Option<PathBuf>,
-    file: Option<tokio::fs::File>,
-    bytes: u64,
-    digest: Sha256,
-    truncated: bool,
-    handle: Option<Arc<File>>,
-    retention_token: Option<RetentionIndexToken>,
-    lifecycle_completed: bool,
-    pending_target: Option<(PathBuf, String)>,
-    pending_output: Vec<u8>,
-    _residency: Option<Arc<File>>,
-}
+
 
 #[cfg(test)]
 static STREAMING_FINALIZE_SYNC_FAILURE_FOR_TEST: AtomicU8 = AtomicU8::new(0);
@@ -1585,480 +1572,9 @@ fn inject_streaming_finalize_sync_failure_for_test() {
     STREAMING_FINALIZE_SYNC_FAILURE_FOR_TEST.store(1, Ordering::Release);
 }
 
-impl RawOutputArtifactWriter {
-    pub(crate) async fn open(state: Option<&Arc<Mutex<RawOutputArtifact>>>) -> Option<Self> {
-        let state = state?;
-        let artifact = {
-            let mut state = state.lock().await;
-            let artifact = state.clone();
-            if let RawOutputArtifact::Stored { finalized, .. } = &mut *state {
-                *finalized = false;
-            }
-            artifact
-        };
-        let target = match &artifact {
-            RawOutputArtifact::Pending {
-                codex_home,
-                thread_id,
-            } => Some((codex_home.clone(), thread_id.clone())),
-            RawOutputArtifact::Stored { path, .. } => path.parent().and_then(|directory| {
-                Some((
-                    directory.parent()?.parent()?.to_path_buf(),
-                    directory.file_name()?.to_str()?.to_string(),
-                ))
-            }),
-            _ => None,
-        };
-        let residency = if let Some((home, id)) = target {
-            match acquire_artifact_residency(&home, &id).await {
-                Ok(owner) => Some(owner),
-                Err(error) => {
-                    *state.lock().await = RawOutputArtifact::unavailable(format!(
-                        "artifact residency is unavailable: {error}"
-                    ));
-                    return None;
-                }
-            }
-        } else {
-            None
-        };
-        if let RawOutputArtifact::Pending {
-            codex_home,
-            thread_id,
-        } = artifact
-        {
-            return Some(Self {
-                id: None,
-                path: None,
-                file: None,
-                bytes: 0,
-                digest: Sha256::new(),
-                truncated: false,
-                handle: None,
-                retention_token: None,
-                lifecycle_completed: false,
-                pending_target: Some((codex_home, thread_id)),
-                pending_output: Vec::new(),
-                _residency: residency.clone(),
-            });
-        }
-        let RawOutputArtifact::Stored {
-            id,
-            path,
-            bytes,
-            truncated,
-            handle,
-            digest,
-            ..
-        } = artifact
-        else {
-            return Some(Self {
-                id: None,
-                path: None,
-                file: None,
-                bytes: 0,
-                digest: Sha256::new(),
-                truncated: false,
-                handle: None,
-                retention_token: None,
-                lifecycle_completed: true,
-                pending_target: None,
-                pending_output: Vec::new(),
-                _residency: residency.clone(),
-            });
-        };
-        let retention_token =
-            match capture_retention_token_async(path.parent().unwrap_or_else(|| Path::new(".")))
-                .await
-            {
-                Ok(token) => token,
-                Err(error) => {
-                    let failed = failed_with_owned_path(
-                        path.clone(),
-                        bytes,
-                        format!(
-                            "failed to prepare `{}` for streaming: {error}",
-                            path.display()
-                        ),
-                        None,
-                    )
-                    .await;
-                    *state.lock().await = failed;
-                    return Some(Self {
-                        id: Some(id),
-                        path: Some(path),
-                        file: None,
-                        bytes,
-                        digest: digest.clone(),
-                        truncated,
-                        handle: Some(handle),
-                        retention_token: None,
-                        lifecycle_completed: true,
-                        pending_target: None,
-                        pending_output: Vec::new(),
-                        _residency: residency.clone(),
-                    });
-                }
-            };
-        match lock_artifact_handle(&handle, SeekFrom::End(0)).await {
-            Ok(file) => {
-                let file = tokio::fs::File::from_std(file);
-                let locked = lock_output_file(file).await;
-                let locked = match locked {
-                    Ok(file) => match invalidate_raw_capture_metadata(&path).await {
-                        Ok(()) => Ok(file),
-                        Err(error) => {
-                            let _ = unlock_output_file(file).await;
-                            Err(error)
-                        }
-                    },
-                    Err(error) => Err(error),
-                };
-                match locked {
-                    Ok(file) => Some(Self {
-                        id: Some(id),
-                        path: Some(path),
-                        file: Some(file),
-                        bytes,
-                        digest: digest.clone(),
-                        truncated,
-                        handle: Some(handle),
-                        retention_token: Some(retention_token),
-                        lifecycle_completed: false,
-                        pending_target: None,
-                        pending_output: Vec::new(),
-                        _residency: residency.clone(),
-                    }),
-                    Err(err) => {
-                        reject_stale_delta(&retention_token);
-                        enforce_retention(path.parent().unwrap_or_else(|| Path::new(".")), &path)
-                            .await;
-                        *state.lock().await = RawOutputArtifact::Failed {
-                            id: artifact_id_from_path(&path),
-                            message: format!(
-                                "failed to lock `{}` for streaming: {err}",
-                                path.display()
-                            ),
-                            owned_path: Some(path.clone()),
-                            bytes,
-                        };
-                        Some(Self {
-                            id: Some(id),
-                            path: Some(path),
-                            file: None,
-                            bytes,
-                            digest: digest.clone(),
-                            truncated,
-                            handle: Some(handle),
-                            retention_token: Some(retention_token),
-                            lifecycle_completed: true,
-                            pending_target: None,
-                            pending_output: Vec::new(),
-                            _residency: residency.clone(),
-                        })
-                    }
-                }
-            }
-            Err(err) => {
-                reject_stale_delta(&retention_token);
-                enforce_retention(path.parent().unwrap_or_else(|| Path::new(".")), &path).await;
-                *state.lock().await = RawOutputArtifact::Failed {
-                    id: artifact_id_from_path(&path),
-                    message: format!("failed to open `{}` for streaming: {err}", path.display()),
-                    owned_path: Some(path.clone()),
-                    bytes,
-                };
-                Some(Self {
-                    id: Some(id),
-                    path: Some(path),
-                    file: None,
-                    bytes,
-                    digest: digest.clone(),
-                    truncated,
-                    handle: Some(handle),
-                    retention_token: Some(retention_token),
-                    lifecycle_completed: true,
-                    pending_target: None,
-                    pending_output: Vec::new(),
-                    _residency: residency.clone(),
-                })
-            }
-        }
-    }
 
-    pub(crate) async fn write_chunk(
-        &mut self,
-        state: Option<&Arc<Mutex<RawOutputArtifact>>>,
-        output: &[u8],
-    ) {
-        if let Some((codex_home, thread_id)) = self.pending_target.as_ref() {
-            // Keep small output inline and defer all artifact I/O until this buffer grows.
-            self.pending_output.extend_from_slice(output);
-            if self.pending_output.len() <= LAZY_RAW_OUTPUT_ARTIFACT_THRESHOLD_BYTES {
-                return;
-            }
-            let artifact = create_raw_output_artifact_inner(
-                codex_home.as_path(),
-                thread_id,
-                &self.pending_output,
-                false,
-            )
-            .await;
-            if let Some(state) = state {
-                *state.lock().await = artifact;
-                if let Some(opened) = Self::open(Some(state)).await {
-                    let truncated = self.truncated;
-                    *self = opened;
-                    self.truncated |= truncated;
-                    if let RawOutputArtifact::Stored { truncated, .. } = &mut *state.lock().await {
-                        *truncated |= self.truncated;
-                    }
-                }
-            }
-            return;
-        }
-        let (Some(state), Some(id), Some(path)) = (state, self.id, self.path.clone()) else {
-            return;
-        };
-        if self.file.is_none() {
-            return;
-        }
-        let remaining = MAX_RAW_OUTPUT_ARTIFACT_BYTES.saturating_sub(self.bytes as usize);
-        let retained = &output[..output.len().min(remaining)];
-        self.truncated |= retained.len() != output.len();
-        self.digest.update(retained);
-        self.pending_output.extend_from_slice(retained);
-        self.bytes = self.bytes.saturating_add(retained.len() as u64);
-        // Readers reject a locked, incomplete artifact. Batch small chunks and
-        // retention metadata publication; finish always flushes the remainder.
-        if self.pending_output.len() >= STREAMING_ARTIFACT_BUFFER_BYTES {
-            self.flush_pending(Some(state)).await;
-            let Some(file) = self.file.as_mut() else {
-                return;
-            };
-            match file.metadata().await.and_then(|metadata| {
-                metadata
-                    .modified()
-                    .map(|modified| (metadata.len(), modified))
-            }) {
-                Ok((bytes, modified)) => {
-                    if let Some(token) = self.retention_token.as_ref() {
-                        publish_streaming_size_async(token, &path, bytes, modified, false).await;
-                    }
-                }
-                Err(_) => {
-                    if let Some(token) = self.retention_token.as_ref() {
-                        reject_stale_delta(token);
-                    }
-                }
-            }
-        }
-        let mut artifact = state.lock().await;
-        if let RawOutputArtifact::Stored {
-            id: stored_id,
-            bytes,
-            truncated,
-            digest,
-            finalized,
-            ..
-        } = &mut *artifact
-            && *stored_id == id
-        {
-            *bytes = self.bytes;
-            *truncated = self.truncated;
-            *digest = self.digest.clone();
-            *finalized = false;
-            return;
-        }
-        let Some(handle) = self.handle.clone() else {
-            return;
-        };
-        *artifact = RawOutputArtifact::Stored {
-            id,
-            path: path.clone(),
-            bytes: self.bytes,
-            truncated: self.truncated,
-            handle,
-            digest: self.digest.clone(),
-            finalized: false,
-        };
-    }
 
-    pub(crate) async fn mark_output_gap(&mut self, state: Option<&Arc<Mutex<RawOutputArtifact>>>) {
-        self.truncated = true;
-        if let Some(state) = state
-            && let RawOutputArtifact::Stored { truncated, .. } = &mut *state.lock().await
-        {
-            *truncated = true;
-        }
-    }
 
-    /// Makes buffered bytes visible before the process's artifact-ready signal.
-    /// Register these bytes for the rollout durability barrier even if finish is cancelled.
-    pub(crate) async fn flush_pending(&mut self, state: Option<&Arc<Mutex<RawOutputArtifact>>>) {
-        if self.pending_target.is_some() || self.pending_output.is_empty() {
-            return;
-        }
-        let (Some(state), Some(path), Some(file)) = (state, self.path.as_ref(), self.file.as_mut())
-        else {
-            return;
-        };
-        let result = async {
-            file.write_all(&self.pending_output).await?;
-            file.flush().await
-        }
-        .await;
-        if let Err(err) = result {
-            if let Some(file) = self.file.take() {
-                let _ = unlock_output_file(file).await;
-            }
-            *state.lock().await = failed_with_owned_path(
-                path.clone(),
-                self.bytes,
-                format!("failed to stream `{}`: {err}", path.display()),
-                self.retention_token.as_ref(),
-            )
-            .await;
-            self.lifecycle_completed = true;
-        } else {
-            defer_artifact_sync(path);
-            self.pending_output.clear();
-        }
-    }
-
-    pub(crate) async fn finish(&mut self, state: Option<&Arc<Mutex<RawOutputArtifact>>>) {
-        if let Some((home, thread)) = self.pending_target.take() {
-            if !self.truncated && std::str::from_utf8(&self.pending_output).is_ok() {
-                self.pending_output.clear();
-                self.lifecycle_completed = true;
-                return;
-            }
-            // Preserve binary bytes and gap state before dropping the inline
-            // buffer. Small reversible text still performs no artifact I/O.
-            let artifact = create_raw_output_artifact_inner(
-                &home, &thread, &self.pending_output, false,
-            ).await;
-            if let Some(state) = state {
-                *state.lock().await = artifact;
-                if let Some(mut opened) = Self::open(Some(state)).await {
-                    opened.truncated |= self.truncated;
-                    *self = opened;
-                    if let RawOutputArtifact::Stored { truncated, .. } = &mut *state.lock().await {
-                        *truncated |= self.truncated;
-                    }
-                } else {
-                    self.lifecycle_completed = true;
-                    return;
-                }
-            } else {
-                self.lifecycle_completed = true;
-                return;
-            }
-        }
-        self.flush_pending(state).await;
-        let (Some(state), Some(path), Some(mut file)) =
-            (state, self.path.clone(), self.file.take())
-        else {
-            return;
-        };
-        if let Err(err) = file.flush().await {
-            let _ = unlock_output_file(file).await;
-            *state.lock().await = failed_with_owned_path(
-                path.clone(),
-                self.bytes,
-                format!("failed to flush `{}`: {err}", path.display()),
-                self.retention_token.as_ref(),
-            )
-            .await;
-            self.lifecycle_completed = true;
-            return;
-        }
-        let status_bytes = match write_raw_capture_metadata(
-            &path,
-            self.id,
-            self.bytes,
-            !self.truncated,
-            hex::encode(self.digest.clone().finalize()),
-        )
-        .await
-        {
-            Ok(bytes) => bytes,
-            Err(error) => {
-                let _ = unlock_output_file(file).await;
-                *state.lock().await = failed_with_owned_path(
-                    path.clone(),
-                    self.bytes,
-                    format!("failed to persist raw capture status: {error}"),
-                    self.retention_token.as_ref(),
-                )
-                .await;
-                self.lifecycle_completed = true;
-                return;
-            }
-        };
-        let metadata = file.metadata().await.and_then(|metadata| {
-            metadata
-                .modified()
-                .map(|modified| (metadata.len(), modified))
-        });
-        if let Err(err) = unlock_output_file(file).await {
-            *state.lock().await = failed_with_owned_path(
-                path.clone(),
-                self.bytes,
-                format!("failed to unlock `{}`: {err}", path.display()),
-                self.retention_token.as_ref(),
-            )
-            .await;
-            self.lifecycle_completed = true;
-            return;
-        }
-        defer_artifact_sync(&path);
-        if let Some(token) = self.retention_token.as_ref() {
-            match metadata {
-                Ok((bytes, modified)) => {
-                    publish_streaming_size_async(
-                        token,
-                        &path,
-                        bytes.saturating_add(status_bytes),
-                        modified,
-                        true,
-                    )
-                    .await;
-                }
-                Err(_) => reject_stale_delta(token),
-            }
-        }
-        if let RawOutputArtifact::Stored {
-            id,
-            finalized,
-            digest,
-            ..
-        } = &mut *state.lock().await
-            && Some(*id) == self.id
-        {
-            *digest = self.digest.clone();
-            *finalized = true;
-        }
-        self.lifecycle_completed = true;
-    }
-}
-
-impl Drop for RawOutputArtifactWriter {
-    fn drop(&mut self) {
-        let Some(file) = self.file.take() else {
-            return;
-        };
-        if let Ok(file) = file.try_into_std() {
-            let _ = file.unlock();
-        }
-        if !self.lifecycle_completed {
-            if let Some(token) = self.retention_token.as_ref() {
-                publish_streaming_abandonment(token);
-            }
-            self.lifecycle_completed = true;
-        }
-    }
-}
 
 // A duplicated handle can share its lock with the retained artifact handle.
 // Keep explicit unlock ownership until the async caller accepts the worker result.
@@ -2151,6 +1667,12 @@ async fn unlock_created_output_file(file: File) -> std::io::Result<File> {
 }
 
 impl RawOutputArtifact {
+    pub(crate) fn is_plain_command_log(&self) -> bool {
+        matches!(self, Self::Stored { path, .. } | Self::Failed { owned_path: Some(path), .. }
+            if path.parent().and_then(|p| p.parent()).and_then(|p| p.file_name())
+                == Some(std::ffi::OsStr::new("command-output")))
+    }
+
     pub(crate) fn capture_finalized_complete(&self) -> bool {
         matches!(
             self,
@@ -2201,7 +1723,7 @@ impl RawOutputArtifact {
                 ..
             } => {
                 let suffix = if *truncated {
-                    ", incomplete capture (output gap or safety limit)"
+                    ", incomplete capture"
                 } else {
                     ""
                 };
@@ -2222,6 +1744,9 @@ impl RawOutputArtifact {
         match self {
             Self::Pending { .. } => (None, None, None),
             Self::Stored { id, bytes, .. } => (Some(*id), Some(*bytes), None),
+            Self::Failed { id, bytes, .. } if self.is_plain_command_log() => (
+                *id, Some(*bytes), Some("command log capture is incomplete".to_string()),
+            ),
             Self::Failed { .. } => (
                 None,
                 None,
@@ -2269,7 +1794,7 @@ impl RawOutputArtifact {
     }
 
     pub(crate) fn retention_limit_hit(&self) -> bool {
-        matches!(
+        !self.is_plain_command_log() && matches!(
             self,
             Self::Stored {
                 truncated: true,
@@ -2760,6 +2285,7 @@ struct StagedCanonicalOutput {
     directory: PathBuf,
     id: ToolOutputArtifactId,
     canonical: CanonicalToolResult,
+    metadata_budget: CanonicalMetadataBudget,
     existing: Vec<u8>,
     segments: Vec<StagedLogicalSegment>,
     cleanup: StagedLogicalSegmentCleanup,
@@ -2773,11 +2299,21 @@ const ARTIFACT_STAGE_BYTE_CAPACITY: u32 = 1024 * 1024 * 1024;
 // Well inside the default nested tool timeout; staging itself is short.
 const ARTIFACT_STAGE_ADMISSION_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 
+#[cfg(test)]
+tokio::task_local! {
+    static TEST_STAGE_ADMISSION: (Arc<Semaphore>, Arc<Semaphore>);
+}
+
 // Separate from retention admission: slow staging does not hold the global
 // retention lock. Reserve both worker count and body/metadata workspace before cloning.
 async fn admit_artifact_stage(
     canonical: &CanonicalToolResult,
-) -> Result<(OwnedSemaphorePermit, OwnedSemaphorePermit), String> {
+) -> Result<((OwnedSemaphorePermit, OwnedSemaphorePermit), CanonicalMetadataBudget), String> {
+    #[cfg(test)]
+    if let Ok((count, bytes)) = TEST_STAGE_ADMISSION.try_with(Clone::clone) {
+        return admit_artifact_stage_from(&count, &bytes, ARTIFACT_STAGE_BYTE_CAPACITY,
+            canonical, ARTIFACT_STAGE_ADMISSION_WAIT).await;
+    }
     static COUNT: OnceLock<Arc<Semaphore>> = OnceLock::new();
     static BYTES: OnceLock<Arc<Semaphore>> = OnceLock::new();
     admit_artifact_stage_from(
@@ -2803,9 +2339,9 @@ async fn admit_artifact_stage_from(
     byte_capacity: u32,
     canonical: &CanonicalToolResult,
     wait: std::time::Duration,
-) -> Result<(OwnedSemaphorePermit, OwnedSemaphorePermit), String> {
-    let metadata = canonical_metadata_budget(
-        canonical,
+) -> Result<((OwnedSemaphorePermit, OwnedSemaphorePermit), CanonicalMetadataBudget), String> {
+    let metadata_budget = CanonicalMetadataBudget::new(canonical)?;
+    let metadata = metadata_budget.for_segments(
         canonical
             .bytes
             .len()
@@ -2841,7 +2377,7 @@ async fn admit_artifact_stage_from(
                 wait.as_millis()
             )
         })?;
-    Ok((count, bytes))
+    Ok(((count, bytes), metadata_budget))
 }
 
 // Four stable native lock files bound staging across every process sharing a
@@ -3418,9 +2954,65 @@ fn canonical_line_count(bytes: &[u8]) -> Result<usize, ReadToolOutputError> {
     Ok(count)
 }
 
+// The detached storage owner needs canonical bytes and recovery addresses, not
+// the producer's JSON DOM. Keep that DOM with the projection owner only.
+fn canonical_storage_snapshot(canonical: &CanonicalToolResult) -> CanonicalToolResult {
+    CanonicalToolResult {
+        kind: canonical.kind,
+        bytes: canonical.bytes.clone(),
+        value: None,
+        sha256: canonical.sha256.clone(),
+        exact_bytes: canonical.exact_bytes,
+        approximate_tokens: canonical.approximate_tokens,
+        complete: canonical.complete,
+        unavailable_ranges: canonical.unavailable_ranges.clone(),
+        json_pointers: canonical.json_pointers.clone(),
+        sections: canonical.sections.clone(),
+    }
+}
+
+#[derive(Debug)]
+struct CanonicalMetadataBudget {
+    invariant_bytes: u64,
+    line_count: Option<usize>,
+}
+
+impl CanonicalMetadataBudget {
+    fn new(canonical: &CanonicalToolResult) -> Result<Self, String> {
+        let line_count = canonical_line_count(&canonical.bytes).ok();
+        let invariant_bytes = canonical_invariant_metadata_bytes(canonical, line_count.unwrap_or(0))?;
+        Ok(Self { invariant_bytes, line_count })
+    }
+
+    fn for_segments(&self, segments: usize) -> Result<u64, String> {
+        let bytes = self.invariant_bytes.saturating_add((segments as u64).saturating_mul(256));
+        if bytes > MAX_CANONICAL_METADATA_BYTES {
+            return Err("artifact metadata exceeds its bounded representation".into());
+        }
+        Ok(bytes)
+    }
+
+    fn line_starts(&self, retained: &[u8], canonical_len: usize) -> Vec<u64> {
+        // Every retained body is a prefix of the immutable admitted bytes, so
+        // its line count cannot exceed the bounded count already computed.
+        self.line_count.map_or_else(Vec::new, |count| {
+            let capacity = if retained.len() == canonical_len { count } else { 1 };
+            canonical_line_starts_with_capacity(retained, capacity)
+        })
+    }
+}
+
+#[cfg(test)]
 fn canonical_metadata_budget(
     canonical: &CanonicalToolResult,
     segments: usize,
+) -> Result<u64, String> {
+    CanonicalMetadataBudget::new(canonical)?.for_segments(segments)
+}
+
+fn canonical_invariant_metadata_bytes(
+    canonical: &CanonicalToolResult,
+    lines: usize,
 ) -> Result<u64, String> {
     struct Counter(u64);
     impl std::io::Write for Counter {
@@ -3439,8 +3031,7 @@ fn canonical_metadata_budget(
     }
     // A newline-dense result is stored without a dense line index, so only an
     // index that will be stored is budgeted; its bytes remain retainable.
-    let lines = canonical_line_count(&canonical.bytes).unwrap_or(0);
-    let mut bytes = Counter(4096 + (segments as u64 + 1) * 256 + lines as u64 * 21);
+    let mut bytes = Counter(4096 + 256 + lines as u64 * 21);
     serde_json::to_writer(&mut bytes, &canonical.json_pointers)
         .map_err(|error| error.to_string())?;
     serde_json::to_writer(&mut bytes, &canonical.sections).map_err(|error| error.to_string())?;
@@ -3450,7 +3041,11 @@ fn canonical_metadata_budget(
 }
 
 fn canonical_line_starts(bytes: &[u8]) -> Result<Vec<u64>, ReadToolOutputError> {
-    let mut starts = Vec::with_capacity(canonical_line_count(bytes)?);
+    Ok(canonical_line_starts_with_capacity(bytes, canonical_line_count(bytes)?))
+}
+
+fn canonical_line_starts_with_capacity(bytes: &[u8], capacity: usize) -> Vec<u64> {
+    let mut starts = Vec::with_capacity(capacity);
     starts.push(0);
     starts.extend(
         bytes
@@ -3459,7 +3054,7 @@ fn canonical_line_starts(bytes: &[u8]) -> Result<Vec<u64>, ReadToolOutputError> 
             .filter_map(|(index, byte)| (*byte == b'\n').then_some(index as u64 + 1))
             .filter(|offset| *offset < bytes.len() as u64),
     );
-    Ok(starts)
+    starts
 }
 
 #[cfg(test)]
@@ -3816,23 +3411,41 @@ async fn create_canonical_output_artifact_inner(
     id: ToolOutputArtifactId,
     protect_history: bool,
 ) -> CanonicalOutputArtifact {
-    create_canonical_output_artifact_with_backing(codex_home, thread_id, canonical, id, protect_history, None).await
+    create_canonical_output_artifact_with_backing(codex_home, thread_id, canonical, id, protect_history, None, std::future::ready).await
 }
 
+#[cfg(test)]
 pub(crate) async fn create_source_snapshot_artifact(
     codex_home: &Path, thread_id: &str, canonical: &CanonicalToolResult, backing: Option<String>,
 ) -> CanonicalOutputArtifact {
-    create_canonical_output_artifact_with_backing(codex_home, thread_id, canonical, ToolOutputArtifactId::new(), false, backing).await
+    create_source_snapshot_artifact_with_completion(codex_home, thread_id, canonical, backing, std::future::ready).await
 }
 
-async fn create_canonical_output_artifact_with_backing(
+pub(crate) async fn create_source_snapshot_artifact_with_completion<F, Fut>(
+    codex_home: &Path, thread_id: &str, canonical: &CanonicalToolResult,
+    backing: Option<String>, completion: F,
+) -> CanonicalOutputArtifact
+where
+    F: FnOnce(CanonicalOutputArtifact) -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = CanonicalOutputArtifact> + Send + 'static,
+{
+    create_canonical_output_artifact_with_backing(codex_home, thread_id, canonical,
+        ToolOutputArtifactId::new(), true, backing, completion).await
+}
+
+async fn create_canonical_output_artifact_with_backing<F, Fut>(
     codex_home: &Path, thread_id: &str, canonical: &CanonicalToolResult,
     id: ToolOutputArtifactId, protect_history: bool, backing: Option<String>,
-) -> CanonicalOutputArtifact {
+    completion: F,
+) -> CanonicalOutputArtifact
+where
+    F: FnOnce(CanonicalOutputArtifact) -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = CanonicalOutputArtifact> + Send + 'static,
+{
     let codex_home = codex_home.to_path_buf();
     let thread_id = thread_id.to_string();
     let exact_bytes = canonical.exact_bytes;
-    let stage_admission = match admit_artifact_stage(canonical).await {
+    let (stage_admission, metadata_budget) = match admit_artifact_stage(canonical).await {
         Ok(permit) => permit,
         Err(error) => {
             return CanonicalOutputArtifact {
@@ -3857,7 +3470,7 @@ async fn create_canonical_output_artifact_with_backing(
                 };
             }
         };
-    let canonical = canonical.clone();
+    let canonical = canonical_storage_snapshot(canonical);
     // The coordinator only transfers ownership between flat filesystem workers.
     // Each worker owns pending-path cleanup and, during commit, the retention permit.
     // Caller cancellation detaches the coordinator; runtime shutdown cannot drop a
@@ -3868,6 +3481,7 @@ async fn create_canonical_output_artifact_with_backing(
                 codex_home,
                 thread_id,
                 canonical,
+                metadata_budget,
                 id,
                 shared_slot,
                 backing,
@@ -3897,10 +3511,18 @@ async fn create_canonical_output_artifact_with_backing(
                 });
             }
         };
-        tokio::task::spawn_blocking(move || {
-            commit_create_canonical_output_artifact(staged, process_permit, protect_history)
+        let (artifact, admission) = tokio::task::spawn_blocking(move || {
+            let mut staged = staged;
+            // Keep existing stage admission through the owned completion. A
+            // stalled registration cannot grow an unbounded queue of owners.
+            let admission = staged._stage_owner._admission.take();
+            let artifact = commit_create_canonical_output_artifact(staged, process_permit, protect_history);
+            (artifact, admission)
         })
-        .await
+        .await?;
+        let artifact = completion(artifact).await;
+        drop(admission);
+        Ok(artifact)
     })
     .await
     .and_then(std::convert::identity)
@@ -3917,6 +3539,7 @@ fn stage_create_canonical_output_artifact(
     codex_home: PathBuf,
     thread_id: String,
     canonical: CanonicalToolResult,
+    metadata_budget: CanonicalMetadataBudget,
     id: ToolOutputArtifactId,
     mut shared_slot: NativeStageSlot,
     backing: Option<String>,
@@ -3930,7 +3553,7 @@ fn stage_create_canonical_output_artifact(
             unavailable_ranges: vec![CanonicalByteRange::new(0, canonical.exact_bytes)],
             error: Some(error.to_string()),
         })?;
-    canonical_metadata_budget(&canonical, 0).map_err(|error| CanonicalOutputArtifact {
+    metadata_budget.for_segments(0).map_err(|error| CanonicalOutputArtifact {
         id: None,
         retained_bytes: 0,
         complete: false,
@@ -3993,6 +3616,7 @@ fn stage_create_canonical_output_artifact(
         directory,
         id,
         canonical,
+        metadata_budget,
         existing: Vec::new(),
         segments: staged_segments,
         cleanup,
@@ -4051,6 +3675,7 @@ fn commit_create_canonical_output_artifact(
         directory,
         id,
         canonical,
+        metadata_budget: canonical_metadata,
         existing: _,
         segments: staged_segments,
         cleanup: _staged_cleanup,
@@ -4088,7 +3713,7 @@ fn commit_create_canonical_output_artifact(
             error: Some(format!("failed to reconcile artifact transactions: {err}")),
         };
     }
-    let metadata_budget = match canonical_metadata_budget(&canonical, staged_segments.len()) {
+    let metadata_budget = match canonical_metadata.for_segments(staged_segments.len()) {
         Ok(bytes) => bytes,
         Err(error) => {
             return CanonicalOutputArtifact {
@@ -4168,26 +3793,7 @@ fn commit_create_canonical_output_artifact(
             }
         };
 
-    // The metadata budget admitted the canonical line count, which bounds this
-    // retained prefix; fail like any other metadata error if that ever breaks.
-    // A newline-dense result was budgeted without an index and stores none.
-    let indexed = canonical_line_count(&canonical.bytes).is_ok();
-    let line_starts = match indexed.then(|| canonical_line_starts(retained)).transpose() {
-        Ok(line_starts) => line_starts.unwrap_or_default(),
-        Err(err) => {
-            rollback_logical_artifact_creation(&retention_token, &path);
-            return CanonicalOutputArtifact {
-                id: Some(id),
-                retained_bytes: 0,
-                complete: false,
-                unavailable_ranges: vec![CanonicalByteRange::new(0, canonical.exact_bytes)],
-                error: Some(format!(
-                    "failed to index artifact lines: {}",
-                    err.for_model()
-                )),
-            };
-        }
-    };
+    let line_starts = canonical_metadata.line_starts(retained, canonical.bytes.len());
     let metadata = LogicalArtifactMetadata {
         version: LOGICAL_ARTIFACT_METADATA_VERSION,
         artifact_id: id.to_string(),
@@ -4303,7 +3909,7 @@ pub(crate) async fn attach_canonical_output_artifact(
     let artifact_id = artifact_id.to_string();
     let id = artifact_id.parse::<ToolOutputArtifactId>().ok();
     let exact_bytes = canonical.exact_bytes;
-    let stage_admission = match admit_artifact_stage(canonical).await {
+    let (stage_admission, metadata_budget) = match admit_artifact_stage(canonical).await {
         Ok(permit) => permit,
         Err(error) => {
             return CanonicalOutputArtifact {
@@ -4328,7 +3934,7 @@ pub(crate) async fn attach_canonical_output_artifact(
                 };
             }
         };
-    let canonical = canonical.clone();
+    let canonical = canonical_storage_snapshot(canonical);
     // The coordinator only transfers ownership between flat filesystem workers.
     // Each worker owns pending-path cleanup and, during commit, the retention permit.
     // Caller cancellation detaches the coordinator; runtime shutdown cannot drop a
@@ -4340,6 +3946,7 @@ pub(crate) async fn attach_canonical_output_artifact(
                 thread_id,
                 artifact_id,
                 canonical,
+                metadata_budget,
                 shared_slot,
             )?;
             staged._stage_owner._admission = Some(stage_admission);
@@ -4390,6 +3997,7 @@ fn stage_attach_canonical_output_artifact(
     thread_id: String,
     artifact_id: String,
     canonical: CanonicalToolResult,
+    metadata_budget: CanonicalMetadataBudget,
     mut shared_slot: NativeStageSlot,
 ) -> Result<StagedCanonicalOutput, CanonicalOutputArtifact> {
     let residency = artifact_residency_file(&codex_home, &thread_id, false)
@@ -4509,6 +4117,7 @@ fn stage_attach_canonical_output_artifact(
         directory,
         id,
         canonical,
+        metadata_budget,
         existing,
         segments: staged_segments,
         cleanup,
@@ -4526,6 +4135,7 @@ fn commit_attach_canonical_output_artifact(
         directory,
         id,
         canonical,
+        metadata_budget: canonical_metadata,
         existing,
         segments: staged_segments,
         cleanup: _staged_cleanup,
@@ -4623,7 +4233,7 @@ fn commit_attach_canonical_output_artifact(
             error: Some(format!("failed to reconcile artifact transactions: {err}")),
         };
     }
-    let metadata_budget = match canonical_metadata_budget(&canonical, staged_segments.len()) {
+    let metadata_budget = match canonical_metadata.for_segments(staged_segments.len()) {
         Ok(bytes) => bytes,
         Err(error) => {
             return CanonicalOutputArtifact {
@@ -4748,31 +4358,7 @@ fn commit_attach_canonical_output_artifact(
         &canonical.unavailable_ranges,
         retained_bytes,
     );
-    // As on creation, the admitted canonical line count bounds this prefix;
-    // fail like a metadata write if that ever breaks. A newline-dense result
-    // was budgeted without an index and stores none.
-    let indexed = canonical_line_count(&canonical.bytes).is_ok();
-    let line_starts = match indexed.then(|| canonical_line_starts(retained)).transpose() {
-        Ok(line_starts) => line_starts.unwrap_or_default(),
-        Err(err) => {
-            let _ = reconcile_logical_artifact_transaction(&path);
-            reject_stale_delta(&retention_token);
-            return CanonicalOutputArtifact {
-                id: Some(id),
-                retained_bytes: existing.len() as u64,
-                complete: false,
-                unavailable_ranges: normalized_unavailable_ranges(
-                    canonical.exact_bytes,
-                    &canonical.unavailable_ranges,
-                    existing.len() as u64,
-                ),
-                error: Some(format!(
-                    "failed to index artifact lines: {}",
-                    err.for_model()
-                )),
-            };
-        }
-    };
+    let line_starts = canonical_metadata.line_starts(retained, canonical.bytes.len());
     let metadata = LogicalArtifactMetadata {
         version: LOGICAL_ARTIFACT_METADATA_VERSION,
         artifact_id: id.to_string(),
@@ -5169,6 +4755,24 @@ fn verify_tool_history_artifact_blocking(
     Ok(())
 }
 
+/// The caller owns a complete receipt from this module's creation transaction.
+/// Check only whether its marker survived session reconciliation during staging.
+pub(crate) async fn created_source_snapshot_is_protected(
+    codex_home: &Path,
+    thread_id: &str,
+    artifact_id: &str,
+) -> Result<bool, String> {
+    let path = codex_home.join("tool-output").join(thread_id).join(format!("{artifact_id}.log"));
+    run_blocking_artifact_io(move || artifact_is_protected_blocking(&path))
+        .await
+        .map_err(|error| format!("failed to inspect new source protection: {error}"))
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(crate) static PROTECTION_VERIFICATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// Protects an artifact only after confinement, size, and digest checks succeed.
 pub(crate) async fn protect_active_tool_history_artifact(
     codex_home: &Path,
@@ -5177,6 +4781,8 @@ pub(crate) async fn protect_active_tool_history_artifact(
     expected_bytes: u64,
     expected_sha256: &str,
 ) -> Result<(), String> {
+    #[cfg(test)]
+    PROTECTION_VERIFICATIONS.with(|count| count.set(count.get() + 1));
     protect_active_tool_history_artifacts(
         codex_home,
         thread_id,
@@ -7240,7 +6846,7 @@ fn successful_exact_selector_result(
     bytes: &[u8],
 ) -> ToolOutputSelectorResult {
     #[cfg(test)]
-    audit145_tests::MATERIALIZED_BYTES.with(|count| count.set(count.get() + bytes.len()));
+    recovery_fidelity_tests::MATERIALIZED_BYTES.with(|count| count.set(count.get() + bytes.len()));
     if matches!(selector, ToolOutputSelector::Bytes { .. }) {
         return successful_byte_selector_result(range, bytes);
     }
@@ -7395,7 +7001,7 @@ fn select_logical_artifact(
     // Validate the range before this lower-bound rejection; semantic JSON
     // values and directories intentionally retain their ordinary path.
     #[cfg(test)]
-    let preflight = !audit145_tests::REFERENCE_SELECTION.with(std::cell::Cell::get);
+    let preflight = !recovery_fidelity_tests::REFERENCE_SELECTION.with(std::cell::Cell::get);
     #[cfg(not(test))]
     let preflight = true;
     if preflight && !matches!(selector, ToolOutputSelector::JsonPointer { .. })
@@ -7602,11 +7208,10 @@ impl ToolOutputSnapshot {
                 .iter()
                 .any(|selector| matches!(selector, ToolOutputSelector::JsonPointer { .. }))
             {
-                let complete = snapshot.indexed_metadata.get_or_init(|| {
-                    ValidatedJsonPointers::new(&snapshot.metadata, &snapshot.bytes)
-                });
                 if snapshot.bytes.len() <= 16 * 1024 {
-                    Some(complete)
+                    Some(snapshot.indexed_metadata.get_or_init(|| {
+                        ValidatedJsonPointers::new(&snapshot.metadata, &snapshot.bytes)
+                    }))
                 } else {
                     targeted = ValidatedJsonPointers::for_selectors(&snapshot.metadata, &snapshot.bytes, &selectors);
                     Some(&targeted)
@@ -7643,6 +7248,20 @@ pub(crate) async fn load_tool_output_snapshot(
         .join(thread_id)
         .join(format!("{id}.log"));
     tokio::task::spawn_blocking(move || {
+        // Capabilities are published before a possibly stalled writer creates
+        // its metadata file. Consult custody before interpreting a missing file
+        // as expiry; no disk or cache lock is held under this registry guard.
+        {
+            let registry = lock_retention_registry();
+            if registry.pending_canonical.contains(&path) {
+                return Err(ReadToolOutputError::StillWriting);
+            }
+            if let Some(error) = registry.failed_canonical.get(&path) {
+                return Err(ReadToolOutputError::Io(format!(
+                    "canonical retention failed: {error}; do not replay effects"
+                )));
+            }
+        }
         #[cfg(windows)]
         {
             immutable_snapshot_cache::shared()
@@ -9672,13 +9291,32 @@ where
     F: Fn(String) -> Fut,
     Fut: std::future::Future<Output = std::io::Result<bool>>,
 {
+    let mut removed = 0;
+    for directory in ["tool-output", "command-output"] {
+        removed += reclaim_unresumable_thread_artifacts_under_root(
+            codex_home, codex_home.join(directory), active_thread_id, now, &thread_is_resumable,
+        ).await?;
+    }
+    Ok(removed)
+}
+
+async fn reclaim_unresumable_thread_artifacts_under_root<F, Fut>(
+    codex_home: &Path,
+    root: PathBuf,
+    active_thread_id: &str,
+    now: SystemTime,
+    thread_is_resumable: &F,
+) -> std::io::Result<usize>
+where
+    F: Fn(String) -> Fut,
+    Fut: std::future::Future<Output = std::io::Result<bool>>,
+{
     let Some(move_owner) = codex_rollout::try_lock_rollout_moves(codex_home).await? else {
         return Ok(0);
     };
     if codex_rollout::has_recoverable_delete_staging(codex_home).await? {
         return Ok(0);
     }
-    let root = codex_home.join("tool-output");
     let scan_root = root.clone();
     let active_thread_id = active_thread_id.to_string();
     let idle = run_blocking_artifact_io(move || {
@@ -9771,10 +9409,12 @@ where
                 ),
             }
         }
-        // The in-memory index still counts the removed records.
-        let root = normalized_tool_output_root(&root);
-        let mut registry = lock_retention_registry();
-        transition_current_root_to_dirty(&mut registry, &root);
+        if root.file_name().is_some_and(|name| name == "tool-output") {
+            // Plain command logs do not participate in this snapshot index.
+            let root = normalized_tool_output_root(&root);
+            let mut registry = lock_retention_registry();
+            transition_current_root_to_dirty(&mut registry, &root);
+        }
         Ok(removed)
     })
     .await
@@ -11041,63 +10681,7 @@ mod tests {
             .unwrap();
     }
 
-    #[tokio::test]
-    async fn durable_audit_02_and_15_raw_status_and_verified_receipts_reenter_the_barrier() {
-        let home = tempfile::tempdir().unwrap();
-        let bytes = b"observed raw output";
-        let raw = create_raw_output_artifact(home.path(), "thread", bytes).await;
-        let RawOutputArtifact::Stored { path, .. } = &raw else {
-            panic!("stored output");
-        };
-        let path = path.clone();
-        sync_tool_output_artifacts(home.path(), "thread")
-            .await
-            .unwrap();
-        let state = Arc::new(Mutex::new(raw));
-        let mut writer = RawOutputArtifactWriter::open(Some(&state)).await.unwrap();
-        writer.finish(Some(&state)).await;
-        let metadata = logical_metadata_path(&path);
-        assert!(
-            lock_retention_registry()
-                .pending_sync
-                .contains_key(&metadata)
-        );
-        let saved = metadata.with_extension("saved");
-        std::fs::rename(&metadata, &saved).unwrap();
-        std::fs::create_dir(&metadata).unwrap();
-        assert!(
-            sync_tool_output_artifacts(home.path(), "thread")
-                .await
-                .is_err()
-        );
-        assert!(
-            lock_retention_registry()
-                .pending_sync
-                .contains_key(&metadata)
-        );
-        std::fs::remove_dir(&metadata).unwrap();
-        std::fs::rename(&saved, &metadata).unwrap();
-        sync_tool_output_artifacts(home.path(), "thread")
-            .await
-            .unwrap();
-        assert!(
-            !lock_retention_registry()
-                .pending_sync
-                .contains_key(&metadata)
-        );
-        verify_tool_history_artifact_blocking(
-            &path,
-            bytes.len() as u64,
-            &hex::encode(Sha256::digest(bytes)),
-        )
-        .unwrap();
-        assert!(lock_retention_registry().pending_sync.contains_key(&path));
-        assert!(
-            lock_retention_registry()
-                .pending_sync
-                .contains_key(&metadata)
-        );
-    }
+
 
     #[tokio::test]
     async fn durable_audit_23_live_and_external_owners_survive_idle_reclamation() {
@@ -11245,49 +10829,9 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn artifact_retains_exact_bytes_across_chunks() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let first = create_raw_output_artifact(temp.path(), "thread", b"alpha\0beta\n").await;
-        let state = Arc::new(Mutex::new(first));
-        let mut writer = RawOutputArtifactWriter::open(Some(&state)).await.unwrap();
-        writer
-            .write_chunk(Some(&state), b"unicode: \xce\xbb\n")
-            .await;
-        writer.finish(Some(&state)).await;
-        let second = state.lock().await.clone();
 
-        let RawOutputArtifact::Stored { path, bytes, .. } = second else {
-            panic!("expected stored artifact");
-        };
-        assert_eq!(bytes, 23);
-        assert_eq!(
-            tokio::fs::read(path).await.expect("read artifact"),
-            b"alpha\0beta\nunicode: \xce\xbb\n"
-        );
-    }
 
-    #[tokio::test]
-    async fn replacement_finalizes_background_output_without_duplicates() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let initial = create_raw_output_artifact(temp.path(), "thread", b"partial\n").await;
-        let state = Arc::new(Mutex::new(initial));
-        let mut writer = RawOutputArtifactWriter::open(Some(&state)).await.unwrap();
-        writer.write_chunk(Some(&state), b"tail\n").await;
-        writer.finish(Some(&state)).await;
-        let appended = state.lock().await.clone();
-        let final_output = b"partial\ntail\ncomplete\n";
-        let replaced = replace_raw_output_artifact(&appended, final_output).await;
 
-        let RawOutputArtifact::Stored { path, bytes, .. } = replaced else {
-            panic!("expected stored artifact");
-        };
-        assert_eq!(bytes, final_output.len() as u64);
-        assert_eq!(
-            tokio::fs::read(path).await.expect("read artifact"),
-            final_output
-        );
-    }
 
     #[tokio::test]
     async fn artifact_creation_truncates_at_the_per_artifact_byte_limit() {
@@ -11320,30 +10864,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn append_uses_the_original_handle_after_path_substitution() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let artifact = create_raw_output_artifact(temp.path(), "thread", b"original").await;
-        let RawOutputArtifact::Stored { path, .. } = &artifact else {
-            panic!("expected stored artifact");
-        };
-        let displaced = path.with_extension("displaced");
-        std::fs::rename(path, &displaced).expect("displace artifact path");
-        std::fs::write(path, b"substitute").expect("write substitute path");
 
-        let state = Arc::new(Mutex::new(artifact.clone()));
-        let mut writer = RawOutputArtifactWriter::open(Some(&state)).await.unwrap();
-        writer.write_chunk(Some(&state), b"-tail").await;
-        writer.finish(Some(&state)).await;
-        let appended = state.lock().await.clone();
-
-        assert!(matches!(appended, RawOutputArtifact::Stored { .. }));
-        assert_eq!(std::fs::read(path).expect("read substitute"), b"substitute");
-        assert_eq!(
-            std::fs::read(displaced).expect("read original handle target"),
-            b"original-tail"
-        );
-    }
 
     #[test]
     fn failed_artifact_render_does_not_disclose_the_owned_path_or_message() {
@@ -11615,51 +11136,9 @@ mod tests {
         assert_eq!(error, ReadToolOutputError::Expired);
     }
 
-    #[tokio::test]
-    async fn lazy_writer_spills_only_above_64_kib() {
-        let temp = tempfile::tempdir().unwrap();
-        let state = Arc::new(Mutex::new(RawOutputArtifact::pending(
-            temp.path(),
-            "thread",
-        )));
-        let mut writer = RawOutputArtifactWriter::open(Some(&state)).await.unwrap();
-        let output = vec![b'x'; 64 * 1024];
-        writer.write_chunk(Some(&state), &output).await;
-        assert!(state.lock().await.is_pending());
-        assert!(!temp.path().join("tool-output").exists());
-        writer.write_chunk(Some(&state), b"\n").await;
-        writer.finish(Some(&state)).await;
-        let artifact = state.lock().await.clone();
-        let RawOutputArtifact::Stored { path, .. } = artifact else {
-            panic!("output above the lazy threshold must remain recoverable");
-        };
-        let mut expected = output;
-        expected.push(b'\n');
-        assert_eq!(tokio::fs::read(path).await.unwrap(), expected);
-    }
 
-    #[tokio::test]
-    async fn read_reports_active_writer_lock_without_blocking() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let artifact = create_raw_output_artifact(temp.path(), "thread", b"partial\n").await;
-        let id = stored_id(&artifact);
-        let state = Arc::new(Mutex::new(artifact));
-        let _writer = RawOutputArtifactWriter::open(Some(&state))
-            .await
-            .expect("writer state");
 
-        let error = read_tool_output_selectors(
-            temp.path(),
-            "thread",
-            &id.to_string(),
-            vec![ToolOutputSelector::Lines { start: 1, end: 1 }],
-        )
-        .await
-        .expect_err("locked artifact should not be read");
 
-        assert_eq!(error, ReadToolOutputError::StillWriting);
-        assert_eq!(error.for_model(), ARTIFACT_WRITING_MESSAGE);
-    }
 
     #[tokio::test]
     async fn retention_removes_oldest_inactive_artifacts() {

@@ -33,7 +33,6 @@ use crate::tools::handlers::command_shape::powershell_script_failure_advisory;
 use crate::tools::handlers::implicit_granted_permissions;
 use crate::tools::handlers::normalize_and_validate_additional_permissions;
 use crate::tools::handlers::parse_arguments;
-use crate::tools::handlers::resolve_repository_root;
 use crate::tools::orchestrator::ToolOrchestrator;
 use crate::tools::runtimes::prove_noprofile_powershell_direct_argv_async;
 use crate::tools::runtimes::shell::ShellRequest;
@@ -497,9 +496,8 @@ pub(super) async fn run_exec_like_with_exit_code(
         }
     }
 
-    let repository_root = resolve_repository_root(args.exec_params.cwd.as_path());
     let is_validation = args.validation_launch;
-    run_exec_like_with_exit_code_inner(args, is_validation, repository_root).await
+    run_exec_like_with_exit_code_inner(args, is_validation).await
 }
 
 pub(crate) fn validation_environment_hash(env: &HashMap<String, String>) -> String {
@@ -527,20 +525,10 @@ fn restore_retained_validation_attempt(
     }
 }
 
-/// Only validation launches take the workspace validation gate, as in unified
-/// exec. Other commands neither wait behind nor block another session's
-/// validation, and their refusal must not read as pending validation.
-pub(crate) fn workspace_operation_root_if_needed(
-    is_validation: bool,
-    repository_root: std::path::PathBuf,
-) -> Option<std::path::PathBuf> {
-    is_validation.then_some(repository_root)
-}
 
 async fn run_exec_like_with_exit_code_inner(
     args: RunExecLikeArgs,
     is_validation: bool,
-    repository_root: std::path::PathBuf,
 ) -> Result<RunExecLikeResult, FunctionCallError> {
     let RunExecLikeArgs {
         max_output_tokens,
@@ -646,15 +634,6 @@ async fn run_exec_like_with_exit_code_inner(
             .begin_attempt_with_freshness(attempt_key, command_repaired, force_fresh)
             .await
     {
-        if blocked.is_search_miss() {
-            return Ok(RunExecLikeResult {
-                output: FunctionToolOutput::from_text(blocked.render_for_model(), Some(true)),
-                exit_code: Some(1),
-                validation_execution_outcome: ValidationExecutionOutcome::NotExecuted,
-                canonical_output: Some(Vec::new()),
-                canonical_complete: true,
-            });
-        }
         return Err(FunctionCallError::RespondToModel(
             blocked.render_for_model(),
         ));
@@ -807,8 +786,6 @@ async fn run_exec_like_with_exit_code_inner(
         None
     };
 
-    let workspace_operation_root =
-        workspace_operation_root_if_needed(is_validation, repository_root);
     let req = ShellRequest {
         command: exec_params.command.clone(),
         command_for_approval: safety_command,
@@ -823,16 +800,11 @@ async fn run_exec_like_with_exit_code_inner(
         cancellation_token,
         env: exec_params.env.clone(),
         explicit_env_overrides,
-        network: exec_params.network.clone(),
         sandbox_permissions: effective_additional_permissions.sandbox_permissions,
         additional_permissions: normalized_additional_permissions,
         justification: exec_params.justification.clone(),
         exec_approval_requirement,
         validation_launch,
-        validation_proof: command_validation
-            .as_ref()
-            .is_some_and(|validation| validation.signal()["proof"] == true),
-        workspace_operation_root,
     };
     let mut orchestrator = ToolOrchestrator::new();
     let mut runtime = ShellRuntime::for_shell_command();
@@ -899,11 +871,6 @@ async fn run_exec_like_with_exit_code_inner(
             .services
             .command_execution
             .record_exit(attempt_key, retry_exit_code)
-            .await;
-        session
-            .services
-            .command_execution
-            .record_verified_search_result(attempt_key, search_no_match)
             .await;
     }
     let execution_output = shell_validation_execution_output(&out, None);

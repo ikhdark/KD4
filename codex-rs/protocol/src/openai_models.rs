@@ -668,21 +668,34 @@ impl From<&ModelInfo> for ModelPreset {
 
 impl ModelPreset {
     pub fn supports_fast_mode(&self) -> bool {
-        self.service_tiers
-            .iter()
-            .any(|tier| tier.id == ServiceTier::Fast.request_value())
-            || self
-                .additional_speed_tiers
-                .iter()
-                .any(|tier| tier == SPEED_TIER_FAST)
+        supports_service_tier(
+            &self.service_tiers,
+            &self.additional_speed_tiers,
+            ServiceTier::Fast.request_value(),
+        )
     }
+}
+
+fn supports_service_tier(
+    service_tiers: &[ModelServiceTier],
+    additional_speed_tiers: &[String],
+    service_tier: &str,
+) -> bool {
+    // Legacy Fast metadata remains additive when a catalog also supplies modern tiers.
+    service_tiers.iter().any(|tier| tier.id == service_tier)
+        || (service_tier == ServiceTier::Fast.request_value()
+            && additional_speed_tiers
+                .iter()
+                .any(|tier| tier == SPEED_TIER_FAST))
 }
 
 impl ModelInfo {
     pub fn supports_service_tier(&self, service_tier: &str) -> bool {
-        self.service_tiers
-            .iter()
-            .any(|tier| tier.id == service_tier)
+        supports_service_tier(
+            &self.service_tiers,
+            &self.additional_speed_tiers,
+            service_tier,
+        )
     }
 
     pub fn service_tier_for_request(&self, service_tier: Option<String>) -> Option<String> {
@@ -1383,5 +1396,60 @@ mod tests {
             None
         );
         assert_eq!(model.service_tier_for_request(/*service_tier*/ None), None);
+    }
+
+    #[test]
+    fn fast_capability_and_request_filter_agree_for_modern_and_legacy_metadata() {
+        for modern in [false, true] {
+            for legacy in [false, true] {
+                let mut model = test_model(/*spec*/ None);
+                model.service_tiers = vec![ModelServiceTier {
+                    id: ServiceTier::Flex.request_value().to_string(),
+                    name: "Flex".to_string(),
+                    description: String::new(),
+                }];
+                if modern {
+                    model.service_tiers.push(ModelServiceTier {
+                        id: ServiceTier::Fast.request_value().to_string(),
+                        name: "Fast".to_string(),
+                        description: String::new(),
+                    });
+                }
+                model.additional_speed_tiers = if legacy {
+                    vec![SPEED_TIER_FAST.to_string()]
+                } else {
+                    Vec::new()
+                };
+                let fast = ServiceTier::Fast.request_value().to_string();
+                assert_eq!(
+                    ModelPreset::from(&model).supports_fast_mode(),
+                    modern || legacy
+                );
+                assert_eq!(model.supports_service_tier(&fast), modern || legacy);
+                assert_eq!(
+                    model.service_tier_for_request(Some(fast.clone())),
+                    (modern || legacy).then_some(fast),
+                );
+                assert_eq!(
+                    model.service_tier_for_request(Some(
+                        ServiceTier::Flex.request_value().to_string()
+                    )),
+                    Some(ServiceTier::Flex.request_value().to_string()),
+                );
+                assert_eq!(
+                    model.service_tier_for_request(Some("unsupported".to_string())),
+                    None
+                );
+            }
+        }
+        let mut legacy_only = test_model(/*spec*/ None);
+        legacy_only.service_tiers.clear();
+        legacy_only.additional_speed_tiers = vec![SPEED_TIER_FAST.to_string()];
+        assert!(ModelPreset::from(&legacy_only).supports_fast_mode());
+        assert_eq!(
+            legacy_only
+                .service_tier_for_request(Some(ServiceTier::Fast.request_value().to_string())),
+            Some(ServiceTier::Fast.request_value().to_string()),
+        );
     }
 }

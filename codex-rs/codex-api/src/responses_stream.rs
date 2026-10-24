@@ -231,22 +231,24 @@ impl ResponsesEventInterpreter {
             event.summary_index = Some(0);
         }
 
-        if let Some(response_turn_state) = event.turn_state()
-            && let Some(turn_state) = self.turn_state.as_deref()
-        {
-            let _ = turn_state.set(response_turn_state);
-        }
-
-        if let Some(headers) = event.headers.as_ref().and_then(Value::as_object)
-            && let Some(updated_treatment) = treatment_from_headers(&json_headers_to_http_headers(
-                headers.iter().filter(|(name, _)| {
-                    name.eq_ignore_ascii_case(X_CODEX_SAFETY_BUFFERING_ENABLED_HEADER)
-                        || name.eq_ignore_ascii_case(X_CODEX_SAFETY_BUFFERING_FASTER_MODEL_HEADER)
-                }),
-            ))
-        {
-            self.safety_buffering_treatment = updated_treatment;
-        }
+        // Stage metadata until the entire frame is admitted. A rejected frame
+        // must not poison caller-owned OnceLock state or model/treatment caches.
+        let response_turn_state = event.turn_state();
+        let updated_treatment = event.headers.as_ref().and_then(Value::as_object).and_then(|headers| {
+            treatment_from_headers(&json_headers_to_http_headers(headers.iter().filter(|(name, _)| {
+                name.eq_ignore_ascii_case(X_CODEX_SAFETY_BUFFERING_ENABLED_HEADER)
+                    || name.eq_ignore_ascii_case(X_CODEX_SAFETY_BUFFERING_FASTER_MODEL_HEADER)
+            })))
+        });
+        let updated_model = event
+            .response_model()
+            .filter(|model| self.last_server_model.as_deref() != Some(*model))
+            .map(str::to_owned);
+        // Failed/incomplete envelopes are admissible observations even though
+        // conversion returns an error. Foreign terminal frames are not.
+        let admissible_terminal_failure =
+            matches!(event.kind.as_ref(), "response.failed" | "response.incomplete")
+                && self.lifecycle.validate_ownership(&event).is_ok();
 
         if let Some(response) = event.response.as_ref()
             && let Some(reported_model) = response.model.as_ref().and_then(Value::as_str)
@@ -258,12 +260,9 @@ impl ResponsesEventInterpreter {
                 reported_model, provenance = "response.model", header_model,
                 "provider-reported identity; not an inferred reroute reason");
         }
-        if let Some(model) = event.response_model()
-            && self.last_server_model.as_deref() != Some(model)
-        {
-            self.last_server_model = Some(model.to_owned());
+        if let Some(model) = &updated_model {
             self.events
-                .push(ResponseEvent::ServerModel(model.to_owned()));
+                .push(ResponseEvent::ServerModel(model.clone()));
         }
         if let Some(verifications) = event.model_verifications() {
             self.events
@@ -273,7 +272,9 @@ impl ResponsesEventInterpreter {
             self.events
                 .push(ResponseEvent::TurnModerationMetadata(metadata));
         }
-        if let Some(buffering) = event.safety_buffering(&self.safety_buffering_treatment) {
+        if let Some(buffering) = event.safety_buffering(
+            updated_treatment.as_ref().unwrap_or(&self.safety_buffering_treatment),
+        ) {
             self.events.push(ResponseEvent::SafetyBuffering(buffering));
         }
         let completion_usage = if event.kind == "response.completed" {
@@ -305,7 +306,21 @@ impl ResponsesEventInterpreter {
                     })
                 }
                 (error, _) => error,
-            })?;
+            });
+        if interpreted.is_ok() || admissible_terminal_failure {
+            if let Some(response_turn_state) = response_turn_state
+                && let Some(turn_state) = self.turn_state.as_deref()
+            {
+                let _ = turn_state.set(response_turn_state);
+            }
+            if let Some(treatment) = updated_treatment {
+                self.safety_buffering_treatment = treatment;
+            }
+            if let Some(model) = updated_model {
+                self.last_server_model = Some(model);
+            }
+        }
+        let interpreted = interpreted?;
         if let Some(event) = interpreted {
             self.events.push(event);
         }
@@ -377,6 +392,8 @@ fn is_known_event(kind: &str) -> bool {
             | "response.output_item.done"
             | "response.output_item.added"
             | "response.output_text.delta"
+            | "response.refusal.delta"
+            | "response.refusal.done"
             | "response.custom_tool_call_input.delta"
             | "response.function_call_arguments.delta"
             | "response.reasoning_summary_text.delta"
@@ -452,6 +469,9 @@ fn parse_usage(value: Option<Value>) -> Option<TokenUsage> {
     invalid |= input
         .zip(cached)
         .is_some_and(|(input, cached)| cached > input);
+    invalid |= input
+        .zip(cache_write)
+        .is_some_and(|(input, write)| write > input);
     invalid |= output
         .zip(reasoning)
         .is_some_and(|(output, reasoning)| reasoning > output);
@@ -461,6 +481,15 @@ fn parse_usage(value: Option<Value>) -> Option<TokenUsage> {
         .is_some_and(|((input, cached), write)| {
             cached.checked_add(write).is_none_or(|sum| sum > input)
         });
+    invalid |= total.is_some_and(|total| {
+        [input, output, cached, cache_write, reasoning]
+            .into_iter()
+            .flatten()
+            .any(|component| component > total)
+            || input.zip(output).is_some_and(|(input, output)| {
+                input.checked_add(output).is_none_or(|sum| sum != total)
+            })
+    });
     Some(TokenUsage {
         input_tokens: input.unwrap_or(0),
         cached_input_tokens: cached.unwrap_or(0),
@@ -484,56 +513,64 @@ fn parse_usage(value: Option<Value>) -> Option<TokenUsage> {
 }
 
 /// Stable error fields are independent of optional provider metadata. HTTP
-/// adapters keep their status-based fallback when the provider code is unknown.
+/// adapters keep their status-based fallback when both code and type are unknown.
 pub(crate) fn classify_provider_error(value: &Value) -> Option<ApiError> {
-    let code = value
-        .get("code")
-        .and_then(Value::as_str)
-        .or_else(|| value.get("type").and_then(Value::as_str));
     let message = value
         .get("message")
         .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_owned();
-    Some(match code? {
-        "context_length_exceeded" => ApiError::ContextWindowExceeded,
-        "insufficient_quota" | "quota_exceeded" | "billing_hard_limit_reached" => {
-            ApiError::QuotaExceeded
-        }
-        "usage_not_included" => ApiError::UsageNotIncluded,
-        "cyber_policy" => ApiError::CyberPolicy {
-            message: cyber_policy_message(Some(message)),
-        },
-        "server_is_overloaded" | "slow_down" => ApiError::ServerOverloaded { retry_after: None },
-        "server_error" | "internal_server_error" | "rate_limit_exceeded" => {
-            let delay = try_parse_retry_after(&Error {
-                code: code.map(str::to_owned),
-                message: Some(message.clone()),
-            });
-            ApiError::Retryable {
-                message,
-                delay: delay.and_then(codex_http_client::RetryAfter::from_delay),
-            }
-        }
-        "invalid_request_error"
-        | "invalid_prompt"
-        | "bio_policy"
-        | "content_policy_violation"
-        | "invalid_image"
-        | "invalid_image_format"
-        | "invalid_base64_image"
-        | "invalid_image_url"
-        | "image_too_large"
-        | "image_too_small"
-        | "image_parse_error"
-        | "image_content_policy_violation"
-        | "invalid_image_mode"
-        | "image_file_too_large"
-        | "unsupported_image_media_type"
-        | "empty_image_file"
-        | "image_file_not_found" => ApiError::InvalidRequest { message },
-        _ => return None,
-    })
+        .unwrap_or_default();
+    // A provider-specific code can refine a stable type without being known to
+    // this client. Prefer recognized codes, but do not let an unknown one hide
+    // a recognized type (for example server_error).
+    [value.get("code"), value.get("type")]
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .find_map(|code| {
+            Some(match code {
+                "context_length_exceeded" => ApiError::ContextWindowExceeded,
+                "insufficient_quota" | "quota_exceeded" | "billing_hard_limit_reached" => {
+                    ApiError::QuotaExceeded
+                }
+                "usage_not_included" => ApiError::UsageNotIncluded,
+                "cyber_policy" => ApiError::CyberPolicy {
+                    message: cyber_policy_message(Some(message.to_owned())),
+                },
+                "server_is_overloaded" | "slow_down" => {
+                    ApiError::ServerOverloaded { retry_after: None }
+                }
+                "server_error" | "internal_server_error" | "rate_limit_exceeded" => {
+                    let delay = try_parse_retry_after(&Error {
+                        code: Some(code.to_owned()),
+                        message: Some(message.to_owned()),
+                    });
+                    ApiError::Retryable {
+                        message: message.to_owned(),
+                        delay: delay.and_then(codex_http_client::RetryAfter::from_delay),
+                    }
+                }
+                "invalid_request_error"
+                | "invalid_prompt"
+                | "bio_policy"
+                | "content_policy_violation"
+                | "invalid_image"
+                | "invalid_image_format"
+                | "invalid_base64_image"
+                | "invalid_image_url"
+                | "image_too_large"
+                | "image_too_small"
+                | "image_parse_error"
+                | "image_content_policy_violation"
+                | "invalid_image_mode"
+                | "image_file_too_large"
+                | "unsupported_image_media_type"
+                | "empty_image_file"
+                | "image_file_not_found" => ApiError::InvalidRequest {
+                    message: message.to_owned(),
+                },
+                _ => return None,
+            })
+        })
 }
 
 fn provider_error(value: &Value) -> ApiError {
@@ -685,7 +722,7 @@ fn process_responses_event(
             let item = parse_required_response_item("response.output_item.done", event.item)?;
             return Ok(Some(ResponseEvent::OutputItemDone(item)));
         }
-        "response.output_text.delta" => {
+        "response.output_text.delta" | "response.refusal.delta" => {
             if let Some(delta) = event.delta {
                 return Ok(Some(ResponseEvent::OutputTextDelta(delta)));
             }
@@ -862,7 +899,11 @@ fn parse_required_response_item(
         ResponseItem::Message { role, content, .. } => {
             role == "assistant"
                 && content.iter().all(|part| {
-                    matches!(part, codex_protocol::models::ContentItem::OutputText { .. })
+                    matches!(
+                        part,
+                        codex_protocol::models::ContentItem::OutputText { .. }
+                            | codex_protocol::models::ContentItem::Refusal { .. }
+                    )
                 })
         }
         ResponseItem::Reasoning { .. }
@@ -2076,5 +2117,252 @@ mod harness_usage_regressions {
         let events = interpreter.process_payload(r#"{"type":"response.completed","response":{"id":"response-1","usage":{"input_tokens":10,"output_tokens":2,"total_tokens":12}}}"#).unwrap().collect::<Vec<_>>();
         assert!(matches!(events.as_slice(), [ResponseEvent::Completed { token_usage: Some(usage), .. }] if usage.known_total() == Some(12)));
         USAGE_PAYLOAD_PARSE_COUNT.with(|count| assert_eq!(count.get(), 1));
+    }
+}
+
+#[cfg(test)]
+mod stream_audit_regressions {
+    use super::*;
+    use serde_json::json;
+
+    fn send(
+        stream: &mut ResponsesEventInterpreter,
+        event: Value,
+    ) -> Result<Vec<ResponseEvent>, ResponsesEventError> {
+        stream
+            .process_payload(&event.to_string())
+            .map(Iterator::collect)
+    }
+
+    #[test]
+    fn rejected_metadata_cannot_poison_shared_turn_state_or_metadata_caches() {
+        let turn_state = Arc::new(OnceLock::new());
+        let mut stream = ResponsesEventInterpreter::new(
+            &ResponsesStreamMetadata::default(),
+            Some(Arc::clone(&turn_state)),
+        );
+        send(
+            &mut stream,
+            json!({"type":"response.created","response":{"id":"current"}}),
+        )
+        .unwrap();
+        let mut metadata = json!({"type":"response.metadata","response_id":"foreign","headers":{
+            "x-codex-turn-state":"turn-state","openai-model":"model",
+            "x-codex-safety-buffering-faster-model":"fast-model"
+        }});
+        assert!(send(&mut stream, metadata.clone()).is_err());
+        assert!(turn_state.get().is_none());
+        assert!(stream.last_server_model.is_none());
+        assert_eq!(
+            stream.safety_buffering_treatment,
+            SafetyBufferingTreatment::default()
+        );
+        metadata["response_id"] = json!("current");
+        let events = send(&mut stream, metadata).unwrap();
+        assert_eq!(turn_state.get().map(String::as_str), Some("turn-state"));
+        assert!(matches!(&events[0], ResponseEvent::ServerModel(model) if model == "model"));
+        assert_eq!(
+            stream.safety_buffering_treatment.faster_model.as_deref(),
+            Some("fast-model")
+        );
+    }
+
+    #[test]
+    fn malformed_items_do_not_commit_metadata_but_owned_terminal_failures_do() {
+        for (kind, commit) in [
+            ("response.output_item.done", false),
+            ("response.failed", true),
+            ("response.incomplete", true),
+        ] {
+            let mut stream =
+                ResponsesEventInterpreter::new(&ResponsesStreamMetadata::default(), None);
+            let event = json!({"type":kind,"response":{"id":"r","error":{"code":"server_error"}},
+                "headers":{"openai-model":"model","x-codex-safety-buffering-faster-model":"fast-model"}});
+            assert!(send(&mut stream, event).is_err());
+            assert_eq!(
+                stream.last_server_model.as_deref(),
+                commit.then_some("model")
+            );
+            assert_eq!(
+                stream.safety_buffering_treatment.faster_model.as_deref(),
+                commit.then_some("fast-model")
+            );
+        }
+    }
+
+    fn terminal_usage(kind: &str, usage: &Value) -> TokenUsage {
+        let mut stream = ResponsesEventInterpreter::new(&ResponsesStreamMetadata::default(), None);
+        let event = json!({"type":kind,"response":{"id":"receipt","usage":usage,
+            "error":{"code":"server_error"},"incomplete_details":{"reason":"max_output_tokens"}}});
+        match send(&mut stream, event) {
+            Ok(events) => events
+                .into_iter()
+                .find_map(|event| match event {
+                    ResponseEvent::Completed { token_usage, .. } => token_usage,
+                    _ => None,
+                })
+                .expect("completed receipt"),
+            Err(ResponsesEventError::Api(error)) => crate::api_bridge::map_api_error(error)
+                .terminal_usage()
+                .expect("terminal observation")
+                .clone()
+                .expect("receipt"),
+            Err(error) => panic!("unexpected parse failure: {error:?}"),
+        }
+    }
+
+    #[test]
+    fn usage_relationships_are_checked_without_erasing_raw_terminal_receipts() {
+        let mut cases = vec![
+            (json!({"input_tokens":10,"total_tokens":9}), true),
+            (json!({"output_tokens":2,"total_tokens":1}), true),
+            (
+                json!({"input_tokens_details":{"cached_tokens":2},"total_tokens":1}),
+                true,
+            ),
+            (
+                json!({"input_tokens_details":{"cache_write_tokens":2},"total_tokens":1}),
+                true,
+            ),
+            (
+                json!({"output_tokens_details":{"reasoning_tokens":2},"total_tokens":1}),
+                true,
+            ),
+            (
+                json!({"input_tokens":10,"output_tokens":2,"total_tokens":1}),
+                true,
+            ),
+            (
+                json!({"input_tokens":10,"output_tokens":2,"total_tokens":13}),
+                true,
+            ),
+            (
+                json!({"input_tokens":10,"output_tokens":2,"total_tokens":12}),
+                false,
+            ),
+            (json!({"input_tokens":10,"total_tokens":12}), false),
+            (
+                json!({"input_tokens":i64::MAX,"output_tokens":1,"total_tokens":i64::MAX}),
+                true,
+            ),
+            (
+                json!({"input_tokens":i64::MAX,"input_tokens_details":{"cached_tokens":i64::MAX,"cache_write_tokens":1}}),
+                true,
+            ),
+        ];
+        for cached in [None, Some(Value::Null), Some(json!(0))] {
+            for write in [9, 11] {
+                let mut usage = json!({"input_tokens":10,"output_tokens":2,"total_tokens":12,"input_tokens_details":{"cache_write_tokens":write}});
+                if let Some(cached) = &cached {
+                    usage["input_tokens_details"]["cached_tokens"] = cached.clone();
+                }
+                cases.push((usage, write > 10));
+            }
+        }
+        for (raw, invalid) in cases {
+            for kind in [
+                "response.completed",
+                "response.failed",
+                "response.incomplete",
+            ] {
+                let usage = terminal_usage(kind, &raw);
+                assert_eq!(
+                    usage.known_input(),
+                    raw.get("input_tokens").and_then(Value::as_i64)
+                );
+                assert_eq!(
+                    usage.known_output(),
+                    raw.get("output_tokens").and_then(Value::as_i64)
+                );
+                assert_eq!(
+                    usage.known_total(),
+                    raw.get("total_tokens").and_then(Value::as_i64)
+                );
+                assert_eq!(
+                    usage.known_cache_write_input(),
+                    raw.get("input_tokens_details")
+                        .and_then(|details| details.get("cache_write_tokens"))
+                        .and_then(Value::as_i64)
+                );
+                assert_eq!(
+                    usage.coverage.as_ref().unwrap().invalid_receipts,
+                    u64::from(invalid),
+                    "{kind}: {raw}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn unknown_specific_error_codes_do_not_hide_recognized_types() {
+        let error = json!({"code":"upstream_timeout","type":"server_error","message":"temporarily unavailable"});
+        for event in [
+            json!({"type":"error","error":error}),
+            json!({"type":"response.failed","response":{"id":"r","error":error}}),
+        ] {
+            let mut stream =
+                ResponsesEventInterpreter::new(&ResponsesStreamMetadata::default(), None);
+            let Err(ResponsesEventError::Api(error)) = send(&mut stream, event) else {
+                panic!("provider failure")
+            };
+            assert!(crate::api_bridge::map_api_error(error).is_retryable());
+        }
+        assert!(matches!(
+            classify_provider_error(&json!({"code":"insufficient_quota","type":"server_error"})),
+            Some(ApiError::QuotaExceeded)
+        ));
+        assert!(
+            classify_provider_error(&json!({"code":"future_code","type":"future_type"})).is_none()
+        );
+        let mapped =
+            crate::api_bridge::map_api_error(ApiError::Transport(crate::TransportError::Http {
+                status: http::StatusCode::BAD_GATEWAY,
+                url: None,
+                headers: None,
+                body: Some(json!({"error":error}).to_string()),
+                retry_after: None,
+            }));
+        assert!(mapped.is_retryable());
+    }
+
+    #[test]
+    fn refusal_streams_display_text_and_preserve_typed_final_content() {
+        let mut stream = ResponsesEventInterpreter::new(&ResponsesStreamMetadata::default(), None);
+        send(
+            &mut stream,
+            json!({"type":"response.created","response":{"id":"r"}}),
+        )
+        .unwrap();
+        send(&mut stream, json!({"type":"response.output_item.added","item":{"type":"message","id":"m","role":"assistant","content":[]}})).unwrap();
+        assert!(
+            matches!(send(&mut stream, json!({"type":"response.refusal.delta","item_id":"m","delta":"Cannot comply"})).unwrap().as_slice(), [ResponseEvent::OutputTextDelta(text)] if text == "Cannot comply")
+        );
+        assert!(send(&mut stream, json!({"type":"response.refusal.done","item_id":"foreign","refusal":"Cannot comply"})).is_err());
+        assert!(
+            send(
+                &mut stream,
+                json!({"type":"response.refusal.done","item_id":"m","refusal":"Cannot comply"})
+            )
+            .unwrap()
+            .is_empty()
+        );
+        let item = json!({"type":"message","id":"m","role":"assistant","content":[{"type":"refusal","refusal":"Cannot comply"}]});
+        let events = send(
+            &mut stream,
+            json!({"type":"response.output_item.done","item":item}),
+        )
+        .unwrap();
+        assert!(
+            matches!(&events[0], ResponseEvent::OutputItemDone(ResponseItem::Message { content, .. }) if matches!(content.as_slice(), [codex_protocol::models::ContentItem::Refusal { refusal }] if refusal == "Cannot comply"))
+        );
+        assert!(matches!(
+            send(
+                &mut stream,
+                json!({"type":"response.completed","response":{"id":"r","output":[item]}})
+            )
+            .unwrap()
+            .as_slice(),
+            [ResponseEvent::Completed { .. }]
+        ));
     }
 }

@@ -187,7 +187,7 @@ impl From<VerbosityConfig> for OpenAiVerbosity {
 pub struct ResponsesInput {
     prefix: Arc<[ResponseItem]>,
     shared: Arc<[ResponseItem]>,
-    contiguous: std::sync::OnceLock<Arc<[ResponseItem]>>,
+    contiguous: Arc<std::sync::OnceLock<Arc<[ResponseItem]>>>,
 }
 
 impl ResponsesInput {
@@ -195,7 +195,7 @@ impl ResponsesInput {
         Self {
             prefix: prefix.into(),
             shared,
-            contiguous: std::sync::OnceLock::new(),
+            contiguous: Arc::default(),
         }
     }
 
@@ -225,7 +225,8 @@ impl ResponsesInput {
     pub fn update_segments(&mut self, mut update: impl FnMut(&mut Arc<[ResponseItem]>)) {
         update(&mut self.prefix);
         update(&mut self.shared);
-        self.contiguous = std::sync::OnceLock::new();
+        // Other immutable request clones can retain their shared materialization.
+        self.contiguous = Arc::default();
     }
 }
 
@@ -257,9 +258,11 @@ impl std::ops::DerefMut for ResponsesInput {
         if !self.prefix.is_empty() {
             self.shared = self
                 .contiguous
-                .take()
+                .get()
+                .cloned()
                 .unwrap_or_else(|| self.iter().cloned().collect::<Vec<_>>().into());
             self.prefix = Arc::from([]);
+            self.contiguous = Arc::default();
         }
         &mut self.shared
     }

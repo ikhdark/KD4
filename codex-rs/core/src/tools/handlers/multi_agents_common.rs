@@ -20,13 +20,12 @@ use codex_protocol::openai_models::ReasoningEffort;
 use codex_protocol::openai_models::ReasoningEffortPreset;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::SubAgentSource;
-use codex_protocol::user_input::UserInput;
 use codex_tools::ToolOutputProjectionMetadata;
 use serde::Serialize;
 use serde_json::Value as JsonValue;
 
-pub(crate) const DEFAULT_SPAWN_AGENT_MODEL: &str = "gpt-6-astra";
-pub(crate) const DEFAULT_SPAWN_AGENT_REASONING_EFFORT: ReasoningEffort = ReasoningEffort::High;
+pub(crate) const DEFAULT_SPAWN_AGENT_MODEL: &str = "gpt-6.1-sol";
+pub(crate) const DEFAULT_SPAWN_AGENT_REASONING_EFFORT: ReasoningEffort = ReasoningEffort::XHigh;
 
 pub(crate) fn function_arguments(payload: ToolPayload) -> Result<String, FunctionCallError> {
     match payload {
@@ -132,38 +131,6 @@ pub(crate) fn thread_spawn_source(
     }))
 }
 
-pub(crate) fn parse_collab_input(
-    message: Option<String>,
-    items: Option<Vec<UserInput>>,
-) -> Result<Vec<UserInput>, FunctionCallError> {
-    match (message, items) {
-        (Some(_), Some(_)) => Err(FunctionCallError::RespondToModel(
-            "Provide either message or items, but not both".to_string(),
-        )),
-        (None, None) => Err(FunctionCallError::RespondToModel(
-            "Provide one of: message or items".to_string(),
-        )),
-        (Some(message), None) => {
-            if message.trim().is_empty() {
-                return Err(FunctionCallError::RespondToModel(
-                    "Empty message can't be sent to an agent".to_string(),
-                ));
-            }
-            Ok(vec![UserInput::Text {
-                text: message,
-                text_elements: Vec::new(),
-            }])
-        }
-        (None, Some(items)) => {
-            if items.is_empty() {
-                return Err(FunctionCallError::RespondToModel(
-                    "Items can't be empty".to_string(),
-                ));
-            }
-            Ok(items)
-        }
-    }
-}
 
 /// Builds the base config snapshot for a newly spawned sub-agent.
 ///
@@ -566,6 +533,24 @@ fn validate_spawn_agent_reasoning_effort(
 #[cfg(test)]
 mod compatible_defaults_tests {
     use super::*;
+    #[test]
+    fn defaults_prefer_sol_6_1_and_extra_high_over_astra_high() {
+        let preset = |model: &str| -> codex_protocol::openai_models::ModelPreset {
+            serde_json::from_value(serde_json::json!({
+                "id": model, "model": model, "display_name": model, "description": model,
+                "default_reasoning_effort": "high", "supported_reasoning_efforts": [],
+                "is_default": false, "show_in_picker": true, "supported_in_api": true
+            })).unwrap()
+        };
+        for name in ["gpt-6.1-sol", "openai.gpt-6.1-sol"] {
+            let catalog = vec![preset("gpt-6-astra"), preset(name)];
+            assert_eq!(find_default_spawn_agent_model_name(&catalog, Some("gpt-6-astra")).unwrap(), name);
+        }
+        let supported = [ReasoningEffort::High, ReasoningEffort::XHigh].map(|effort| ReasoningEffortPreset {
+            effort, description: String::new(),
+        });
+        assert_eq!(default_spawn_reasoning_effort(&supported, Some(ReasoningEffort::High)), Some(ReasoningEffort::XHigh));
+    }
     #[test]
     fn omitted_effort_falls_back_but_explicit_effort_stays_strict() {
         let supported = vec![ReasoningEffortPreset {

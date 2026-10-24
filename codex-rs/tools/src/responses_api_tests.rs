@@ -14,6 +14,49 @@ use serde_json::json;
 use std::collections::BTreeMap;
 
 #[test]
+fn callable_name_receipts_reject_malformed_namespace_identity() {
+    for scope in [
+        json!(null),
+        json!(7),
+        json!({}),
+        json!([]),
+        json!(""),
+        json!(" "),
+        json!(" padded "),
+    ] {
+        assert_eq!(
+            LoadableToolSpec::callable_names_from_value(
+                &json!({"type":"function", "name":"read", "namespace":scope})
+            ),
+            None
+        );
+    }
+    for value in [
+        json!({"type":"function", "name":"flat", "function":{"name":"wrapped"}}),
+        json!({"type":"function", "function":{"name":"read", "namespace":7}}),
+        json!({"type":"namespace", "name":"docs", "tools":[{"type":"function", "name":"read", "namespace":"other"}]}),
+    ] {
+        assert_eq!(LoadableToolSpec::callable_names_from_value(&value), None);
+    }
+    for (value, expected) in [
+        (json!({"name":"read"}), "read"),
+        (
+            json!({"type":"function", "name":"read", "namespace":"docs"}),
+            "docs.read",
+        ),
+        (
+            json!({"type":"function", "function":{"name":"read"}, "namespace":"docs"}),
+            "docs.read",
+        ),
+    ] {
+        assert_eq!(
+            LoadableToolSpec::callable_names_from_value(&value),
+            Some(vec![expected.into()])
+        );
+    }
+}
+
+#[test]
 fn tool_definition_to_responses_api_tool_omits_false_defer_loading() {
     let tool = tool_definition_to_responses_api_tool(ToolDefinition {
         name: "lookup_order".to_string(),

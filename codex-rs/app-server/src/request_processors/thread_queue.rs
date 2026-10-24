@@ -1,5 +1,10 @@
-use super::thread_goal_processor::parse_thread_id_for_request;
 use super::*;
+
+fn parse_thread_id_for_request(thread_id: &str) -> Result<ThreadId, JSONRPCErrorError> {
+    ThreadId::from_string(thread_id)
+        .map_err(|err| invalid_request(format!("invalid thread id: {err}")))
+}
+
 use codex_app_server_protocol::QueuedSubmission;
 use codex_app_server_protocol::ThreadQueueAddParams;
 use codex_app_server_protocol::ThreadQueueAddResponse;
@@ -86,18 +91,63 @@ impl Default for Queue {
 }
 
 impl Queue {
+    fn encode_with_budget(&mut self, max_bytes: usize) -> Result<String, JSONRPCErrorError> {
+        let payload = serde_json::to_string(&*self).map_err(queue_error)?;
+        let mut bytes = payload.len();
+        let mut evicted = 0;
+        for accepted in &self.accepted {
+            if bytes <= max_bytes {
+                break;
+            }
+            // Compact JSON contributions are exact, including escaped keys and
+            // the comma removed from each non-singleton array/object.
+            bytes -= serde_json::to_vec(accepted).map_err(queue_error)?.len()
+                + usize::from(self.accepted.len() - evicted > 1);
+            let observation_count = self.task_observations.len();
+            if let Some(observation) = self.task_observations.remove(&accepted.submission.id) {
+                bytes -= serde_json::to_vec(&accepted.submission.id)
+                    .map_err(queue_error)?
+                    .len()
+                    + 1
+                    + serde_json::to_vec(&observation).map_err(queue_error)?.len()
+                    + usize::from(observation_count > 1);
+            }
+            evicted += 1;
+        }
+        self.accepted.drain(..evicted);
+        if bytes > max_bytes {
+            return Err(invalid_params("thread queue exceeds its storage limit"));
+        }
+        if evicted == 0 {
+            Ok(payload)
+        } else {
+            // Pending prompts are encoded at most twice, not once per receipt.
+            serde_json::to_string(self).map_err(queue_error)
+        }
+    }
+
+    #[cfg(test)]
     async fn add_sealed(
         &mut self,
         params: ThreadQueueAddParams,
     ) -> Result<(QueuedSubmission, bool), JSONRPCErrorError> {
         let (item, added) = self.add(params)?;
-        if added
-            && item
-                .input
-                .iter()
-                .any(|input| matches!(input, V2UserInput::LocalImage { .. }))
-        {
-            match seal_queue_input(item.input.clone()).await {
+        let sealed = if added {
+            seal_queue_input(item.input.clone()).await
+        } else {
+            Ok(Vec::new())
+        };
+        self.finish_sealed_add(item, added, sealed)
+    }
+
+    fn finish_sealed_add(
+        &mut self,
+        item: QueuedSubmission,
+        added: bool,
+        sealed: Result<Vec<V2UserInput>, JSONRPCErrorError>,
+    ) -> Result<(QueuedSubmission, bool), JSONRPCErrorError> {
+        if added && item.input.iter().any(|input| matches!(input, V2UserInput::LocalImage { .. })) {
+            match sealed {
                 Ok(input) => {
                     self.execution_inputs.insert(item.id.clone(), input);
                 }
@@ -116,10 +166,10 @@ impl Queue {
         Ok((item, added))
     }
 
-    fn add(
-        &mut self,
-        params: ThreadQueueAddParams,
-    ) -> Result<(QueuedSubmission, bool), JSONRPCErrorError> {
+    fn existing_submission(
+        &self,
+        params: &ThreadQueueAddParams,
+    ) -> Result<Option<QueuedSubmission>, JSONRPCErrorError> {
         if let Some(client_id) = &params.client_user_message_id
             && let Some(existing) = self
                 .submissions
@@ -132,7 +182,17 @@ impl Queue {
                     "clientUserMessageId already has different queued input",
                 ));
             }
-            return Ok((existing.clone(), false));
+            return Ok(Some(existing.clone()));
+        }
+        Ok(None)
+    }
+
+    fn add(
+        &mut self,
+        params: ThreadQueueAddParams,
+    ) -> Result<(QueuedSubmission, bool), JSONRPCErrorError> {
+        if let Some(existing) = self.existing_submission(&params)? {
+            return Ok((existing, false));
         }
         if self.submissions.len() >= MAX_QUEUE_ENTRIES {
             return Err(invalid_params("thread queue is full"));
@@ -251,6 +311,7 @@ pub(crate) struct ThreadQueueRequestProcessor {
     background_tasks: TaskTracker,
     // Connection capabilities are never persisted or reused across restarts.
     origins: Arc<StdMutex<HashMap<(ThreadId, String), QueueOrigin>>>,
+    notification_revisions: Arc<StdMutex<HashMap<ThreadId, std::sync::Weak<Mutex<u64>>>>>,
 }
 
 impl ThreadQueueRequestProcessor {
@@ -269,6 +330,7 @@ impl ThreadQueueRequestProcessor {
             turn_processor,
             background_tasks: thread_processor.background_tasks.clone(),
             origins: Arc::default(),
+            notification_revisions: Arc::default(),
         }
     }
 
@@ -324,15 +386,7 @@ impl ThreadQueueRequestProcessor {
             .revision
             .checked_add(1)
             .ok_or_else(|| internal_error("queue revision overflow"))?;
-        let mut payload = serde_json::to_string(queue).map_err(queue_error)?;
-        while payload.len() > MAX_QUEUE_BYTES && !queue.accepted.is_empty() {
-            let evicted = queue.accepted.remove(0);
-            queue.task_observations.remove(&evicted.submission.id);
-            payload = serde_json::to_string(queue).map_err(queue_error)?;
-        }
-        if payload.len() > MAX_QUEUE_BYTES {
-            return Err(invalid_params("thread queue exceeds its storage limit"));
-        }
+        let payload = queue.encode_with_budget(MAX_QUEUE_BYTES)?;
         let db = self.db()?;
         if db.get_thread(id).await.map_err(queue_error)?.is_none() {
             let thread = self
@@ -351,7 +405,10 @@ impl ThreadQueueRequestProcessor {
     /// File locks span SQLite writes *and* core admission without holding a DB
     /// transaction while core itself writes state. OS release on exit also lets
     /// another process safely reconcile an interrupted admission.
-    async fn lock(&self, id: ThreadId) -> Result<File, JSONRPCErrorError> {
+    async fn lock(&self, id: ThreadId) -> Result<(File, Arc<Mutex<u64>>), JSONRPCErrorError> {
+        // Register publication lifetime before storage admission. A delayed
+        // older operation must share the gate retained by a newer publisher.
+        let publication = self.publication(id);
         let directory = self.codex_home.join("thread-queue-locks");
         let file = tokio::task::spawn_blocking(move || {
             std::fs::create_dir_all(&directory)?;
@@ -368,7 +425,7 @@ impl ThreadQueueRequestProcessor {
         tokio::time::timeout(Duration::from_secs(10), async {
             loop {
                 match file.try_lock() {
-                    Ok(()) => return Ok(file),
+                    Ok(()) => return Ok((file, publication)),
                     Err(TryLockError::WouldBlock) => {
                         tokio::time::sleep(Duration::from_millis(10)).await
                     }
@@ -380,20 +437,29 @@ impl ThreadQueueRequestProcessor {
         .map_err(|_| invalid_request("thread queue is busy; retry the request"))?
     }
 
-    async fn changed(&self, id: ThreadId, revision: u64) {
-        let connections = self
-            .thread_state_manager
-            .subscribed_connection_ids(id)
-            .await;
-        self.outgoing
-            .send_server_notification_to_connections(
-                &connections,
-                ServerNotification::ThreadQueueChanged(ThreadQueueChangedNotification {
-                    thread_id: id.to_string(),
-                    revision: Some(revision),
-                }),
-            )
-            .await;
+    fn publication(&self, id: ThreadId) -> Arc<Mutex<u64>> {
+        let mut publications = self
+            .notification_revisions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        publications.retain(|_, gate| gate.strong_count() > 0);
+        if let Some(publication) = publications.get(&id).and_then(std::sync::Weak::upgrade) {
+            return publication;
+        }
+        let publication = Arc::new(Mutex::new(0));
+        publications.insert(id, Arc::downgrade(&publication));
+        publication
+    }
+
+    async fn changed(&self, id: ThreadId, revision: u64, publication: Arc<Mutex<u64>>) {
+        publish_queue_change(
+            &self.thread_state_manager,
+            &self.outgoing,
+            id,
+            revision,
+            publication,
+        )
+        .await;
     }
 
     async fn recover(&self, id: ThreadId, queue: &mut Queue) -> Result<(), JSONRPCErrorError> {
@@ -401,10 +467,17 @@ impl ThreadQueueRequestProcessor {
             return Ok(());
         };
         let thread = self.thread_manager.get_thread(id).await.ok();
-        if let Some(thread) = &thread {
-            thread.flush_rollout().await.map_err(queue_error)?;
-        }
-        let history = self
+        let live_receipt = match &thread {
+            Some(thread) => thread.durable_input_recorded(&pending.turn_id).await.map_err(queue_error)?,
+            None => None,
+        };
+        let accepted = if let Some(recorded) = live_receipt {
+            recorded
+        } else {
+            if let Some(thread) = &thread {
+                thread.flush_rollout().await.map_err(queue_error)?;
+            }
+            let history = self
             .thread_store
             .read_thread(codex_thread_store::ReadThreadParams {
                 thread_id: id,
@@ -413,10 +486,11 @@ impl ThreadQueueRequestProcessor {
             })
             .await
             .map_err(queue_error)?;
-        let accepted = history
+            history
             .history
             .as_ref()
-            .is_some_and(|history| pending_input_recorded(&history.items, &pending.turn_id));
+            .is_some_and(|history| pending_input_recorded(&history.items, &pending.turn_id))
+        };
         // Accepted input belongs to history even while the turn is running.
         // Without that evidence, worker installation is not enough to release
         // custody: it may still be starting or recording the prompt.
@@ -463,7 +537,15 @@ impl ThreadQueueRequestProcessor {
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .remove(&(id, pending.submission_id));
         }
-        self.changed(id, queue.revision).await;
+        let processor = self.clone();
+        let revision = queue.revision;
+        let publication = self.publication(id);
+        // Publication is owned independently of the request and never extends
+        // the file-lock critical section with a transport wait. A later
+        // revision can overtake it; changed() coalesces that stale invalidation.
+        self.background_tasks.spawn(async move {
+            processor.changed(id, revision, publication).await;
+        });
         Ok(())
     }
 
@@ -472,7 +554,7 @@ impl ThreadQueueRequestProcessor {
         id: ThreadId,
         mutation: impl FnOnce(&mut Queue) -> Result<(R, bool), JSONRPCErrorError>,
     ) -> Result<R, JSONRPCErrorError> {
-        let guard = self.lock(id).await?;
+        let (guard, publication) = self.lock(id).await?;
         let mut queue = self.load(id).await?;
         self.recover(id, &mut queue).await?;
         let (result, changed) = mutation(&mut queue)?;
@@ -481,7 +563,7 @@ impl ThreadQueueRequestProcessor {
         }
         drop(guard);
         if changed {
-            self.changed(id, queue.revision).await;
+            self.changed(id, queue.revision, publication).await;
         }
         Ok(result)
     }
@@ -504,11 +586,31 @@ impl ThreadQueueRequestProcessor {
     ) -> Result<(), JSONRPCErrorError> {
         TurnRequestProcessor::validate_queue_input(&params.input)?;
         let id = parse_thread_id_for_request(&params.thread_id)?;
-        let guard = self.lock(id).await?;
+        let (mut guard, mut publication) = self.lock(id).await?;
         let mut queue = self.load(id).await?;
         self.recover(id, &mut queue).await?;
         // Duplicate accepted IDs are resolved before reading mutable source paths.
-        let (queued_submission, added) = queue.add_sealed(params).await?;
+        let (queued_submission, added) = if params.input.iter().any(|input| matches!(input, V2UserInput::LocalImage { .. })) {
+            if let Some(existing) = queue.existing_submission(&params)? {
+                (existing, false)
+            } else {
+            if queue.submissions.len() >= MAX_QUEUE_ENTRIES {
+                return Err(invalid_params("thread queue is full"));
+            }
+            drop(guard);
+            drop(queue);
+            let sealed = seal_queue_input(params.input.clone()).await;
+            (guard, publication) = self.lock(id).await?;
+            queue = self.load(id).await?;
+            self.recover(id, &mut queue).await?;
+            // Capacity and identity can change during preparation. A winning
+            // duplicate keeps its snapshot, even if our source read failed.
+            let (item, added) = queue.add(params)?;
+            queue.finish_sealed_add(item, added, sealed)?
+            }
+        } else {
+            queue.add(params)?
+        };
         if added {
             self.save(id, &mut queue).await?;
         }
@@ -524,7 +626,7 @@ impl ThreadQueueRequestProcessor {
         }
         drop(guard);
         if added {
-            self.changed(id, queue.revision).await;
+            self.changed(id, queue.revision, publication).await;
         }
         if added {
             self.origins
@@ -664,7 +766,7 @@ impl ThreadQueueRequestProcessor {
         selected: Option<&str>,
         origin: Option<QueueOrigin>,
     ) -> Result<Option<ThreadQueueStartResponse>, JSONRPCErrorError> {
-        let guard = self.lock(id).await?;
+        let (guard, publication) = self.lock(id).await?;
         let mut queue = self.load(id).await?;
         self.recover(id, &mut queue).await?;
         if queue.pending_start.is_some() {
@@ -771,7 +873,7 @@ impl ThreadQueueRequestProcessor {
                 // custody. The input event reconciles that handoff; completion
                 // and later queue requests remain recovery paths.
                 drop(guard);
-                self.changed(id, queue.revision).await;
+                self.changed(id, queue.revision, publication).await;
                 Ok(Some(ThreadQueueStartResponse {
                     turn: response.turn,
                 }))
@@ -889,6 +991,34 @@ impl ThreadQueueRequestProcessor {
     }
 }
 
+async fn publish_queue_change(
+    thread_state_manager: &ThreadStateManager,
+    outgoing: &OutgoingMessageSender,
+    id: ThreadId,
+    revision: u64,
+    publication: Arc<Mutex<u64>>,
+) {
+    let mut published_revision = publication.lock().await;
+    if revision <= *published_revision {
+        return;
+    }
+    let connections = thread_state_manager.subscribed_connection_ids(id).await;
+    // Recovery publication outlives its RPC and may run after the last
+    // subscriber disconnects. An empty target list means broadcast to outgoing.
+    if !connections.is_empty() {
+        outgoing
+            .send_server_notification_to_connections(
+                &connections,
+                ServerNotification::ThreadQueueChanged(ThreadQueueChangedNotification {
+                    thread_id: id.to_string(),
+                    revision: Some(revision),
+                }),
+            )
+            .await;
+    }
+    *published_revision = revision;
+}
+
 // A TurnStarted record alone says nothing about recoverable input ownership.
 fn pending_input_recorded(items: &[RolloutItem], turn_id: &str) -> bool {
     let mut in_turn = false;
@@ -988,6 +1118,107 @@ async fn seal_queue_input(input: Vec<V2UserInput>) -> Result<Vec<V2UserInput>, J
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn delayed_recovery_publication_does_not_broadcast_after_last_disconnect() {
+        use crate::outgoing_message::OutgoingEnvelope;
+        use crate::outgoing_message::OutgoingMessage;
+        use crate::thread_state::ConnectionCapabilities;
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        let outgoing = OutgoingMessageSender::new(tx, codex_analytics::AnalyticsEventsClient::disabled());
+        let manager = ThreadStateManager::new();
+        let thread_id = ThreadId::new();
+        let disconnected = ConnectionId(1);
+        let unrelated = ConnectionId(2);
+        for connection_id in [disconnected, unrelated] {
+            outgoing.connection_opened(connection_id, Arc::new(std::sync::atomic::AtomicBool::new(true))).await;
+            manager.connection_initialized(connection_id, ConnectionCapabilities::default()).await;
+        }
+        assert!(manager.try_add_connection_to_thread(thread_id, disconnected).await);
+        assert!(manager.try_add_connection_to_thread(ThreadId::new(), unrelated).await);
+        let publication = Arc::new(Mutex::new(0));
+        let gate = publication.lock().await;
+        let mut recovery = Box::pin(publish_queue_change(&manager, &outgoing, thread_id, 1, publication.clone()));
+        assert!(futures::poll!(recovery.as_mut()).is_pending());
+        manager.remove_connection(disconnected).await;
+        outgoing.connection_closed(disconnected).await;
+        drop(gate);
+        recovery.await;
+        assert!(rx.try_recv().is_err(), "unrelated clients must not see an empty-target recovery publication");
+        assert_eq!(*publication.lock().await, 1);
+
+        let reattached = ConnectionId(3);
+        manager.connection_initialized(reattached, ConnectionCapabilities::default()).await;
+        assert!(manager.try_add_connection_to_thread(thread_id, reattached).await);
+        publish_queue_change(&manager, &outgoing, thread_id, 2, publication).await;
+        let OutgoingEnvelope::ToConnection {
+            connection_id,
+            message: OutgoingMessage::AppServerNotification(ServerNotification::ThreadQueueChanged(notification)),
+            ..
+        } = rx.try_recv().unwrap() else { panic!("reattached subscriber receives a targeted change"); };
+        assert_eq!(connection_id, reattached);
+        assert_eq!(notification.revision, Some(2));
+
+        outgoing.send_server_notification(ServerNotification::ThreadQueueChanged(ThreadQueueChangedNotification {
+            thread_id: thread_id.to_string(), revision: Some(3),
+        })).await;
+        assert!(matches!(rx.try_recv(), Ok(OutgoingEnvelope::Broadcast { .. })), "intentional global broadcasts retain their contract");
+    }
+
+    #[test]
+    fn queue_budget_matches_exact_oldest_prefix_eviction() {
+        let mut source = Queue::default();
+        add(&mut source, "pending\n\"\\é");
+        for index in 0..12 {
+            let item = add(&mut source, &format!("receipt-{index}\n\"\\é"));
+            let item = source.submissions.remove(source.submissions.iter().position(|entry| entry.id == item.id).unwrap());
+            source.accepted.push(AcceptedSubmission { submission: item, turn_id: format!("turn-{index}") });
+        }
+        let original = serde_json::to_string(&source).unwrap();
+        let mut suffix_sizes = vec![original.len()];
+        let mut reference: Queue = serde_json::from_str(&original).unwrap();
+        while !reference.accepted.is_empty() {
+            let receipt = reference.accepted.remove(0);
+            reference.task_observations.remove(&receipt.submission.id);
+            suffix_sizes.push(serde_json::to_string(&reference).unwrap().len());
+        }
+        for cap in suffix_sizes.into_iter().flat_map(|size| [size - 1, size, size + 1]) {
+            let mut expected: Queue = serde_json::from_str(&original).unwrap();
+            let mut expected_payload = serde_json::to_string(&expected).unwrap();
+            while expected_payload.len() > cap && !expected.accepted.is_empty() {
+                let receipt = expected.accepted.remove(0);
+                expected.task_observations.remove(&receipt.submission.id);
+                expected_payload = serde_json::to_string(&expected).unwrap();
+            }
+            let mut actual: Queue = serde_json::from_str(&original).unwrap();
+            let result = actual.encode_with_budget(cap);
+            assert_eq!(result.is_ok(), expected_payload.len() <= cap, "cap={cap}");
+            assert_eq!(serde_json::to_value(&actual).unwrap(), serde_json::to_value(expected).unwrap());
+            if let Ok(payload) = result {
+                assert!(payload.len() <= cap);
+                assert_eq!(serde_json::from_str::<serde_json::Value>(&payload).unwrap(), serde_json::from_str::<serde_json::Value>(&expected_payload).unwrap());
+            }
+        }
+    }
+
+    #[test]
+    fn concurrent_image_retry_keeps_winning_snapshot_even_if_preparation_failed() {
+        let mut queue = Queue::default();
+        let params = ThreadQueueAddParams {
+            thread_id: "thread".into(),
+            client_user_message_id: Some("duplicate".into()),
+            input: vec![V2UserInput::LocalImage { path: PathBuf::from("source.png"), detail: None }],
+        };
+        let (winner, added) = queue.add(params.clone()).unwrap();
+        let sealed = input("winning immutable snapshot");
+        queue.finish_sealed_add(winner.clone(), added, Ok(sealed.clone())).unwrap();
+        let (retry, added) = queue.add(params).unwrap();
+        let (retry, added) = queue.finish_sealed_add(retry, added, Err(invalid_params("source disappeared"))).unwrap();
+        assert!(!added);
+        assert_eq!(retry, winner);
+        assert_eq!(queue.execution_inputs[&winner.id], sealed);
+    }
 
     #[test]
     fn queue_pages_preserve_phase_revision_and_accepted_turn_receipts() {

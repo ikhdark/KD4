@@ -226,6 +226,56 @@ fn sandbox_timeout_reports_partial_output_without_debug_dump() {
 }
 
 #[test]
+fn sandbox_error_preserves_selected_producer_loss_through_ui_shortening() {
+    for selected in 0..4 {
+        for line_loss in [false, true] {
+            let mut output = ExecToolCallOutput::default();
+            let selected_stream = match selected {
+                0 => &mut output.aggregated_output,
+                1 => &mut output.stdout,
+                _ => &mut output.stderr,
+            };
+            selected_stream.text = "retained prefix".to_string();
+            selected_stream.truncated = !line_loss;
+            selected_stream.truncated_after_lines = line_loss.then_some(7);
+            if selected == 3 {
+                output.stdout.text = "stdout tail".repeat(4_000);
+            }
+            for timeout in [false, true] {
+                let err = CodexErr::Sandbox(if timeout {
+                    SandboxErr::Timeout {
+                        output: Box::new(output.clone()),
+                    }
+                } else {
+                    SandboxErr::Denied {
+                        output: Box::new(output.clone()),
+                        network_policy_decision: None,
+                    }
+                });
+                let message = get_error_message_ui(&err);
+                assert_eq!(message.matches("[output truncated by producer]").count(), 1);
+                assert!(message.contains("retained prefix"));
+                assert!(message.len() < 2200);
+            }
+        }
+    }
+}
+
+#[test]
+fn sandbox_complete_aggregate_does_not_inherit_unused_stream_loss() {
+    let mut output = ExecToolCallOutput::default();
+    output.aggregated_output.text = "complete aggregate".to_string();
+    output.stdout.truncated = true;
+    output.stderr.truncated_after_lines = Some(7);
+    assert_eq!(bounded_exec_output(&output), "complete aggregate");
+    output.aggregated_output.text.clear();
+    assert_eq!(
+        bounded_exec_output(&output),
+        "[output truncated by producer]\n"
+    );
+}
+
+#[test]
 fn sandbox_denied_display_bounds_output_and_keeps_diagnostics() {
     let output = ExecToolCallOutput {
         exit_code: 77,

@@ -12,11 +12,8 @@ use crate::sandboxing::SandboxPermissions;
 use crate::sandboxing::execute_exec_request_with_after_spawn;
 use crate::session::turn_context::TurnEnvironment;
 use crate::shell::ShellType;
-use crate::tools::network_approval::NetworkApprovalMode;
-use crate::tools::network_approval::NetworkApprovalSpec;
 use crate::tools::runtimes::ShellCommandPreparation;
 use crate::tools::runtimes::build_sandbox_command;
-use crate::tools::runtimes::exec_env_for_sandbox_permissions;
 use crate::tools::runtimes::prepare_shell_command;
 use crate::tools::runtimes::shell_snapshot_additional_read_roots;
 use crate::tools::sandboxing::Approvable;
@@ -28,10 +25,7 @@ use crate::tools::sandboxing::Sandboxable;
 use crate::tools::sandboxing::ToolCtx;
 use crate::tools::sandboxing::ToolError;
 use crate::tools::sandboxing::ToolRuntime;
-use crate::tools::sandboxing::managed_network_for_sandbox_permissions;
-use crate::tools::sandboxing::sandbox_permissions_preserving_denied_reads;
 use crate::tools::sandboxing::with_cached_approval;
-use codex_network_proxy::NetworkProxy;
 use codex_protocol::error::CodexErr;
 use codex_protocol::error::SandboxErr;
 use codex_protocol::exec_output::ExecToolCallOutput;
@@ -64,17 +58,11 @@ pub struct ShellRequest {
     pub cancellation_token: CancellationToken,
     pub env: HashMap<String, String>,
     pub explicit_env_overrides: HashMap<String, String>,
-    pub network: Option<NetworkProxy>,
     pub sandbox_permissions: SandboxPermissions,
     pub additional_permissions: Option<AdditionalPermissionProfile>,
     pub justification: Option<String>,
     pub exec_approval_requirement: ExecApprovalRequirement,
     pub(crate) validation_launch: bool,
-    /// Runner-aware proof capability. A refusal keeps only a validation that a
-    /// later proving rerun can retire pending; call-argument classification
-    /// cannot recognize repository runners.
-    pub(crate) validation_proof: bool,
-    pub(crate) workspace_operation_root: Option<PathBuf>,
 }
 
 pub struct ShellRuntime {
@@ -276,31 +264,6 @@ impl Approvable<ShellRequest> for ShellRuntime {
 }
 
 impl ToolRuntime<ShellRequest, ExecToolCallOutput> for ShellRuntime {
-    fn network_approval_spec(
-        &self,
-        req: &ShellRequest,
-        ctx: &ToolCtx,
-    ) -> Option<NetworkApprovalSpec> {
-        let file_system_sandbox_policy = ctx.turn.file_system_sandbox_policy();
-        let sandbox_permissions = sandbox_permissions_preserving_denied_reads(
-            req.sandbox_permissions,
-            &file_system_sandbox_policy,
-        );
-        let network =
-            managed_network_for_sandbox_permissions(req.network.as_ref(), sandbox_permissions)?;
-        Some(NetworkApprovalSpec {
-            network: Some(network.clone()),
-            mode: NetworkApprovalMode::Immediate,
-            cwd: codex_utils_path_uri::PathUri::from_abs_path(&req.cwd),
-            command: req.hook_command.clone(),
-            environment_id: req.turn_environment.environment_id.clone(),
-            approval_scope_id: req
-                .turn_environment
-                .environment
-                .approval_scope_id()
-                .to_string(),
-        })
-    }
 
     async fn run(
         &mut self,
@@ -317,32 +280,6 @@ impl ToolRuntime<ShellRequest, ExecToolCallOutput> for ShellRuntime {
         if attempt.sandbox_requested && attempt.sandbox == codex_sandboxing::SandboxType::None {
             return Err(ToolError::Codex(crate::exec::unavailable_sandbox_error()));
         }
-        let _workspace_operation_permit = match req.workspace_operation_root.as_deref() {
-            Some(root) => {
-                let _tool_wait = ctx.turn.turn_timing_state.begin_tool_execution();
-                let _phase =
-                    crate::tools::tool_dispatch_trace::begin_tool_phase("validation_gate_wait");
-                Some(
-                    crate::workspace_operation_gate::acquire_workspace_validation(
-                        root,
-                        &req.hook_command,
-                        crate::workspace_operation_gate::ValidationOwner::for_command(
-                            ctx.session.thread_id(),
-                            &req.command_for_approval,
-                        ),
-                    )
-                    .await
-                    .map_err(|reason| {
-                        crate::validation_task::record_admission_refusal(
-                            ctx,
-                            req.validation_proof,
-                        );
-                        ToolError::Rejected(reason)
-                    })?,
-                )
-            }
-            None => None,
-        };
         let session_shell = ctx
             .session
             .shell_for_environment(&req.turn_environment)
@@ -356,14 +293,7 @@ impl ToolRuntime<ShellRequest, ExecToolCallOutput> for ShellRuntime {
                 &ctx.turn.config,
             )
             .await;
-        let (file_system_sandbox_policy, _) = attempt.permissions.to_runtime_permissions();
-        let sandbox_permissions = sandbox_permissions_preserving_denied_reads(
-            req.sandbox_permissions,
-            &file_system_sandbox_policy,
-        );
-        let managed_network =
-            managed_network_for_sandbox_permissions(req.network.as_ref(), sandbox_permissions);
-        let mut env = exec_env_for_sandbox_permissions(&req.env, sandbox_permissions);
+        let mut env = req.env.clone();
         let command = prepare_shell_command(ShellCommandPreparation {
             command: &req.command,
             command_for_approval: &req.command_for_approval,
@@ -375,7 +305,7 @@ impl ToolRuntime<ShellRequest, ExecToolCallOutput> for ShellRuntime {
             sandbox_shell_type: req.shell_type.as_ref(),
             sandbox: attempt.sandbox,
             windows_sandbox_level: attempt.windows_sandbox_level,
-            enforce_managed_network: attempt.enforce_managed_network,
+            enforce_managed_network: false,
             approved_powershell_direct_argv: req.approved_powershell_direct_argv.as_ref(),
             proof_cwd: Some(req.cwd.as_path()),
         })
@@ -394,11 +324,7 @@ impl ToolRuntime<ShellRequest, ExecToolCallOutput> for ShellRuntime {
                 &env,
             )
             .await
-            .map_err(|reason| {
-                // Nothing was launched: required validation remains pending.
-                crate::validation_task::record_admission_refusal(ctx, req.validation_proof);
-                ToolError::Rejected(reason)
-            })?;
+            .map_err(ToolError::Rejected)?;
         }
 
         let additional_read_roots = shell_snapshot_additional_read_roots(
@@ -413,9 +339,6 @@ impl ToolRuntime<ShellRequest, ExecToolCallOutput> for ShellRuntime {
         if let Some(cancellation) = stall_cancellation.as_ref() {
             expiration = expiration.with_cancellation(cancellation.clone());
         }
-        if let Some(cancellation) = attempt.network_denial_cancellation_token.clone() {
-            expiration = expiration.with_cancellation(cancellation);
-        }
         let options = ExecOptions {
             expiration,
             capture_policy: ExecCapturePolicy::ShellTool,
@@ -424,21 +347,13 @@ impl ToolRuntime<ShellRequest, ExecToolCallOutput> for ShellRuntime {
             .env_for(
                 command,
                 options,
-                managed_network,
-                Some(&req.turn_environment.environment_id),
             )
             .await
             .map_err(ToolError::Codex)?;
         env.windows_sandbox_additional_read_roots = additional_read_roots;
-        let full_suite_dispatch = crate::validation_task::begin_dispatch(
-            ctx,
-            &mut env.env,
-            !req.turn_environment.environment.is_remote(),
-        )
-        .await
-        .map_err(ToolError::Rejected)?;
+        crate::validation_task::begin_policy_attempt(ctx).await.map_err(ToolError::Rejected)?;
         let validation_attempt_started = Arc::new(AtomicBool::new(false));
-        let after_spawn = (req.validation_launch || full_suite_dispatch.is_some()).then(|| {
+        let after_spawn = req.validation_launch.then(|| {
             let validation_attempt_started = Arc::clone(&validation_attempt_started);
             Box::new(move || {
                 validation_attempt_started.store(true, Ordering::Release);
@@ -486,9 +401,8 @@ impl ToolRuntime<ShellRequest, ExecToolCallOutput> for ShellRuntime {
                 // sandbox launcher never does, so its failures stay spent.
                 if !attempt_started
                     && attempt.sandbox != codex_sandboxing::SandboxType::WindowsRestrictedToken
-                    && let Some(dispatch) = full_suite_dispatch
                 {
-                    dispatch.acknowledge_not_spawned().await;
+                    crate::validation_task::policy_attempt_not_started(ctx).await;
                 }
                 self.remember_validation_attempt_error(
                     req.validation_launch,

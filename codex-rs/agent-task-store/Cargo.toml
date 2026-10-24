@@ -11,6 +11,7 @@ doctest = false
 
 [dependencies]
 chrono = { workspace = true, features = ["serde"] }
+codex-file-system = { workspace = true }
 codex-state = { workspace = true }
 futures = { workspace = true }
 hex = { workspace = true }
@@ -31,3 +32,6 @@ tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 
 [lints]
 workspace = true
+
+[target.'cfg(windows)'.dev-dependencies]
+windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }

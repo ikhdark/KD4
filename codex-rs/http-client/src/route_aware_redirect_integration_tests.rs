@@ -17,6 +17,67 @@ use super::*;
 use crate::RouteAwareClientPool;
 
 #[tokio::test]
+async fn both_proxy_policies_strip_cross_origin_secrets_and_redact_response_cookies() {
+    for policy in [
+        OutboundProxyPolicy::ReqwestDefault,
+        OutboundProxyPolicy::RespectSystemProxy,
+    ] {
+        let (final_addr, final_thread) = spawn_response(
+            "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nSet-Cookie: session=first-cookie-secret\r\nSet-Cookie: session=second-cookie-secret\r\nX-Private-Token: hidden-response-secret\r\nConnection: close\r\n\r\nok",
+        );
+        let (source_addr, source_thread) = spawn_response_text(format!(
+            "HTTP/1.1 302 Found\r\nLocation: http://{final_addr}/final?sig=redirect-secret\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        ));
+        let source_url = format!("http://{source_addr}/start?sig=source-query-secret");
+        let pool = RouteAwareClientPool::new(HttpClientFactory::new(policy), ClientRouteClass::Api)
+            .with_direct_routing();
+        let buffer = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::registry().with(
+            tracing_subscriber::fmt::layer()
+                .with_ansi(false)
+                .with_writer(TestLogWriter {
+                    buffer: buffer.clone(),
+                })
+                .with_filter(
+                    tracing_subscriber::filter::Targets::new()
+                        .with_target("codex_http_client", tracing::Level::DEBUG),
+                ),
+        );
+        let _guard = tracing::subscriber::set_default(subscriber);
+        let mut key = http::HeaderValue::from_static("provider-secret");
+        key.set_sensitive(true);
+        let response = tokio::time::timeout(
+            Duration::from_secs(2),
+            pool.get(&source_url)
+                .header("x-api-key", key)
+                .header(AUTHORIZATION, "Bearer origin-secret")
+                .send(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(response.status(), http::StatusCode::OK);
+        assert_eq!(response.headers().get_all("set-cookie").iter().count(), 2);
+        let source = source_thread.join().unwrap();
+        assert!(has_header(&source, "x-api-key"));
+        let received = final_thread.join().unwrap();
+        assert!(!has_header(&received, "x-api-key"));
+        assert!(!has_header(&received, "authorization"));
+        assert!(!received.contains("source-query-secret"));
+        let logs = String::from_utf8(buffer.lock().unwrap().clone()).unwrap();
+        for secret in [
+            "first-cookie-secret",
+            "second-cookie-secret",
+            "hidden-response-secret",
+            "provider-secret",
+            "redirect-secret",
+        ] {
+            assert!(!logs.contains(secret), "{policy:?}: {logs}");
+        }
+    }
+}
+
+#[tokio::test]
 async fn route_aware_pool_re_resolves_redirects_and_logs_only_final_outcome() {
     let (proxy_addr, proxy_thread) =
         spawn_response("HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok");
@@ -82,6 +143,12 @@ async fn route_aware_pool_re_resolves_redirects_and_logs_only_final_outcome() {
 
 fn spawn_response(
     response: &'static str,
+) -> (std::net::SocketAddr, std::thread::JoinHandle<String>) {
+    spawn_response_text(response.to_owned())
+}
+
+fn spawn_response_text(
+    response: String,
 ) -> (std::net::SocketAddr, std::thread::JoinHandle<String>) {
     let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind listener");
     let address = listener.local_addr().expect("HTTP listener address");

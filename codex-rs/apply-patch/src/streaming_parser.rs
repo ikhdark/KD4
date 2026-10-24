@@ -314,6 +314,7 @@ impl StreamingPatchParser {
                             old_lines: Vec::new(),
                             new_lines: Vec::new(),
                             is_end_of_file: false,
+                            line_kinds: Vec::new(),
                         });
                         self.state.mode = StreamingParserMode::UpdateFile { hunk_line_number };
                         return Ok(());
@@ -325,6 +326,7 @@ impl StreamingPatchParser {
                             old_lines: Vec::new(),
                             new_lines: Vec::new(),
                             is_end_of_file: false,
+                            line_kinds: Vec::new(),
                         });
                         self.state.mode = StreamingParserMode::UpdateFile { hunk_line_number };
                         return Ok(());
@@ -353,9 +355,11 @@ impl StreamingPatchParser {
                                 old_lines: Vec::new(),
                                 new_lines: Vec::new(),
                                 is_end_of_file: false,
+                                line_kinds: Vec::new(),
                             });
                         }
                         if let Some(chunk) = chunks.last_mut() {
+                            chunk.line_kinds.push(crate::parser::UpdateLineKind::Context);
                             chunk.old_lines.push(String::new());
                             chunk.new_lines.push(String::new());
                         }
@@ -370,9 +374,11 @@ impl StreamingPatchParser {
                                 old_lines: Vec::new(),
                                 new_lines: Vec::new(),
                                 is_end_of_file: false,
+                                line_kinds: Vec::new(),
                             });
                         }
                         if let Some(chunk) = chunks.last_mut() {
+                            chunk.line_kinds.push(crate::parser::UpdateLineKind::Context);
                             chunk.old_lines.push(line_to_add.to_string());
                             chunk.new_lines.push(line_to_add.to_string());
                         }
@@ -387,9 +393,11 @@ impl StreamingPatchParser {
                                 old_lines: Vec::new(),
                                 new_lines: Vec::new(),
                                 is_end_of_file: false,
+                                line_kinds: Vec::new(),
                             });
                         }
                         if let Some(chunk) = chunks.last_mut() {
+                            chunk.line_kinds.push(crate::parser::UpdateLineKind::Add);
                             chunk.new_lines.push(line_to_add.to_string());
                         }
                         self.state.mode = StreamingParserMode::UpdateFile { hunk_line_number };
@@ -403,9 +411,11 @@ impl StreamingPatchParser {
                                 old_lines: Vec::new(),
                                 new_lines: Vec::new(),
                                 is_end_of_file: false,
+                                line_kinds: Vec::new(),
                             });
                         }
                         if let Some(chunk) = chunks.last_mut() {
+                            chunk.line_kinds.push(crate::parser::UpdateLineKind::Remove);
                             chunk.old_lines.push(line_to_remove.to_string());
                         }
                         self.state.mode = StreamingParserMode::UpdateFile { hunk_line_number };
@@ -473,6 +483,7 @@ mod tests {
                     old_lines: vec!["old".to_string()],
                     new_lines: vec!["new".to_string()],
                     is_end_of_file: false,
+                    line_kinds: Vec::new(),
                 }],
             },
         ];
@@ -547,6 +558,7 @@ mod tests {
                     old_lines: vec!["old".to_string()],
                     new_lines: vec!["new".to_string()],
                     is_end_of_file: false,
+                    line_kinds: Vec::new(),
                 }],
             }])
         );
@@ -696,6 +708,7 @@ mod tests {
                 old_lines: vec!["Build the Rust workspace before opening a pull request.".to_string()],
                 new_lines: vec!["Build the Rust workspace before opening a pull request.".to_string(), "When touching streamed tool calls, include parser coverage for partial input.".to_string(), "Prefer tests that exercise the exact event payload shape.".to_string()],
                 is_end_of_file: false,
+                line_kinds: Vec::new(),
             }],
         });
         assert_eq!(hunks.len(), 7);
@@ -752,12 +765,14 @@ mod tests {
                         old_lines: vec!["old a".to_string(), "*** Update File: b.txt".to_string()],
                         new_lines: vec!["new a".to_string(), "*** Update File: b.txt".to_string()],
                         is_end_of_file: false,
+                        line_kinds: Vec::new(),
                     },
                     UpdateFileChunk {
                         change_context: None,
                         old_lines: vec!["old b".to_string()],
                         new_lines: vec!["new b".to_string()],
                         is_end_of_file: false,
+                        line_kinds: Vec::new(),
                     },
                 ],
             }])
@@ -797,6 +812,7 @@ mod tests {
                         "context after".to_string(),
                     ],
                     is_end_of_file: false,
+                    line_kinds: Vec::new(),
                 }],
             }])
         );
@@ -817,6 +833,7 @@ mod tests {
                     old_lines: Vec::new(),
                     new_lines: vec!["quux".to_string()],
                     is_end_of_file: true,
+                    line_kinds: Vec::new(),
                 }],
             }])
         );
@@ -835,6 +852,7 @@ mod tests {
                     old_lines: vec!["old".to_string()],
                     new_lines: vec!["new".to_string()],
                     is_end_of_file: false,
+                    line_kinds: Vec::new(),
                 }],
             }])
         );
@@ -850,6 +868,7 @@ mod tests {
                     old_lines: vec!["old\r".to_string()],
                     new_lines: vec!["new".to_string()],
                     is_end_of_file: false,
+                    line_kinds: Vec::new(),
                 }],
             }])
         );
@@ -886,6 +905,7 @@ mod tests {
                     old_lines: vec!["old".to_string()],
                     new_lines: vec!["new".to_string()],
                     is_end_of_file: false,
+                    line_kinds: Vec::new(),
                 }],
             }])
         );
@@ -899,6 +919,7 @@ mod tests {
                     old_lines: vec!["old".to_string()],
                     new_lines: vec!["new".to_string()],
                     is_end_of_file: false,
+                    line_kinds: Vec::new(),
                 }],
             }])
         );

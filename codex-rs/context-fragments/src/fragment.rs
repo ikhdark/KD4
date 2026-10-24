@@ -50,6 +50,12 @@ pub trait ContextualUserFragment {
 
     fn body(&self) -> std::borrow::Cow<'_, str>;
 
+    /// Whether aggregate budgeting may truncate the rendered body as plain text.
+    /// Structured bodies and escaped payloads must opt out to remain intact.
+    fn can_truncate_body(&self) -> bool {
+        true
+    }
+
     fn type_markers() -> (&'static str, &'static str)
     where
         Self: Sized;

@@ -20,7 +20,6 @@ pub use manager::should_sandbox;
 pub use manager::transform;
 pub use manager::transform_for_direct_spawn;
 pub use manager::transform_for_direct_spawn_with_codex_home;
-pub use manager::with_managed_mitm_ca_readable_root;
 pub use windows::WindowsSandboxFilesystemOverrides;
 pub use windows::permission_profile_supports_windows_restricted_token_sandbox;
 pub use windows::resolve_windows_elevated_filesystem_overrides;
@@ -35,9 +34,6 @@ impl From<SandboxTransformError> for CodexErr {
             error @ SandboxTransformError::InvalidCommandCwd { .. }
             | error @ SandboxTransformError::InvalidSandboxPolicyCwd { .. } => {
                 CodexErr::InvalidRequest(error.to_string())
-            }
-            SandboxTransformError::EnvironmentNetworkProxy(message) => {
-                CodexErr::UnsupportedOperation(message)
             }
             SandboxTransformError::WindowsSandboxPreparation(message) => {
                 CodexErr::UnsupportedOperation(message)

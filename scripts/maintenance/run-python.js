@@ -3,68 +3,17 @@
 const { spawnSync } = require("node:child_process");
 const { join } = require("node:path");
 
-const scriptArgs = process.argv.slice(2);
-if (scriptArgs.length === 0) {
+const args = process.argv.slice(2);
+if (!args.length) {
   console.error("usage: run-python.js <script> [args...]");
   process.exit(2);
 }
-
-const configuredPython = process.env.PYTHON;
-const virtualEnvPython = process.env.VIRTUAL_ENV
-  ? join(
-      process.env.VIRTUAL_ENV,
-      process.platform === "win32" ? "Scripts" : "bin",
-      process.platform === "win32" ? "python.exe" : "python",
-    )
-  : undefined;
-const candidates = configuredPython
-  ? [[configuredPython, []]]
-  : [
-      ...(virtualEnvPython ? [[virtualEnvPython, []]] : []),
-      ["py", ["-3"]],
-      ["python3", []],
-      ["python", []],
-    ];
-
-for (const [command, prefixArgs] of candidates) {
-  const probe = spawnSync(
-    command,
-    [
-      ...prefixArgs,
-      "-c",
-      "import sys; raise SystemExit(0 if sys.version_info >= (3, 11) else 1)",
-    ],
-    { stdio: "ignore", timeout: 10000 },
-  );
-  if (probe.error?.code === "ENOENT") {
-    continue;
-  }
-  if (probe.error) {
-    if (probe.error.code === "ETIMEDOUT") {
-      console.error(`Python capability probe timed out: ${command}`);
-      process.exit(1);
-    }
-    console.error(`failed to probe ${command}: ${probe.error.message}`);
-    process.exit(1);
-  }
-  if (probe.status !== 0) {
-    continue;
-  }
-
-  const result = spawnSync(command, [...prefixArgs, ...scriptArgs], {
-    stdio: "inherit",
-  });
-  if (result.error?.code === "ENOENT") {
-    continue;
-  }
-  if (result.error) {
-    console.error(`failed to launch ${command}: ${result.error.message}`);
-    process.exit(1);
-  }
-  process.exit(result.status ?? 1);
+const windows = process.platform === "win32";
+const python = process.env.PYTHON || (process.env.VIRTUAL_ENV
+  ? join(process.env.VIRTUAL_ENV, windows ? "Scripts" : "bin", windows ? "python.exe" : "python")
+  : windows ? "python" : "python3");
+const result = spawnSync(python, args, { stdio: "inherit" });
+if (result.error) {
+  console.error(result.error.message);
 }
-
-console.error(
-  "No Python 3.11 or newer interpreter passed the capability check. Set PYTHON to a compatible executable or install Python 3.11+ and expose python3/python/py.",
-);
-process.exit(127);
+process.exit(result.status ?? 1);

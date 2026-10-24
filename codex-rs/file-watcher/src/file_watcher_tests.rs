@@ -391,6 +391,280 @@ fn symlink_dir(target: &Path, link: &Path) -> std::io::Result<()> {
     }
 }
 
+// Capture exactly the content and namespace observations made before the
+// public registration enters the state lock, so tests can move the namespace
+// in that otherwise unobservable window without relying on timing.
+fn resolved_registration_for_test(requested: WatchPath) -> Vec<SubscriberWatchRegistration> {
+    let mut guards = BTreeSet::new();
+    for root in [requested.path.clone(), canonical_watch_path(&requested.path)] {
+        guards.extend(root.ancestors().skip(1).map(Path::to_path_buf));
+    }
+    std::iter::once((requested, false))
+        .chain(guards.into_iter().map(|path| {
+            (
+                WatchPath {
+                    path,
+                    recursive: false,
+                },
+                true,
+            )
+        }))
+        .map(|(requested, namespace_guard)| {
+            let (actual, matched, fallback) = actual_watch_path(&requested);
+            SubscriberWatchRegistration {
+                key: SubscriberWatchKey {
+                    requested,
+                    namespace_guard,
+                },
+                actual,
+                matched,
+                fallback,
+            }
+        })
+        .collect()
+}
+
+fn commit_resolved_registration_for_test(
+    watcher: &Arc<FileWatcher>,
+    subscriber: &FileWatcherSubscriber,
+    registrations: &[SubscriberWatchRegistration],
+) -> notify::Result<WatchRegistration> {
+    let newly_covered_paths = watcher.register_paths(subscriber.id, registrations)?;
+    Ok(WatchRegistration {
+        file_watcher: Arc::downgrade(watcher),
+        subscriber_id: subscriber.id,
+        watched_paths: registrations.iter().map(|watch| watch.key.clone()).collect(),
+        newly_covered_paths,
+    })
+}
+
+fn retarget_alias_for_test(alias: &Path, target: &Path) {
+    #[cfg(windows)]
+    std::fs::remove_dir(alias).expect("remove alias");
+    #[cfg(unix)]
+    std::fs::remove_file(alias).expect("remove alias");
+    symlink_dir(target, alias).expect("retarget alias");
+}
+
+#[test]
+fn native_paths_cover_ancestors_before_content_roots() {
+    let parent = path("namespace");
+    let child = parent.join("child");
+    let content = child.join("content");
+    let roots = HashMap::from([
+        (content.clone(), RecursiveMode::Recursive),
+        (parent.clone(), RecursiveMode::NonRecursive),
+        (child.clone(), RecursiveMode::NonRecursive),
+    ]);
+    let ordered = namespace_ordered_native_paths(&roots)
+        .into_iter()
+        .map(|(path, _)| path.clone())
+        .collect::<Vec<_>>();
+    assert_eq!(ordered, vec![parent, child, content]);
+}
+
+#[tokio::test]
+async fn registration_repairs_retarget_before_any_native_coverage_exists() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let first = temp.path().join("first-parent/target");
+    let second = temp.path().join("second-parent/target");
+    std::fs::create_dir_all(&first).expect("first target");
+    std::fs::create_dir_all(&second).expect("second target");
+    let alias = temp.path().join("alias");
+    symlink_dir(&first, &alias).expect("create alias");
+    let registrations = resolved_registration_for_test(WatchPath {
+        path: alias.clone(),
+        recursive: true,
+    });
+    retarget_alias_for_test(&alias, &second);
+
+    // The backend is created only after the retarget. There is no queued native
+    // alias event that could repair stale registration as a side effect.
+    let watcher = Arc::new(FileWatcher::new().expect("watcher"));
+    let (subscriber, mut rx) = watcher.add_subscriber();
+    let registration = commit_resolved_registration_for_test(&watcher, &subscriber, &registrations)
+        .expect("reconcile registration");
+    assert_eq!(registration.newly_covered_paths(), &[alias.clone()]);
+    assert_eq!(content_watch_counts(&watcher, &first), None);
+    assert_eq!(content_watch_counts(&watcher, &second), Some((0, 1)));
+    let canonical_second = second.canonicalize().expect("canonical target");
+    {
+        let inner = watcher
+            .inner
+            .as_ref()
+            .expect("native watcher")
+            .lock()
+            .unwrap();
+        assert_eq!(
+            inner.native_paths.get(&canonical_second),
+            Some(&RecursiveMode::Recursive)
+        );
+        assert!(
+            inner
+                .native_paths
+                .contains_key(canonical_second.parent().unwrap())
+        );
+    }
+    // Consume the registration-time invalidation before writing. That hint
+    // must not satisfy the subsequent native-notification expectation.
+    assert!(
+        timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .expect("registration invalidation timeout")
+            .expect("registration invalidation")
+            .rescan_required
+    );
+    let file = second.join("new-content");
+    std::fs::write(&file, "new target bytes").expect("write new target");
+    wait_for_native_bytes(&mut rx, &alias.join("new-content"), "new target bytes").await;
+    drop(registration);
+    assert!(watcher.state.read().unwrap().path_ref_counts.is_empty());
+}
+
+#[tokio::test]
+async fn registration_retarget_marks_shared_snapshot_uncovered_and_preserves_leases() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let first = temp.path().join("first");
+    let second = temp.path().join("second");
+    std::fs::create_dir(&first).unwrap();
+    std::fs::create_dir(&second).unwrap();
+    let alias = temp.path().join("alias");
+    symlink_dir(&first, &alias).unwrap();
+    let watcher = Arc::new(FileWatcher::noop());
+    let (subscriber, mut rx) = watcher.add_subscriber();
+    let first_lease = subscriber.register_path(alias.clone(), false);
+    let registrations = resolved_registration_for_test(WatchPath {
+        path: alias.clone(),
+        recursive: false,
+    });
+    retarget_alias_for_test(&alias, &second);
+    let second_lease = commit_resolved_registration_for_test(&watcher, &subscriber, &registrations)
+        .expect("reconcile shared registration");
+    assert_eq!(second_lease.newly_covered_paths(), &[alias]);
+    assert!(
+        timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .expect("retarget invalidation timeout")
+            .expect("retarget invalidation")
+            .rescan_required
+    );
+    assert_eq!(content_watch_counts(&watcher, &first), None);
+    assert_eq!(content_watch_counts(&watcher, &second), Some((2, 0)));
+    drop(first_lease);
+    assert_eq!(content_watch_counts(&watcher, &second), Some((1, 0)));
+    drop(second_lease);
+    let state = watcher.state.read().unwrap();
+    assert!(state.path_ref_counts.is_empty());
+    assert!(state.pending_requests.is_empty());
+}
+
+#[tokio::test]
+async fn failed_registration_retarget_rolls_back_only_the_new_lease_and_retries_existing_owner() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let first = temp.path().join("first");
+    let second = temp.path().join("second");
+    std::fs::create_dir(&first).unwrap();
+    std::fs::create_dir(&second).unwrap();
+    let alias = temp.path().join("alias");
+    symlink_dir(&first, &alias).unwrap();
+    let watcher = Arc::new(FileWatcher::new().expect("watcher"));
+    let (subscriber, _) = watcher.add_subscriber();
+    let existing = subscriber.register_path(alias.clone(), true);
+    let registrations = resolved_registration_for_test(WatchPath {
+        path: alias,
+        recursive: true,
+    });
+    retarget_alias_for_test(&registrations[0].key.requested.path, &second);
+    let inner = watcher.inner.as_ref().unwrap();
+    inner.lock().unwrap().fail_watch_attempts = 1;
+    assert!(commit_resolved_registration_for_test(&watcher, &subscriber, &registrations).is_err());
+    assert_eq!(content_watch_counts(&watcher, &first), Some((0, 1)));
+    assert_eq!(content_watch_counts(&watcher, &second), None);
+    assert!(
+        watcher
+            .state
+            .read()
+            .unwrap()
+            .pending_requests
+            .contains(&(subscriber.id, registrations[0].key.clone()))
+    );
+
+    // Run the existing reconciliation owner explicitly; no unrelated filesystem
+    // change or timing-dependent native delivery is needed to retry the move.
+    assert!(!FileWatcher::reconcile_degraded_paths(&watcher.state, inner));
+    assert_eq!(content_watch_counts(&watcher, &first), None);
+    assert_eq!(content_watch_counts(&watcher, &second), Some((0, 1)));
+    drop(existing);
+    let state = watcher.state.read().unwrap();
+    assert!(state.path_ref_counts.is_empty());
+    assert!(state.pending_requests.is_empty());
+}
+
+#[test]
+fn concurrent_unregister_waits_for_registration_retarget_reconciliation() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let first = temp.path().join("first");
+    let second = temp.path().join("second");
+    std::fs::create_dir(&first).unwrap();
+    std::fs::create_dir(&second).unwrap();
+    let alias = temp.path().join("alias");
+    symlink_dir(&first, &alias).unwrap();
+    let watcher = Arc::new(FileWatcher::noop());
+    let (subscriber, _) = watcher.add_subscriber();
+    let existing = subscriber.register_path(alias.clone(), true);
+    let registrations = resolved_registration_for_test(WatchPath {
+        path: alias.clone(),
+        recursive: true,
+    });
+    let (covered_tx, covered_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let release_rx = Mutex::new(release_rx);
+    watcher.state.write().unwrap().before_registration_reconcile = Some(Box::new(move || {
+        covered_tx.send(()).unwrap();
+        release_rx
+            .lock()
+            .unwrap()
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap();
+    }));
+    let registering_watcher = Arc::clone(&watcher);
+    let registering = std::thread::spawn(move || {
+        let registration = commit_resolved_registration_for_test(
+            &registering_watcher,
+            &subscriber,
+            &registrations,
+        )
+        .expect("reconcile registration");
+        (subscriber, registration)
+    });
+    covered_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("native coverage boundary");
+    retarget_alias_for_test(&alias, &second);
+    let (dropping_tx, dropping_rx) = std::sync::mpsc::channel();
+    let (dropped_tx, dropped_rx) = std::sync::mpsc::channel();
+    let unregistering = std::thread::spawn(move || {
+        dropping_tx.send(()).unwrap();
+        drop(existing);
+        dropped_tx.send(()).unwrap();
+    });
+    dropping_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("unregister started");
+    assert_eq!(
+        dropped_rx.try_recv(),
+        Err(std::sync::mpsc::TryRecvError::Empty)
+    );
+    release_tx.send(()).unwrap();
+    let (_subscriber, registration) = registering.join().expect("registration worker");
+    unregistering.join().expect("unregister worker");
+    assert_eq!(content_watch_counts(&watcher, &first), None);
+    assert_eq!(content_watch_counts(&watcher, &second), Some((0, 1)));
+    assert_eq!(registration.newly_covered_paths(), &[alias]);
+    drop(registration);
+    assert!(watcher.state.read().unwrap().path_ref_counts.is_empty());
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn event_reconciliation_wait_does_not_block_runtime_progress() {
     let directory = tempfile::tempdir().expect("temporary watched directory");

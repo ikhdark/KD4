@@ -40,8 +40,11 @@ pub(crate) struct FsWatchManager {
     outgoing: Arc<OutgoingMessageSender>,
     file_watcher: Option<Arc<FileWatcher>>,
     state: Arc<AsyncMutex<FsWatchState>>,
+    setup_slots: Arc<tokio::sync::Semaphore>,
     #[cfg(test)]
     watch_setup_count: Arc<AtomicUsize>,
+    #[cfg(test)]
+    setup_hook: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 #[derive(Default)]
@@ -60,8 +63,51 @@ struct ActiveWatchEntry {
     cancellation: CancellationToken,
     abort_handle: AbortHandle,
     done_rx: oneshot::Receiver<()>,
-    _subscriber: FileWatcherSubscriber,
-    _registration: WatchRegistration,
+    native: NativeWatchHandles,
+}
+
+struct NativeWatchHandles(Option<(FileWatcherSubscriber, WatchRegistration)>);
+
+impl NativeWatchHandles {
+    async fn stop(mut self) {
+        if let Some(handles) = self.0.take() {
+            let _ = tokio::task::spawn_blocking(move || drop(handles)).await;
+        }
+    }
+}
+
+impl Drop for NativeWatchHandles {
+    fn drop(&mut self) {
+        if let Some(handles) = self.0.take() {
+            // A setup result may outlive its canceled RPC. Retain ownership of
+            // late native teardown even when no caller can await its cleanup.
+            if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+                drop(runtime.spawn_blocking(move || drop(handles)));
+            } else {
+                drop(handles);
+            }
+        }
+    }
+}
+
+struct PendingReservation {
+    manager: FsWatchManager,
+    key: WatchKey,
+    id: u64,
+    armed: bool,
+}
+
+impl Drop for PendingReservation {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let manager = self.manager.clone();
+        let key = self.key.clone();
+        let id = self.id;
+        // This also covers cancellation while blocking setup is still running.
+        drop(tokio::spawn(async move { manager.remove_pending_reservation(&key, id).await; }));
+    }
 }
 
 impl WatchEntry {
@@ -74,6 +120,7 @@ impl WatchEntry {
             {
                 entry.abort_handle.abort();
             }
+            entry.native.stop().await;
         }
     }
 }
@@ -97,8 +144,11 @@ impl FsWatchManager {
             outgoing,
             file_watcher,
             state: Arc::new(AsyncMutex::new(FsWatchState::default())),
+            setup_slots: Arc::new(tokio::sync::Semaphore::new(4)),
             #[cfg(test)]
             watch_setup_count: Arc::new(AtomicUsize::new(0)),
+            #[cfg(test)]
+            setup_hook: None,
         }
     }
 
@@ -111,7 +161,9 @@ impl FsWatchManager {
             outgoing,
             file_watcher: Some(file_watcher),
             state: Arc::new(AsyncMutex::new(FsWatchState::default())),
+            setup_slots: Arc::new(tokio::sync::Semaphore::new(4)),
             watch_setup_count: Arc::new(AtomicUsize::new(0)),
+            setup_hook: None,
         }
     }
 
@@ -126,6 +178,7 @@ impl FsWatchManager {
             connection_id,
             watch_id: watch_id.clone(),
         };
+
         let reservation_id = {
             let mut state = self.state.lock().await;
             let reservation_id = state.next_reservation_id;
@@ -149,29 +202,52 @@ impl FsWatchManager {
             }
         };
 
+        let mut reservation = PendingReservation {
+            manager: self.clone(),
+            key: watch_key.clone(),
+            id: reservation_id,
+            armed: true,
+        };
+        let cancellation = rpc_gate.cancellation_token().child_token();
+        let setup_guard = cancellation.clone().drop_guard();
+        let setup_permit = tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => return Err(invalid_request("connection is closed")),
+            permit = self.setup_slots.clone().acquire_owned() => permit
+                .map_err(|_| internal_error("filesystem watch setup is unavailable"))?,
+        };
+        let setup_manager = self.clone();
+        let setup_path = params.path.clone();
+        let setup_key = watch_key.clone();
+
         #[cfg(test)]
         self.watch_setup_count.fetch_add(1, Ordering::AcqRel);
-        let setup_result = (|| {
-            let file_watcher = self
+        let setup_result = tokio::task::spawn_blocking(move || {
+            let _setup_permit = setup_permit;
+            #[cfg(test)]
+            if let Some(hook) = &setup_manager.setup_hook { hook(); }
+            if cancellation.is_cancelled() {
+                return Err(invalid_request("watch registration was canceled"));
+            }
+            let file_watcher = setup_manager
                 .file_watcher
                 .as_ref()
                 .ok_or_else(|| internal_error("filesystem watching is unavailable"))?;
-            let outgoing = self.outgoing.clone();
+            let outgoing = setup_manager.outgoing.clone();
             let (subscriber, rx) = file_watcher.add_subscriber();
-            let watch_root = params.path.clone();
+            let watch_root = setup_path.clone();
             let registration = subscriber
                 .register_paths(vec![WatchPath {
-                    path: params.path.to_path_buf(),
+                    path: setup_path.to_path_buf(),
                     recursive: false,
                 }])
                 .map_err(|err| {
                     internal_error(format!("failed to register filesystem watch: {err}"))
                 })?;
-            let cancellation = rpc_gate.cancellation_token().child_token();
             let task_cancellation = cancellation.clone();
             let task_watch_id = watch_id.clone();
-            let task_state = Arc::downgrade(&self.state);
-            let task_key = watch_key.clone();
+            let task_state = Arc::downgrade(&setup_manager.state);
+            let task_key = setup_key;
             let (start_tx, start_rx) = oneshot::channel();
             let (done_tx, done_rx) = oneshot::channel();
             let task = tokio::spawn(async move {
@@ -228,8 +304,8 @@ impl FsWatchManager {
                             None
                         }
                     };
-                    if let Some(retired) = retired {
-                        let _ = tokio::task::spawn_blocking(move || drop(retired)).await;
+                    if let Some(WatchEntry::Active(retired)) = retired {
+                        retired.native.stop().await;
                     }
                 }
                 let _ = done_tx.send(());
@@ -239,17 +315,17 @@ impl FsWatchManager {
                 cancellation,
                 abort_handle: task.abort_handle(),
                 done_rx,
-                _subscriber: subscriber,
-                _registration: registration,
+                native: NativeWatchHandles(Some((subscriber, registration))),
             };
             drop(task);
             Ok::<_, JSONRPCErrorError>((entry, start_tx))
-        })();
+        }).await.map_err(|err| internal_error(format!("filesystem watch setup worker failed: {err}")))?;
         let (entry, start_tx) = match setup_result {
             Ok(setup) => setup,
             Err(err) => {
                 self.remove_pending_reservation(&watch_key, reservation_id)
                     .await;
+                reservation.armed = false;
                 return Err(err);
             }
         };
@@ -278,6 +354,8 @@ impl FsWatchManager {
             })
         };
         if commit_result.as_ref().is_some_and(Result::is_ok) {
+            reservation.armed = false;
+            setup_guard.disarm();
             let _ = start_tx.send(());
         } else {
             drop(start_tx);
@@ -287,6 +365,7 @@ impl FsWatchManager {
         }
         self.remove_pending_reservation(&watch_key, reservation_id)
             .await;
+        reservation.armed = false;
         commit_result.ok_or_else(|| invalid_request("connection is closed"))??;
 
         Ok(FsWatchResponse { path: params.path })
@@ -356,6 +435,51 @@ mod tests {
     use std::collections::HashSet;
     use std::path::PathBuf;
     use tempfile::TempDir;
+
+    #[tokio::test]
+    async fn canceled_blocking_setup_releases_its_reservation_without_stalling_executor() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("watched");
+        std::fs::write(&path, "value").unwrap();
+        let mut manager = manager_with_noop_watcher();
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        let worker_entered = entered.clone();
+        let worker_release = release.clone();
+        let executor_thread = std::thread::current().id();
+        manager.setup_hook = Some(Arc::new(move || {
+            assert_ne!(std::thread::current().id(), executor_thread);
+            worker_entered.notify_one();
+            let (lock, changed) = &*worker_release;
+            drop(changed.wait_timeout_while(lock.lock().unwrap(), Duration::from_secs(5), |released| !*released).unwrap());
+        }));
+        let task_manager = manager.clone();
+        let params = FsWatchParams { watch_id: "canceled".into(), path: absolute_path(path) };
+        let task_params = params.clone();
+        let task = tokio::spawn(async move { task_manager.watch(ConnectionId(1), task_params).await });
+        entered.notified().await;
+        // This current-thread executor must continue to run while the native
+        // setup hook deliberately occupies its blocking worker.
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !manager.state.lock().await.entries.is_empty() {
+                tokio::task::yield_now().await;
+            }
+        }).await.expect("canceled setup must relinquish its watch ID");
+        *release.0.lock().unwrap() = true;
+        release.1.notify_all();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while manager.setup_slots.available_permits() != 4 {
+                tokio::task::yield_now().await;
+            }
+        }).await.expect("late setup must release native admission");
+        manager.setup_hook = None;
+        manager.watch(ConnectionId(1), params).await.expect("canceled watch ID can be reused");
+        manager.connection_closed(ConnectionId(1)).await;
+        assert!(manager.state.lock().await.entries.is_empty());
+    }
 
     #[tokio::test]
     async fn backpressure_completion_retires_the_exact_watch_id() {
@@ -432,7 +556,9 @@ mod tests {
             )),
             file_watcher: None,
             state: Arc::new(AsyncMutex::new(FsWatchState::default())),
+            setup_slots: Arc::new(tokio::sync::Semaphore::new(4)),
             watch_setup_count: Arc::new(AtomicUsize::new(0)),
+            setup_hook: None,
         }
     }
 

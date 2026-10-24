@@ -89,6 +89,47 @@ pub fn build_turns_from_rollout_items(items: &[RolloutItem]) -> Vec<Turn> {
     builder.finish()
 }
 
+/// Replay the same structural history while omitting tool payloads that this view cannot return.
+/// Item slots remain present until replay finishes: legacy boundaries, synthetic IDs,
+/// rollback and late scoped updates all depend on their identities and positions.
+pub fn build_turns_from_rollout_items_with_items_view<'a>(
+    items: impl IntoIterator<Item = &'a RolloutItem>,
+    items_view: TurnItemsView,
+) -> Vec<Turn> {
+    let mut builder = ThreadHistoryBuilder::new();
+    builder.omit_tool_payloads = items_view != TurnItemsView::Full;
+    for item in items {
+        builder.handle_rollout_item(item);
+    }
+    let mut turns = builder.finish();
+    for turn in &mut turns {
+        match items_view {
+            TurnItemsView::Full => {}
+            TurnItemsView::NotLoaded => turn.items = Vec::new(),
+            TurnItemsView::Summary => {
+                let user = turn.items.iter().position(|item| matches!(item, ThreadItem::UserMessage { .. }));
+                let agent = turn.items.iter().rposition(|item| matches!(item, ThreadItem::AgentMessage { .. }))
+                    .filter(|&index| user.is_none_or(|user| turn.items[user].id() != turn.items[index].id()));
+                let (mut first_user, mut last_agent) = (None, None);
+                for (index, item) in std::mem::take(&mut turn.items).into_iter().enumerate() {
+                    if Some(index) == user {
+                        first_user = Some(item);
+                    } else if Some(index) == agent {
+                        last_agent = Some(item);
+                    }
+                }
+                turn.items = first_user.into_iter().chain(last_agent).collect();
+            }
+        }
+        turn.items_view = items_view;
+    }
+    turns
+}
+
+#[cfg(test)]
+#[path = "thread_history_projection_tests.rs"]
+mod projection_tests;
+
 #[cfg(test)]
 #[path = "thread_history_compat_tests.rs"]
 mod compatibility_tests;
@@ -212,6 +253,7 @@ impl ThreadHistoryChangeAccumulator {
 }
 
 pub struct ThreadHistoryBuilder {
+    omit_tool_payloads: bool,
     turns: Vec<Turn>,
     current_turn: Option<PendingTurn>,
     next_item_index: i64,
@@ -251,6 +293,7 @@ impl ThreadHistoryBuilder {
 
     pub fn new() -> Self {
         Self {
+            omit_tool_payloads: false,
             turns: Vec::new(),
             current_turn: None,
             next_item_index: 1,
@@ -642,6 +685,10 @@ impl ThreadHistoryBuilder {
             return;
         };
 
+        if self.omit_tool_payloads {
+            self.upsert_item_in_current_turn(Self::omitted_tool_item(hook_prompt.id));
+            return;
+        }
         self.upsert_item_in_current_turn(ThreadItem::HookPrompt {
             id: hook_prompt.id,
             fragments: hook_prompt
@@ -698,11 +745,12 @@ impl ThreadHistoryBuilder {
         if payload.text.is_empty() {
             return;
         }
+        let mut text = if self.omit_tool_payloads { String::new() } else { payload.text.clone() };
 
         let updated_index = {
             let turn = self.ensure_turn();
             if let Some(ThreadItem::Reasoning { summary, .. }) = turn.items.last_mut() {
-                summary.push(payload.text.clone());
+                summary.push(std::mem::take(&mut text));
                 Some(turn.items.len() - 1)
             } else {
                 None
@@ -717,7 +765,7 @@ impl ThreadHistoryBuilder {
         let id = self.next_item_id();
         self.push_item_in_current_turn(ThreadItem::Reasoning {
             id,
-            summary: vec![payload.text.clone()],
+            summary: vec![text],
             content: Vec::new(),
         });
     }
@@ -726,11 +774,12 @@ impl ThreadHistoryBuilder {
         if payload.text.is_empty() {
             return;
         }
+        let mut text = if self.omit_tool_payloads { String::new() } else { payload.text.clone() };
 
         let updated_index = {
             let turn = self.ensure_turn();
             if let Some(ThreadItem::Reasoning { content, .. }) = turn.items.last_mut() {
-                content.push(payload.text.clone());
+                content.push(std::mem::take(&mut text));
                 Some(turn.items.len() - 1)
             } else {
                 None
@@ -746,7 +795,7 @@ impl ThreadHistoryBuilder {
         self.push_item_in_current_turn(ThreadItem::Reasoning {
             id,
             summary: Vec::new(),
-            content: vec![payload.text.clone()],
+            content: vec![text],
         });
     }
 
@@ -777,7 +826,7 @@ impl ThreadHistoryBuilder {
                     codex_extension_items::ExtensionItem::WebSearch(_)
                 )
         ) {
-            let item = ThreadItem::from(payload.item.clone());
+            let item = self.materialize_item(&payload.item);
             if !matches!(&item, ThreadItem::AgentMessage { text, .. } if text.is_empty()) {
                 self.upsert_item_in_turn_id(&payload.turn_id, item.clone());
                 if self.contains_turn(&payload.turn_id) {
@@ -827,7 +876,7 @@ impl ThreadHistoryBuilder {
             {
                 self.rollback_eligible_turn_ids.insert(turn_id.to_string());
             }
-            let item = ThreadItem::from(item.clone());
+            let item = self.materialize_item(item);
             if is_review_mode_item {
                 self.upsert_review_mode_item(Some(turn_id), item);
             } else {
@@ -862,11 +911,19 @@ impl ThreadHistoryBuilder {
     }
 
     fn handle_exec_command_begin(&mut self, payload: &ExecCommandBeginEvent) {
+        if self.omit_tool_payloads {
+            self.upsert_item_in_turn_id(&payload.turn_id, Self::omitted_tool_item(payload.call_id.clone()));
+            return;
+        }
         let item = build_command_execution_begin_item(payload);
         self.upsert_item_in_turn_id(&payload.turn_id, item);
     }
 
     fn handle_exec_command_end(&mut self, payload: &ExecCommandEndEvent) {
+        if self.omit_tool_payloads {
+            self.upsert_item_in_turn_id(&payload.turn_id, Self::omitted_tool_item(payload.call_id.clone()));
+            return;
+        }
         let item = build_command_execution_end_item(payload);
         // Command completions can arrive out of order. Unified exec may return
         // while a PTY is still running, then emit ExecCommandEnd later from a
@@ -877,7 +934,11 @@ impl ThreadHistoryBuilder {
     }
 
     fn handle_apply_patch_approval_request(&mut self, payload: &ApplyPatchApprovalRequestEvent) {
-        let item = build_file_change_approval_request_item(payload);
+        let item = if self.omit_tool_payloads {
+            Self::omitted_tool_item(payload.call_id.clone())
+        } else {
+            build_file_change_approval_request_item(payload)
+        };
         if payload.turn_id.is_empty() {
             self.upsert_item_in_current_turn(item);
         } else {
@@ -886,7 +947,11 @@ impl ThreadHistoryBuilder {
     }
 
     fn handle_patch_apply_begin(&mut self, payload: &PatchApplyBeginEvent) {
-        let item = build_file_change_begin_item(payload);
+        let item = if self.omit_tool_payloads {
+            Self::omitted_tool_item(payload.call_id.clone())
+        } else {
+            build_file_change_begin_item(payload)
+        };
         if payload.turn_id.is_empty() {
             self.upsert_item_in_current_turn(item);
         } else {
@@ -895,7 +960,11 @@ impl ThreadHistoryBuilder {
     }
 
     fn handle_patch_apply_end(&mut self, payload: &PatchApplyEndEvent) {
-        let item = build_file_change_end_item(payload);
+        let item = if self.omit_tool_payloads {
+            Self::omitted_tool_item(payload.call_id.clone())
+        } else {
+            build_file_change_end_item(payload)
+        };
         if payload.turn_id.is_empty() {
             self.upsert_item_in_current_turn(item);
         } else {
@@ -907,6 +976,15 @@ impl ThreadHistoryBuilder {
         &mut self,
         payload: &codex_protocol::dynamic_tools::DynamicToolCallRequest,
     ) {
+        if self.omit_tool_payloads {
+            let item = Self::omitted_tool_item(payload.call_id.clone());
+            if payload.turn_id.is_empty() {
+                self.upsert_item_in_current_turn(item);
+            } else {
+                self.upsert_item_in_turn_id(&payload.turn_id, item);
+            }
+            return;
+        }
         let item = ThreadItem::DynamicToolCall {
             id: payload.call_id.clone(),
             namespace: payload.namespace.clone(),
@@ -926,6 +1004,15 @@ impl ThreadHistoryBuilder {
     }
 
     fn handle_dynamic_tool_call_response(&mut self, payload: &DynamicToolCallResponseEvent) {
+        if self.omit_tool_payloads {
+            let item = Self::omitted_tool_item(payload.call_id.clone());
+            if payload.turn_id.is_empty() {
+                self.upsert_item_in_current_turn(item);
+            } else {
+                self.upsert_item_in_turn_id(&payload.turn_id, item);
+            }
+            return;
+        }
         let status = if payload.success {
             DynamicToolCallStatus::Completed
         } else {
@@ -951,6 +1038,10 @@ impl ThreadHistoryBuilder {
     }
 
     fn handle_mcp_tool_call_begin(&mut self, payload: &McpToolCallBeginEvent) {
+        if self.omit_tool_payloads {
+            self.upsert_item_in_current_turn(Self::omitted_tool_item(payload.call_id.clone()));
+            return;
+        }
         let item = ThreadItem::McpToolCall {
             id: payload.call_id.clone(),
             server: payload.invocation.server.clone(),
@@ -982,6 +1073,10 @@ impl ThreadHistoryBuilder {
     }
 
     fn handle_mcp_tool_call_end(&mut self, payload: &McpToolCallEndEvent) {
+        if self.omit_tool_payloads {
+            self.upsert_item_in_current_turn(Self::omitted_tool_item(payload.call_id.clone()));
+            return;
+        }
         let status = if payload.is_success() {
             McpToolCallStatus::Completed
         } else {
@@ -1051,7 +1146,8 @@ impl ThreadHistoryBuilder {
             id: payload.call_id.clone(),
             status: String::new(),
             revised_prompt: None,
-            result: String::new(),
+            result: None,
+            error: None,
             saved_path: None,
             provider_usage: None,
         });
@@ -1059,11 +1155,16 @@ impl ThreadHistoryBuilder {
     }
 
     fn handle_image_generation_end(&mut self, payload: &ImageGenerationEndEvent) {
+        if self.omit_tool_payloads {
+            self.upsert_item_in_current_turn(Self::omitted_tool_item(payload.call_id.clone()));
+            return;
+        }
         let item = ThreadItem::ImageGeneration(ImageGenerationItem {
             id: payload.call_id.clone(),
             status: payload.status.clone(),
             revised_prompt: payload.revised_prompt.clone(),
             result: payload.result.clone(),
+            error: payload.error.clone(),
             saved_path: payload.saved_path.clone(),
             provider_usage: None,
         });
@@ -1074,6 +1175,10 @@ impl ThreadHistoryBuilder {
         &mut self,
         payload: &codex_protocol::protocol::CollabAgentSpawnBeginEvent,
     ) {
+        if self.omit_tool_payloads {
+            self.upsert_item_in_current_turn(Self::omitted_collab_item(&payload.call_id, CollabAgentTool::SpawnAgent, CollabAgentToolCallStatus::InProgress));
+            return;
+        }
         let item = ThreadItem::CollabAgentToolCall {
             id: payload.call_id.clone(),
             tool: CollabAgentTool::SpawnAgent,
@@ -1098,6 +1203,10 @@ impl ThreadHistoryBuilder {
             _ if has_receiver => CollabAgentToolCallStatus::Completed,
             _ => CollabAgentToolCallStatus::Failed,
         };
+        if self.omit_tool_payloads {
+            self.upsert_item_in_current_turn(Self::omitted_collab_item(&payload.call_id, CollabAgentTool::SpawnAgent, status));
+            return;
+        }
         let (receiver_thread_ids, agents_states) = match &payload.new_thread_id {
             Some(id) => {
                 let receiver_id = id.to_string();
@@ -1126,6 +1235,10 @@ impl ThreadHistoryBuilder {
         &mut self,
         payload: &codex_protocol::protocol::CollabAgentInteractionBeginEvent,
     ) {
+        if self.omit_tool_payloads {
+            self.upsert_item_in_current_turn(Self::omitted_collab_item(&payload.call_id, CollabAgentTool::SendInput, CollabAgentToolCallStatus::InProgress));
+            return;
+        }
         let item = ThreadItem::CollabAgentToolCall {
             id: payload.call_id.clone(),
             tool: CollabAgentTool::SendInput,
@@ -1148,6 +1261,10 @@ impl ThreadHistoryBuilder {
             AgentStatus::Errored(_) | AgentStatus::NotFound => CollabAgentToolCallStatus::Failed,
             _ => CollabAgentToolCallStatus::Completed,
         };
+        if self.omit_tool_payloads {
+            self.upsert_item_in_current_turn(Self::omitted_collab_item(&payload.call_id, CollabAgentTool::SendInput, status));
+            return;
+        }
         let receiver_id = payload.receiver_thread_id.to_string();
         let received_status = CollabAgentState::from(payload.status.clone());
         self.upsert_item_in_current_turn(ThreadItem::CollabAgentToolCall {
@@ -1179,6 +1296,10 @@ impl ThreadHistoryBuilder {
         &mut self,
         payload: &codex_protocol::protocol::CollabWaitingBeginEvent,
     ) {
+        if self.omit_tool_payloads {
+            self.upsert_item_in_current_turn(Self::omitted_collab_item(&payload.call_id, CollabAgentTool::Wait, CollabAgentToolCallStatus::InProgress));
+            return;
+        }
         let item = ThreadItem::CollabAgentToolCall {
             id: payload.call_id.clone(),
             tool: CollabAgentTool::Wait,
@@ -1252,6 +1373,15 @@ impl ThreadHistoryBuilder {
         } else {
             CollabAgentToolCallStatus::Completed
         };
+        if self.omit_tool_payloads {
+            let item = Self::omitted_collab_item(&payload.call_id, CollabAgentTool::Wait, status);
+            if let Some((turn_id, _)) = owner {
+                self.upsert_item_in_turn_id(&turn_id, item);
+            } else {
+                self.upsert_item_in_current_turn(item);
+            }
+            return;
+        }
         let mut receiver_thread_ids: Vec<String> =
             payload.statuses.keys().map(ToString::to_string).collect();
         receiver_thread_ids.sort();
@@ -1282,6 +1412,10 @@ impl ThreadHistoryBuilder {
         &mut self,
         payload: &codex_protocol::protocol::CollabCloseBeginEvent,
     ) {
+        if self.omit_tool_payloads {
+            self.upsert_item_in_current_turn(Self::omitted_collab_item(&payload.call_id, CollabAgentTool::CloseAgent, CollabAgentToolCallStatus::InProgress));
+            return;
+        }
         let item = ThreadItem::CollabAgentToolCall {
             id: payload.call_id.clone(),
             tool: CollabAgentTool::CloseAgent,
@@ -1301,6 +1435,10 @@ impl ThreadHistoryBuilder {
             AgentStatus::Errored(_) | AgentStatus::NotFound => CollabAgentToolCallStatus::Failed,
             _ => CollabAgentToolCallStatus::Completed,
         };
+        if self.omit_tool_payloads {
+            self.upsert_item_in_current_turn(Self::omitted_collab_item(&payload.call_id, CollabAgentTool::CloseAgent, status));
+            return;
+        }
         let receiver_id = payload.receiver_thread_id.to_string();
         let agents_states = [(
             receiver_id.clone(),
@@ -1325,6 +1463,10 @@ impl ThreadHistoryBuilder {
         &mut self,
         payload: &codex_protocol::protocol::CollabResumeBeginEvent,
     ) {
+        if self.omit_tool_payloads {
+            self.upsert_item_in_current_turn(Self::omitted_collab_item(&payload.call_id, CollabAgentTool::ResumeAgent, CollabAgentToolCallStatus::InProgress));
+            return;
+        }
         let item = ThreadItem::CollabAgentToolCall {
             id: payload.call_id.clone(),
             tool: CollabAgentTool::ResumeAgent,
@@ -1347,6 +1489,10 @@ impl ThreadHistoryBuilder {
             AgentStatus::Errored(_) | AgentStatus::NotFound => CollabAgentToolCallStatus::Failed,
             _ => CollabAgentToolCallStatus::Completed,
         };
+        if self.omit_tool_payloads {
+            self.upsert_item_in_current_turn(Self::omitted_collab_item(&payload.call_id, CollabAgentTool::ResumeAgent, status));
+            return;
+        }
         let receiver_id = payload.receiver_thread_id.to_string();
         let agents_states = [(
             receiver_id.clone(),
@@ -1385,6 +1531,11 @@ impl ThreadHistoryBuilder {
         &mut self,
         payload: &codex_protocol::protocol::EnteredReviewModeEvent,
     ) {
+        if self.omit_tool_payloads {
+            let id = payload.item_id.clone().unwrap_or_else(|| self.next_item_id());
+            self.upsert_review_mode_item(payload.turn_id.as_deref(), Self::omitted_tool_item(id));
+            return;
+        }
         let review = payload
             .user_facing_hint
             .clone()
@@ -1403,6 +1554,11 @@ impl ThreadHistoryBuilder {
         &mut self,
         payload: &codex_protocol::protocol::ExitedReviewModeEvent,
     ) {
+        if self.omit_tool_payloads {
+            let id = payload.item_id.clone().unwrap_or_else(|| self.next_item_id());
+            self.upsert_review_mode_item(payload.turn_id.as_deref(), Self::omitted_tool_item(id));
+            return;
+        }
         let review = review_output_text(payload.review_output.as_ref());
         let id = payload
             .item_id
@@ -1875,6 +2031,45 @@ impl ThreadHistoryBuilder {
             });
         }
         content
+    }
+
+    fn omitted_tool_item(id: String) -> ThreadItem {
+        ThreadItem::Plan { id, text: String::new() }
+    }
+
+    fn omitted_collab_item(id: &str, tool: CollabAgentTool, status: CollabAgentToolCallStatus) -> ThreadItem {
+        ThreadItem::CollabAgentToolCall {
+            id: id.to_string(), tool, status, sender_thread_id: String::new(),
+            receiver_thread_ids: Vec::new(), prompt: None, model: None,
+            reasoning_effort: None, agents_states: HashMap::new(),
+        }
+    }
+
+    fn materialize_item(&self, item: &codex_protocol::items::TurnItem) -> ThreadItem {
+        use codex_protocol::items::TurnItem as CoreItem;
+        if !self.omit_tool_payloads {
+            return ThreadItem::from(item.clone());
+        }
+        match item {
+            // Keep exact canonical/legacy mirror evidence and user/assistant summaries.
+            CoreItem::UserMessage(_) | CoreItem::AgentMessage(_) | CoreItem::WebSearch(_)
+            | CoreItem::Extension(codex_extension_items::ExtensionItem::WebSearch(_)) => {
+                ThreadItem::from(item.clone())
+            }
+            CoreItem::ContextCompaction(_) => ThreadItem::ContextCompaction {
+                id: item.id(), tokens_before: None, tokens_after: None,
+                omitted_image_count: None, retained_image_count: None, omitted_text: None,
+            },
+            CoreItem::Reasoning(_) => ThreadItem::Reasoning {
+                id: item.id(), summary: Vec::new(), content: Vec::new(),
+            },
+            CoreItem::CollabAgentToolCall(call) => ThreadItem::CollabAgentToolCall {
+                id: call.id.clone(), tool: call.tool.into(), status: call.status.into(),
+                sender_thread_id: String::new(), receiver_thread_ids: Vec::new(),
+                prompt: None, model: None, reasoning_effort: None, agents_states: HashMap::new(),
+            },
+            _ => Self::omitted_tool_item(item.id()),
+        }
     }
 }
 
@@ -2566,7 +2761,8 @@ mod tests {
                         id: "image-1".to_string(),
                         status: "completed".to_string(),
                         revised_prompt: Some("A blue square".to_string()),
-                        result: "cG5n".to_string(),
+                        result: Some("cG5n".to_string()),
+                        error: None,
                         saved_path: Some(saved_path.clone()),
                         provider_usage: None,
                     },
@@ -2597,7 +2793,8 @@ mod tests {
                 id: "image-1".to_string(),
                 status: "completed".to_string(),
                 revised_prompt: Some("A blue square".to_string()),
-                result: "cG5n".to_string(),
+                result: Some("cG5n".to_string()),
+                error: None,
                 saved_path: Some(saved_path),
                 provider_usage: None,
             })]
@@ -2675,7 +2872,8 @@ mod tests {
             id: "image-1".to_string(),
             status: "in_progress".to_string(),
             revised_prompt: None,
-            result: String::new(),
+            result: None,
+            error: None,
             saved_path: None,
             provider_usage: None,
         };
@@ -2732,7 +2930,8 @@ mod tests {
                     id: "hosted-image".to_string(),
                     status: String::new(),
                     revised_prompt: None,
-                    result: String::new(),
+                    result: None,
+                    error: None,
                     saved_path: None,
                     provider_usage: None,
                 }),
@@ -2916,6 +3115,41 @@ mod tests {
     }
 
     #[test]
+    fn image_generation_failure_replay_preserves_error_without_image_data() {
+        let error =
+            serde_json::json!({"type":"image_generation_error", "message":"Generation failed"});
+        let event = ImageGenerationEndEvent {
+            call_id: "ig_failed".to_string(),
+            status: "failed".to_string(),
+            revised_prompt: None,
+            result: None,
+            error: Some(error.clone()),
+            saved_path: None,
+        };
+        let turns = build_turns_from_rollout_items(&[RolloutItem::EventMsg(
+            EventMsg::ImageGenerationEnd(event),
+        )]);
+        let [ThreadItem::ImageGeneration(image)] = turns[0].items.as_slice() else {
+            panic!("failed image")
+        };
+        assert_eq!(image.status, "failed");
+        assert!(image.result.is_none());
+        assert!(image.saved_path.is_none());
+        assert_eq!(image.error, Some(error.clone()));
+
+        let canonical = CoreTurnItem::ImageGeneration(codex_protocol::items::ImageGenerationItem {
+            id: "ig_failed".to_string(),
+            status: "failed".to_string(),
+            revised_prompt: None,
+            result: None,
+            error: Some(error),
+            saved_path: None,
+            provider_usage: None,
+        });
+        assert_eq!(ThreadItem::from(canonical), turns[0].items[0]);
+    }
+
+    #[test]
     fn replays_image_generation_end_events_into_turn_history() {
         let items = vec![
             RolloutItem::EventMsg(EventMsg::TurnStarted(TurnStartedEvent {
@@ -2937,7 +3171,8 @@ mod tests {
                 call_id: "ig_123".into(),
                 status: "completed".into(),
                 revised_prompt: Some("final prompt".into()),
-                result: "Zm9v".into(),
+                result: Some("Zm9v".into()),
+                error: None,
                 saved_path: Some(test_path_buf("/tmp/ig_123.png").abs()),
             })),
             RolloutItem::EventMsg(EventMsg::TurnComplete(TurnCompleteEvent {
@@ -2979,7 +3214,8 @@ mod tests {
                         id: "ig_123".into(),
                         status: "completed".into(),
                         revised_prompt: Some("final prompt".into()),
-                        result: "Zm9v".into(),
+                        result: Some("Zm9v".into()),
+                        error: None,
                         saved_path: Some(test_path_buf("/tmp/ig_123.png").abs()),
                         provider_usage: None,
                     }),

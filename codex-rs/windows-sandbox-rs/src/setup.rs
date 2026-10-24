@@ -30,8 +30,6 @@ use crate::setup_protocol::SetupPayload;
 use crate::ssh_config_dependencies::ssh_config_dependency_paths;
 use anyhow::Result;
 use anyhow::anyhow;
-use base64::Engine;
-use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use codex_protocol::models::PermissionProfile;
 use codex_utils_absolute_path::AbsolutePathBuf;
 
@@ -134,6 +132,7 @@ pub fn run_setup_refresh(
         SetupRootOverrides::default(),
         /*offline_proxy_settings_override*/ None,
         SetupMode::Full,
+        None,
     )
 }
 
@@ -141,12 +140,14 @@ pub(crate) fn run_setup_refresh_with_overrides_and_proxy_settings(
     request: SandboxSetupRequest<'_>,
     overrides: SetupRootOverrides,
     offline_proxy_settings: &OfflineProxySettings,
+    cancellation: Option<&crate::WindowsSandboxCancellationToken>,
 ) -> Result<()> {
     run_setup_refresh_inner(
         request,
         overrides,
         Some(offline_proxy_settings),
         SetupMode::Full,
+        cancellation,
     )
 }
 
@@ -186,6 +187,7 @@ pub fn run_setup_refresh_with_extra_read_roots(
         },
         /*offline_proxy_settings_override*/ None,
         SetupMode::Full,
+        None,
     )
 }
 
@@ -222,6 +224,7 @@ pub fn run_strict_read_root_grant(
         },
         /*offline_proxy_settings_override*/ None,
         SetupMode::ReadAclsOnlyStrict,
+        None,
     )
 }
 
@@ -230,7 +233,9 @@ fn run_setup_refresh_inner(
     overrides: SetupRootOverrides,
     offline_proxy_settings_override: Option<&OfflineProxySettings>,
     mode: SetupMode,
+    cancellation: Option<&crate::WindowsSandboxCancellationToken>,
 ) -> Result<()> {
+    check_setup_cancellation(cancellation)?;
     if !request.permissions.is_enforceable_by_windows_sandbox() {
         anyhow::bail!("unsupported filesystem permissions for Windows sandbox setup");
     }
@@ -256,9 +261,9 @@ fn run_setup_refresh_inner(
         mode,
         refresh_only: true,
     };
-    let json = serde_json::to_vec(&payload)?;
-    let b64 = BASE64_STANDARD.encode(json);
-    let exe = find_setup_exe();
+    let staged_payload = crate::setup_protocol::PreparedSetupRequest::new(&payload)?;
+    let payload_args = staged_payload.arguments(false)?;
+    let exe = find_setup_exe()?;
     let sbx_dir = sandbox_dir(request.codex_home);
     let log_path = current_log_file_path(&sbx_dir);
     let cleared_report = match clear_setup_error_report(request.codex_home) {
@@ -273,18 +278,18 @@ fn run_setup_refresh_inner(
     };
     // Refresh should never request elevation; ensure verb isn't set and we don't trigger UAC.
     let mut cmd = Command::new(&exe);
-    cmd.arg(&b64).stdout(Stdio::null()).stderr(Stdio::null());
+    cmd.args(&payload_args).stdout(Stdio::null()).stderr(Stdio::null());
     let cwd = std::env::current_dir().unwrap_or_else(|_| request.codex_home.to_path_buf());
     log_note(
         &format!(
             "setup refresh: spawning {} (cwd={}, payload_len={})",
             exe.display(),
             cwd.display(),
-            b64.len()
+            staged_payload.payload_len
         ),
         Some(&sbx_dir),
     );
-    let status = cmd.status().map_err(|err| {
+    let status = wait_setup_child(&mut cmd, cancellation).map_err(|err| {
         let message = format!(
             "setup refresh failed to launch helper: helper={}, cwd={}, log={}, error={err}",
             exe.display(),
@@ -702,13 +707,14 @@ fn quote_arg(arg: &str) -> String {
     out
 }
 
-fn find_setup_exe() -> PathBuf {
+fn find_setup_exe() -> Result<PathBuf> {
     if let Ok(exe) = std::env::current_exe()
         && let Some(setup_exe) = find_setup_exe_for_current_exe(&exe)
     {
-        return setup_exe;
+        if setup_exe.is_absolute() && setup_exe.is_file() { return Ok(setup_exe); }
     }
-    PathBuf::from(SETUP_EXE_FILENAME)
+    Err(failure(SetupErrorCode::OrchestratorHelperLaunchFailed,
+        "packaged Windows sandbox setup helper was not found; refusing ambient executable lookup"))
 }
 
 fn find_setup_exe_for_current_exe(exe: &Path) -> Option<PathBuf> {
@@ -745,21 +751,44 @@ fn verify_setup_completed(codex_home: &Path) -> Result<()> {
     }
 }
 
-fn run_setup_exe(payload: &SetupPayload, needs_elevation: bool, codex_home: &Path) -> Result<()> {
+pub(crate) fn check_setup_cancellation(cancellation: Option<&crate::WindowsSandboxCancellationToken>) -> Result<()> {
+    anyhow::ensure!(!cancellation.is_some_and(|token| token.is_cancelled()), "sandbox setup cancelled");
+    Ok(())
+}
+
+fn wait_setup_child(command: &mut Command, cancellation: Option<&crate::WindowsSandboxCancellationToken>) -> Result<std::process::ExitStatus> {
+    check_setup_cancellation(cancellation)?;
+    let mut child = command.spawn()?;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return Ok(status),
+            Ok(None) => {}
+            Err(err) => { let _ = child.kill(); let _ = child.wait(); return Err(err.into()); }
+        }
+        if let Err(err) = check_setup_cancellation(cancellation) {
+            let killed = child.kill();
+            let reaped = child.wait();
+            return Err(err.context(format!("setup helper termination: {killed:?}; reap: {reaped:?}")));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+}
+
+fn run_setup_exe(payload: &SetupPayload, needs_elevation: bool, codex_home: &Path, cancellation: Option<&crate::WindowsSandboxCancellationToken>) -> Result<()> {
     use windows_sys::Win32::System::Threading::GetExitCodeProcess;
-    use windows_sys::Win32::System::Threading::INFINITE;
     use windows_sys::Win32::System::Threading::WaitForSingleObject;
     use windows_sys::Win32::UI::Shell::SEE_MASK_NOCLOSEPROCESS;
     use windows_sys::Win32::UI::Shell::SHELLEXECUTEINFOW;
     use windows_sys::Win32::UI::Shell::ShellExecuteExW;
-    let exe = find_setup_exe();
-    let payload_json = serde_json::to_string(payload).map_err(|err| {
+    check_setup_cancellation(cancellation)?;
+    let exe = find_setup_exe()?;
+    let staged_payload = crate::setup_protocol::PreparedSetupRequest::new(payload).map_err(|err| {
         failure(
             SetupErrorCode::OrchestratorPayloadSerializeFailed,
             format!("failed to serialize elevation payload: {err}"),
         )
     })?;
-    let payload_b64 = BASE64_STANDARD.encode(payload_json.as_bytes());
+    let payload_args = staged_payload.arguments(false)?;
     let cleared_report = match clear_setup_error_report(codex_home) {
         Ok(()) => true,
         Err(err) => {
@@ -774,13 +803,15 @@ fn run_setup_exe(payload: &SetupPayload, needs_elevation: bool, codex_home: &Pat
     };
 
     if !needs_elevation {
-        let status = Command::new(&exe)
-            .arg(&payload_b64)
+        let mut command = Command::new(&exe);
+        command
+            .args(&payload_args)
             .creation_flags(0x08000000) // CREATE_NO_WINDOW
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
-            .status()
+            ;
+        let status = wait_setup_child(&mut command, cancellation)
             .map_err(|err| {
                 failure(
                     SetupErrorCode::OrchestratorHelperLaunchFailed,
@@ -807,7 +838,7 @@ fn run_setup_exe(payload: &SetupPayload, needs_elevation: bool, codex_home: &Pat
     }
 
     let exe_w = crate::winutil::to_wide(&exe);
-    let params = quote_arg(&payload_b64);
+    let params = payload_args.iter().map(|arg| quote_arg(arg)).collect::<Vec<_>>().join(" ");
     let params_w = crate::winutil::to_wide(params);
     let verb_w = crate::winutil::to_wide("runas");
     // SAFETY: SHELLEXECUTEINFOW contains integer fields and nullable pointers, so zero is a valid
@@ -823,6 +854,8 @@ fn run_setup_exe(payload: &SetupPayload, needs_elevation: bool, codex_home: &Pat
     // SAFETY: sei has its required size and points to live NUL-terminated verb, executable and
     // parameter buffers; the process handle output remains in sei for checked ownership
     // below.
+    check_setup_cancellation(cancellation)?;
+    // ShellExecuteExW's UAC consent UI itself has no cancellation handle.
     let ok = unsafe { ShellExecuteExW(&mut sei) };
     if ok == 0 || sei.hProcess.is_null() {
         // SAFETY: Read the thread-local ShellExecuteExW status before any further native call can
@@ -841,7 +874,22 @@ fn run_setup_exe(payload: &SetupPayload, needs_elevation: bool, codex_home: &Pat
     // SAFETY: sei.hProcess is the checked successful handle retained by this function; the exit-
     // code slot is writable, and the handle is closed once after the wait and query.
     unsafe {
-        WaitForSingleObject(sei.hProcess, INFINITE);
+        loop {
+            let waited = WaitForSingleObject(sei.hProcess, 50);
+            if waited == 0 { break; }
+            if waited != 258 {
+                let error = std::io::Error::last_os_error();
+                let _ = windows_sys::Win32::System::Threading::TerminateProcess(sei.hProcess, 1);
+                CloseHandle(sei.hProcess);
+                return Err(error.into());
+            }
+            if check_setup_cancellation(cancellation).is_err() {
+                let terminated = windows_sys::Win32::System::Threading::TerminateProcess(sei.hProcess, 1);
+                let reaped = WaitForSingleObject(sei.hProcess, 5000) == 0;
+                CloseHandle(sei.hProcess);
+                anyhow::bail!("sandbox setup cancelled (termination accepted: {}, reaped: {})", terminated != 0, reaped);
+            }
+        }
         let mut code: u32 = 1;
         GetExitCodeProcess(sei.hProcess, &mut code);
         CloseHandle(sei.hProcess);
@@ -868,7 +916,7 @@ pub fn run_elevated_setup(
     overrides: SetupRootOverrides,
 ) -> Result<()> {
     run_elevated_setup_inner(
-        request, overrides, /*offline_proxy_settings_override*/ None,
+        request, overrides, /*offline_proxy_settings_override*/ None, None,
     )
 }
 
@@ -876,15 +924,18 @@ pub(crate) fn run_elevated_setup_with_proxy_settings(
     request: SandboxSetupRequest<'_>,
     overrides: SetupRootOverrides,
     offline_proxy_settings: &OfflineProxySettings,
+    cancellation: Option<&crate::WindowsSandboxCancellationToken>,
 ) -> Result<()> {
-    run_elevated_setup_inner(request, overrides, Some(offline_proxy_settings))
+    run_elevated_setup_inner(request, overrides, Some(offline_proxy_settings), cancellation)
 }
 
 fn run_elevated_setup_inner(
     request: SandboxSetupRequest<'_>,
     overrides: SetupRootOverrides,
     offline_proxy_settings_override: Option<&OfflineProxySettings>,
+    cancellation: Option<&crate::WindowsSandboxCancellationToken>,
 ) -> Result<()> {
+    check_setup_cancellation(cancellation)?;
     if !request.permissions.is_enforceable_by_windows_sandbox() {
         anyhow::bail!("unsupported filesystem permissions for Windows sandbox setup");
     }
@@ -924,7 +975,7 @@ fn run_elevated_setup_inner(
             format!("failed to determine elevation state: {err}"),
         )
     })?;
-    run_setup_exe(&payload, needs_elevation, request.codex_home)
+    run_setup_exe(&payload, needs_elevation, request.codex_home, cancellation)
 }
 
 pub fn run_elevated_provisioning_setup(codex_home: &Path, real_user: &str) -> Result<()> {
@@ -963,7 +1014,7 @@ pub fn run_elevated_provisioning_setup(codex_home: &Path, real_user: &str) -> Re
         mode: SetupMode::ProvisionOnly,
         refresh_only: false,
     };
-    run_setup_exe(&payload, /*needs_elevation*/ false, codex_home)
+    run_setup_exe(&payload, /*needs_elevation*/ false, codex_home, None)
 }
 
 fn build_payload_roots(
@@ -1101,6 +1152,9 @@ fn filter_user_profile_roots_for(roots: Vec<PathBuf>, user_profile: &Path) -> Ve
             if *key == profile_key {
                 return false;
             }
+            if profile_key.starts_with(&format!("{}/", key.trim_end_matches('/'))) {
+                return false;
+            }
             let Some(child_name) = profile_child_name(key, &profile_prefix) else {
                 return true;
             };
@@ -1144,6 +1198,7 @@ fn filter_sensitive_write_roots(mut roots: Vec<PathBuf>, codex_home: &Path) -> V
     roots.retain(|root| {
         let key = canonical_path_key(root);
         key != codex_home_key
+            && !codex_home_key.starts_with(&format!("{}/", key.trim_end_matches('/')))
             && key != sbx_dir_key
             && !key.starts_with(&sbx_dir_prefix)
             && key != sbx_bin_dir_key
@@ -1152,6 +1207,19 @@ fn filter_sensitive_write_roots(mut roots: Vec<PathBuf>, codex_home: &Path) -> V
             && !key.starts_with(&secrets_dir_prefix)
     });
     roots
+}
+
+pub(crate) fn ensure_safe_write_roots<'a>(roots: impl IntoIterator<Item = &'a PathBuf>, codex_home: &Path) -> Result<()> {
+    let home = canonical_path_key(codex_home);
+    let profile = std::env::var_os("USERPROFILE").map(PathBuf::from).map(|path| canonical_path_key(&path));
+    for root in roots {
+        let key = canonical_path_key(root);
+        let prefix = format!("{}/", key.trim_end_matches('/'));
+        anyhow::ensure!(key != home && !home.starts_with(&prefix)
+            && !profile.as_ref().is_some_and(|profile| profile != &key && profile.starts_with(&prefix)),
+            "write root {} encloses protected sandbox/profile state; use narrower writable roots or move CODEX_HOME outside the workspace", root.display());
+    }
+    Ok(())
 }
 
 #[cfg(test)]

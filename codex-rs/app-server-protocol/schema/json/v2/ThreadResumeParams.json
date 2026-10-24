@@ -169,6 +169,27 @@
           ],
           "title": "OutputTextContentItem",
           "type": "object"
+        },
+        {
+          "description": "Provider refusal content, retained as a distinct type in history and replay.",
+          "properties": {
+            "refusal": {
+              "type": "string"
+            },
+            "type": {
+              "enum": [
+                "refusal"
+              ],
+              "title": "RefusalContentItemType",
+              "type": "string"
+            }
+          },
+          "required": [
+            "refusal",
+            "type"
+          ],
+          "title": "RefusalContentItem",
+          "type": "object"
         }
       ]
     },
@@ -1334,6 +1355,7 @@
         },
         {
           "properties": {
+            "error": true,
             "id": {
               "type": [
                 "string",
@@ -1351,7 +1373,10 @@
               ]
             },
             "result": {
-              "type": "string"
+              "type": [
+                "string",
+                "null"
+              ]
             },
             "revised_prompt": {
               "type": [
@@ -1371,7 +1396,6 @@
             }
           },
           "required": [
-            "result",
             "status",
             "type"
           ],

@@ -23,6 +23,7 @@ const LOCK_CONTENTION_EVENT_TARGET: &str = "codex_rmcp_client::oauth::store_lock
 
 #[derive(Clone, Copy, Debug)]
 pub(super) enum OAuthStore {
+    Authority,
     File,
     Secrets,
 }
@@ -30,6 +31,7 @@ pub(super) enum OAuthStore {
 impl OAuthStore {
     fn lock_filename(self) -> &'static str {
         match self {
+            Self::Authority => "authority.lock",
             Self::File => "file-store.lock",
             Self::Secrets => "secrets-store.lock",
         }
@@ -39,6 +41,7 @@ impl OAuthStore {
 impl std::fmt::Display for OAuthStore {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::Authority => f.write_str("credential authority"),
             Self::File => f.write_str("fallback file"),
             Self::Secrets => f.write_str("encrypted secrets"),
         }

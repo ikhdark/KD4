@@ -207,7 +207,47 @@ fn completion_preserves_exact_receipt_and_attempt_under_truncation() {
     assert!(approx_token_count(&message) < COMPLETION_MESSAGE_MAX_TOKENS);
 }
 #[test]
-fn protected_completion_diagnostics_survive_middle_echo_and_multibyte_truncation() {
+fn completion_notifications_deliver_reports_without_host_summaries() {
+    let summary = "Host completion summary: behavior unverified";
+    let receipt = "Receipt: assignment-123\nProducer attempt: attempt-456";
+    for surfaced in [false, true] {
+        for prefixed in [false, true] {
+            let report = if prefixed {
+                format!("{summary}\n\nauthored report")
+            } else {
+                "authored report".to_string()
+            };
+            let status = if surfaced {
+                AgentStatus::CompletedWithSurface {
+                    last_agent_message: Some(report),
+                    surfaced_result: codex_protocol::protocol::SurfacedToolResult {
+                        adapter: "owner".into(),
+                        value: serde_json::json!({"answer": 42}),
+                        canonical_message: None,
+                    },
+                }
+            } else {
+                AgentStatus::Completed(Some(report))
+            };
+            let message = super::inter_agent_completion_communication_with_diagnostics(
+                AgentPath::root(),
+                AgentPath::try_from("/root/worker").unwrap(),
+                codex_protocol::ThreadId::new(),
+                &status,
+                Some(receipt),
+                Some(summary),
+            )
+            .unwrap();
+            assert_eq!(
+                message.content,
+                format!("Message Type: FINAL_ANSWER\nTask name: /root\nSender: /root/worker\n{receipt}\nPayload:\nauthored report")
+            );
+        }
+    }
+}
+
+#[test]
+fn completion_diagnostics_are_not_attached_under_multibyte_truncation() {
     use codex_protocol::protocol::TurnCompletionAssessment;
     let receipt = "Receipt: get_agent_task({\"assignment_id\":\"assignment-123\"})\nProducer attempt: attempt-456";
     for entry in ["validation failed".to_string(), "🦀".repeat(192)] {
@@ -248,14 +288,14 @@ fn protected_completion_diagnostics_survive_middle_echo_and_multibyte_truncation
             Some(&summary),
         )
         .unwrap();
-        assert!(communication.content.contains(&summary));
+        assert!(!communication.content.contains(&summary));
         assert!(communication.content.contains(receipt));
         assert!(approx_token_count(&communication.content) < COMPLETION_MESSAGE_MAX_TOKENS);
     }
 }
 
 #[test]
-fn audit149x_protected_host_summary_is_not_repeated_in_error_or_stopped_payloads() {
+fn host_completion_summary_is_removed_from_error_or_stopped_payloads() {
     use codex_protocol::protocol::TurnExecutionStopCause;
     let summary = codex_protocol::protocol::TurnCompletionAssessment {
         verification_gaps: vec!["final workspace not verified".into()],
@@ -285,18 +325,19 @@ fn audit149x_protected_host_summary_is_not_repeated_in_error_or_stopped_payloads
         &AgentStatus::Errored(format!("{summary}\n\nturn failed")),
         Some(summary.as_str()),
     );
-    assert_eq!(errored.matches(summary.as_str()).count(), 1, "{errored}");
+    assert!(!errored.contains(&summary), "{errored}");
     assert!(errored.contains("Agent errored: turn failed"));
 
     let partial = render(
         &stopped(format!("{summary}\n\npartial report")),
         Some(summary.as_str()),
     );
-    assert_eq!(partial.matches(summary.as_str()).count(), 1, "{partial}");
+    assert!(!partial.contains(&summary), "{partial}");
     assert!(partial.contains("partial report"));
+    assert!(partial.contains("Host execution stop cause: \"subagent_context_budget\"."));
 
     let host_only = render(&stopped(summary.clone()), Some(summary.as_str()));
-    assert_eq!(host_only.matches(summary.as_str()).count(), 1, "{host_only}");
+    assert!(!host_only.contains(&summary), "{host_only}");
     assert!(host_only.contains("No authored report was delivered."));
 
     // Negative control: without a protected summary nothing is removed.

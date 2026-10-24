@@ -21,7 +21,20 @@ impl ToolOutputSchema {
     /// Discovery uses only a bounded prefix; output evidence never authorizes a call.
     pub(crate) fn search_field_names(&self) -> impl Iterator<Item = &str> {
         let properties = match &self.0 {
-            OutputSchemaStorage::Json(schema) => schema.get("properties"),
+            OutputSchemaStorage::Json(schema) => {
+                if schema
+                    .get(codex_code_mode::MCP_RESULT_SCHEMA_MARKER)
+                    .and_then(Value::as_bool)
+                    == Some(true)
+                {
+                    schema
+                        .get("properties")
+                        .and_then(|properties| properties.get("structuredContent"))
+                        .and_then(|content| content.get("properties"))
+                } else {
+                    schema.get("properties")
+                }
+            }
             OutputSchemaStorage::McpCallToolResult(schema) => {
                 schema.as_ref().and_then(|schema| schema.get("properties"))
             }

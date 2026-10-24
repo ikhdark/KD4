@@ -103,6 +103,7 @@
     #point = 0;
     #lower = 0x80;
     #upper = 0xbf;
+    #pending = new Uint8Array(0);
 
     constructor(label = "utf-8", options = undefined) {
       const name = `${label}`
@@ -151,8 +152,16 @@
       if (!this.#doNotFlush) {
         this.#reset();
         this.#bomSeen = false;
+        this.#pending = new Uint8Array(0);
+      } else if (this.#pending.length) {
+        const queued = new Uint8Array(this.#pending.length + bytes.length);
+        queued.set(this.#pending);
+        queued.set(bytes, this.#pending.length);
+        bytes = queued;
       }
+      this.#pending = new Uint8Array(0);
       this.#doNotFlush = stream;
+      const previousBOMSeen = this.#bomSeen;
       const parts = [];
       let units = [];
       const emit = (cp) => {
@@ -171,15 +180,19 @@
           units = [];
         }
       };
+      let i = 0;
       const error = () => {
         if (this.#fatal) {
-          this.#reset();
-          this.#doNotFlush = false;
+          // A fatal processing result throws without flushing the input queue
+          // or changing stream ownership. Copy unread bytes, never retain a
+          // caller-owned view that can be changed before the next decode.
+          if (stream) this.#pending = bytes.slice(i);
+          this.#bomSeen = previousBOMSeen;
           throw new TypeError("TextDecoder: the encoded data is not valid UTF-8");
         }
         emit(REPLACEMENT);
       };
-      for (let i = 0; i < bytes.length; ) {
+      for (; i < bytes.length; ) {
         const byte = bytes[i];
         if (this.#needed === 0) {
           ++i;

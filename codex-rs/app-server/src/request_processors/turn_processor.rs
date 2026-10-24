@@ -15,7 +15,6 @@ use codex_protocol::openai_models::ModelInfo;
 use codex_protocol::protocol::AdditionalContextEntry as CoreAdditionalContextEntry;
 use codex_protocol::protocol::AdditionalContextKind as CoreAdditionalContextKind;
 use codex_protocol::protocol::SessionSource;
-use codex_rollout_trace::InferenceTraceContext;
 use codex_state::BugAttemptReceipt;
 use codex_state::BugClaim;
 use codex_state::BugClassification;
@@ -137,6 +136,34 @@ impl std::io::Write for Sha256Writer {
     }
 }
 
+fn task_fingerprint_envelope(
+    request: Value,
+    workspace_identity: &str,
+    settings_identity: &str,
+) -> Value {
+    // json!(request) serializes &Value into a second full tree. Preserve both
+    // ownership and the existing envelope key order instead.
+    Value::Object(serde_json::Map::from_iter([
+        ("request".to_string(), request),
+        ("workspace".to_string(), Value::String(workspace_identity.to_string())),
+        ("settings".to_string(), Value::String(settings_identity.to_string())),
+    ]))
+}
+
+async fn environment_fallback_cwd(
+    selections: &[TurnEnvironmentSelection],
+    fallback: impl std::future::Future<Output = AbsolutePathBuf>,
+) -> AbsolutePathBuf {
+    match selections
+        .iter()
+        .find(|selection| selection.environment_id == LOCAL_ENVIRONMENT_ID)
+        .and_then(|selection| selection.cwd.to_abs_path().ok())
+    {
+        Some(cwd) => cwd,
+        None => fallback.await,
+    }
+}
+
 fn normalized_task_fingerprint(
     params: &TurnStartParams,
     workspace_identity: &str,
@@ -148,11 +175,7 @@ fn normalized_task_fingerprint(
         request.remove("runIndependently");
     }
     canonicalize_task_fingerprint_json(&mut request);
-    let identity = serde_json::json!({
-        "request": request,
-        "workspace": workspace_identity,
-        "settings": settings_identity,
-    });
+    let identity = task_fingerprint_envelope(request, workspace_identity, settings_identity);
     let mut writer = Sha256Writer(Sha256::new());
     serde_json::to_writer(&mut writer, &identity).ok()?;
     Some(hex::encode(writer.0.finalize()))
@@ -1092,14 +1115,9 @@ impl TurnRequestProcessor {
             (cwd, Some(environment_selections)) => {
                 let legacy_fallback_cwd = match cwd {
                     Some(cwd) => cwd,
-                    None => {
-                        let snapshot = thread.config_snapshot().await;
-                        environment_selections
-                            .iter()
-                            .find(|selection| selection.environment_id == LOCAL_ENVIRONMENT_ID)
-                            .and_then(|selection| selection.cwd.to_abs_path().ok())
-                            .unwrap_or_else(|| snapshot.cwd().clone())
-                    }
+                    None => environment_fallback_cwd(&environment_selections, async {
+                        thread.config_snapshot().await.cwd().clone()
+                    }).await,
                 };
                 Some(TurnEnvironmentSelections::new(
                     legacy_fallback_cwd,
@@ -1674,7 +1692,6 @@ async fn classify_bug_report(
     );
     let responses_metadata =
         CodexResponsesMetadata::for_bug_classifier(&claim.attempt_id, &claim.thread_id, claim.id);
-    let inference_trace = InferenceTraceContext::disabled();
     let mut session = model_client.new_session();
     if context.shutdown.is_cancelled() {
         return Err(BugClassificationFailure::Cancelled);
@@ -1692,7 +1709,6 @@ async fn classify_bug_report(
             ReasoningSummary::None,
             None,
             &responses_metadata,
-            &inference_trace,
         ) => result.map_err(|_| BugClassificationFailure::Provider)?,
     };
 

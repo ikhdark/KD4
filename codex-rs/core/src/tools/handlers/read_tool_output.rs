@@ -1107,6 +1107,27 @@ async fn handle_read_tool_output(
     } else {
         resolved_max_bytes(args.max_bytes)?
     };
+    // Plain command logs do not enter the indexed snapshot/recovery pipeline.
+    let command_limit = max_bytes.min(if code_mode_recovery {
+        (READ_TOOL_OUTPUT_SCRIPT_MAX_BYTES / 8).saturating_sub(1024)
+    } else {
+        let policy: codex_protocol::protocol::TruncationPolicy =
+            invocation.step_context.turn.model_info.truncation_policy.into();
+        (policy.byte_budget() / 8).saturating_sub(1024).max(1)
+    });
+    if let Some(output) = crate::tools::command_output_artifact::capture::read_command_log(
+        invocation.step_context.turn.config.codex_home.as_path(),
+        &invocation.session.thread_id.to_string(), &args.artifact_id,
+        &selectors, command_limit,
+    ).await.map_err(|error| FunctionCallError::RespondToModel(error.for_model()))? {
+        let success = output["results"].as_array().is_some_and(|results|
+            results.iter().all(|result| result["status"] == "ok"));
+        let result = JsonToolOutput::with_success(output, Some(success))
+            .with_code_mode_failure_as_data();
+        crate::tools::context::ensure_exact_model_delivery(&result, &invocation)?;
+        attempt.completed = true;
+        return Ok(boxed_tool_output(result));
+    }
     let mut action_bounds_digest = Sha256::new();
     serde_json::to_writer(DigestWriter(&mut action_bounds_digest), &selectors).map_err(|err| {
         FunctionCallError::RespondToModel(format!("failed to serialize recovery selectors: {err}"))
@@ -1203,75 +1224,44 @@ async fn handle_read_tool_output(
             "identity": identity,
         })
     });
-    if evidence.is_some() {
-        let selectors = output
-            .delivered_ranges()
-            .into_iter()
-            .map(|(start, end)| serde_json::json!({"kind": "bytes", "start": start, "end": end}))
-            .collect();
-        invocation
-            .session
-            .record_tool_history_recovery(
-                args.artifact_id.clone(),
-                invocation.call_id.clone(),
-                selectors,
-            )
-            .await;
-    }
-    let completed_inspection = if output.capture_complete {
-        let coordinator = invocation.session.services.agent_control.task_coordinator();
-        if let (Some(binding), Some(store)) = (
-            coordinator.binding_for_turn(&invocation.step_context.turn),
-            coordinator.store(),
-        ) {
-            invocation
-                .session
-                .completed_source_inspection(
-                    &args.artifact_id,
-                    output.canonical_bytes,
-                    &output.canonical_sha256,
-                    binding.attempt_id,
-                )
-                .await
-                .map(|(call_id, source)| {
-                    (
-                        store,
-                        call_id,
-                        source,
-                        output.canonical_sha256.clone(),
-                        output.canonical_bytes,
-                    )
-                })
-        } else {
-            None
-        }
-    } else {
-        None
-    };
+    let mut selectors = output.delivered_ranges().into_iter().map(|(start, end)|
+        serde_json::json!({"kind":"bytes", "start":start, "end":end, "source_inspection":false})
+    ).collect::<Vec<_>>();
+    let source_bytes = output.canonical_bytes;
+    let source_sha256 = output.canonical_sha256.clone();
     let mut output = recovery_envelope(&output, continuation_stop.as_ref()).map_err(|err| {
         FunctionCallError::RespondToModel(format!("failed to serialize recovery result: {err}"))
     })?;
     output["historical_authenticity"] = serde_json::json!(snapshot.historical_authenticity());
-    if let Some((store, call_id, source, sha256, bytes)) = completed_inspection {
-        if source.start.canonical_path().is_none() {
-            output["inspection_proof_error"] = serde_json::json!(
-                "retained source has no opened-target provenance; bytes are recoverable but cannot certify an inspection criterion"
-            );
-        } else {
-            match store
-                .record_source_inspection(source.start, call_id, sha256, bytes)
-                .await
-            {
-                Ok(reference) => output["criterion_evidence"] = serde_json::json!(reference),
-                Err(error) => {
-                    output["inspection_proof_error"] = serde_json::json!(error.to_string())
-                }
-            }
-        }
-    }
-    let inner = recovery_tool_output(output, successful, evidence);
+    let inspection_delivery = successful
+        && snapshot.historical_authenticity() == "authenticated"
+        && !invocation.cancellation_token.is_cancelled();
+    let acquired = if inspection_delivery {
+        super::read_file::source_inspection_selectors(&output)
+    } else { Vec::new() };
+    let acquired_source_bytes = !acquired.is_empty();
+    selectors.extend(acquired);
+    let mut inner = recovery_tool_output(output, successful, evidence.clone());
     attempt.phase = "delivery";
     crate::tools::context::ensure_exact_model_delivery(&inner, &invocation)?;
+    if evidence.is_some() {
+        invocation.session.record_tool_history_recovery(
+            args.artifact_id.clone(), invocation.call_id.clone(), selectors,
+        ).await;
+    }
+    if acquired_source_bytes {
+        let proof = super::read_file::completed_source_inspection_evidence(
+            &invocation, &args.artifact_id, source_bytes, &source_sha256,
+        ).await;
+        if !matches!(&proof, Ok(None)) {
+            let mut output = inner.value().clone();
+            let mut projected = codex_code_mode::model_visible_tool_result(
+                &ToolName::plain(READ_TOOL_OUTPUT_TOOL_NAME), &output,
+            ).unwrap_or_else(|| output.clone());
+            super::read_file::attach_source_inspection_evidence(&mut output, &mut projected, proof, &invocation);
+            inner = recovery_tool_output(output, successful, evidence).with_model_value(projected);
+        }
+    }
     attempt.completed = true;
     Ok(boxed_tool_output(ReadToolOutputToolOutput {
         inner,
@@ -1960,8 +1950,8 @@ fn resolved_max_bytes(max_bytes: Option<usize>) -> Result<usize, FunctionCallErr
 #[path = "read_tool_output_paging_tests.rs"]
 mod paging_regressions;
 #[cfg(test)]
-#[path = "read_tool_output_audit145_tests.rs"]
-mod audit145_tests;
+#[path = "read_tool_output_budget_tests.rs"]
+mod budget_tests;
 #[cfg(test)]
 #[path = "read_tool_output_tests.rs"]
 mod tests;

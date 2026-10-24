@@ -188,7 +188,9 @@ pub(crate) struct SessionState {
 struct OrderedSessionEvents {
     last_published_seq: u64,
     exit_published: bool,
+    observed_exited: bool,
     last_exit_code: Option<i32>,
+    sandbox_denied: bool,
     closed_published: bool,
     // Server-side output, exit, and closed notifications are emitted by
     // different tasks and can reach the client out of order. Keep future events
@@ -1043,6 +1045,7 @@ impl ExecServerClient {
             };
             let client = self.clone();
             let (mut result_tx, result_rx) = tokio::sync::oneshot::channel();
+            let (accepted_tx, accepted_rx) = tokio::sync::oneshot::channel::<()>();
             let process_start_task = async move {
                 let owned_params = crate::protocol::OwnedProcessParams {
                     incarnation: Some(state.incarnation.clone()),
@@ -1071,9 +1074,12 @@ impl ExecServerClient {
                             process_id: process_id.clone(),
                             state: Arc::clone(&state),
                         };
-                        if result_tx.send(Ok(session)).is_err() {
+                        let send_failed = result_tx.send(Ok(session)).is_err();
+                        // Queuing a result is not caller ownership. Do not keep
+                        // the recovery-start barrier while awaiting acceptance.
+                        drop(active_start);
+                        if send_failed || accepted_rx.await.is_err() {
                             state.recoverable.store(false, Ordering::Release);
-                            drop(active_start);
                             cleanup_process_start(
                                 &client,
                                 &process_id,
@@ -1123,9 +1129,13 @@ impl ExecServerClient {
                 }
             };
             tokio::spawn(process_start_task.in_current_span());
-            return result_rx.await.map_err(|_| {
+            let result = result_rx.await.map_err(|_| {
                 ExecServerError::Protocol("process start task stopped unexpectedly".to_string())
             })?;
+            if result.is_ok() {
+                let _ = accepted_tx.send(());
+            }
+            return result;
         }
     }
 
@@ -1470,6 +1480,17 @@ impl SessionState {
             return Ok(false);
         }
 
+        match &event {
+            ExecProcessEvent::Exited { exit_code, sandbox_denied, .. } => {
+                ordered_events.observed_exited = true;
+                ordered_events.last_exit_code = Some(*exit_code);
+                ordered_events.sandbox_denied |= sandbox_denied.unwrap_or(false);
+            }
+            ExecProcessEvent::Closed { sandbox_denied, .. } => {
+                ordered_events.sandbox_denied |= sandbox_denied.unwrap_or(false);
+            }
+            _ => {}
+        }
         ordered_events.insert_pending(event)?;
         Ok(self.publish_ready(&mut ordered_events))
     }
@@ -1531,22 +1552,29 @@ impl SessionState {
         message.map(|message| self.synthesized_failure(message))
     }
 
+    fn observe_read_facts(&self, response: &ReadResponse) {
+        let mut events = self.ordered_events.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        events.observed_exited |= response.exited;
+        if let Some(exit_code) = response.exit_code { events.last_exit_code = Some(exit_code); }
+        events.sandbox_denied |= response.sandbox_denied;
+    }
+
     fn synthesized_failure(&self, message: String) -> ReadResponse {
         let next_seq = (*self.wake_tx.borrow()).saturating_add(1);
-        let exit_code = self
+        let events = self
             .ordered_events
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .last_exit_code;
+            ;
         ReadResponse {
             chunks: Vec::new(),
             next_seq,
-            exited: exit_code.is_some(),
-            exit_code,
+            exited: events.observed_exited || events.exit_published,
+            exit_code: events.last_exit_code,
             closed: true,
             failure: Some(message),
             output_gap: None,
-            sandbox_denied: false,
+            sandbox_denied: events.sandbox_denied,
         }
     }
 
@@ -1681,17 +1709,20 @@ impl Session {
                 .await
             {
                 Ok(response) => {
+                    self.state.observe_read_facts(&response);
                     if let Some(message) = &response.failure {
                         self.state.set_failure(message.clone());
                     }
                     return Ok(response);
                 }
                 Err(error)
-                    if is_transport_closed_error(&error) && !self.client.inner.is_failed() =>
+                    if is_transport_closed_error(&error)
+                        && matches!(self.client.recovery_policy, RecoveryPolicy::Wait)
+                        && !self.client.inner.is_failed() =>
                 {
                     continue;
                 }
-                Err(error) if is_transport_closed_error(&error) => {
+                Err(error) if is_transport_closed_error(&error) && self.client.inner.is_failed() => {
                     if let Some(response) = self.state.failed_response() {
                         return Ok(response);
                     }
@@ -1717,7 +1748,9 @@ impl Session {
             match self.client.call(EXEC_WRITE_METHOD, &params).await {
                 Ok(response) => return Ok(response),
                 Err(error)
-                    if is_transport_closed_error(&error) && !self.client.inner.is_failed() =>
+                    if is_transport_closed_error(&error)
+                        && matches!(self.client.recovery_policy, RecoveryPolicy::Wait)
+                        && !self.client.inner.is_failed() =>
                 {
                     continue;
                 }
@@ -2035,6 +2068,10 @@ mod tests {
     use tracing_subscriber::filter::filter_fn;
     use tracing_subscriber::prelude::*;
 
+    use super::ConnectionStatus;
+    use super::RecoveryPolicy;
+    use super::Session;
+    use super::SessionState;
     use super::ExecServerClient;
     use super::ExecServerClientConnectOptions;
     use super::LazyRemoteExecServerClient;
@@ -2296,6 +2333,39 @@ mod tests {
         assert_eq!(trace.tracestate, expected_trace.tracestate);
     }
 
+    #[test]
+    fn fail_fast_session_reads_and_writes_return_without_spinning_or_poisoning() {
+        let runtime = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
+        let (finished, completion) = std::sync::mpsc::channel();
+        runtime.spawn(async move {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("ws://{}", listener.local_addr().unwrap());
+            let (release, released) = oneshot::channel();
+            let server = tokio::spawn(async move {
+                let mut socket = accept_websocket(&listener).await;
+                complete_websocket_session_initialize(&mut socket, "fail-fast-session", None).await;
+                let _ = released.await;
+            });
+            let mut client = ExecServerClient::connect_websocket(RemoteExecServerConnectArgs::new(url, "fail-fast".into())).await.unwrap();
+            let rpc = client.rpc_client().await.unwrap();
+            client.recovery_policy = RecoveryPolicy::FailFast;
+            client.inner.connection.lock().unwrap().status = ConnectionStatus::Recovering;
+            let session = Session { client: client.clone(), process_id: "conditional-session".into(), state: Arc::new(SessionState::new(true)) };
+            assert!(session.read(None, None, Some(0)).await.is_err());
+            assert!(session.write(Vec::new()).await.is_err());
+            assert!(session.state.failed_response().is_none(), "temporary recovery must not poison the session");
+            client.inner.connection.lock().unwrap().status = ConnectionStatus::Connected(rpc);
+            let _ = release.send(());
+            server.await.unwrap();
+            finished.send(()).unwrap();
+        });
+        // A regressed first poll spins without yielding, so use an external
+        // deadline rather than a timer on that potentially blocked executor.
+        let result = completion.recv_timeout(Duration::from_secs(2));
+        runtime.shutdown_timeout(Duration::from_millis(50));
+        assert!(result.is_ok(), "fail-fast operations did not finish: {result:?}");
+    }
+
     #[tokio::test]
     async fn cancelling_process_start_sends_cleanup_and_releases_provisional_state() {
         let (client_stdin, server_reader) = duplex(1 << 20);
@@ -2414,6 +2484,160 @@ mod tests {
             .expect("start observer should remain open");
         start_task.abort();
         let _ = start_task.await;
+        assert_eq!(
+            timeout(Duration::from_secs(1), cleanup_observed_rx)
+                .await
+                .expect("cancelled start cleanup should not hang")
+                .expect("cleanup observer should receive the process id"),
+            process_id
+        );
+        timeout(Duration::from_secs(1), async {
+            loop {
+                let active_process_starts = client
+                    .inner
+                    .connection
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .active_process_starts;
+                if active_process_starts == 0 && client.inner.get_session(&process_id).is_none() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("cancelled start should release provisional state");
+
+        let _ = release_server_tx.send(());
+        server.await.expect("server task should finish");
+    }
+
+    #[tokio::test]
+    async fn cancelling_after_successful_start_handoff_cleans_the_unaccepted_process() {
+        let (client_stdin, server_reader) = duplex(1 << 20);
+        let (mut server_writer, client_stdout) = duplex(1 << 20);
+        let (start_observed_tx, start_observed_rx) = oneshot::channel();
+        let (cleanup_observed_tx, cleanup_observed_rx) = oneshot::channel();
+        let (release_server_tx, release_server_rx) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            let mut lines = BufReader::new(server_reader).lines();
+            let initialize = match read_jsonrpc_line(&mut lines).await {
+                JSONRPCMessage::Request(request) if request.method == INITIALIZE_METHOD => request,
+                other => panic!("expected initialize request, got {other:?}"),
+            };
+            write_jsonrpc_line(
+                &mut server_writer,
+                JSONRPCMessage::Response(JSONRPCResponse {
+                    id: initialize.id,
+                    result: serde_json::to_value(InitializeResponse {
+                        session_id: "cancelled-start".to_string(),
+                    })
+                    .expect("initialize response should serialize"),
+                }),
+            )
+            .await;
+            assert!(matches!(
+                read_jsonrpc_line(&mut lines).await,
+                JSONRPCMessage::Notification(notification)
+                    if notification.method == INITIALIZED_METHOD
+            ));
+
+            let start = match read_jsonrpc_line(&mut lines).await {
+                JSONRPCMessage::Request(request)
+                    if request.method == crate::protocol::EXEC_OWNED_METHOD =>
+                {
+                    request
+                }
+                other => panic!("expected process start request, got {other:?}"),
+            };
+            let start_params: crate::protocol::OwnedProcessParams<ExecParams> =
+                serde_json::from_value(start.params.expect("process start params should exist"))
+                    .expect("process start params should deserialize");
+            assert!(
+                start_params
+                    .incarnation
+                    .as_ref()
+                    .is_some_and(|token| !token.is_empty())
+            );
+            write_jsonrpc_line(&mut server_writer, JSONRPCMessage::Response(JSONRPCResponse {
+                id: start.id, result: serde_json::json!({"processId": start_params.params.process_id}),
+            })).await;
+            start_observed_tx
+                .send(())
+                .expect("start observer should remain open");
+            let terminate = match read_jsonrpc_line(&mut lines).await {
+                JSONRPCMessage::Request(request) if request.method == EXEC_TERMINATE_METHOD => {
+                    request
+                }
+                other => panic!("expected cleanup terminate request, got {other:?}"),
+            };
+            let terminate_params: crate::protocol::OwnedProcessParams<
+                crate::protocol::TerminateParams,
+            > = serde_json::from_value(terminate.params.expect("cleanup parameters"))
+                .expect("decode cleanup parameters");
+            assert_eq!(terminate_params.incarnation, start_params.incarnation);
+            assert_eq!(
+                terminate_params.params.process_id,
+                start_params.params.process_id
+            );
+            write_jsonrpc_line(
+                &mut server_writer,
+                JSONRPCMessage::Response(JSONRPCResponse {
+                    id: terminate.id,
+                    result: serde_json::to_value(TerminateResponse { running: false })
+                        .expect("terminate response should serialize"),
+                }),
+            )
+            .await;
+            cleanup_observed_tx
+                .send(start_params.params.process_id)
+                .expect("cleanup observer should remain open");
+            let _ = release_server_rx.await;
+        });
+
+        let client = ExecServerClient::connect(
+            JsonRpcConnection::from_stdio(
+                client_stdout,
+                client_stdin,
+                "cancelled-start-client".to_string(),
+            ),
+            ExecServerClientConnectOptions::default(),
+        )
+        .await
+        .expect("client should connect");
+        let process_id = ProcessId::from("cancelled-start-process");
+        let start_client = client.clone();
+        let start_process_id = process_id.clone();
+        let mut start_task = Box::pin(async move {
+            start_client
+                .start_process(ExecParams {
+                    process_id: start_process_id,
+                    argv: vec!["true".to_string()],
+                    cwd: PathUri::from_host_native_path(std::env::current_dir().expect("cwd"))
+                        .expect("cwd URI"),
+                    env_policy: None,
+                    env: HashMap::new(),
+                    tty: false,
+                    pipe_stdin: false,
+                    arg0: None,
+                    sandbox: None,
+                    enforce_managed_network: false,
+                    managed_network: None,
+                })
+                .await
+        });
+
+        assert!(matches!(futures::poll!(start_task.as_mut()), std::task::Poll::Pending));
+        timeout(Duration::from_secs(1), start_observed_rx)
+            .await
+            .expect("process start request should be sent")
+            .expect("start observer should remain open");
+        timeout(Duration::from_secs(1), async {
+            while client.inner.connection.lock().unwrap_or_else(std::sync::PoisonError::into_inner).active_process_starts != 0 {
+                tokio::task::yield_now().await;
+            }
+        }).await.expect("acknowledged result must be queued before cancellation");
+        drop(start_task);
         assert_eq!(
             timeout(Duration::from_secs(1), cleanup_observed_rx)
                 .await
@@ -3068,6 +3292,7 @@ mod tests {
             "queue_timeout",
             "expired",
             "stream_drop",
+            "cross_runtime_stream_drop",
             "cleanup_overflow",
         ] {
             assert_file_close_releases_server_file(scenario).await;
@@ -3160,7 +3385,8 @@ mod tests {
             ExecServerClient::connect(connection, ExecServerClientConnectOptions::default())
                 .await
                 .expect("connect real server");
-        let stream = if scenario == "stream_drop" {
+        let mut opening_runtime_owner = None;
+        let stream = if matches!(scenario, "stream_drop" | "cross_runtime_stream_drop") {
             // Supply the already connected real transport to the usual filesystem.
             let lazy = LazyRemoteExecServerClient::new(ExecServerTransportParams::WebSocketUrl {
                 websocket_url: "ws://127.0.0.1:1".to_string(),
@@ -3169,14 +3395,23 @@ mod tests {
             });
             *lazy.current_client.lock().expect("client cache") = Some(client.clone());
             let fs = crate::remote_file_system::RemoteFileSystem::new(lazy);
-            Some(
-                fs.read_file_stream(
-                    &PathUri::from_host_native_path(&path).expect("file URI"),
-                    None,
-                )
-                .await
-                .expect("normal filesystem stream open"),
-            )
+            let uri = PathUri::from_host_native_path(&path).expect("file URI");
+            if scenario == "cross_runtime_stream_drop" {
+                let (stream_tx, stream_rx) = oneshot::channel();
+                let (release_tx, release_rx) = std::sync::mpsc::channel();
+                let owner = std::thread::spawn(move || {
+                    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+                    let stream = runtime.block_on(fs.read_file_stream(&uri, None)).unwrap();
+                    stream_tx.send(stream).unwrap_or_else(|_| panic!("stream receiver dropped"));
+                    // Runtime B remains alive but is no longer driven. RPC and
+                    // transport ownership remain on the persistent runtime A.
+                    let _ = release_rx.recv_timeout(Duration::from_secs(30));
+                });
+                opening_runtime_owner = Some((release_tx, owner));
+                Some(stream_rx.await.unwrap())
+            } else {
+                Some(fs.read_file_stream(&uri, None).await.expect("normal filesystem stream open"))
+            }
         } else {
             client
                 .fs_open(crate::protocol::FsOpenParams {
@@ -3215,7 +3450,7 @@ mod tests {
                 .await
                 .expect("queue notification");
         }
-        tokio::time::pause();
+        if scenario != "cross_runtime_stream_drop" { tokio::time::pause(); }
         let close_params = crate::protocol::FsCloseParams {
             handle_id: "held-read".to_string(),
         };
@@ -3245,7 +3480,7 @@ mod tests {
                     if message.contains("fs/close") && message.contains("timed out")));
                 assert_eq!(tokio::time::Instant::now(), before);
             }
-            "stream_drop" => {
+            "stream_drop" | "cross_runtime_stream_drop" => {
                 // Dropping the normal stream must schedule the real registration
                 // cleanup; no direct fs_close invocation drives this scenario.
                 drop(stream);
@@ -3256,6 +3491,7 @@ mod tests {
                 })
                 .await
                 .expect("stream Drop must admit its cleanup owner");
+                if scenario == "cross_runtime_stream_drop" { tokio::time::pause(); }
                 tokio::time::advance(super::PROCESS_TERMINATION_TIMEOUT + Duration::from_millis(1))
                     .await;
                 timeout(Duration::from_millis(1), async {
@@ -3330,6 +3566,10 @@ mod tests {
                 .is_err()
         );
         processor.shutdown().await;
+        if let Some((release, owner)) = opening_runtime_owner {
+            let _ = release.send(());
+            tokio::task::spawn_blocking(move || owner.join()).await.unwrap().unwrap();
+        }
     }
 
     #[tokio::test]

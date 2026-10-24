@@ -7,6 +7,56 @@ use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 
 #[tokio::test]
+async fn replacing_mcp_servers_preserves_layer_presence_and_explicit_defaults() -> anyhow::Result<()> {
+    let lower: TomlValue = toml::from_str(r#"
+[mcp_servers.worker]
+command = "worker"
+args = ["--legacy"]
+env_vars = ["PROD_TOKEN"]
+environment_id = "remote"
+auth = "chatgpt"
+enabled = false
+required = true
+supports_parallel_tool_calls = true
+disabled_tools = ["legacy"]
+"#)?;
+    for original in [
+        r#"[mcp_servers.worker]
+command = "worker"
+args = []
+env_vars = []
+environment_id = "local"
+auth = "oauth"
+enabled = true
+required = false
+supports_parallel_tool_calls = false
+disabled_tools = []
+"#,
+        r#"mcp_servers = { worker = {command = "worker", args = [], env_vars = [], environment_id = "local", auth = "oauth", enabled = true, required = false, supports_parallel_tool_calls = false, disabled_tools = []} }"#,
+        "[mcp_servers.worker]\ncommand = 'worker'\n",
+    ] {
+        let home = tempfile::tempdir()?;
+        let path = home.path().join(CONFIG_TOML_FILE);
+        fs::write(&path, original)?;
+        let mut expected = lower.clone();
+        crate::merge::merge_toml_values(&mut expected, &toml::from_str(original)?);
+        let mut servers = load_global_mcp_servers(home.path()).await?;
+        servers.insert("added".into(), toml::from_str("command = 'added'")?);
+        ConfigEditsBuilder::new(home.path()).replace_mcp_servers(&servers).apply().await?;
+        let saved: TomlValue = toml::from_str(&fs::read_to_string(&path)?)?;
+        let mut actual = lower.clone();
+        crate::merge::merge_toml_values(&mut actual, &saved);
+        assert_eq!(actual["mcp_servers"]["worker"], expected["mcp_servers"]["worker"]);
+        // Changes to a default-valued scalar remain explicit when required.
+        servers.get_mut("worker").unwrap().enabled = false;
+        ConfigEditsBuilder::new(home.path()).replace_mcp_servers(&servers).apply().await?;
+        let saved: TomlValue = toml::from_str(&fs::read_to_string(&path)?)?;
+        assert_eq!(saved["mcp_servers"]["worker"]["enabled"].as_bool(), Some(false));
+    }
+    Ok(())
+}
+
+#[tokio::test]
 async fn merge_preserves_latest_existing_document_entries() -> anyhow::Result<()> {
     for original in [
         "# user settings\n[mcp_servers.existing]\ncommand = 'old' # keep\nfuture_field = 'retained'\n",

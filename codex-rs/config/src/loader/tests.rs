@@ -11,6 +11,26 @@ use codex_utils_path_uri::PathUri;
 use pretty_assertions::assert_eq;
 use tempfile::tempdir;
 
+#[cfg(windows)]
+#[tokio::test]
+async fn managed_config_default_reads_the_protected_system_directory() {
+    let home = tempdir().unwrap();
+    let expected = AbsolutePathBuf::from_absolute_path(
+        windows_codex_system_dir().join("managed_config.toml"),
+    ).unwrap();
+    let fs = TestFileSystem {
+        read_snapshot: Some((expected.clone(), "model = 'managed-default'".into())),
+        ..Default::default()
+    };
+    let layers = layer_io::load_config_layers_internal(
+        &fs, home.path(), LoaderOverrides::default(), false,
+    ).await.unwrap();
+    let managed = layers.managed_config.expect("protected managed policy");
+    assert_eq!(managed.file, expected);
+    assert_eq!(managed.managed_config["model"].as_str(), Some("managed-default"));
+    assert_eq!(*fs.reads.lock().unwrap(), vec![expected]);
+}
+
 #[test]
 fn unversioned_config_is_migrated_to_current_canonical_shape() {
     let path = Path::new("config.toml");

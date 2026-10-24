@@ -163,6 +163,61 @@ pub(crate) fn final_message_from_turn(
     final_message_from_turn_items(items)
 }
 
+/// Some(None) is an authoritative no-final receipt, not missing evidence.
+pub(crate) fn authoritative_final_message(
+    notification: &codex_app_server_protocol::TurnCompletedNotification,
+) -> Option<Option<&str>> {
+    if let Some(result) = notification
+        .surfaced_result
+        .as_ref()
+        .or(notification.turn.surfaced_result.as_ref())
+    {
+        return Some(result.canonical_message.as_deref());
+    }
+    notification
+        .timing
+        .as_ref()
+        .or(notification.turn.timing.as_ref())
+        .and_then(|timing| timing.final_answer.as_ref())
+        .map(|answer| answer.message.as_ref().map(|message| message.text.as_str()))
+}
+
+pub(crate) fn item_is_in_progress(item: &ThreadItem) -> bool {
+    use codex_app_server_protocol::CollabAgentToolCallStatus;
+    use codex_app_server_protocol::CommandExecutionStatus;
+    use codex_app_server_protocol::DynamicToolCallStatus;
+    use codex_app_server_protocol::McpToolCallStatus;
+    use codex_app_server_protocol::PatchApplyStatus;
+
+    match item {
+        ThreadItem::CommandExecution { status, .. } => {
+            *status == CommandExecutionStatus::InProgress
+        }
+        ThreadItem::FileChange { status, .. } => *status == PatchApplyStatus::InProgress,
+        ThreadItem::McpToolCall { status, .. } => *status == McpToolCallStatus::InProgress,
+        ThreadItem::CollabAgentToolCall { status, .. } => {
+            *status == CollabAgentToolCallStatus::InProgress
+        }
+        ThreadItem::DynamicToolCall {
+            namespace,
+            tool,
+            arguments,
+            status,
+            ..
+        } => {
+            if namespace.as_deref() == Some("codex.internal") && tool == "code_mode_cell" {
+                match arguments.get("state").and_then(|value| value.as_str()) {
+                    Some("yielded") => return true,
+                    Some("terminated") => return false,
+                    _ => {}
+                }
+            }
+            *status == DynamicToolCallStatus::InProgress
+        }
+        _ => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

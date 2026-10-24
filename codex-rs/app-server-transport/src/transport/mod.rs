@@ -286,14 +286,54 @@ async fn enqueue_incoming_message(
                 }
             }
         }
-        Err(mpsc::error::TrySendError::Full(event)) => transport_event_tx.send(event).await.is_ok(),
+        Err(mpsc::error::TrySendError::Full(_)) => {
+            // Notifications cannot be rejected with an RPC error, and replies
+            // must never be silently discarded. Explicitly retire this overloaded
+            // connection rather than borrowing the interrupt reserve or blocking
+            // the reader behind an unreserved send.
+            warn!("closing connection {connection_id:?}: ingress cannot accept required message");
+            false
+        }
     }
 }
 
+/// Count a JSON envelope without allocating its wire representation. Stop as
+/// soon as it exceeds the budget; serialization failures never gain admission.
+pub fn serialized_request_bytes_up_to<T: serde::Serialize + ?Sized>(request: &T, limit: usize) -> usize {
+    struct CountingWriter {
+        bytes: usize,
+        limit: usize,
+    }
+
+    impl std::io::Write for CountingWriter {
+        fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+            self.bytes = self.bytes.saturating_add(buffer.len());
+            if self.bytes > self.limit {
+                return Err(std::io::Error::other("request byte budget exceeded"));
+            }
+            Ok(buffer.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let mut writer = CountingWriter { bytes: 0, limit };
+    serde_json::to_writer(&mut writer, request)
+        .map(|()| writer.bytes)
+        .unwrap_or(usize::MAX)
+}
+
 fn ingress_message_is_control(message: &JSONRPCMessage) -> bool {
-    matches!(message, JSONRPCMessage::Request(request)
-        if codex_app_server_protocol::client_request_is_control(&request.method)
-            && serde_json::to_vec(request).is_ok_and(|bytes| bytes.len() <= 64 * 1024))
+    match message {
+        JSONRPCMessage::Response(_) | JSONRPCMessage::Error(_) => true,
+        JSONRPCMessage::Notification(notification) => notification.method == "initialized",
+        JSONRPCMessage::Request(request) => {
+            codex_app_server_protocol::client_request_is_control(&request.method)
+                && serialized_request_bytes_up_to(request, 64 * 1024) <= 64 * 1024
+        }
+    }
 }
 
 fn ingress_reserve(sender: &mpsc::Sender<TransportEvent>) -> usize {
@@ -502,7 +542,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn enqueue_incoming_response_waits_instead_of_dropping_when_queue_is_full() {
+    async fn required_response_exhaustion_explicitly_closes_instead_of_blocking() {
         let connection_id = ConnectionId(42);
         let (transport_event_tx, mut transport_event_rx) = mpsc::channel(1);
         let (writer_tx, _writer_rx) = mpsc::channel(1);
@@ -523,10 +563,10 @@ mod tests {
             id: RequestId::Integer(7),
             result: json!({"ok": true}),
         });
-        let enqueue =
-            enqueue_incoming_message(&transport_event_tx, &writer_tx, connection_id, response);
-        tokio::pin!(enqueue);
-        assert!(futures::poll!(&mut enqueue).is_pending());
+        assert!(
+            !enqueue_incoming_message(&transport_event_tx, &writer_tx, connection_id, response)
+                .await
+        );
 
         let queued_event = transport_event_rx
             .recv()
@@ -543,25 +583,45 @@ mod tests {
             _ => panic!("expected queued incoming message"),
         }
 
-        let enqueue_result = timeout(Duration::from_secs(1), enqueue)
-            .await
-            .expect("enqueue should resume after capacity is released");
-        assert!(enqueue_result);
+        assert!(transport_event_rx.try_recv().is_err());
+    }
 
-        let forwarded_event = transport_event_rx
-            .recv()
-            .await
-            .expect("response should be forwarded instead of dropped");
-        match forwarded_event {
-            TransportEvent::IncomingMessage {
-                connection_id: queued_connection_id,
-                message: JSONRPCMessage::Response(JSONRPCResponse { id, result }),
-            } => {
-                assert_eq!(queued_connection_id, connection_id);
-                assert_eq!(id, RequestId::Integer(7));
-                assert_eq!(result, json!({"ok": true}));
-            }
-            _ => panic!("expected forwarded response message"),
+    #[tokio::test]
+    async fn ordinary_notifications_preserve_control_reply_and_lifecycle_reserve() {
+        let (events, mut received) = mpsc::channel(INGRESS_CAPACITY);
+        let (writer, _replies) = mpsc::channel(1);
+        let ordinary = || {
+            JSONRPCMessage::Notification(JSONRPCNotification {
+                method: "ordinary".into(),
+                params: None,
+            })
+        };
+        for _ in 0..CHANNEL_CAPACITY {
+            assert!(enqueue_incoming_message(&events, &writer, ConnectionId(1), ordinary()).await);
+        }
+        for _ in 0..CONTROL_INGRESS_RESERVE {
+            assert!(!enqueue_incoming_message(&events, &writer, ConnectionId(2), ordinary()).await);
+        }
+        for payload in [
+            r#"{"id":1,"result":{"ok":true}}"#,
+            r#"{"id":2,"error":{"code":-1,"message":"declined"}}"#,
+            r#"{"method":"initialized"}"#,
+            r#"{"id":3,"method":"turn/interrupt","params":{"threadId":"t","turnId":"turn"}}"#,
+        ] {
+            assert!(forward_incoming_message(&events, &writer, ConnectionId(3), payload).await);
+        }
+        assert_eq!(received.len(), CHANNEL_CAPACITY + 4);
+        for _ in 0..CHANNEL_CAPACITY {
+            received.recv().await.unwrap();
+        }
+        for _ in 0..4 {
+            assert!(matches!(
+                received.recv().await,
+                Some(TransportEvent::IncomingMessage {
+                    connection_id: ConnectionId(3),
+                    ..
+                })
+            ));
         }
     }
 

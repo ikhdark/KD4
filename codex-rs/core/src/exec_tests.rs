@@ -49,9 +49,12 @@ async fn audit132_legacy_reader_retains_original_bytes_before_display_reduction(
             aggregate.lock().unwrap().snapshot()
         })
         .await;
-        let canonical = captured.canonical.expect("original capture");
-        assert_eq!(canonical.bytes, original);
-        assert_eq!(canonical.complete, !gap);
+        assert!(captured.canonical.is_none(), "command logs do not duplicate canonical snapshots");
+        let crate::tools::command_output_artifact::RawOutputArtifact::Stored { path, .. } = &captured.artifact else {
+            panic!("original command bytes must be retained");
+        };
+        assert_eq!(std::fs::read(path).unwrap(), original);
+        assert_eq!(captured.artifact.capture_finalized_complete(), !gap);
         if length > EXEC_OUTPUT_MAX_BYTES {
             assert!(display.truncated);
             assert!(captured.artifact.capture_finalized_complete());
@@ -778,8 +781,6 @@ async fn exec_full_buffer_capture_honors_expiration() -> Result<()> {
             expiration: 1.into(),
             capture_policy: ExecCapturePolicy::FullBuffer,
             env,
-            network: None,
-            network_environment_id: None,
             sandbox_permissions: SandboxPermissions::UseDefault,
             windows_sandbox_level: WindowsSandboxLevel::Disabled,
             windows_sandbox_private_desktop: false,
@@ -816,8 +817,6 @@ async fn windows_direct_exec_completes_for_trivial_command() -> Result<()> {
                 expiration: ExecExpiration::Timeout(Duration::from_secs(5)),
                 capture_policy: ExecCapturePolicy::FullBuffer,
                 env,
-                network: None,
-                network_environment_id: None,
                 sandbox_permissions: SandboxPermissions::UseDefault,
                 windows_sandbox_level: WindowsSandboxLevel::Disabled,
                 windows_sandbox_private_desktop: false,
@@ -859,7 +858,6 @@ async fn forced_direct_exec_termination_reaps_the_child() -> Result<()> {
         arg0: None,
         cwd,
         network_sandbox_policy: NetworkSandboxPolicy::Enabled,
-        network: None,
         stdio_policy: StdioPolicy::RedirectForShellTool,
         env: std::env::vars().collect(),
         creation_flags: 0,
@@ -1083,8 +1081,6 @@ async fn process_exec_tool_call_preserves_full_buffer_capture_policy() -> Result
             expiration: 30_000.into(),
             capture_policy: ExecCapturePolicy::FullBuffer,
             env: std::env::vars().collect(),
-            network: None,
-            network_environment_id: None,
             sandbox_permissions: SandboxPermissions::UseDefault,
             windows_sandbox_level: WindowsSandboxLevel::Disabled,
             windows_sandbox_private_desktop: false,
@@ -1726,8 +1722,6 @@ async fn process_exec_tool_call_rejects_unavailable_sandbox_without_spawning() -
             expiration: ExecExpiration::DefaultTimeout,
             capture_policy: ExecCapturePolicy::ShellTool,
             env: std::env::vars().collect(),
-            network: None,
-            network_environment_id: None,
             sandbox_permissions: SandboxPermissions::UseDefault,
             windows_sandbox_level: WindowsSandboxLevel::Disabled,
             windows_sandbox_private_desktop: false,
@@ -1771,8 +1765,6 @@ async fn build_exec_request_preserves_windows_workspace_roots() -> Result<()> {
         expiration: ExecExpiration::DefaultTimeout,
         capture_policy: ExecCapturePolicy::ShellTool,
         env: HashMap::new(),
-        network: None,
-        network_environment_id: None,
         sandbox_permissions: SandboxPermissions::UseDefault,
         windows_sandbox_level: WindowsSandboxLevel::Disabled,
         windows_sandbox_private_desktop: false,
@@ -1899,8 +1891,6 @@ async fn direct_exec_cancellation_terminates_windows_descendants() -> Result<()>
         expiration: ExecExpiration::Cancellation(cancellation),
         capture_policy: ExecCapturePolicy::ShellTool,
         env: std::env::vars().collect(),
-        network: None,
-        network_environment_id: None,
         sandbox_permissions: SandboxPermissions::UseDefault,
         windows_sandbox_level: WindowsSandboxLevel::Disabled,
         windows_sandbox_private_desktop: false,
@@ -1955,8 +1945,6 @@ async fn process_exec_tool_call_respects_cancellation_token() -> Result<()> {
         expiration: ExecExpiration::Cancellation(cancel_token),
         capture_policy: ExecCapturePolicy::ShellTool,
         env,
-        network: None,
-        network_environment_id: None,
         sandbox_permissions: SandboxPermissions::UseDefault,
         windows_sandbox_level: codex_protocol::config_types::WindowsSandboxLevel::Disabled,
         windows_sandbox_private_desktop: false,

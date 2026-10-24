@@ -8,6 +8,41 @@ pub fn truncate_middle_chars(s: &str, max_bytes: usize) -> String {
     truncate_with_byte_estimate(s, max_bytes, /*use_tokens*/ false)
 }
 
+/// Apply the same byte budget and character-count marker to borrowed parts,
+/// without allocating their potentially unbounded concatenation first.
+pub fn truncate_middle_chars_from_parts(parts: &[&str], max_bytes: usize) -> String {
+    let total_bytes = parts.iter().map(|part| part.len()).sum::<usize>();
+    if total_bytes <= max_bytes {
+        return parts.concat();
+    }
+    let (left_budget, right_budget) = split_budget(max_bytes);
+    let mut prefix = String::with_capacity(left_budget);
+    for part in parts {
+        let remaining = left_budget - prefix.len();
+        if part.len() > remaining {
+            prefix.push_str(&part[..part.floor_char_boundary(remaining)]);
+            break;
+        }
+        prefix.push_str(part);
+    }
+    let mut suffix_parts = Vec::new();
+    let mut remaining = right_budget;
+    for part in parts.iter().rev() {
+        if part.len() > remaining {
+            suffix_parts.push(&part[part.ceil_char_boundary(part.len() - remaining)..]);
+            break;
+        }
+        suffix_parts.push(*part);
+        remaining -= part.len();
+    }
+    let suffix = suffix_parts.into_iter().rev().collect::<String>();
+    let removed_chars = parts.iter().map(|part| part.chars().count()).sum::<usize>()
+        - prefix.chars().count()
+        - suffix.chars().count();
+    let marker = format_truncation_marker(false, removed_chars as u64);
+    assemble_truncated_output(&prefix, &suffix, &marker)
+}
+
 /// Truncate the middle of a UTF-8 string to at most `max_tokens` approximate
 /// tokens, preserving the beginning and the end. Returns the possibly
 /// truncated string and `Some(original_token_count)` if truncation occurred;

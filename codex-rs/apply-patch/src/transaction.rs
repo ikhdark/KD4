@@ -72,16 +72,31 @@ pub(crate) async fn acquire(
     let endpoints = identities(hunks, cwd, fs, sandbox).await?;
     let keys = endpoints.clone();
     let transaction = tokio::task::spawn_blocking(move || -> io::Result<PatchTransaction> {
-        // Stable across CODEX_HOME/checkouts. The platform's user temporary
-        // directory is the lease namespace; participants must share it. No
+        // Stable across CODEX_HOME/checkouts. The account-private directory
+        // is the lease namespace; participants must share it. No
         // target or missing target parent is created during admission.
-        let directory = std::env::temp_dir().join("codex-patch-transactions-v1");
-        std::fs::create_dir_all(&directory)?;
+        let directory = lease_directory()?;
         let mut locks = Vec::with_capacity(keys.len());
         for key in keys {
             let digest = hex::encode(Sha256::digest(key.as_bytes()));
-            let file = OpenOptions::new().read(true).write(true).create(true)
-                .truncate(false).open(directory.join(digest))?;
+            let mut options = OpenOptions::new();
+            options.read(true).write(true).create(true).truncate(false);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600).custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+            }
+            let file = options.open(directory.join(digest))?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::{MetadataExt, PermissionsExt};
+                let metadata = file.metadata()?;
+                // SAFETY: geteuid takes no pointers and has no failure mode.
+                let uid = unsafe { libc::geteuid() };
+                if !metadata.is_file() || metadata.uid() != uid || metadata.permissions().mode() & 0o077 != 0 {
+                    return Err(io::Error::new(io::ErrorKind::PermissionDenied, "unsafe patch lease file"));
+                }
+            }
             file.try_lock().map_err(|error| match error {
                 std::fs::TryLockError::WouldBlock => io::Error::new(io::ErrorKind::WouldBlock,
                     "apply_patch: an endpoint is busy in another patch process. No files were changed by this attempt; retry after its owner finishes."),
@@ -96,6 +111,42 @@ pub(crate) async fn acquire(
         "patch endpoint aliases changed during admission; no files were changed"
     );
     Ok(Some(transaction))
+}
+
+fn lease_directory() -> io::Result<std::path::PathBuf> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
+        // SAFETY: geteuid takes no pointers and has no failure mode.
+        let uid = unsafe { libc::geteuid() };
+        let home = std::env::var_os("HOME").ok_or_else(||
+            io::Error::new(io::ErrorKind::NotFound, "HOME is required for private patch leases"))?;
+        let home = std::fs::canonicalize(std::path::PathBuf::from(home))?;
+        let home_metadata = std::fs::metadata(&home)?;
+        if !home_metadata.is_dir() || home_metadata.uid() != uid || home_metadata.permissions().mode() & 0o022 != 0 {
+            return Err(io::Error::new(io::ErrorKind::PermissionDenied, "patch lease home is not private to this account"));
+        }
+        // Unlike a predictable name under shared /tmp, another account cannot
+        // pre-create this directory and deny all future endpoint admissions.
+        let directory = home.join(".codex-patch-transactions-v2");
+        match std::fs::DirBuilder::new().mode(0o700).create(&directory) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error),
+        }
+        let metadata = std::fs::symlink_metadata(&directory)?;
+        if !metadata.is_dir() || metadata.file_type().is_symlink() || metadata.uid() != uid
+            || metadata.permissions().mode() & 0o077 != 0 {
+            return Err(io::Error::new(io::ErrorKind::PermissionDenied, "unsafe patch lease directory"));
+        }
+        return Ok(directory);
+    }
+    #[cfg(not(unix))]
+    {
+        let directory = std::env::temp_dir().join("codex-patch-transactions-v1");
+        std::fs::create_dir_all(&directory)?;
+        Ok(directory)
+    }
 }
 
 #[cfg(test)]

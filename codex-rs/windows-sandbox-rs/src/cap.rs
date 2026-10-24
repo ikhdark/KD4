@@ -1,4 +1,4 @@
-use crate::path_normalization::canonical_path_key;
+use crate::path_normalization::security_path_key as canonical_path_key;
 use crate::path_normalization::canonicalize_path;
 use anyhow::Context;
 use anyhow::Result;
@@ -101,15 +101,18 @@ fn lock_cap_sid_file(codex_home: &Path) -> Result<fs::File> {
 
 fn load_or_create_cap_sids_from_disk(codex_home: &Path) -> Result<CapSids> {
     let path = cap_sid_file(codex_home);
-    if path.exists() {
-        let txt = fs::read_to_string(&path)
-            .with_context(|| format!("read cap sid file {}", path.display()))?;
+    match fs::read_to_string(&path) {
+        Ok(txt) => {
         let t = txt.trim();
-        if t.starts_with('{') && t.ends_with('}') {
-            if let Ok(obj) = serde_json::from_str::<CapSids>(t) {
-                return Ok(obj);
-            }
-        } else if !t.is_empty() {
+        if t.starts_with('{') {
+            let caps: CapSids = serde_json::from_str(t)
+                .with_context(|| format!("parse cap sid file {}", path.display()))?;
+            validate_caps(&caps)?;
+            return Ok(caps);
+        } else {
+            // Only a valid legacy single SID may be upgraded. Existing corrupt
+            // state must never rotate identities already bound to durable ACLs.
+            validate_cap_sid(t).context("invalid legacy capability SID")?;
             let caps = CapSids {
                 workspace: t.to_string(),
                 readonly: make_random_cap_sid_string(),
@@ -119,6 +122,9 @@ fn load_or_create_cap_sids_from_disk(codex_home: &Path) -> Result<CapSids> {
             persist_caps(&path, &caps)?;
             return Ok(caps);
         }
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => return Err(err).with_context(|| format!("read cap sid file {}", path.display())),
     }
     let caps = CapSids {
         workspace: make_random_cap_sid_string(),
@@ -128,6 +134,25 @@ fn load_or_create_cap_sids_from_disk(codex_home: &Path) -> Result<CapSids> {
     };
     persist_caps(&path, &caps)?;
     Ok(caps)
+}
+
+fn validate_caps(caps: &CapSids) -> Result<()> {
+    for sid in std::iter::once(&caps.workspace)
+        .chain(std::iter::once(&caps.readonly))
+        .chain(caps.workspace_by_cwd.values())
+        .chain(caps.writable_root_by_path.values())
+    {
+        validate_cap_sid(sid).context("invalid persisted capability SID")?;
+    }
+    Ok(())
+}
+
+fn validate_cap_sid(sid: &str) -> Result<()> {
+    let components = sid.strip_prefix("S-1-5-21-").context("unsupported capability SID shape")?
+        .split('-').collect::<Vec<_>>();
+    anyhow::ensure!(components.len() == 4 && components.iter().all(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit()) && part.parse::<u32>().is_ok()), "invalid capability SID components");
+    crate::token::LocalSid::from_string(sid)?;
+    Ok(())
 }
 
 fn cached_cap_sids<'a>(

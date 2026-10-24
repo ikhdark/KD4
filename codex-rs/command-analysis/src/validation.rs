@@ -2,6 +2,7 @@ use crate::command_shape::CommandInvocation;
 
 pub use codex_shell_command::validation::ValidationClassification;
 pub use codex_shell_command::validation::ValidationOperation;
+pub use codex_shell_command::validation::ValidationPolicyClassification;
 use codex_shell_command::validation::classify_argv;
 use codex_shell_command::validation::classify_powershell_script;
 use codex_shell_command::validation::combine_validation_classifications;
@@ -13,8 +14,6 @@ pub struct CommandValidation {
     pub execution_context: Option<ValidationExecutionContext>,
     pub declared: Option<codex_protocol::validation::ValidationCommandContext>,
     pub classification: ValidationClassification,
-    pub receipt_runner: Option<String>,
-    pub admission_runner: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
@@ -27,30 +26,7 @@ pub struct ValidationExecutionContext {
     pub environment_fingerprint: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, serde::Deserialize, serde::Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct RunnerTestIdentity {
-    pub binary: String,
-    pub helpers: Vec<String>,
-    pub test: String,
-}
 
-pub fn runner_test_identities(
-    value: &serde_json::Value,
-) -> Option<std::collections::BTreeSet<RunnerTestIdentity>> {
-    let rows: Vec<RunnerTestIdentity> = serde_json::from_value(value.clone()).ok()?;
-    if rows.iter().any(|row| {
-        row.binary.is_empty()
-            || row.test.is_empty()
-            || row.helpers.iter().any(String::is_empty)
-            || row.helpers.windows(2).any(|pair| pair[0] >= pair[1])
-    }) {
-        return None;
-    }
-    let count = rows.len();
-    let identities = rows.into_iter().collect::<std::collections::BTreeSet<_>>();
-    (identities.len() == count).then_some(identities)
-}
 
 impl CommandValidation {
     pub fn is_validation(&self) -> bool {
@@ -75,9 +51,6 @@ impl CommandValidation {
         };
         serde_json::json!({
             "validation": self.is_validation(),
-            "proof": matches!(self.classification, ValidationClassification::Validation {
-                exit_code_is_authoritative: true, has_unclassified_targets: false, ..
-            }) && !modes.is_empty() && modes.iter().all(|mode| mode.can_prove_validation()),
             "tests": self.is_test(),
             "execution_modes": modes,
             "execution_context": self.execution_context,
@@ -88,7 +61,7 @@ impl CommandValidation {
 #[cfg(test)]
 #[test]
 fn validation_signals_require_executing_or_checking_modes() {
-    for (command, proof, tests, mode) in [
+    for (command, _proof, tests, mode) in [
         ("cargo test", true, true, "execution"),
         ("cargo bench --no-run", true, false, "compilation_only"),
         ("cargo check --tests", true, false, "checking"),
@@ -111,12 +84,10 @@ fn validation_signals_require_executing_or_checking_modes() {
         let validation = CommandValidation {
             execution_context: None,
             declared: None,
-            receipt_runner: None,
-            admission_runner: None,
             classification: classify_validation_script(command),
         };
         let signal = validation.signal();
-        assert_eq!(signal["proof"], proof, "{command}");
+        assert!(signal.get("proof").is_none(), "{command}");
         assert_eq!(signal["tests"], tests, "{command}");
         assert_eq!(
             signal["execution_modes"],
@@ -132,7 +103,7 @@ fn syntax_only_shell_wrappers_do_not_prove_validation() {
     // POSIX `-n` reads commands without executing them. A successful syntax
     // check of a validation command is not execution of that validation.
     for program in ["sh", "bash"] {
-        for (args, proof) in [
+        for (args, _proof) in [
             (vec!["-n", "-c", "cargo check"], false),
             (vec!["-nc", "cargo check"], false),
             (vec!["-c", "-n", "cargo check"], false),
@@ -150,52 +121,12 @@ fn syntax_only_shell_wrappers_do_not_prove_validation() {
                 execution_context: None,
                 declared: None,
                 classification: classify_validation(&invocation),
-                receipt_runner: None,
-                admission_runner: None,
             };
-            assert_eq!(validation.signal()["proof"], proof, "{program} {args:?}");
+            assert!(validation.signal().get("proof").is_none(), "{program} {args:?}");
         }
     }
 }
 
-#[cfg(test)]
-#[test]
-#[ignore = "opt-in bounded classifier/proof timing; not an end-to-end shell benchmark"]
-fn validation_shell_mode_proof_bounded_benchmark() {
-    const ITERATIONS: usize = 5_000;
-    for (program, args, proof) in [
-        ("cargo", vec!["check"], true),
-        ("sh", vec!["-c", "cargo check"], true),
-        ("sh", vec!["-n", "-c", "cargo check"], false),
-        ("sh", vec!["-n", "+n", "-c", "cargo check"], true),
-    ] {
-        let invocation = CommandInvocation::Argv {
-            program: program.to_string(),
-            args: args.iter().map(|arg| (*arg).to_string()).collect(),
-        };
-        let started = std::time::Instant::now();
-        let mut proofs = 0;
-        for _ in 0..ITERATIONS {
-            let validation = CommandValidation {
-                execution_context: None,
-                declared: None,
-                classification: classify_validation(std::hint::black_box(&invocation)),
-                receipt_runner: None,
-                admission_runner: None,
-            };
-            proofs += usize::from(std::hint::black_box(validation.signal())["proof"] == true);
-        }
-        eprintln!(
-            "validation shell proof: {program} {args:?}; iterations={ITERATIONS}; elapsed_us={}",
-            started.elapsed().as_micros()
-        );
-        assert_eq!(
-            proofs,
-            if proof { ITERATIONS } else { 0 },
-            "{program} {args:?}"
-        );
-    }
-}
 
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -310,12 +241,12 @@ fn load_repository_runners(root: &std::path::Path, oid: &str) -> Option<Runners>
         .arg("--no-replace-objects")
         .arg("-C")
         .arg(root)
-        .args(["cat-file", "--batch"])
+        .args(["cat-file", "--batch-command"])
         .env("GIT_NO_LAZY_FETCH", "1")
         .env("GIT_TERMINAL_PROMPT", "0");
     let (success, bytes) = bounded_runner_lookup(
         command,
-        format!("{oid}\n{object}\n").as_bytes(),
+        format!("info {oid}\ncontents {object}\n").as_bytes(),
         std::time::Duration::from_secs(5),
     )?;
     // First prove the commit exists. A missing/corrupt commit object is a
@@ -326,11 +257,10 @@ fn load_repository_runners(root: &std::path::Path, oid: &str) -> Option<Runners>
     if fields.len() != 3 || fields[0] != oid || fields[1] != "commit" {
         return None;
     }
-    let commit_size = fields[2].parse::<usize>().ok()?;
-    if commit_size > MAX_RUNNER_DECLARATION_BYTES {
-        return None;
-    }
-    let bytes = bytes.get(newline + 1 + commit_size + 1..)?;
+    // `info` proves the commit's type/existence without transferring its body.
+    // Commit messages have no relationship to the declaration's size limit.
+    fields[2].parse::<usize>().ok()?;
+    let bytes = bytes.get(newline + 1..)?;
     let newline = bytes.iter().position(|byte| *byte == b'\n')?;
     let header = std::str::from_utf8(&bytes[..newline]).ok()?;
     if header == format!("{object} missing") {
@@ -389,8 +319,8 @@ fn bounded_runner_lookup(
         child.0.stdin.take()?.write_all(input).ok()?;
         let stdout = child.0.stdout.take()?;
         let (tx, rx) = std::sync::mpsc::sync_channel(1);
-        // Bound both the commit proof and declaration, including Git headers.
-        let limit = 2 * MAX_RUNNER_DECLARATION_BYTES + 1024;
+        // Commit metadata is one header; only the declaration has a body.
+        let limit = MAX_RUNNER_DECLARATION_BYTES + 1024;
         scope.spawn(move || {
             let mut bytes = Vec::new();
             let result = stdout
@@ -556,16 +486,6 @@ pub async fn resolve_command_launch_analysis_with_shell(
         } else {
             classify_with_runners(&invocation, &runners)
         };
-        let receipt_runner = argv
-            .as_ref()
-            .and_then(|argv| argv.split_first())
-            .and_then(|(program, args)| runners.iter().find(|runner| runner.matches(program, args)))
-            .and_then(|runner| runner.receipt_runner.clone());
-        let admission_runner = argv
-            .as_ref()
-            .and_then(|argv| argv.split_first())
-            .and_then(|(program, args)| runners.iter().find(|runner| runner.matches(program, args)))
-            .and_then(|runner| runner.admission_runner.clone());
         let long_running = matches!(classification, ValidationClassification::Validation { .. })
             || prefers_long_observation_wait(&invocation);
         let validation = (declared.is_some()
@@ -574,13 +494,74 @@ pub async fn resolve_command_launch_analysis_with_shell(
             execution_context: None,
             declared,
             classification,
-            receipt_runner,
-            admission_runner,
         });
         (validation, long_running)
     })
     .await
     .unwrap_or_default()
+}
+
+/// Policy classification shares the trusted runner declarations and analysis
+/// worker with validation evidence, but never upgrades it into receipt proof.
+pub async fn classify_validation_policy_with_shell(
+    invocation: &CommandInvocation,
+    shell_type: Option<codex_shell_command::shell_detect::ShellType>,
+    cwd: Option<&std::path::Path>,
+) -> ValidationPolicyClassification {
+    analyze_validation_policy_with_shell(invocation, shell_type, cwd).await.0
+}
+
+pub async fn analyze_validation_policy_with_shell(
+    invocation: &CommandInvocation,
+    shell_type: Option<codex_shell_command::shell_detect::ShellType>,
+    cwd: Option<&std::path::Path>,
+) -> (ValidationPolicyClassification, String) {
+    let invocation = match invocation {
+        CommandInvocation::Script(script)
+            if shell_type == Some(codex_shell_command::shell_detect::ShellType::PowerShell) =>
+        {
+            CommandInvocation::PowerShellScript(script.clone())
+        }
+        _ => invocation.clone(),
+    };
+    let cwd = cwd.map(std::path::Path::to_path_buf);
+    crate::run_blocking_command_analysis(move || {
+        let runners = cwd.as_deref().map(repository_runners).unwrap_or_default();
+        analyze_policy_with_runners(&invocation, &runners)
+    })
+    .await
+    .unwrap_or((ValidationPolicyClassification::Opaque, String::new()))
+}
+
+pub fn classify_validation_policy(
+    invocation: &CommandInvocation,
+) -> ValidationPolicyClassification {
+    classify_policy_with_runners(invocation, &[])
+}
+
+fn classify_policy_with_runners(
+    invocation: &CommandInvocation,
+    runners: &[codex_shell_command::validation::RepositoryRunner],
+) -> ValidationPolicyClassification {
+    analyze_policy_with_runners(invocation, runners).0
+}
+
+fn analyze_policy_with_runners(
+    invocation: &CommandInvocation,
+    runners: &[codex_shell_command::validation::RepositoryRunner],
+) -> (ValidationPolicyClassification, String) {
+    use codex_shell_command::validation as commands;
+    match invocation {
+        CommandInvocation::Argv { program, args } => {
+            commands::analyze_validation_policy_argv_with_runners(program, args, runners)
+        }
+        CommandInvocation::Script(script) => {
+            commands::analyze_validation_policy_script_with_runners(script, runners, false)
+        }
+        CommandInvocation::PowerShellScript(script) => {
+            commands::analyze_validation_policy_script_with_runners(script, runners, true)
+        }
+    }
 }
 
 pub fn classify_validation(invocation: &CommandInvocation) -> ValidationClassification {
@@ -871,7 +852,11 @@ mod tests {
             };
             std::fs::write(&manifest, config("test")).unwrap();
             git(&["add", ".codex/test-runners.json"]);
-            git(&["commit", "-m", "first"]);
+            // A large valid commit body must not consume the declaration's
+            // independent bounded read or turn this immutable key retryable.
+            let message = root.join("commit-message.txt");
+            std::fs::write(&message, "x".repeat(MAX_RUNNER_DECLARATION_BYTES * 2)).unwrap();
+            git(&["commit", "-F", message.to_str().unwrap()]);
             assert_eq!(
                 repository_runners(root)[0].operations,
                 vec![ValidationOperation::Test]
@@ -889,83 +874,6 @@ mod tests {
             );
         }
 
-        #[cfg(windows)]
-        #[tokio::test]
-        async fn powershell_runner_receipts_use_the_selected_shell_and_committed_manifest() {
-            let temp = tempfile::tempdir().unwrap();
-            let root = temp.path();
-            let git = |args: &[&str]| {
-                let output = std::process::Command::new("git")
-                    .arg("-C")
-                    .arg(root)
-                    .args([
-                        "-c",
-                        "user.name=Test",
-                        "-c",
-                        "user.email=test@example.com",
-                        "-c",
-                        "commit.gpgsign=false",
-                    ])
-                    .args(args)
-                    .output()
-                    .unwrap();
-                assert!(
-                    output.status.success(),
-                    "{}",
-                    String::from_utf8_lossy(&output.stderr)
-                );
-            };
-            git(&["init"]);
-            std::fs::create_dir(root.join(".codex")).unwrap();
-            std::fs::write(
-                root.join(".codex/test-runners.json"),
-                include_str!("../../../.codex/test-runners.json"),
-            )
-            .unwrap();
-            git(&["add", ".codex/test-runners.json"]);
-            git(&["commit", "-m", "runner fixture"]);
-            let script = r"python -B scripts\build\rust_test_runner.py run-target core_lib";
-            for invocation in [
-                CommandInvocation::Script(script.into()),
-                CommandInvocation::PowerShellScript(script.into()),
-            ] {
-                let validation = resolve_command_validation_with_shell(
-                    &invocation,
-                    Some(codex_shell_command::shell_detect::ShellType::PowerShell),
-                    Some(root),
-                    None,
-                )
-                .await
-                .unwrap();
-                assert!(validation.is_test());
-                assert_eq!(
-                    validation.receipt_runner.as_deref(),
-                    Some("rust_test_runner")
-                );
-            }
-            let posix = resolve_command_validation_with_shell(
-                &CommandInvocation::Script(script.into()),
-                Some(codex_shell_command::shell_detect::ShellType::Bash),
-                Some(root),
-                None,
-            )
-            .await;
-            assert!(posix.is_none_or(|validation| validation.receipt_runner.is_none()));
-            for suffix in [
-                "; Write-Output receipt",
-                " | Write-Output receipt",
-                " > receipt.json",
-            ] {
-                let validation = resolve_command_validation_with_shell(
-                    &CommandInvocation::Script(format!("{script}{suffix}")),
-                    Some(codex_shell_command::shell_detect::ShellType::PowerShell),
-                    Some(root),
-                    None,
-                )
-                .await;
-                assert!(validation.is_none_or(|validation| validation.receipt_runner.is_none()));
-            }
-        }
 
         fn classify_validation(invocation: &CommandInvocation) -> ValidationClassification {
             let runner = serde_json::from_value(serde_json::json!({
@@ -1436,87 +1344,46 @@ mod tests {
 mod audit36_validation_regressions {
     use super::*;
 
-    fn proof(invocation: CommandInvocation) -> bool {
-        CommandValidation {
-            execution_context: None,
-            declared: None,
-            receipt_runner: None,
-            admission_runner: None,
-            classification: classify_validation(&invocation),
-        }
-        .signal()["proof"]
-            == true
-    }
 
-    #[test]
-    fn nonexecuting_or_exit_masking_commands_never_emit_proof() {
-        for (program, args) in [
-            ("bash", vec!["-c", "# no execution && cargo test"]),
-            ("bash", vec!["-c", "python -I -B -m unittest $OPTIONS"]),
-            ("bash", vec!["-c", "python -m unittest \"$OPTIONS\""]),
-            ("command", vec!["-v", "cargo", "test"]),
-            ("env", vec!["--version", "cargo", "test"]),
-            ("env", vec!["--split-string=echo", "cargo", "test"]),
-            (
-                "powershell.exe",
-                vec!["-File", "noop.ps1", "-Command", "cargo test"],
-            ),
-            (
-                "python",
-                vec!["-I", "-B", "-i", "-m", "unittest", "discover"],
-            ),
-            ("python", vec!["-IBi", "-m", "unittest"]),
-            ("npm", vec!["test", "--help"]),
-            ("go", vec!["test", "-list", "."]),
-            ("go", vec!["test", "-n"]),
-            ("gradle", vec!["test", "-x", "test"]),
-            ("gradle", vec!["--version", "test"]),
-        ] {
-            assert!(
-                !proof(CommandInvocation::Argv {
-                    program: program.into(),
-                    args: args.iter().map(|arg| (*arg).into()).collect(),
-                }),
-                "{program} {args:?}"
-            );
-        }
-        assert!(!proof(CommandInvocation::PowerShellScript(
-            "cargo test; if ($LASTEXITCODE -ne 0) { exit 0 }".into(),
-        )));
-    }
 
-    #[test]
-    fn supported_literal_executions_keep_proof_and_file_args_never_grant_fmt_exemption() {
-        for (program, args) in [
-            ("cargo", vec!["test"]),
-            ("env", vec!["NAME=value", "cargo", "test"]),
-            ("env", vec!["-u", "NAME", "cargo", "test"]),
-            ("command", vec!["-p", "cargo", "test"]),
-            ("python", vec!["-I", "-B", "-m", "unittest"]),
-            ("go", vec!["test"]),
-            ("gradle", vec!["--show-version", "test"]),
-            ("npm", vec!["test", "--", "--help"]),
-            ("bash", vec!["-c", "cargo test && cargo check"]),
-            ("bash", vec!["-c", "cargo test 'literal$#'"]),
-        ] {
-            assert!(
-                proof(CommandInvocation::Argv {
-                    program: program.into(),
-                    args: args.iter().map(|arg| (*arg).into()).collect(),
-                }),
-                "{program} {args:?}"
-            );
-        }
-        let args = ["-File", "noop.ps1", "-Command", "cargo fmt --check"].map(str::to_owned);
-        assert!(
-            !codex_shell_command::validation::is_standalone_cargo_fmt_check(
-                "powershell.exe",
-                &args
-            )
-        );
-    }
 }
 
 #[cfg(test)]
-#[path = "validation_audit120_tests.rs"]
-mod audit120_tests;
+#[path = "validation_runner_resolution_tests.rs"]
+mod runner_resolution_tests;
+
+#[cfg(test)]
+mod validation_policy_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn policy_analysis_keeps_scope_and_wrapper_selection_separate_from_proof() {
+        let direct = CommandInvocation::Argv {
+            program: "cargo".into(),
+            args: ["check", "-p", "codex-core", "--tests"].map(str::to_owned).to_vec(),
+        };
+        let wrapped = CommandInvocation::Script("cargo check -p codex-core --tests".into());
+        let direct = analyze_validation_policy_with_shell(&direct, None, None).await;
+        let wrapped = analyze_validation_policy_with_shell(&wrapped, None, None).await;
+        assert_eq!(direct.0, ValidationPolicyClassification::TargetedCompilation);
+        assert_eq!(direct, wrapped);
+        assert_eq!(
+            classify_validation_policy(&CommandInvocation::Script("cargo fmt --check".into())),
+            ValidationPolicyClassification::Restricted,
+        );
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn policy_analysis_uses_the_actual_powershell_parser() {
+        let invocation = CommandInvocation::Script("& cargo test -p codex-core".into());
+        assert_eq!(
+            classify_validation_policy_with_shell(
+                &invocation,
+                Some(codex_shell_command::shell_detect::ShellType::PowerShell),
+                None,
+            ).await,
+            ValidationPolicyClassification::Restricted,
+        );
+    }
+}

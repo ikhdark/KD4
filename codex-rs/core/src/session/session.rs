@@ -52,8 +52,7 @@ fn coordination_startup_result(
             Err(anyhow::anyhow!("failed to initialize child task coordination: {error}"))
         }
         Err(error) => {
-            // Root analysis remains usable. Missing validation scope obtains an
-            // uncertain/spent budget, and spawn still requires durable admission.
+            // Root analysis remains usable; spawn still requires durable admission.
             warn!(%error, "task coordination unavailable; dependent operations remain fail-closed");
             Ok(false)
         }
@@ -802,13 +801,8 @@ pub(crate) struct Session {
     pub(super) tool_history_reconciliation_gate: Semaphore,
     /// Keeps ledger durability ordered without delaying nested result relay.
     pub(super) tool_history_persistence: ToolHistoryPersistenceQueue,
-    /// Serializes rebuild/apply cycles for the running proxy; each cycle
-    /// rebuilds from the current SessionState while holding this lock.
-    pub(super) managed_network_proxy_refresh_lock: Semaphore,
-    #[cfg(test)]
-    pub(super) managed_network_proxy_start_gate: Semaphore,
-    #[cfg(test)]
-    pub(super) managed_network_proxy_start_entered: tokio::sync::Notify,
+    /// Serializes accepted configuration changes and runtime refreshes.
+    pub(super) configuration_update_lock: Semaphore,
     /// The set of enabled features should be invariant for the lifetime of the
     /// session.
     pub(super) features: ManagedFeatures,
@@ -884,6 +878,10 @@ pub(crate) struct SessionConfiguration {
     pub(super) collaboration_mode: CollaborationMode,
     pub(super) model_reasoning_summary: Option<ReasoningSummaryConfig>,
     pub(super) service_tier: Option<String>,
+    pub(super) validation_mode: codex_protocol::validation::ValidationMode,
+    pub(super) validation_full_budget: usize,
+    pub(super) validation_root_turn: Option<(String, String)>,
+    pub(super) validation_attempts: Vec<(String, String)>,
 
     /// Developer instructions that supplement the base instructions.
     pub(super) developer_instructions: Option<String>,
@@ -1076,6 +1074,9 @@ impl SessionConfiguration {
         if let Some(summary) = updates.reasoning_summary {
             next_configuration.model_reasoning_summary = Some(summary);
         }
+        if let Some(validation_mode) = updates.validation_mode {
+            next_configuration.validation_mode = validation_mode;
+        }
         if let Some(service_tier) = updates.service_tier.clone() {
             next_configuration.service_tier = match service_tier {
                 Some(service_tier) => Some(
@@ -1152,19 +1153,6 @@ impl SessionConfiguration {
             {
                 let mut config = (*next_configuration.original_config_do_not_use).clone();
                 let permission_profile = next_configuration.permission_profile();
-                config.permissions.network = config
-                    .network_proxy_spec_for_active_permission_profile(
-                        &active_permission_profile,
-                        &permission_profile,
-                    )
-                    .map_err(|err| ConstraintError::InvalidValue {
-                        field_name: "default_permissions",
-                        candidate: active_permission_profile.id.clone(),
-                        allowed: format!(
-                            "configured permission profile with valid network policy ({err})"
-                        ),
-                        requirement_source: codex_config::RequirementSource::Unknown,
-                    })?;
                 config
                     .permissions
                     .set_permission_profile_from_session_snapshot(
@@ -1274,6 +1262,7 @@ pub(crate) struct SessionSettingsUpdate {
     pub(crate) collaboration_mode: Option<CollaborationMode>,
     pub(crate) reasoning_summary: Option<ReasoningSummaryConfig>,
     pub(crate) service_tier: Option<Option<String>>,
+    pub(crate) validation_mode: Option<codex_protocol::validation::ValidationMode>,
     pub(crate) personality: Option<Personality>,
     pub(crate) app_server_client_name: Option<String>,
     pub(crate) app_server_client_version: Option<String>,
@@ -1292,6 +1281,7 @@ impl SessionSettingsUpdate {
             && self.collaboration_mode.is_none()
             && self.reasoning_summary.is_none()
             && self.service_tier.is_none()
+            && self.validation_mode.is_none()
             && self.personality.is_none()
             && self.app_server_client_name.is_none()
             && self.app_server_client_version.is_none()
@@ -1470,7 +1460,6 @@ impl Session {
         inherited_environments: Option<TurnEnvironmentSnapshot>,
         analytics_events_client: Option<AnalyticsEventsClient>,
         thread_store: Arc<dyn ThreadStore>,
-        parent_rollout_thread_trace: ThreadTraceContext,
         attestation_provider: Option<Arc<dyn AttestationProvider>>,
         external_time_provider: Option<Arc<dyn TimeProvider>>,
         multi_agent_version: Option<MultiAgentVersion>,
@@ -1495,7 +1484,10 @@ impl Session {
             .parent_thread_id
             .or_else(|| initial_history.get_resumed_parent_thread_id());
         session_configuration.parent_thread_id = parent_thread_id;
-        let multi_agent_version = multi_agent_version.map(OnceLock::from).unwrap_or_default();
+        let multi_agent_version = multi_agent_version
+            .map(MultiAgentVersion::runtime_version)
+            .map(OnceLock::from)
+            .unwrap_or_default();
         let initial_multi_agent_version = multi_agent_version.get().copied();
 
         let thread_id = match &initial_history {
@@ -1799,7 +1791,8 @@ impl Session {
             }
             if config.features.enabled(Feature::Kd4Runtime) && coordination_ready {
                 let coordinator = agent_control.task_coordinator();
-                let validation_init: codex_agent_task_store::StoreResult<()> = async {
+                coordination_startup_result(
+                    &session_configuration.session_source,
                     coordinator
                         .initialize_for_workspace_coordination(
                             state_db_ctx.clone(),
@@ -1807,36 +1800,7 @@ impl Session {
                             config.model_provider_id.clone(),
                             session_id.to_string(),
                         )
-                        .await?;
-                    let parent = parent_thread_id
-                        .or(session_configuration.forked_from_thread_id)
-                        .map(|id| id.to_string());
-                    let store = coordinator.store().ok_or_else(|| {
-                        codex_agent_task_store::StoreError::CorruptData(
-                            "validation task store is unavailable".into(),
-                        )
-                    })?;
-                    if let Some((task, grant)) =
-                        agent_control.inherited_validation_task_scope.as_ref()
-                    {
-                        store
-                            .inherit_validation_task_scope(&thread_id.to_string(), task, grant)
-                            .await?;
-                    } else {
-                        store
-                            .initialize_validation_task(
-                                &thread_id.to_string(),
-                                parent.as_deref(),
-                                matches!(&initial_history, InitialHistory::New) && parent.is_none(),
-                            )
-                            .await?;
-                    }
-                    Ok(())
-                }
-                .await;
-                coordination_startup_result(
-                    &session_configuration.session_source,
-                    validation_init,
+                        .await,
                 )?;
             }
             let rollout_path = if let Some(live_thread) = live_thread_init.as_ref() {
@@ -1852,43 +1816,6 @@ impl Session {
                 )
                 .await?;
             }
-            let trace_agent_path = session_configuration
-                .session_source
-                .get_agent_path()
-                .unwrap_or_else(codex_protocol::AgentPath::root);
-            let trace_task_name =
-                (!trace_agent_path.is_root()).then(|| trace_agent_path.name().to_string());
-            let trace_metadata = ThreadStartedTraceMetadata {
-                thread_id: thread_id.to_string(),
-                agent_path: trace_agent_path.to_string(),
-                task_name: trace_task_name,
-                nickname: session_configuration.session_source.get_nickname(),
-                agent_role: session_configuration.session_source.get_agent_role(),
-                session_source: session_configuration.session_source.clone(),
-                cwd: session_configuration.cwd().to_path_buf(),
-                rollout_path: rollout_path.clone(),
-                model: session_configuration.collaboration_mode.model().to_string(),
-                provider_name: config.model_provider_id.clone(),
-                approval_policy: session_configuration.approval_policy.value().to_string(),
-                sandbox_policy: format!("{:?}", session_configuration.sandbox_policy()),
-            };
-            let rollout_thread_trace = if matches!(
-                session_configuration.session_source,
-                SessionSource::SubAgent(SubAgentSource::ThreadSpawn { .. })
-            ) {
-                // Spawned child threads are part of their root rollout tree. If the
-                // parent had no trace bundle, do not create an orphan child bundle
-                // that looks like an independent rollout.
-                if matches!(&initial_history, InitialHistory::Resumed(_)) {
-                    parent_rollout_thread_trace
-                        .resume_child_thread_trace_or_disabled(trace_metadata)
-                } else {
-                    parent_rollout_thread_trace.start_child_thread_trace_or_disabled(trace_metadata)
-                }
-            } else {
-                ThreadTraceContext::start_root_or_disabled(trace_metadata)
-            };
-
             let mut post_session_configured_events = Vec::<Event>::new();
 
             for usage in config.features.legacy_feature_usages() {
@@ -1924,7 +1851,7 @@ impl Session {
                     .and_then(TomlValue::as_table),
                 &user_config_file,
                 |key| {
-                    let metadata = feature_origins.get(&format!("features.{key}"))?;
+                    let metadata = feature_origins.get(&codex_config::config_origin_key(&["features", key]))?;
                     if matches!(metadata.name, codex_config::ConfigLayerSource::User { .. }) {
                         return None;
                     }
@@ -1975,17 +1902,6 @@ impl Session {
             if let Some(service_name) = session_configuration.metrics_service_name.as_deref() {
                 session_telemetry = session_telemetry.with_metrics_service_name(service_name);
             }
-            let network_proxy_audit_metadata = NetworkProxyAuditMetadata {
-                conversation_id: Some(thread_id.to_string()),
-                app_version: Some(env!("CARGO_PKG_VERSION").to_string()),
-                user_account_id: account_id,
-                auth_mode: auth_mode.map(|mode| mode.to_string()),
-                originator: Some(originator),
-                user_email: account_email,
-                terminal_type: Some(terminal_type),
-                model: Some(session_model.clone()),
-                slug: Some(session_model),
-            };
             config.features.emit_metrics(&session_telemetry);
             session_telemetry.conversation_starts(
                 config.model_provider.name.as_str(),
@@ -2134,67 +2050,6 @@ impl Session {
             crate::tools::command_output_artifact::spawn_retention_index_prewarm(
                 config.codex_home.as_path(),
             );
-            let managed_network_requirements_configured = config
-                .config_layer_stack
-                .requirements_toml()
-                .network
-                .is_some();
-            let managed_network_requirements_enabled =
-                config.managed_network_requirements_enabled();
-            let network_approval = Arc::new(NetworkApprovalService::default());
-            // The managed proxy can call back into core for allowlist-miss decisions.
-            let network_policy_decider_session = if managed_network_requirements_configured {
-                config
-                    .permissions
-                    .network
-                    .as_ref()
-                    .map(|_| Arc::new(RwLock::new(std::sync::Weak::<Session>::new())))
-            } else {
-                None
-            };
-            let blocked_request_observer = if managed_network_requirements_configured {
-                config
-                    .permissions
-                    .network
-                    .as_ref()
-                    .map(|_| build_blocked_request_observer(Arc::clone(&network_approval)))
-            } else {
-                None
-            };
-            let network_policy_decider =
-                network_policy_decider_session
-                    .as_ref()
-                    .map(|network_policy_decider_session| {
-                        build_network_policy_decider(
-                            Arc::clone(&network_approval),
-                            Arc::clone(network_policy_decider_session),
-                        )
-                    });
-            let (network_proxy, session_network_proxy) =
-                if let Some(spec) = config.permissions.network.as_ref() {
-                    let current_exec_policy = exec_policy.current();
-                    let (network_proxy, session_network_proxy) = Self::start_managed_network_proxy(
-                        spec,
-                        config.codex_home.as_path(),
-                        current_exec_policy.as_ref(),
-                        config.permissions.permission_profile(),
-                        network_policy_decider.as_ref().map(Arc::clone),
-                        blocked_request_observer.as_ref().map(Arc::clone),
-                        managed_network_requirements_configured,
-                        network_proxy_audit_metadata.clone(),
-                    )
-                    .instrument(info_span!(
-                        "session_init.network_proxy",
-                        otel.name = "session_init.network_proxy",
-                        session_init.managed_network_requirements_enabled =
-                            managed_network_requirements_enabled,
-                    ))
-                    .await?;
-                    (Some(network_proxy), Some(session_network_proxy))
-                } else {
-                    (None, None)
-                };
-
             let plugin_outcome = plugins_manager
                 .plugins_for_config(&config.plugins_config_input())
                 .await;
@@ -2279,13 +2134,11 @@ impl Session {
                 unified_exec_manager,
                 command_execution,
                 retained_patches: Default::default(),
-                path_replays: Default::default(),
-                validation_uncertainty: Default::default(),
+
                 plan_store: crate::plan_store::PlanStore::default(),
                 elicitations: crate::elicitation::ElicitationService::new(),
                 analytics_events_client,
                 hooks: arc_swap::ArcSwap::from_pointee(hooks),
-                rollout_thread_trace,
                 user_shell: default_shell,
                 show_raw_agent_reasoning: config.show_raw_agent_reasoning,
                 exec_policy,
@@ -2308,11 +2161,6 @@ impl Session {
                     supports_openai_form_elicitation,
                 ),
                 agent_control,
-                network_proxy: arc_swap::ArcSwapOption::from(network_proxy.map(Arc::new)),
-                network_proxy_audit_metadata,
-                managed_network_requirements_configured,
-                network_approval: Arc::clone(&network_approval),
-                network_policy_decider: network_policy_decider.clone(),
                 state_db: state_db_ctx.clone(),
                 live_thread: live_thread_init.as_ref().cloned(),
                 thread_store: Arc::clone(&thread_store),
@@ -2377,11 +2225,7 @@ impl Session {
                 tool_history_io_gate,
                 tool_history_reconciliation_gate: Semaphore::new(/*permits*/ 1),
                 tool_history_persistence,
-                managed_network_proxy_refresh_lock: Semaphore::new(/*permits*/ 1),
-                #[cfg(test)]
-                managed_network_proxy_start_gate: Semaphore::new(/*permits*/ 1),
-                #[cfg(test)]
-                managed_network_proxy_start_entered: tokio::sync::Notify::new(),
+                configuration_update_lock: Semaphore::new(/*permits*/ 1),
                 features: config.features.clone(),
                 multi_agent_version,
                 pending_mcp_server_refresh_config: Mutex::new(None),
@@ -2415,10 +2259,6 @@ impl Session {
                 next_internal_sub_id: AtomicU64::new(0),
             });
             runtime_init.0 = Some(Arc::clone(&sess));
-            if let Some(network_policy_decider_session) = network_policy_decider_session {
-                let mut guard = network_policy_decider_session.write().await;
-                *guard = Arc::downgrade(&sess);
-            }
             sess.schedule_startup_transport_preconnect().await;
             // Dispatch the SessionConfiguredEvent first and then report any errors.
             // If resuming, include converted initial messages in the payload so UIs can render them immediately.
@@ -2447,13 +2287,6 @@ impl Session {
                     cwd: session_configuration.cwd().clone(),
                     reasoning_effort: session_reasoning_effort,
                     initial_messages,
-                    network_proxy: session_network_proxy.filter(|_| {
-                        Self::managed_network_proxy_active_for_permission_profile(
-                            session_configuration
-                                .permission_profile_state()
-                                .permission_profile(),
-                        )
-                    }),
                     rollout_path,
                 }),
             })

@@ -93,6 +93,11 @@ fn cloud_config_layers_from_fragments_impl(
                 fragment: source_ref.clone(),
                 message: err.to_string(),
             })?;
+        let value = crate::loader::migrate_config_toml_for_source(value, &source_ref.to_string())
+            .map_err(|err| CloudConfigLayerError::Invalid {
+                fragment: source_ref.clone(),
+                message: err.to_string(),
+            })?;
         if strict_config {
             validate_fragment_strictly(&source_ref, &raw_toml, &value, base_dir)?;
         }

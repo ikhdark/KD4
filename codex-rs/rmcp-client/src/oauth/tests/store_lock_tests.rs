@@ -41,6 +41,9 @@ use crate::oauth::test_support::TempCodexHome;
 
 const STORE_LOCK_CONTENTION_EVENT_TARGET: &str = "codex_rmcp_client::oauth::store_lock::contention";
 
+#[path = "audit20261023_authority_tests.rs"]
+mod audit20261023_tests;
+
 fn assert_tokens_match_without_expiry(actual: &StoredOAuthTokens, expected: &StoredOAuthTokens) {
     assert_eq!(actual.server_name, expected.server_name);
     assert_eq!(actual.url, expected.url);

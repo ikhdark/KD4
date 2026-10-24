@@ -15,16 +15,12 @@ use crate::events::CodexDynamicToolCallEventParams;
 use crate::events::CodexDynamicToolCallEventRequest;
 use crate::events::CodexFileChangeEventParams;
 use crate::events::CodexFileChangeEventRequest;
-use crate::events::CodexGoalEventRequest;
+
 use crate::events::CodexHookRunEventRequest;
 use crate::events::CodexImageGenerationEventParams;
 use crate::events::CodexImageGenerationEventRequest;
 use crate::events::CodexMcpToolCallEventParams;
 use crate::events::CodexMcpToolCallEventRequest;
-use crate::events::CodexOnboardingExternalAgentImportCompleteEventRequest;
-use crate::events::CodexOnboardingExternalAgentImportCompleteMetadata;
-use crate::events::CodexOnboardingExternalAgentImportFailureEventRequest;
-use crate::events::CodexOnboardingExternalAgentImportFailureMetadata;
 use crate::events::CodexPluginEventRequest;
 use crate::events::CodexPluginInstallFailedEventRequest;
 use crate::events::CodexPluginInstallFailedMetadata;
@@ -57,7 +53,7 @@ use crate::events::TrackEventRequest;
 use crate::events::WebSearchActionKind;
 use crate::events::codex_app_metadata;
 use crate::events::codex_compaction_event_params;
-use crate::events::codex_goal_event_params;
+
 use crate::events::codex_hook_run_metadata;
 use crate::events::codex_plugin_install_requested_metadata;
 use crate::events::codex_plugin_metadata;
@@ -70,10 +66,8 @@ use crate::facts::AnalyticsJsonRpcError;
 use crate::facts::AppMentionedInput;
 use crate::facts::AppUsedInput;
 use crate::facts::CodexCompactionEvent;
-use crate::facts::CodexGoalEvent;
+
 use crate::facts::CustomAnalyticsFact;
-use crate::facts::ExternalAgentConfigImportCompletedInput;
-use crate::facts::ExternalAgentConfigImportFailureInput;
 use crate::facts::HookRunInput;
 use crate::facts::PluginInstallFailedInput;
 use crate::facts::PluginInstallRequestedInput;
@@ -96,6 +90,7 @@ use crate::now_unix_seconds;
 use crate::option_i64_to_u64;
 use crate::serialize_enum_as_string;
 use crate::usize_to_u64;
+#[cfg(test)]
 use codex_app_server_protocol::ClientRequest;
 use codex_app_server_protocol::ClientResponse;
 use codex_app_server_protocol::CodexErrorInfo;
@@ -232,15 +227,7 @@ impl<'a> AnalyticsDropSite<'a> {
         }
     }
 
-    fn goal(input: &'a CodexGoalEvent) -> Self {
-        Self {
-            event_name: "goal",
-            thread_id: &input.thread_id,
-            turn_id: input.turn_id.as_deref(),
-            review_id: None,
-            item_id: None,
-        }
-    }
+
 
     fn tool_item(
         notification: &'a codex_app_server_protocol::ItemCompletedNotification,
@@ -376,6 +363,7 @@ struct CompletedTurnState {
 struct TurnState {
     tool_count_baseline_seen: bool,
     tool_counts_incomplete: bool,
+    review_history_incomplete: bool,
     emitted: bool,
     connection_id: Option<u64>,
     thread_id: Option<String>,
@@ -444,6 +432,17 @@ impl TurnToolCounts {
 }
 
 impl AnalyticsReducer {
+    pub(crate) fn reset_for_auth_transition(&mut self) {
+        // Connection capabilities/runtime are account-independent. Everything
+        // tied to threads, turns, approvals and pending requests is retired.
+        let connections = std::mem::take(&mut self.connections);
+        let loss_epoch = self.delivery_loss_epoch;
+        let gap_active = self.delivery_gap_active;
+        *self = Self::default();
+        self.connections = connections;
+        self.delivery_loss_epoch = loss_epoch;
+        self.delivery_gap_active = gap_active;
+    }
     fn retire_closed_metadata(&mut self) {
         if !self.retirement_pending {
             return;
@@ -562,6 +561,7 @@ impl AnalyticsReducer {
         self.delivery_gap_active = true;
         for turn in self.turns.values_mut() {
             turn.tool_counts_incomplete = true;
+            turn.review_history_incomplete = true;
         }
     }
 
@@ -587,6 +587,7 @@ impl AnalyticsReducer {
                 turn_id.to_string(),
                 TurnState {
                     tool_counts_incomplete: self.delivery_gap_active,
+                    review_history_incomplete: self.delivery_gap_active,
                     ..TurnState::default()
                 },
             );
@@ -621,6 +622,11 @@ impl AnalyticsReducer {
             _ => false,
         };
         match input {
+            AnalyticsFact::AuthBound { .. } => {
+                // Queue admission owns unbinding; never ingest a nested or
+                // unverified authority envelope as ordinary telemetry.
+                return;
+            }
             AnalyticsFact::ConnectionClosed { connection_id } => {
                 self.ingest_connection_closed(connection_id)
             }
@@ -639,12 +645,16 @@ impl AnalyticsReducer {
                     rpc_transport,
                 );
             }
+            #[cfg(test)]
             AnalyticsFact::ClientRequest {
                 connection_id,
                 request_id,
                 request,
             } => {
                 self.ingest_request(connection_id, request_id, *request);
+            }
+            AnalyticsFact::TurnRequest { connection_id, request_id, request } => {
+                self.ingest_turn_request(connection_id, request_id, request);
             }
             AnalyticsFact::ClientResponse {
                 connection_id,
@@ -704,9 +714,7 @@ impl AnalyticsReducer {
                 CustomAnalyticsFact::Compaction(input) => {
                     self.ingest_compaction(*input, out);
                 }
-                CustomAnalyticsFact::Goal(input) => {
-                    self.ingest_goal(*input, out);
-                }
+
                 CustomAnalyticsFact::TurnResolvedConfig(input) => {
                     self.ingest_turn_resolved_config(*input, out).await;
                 }
@@ -750,12 +758,6 @@ impl AnalyticsReducer {
                 }
                 CustomAnalyticsFact::PluginInstallFailed(input) => {
                     self.ingest_plugin_install_failed(input, out);
-                }
-                CustomAnalyticsFact::ExternalAgentConfigImportCompleted(input) => {
-                    self.ingest_external_agent_config_import_completed(input, out);
-                }
-                CustomAnalyticsFact::ExternalAgentConfigImportFailure(input) => {
-                    self.ingest_external_agent_config_import_failure(input, out);
                 }
             },
         }
@@ -837,6 +839,17 @@ impl AnalyticsReducer {
         ));
     }
 
+    fn ingest_turn_request(&mut self, connection_id: u64, request_id: RequestId, request: crate::facts::TurnRequestFact) {
+        let state = match request {
+            crate::facts::TurnRequestFact::Start { thread_id, num_input_images } => RequestState::TurnStart(
+                PendingTurnStartState { thread_id, num_input_images }),
+            crate::facts::TurnRequestFact::Steer { thread_id, expected_turn_id, num_input_images } => RequestState::TurnSteer(
+                PendingTurnSteerState { thread_id, expected_turn_id, num_input_images, created_at: now_unix_seconds() }),
+        };
+        insert_pending(&mut self.requests, (connection_id, request_id), state);
+    }
+
+    #[cfg(test)]
     fn ingest_request(
         &mut self,
         connection_id: u64,
@@ -1079,45 +1092,7 @@ impl AnalyticsReducer {
         ));
     }
 
-    fn ingest_external_agent_config_import_completed(
-        &mut self,
-        input: ExternalAgentConfigImportCompletedInput,
-        out: &mut Vec<TrackEventRequest>,
-    ) {
-        out.push(TrackEventRequest::ExternalAgentConfigImportCompleted(
-            CodexOnboardingExternalAgentImportCompleteEventRequest {
-                event_type: "codex_onboarding_external_agent_import_complete",
-                event_params: CodexOnboardingExternalAgentImportCompleteMetadata {
-                    import_id: input.import_id,
-                    source: input.source,
-                    item_type: input.item_type,
-                    success_count: input.success_count,
-                    failed_count: input.failed_count,
-                    product_client_id: Some(originator().value),
-                },
-            },
-        ));
-    }
 
-    fn ingest_external_agent_config_import_failure(
-        &mut self,
-        input: ExternalAgentConfigImportFailureInput,
-        out: &mut Vec<TrackEventRequest>,
-    ) {
-        out.push(TrackEventRequest::ExternalAgentConfigImportFailure(
-            CodexOnboardingExternalAgentImportFailureEventRequest {
-                event_type: "codex_onboarding_external_agent_import_failure",
-                event_params: CodexOnboardingExternalAgentImportFailureMetadata {
-                    import_id: input.import_id,
-                    source: input.source,
-                    item_type: input.item_type,
-                    failure_stage: input.failure_stage,
-                    error_type: input.error_type,
-                    product_client_id: Some(originator().value),
-                },
-            },
-        ));
-    }
 
     async fn ingest_response(
         &mut self,
@@ -1549,6 +1524,8 @@ impl AnalyticsReducer {
                     .get(&notification.turn_id)
                     .and_then(|turn| turn.resolved_config.as_ref())
                     .map(|config| &config.approval_policy);
+                let review_history_complete = self.turns.get(&notification.turn_id)
+                    .is_some_and(|turn| !turn.review_history_incomplete);
                 let Some((connection_state, thread_state, thread_metadata)) = self
                     .thread_context_or_warn(AnalyticsDropSite::tool_item(&notification, item_id))
                 else {
@@ -1561,6 +1538,7 @@ impl AnalyticsReducer {
                     started_at_ms: pending_item.started_at_ms,
                     completed_at_ms,
                     terminal_status_override: None,
+                    review_history_complete,
                     approval_policy,
                     connection_state,
                     thread_state,
@@ -1735,25 +1713,7 @@ impl AnalyticsReducer {
         )));
     }
 
-    fn ingest_goal(&mut self, input: CodexGoalEvent, out: &mut Vec<TrackEventRequest>) {
-        let Some((connection_state, thread_state, thread_metadata)) =
-            self.thread_context_or_warn(AnalyticsDropSite::goal(&input))
-        else {
-            return;
-        };
-        out.push(TrackEventRequest::Goal(Box::new(CodexGoalEventRequest {
-            event_type: "codex_goal_event",
-            event_params: codex_goal_event_params(
-                input,
-                thread_metadata.session_id.clone(),
-                thread_state.app_server_client(connection_state),
-                connection_state.runtime.clone(),
-                thread_metadata.thread_source.clone(),
-                thread_metadata.subagent_source.clone(),
-                thread_metadata.parent_thread_id.clone(),
-            ),
-        })));
-    }
+
 
     fn ingest_turn_steer_response(
         &mut self,
@@ -1924,15 +1884,16 @@ impl AnalyticsReducer {
                 continue;
             };
             let review_summary = self.item_review_summaries.remove(&key);
-            let approval_policy = {
+            let (approval_policy, review_history_complete) = {
                 let Some(turn_state) = self.turns.get_mut(turn_id) else {
                     continue;
                 };
                 turn_state.tool_counts.record(&pending_item.item);
-                turn_state
+                let policy = turn_state
                     .resolved_config
                     .as_ref()
-                    .map(|config| config.approval_policy)
+                    .map(|config| config.approval_policy);
+                (policy, !turn_state.review_history_incomplete)
             };
             let Some((connection_state, thread_state, thread_metadata)) = self
                 .thread_context_or_warn(AnalyticsDropSite::tool_item_parts(
@@ -1950,6 +1911,7 @@ impl AnalyticsReducer {
                 started_at_ms: pending_item.started_at_ms,
                 completed_at_ms,
                 terminal_status_override: Some(terminal_status),
+                review_history_complete,
                 approval_policy: approval_policy.as_ref(),
                 connection_state,
                 thread_state,
@@ -2268,7 +2230,8 @@ pub(crate) fn analytics_tool_item(item: &ThreadItem) -> Option<ThreadItem> {
             id: item.id.clone(),
             status: item.status.clone(),
             revised_prompt: item.revised_prompt.as_ref().map(|_| String::new()),
-            result: String::new(),
+            result: None,
+            error: None,
             saved_path: item.saved_path.clone(),
             provider_usage: item.provider_usage.clone(),
         }),
@@ -2304,6 +2267,7 @@ struct ToolItemEventInput<'a> {
     started_at_ms: u64,
     completed_at_ms: u64,
     terminal_status_override: Option<ToolItemTerminalStatus>,
+    review_history_complete: bool,
     approval_policy: Option<&'a AskForApproval>,
     connection_state: &'a ConnectionState,
     thread_state: &'a ThreadAnalyticsState,
@@ -2319,6 +2283,7 @@ fn tool_item_event(input: ToolItemEventInput<'_>) -> Option<TrackEventRequest> {
         started_at_ms,
         completed_at_ms,
         terminal_status_override,
+        review_history_complete,
         approval_policy,
         connection_state,
         thread_state,
@@ -2357,6 +2322,7 @@ fn tool_item_event(input: ToolItemEventInput<'_>) -> Option<TrackEventRequest> {
                     thread_state,
                     thread_metadata,
                     review_summary,
+                    review_history_complete,
                     approval_policy,
                 },
             );
@@ -2402,6 +2368,7 @@ fn tool_item_event(input: ToolItemEventInput<'_>) -> Option<TrackEventRequest> {
                     thread_state,
                     thread_metadata,
                     review_summary,
+                    review_history_complete,
                     approval_policy,
                 },
             );
@@ -2448,6 +2415,7 @@ fn tool_item_event(input: ToolItemEventInput<'_>) -> Option<TrackEventRequest> {
                     thread_state,
                     thread_metadata,
                     review_summary,
+                    review_history_complete,
                     approval_policy,
                 },
             );
@@ -2497,6 +2465,7 @@ fn tool_item_event(input: ToolItemEventInput<'_>) -> Option<TrackEventRequest> {
                     thread_state,
                     thread_metadata,
                     review_summary,
+                    review_history_complete,
                     approval_policy,
                 },
             );
@@ -2546,6 +2515,7 @@ fn tool_item_event(input: ToolItemEventInput<'_>) -> Option<TrackEventRequest> {
                     thread_state,
                     thread_metadata,
                     review_summary,
+                    review_history_complete,
                     approval_policy,
                 },
             );
@@ -2587,7 +2557,11 @@ fn tool_item_event(input: ToolItemEventInput<'_>) -> Option<TrackEventRequest> {
         }
         ThreadItem::WebSearch(item) => {
             let (terminal_status, failure_kind) = override_tool_item_outcome(
-                Some((ToolItemTerminalStatus::Completed, None)),
+                Some(match item.status.as_deref() {
+                    Some("failed") => (ToolItemTerminalStatus::Failed, Some(ToolItemFailureKind::ToolError)),
+                    Some("cancelled") => (ToolItemTerminalStatus::Interrupted, None),
+                    _ => (ToolItemTerminalStatus::Completed, None),
+                }),
                 terminal_status_override,
             )?;
             let base = tool_item_base(
@@ -2607,6 +2581,7 @@ fn tool_item_event(input: ToolItemEventInput<'_>) -> Option<TrackEventRequest> {
                     thread_state,
                     thread_metadata,
                     review_summary,
+                    review_history_complete,
                     approval_policy,
                 },
             );
@@ -2642,6 +2617,7 @@ fn tool_item_event(input: ToolItemEventInput<'_>) -> Option<TrackEventRequest> {
                     thread_state,
                     thread_metadata,
                     review_summary,
+                    review_history_complete,
                     approval_policy,
                 },
             );
@@ -2699,6 +2675,7 @@ struct ToolItemContext<'a> {
     thread_state: &'a ThreadAnalyticsState,
     thread_metadata: &'a ThreadMetadataState,
     review_summary: Option<&'a ItemReviewSummary>,
+    review_history_complete: bool,
     approval_policy: Option<&'a AskForApproval>,
 }
 
@@ -2713,11 +2690,15 @@ fn tool_item_base(
     let thread_metadata = context.thread_metadata;
     let review_summary = context.review_summary.cloned().unwrap_or_default();
     let terminal_status = outcome.terminal_status;
-    let final_approval_outcome = review_summary.final_approval_outcome.unwrap_or_else(|| {
+    let final_approval_outcome = if !context.review_history_complete {
+        FinalApprovalOutcome::Unknown
+    } else { review_summary.final_approval_outcome.unwrap_or_else(|| {
         final_approval_outcome_without_review(context.approval_policy, terminal_status)
-    });
+    }) };
     let failure_kind = if matches!(terminal_status, ToolItemTerminalStatus::Completed) {
         None
+    } else if !context.review_history_complete {
+        outcome.failure_kind
     } else {
         review_summary
             .final_failure_kind
@@ -2747,6 +2728,7 @@ fn tool_item_base(
         // full upstream execution time.
         duration_ms: observed_duration_ms(context.started_at_ms, context.completed_at_ms),
         execution_duration_ms: outcome.execution_duration_ms,
+        review_history_complete: context.review_history_complete,
         review_count: review_summary.review_count,
         user_review_count: review_summary.user_review_count,
         final_approval_outcome,
@@ -3297,7 +3279,7 @@ fn analytics_turn_status(status: codex_app_server_protocol::TurnStatus) -> Optio
     }
 }
 
-fn num_input_images(input: &[UserInput]) -> usize {
+pub(crate) fn num_input_images(input: &[UserInput]) -> usize {
     input
         .iter()
         .filter(|item| matches!(item, UserInput::Image { .. } | UserInput::LocalImage { .. }))

@@ -191,6 +191,81 @@ struct TracingHarness {
 
 #[tokio::test]
 #[serial(app_server_tracing)]
+async fn malformed_request_rejection_does_not_block_callback_ingress() -> Result<()> {
+    let mut harness = TracingHarness::new().await?;
+    let outgoing = Arc::clone(&harness.processor.outgoing);
+    let (callback_id, callback) = outgoing.send_request_to_connections(
+        Some(&[TEST_CONNECTION_ID]),
+        codex_app_server_protocol::ServerRequestPayload::AttestationGenerate(codex_app_server_protocol::AttestationGenerateParams {}),
+        None,
+    ).await.expect("callback registration");
+    let remaining_capacity = harness.outgoing_rx.capacity();
+    for id in 0..remaining_capacity {
+        outgoing.send_error(crate::outgoing_message::ConnectionRequestId {
+            connection_id: TEST_CONNECTION_ID, request_id: RequestId::Integer(100_000 + id as i64),
+        }, crate::error_code::internal_error("fill output")).await;
+    }
+    {
+    let rejection = harness.processor.process_request(TEST_CONNECTION_ID, JSONRPCRequest {
+        id: RequestId::Integer(90_000), method: "unknown/method".into(), params: None, trace: None,
+    }, &AppServerTransport::Stdio, Arc::clone(&harness.session));
+    tokio::pin!(rejection);
+    assert!(futures::poll!(&mut rejection).is_ready(), "rejection must return while output stays full");
+    }
+    harness.processor.process_response(TEST_CONNECTION_ID, codex_app_server_protocol::JSONRPCResponse {
+        id: callback_id, result: json!({"token": "answer"}),
+    }).await;
+    assert_eq!(callback.await?, Ok(json!({"token": "answer"})));
+    assert_eq!(harness.outgoing_rx.capacity(), 0);
+    loop {
+        let Some(crate::outgoing_message::OutgoingEnvelope::ToConnection {
+            message: crate::outgoing_message::OutgoingMessage::Error(error), ..
+        }) = harness.outgoing_rx.recv().await else { continue; };
+        if error.id == RequestId::Integer(90_000) { break; }
+    }
+    harness.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+#[serial(app_server_tracing)]
+async fn rollback_snapshot_releases_shared_permit_before_response_delivery() -> Result<()> {
+    use crate::outgoing_message::{ConnectionRequestId, OutgoingEnvelope, OutgoingMessage, RequestContext, ThreadScopedOutgoingMessageSender};
+    use codex_protocol::protocol::{Event, EventMsg, ThreadRolledBackEvent};
+    let mut harness = TracingHarness::new().await?;
+    let thread_id = ThreadId::from_string(&harness.start_thread(2, None).await.thread.id)?;
+    let conversation = harness.processor.thread_manager.get_thread(thread_id).await?;
+    let state = Arc::new(tokio::sync::Mutex::new(crate::thread_state::ThreadState::default()));
+    let request_id = ConnectionRequestId { connection_id: TEST_CONNECTION_ID, request_id: RequestId::Integer(90_001) };
+    let rollback_owner = state.lock().await.reserve_rollback(request_id.clone()).expect("rollback reservation");
+    let (tx, mut rx) = mpsc::channel(1);
+    let congestion = tx.clone().reserve_owned().await?;
+    let outgoing = Arc::new(OutgoingMessageSender::new(tx, codex_analytics::AnalyticsEventsClient::disabled()));
+    assert!(outgoing.register_request_context(RequestContext::new(request_id.clone(), tracing::Span::none(), None)).await);
+    let permit = Arc::new(tokio::sync::Semaphore::new(1));
+    let held = Arc::clone(&permit).acquire_owned().await?;
+    let handling = tokio::spawn(crate::bespoke_event_handling::apply_bespoke_event_handling(
+        Event { id: "rollback".into(), msg: EventMsg::ThreadRolledBack(ThreadRolledBackEvent { num_turns: 0 }) },
+        thread_id, conversation, Arc::clone(&harness.processor.thread_manager),
+        ThreadScopedOutgoingMessageSender::new(outgoing, vec![TEST_CONNECTION_ID], thread_id),
+        state, harness.processor.thread_processor.thread_watch_manager.clone(), Arc::clone(&permit), "openai".into(),
+    ));
+    tokio::task::yield_now().await;
+    drop(held);
+    let other_consumer = tokio::time::timeout(std::time::Duration::from_secs(1), permit.acquire()).await
+        .expect("immutable rollback snapshot must release its shared permit while output remains full")?;
+    assert!(!handling.is_finished(), "response is still waiting on the held output slot");
+    drop(other_consumer);
+    drop(congestion);
+    handling.await?;
+    assert!(matches!(rx.recv().await, Some(OutgoingEnvelope::ToConnection { message: OutgoingMessage::Response(response), .. }) if response.id == request_id.request_id));
+    drop(rollback_owner);
+    harness.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+#[serial(app_server_tracing)]
 async fn graceful_drain_rejects_new_turns_but_routes_interrupts() -> Result<()> {
     let mut harness = TracingHarness::new().await?;
     let thread = harness.start_thread(2, None).await.thread.id;
@@ -533,7 +608,6 @@ async fn build_test_config(
         BTreeMap::new()
     };
     if enable_goals {
-        feature_flags.insert(Feature::Goals, true);
     }
     write_mock_responses_config_toml(
         codex_home,
@@ -2980,7 +3054,7 @@ mod resume_listener_generation_rpc_tests {
     use crate::outgoing_message::OutgoingEnvelope;
     use crate::outgoing_message::OutgoingMessage;
     use codex_app_server_protocol::ServerNotification;
-    use codex_app_server_protocol::ThreadGoalClearedNotification;
+    use codex_app_server_protocol::ThreadClosedNotification;
     use codex_app_server_protocol::ThreadResumeResponse;
     use codex_app_server_protocol::TurnStatus;
     use pretty_assertions::assert_eq;
@@ -3171,8 +3245,8 @@ mod resume_listener_generation_rpc_tests {
         let outgoing = Arc::clone(&harness.processor.outgoing);
         while harness.outgoing_rx.try_recv().is_ok() {}
         let mut filled = 0;
-        while outgoing.try_send_server_notification(ServerNotification::ThreadGoalCleared(
-            ThreadGoalClearedNotification {
+        while outgoing.try_send_server_notification(ServerNotification::ThreadClosed(
+            ThreadClosedNotification {
                 thread_id: started.thread.id.clone(),
             },
         )) {
@@ -3344,7 +3418,7 @@ mod command_output_fallback_rpc_tests {
     use codex_app_server_protocol::CommandExecOutputStream;
     use codex_app_server_protocol::CommandExecResponse;
     use codex_app_server_protocol::ServerNotification;
-    use codex_app_server_protocol::ThreadGoalClearedNotification;
+    use codex_app_server_protocol::ThreadClosedNotification;
     use pretty_assertions::assert_eq;
     use std::time::Duration;
 
@@ -3433,8 +3507,8 @@ mod command_output_fallback_rpc_tests {
                 assert!(!finished.exists());
                 let outgoing = Arc::clone(&harness.processor.outgoing);
                 let mut filled = 0;
-                while outgoing.try_send_server_notification(ServerNotification::ThreadGoalCleared(
-                    ThreadGoalClearedNotification {
+                while outgoing.try_send_server_notification(ServerNotification::ThreadClosed(
+                    ThreadClosedNotification {
                         thread_id: "output-capacity-fixture".to_string(),
                     },
                 )) {
@@ -5394,443 +5468,5 @@ fn registered_api_key_login_persists_before_reply_and_survives_shutdown() -> Res
     Ok(())
 }
 
-#[test]
-#[serial(app_server_tracing)]
-fn acknowledged_goal_set_finishes_runtime_update_after_rpc_gate_cancellation() -> Result<()> {
-    run_current_thread_test_with_stack(
-        "acknowledged_goal_set_finishes_runtime_update_after_rpc_gate_cancellation",
-        async {
-            use crate::outgoing_message::OutgoingEnvelope;
-            use crate::outgoing_message::OutgoingMessage;
-            use codex_app_server_protocol::ServerNotification;
-            use codex_app_server_protocol::ThreadGoalSetResponse;
-            use std::time::Duration;
 
-            let server = MockServer::start().await;
-            wiremock::Mock::given(wiremock::matchers::method("POST"))
-                .and(wiremock::matchers::path("/v1/responses"))
-                .respond_with(
-                    wiremock::ResponseTemplate::new(200)
-                        .insert_header("content-type", "text/event-stream")
-                        .set_body_string(
-                            app_test_support::create_final_assistant_message_sse_response("Done")?,
-                        )
-                        .set_delay(Duration::from_secs(60)),
-                )
-                .mount(&server)
-                .await;
-            let mut harness = TracingHarness::new_with_features(
-                server,
-                Arc::new(codex_config::NoopThreadConfigLoader),
-                false,
-                true,
-            )
-            .await?;
-            let started: ThreadStartResponse = harness
-                .request(
-                    ClientRequest::ThreadStart {
-                        request_id: RequestId::Integer(428_900),
-                        params: ThreadStartParams::default(),
-                    },
-                    None,
-                )
-                .await;
-            read_thread_started_notification(&mut harness.outgoing_rx).await;
-            let thread_id = ThreadId::from_string(&started.thread.id)?;
-            let thread_state = harness
-                .processor
-                .thread_processor
-                .thread_state_manager
-                .thread_state(thread_id)
-                .await;
-            let (command_tx, listener_cancellation) = thread_state
-                .lock()
-                .await
-                .listener_command_route()
-                .expect("normal thread start registers listener");
-            // Reserve the actual queue capacity as competing producers. The registered
-            // listener stays live, while the goal notification cannot yet be enqueued.
-            let mut reservations = Vec::new();
-            for _ in 0..command_tx.max_capacity() {
-                reservations.push(
-                    tokio::time::timeout(
-                        Duration::from_secs(5),
-                        command_tx.clone().reserve_owned(),
-                    )
-                    .await
-                    .expect("queue reservation deadline")
-                    .expect("live listener"),
-                );
-            }
-            let response: ThreadGoalSetResponse = harness
-                .request(
-                    ClientRequest::ThreadGoalSet {
-                        request_id: RequestId::Integer(428_901),
-                        params: serde_json::from_value(json!({
-                            "threadId": started.thread.id,
-                            "objective": "continue after the request owner closes",
-                            "status": "active",
-                        }))?,
-                    },
-                    None,
-                )
-                .await;
-            assert_eq!(
-                response.goal.objective,
-                "continue after the request owner closes"
-            );
-            assert_eq!(
-                response.goal.status,
-                codex_app_server_protocol::ThreadGoalStatus::Active
-            );
-            assert_eq!(command_tx.capacity(), 0);
-            assert!(
-                harness
-                    ._server
-                    .received_requests()
-                    .await
-                    .expect("model requests")
-                    .iter()
-                    .all(|request| request.url.path() != "/v1/responses"),
-                "runtime continuation must follow ordered notification admission"
-            );
-            // Use the same gate shutdown boundary as transport disconnect, while keeping
-            // listener ownership live to distinguish this from listener-stop cancellation.
-            harness.session.rpc_gate.shutdown().await;
-            assert!(!listener_cancellation.is_cancelled());
-            drop(reservations);
-            let mut goal_notification = false;
-            tokio::time::timeout(Duration::from_secs(10), async {
-                loop {
-                    let message = match harness.outgoing_rx.recv().await.expect("outgoing open") {
-                        OutgoingEnvelope::Broadcast { message }
-                        | OutgoingEnvelope::ToConnection { message, .. } => message,
-                    };
-                    match message {
-                        OutgoingMessage::AppServerNotification(
-                            ServerNotification::ThreadGoalUpdated(notification),
-                        ) => {
-                            assert_eq!(notification.goal.objective, response.goal.objective);
-                            goal_notification = true;
-                        }
-                        OutgoingMessage::AppServerNotification(
-                            ServerNotification::TurnStarted(notification),
-                        ) => {
-                            assert_eq!(notification.thread_id, started.thread.id);
-                            assert!(goal_notification, "goal update precedes its automatic turn");
-                            break;
-                        }
-                        OutgoingMessage::Response(response) => {
-                            panic!("unexpected duplicate response: {response:?}")
-                        }
-                        OutgoingMessage::Error(error) => panic!("unexpected late error: {error:?}"),
-                        _ => {}
-                    }
-                }
-            })
-            .await
-            .expect("committed goal must still start its runtime continuation");
-            tokio::time::timeout(Duration::from_secs(10), async {
-                loop {
-                    if harness
-                        ._server
-                        .received_requests()
-                        .await
-                        .expect("model requests")
-                        .iter()
-                        .any(|request| request.url.path() == "/v1/responses")
-                    {
-                        break;
-                    }
-                    tokio::task::yield_now().await;
-                }
-            })
-            .await
-            .expect("normal goal runtime must reach the model provider");
-            harness.shutdown().await;
-            Ok(())
-        },
-    )
-}
 
-#[test]
-#[serial(app_server_tracing)]
-fn committed_goal_reaches_runtime_when_transport_stays_full_past_delivery_budget() -> Result<()> {
-    run_current_thread_test_with_stack(
-        "committed_goal_reaches_runtime_when_transport_stays_full_past_delivery_budget",
-        async {
-            use codex_app_server_protocol::ServerNotification;
-            use codex_app_server_protocol::ThreadGoalClearedNotification;
-            use std::time::Duration;
-            let server = MockServer::start().await;
-            wiremock::Mock::given(wiremock::matchers::method("POST"))
-                .and(wiremock::matchers::path("/v1/responses"))
-                .respond_with(
-                    wiremock::ResponseTemplate::new(200)
-                        .insert_header("content-type", "text/event-stream")
-                        .set_body_string(
-                            app_test_support::create_final_assistant_message_sse_response("Done")?,
-                        )
-                        .set_delay(Duration::from_secs(60)),
-                )
-                .mount(&server)
-                .await;
-            let mut harness = TracingHarness::new_with_features(
-                server,
-                Arc::new(codex_config::NoopThreadConfigLoader),
-                false,
-                true,
-            )
-            .await?;
-            let started: ThreadStartResponse = harness
-                .request(
-                    ClientRequest::ThreadStart {
-                        request_id: RequestId::Integer(428_910),
-                        params: ThreadStartParams::default(),
-                    },
-                    None,
-                )
-                .await;
-            read_thread_started_notification(&mut harness.outgoing_rx).await;
-            let thread_id = ThreadId::from_string(&started.thread.id)?;
-            let thread = harness
-                .processor
-                .thread_manager
-                .get_thread(thread_id)
-                .await?;
-            let state_db = thread.state_db().expect("materialized thread database");
-            // Exercise the normal no-listener notification route, including a blocked
-            // response. Neither transport nor listener capacity is released by the test.
-            harness
-                .processor
-                .thread_processor
-                .thread_state_manager
-                .clear_all_listeners()
-                .await;
-            while harness.processor.outgoing.try_send_server_notification(
-                ServerNotification::ThreadGoalCleared(ThreadGoalClearedNotification {
-                    thread_id: started.thread.id.clone(),
-                }),
-            ) {}
-            assert_eq!(harness.outgoing_rx.capacity(), 0);
-            harness
-                .processor
-                .process_request(
-                    TEST_CONNECTION_ID,
-                    request_from_client_request(ClientRequest::ThreadGoalSet {
-                        request_id: RequestId::Integer(428_911),
-                        params: serde_json::from_value(json!({
-                            "threadId": started.thread.id,
-                            "objective": "continue despite saturated transport",
-                            "status": "active",
-                        }))?,
-                    }),
-                    &AppServerTransport::Stdio,
-                    Arc::clone(&harness.session),
-                )
-                .await;
-            tokio::time::timeout(Duration::from_secs(5), async {
-                loop {
-                    if let Some(goal) = state_db
-                        .thread_goals()
-                        .get_thread_goal(thread_id)
-                        .await
-                        .expect("read durable goal")
-                    {
-                        assert_eq!(goal.objective, "continue despite saturated transport");
-                        break;
-                    }
-                    tokio::task::yield_now().await;
-                }
-            })
-            .await
-            .expect("normal goal RPC durably commits before cancellation");
-            harness.session.rpc_gate.shutdown().await;
-            tokio::time::timeout(Duration::from_secs(10), async {
-                loop {
-                    if harness
-                        ._server
-                        .received_requests()
-                        .await
-                        .expect("model requests")
-                        .iter()
-                        .any(|request| request.url.path() == "/v1/responses")
-                    {
-                        break;
-                    }
-                    tokio::task::yield_now().await;
-                }
-            })
-            .await
-            .expect("delivery budget must release committed runtime effects");
-            assert_eq!(
-                harness.outgoing_rx.capacity(),
-                0,
-                "runtime continuation must happen while transport remains full"
-            );
-            assert_eq!(
-                state_db
-                    .thread_goals()
-                    .get_thread_goal(thread_id)
-                    .await?
-                    .expect("durable goal")
-                    .objective,
-                "continue despite saturated transport"
-            );
-            harness.shutdown().await;
-            Ok(())
-        },
-    )
-}
-
-#[test]
-#[serial(app_server_tracing)]
-fn acknowledged_goal_clear_survives_rpc_cancellation_without_resurrecting_goal() -> Result<()> {
-    run_current_thread_test_with_stack(
-        "acknowledged_goal_clear_survives_rpc_cancellation_without_resurrecting_goal",
-        async {
-            use crate::outgoing_message::OutgoingEnvelope;
-            use crate::outgoing_message::OutgoingMessage;
-            use codex_app_server_protocol::ServerNotification;
-            use codex_app_server_protocol::ThreadGoalClearResponse;
-            use codex_app_server_protocol::ThreadGoalSetResponse;
-            use std::time::Duration;
-            let server = create_mock_responses_server_repeating_assistant("Done").await;
-            let mut harness = TracingHarness::new_with_features(
-                server,
-                Arc::new(codex_config::NoopThreadConfigLoader),
-                false,
-                true,
-            )
-            .await?;
-            let started: ThreadStartResponse = harness
-                .request(
-                    ClientRequest::ThreadStart {
-                        request_id: RequestId::Integer(429_200),
-                        params: ThreadStartParams::default(),
-                    },
-                    None,
-                )
-                .await;
-            read_thread_started_notification(&mut harness.outgoing_rx).await;
-            let thread_id = ThreadId::from_string(&started.thread.id)?;
-            let thread = harness
-                .processor
-                .thread_manager
-                .get_thread(thread_id)
-                .await?;
-            let state_db = thread.state_db().expect("materialized thread database");
-            let _: ThreadGoalSetResponse = harness.request(ClientRequest::ThreadGoalSet {
-                request_id: RequestId::Integer(429_201),
-                params: serde_json::from_value(json!({
-                    "threadId": started.thread.id, "objective": "remove this goal", "status": "paused",
-                }))?,
-            }, None).await;
-            tokio::time::timeout(Duration::from_secs(5), async {
-                loop {
-                    let message = match harness.outgoing_rx.recv().await.expect("outgoing open") {
-                        OutgoingEnvelope::Broadcast { message }
-                        | OutgoingEnvelope::ToConnection { message, .. } => message,
-                    };
-                    if matches!(
-                        message,
-                        OutgoingMessage::AppServerNotification(
-                            ServerNotification::ThreadGoalUpdated(_)
-                        )
-                    ) {
-                        break;
-                    }
-                }
-            })
-            .await
-            .expect("initial goal notification");
-            assert!(
-                state_db
-                    .thread_goals()
-                    .get_thread_goal(thread_id)
-                    .await?
-                    .is_some()
-            );
-            let thread_state = harness
-                .processor
-                .thread_processor
-                .thread_state_manager
-                .thread_state(thread_id)
-                .await;
-            let (command_tx, cancellation) = thread_state
-                .lock()
-                .await
-                .listener_command_route()
-                .expect("normal registered listener");
-            let mut reservations = Vec::new();
-            for _ in 0..command_tx.max_capacity() {
-                reservations.push(
-                    tokio::time::timeout(
-                        Duration::from_secs(5),
-                        command_tx.clone().reserve_owned(),
-                    )
-                    .await
-                    .expect("queue reservation deadline")
-                    .expect("live listener"),
-                );
-            }
-            let cleared: ThreadGoalClearResponse = harness
-                .request(
-                    ClientRequest::ThreadGoalClear {
-                        request_id: RequestId::Integer(429_202),
-                        params: serde_json::from_value(json!({"threadId": started.thread.id}))?,
-                    },
-                    None,
-                )
-                .await;
-            assert!(cleared.cleared);
-            assert!(
-                state_db
-                    .thread_goals()
-                    .get_thread_goal(thread_id)
-                    .await?
-                    .is_none(),
-                "clear success requires durable deletion"
-            );
-            harness.session.rpc_gate.shutdown().await;
-            assert!(!cancellation.is_cancelled());
-            drop(reservations);
-            tokio::time::timeout(Duration::from_secs(5), async {
-                loop {
-                    let message = match harness.outgoing_rx.recv().await.expect("outgoing open") {
-                        OutgoingEnvelope::Broadcast { message }
-                        | OutgoingEnvelope::ToConnection { message, .. } => message,
-                    };
-                    match message {
-                        OutgoingMessage::AppServerNotification(
-                            ServerNotification::ThreadGoalCleared(notification),
-                        ) => {
-                            assert_eq!(notification.thread_id, started.thread.id);
-                            break;
-                        }
-                        OutgoingMessage::AppServerNotification(
-                            ServerNotification::ThreadGoalUpdated(_),
-                        ) => panic!("cleared goal must not be resurrected"),
-                        OutgoingMessage::Response(response) => {
-                            panic!("duplicate clear response: {response:?}")
-                        }
-                        OutgoingMessage::Error(error) => panic!("late clear error: {error:?}"),
-                        _ => {}
-                    }
-                }
-            })
-            .await
-            .expect("owned clear notification survives request cancellation");
-            harness.shutdown().await;
-            assert!(
-                state_db
-                    .thread_goals()
-                    .get_thread_goal(thread_id)
-                    .await?
-                    .is_none(),
-                "shutdown must not resurrect the cleared goal"
-            );
-            Ok(())
-        },
-    )
-}

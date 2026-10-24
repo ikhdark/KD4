@@ -151,19 +151,26 @@ enum SpawnInitialInput {
 }
 
 // Before publication, capacity belongs to the created child even when its caller
-// is cancelled. Foreground rollback can finish before session termination.
+// is cancelled. Foreground rollback and loop termination can finish before the
+// accepted session owners drain.
 struct PendingSpawnCapacity {
     reservation: Option<crate::agent::registry::SpawnReservation>,
     residency_slot: Option<super::residency::V2ResidencySlot>,
 }
 
 impl PendingSpawnCapacity {
-    fn retain_until_terminated(self, child_thread: Arc<crate::CodexThread>) {
+    fn retain_until_drained(self, child_thread: Arc<crate::CodexThread>) {
         if self.reservation.is_some() || self.residency_slot.is_some() {
-            tokio::spawn(async move {
-                child_thread.wait_until_terminated().await;
-                drop(self);
-            });
+            tokio::spawn(self.release_after_drain(child_thread));
+        }
+    }
+
+    async fn release_after_drain(self, child_thread: Arc<crate::CodexThread>) {
+        if let Err(error) = child_thread.wait_until_drained().await {
+            warn!(%error, "retaining pending spawn capacity after unconfirmed session retirement");
+            // A failed observer does not prove accepted owners or their storage
+            // ownership retired. Fail closed rather than admit a replacement.
+            std::mem::forget(self);
         }
     }
 }
@@ -233,7 +240,7 @@ impl PendingSpawnCleanupJob {
             )
             .await;
         self.capacity
-            .retain_until_terminated(Arc::clone(&self.child_thread));
+            .retain_until_drained(Arc::clone(&self.child_thread));
         // Successful rollback returns the original cancellation error.
         if !matches!(error, CodexErr::TurnAborted) {
             warn!(child_thread_id = %self.child_thread_id, %error,
@@ -389,7 +396,7 @@ impl PendingSpawnCleanup {
             .await;
         self.armed = false;
         self.take_capacity()
-            .retain_until_terminated(Arc::clone(&self.child_thread));
+            .retain_until_drained(Arc::clone(&self.child_thread));
         error
     }
 
@@ -510,6 +517,9 @@ pub(super) fn agent_nickname_candidates(config: &Config, role_name: Option<&str>
 
 fn keep_forked_rollout_item(item: &RolloutItem, preserve_reference_context_item: bool) -> bool {
     match item {
+        // A fork borrows conversation, not the parent's task-completion authority.
+        RolloutItem::ResponseItem(item)
+            if crate::plan_store::plan_snapshot_from_item(item).is_some() => false,
         RolloutItem::ResponseItem(ResponseItem::Message { role, phase, .. }) => match role.as_str()
         {
             "system" | "developer" | "user" => true,
@@ -861,6 +871,33 @@ impl AgentControl {
         }
     }
 
+    pub(super) async fn retire_cold_v2_agent(
+        &self,
+        state: &Arc<ThreadManagerState>,
+        thread_id: ThreadId,
+    ) -> bool {
+        loop {
+            if self.state.agent_metadata_for_thread(thread_id).is_none() {
+                return false;
+            }
+            match self.begin_v2_agent_load(thread_id) {
+                V2AgentLoadFlight::Follower(completion) => {
+                    Self::wait_for_v2_agent_load(completion).await;
+                }
+                V2AgentLoadFlight::Owner(owner) => {
+                    // Exclude cold loaders as well as registry publication.
+                    // A loader that already owned the key has drained above.
+                    let retired = state.cleanup_thread_if_absent(thread_id, || {
+                        self.forget_v2_residency(thread_id);
+                        self.state.release_spawned_thread(thread_id);
+                    }).await;
+                    owner.finish(&Err(CodexErr::ThreadNotFound(thread_id)));
+                    return retired;
+                }
+            }
+        }
+    }
+
     fn begin_v2_agent_load(&self, thread_id: ThreadId) -> V2AgentLoadFlight {
         let mut flights = self
             .v2_load_flights
@@ -1117,7 +1154,7 @@ impl AgentControl {
 
     async fn spawn_agent_internal(
         &self,
-        config: Config,
+        mut config: Config,
         initial_input: SpawnInitialInput,
         session_source: Option<SessionSource>,
         options: SpawnAgentOptions,
@@ -1135,23 +1172,35 @@ impl AgentControl {
             .as_ref()
             .map(|token| &token.session_source)
             .or(session_source.as_ref());
+        let state = self.upgrade()?;
         let mut child_control = self.clone();
-        if child_control.inherited_validation_task_scope.is_none()
-            && let Some(parent) = options.parent_thread_id.or(match effective_source {
-                Some(SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
-                    parent_thread_id,
-                    ..
-                })) => Some(*parent_thread_id),
-                _ => None,
-            })
-            && let Some(store) = self.task_coordinator().store()
-        {
-            child_control.inherited_validation_task_scope = store
-                .validation_task_scope(&parent.to_string())
-                .await
-                .map_err(|error| {
-                    CodexErr::Fatal(format!("failed to capture parent validation task: {error}"))
-                })?;
+        if let Some(parent) = options.parent_thread_id.or(match effective_source {
+            Some(SessionSource::SubAgent(SubAgentSource::ThreadSpawn { parent_thread_id, .. })) => {
+                Some(*parent_thread_id)
+            }
+            _ => None,
+        }) {
+            let current = match state.get_thread(parent).await {
+                Ok(thread) => {
+                    let active = thread.codex.session.active_turn.lock().await;
+                    active.as_ref().and_then(|active| active.task.as_ref()).map(|task| {
+                        let turn = &task.turn_context;
+                        super::super::task_coordinator::ValidationTurnContext {
+                            scope: turn.validation_root_turn.clone(),
+                            mode: turn.validation_mode,
+                            full_budget: turn.validation_full_budget,
+                            budget: Arc::clone(&turn.full_suite_budget),
+                        }
+                    })
+                }
+                Err(_) => None,
+            };
+            child_control.inherited_validation_context = current
+                .or_else(|| self.inherited_validation_context.clone());
+        }
+        if let Some(validation) = child_control.inherited_validation_context.as_ref() {
+            config.validation_mode = validation.mode;
+            config.validation_full_budget = validation.full_budget;
         }
         if options.fork_mode.is_some() {
             if options.fork_parent_spawn_call_id.is_none() {
@@ -1168,7 +1217,6 @@ impl AgentControl {
                 ));
             }
         }
-        let state = self.upgrade()?;
         let (
             multi_agent_version,
             execution_guard,
@@ -1815,7 +1863,8 @@ impl AgentControl {
                         ResponseItem::Message { .. }
                             | ResponseItem::Compaction { .. }
                             | ResponseItem::ContextCompaction { .. }
-                    ) && !is_multi_agent_v2_usage_hint_message(
+                    ) && crate::plan_store::plan_snapshot_from_item(response_item).is_none()
+                        && !is_multi_agent_v2_usage_hint_message(
                         response_item,
                         &multi_agent_v2_usage_hint_texts_to_filter,
                     )
@@ -2198,6 +2247,98 @@ impl AgentControl {
 #[cfg(test)]
 mod pending_spawn_cleanup_worker_tests {
     use super::send_with_restarting_worker;
+
+    #[tokio::test]
+    async fn pending_capacity_releases_only_after_confirmed_drain() {
+        let mut config = crate::config::test_config().await;
+        let home = tempfile::tempdir().expect("temporary home");
+        config.codex_home = home.path().to_path_buf().try_into().unwrap();
+        config.cwd = home.path().to_path_buf().try_into().unwrap();
+        config.agent_max_threads = Some(1);
+        let manager = crate::ThreadManager::with_models_provider_and_home_for_tests(
+            codex_login::CodexAuth::from_api_key("dummy"),
+            config.model_provider.clone(),
+            config.codex_home.to_path_buf(),
+            std::sync::Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
+            std::sync::Arc::new(crate::test_support::EmptyUserInstructionsProvider),
+        );
+        let child = manager
+            .start_thread(config.clone())
+            .await
+            .expect("start capacity owner");
+        let control = manager.agent_control();
+        let state = control.upgrade().expect("live thread manager");
+        let reservation = control.state.reserve_spawn_slot(Some(1)).unwrap();
+        let residency_slot = control
+            .reserve_v2_residency_slot(&state, &config, None)
+            .await
+            .expect("reserve the child's resident capacity");
+        let release = crate::test_support::block_thread_terminal_tasks(child.thread.as_ref());
+        child.thread.request_shutdown().await.unwrap();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            child.thread.wait_until_terminated(),
+        )
+        .await
+        .expect("the bounded session loop must exit while terminal work remains owned");
+
+        let mut retirement = Box::pin(
+            super::PendingSpawnCapacity {
+                reservation: Some(reservation),
+                residency_slot: Some(residency_slot),
+            }
+            .release_after_drain(std::sync::Arc::clone(&child.thread)),
+        );
+        assert!(
+            futures::poll!(retirement.as_mut()).is_pending(),
+            "loop termination must not release capacity while an accepted owner is blocked"
+        );
+        assert!(matches!(
+            control.state.reserve_spawn_slot(Some(1)),
+            Err(codex_protocol::error::CodexErr::AgentLimitReached { max_threads: 1 })
+        ));
+        assert!(matches!(
+            control.reserve_v2_residency_slot(&state, &config, None).await,
+            Err(codex_protocol::error::CodexErr::AgentLimitReached { max_threads: 1 })
+        ));
+
+        release.send(()).expect("release the accepted terminal owner");
+        tokio::time::timeout(std::time::Duration::from_secs(5), retirement)
+            .await
+            .expect("confirmed owner drain must release pending capacity");
+        let reservation = control
+            .state
+            .reserve_spawn_slot(Some(1))
+            .expect("drain releases the spawn reservation");
+        let residency_slot = control
+            .reserve_v2_residency_slot(&state, &config, None)
+            .await
+            .expect("drain releases the resident slot");
+
+        // Inject a retirement failure only after the real persistence owner has
+        // finished, so no background result writer can race this fault.
+        *child
+            .thread
+            .codex
+            .session
+            .persistence_retirement_result
+            .lock()
+            .unwrap() = Some(Err("injected retirement failure".to_string()));
+        super::PendingSpawnCapacity {
+            reservation: Some(reservation),
+            residency_slot: Some(residency_slot),
+        }
+        .release_after_drain(std::sync::Arc::clone(&child.thread))
+        .await;
+        assert!(matches!(
+            control.state.reserve_spawn_slot(Some(1)),
+            Err(codex_protocol::error::CodexErr::AgentLimitReached { max_threads: 1 })
+        ));
+        assert!(matches!(
+            control.reserve_v2_residency_slot(&state, &config, None).await,
+            Err(codex_protocol::error::CodexErr::AgentLimitReached { max_threads: 1 })
+        ));
+    }
 
     #[tokio::test]
     async fn cleanup_worker_finishes_late_shutdown_without_another_job() {

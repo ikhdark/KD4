@@ -30,6 +30,7 @@ pub use crate::events::session_telemetry::ModelPromptContextCategoryTelemetry;
 pub use crate::events::session_telemetry::ModelToolSchemaTelemetry;
 pub use crate::events::session_telemetry::SessionTelemetry;
 pub use crate::events::session_telemetry::SessionTelemetryMetadata;
+pub use crate::events::session_telemetry::ToolResultOutputStats;
 pub use crate::metrics::runtime_metrics::RuntimeMetricTotals;
 pub use crate::metrics::runtime_metrics::RuntimeMetricsSummary;
 pub use crate::metrics::timer::Timer;

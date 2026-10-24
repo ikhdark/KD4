@@ -3698,3 +3698,29 @@ async fn read_server_event_with_stream_id(
         }
     }
 }
+#[tokio::test]
+async fn newer_disable_supersedes_enrollment_during_durable_enable() {
+    for durable in [false, true] {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let home = TempDir::new().unwrap();
+        let mut handle = remote_control_handle_with_current_enrollment(&remote_control_url_for_listener(&listener), remote_control_auth_manager());
+        handle.state_db = Some(remote_control_state_runtime(&home).await);
+        *handle.current_enrollment.lock().await = None;
+        handle.desired_state_tx.send_replace(RemoteControlDesiredState::Disabled);
+        let enable_handle = handle.clone();
+        let enable = tokio::spawn(async move { enable_handle.enable(None).await });
+        let mut request = accept_http_request(&listener).await;
+        timeout(Duration::from_secs(1), async {
+            if durable { handle.disable(None).await.unwrap(); }
+            else { handle.disable_ephemeral().await; }
+        }).await.expect("disable must not wait for obsolete enrollment HTTP");
+        assert_eq!(enable.await.unwrap().unwrap_err().kind(), io::ErrorKind::Interrupted);
+        let body = remote_control_server_token_response("late-server", "late-env", "late-token").to_string();
+        let response = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{body}", body.len());
+        let _ = request.stream.write_all(response.as_bytes()).await;
+        assert!(!handle.desired_state_tx.borrow().is_enabled());
+        assert!(handle.current_enrollment.snapshot().is_none());
+        let target = normalize_remote_control_url(&handle.remote_control_url).unwrap();
+        assert!(handle.state_db.as_ref().unwrap().get_remote_control_enrollment(&target.websocket_url, "account_id", None).await.unwrap().is_none());
+    }
+}

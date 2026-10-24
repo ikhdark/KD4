@@ -13,7 +13,6 @@ use crate::ipc_framed::SpawnRequest;
 use crate::resolved_permissions::ResolvedWindowsSandboxPermissions;
 use crate::runner_client::RunnerTransport;
 use crate::runner_client::retry_runner_spawn_once;
-use crate::runner_client::spawn_runner_transport;
 use crate::spawn_prep::prepare_elevated_spawn_context_for_permissions;
 use anyhow::Result;
 use codex_protocol::models::PermissionProfile;
@@ -97,16 +96,29 @@ async fn spawn_runner_transport_task(
     sandbox_creds: SandboxCreds,
     request: RunnerTransportRequest,
 ) -> Result<RunnerTransport> {
-    tokio::task::spawn_blocking(move || -> Result<_> {
-        spawn_runner_transport_with_retry(
+    use crate::runner_client::{RunnerAdmission, spawn_runner_transport_with_admission};
+    let admission = std::sync::Arc::new(RunnerAdmission::new(|| false));
+    struct CancelOnDrop(std::sync::Arc<RunnerAdmission>);
+    impl Drop for CancelOnDrop { fn drop(&mut self) { self.0.cancel(); } }
+    let _cancel = CancelOnDrop(std::sync::Arc::clone(&admission));
+    let (result_tx, result_rx) = oneshot::channel();
+    tokio::task::spawn_blocking(move || {
+        if result_tx.is_closed() || admission.is_cancelled() { return; }
+        let result = spawn_runner_transport_with_retry(
             sandbox_creds,
             &request,
-            spawn_runner_transport,
-            refresh_logon_sandbox_creds,
-        )
-    })
-    .await
-    .map_err(|err| anyhow::anyhow!("runner handshake task failed: {err}"))?
+            |home, cwd, creds, logs, request| spawn_runner_transport_with_admission(home, cwd, creds, logs, request, &admission),
+            |permissions, cwd, env, home, read, additional, defaults, write, deny_read, deny_write, proxy, mode| {
+                anyhow::ensure!(!admission.is_cancelled(), "runner launch cancelled before credential refresh");
+                let token = crate::WindowsSandboxCancellationToken::new({ let admission = std::sync::Arc::clone(&admission); move || admission.is_cancelled() });
+                refresh_logon_sandbox_creds(permissions, cwd, env, home, read, additional, defaults, write, deny_read, deny_write, proxy, mode, Some(&token))
+            },
+        );
+        // An undelivered transport still owns process rollback, so cancellation
+        // after admission cannot strand a runner or a requested process tree.
+        let _ = result_tx.send(result);
+    });
+    result_rx.await.map_err(|err| anyhow::anyhow!("runner handshake worker stopped: {err}"))?
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -129,6 +141,7 @@ fn prepare_runner_transport_request(
     tty: bool,
     stdin_open: bool,
     use_private_desktop: bool,
+    cancellation: Option<&crate::WindowsSandboxCancellationToken>,
 ) -> Result<(SandboxCreds, RunnerTransportRequest)> {
     let deny_read_paths_override = deny_read_paths_override
         .iter()
@@ -161,6 +174,7 @@ fn prepare_runner_transport_request(
         &deny_write_paths_override,
         proxy_enforced,
         proxy_settings_mode,
+        cancellation,
     )?;
 
     let sandbox_creds = elevated.sandbox_creds;
@@ -227,6 +241,11 @@ pub(crate) async fn spawn_windows_sandbox_session_elevated_for_permission_profil
     let deny_read_paths_override = deny_read_paths_override.to_vec();
     let deny_write_paths_override = deny_write_paths_override.to_vec();
     let (prepared_tx, prepared_rx) = oneshot::channel();
+    let prepared_cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    struct CancelPreparation(std::sync::Arc<std::sync::atomic::AtomicBool>);
+    impl Drop for CancelPreparation { fn drop(&mut self) { self.0.store(true, std::sync::atomic::Ordering::Release); } }
+    let _cancel_preparation = CancelPreparation(std::sync::Arc::clone(&prepared_cancelled));
+    let preparation_token = crate::WindowsSandboxCancellationToken::new(move || prepared_cancelled.load(std::sync::atomic::Ordering::Acquire));
     tokio::task::spawn_blocking(move || {
         // A dropped request must not start queued persistent setup. Once setup
         // starts this worker finishes its owned security operations; it never
@@ -253,6 +272,7 @@ pub(crate) async fn spawn_windows_sandbox_session_elevated_for_permission_profil
             tty,
             stdin_open,
             use_private_desktop,
+            Some(&preparation_token),
         );
         // The prepared value owns strings/configuration only. Cancellation
         // drops it here without losing a child process or a native token handle.

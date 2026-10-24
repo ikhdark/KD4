@@ -166,7 +166,7 @@ Object.defineProperty(globalThis, "run_graph", {
     // any effect, including transitive dependencies of requested targets.
     let missingCapabilities;
     let missingCount = 0,
-      diagnosticBytes = 0;
+      diagnosticBytes = 2; // The JSON array's brackets.
     // Snapshot once per invocation, not once per required name. A later graph
     // still sees a changed catalog; this is not cross-cell capability caching.
     const capabilities = new Set(ALL_TOOL_NAMES);
@@ -177,9 +177,14 @@ Object.defineProperty(globalThis, "run_graph", {
         missingCapabilities ??= [];
         // Failure-only, bounded diagnostics. Names are exact or explicitly
         // omitted, never shortened into a different callable capability.
-        const cost = id.length + name.length + 64;
+        // Check a cheap lower bound before allocating escaped JSON/UTF-8.
+        if (missingCapabilities.length >= 64 || id.length + name.length > 4096)
+          continue;
+        const entry = { node_id: id, tool: name };
+        const cost = new TextEncoder().encode(JSON.stringify(entry)).length +
+          (missingCapabilities.length ? 1 : 0);
         if (missingCapabilities.length < 64 && diagnosticBytes + cost <= 4096) {
-          missingCapabilities.push({ node_id: id, tool: name });
+          missingCapabilities.push(entry);
           diagnosticBytes += cost;
         }
       }
@@ -274,11 +279,12 @@ Object.defineProperty(globalThis, "run_graph", {
       try {
         const dependencies = Object.create(null);
         for (const dep of node.deps) dependencies[dep] = results[dep].value;
-        value = await node.run(Object.freeze(dependencies));
+        const { run, accept } = node;
+        value = await run(Object.freeze(dependencies));
         produced = true;
         // Promise resolution is not tool success. `accept` establishes the
         // node's behavioral postcondition; by default, command exit codes.
-        if ((await node.accept(value)) !== true) {
+        if ((await accept(value)) !== true) {
           results[id] = {
             status: "rejected",
             value,
@@ -353,11 +359,16 @@ Object.defineProperty(globalThis, "run_graph", {
         await new Promise((resolve) => {
           wake = resolve;
         });
+      else if (remaining)
+        throw new Error("dependency graph cannot make progress; no nodes are running");
     }
     const ordered = Object.create(null);
     for (const [id, node] of graph) {
       if (!selected.has(id)) continue;
       ordered[id] = results[id];
+      // Integer-like object keys enumerate numerically; retain a persistable
+      // ordering witness without proxies or reserving any caller's node ID.
+      ordered[id].input_index = node.ordinal;
       if (node.step_id !== undefined) ordered[id].step_id = node.step_id;
     }
     if (

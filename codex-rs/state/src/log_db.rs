@@ -49,6 +49,9 @@ use crate::runtime::LogRetentionScope;
 const LOG_QUEUE_CAPACITY: usize = 512;
 const LOG_BATCH_SIZE: usize = 128;
 const LOG_FLUSH_INTERVAL: Duration = Duration::from_secs(2);
+// Span records are diagnostic history, not an unbounded event log. Retain the
+// newest UTF-8 suffix; thread identity is stored separately in SpanLogContext.
+const MAX_SPAN_FIELDS_BYTES: usize = 16 * 1024;
 
 pub fn default_filter() -> Targets {
     Targets::new()
@@ -162,7 +165,7 @@ where
         if let Some(span) = ctx.span(id) {
             span.extensions_mut().insert(SpanLogContext {
                 name: span.metadata().name().to_string(),
-                formatted_fields: format_fields(attrs),
+                formatted_fields: bounded_span_fields(format_fields(attrs)),
                 thread_id: visitor.thread_id,
             });
         }
@@ -187,7 +190,7 @@ where
             } else {
                 extensions.insert(SpanLogContext {
                     name: span.metadata().name().to_string(),
-                    formatted_fields: format_fields(values),
+                    formatted_fields: bounded_span_fields(format_fields(values)),
                     thread_id: visitor.thread_id,
                 });
             }
@@ -367,7 +370,21 @@ fn append_fields(fields: &mut String, values: &Record<'_>) {
     let formatter = DefaultFields::default();
     let mut formatted = FormattedFields::<DefaultFields>::new(std::mem::take(fields));
     let _ = formatter.add_fields(&mut formatted, values);
-    *fields = formatted.fields;
+    *fields = bounded_span_fields(formatted.fields);
+}
+
+fn bounded_span_fields(fields: String) -> String {
+    const MARKER: &str = "[earlier span fields truncated] ";
+    if fields.len() > MAX_SPAN_FIELDS_BYTES {
+        let mut start = fields.len() - (MAX_SPAN_FIELDS_BYTES - MARKER.len());
+        while !fields.is_char_boundary(start) {
+            start += 1;
+        }
+        // Allocate only the retained suffix: shortening in place would keep a
+        // possibly huge original allocation alive for the lifetime of the span.
+        return format!("{MARKER}{}", &fields[start..]);
+    }
+    fields
 }
 
 fn current_process_log_uuid() -> &'static str {
@@ -413,7 +430,11 @@ async fn run_inserter(
                             &mut pending_retention,
                             flush(&state_db, &mut buffer, &mut insert_error).await,
                         );
-                        let _ = reply.send(insert_error.take().map_or(Ok(()), Err));
+                        if let Err(Err(error)) = reply.send(insert_error.take().map_or(Ok(()), Err)) {
+                            // Cancellation must not acknowledge an error that
+                            // no live flush receiver was able to observe.
+                            insert_error = Some(error);
+                        }
                     }
                     None => {
                         merge_pending_retention(
@@ -893,6 +914,55 @@ mod tests {
             "flush must report the earlier batch failure"
         );
         layer.flush().await.expect("reported failure is consumed");
+    }
+
+    #[tokio::test]
+    async fn repeated_span_records_have_bounded_utf8_history_and_latest_values() {
+        let (sender, mut receiver) = mpsc::channel(1);
+        let layer = LogDbLayer { sender, process_uuid: "test".into() };
+        tracing::subscriber::with_default(tracing_subscriber::registry().with(layer), || {
+            let span = tracing::info_span!("long_lived", thread_id = "thread-1", progress = tracing::field::Empty);
+            for index in 0..10_000 {
+                span.record("progress", format!("é🦀-{index}"));
+            }
+            span.in_scope(|| tracing::info!("final event"));
+        });
+        let LogDbCommand::Entry(entry) = receiver.try_recv().unwrap() else { panic!("entry") };
+        let body = entry.feedback_log_body.unwrap();
+        assert!(body.len() <= MAX_SPAN_FIELDS_BYTES + 100);
+        assert!(body.contains("[earlier span fields truncated]"));
+        assert!(body.contains("é🦀-9999"));
+        assert_eq!(entry.thread_id.as_deref(), Some("thread-1"));
+    }
+
+    #[test]
+    fn audit20261023_oversized_span_updates_do_not_retain_the_original_allocation() {
+        let fields = "é🦀".repeat(MAX_SPAN_FIELDS_BYTES);
+        let retained = bounded_span_fields(fields);
+        assert!(retained.len() <= MAX_SPAN_FIELDS_BYTES);
+        assert!(retained.capacity() <= MAX_SPAN_FIELDS_BYTES * 2);
+        assert!(retained.starts_with("[earlier span fields truncated]"));
+        assert!(retained.ends_with("é🦀"));
+    }
+
+    #[tokio::test]
+    async fn cancelled_flush_preserves_unreported_insertion_failure() {
+        let temp = tempfile::tempdir().unwrap();
+        let runtime = StateRuntime::init(temp.path().to_path_buf(), "test-provider".into())
+            .await
+            .unwrap();
+        runtime.close().await;
+        let (sender, receiver) = mpsc::channel(8);
+        sender.send(LogDbCommand::Entry(Box::new(test_entry("failed")))).await.unwrap();
+        let (cancelled_tx, cancelled_rx) = oneshot::channel();
+        drop(cancelled_rx);
+        sender.send(LogDbCommand::Flush(cancelled_tx)).await.unwrap();
+        let (live_tx, live_rx) = oneshot::channel();
+        sender.send(LogDbCommand::Flush(live_tx)).await.unwrap();
+        drop(sender);
+        let writer = tokio::spawn(run_inserter(runtime, receiver, LogSinkQueueConfig::default()));
+        assert!(live_rx.await.unwrap().is_err(), "cancelled flush must retain the failure");
+        writer.await.unwrap();
     }
 
     #[tokio::test]

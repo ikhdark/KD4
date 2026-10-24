@@ -1,6 +1,5 @@
 use std::collections::HashMap;
 
-use codex_network_proxy::ManagedNetworkSandboxContext;
 use codex_protocol::config_types::WindowsSandboxLevel;
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::permissions::FileSystemAccessMode;
@@ -113,11 +112,8 @@ fn windows_restricted_token_request_prepares_session_launch() {
         pipe_stdin: false,
         arg0: Some("custom-tty-program".to_string()),
         sandbox: Some(sandbox),
-        enforce_managed_network: true,
-        managed_network: Some(ManagedNetworkSandboxContext {
-            loopback_ports: vec![43123],
-            allow_local_binding: false,
-        }),
+        enforce_managed_network: false,
+        managed_network: None,
     };
 
     let prepared = prepare_exec_request(&params, env.clone(), Some(&runtime_paths))
@@ -140,7 +136,7 @@ fn windows_restricted_token_request_prepares_session_launch() {
         windows_sandbox.windows_sandbox_level,
         WindowsSandboxLevel::RestrictedToken
     );
-    assert!(windows_sandbox.proxy_enforced);
+    assert!(!windows_sandbox.proxy_enforced);
     assert!(windows_sandbox.use_private_desktop);
     let overrides = windows_sandbox
         .filesystem_overrides
@@ -179,4 +175,27 @@ fn windows_restricted_token_request_prepares_session_launch() {
     assert!(!windows_sandbox_stdin_open(
         /*tty*/ false, /*pipe_stdin*/ false,
     ));
+}
+#[test]
+fn removed_proxy_requests_fail_closed_before_launch() {
+    let cwd = PathUri::from_host_native_path(std::env::current_dir().unwrap()).unwrap();
+    for (enforce, context) in [
+        (true, None),
+        (false, Some(serde_json::json!({"loopbackPorts": [1234], "allowLocalBinding": false}))),
+    ] {
+        let params = ExecParams {
+            process_id: ProcessId::from("removed-proxy"),
+            argv: vec!["must-not-launch".into()],
+            cwd: cwd.clone(),
+            env_policy: None,
+            env: HashMap::new(),
+            tty: false,
+            pipe_stdin: false,
+            arg0: None,
+            sandbox: None,
+            enforce_managed_network: enforce,
+            managed_network: context,
+        };
+        assert!(prepare_exec_request(&params, HashMap::new(), None).is_err());
+    }
 }

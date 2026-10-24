@@ -1,7 +1,6 @@
 use super::*;
 use crate::sandboxing::SandboxPermissions;
 use crate::tools::hook_names::HookToolName;
-use codex_network_proxy::ManagedNetworkSandboxContext;
 use codex_protocol::permissions::FileSystemAccessMode;
 use codex_protocol::permissions::FileSystemPath;
 use codex_protocol::permissions::FileSystemSandboxEntry;
@@ -378,24 +377,16 @@ fn exec_server_env_keeps_command_native_and_carries_sandbox_context() {
         sandbox_requested: true,
         permissions: &permissions,
         exec_server_permissions: &exec_server_permissions,
-        enforce_managed_network: true,
         sandbox_cwd: &cwd_uri,
         workspace_roots: std::slice::from_ref(&cwd),
         windows_sandbox_level: codex_protocol::config_types::WindowsSandboxLevel::Disabled,
         windows_sandbox_private_desktop: false,
-        network_denial_cancellation_token: None,
-        network_proxy: None,
-    };
-    let managed_network = ManagedNetworkSandboxContext {
-        loopback_ports: vec![43123],
-        allow_local_binding: false,
     };
     let command = || SandboxCommand {
         program: "/bin/bash".into(),
         args: vec!["-lc".to_string(), "pwd".to_string()],
         cwd: cwd_uri.clone(),
         env: HashMap::new(),
-        managed_network: Some(managed_network.clone()),
         additional_permissions: None,
     };
     let options = || crate::sandboxing::ExecOptions {
@@ -406,8 +397,6 @@ fn exec_server_env_keeps_command_native_and_carries_sandbox_context() {
         .env_for_exec_server(
             command(),
             options(),
-            /*network*/ None,
-            Some("remote"),
             /*additional_permissions_uri*/ None,
         )
         .expect("prepare remote exec request");
@@ -432,11 +421,6 @@ fn exec_server_env_keeps_command_native_and_carries_sandbox_context() {
             windows_sandbox_private_desktop: false,
         })
     );
-    assert!(request.exec_server_enforce_managed_network);
-    assert_eq!(
-        request.exec_server_managed_network,
-        Some(managed_network.clone())
-    );
 
     let remote_write_root =
         PathUri::parse("file:///home/remote/workspace/granted-output").expect("remote path URI");
@@ -454,8 +438,6 @@ fn exec_server_env_keeps_command_native_and_carries_sandbox_context() {
         .env_for_exec_server(
             command(),
             options(),
-            /*network*/ None,
-            Some("remote"),
             Some(&additional_permissions_uri),
         )
         .expect("prepare remote exec request with URI grant");
@@ -483,15 +465,11 @@ fn exec_server_env_keeps_command_native_and_carries_sandbox_context() {
         .env_for_exec_server(
             command(),
             options(),
-            /*network*/ None,
-            Some("remote"),
             /*additional_permissions_uri*/ None,
         )
         .expect("prepare unsandboxed remote exec request");
 
     assert_eq!(request.exec_server_sandbox, None);
-    assert!(!request.exec_server_enforce_managed_network);
-    assert_eq!(request.exec_server_managed_network, Some(managed_network));
 }
 
 #[tokio::test]
@@ -531,13 +509,10 @@ async fn local_env_carries_restricted_token_filesystem_overrides() {
         sandbox_requested: true,
         permissions: &permissions,
         exec_server_permissions: &permissions,
-        enforce_managed_network: false,
         sandbox_cwd: &cwd_uri,
         workspace_roots: std::slice::from_ref(&cwd),
         windows_sandbox_level: codex_protocol::config_types::WindowsSandboxLevel::RestrictedToken,
         windows_sandbox_private_desktop: false,
-        network_denial_cancellation_token: None,
-        network_proxy: None,
     };
     let request = attempt
         .env_for(
@@ -546,15 +521,12 @@ async fn local_env_carries_restricted_token_filesystem_overrides() {
                 args: vec!["/c".to_string(), "exit 0".to_string()],
                 cwd: cwd_uri.clone(),
                 env: HashMap::new(),
-                managed_network: None,
                 additional_permissions: None,
             },
             crate::sandboxing::ExecOptions {
                 expiration: crate::exec::ExecExpiration::DefaultTimeout,
                 capture_policy: crate::exec::ExecCapturePolicy::ShellTool,
             },
-            /*network*/ None,
-            /*environment_id*/ None,
         )
         .await
         .expect("prepare local exec request");
@@ -609,13 +581,10 @@ fn local_env_carries_elevated_filesystem_overrides() {
         sandbox_requested: true,
         permissions: &permissions,
         exec_server_permissions: &permissions,
-        enforce_managed_network: false,
         sandbox_cwd: &cwd_uri,
         workspace_roots: std::slice::from_ref(&cwd),
         windows_sandbox_level: codex_protocol::config_types::WindowsSandboxLevel::Elevated,
         windows_sandbox_private_desktop: false,
-        network_denial_cancellation_token: None,
-        network_proxy: None,
     };
     let (occupied_tx, occupied_rx) = tokio::sync::oneshot::channel();
     let (release_tx, release_rx) = std::sync::mpsc::channel();
@@ -631,15 +600,12 @@ fn local_env_carries_elevated_filesystem_overrides() {
                 args: vec!["/c".to_string(), "exit 0".to_string()],
                 cwd: cwd_uri.clone(),
                 env: HashMap::new(),
-                managed_network: None,
                 additional_permissions: None,
             },
             crate::sandboxing::ExecOptions {
                 expiration: crate::exec::ExecExpiration::DefaultTimeout,
                 capture_policy: crate::exec::ExecCapturePolicy::ShellTool,
             },
-            /*network*/ None,
-            /*environment_id*/ None,
         );
     tokio::pin!(prepare);
     tokio::select! {

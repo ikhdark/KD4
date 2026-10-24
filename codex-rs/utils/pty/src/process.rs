@@ -334,7 +334,7 @@ impl ProcessHandle {
         self
     }
 
-    /// Only the Unix PTY writer can acknowledge terminal EOF (canonical VEOF);
+    /// The Unix PTY writer reports ordered input-drain/close errors;
     /// pipe and ConPTY sessions keep sender-drop close semantics.
     #[cfg(unix)]
     pub(crate) fn with_stdin_close_receipt(mut self, receipt: StdinCloseReceipt) -> Self {
@@ -419,30 +419,29 @@ impl ProcessHandle {
 
     /// Drop this handle's stdin sender. All sender clones must also be dropped.
     /// This alone is not evidence of terminal EOF; use `close_stdin_ordered`
-    /// when the caller needs an acknowledged EOF operation.
+    /// when the caller needs an ordered close result.
     pub fn close_stdin(&self) {
         if let Ok(mut writer_tx) = self.writer_tx.lock() {
             writer_tx.take();
         }
     }
 
-    /// Close pipe input, or request canonical Unix terminal EOF after queued
-    /// input. Terminal EOF uses the current VEOF twice (flush a partial line,
-    /// then an empty read); it is not a permanent pipe half-close. Raw mode or
-    /// disabled VEOF returns Unsupported, never a false EOF acknowledgement.
+    /// Close pipe input after queued bytes. Unix PTYs drain accepted input then
+    /// return Unsupported: terminal input cannot be half-closed reliably, and
+    /// no terminal-control bytes are synthesized.
     /// External writer clones must be dropped before this operation can finish.
     pub async fn close_stdin_ordered(&self) -> io::Result<()> {
         self.close_stdin();
         if let Some(mut receipt) = self.stdin_close_receipt.clone() {
             let result = receipt.wait_for(Option::is_some).await.map_err(|_| {
-                io::Error::other("stdin writer stopped before confirming terminal EOF")
+                io::Error::other("stdin writer stopped before reporting ordered input close")
             })?;
             return match result.as_ref() {
                 Some(Ok(())) => Ok(()),
                 Some(Err((kind, message))) => Err(io::Error::new(*kind, message.clone())),
                 // `wait_for(Option::is_some)` never yields an empty result.
                 None => Err(io::Error::other(
-                    "stdin writer stopped before confirming terminal EOF",
+                    "stdin writer stopped before reporting ordered input close",
                 )),
             };
         }

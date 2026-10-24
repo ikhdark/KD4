@@ -162,7 +162,10 @@ impl DelegateRuntime {
         // Keep execution, panic conversion, and completion delivery in one
         // owner task so a finished child does not wait on a second join/wakeup.
         tokio::spawn(async move {
+            let started = std::sync::atomic::AtomicBool::new(false);
+            let started_ref = &started;
             let delegate_future = async move {
+                started_ref.store(true, std::sync::atomic::Ordering::Relaxed);
                 match task_request {
                     DelegateTask::InvokeTool(invocation) => delegate
                         .invoke_tool(invocation, task_cancellation)
@@ -183,6 +186,9 @@ impl DelegateRuntime {
             let result = tokio::select! {
                 biased;
                 _ = completion_stop.cancelled() => {
+                    if !started.load(std::sync::atomic::Ordering::Relaxed) {
+                        return;
+                    }
                     // Cancellation revokes delivery immediately. Give the
                     // forwarded cancellation token a bounded cleanup window,
                     // then drop the future rather than orphaning this task.

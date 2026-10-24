@@ -12,6 +12,7 @@ use super::RouteFailureClass;
 use super::SystemProxyDecision;
 use super::no_proxy_matches_origin;
 use super::parse_proxy_list;
+use super::parse_static_proxy_list;
 use windows_sys::Win32::Foundation::ERROR_FILE_NOT_FOUND;
 use windows_sys::Win32::Foundation::FALSE;
 use windows_sys::Win32::Foundation::GetLastError;
@@ -106,7 +107,7 @@ fn resolve_with_config(
         {
             return SystemProxyDecision::Direct;
         }
-        return match proxy_list_decision(proxy, origin) {
+        return match proxy_list_result_decision(parse_static_proxy_list(proxy, &origin.scheme)) {
             SystemProxyDecision::Unavailable { .. }
                 if failure != RouteFailureClass::ProxyResolutionUnavailable =>
             {
@@ -232,7 +233,11 @@ fn proxy_info_decision(proxy_info: &ProxyInfo, origin: &RequestOrigin) -> System
 }
 
 fn proxy_list_decision(proxy_list: &str, origin: &RequestOrigin) -> SystemProxyDecision {
-    match parse_proxy_list(proxy_list, &origin.scheme) {
+    proxy_list_result_decision(parse_proxy_list(proxy_list, &origin.scheme))
+}
+
+fn proxy_list_result_decision(decision: ParsedProxyListDecision) -> SystemProxyDecision {
+    match decision {
         ParsedProxyListDecision::Direct => SystemProxyDecision::Direct,
         ParsedProxyListDecision::Proxy(url) => SystemProxyDecision::Proxy { url },
         ParsedProxyListDecision::UnsupportedScheme => SystemProxyDecision::Unavailable {

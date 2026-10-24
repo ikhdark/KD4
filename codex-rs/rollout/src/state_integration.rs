@@ -331,7 +331,7 @@ pub async fn get_state_db(config: &impl RolloutConfigView) -> Option<StateDbHand
         );
         return None;
     }
-    let runtime = match codex_state::StateRuntime::init(
+    let runtime = match codex_state::StateRuntime::init_for_read(
         config.sqlite_home().to_path_buf(),
         config.model_provider_id().to_string(),
     )

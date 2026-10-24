@@ -96,6 +96,7 @@ fn legacy_end_event(item: &ImageGenerationItem) -> EventMsg {
         status: item.status.clone(),
         revised_prompt: item.revised_prompt.clone(),
         result: item.result.clone(),
+        error: item.error.clone(),
         saved_path: item.saved_path.clone(),
     })
 }
@@ -162,7 +163,8 @@ impl ImageGenerationTool {
                     id: call.call_id.clone(),
                     status: "in_progress".to_string(),
                     revised_prompt: None,
-                    result: String::new(),
+                    result: None,
+                    error: None,
                     saved_path: None,
                     provider_usage: None,
                 },
@@ -246,7 +248,8 @@ async fn complete_image_generation(
         id: call_id.to_string(),
         status: "completed".to_string(),
         revised_prompt: Some(prompt),
-        result: result.clone(),
+        result: Some(result.clone()),
+        error: None,
         saved_path: saved_path.clone(),
         provider_usage,
     };
@@ -331,7 +334,8 @@ async fn emit_failed_result(
         id: call_id.to_string(),
         status: "failed".to_string(),
         revised_prompt: Some(prompt.to_string()),
-        result: String::new(),
+        result: None,
+        error: None,
         saved_path: None,
         provider_usage,
     };
@@ -535,7 +539,9 @@ fn recent_images(history: &[ResponseItem], count: usize) -> Vec<ImageUrl> {
                         .rev()
                         .filter_map(|item| match item {
                             ContentItem::InputImage { image_url, .. } => Some(image_url),
-                            ContentItem::InputText { .. } | ContentItem::OutputText { .. } => None,
+                            ContentItem::InputText { .. }
+                            | ContentItem::OutputText { .. }
+                            | ContentItem::Refusal { .. } => None,
                         })
                         .take(remaining)
                         .cloned(),
@@ -551,7 +557,10 @@ fn recent_images(history: &[ResponseItem], count: usize) -> Vec<ImageUrl> {
             } if custom_tool_call_ids.contains(call_id.as_str()) => {
                 image_urls.extend(output_image_urls(output).take(remaining).cloned());
             }
-            ResponseItem::ImageGenerationCall { result, .. } if !result.is_empty() => {
+            ResponseItem::ImageGenerationCall {
+                result: Some(result),
+                ..
+            } if !result.is_empty() => {
                 image_urls.push(format!("data:image/png;base64,{result}"));
             }
             ResponseItem::AdditionalTools { .. }

@@ -3,6 +3,38 @@ use serde::Deserialize;
 use serde::Serialize;
 use ts_rs::TS;
 
+/// Authoritative runtime policy for validation command execution.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(rename_all = "snake_case", export_to = "v2/")]
+pub enum ValidationMode {
+    Off,
+    Compile,
+    #[default]
+    Benchmark,
+    Full,
+}
+
+/// Maximum admitted BENCHMARK/FULL validation attempts in one root turn, including its children.
+pub const DEFAULT_VALIDATION_FULL_BUDGET: usize = 2;
+
+impl ValidationMode {
+    /// Parse an exact command on the first line of trusted, top-level user input.
+    /// A task may follow on subsequent lines. Arbitrary instruction or tool text
+    /// must never reach this API.
+    pub fn from_user_command(text: &str) -> Option<Self> {
+        let first_line = text.split('\n').next()?;
+        let first_line = first_line.strip_suffix('\r').unwrap_or(first_line);
+        match first_line {
+            "/validation off" => Some(Self::Off),
+            "/validation compile" => Some(Self::Compile),
+            "/validation benchmark" => Some(Self::Benchmark),
+            "/validation full" => Some(Self::Full),
+            _ => None,
+        }
+    }
+}
+
 /// Repository-relative paths whose current contents are checked by a direct
 /// validation command.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema, TS)]
@@ -48,7 +80,7 @@ impl ValidationTerminalStatus {
 
 /// The settled result of one validation command execution.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema, TS)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 #[ts(export_to = "v2/")]
 pub struct ValidationResult {
     pub argv: Vec<String>,
@@ -157,6 +189,7 @@ fn is_normalized_repository_relative_scope(path: &str) -> bool {
         return true;
     }
     if path.is_empty()
+        || path.contains('\0')
         || path.trim() != path
         || path.contains('\\')
         || path.starts_with('/')
@@ -174,9 +207,54 @@ fn is_normalized_repository_relative_scope(path: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::ValidationCommandContext;
+    use super::ValidationMode;
     use super::ValidationResult;
     use super::ValidationTerminalStatus;
     use serde_json::json;
+
+    #[test]
+    fn validation_mode_defaults_and_wire_values_are_exact() {
+        assert_eq!(ValidationMode::default(), ValidationMode::Benchmark);
+        for (mode, wire) in [
+            (ValidationMode::Off, "off"),
+            (ValidationMode::Compile, "compile"),
+            (ValidationMode::Benchmark, "benchmark"),
+            (ValidationMode::Full, "full"),
+        ] {
+            assert_eq!(serde_json::to_value(mode).unwrap(), json!(wire));
+            assert_eq!(serde_json::from_value::<ValidationMode>(json!(wire)).unwrap(), mode);
+        }
+        assert!(serde_json::from_value::<ValidationMode>(json!("Full")).is_err());
+    }
+
+    #[test]
+    fn validation_command_requires_an_exact_first_line() {
+        assert_eq!(
+            ValidationMode::from_user_command("/validation off"),
+            Some(ValidationMode::Off)
+        );
+        assert_eq!(
+            ValidationMode::from_user_command("/validation compile\r\nImplement the fix"),
+            Some(ValidationMode::Compile)
+        );
+        assert_eq!(
+            ValidationMode::from_user_command("/validation full\nImplement the fix"),
+            Some(ValidationMode::Full)
+        );
+        for text in [
+            "Please use /validation full",
+            "`/validation full`",
+            "/validation FULL",
+            "Task\n/validation full",
+            " /validation full",
+            "```\n/validation full\n```",
+            "> /validation full",
+            "/validation full extra",
+            "<user>/validation full</user>",
+        ] {
+            assert_eq!(ValidationMode::from_user_command(text), None, "{text}");
+        }
+    }
 
     #[test]
     fn terminal_status_wire_contract_is_lean_and_exact() {
@@ -205,6 +283,8 @@ mod tests {
 
     #[test]
     fn lean_context_and_result_round_trip_and_reject_legacy_fields() {
+        let schema = serde_json::to_value(schemars::schema_for!(ValidationResult)).unwrap();
+        assert_eq!(schema["additionalProperties"], json!(false));
         let context_value = json!({"covered_paths": ["codex-rs/core/src"]});
         let context = serde_json::from_value::<ValidationCommandContext>(context_value.clone())
             .expect("lean context");
@@ -290,6 +370,8 @@ mod tests {
             json!(["src//lib"]),
             json!(["src/./lib"]),
             json!(["src\\lib"]),
+            json!(["src\0lib"]),
+            json!(["src/\0lib"]),
             json!(["src/"]),
             json!(["~/src"]),
             json!([" src"]),

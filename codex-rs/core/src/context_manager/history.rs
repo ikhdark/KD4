@@ -372,6 +372,37 @@ enum RealizedContextBaseline {
     Unknown,
 }
 
+/// Occurrence-aware tool ownership without repeated history scans.
+#[derive(Clone, Copy, Debug, Default)]
+struct ToolCallClassification {
+    exact_read: bool,
+    code_mode_budget: bool,
+}
+
+#[derive(Clone, Debug, Default)]
+struct ToolCallClassificationIndex {
+    source: Weak<Vec<ResponseItem>>,
+    calls: HashMap<String, ToolCallClassification>,
+}
+
+impl ToolCallClassificationIndex {
+    fn append(&mut self, items: &[ResponseItem]) {
+        for item in items {
+            if let ResponseItem::FunctionCall { call_id, name, namespace, .. }
+                | ResponseItem::CustomToolCall { call_id, name, namespace, .. } = item
+            {
+                let class = self.calls.entry(call_id.clone()).or_default();
+                // Exact-read classification uses the latest matching call;
+                // legacy exec/wait ownership intentionally matches any occurrence.
+                class.exact_read = namespace.is_none()
+                    && matches!(name.as_str(), "read_file" | "read_tool_output");
+                class.code_mode_budget |= namespace.is_none()
+                    && matches!(name.as_str(), "exec" | "wait");
+            }
+        }
+    }
+}
+
 /// Transcript of thread history
 #[derive(Debug, Clone, Default)]
 pub(crate) struct ContextManager {
@@ -383,6 +414,7 @@ pub(crate) struct ContextManager {
     history_version: u64,
     projection_revision: u64,
     tool_history: Arc<ToolHistoryState>,
+    tool_call_classes: Arc<StdMutex<ToolCallClassificationIndex>>,
     prepared_history: Arc<StdMutex<Option<PreparedHistoryCacheEntry>>>,
     /// The tool-history projection sent by the latest sampling request of the
     /// current turn. Continuation requests extend it so their input keeps the
@@ -415,6 +447,7 @@ impl ContextManager {
             history_version: 0,
             projection_revision: 0,
             tool_history: Arc::new(ToolHistoryState::default()),
+            tool_call_classes: Default::default(),
             prepared_history: Arc::new(StdMutex::new(None)),
             sampling_projection_anchor: Arc::new(StdMutex::new(None)),
             item_token_estimates: Arc::new(StdMutex::new(HashMap::new())),
@@ -523,6 +556,11 @@ impl ContextManager {
         I: IntoIterator,
         I::Item: std::ops::Deref<Target = ResponseItem>,
     {
+        if Arc::strong_count(&self.tool_call_classes) > 1 {
+            let index = self.tool_call_classes.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner).clone();
+            self.tool_call_classes = Arc::new(StdMutex::new(index));
+        }
         let appended = items
             .into_iter()
             .filter_map(|item| {
@@ -582,7 +620,19 @@ impl ContextManager {
                 })
             })
         };
-        Arc::make_mut(&mut self.items).extend(appended.iter().cloned());
+        {
+            let mut index = self.tool_call_classes.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let indexed = weak_ptr_eq_arc(&index.source, &self.items);
+            index.source = Weak::new();
+            Arc::make_mut(&mut self.items).extend(appended.iter().cloned());
+            if indexed {
+                index.append(&appended);
+                index.source = Arc::downgrade(&self.items);
+            } else {
+                *index = ToolCallClassificationIndex::default();
+            }
+        }
         self.advance_prepared_history_for_append(&appended, prepared_append);
     }
 
@@ -968,12 +1018,7 @@ impl ContextManager {
             .read_status_page(paths, environment_id, self.raw_items(), query)
     }
 
-    pub(crate) fn rehydrate_read_replays(
-        &self,
-        replays: &crate::session::turn_execution::SessionPathReplays,
-    ) {
-        replays.rehydrate(self.raw_items(), &self.tool_history);
-    }
+
 
     #[cfg(test)]
     pub(crate) fn register_non_workspace_code_mode_call(&mut self, call_id: String) {
@@ -1052,17 +1097,23 @@ impl ContextManager {
             .clone()
             .prepare_for_prompt_target(input_modalities, StableContextTarget::Sampling);
         let prepared_items = prepared.shared_items();
-        let projected = self.sampling_items_for_estimate(Arc::clone(&prepared_items));
+        let (projected, tail) = self.sampling_items_for_estimate(&prepared_items);
         self.estimate_projected_items_token_count(
             &prepared_items,
             &projected,
+            tail,
             base_instructions,
             pending_user_boundary,
             Some(prepared.policy),
         )
     }
 
-    fn sampling_items_for_estimate(&self, items: Arc<[ResponseItem]>) -> Arc<[ResponseItem]> {
+    // Keep the anchored projection shared and borrow its appended source tail.
+    // The estimator traverses both segments in one projected-position space.
+    fn sampling_items_for_estimate<'a>(
+        &self,
+        items: &'a Arc<[ResponseItem]>,
+    ) -> (Arc<[ResponseItem]>, &'a [ResponseItem]) {
         let anchor = self
             .sampling_projection_anchor
             .lock()
@@ -1079,21 +1130,12 @@ impl ContextManager {
             })
         {
             let tail = &items[anchor.prepared_items.len()..];
-            if tail.is_empty() {
-                return Arc::clone(&anchor.projection.items);
-            }
-            return anchor
-                .projection
-                .items
-                .iter()
-                .chain(tail)
-                .cloned()
-                .collect();
+            return (Arc::clone(&anchor.projection.items), tail);
         }
-        if ToolHistoryState::has_phase_checkpoint(&items) {
-            return self.tool_history.apply_checkpoint_pins(&items);
+        if ToolHistoryState::has_phase_checkpoint(items) {
+            return (self.tool_history.apply_checkpoint_pins(items), &[]);
         }
-        items
+        (Arc::clone(items), &[])
     }
 
     /// See [`ToolHistoryState::pressure_retirement_selection`].
@@ -1131,6 +1173,7 @@ impl ContextManager {
         &self,
         source_items: &Arc<[ResponseItem]>,
         projected_items: &Arc<[ResponseItem]>,
+        projected_tail: &[ResponseItem],
         base_instructions: &BaseInstructions,
         pending_user_boundary: bool,
         policy: Option<PreparedHistoryPolicy>,
@@ -1139,13 +1182,16 @@ impl ContextManager {
             i64::try_from(approx_token_count(&base_instructions.text)).unwrap_or(i64::MAX);
         // Use sampling's completed-task boundary, not every steering or agent
         // instruction. Those boundaries deliberately retain active reasoning.
+        let projected = projected_items.iter().chain(projected_tail);
         let last_instruction_boundary =
-            completed_turn_boundary_with_pending_user(projected_items, pending_user_boundary);
-        let unchanged = Arc::ptr_eq(source_items, projected_items);
-        let mut retained = Vec::with_capacity(projected_items.len());
+            completed_turn_boundary_with_pending_user(projected.clone(), pending_user_boundary);
+        let unchanged = projected_tail.is_empty() && Arc::ptr_eq(source_items, projected_items);
+        let mut retained = Vec::with_capacity(
+            projected_items.len().saturating_add(projected_tail.len()),
+        );
         let mut introduced_tokens = 0i64;
         let mut source_index = 0usize;
-        for (projected_index, item) in projected_items.iter().enumerate() {
+        for (projected_index, item) in projected.enumerate() {
             let counted = !is_resolved_reasoning(projected_index, item, last_instruction_boundary);
             if unchanged {
                 if counted {
@@ -1495,33 +1541,24 @@ impl ContextManager {
         item: &ResponseItem,
         policy: TruncationPolicy,
     ) -> ResponseItem {
-        let exact_read = crate::tool_history::item_call_id(item).is_some_and(|call_id| {
-            self.items
-                .iter()
-                .rev()
-                .find_map(|prior| match prior {
-                    ResponseItem::FunctionCall {
-                        call_id: id,
-                        name,
-                        namespace,
-                        ..
-                    }
-                    | ResponseItem::CustomToolCall {
-                        call_id: id,
-                        name,
-                        namespace,
-                        ..
-                    } if id == call_id => Some(
-                        namespace.is_none()
-                            && matches!(name.as_str(), "read_file" | "read_tool_output"),
-                    ),
-                    _ => None,
-                })
-                .unwrap_or(false)
-        });
+        let class = if matches!(item,
+            ResponseItem::FunctionCallOutput { .. } | ResponseItem::CustomToolCallOutput { .. })
+        {
+            let mut index = self.tool_call_classes.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if !weak_ptr_eq_arc(&index.source, &self.items) {
+                index.calls.clear();
+                index.append(&self.items);
+                index.source = Arc::downgrade(&self.items);
+            }
+            crate::tool_history::item_call_id(item)
+                .and_then(|id| index.calls.get(id)).copied().unwrap_or_default()
+        } else {
+            ToolCallClassification::default()
+        };
         let truncate_output = |output: &FunctionCallOutputPayload| {
             let bounded = truncate_function_output_payload(output, policy);
-            if !exact_read || bounded == *output {
+            if !class.exact_read || bounded == *output {
                 return bounded;
             }
             // A legacy/resumed packet may face a smaller policy than its owner
@@ -1560,27 +1597,7 @@ impl ContextManager {
                 success: Some(false),
             }
         };
-        if let Some(call_id) = crate::tool_history::item_call_id(item)
-            && matches!(
-                item,
-                ResponseItem::FunctionCallOutput { .. } | ResponseItem::CustomToolCallOutput { .. }
-            )
-            && self.items.iter().rev().any(|prior| match prior {
-                ResponseItem::FunctionCall {
-                    call_id: id,
-                    name,
-                    namespace: None,
-                    ..
-                }
-                | ResponseItem::CustomToolCall {
-                    call_id: id,
-                    name,
-                    namespace: None,
-                    ..
-                } => id == call_id && matches!(name.as_str(), "exec" | "wait"),
-                _ => false,
-            })
-        {
+        if class.code_mode_budget {
             // The cell owner has already enforced its tokenizer-based budget.
             return item.clone();
         }
@@ -2184,15 +2201,17 @@ fn hash_prepared_history_items(
     hasher: &mut Sha256,
     items: &[ResponseItem],
 ) -> serde_json::Result<()> {
+    let mut encoded = Vec::new();
     for item in items {
         // Turn IDs are rollout bookkeeping, not model-visible history. Normalize
         // them out so reconstruction and compaction do not churn an otherwise
         // unchanged prompt prefix.
-        let mut normalized = item.clone();
-        normalized.clear_internal_chat_message_metadata_passthrough();
-        let encoded = serde_json::to_vec(&normalized)?;
+        encoded.clear();
+        item.serialize_without_internal_chat_message_metadata_passthrough(
+            &mut serde_json::Serializer::new(&mut encoded),
+        )?;
         hasher.update((encoded.len() as u64).to_be_bytes());
-        hasher.update(encoded);
+        hasher.update(&encoded);
     }
     Ok(())
 }
@@ -2292,7 +2311,9 @@ fn estimate_response_item_model_visible_bytes(item: &ResponseItem) -> i64 {
         ResponseItem::Message { content, .. } => content
             .iter()
             .map(|part| match part {
-                ContentItem::InputText { text } | ContentItem::OutputText { text } => {
+                ContentItem::InputText { text }
+                | ContentItem::OutputText { text }
+                | ContentItem::Refusal { refusal: text } => {
                     text_bytes(text)
                 }
                 ContentItem::InputImage { image_url, detail } => {
@@ -2368,7 +2389,7 @@ fn estimate_response_item_model_visible_bytes(item: &ResponseItem) -> i64 {
             result,
             ..
         } => text_bytes(revised_prompt.as_deref().unwrap_or_default()).saturating_add(
-            if result.is_empty() {
+            if result.as_ref().is_none_or(String::is_empty) {
                 0
             } else {
                 RESIZED_IMAGE_BYTES_ESTIMATE
@@ -2602,8 +2623,8 @@ pub(crate) fn completed_turn_boundary(items: &[ResponseItem]) -> Option<usize> {
     completed_turn_boundary_with_pending_user(items, false)
 }
 
-fn completed_turn_boundary_with_pending_user(
-    _items: &[ResponseItem],
+fn completed_turn_boundary_with_pending_user<'a>(
+    _items: impl IntoIterator<Item = &'a ResponseItem>,
     _pending_user_boundary: bool,
 ) -> Option<usize> {
     // ResponseItem carries presentation and checklist state, not an accepted

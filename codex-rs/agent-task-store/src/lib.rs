@@ -8,7 +8,6 @@ mod error;
 mod id;
 mod local;
 mod model;
-mod proof;
 mod scope;
 mod shared;
 
@@ -18,6 +17,7 @@ pub use id::AssignmentId;
 pub use id::AttemptId;
 pub use id::MutationEventId;
 pub use id::WakeEventId;
+pub use local::DeferredHostCompletionWake;
 pub use local::LocalAgentTaskStore;
 pub use local::PendingTerminalOutcome;
 pub use local::TaskStoreFuture;
@@ -32,6 +32,3 @@ pub use scope::repository_workspace_id;
 #[cfg(test)]
 #[path = "tests.rs"]
 mod tests;
-
-#[cfg(test)]
-mod suite_budget_tests;

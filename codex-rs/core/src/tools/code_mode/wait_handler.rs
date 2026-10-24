@@ -190,13 +190,16 @@ impl CodeModeWaitHandler {
                             exit: OwnerHeldCodeModeExit::Runtime(
                                 terminate_interrupted_cell(&exec, &cell_id)
                                     .await
-                                    .map_err(FunctionCallError::RespondToModel)?,
+                                    .unwrap_or_else(|error| codex_code_mode::WaitOutcome::LiveCell(super::observation_error_response(&cell_id, error))),
                             ),
                             drained_observations: error.drained_observations,
                         },
                         Err(error) => {
-                            record_internally_drained_waits(&exec, error.drained_observations);
-                            return Err(FunctionCallError::RespondToModel(error.message));
+                            OwnerHeldCodeModeWait {
+                                exit: OwnerHeldCodeModeExit::Runtime(codex_code_mode::WaitOutcome::LiveCell(
+                                    super::observation_error_response(&cell_id, error.message))),
+                                drained_observations: error.drained_observations,
+                            }
                         }
                     };
                     let response = match held.exit {
@@ -209,15 +212,13 @@ impl CodeModeWaitHandler {
                     };
                     Ok((response, held.drained_observations))
                 }
-                .map_err(FunctionCallError::RespondToModel)?;
+                .unwrap_or_else(|error| (codex_code_mode::WaitOutcome::LiveCell(super::observation_error_response(&cell_id, error)), 0));
                 let authoritative_wait_signal =
                     terminal_wait_owner_signal(&wait_response, &cell_id);
                 let keep_dispatch_open = matches!(
                     &wait_response,
-                    codex_code_mode::WaitOutcome::LiveCell(
-                        codex_code_mode::RuntimeResponse::Yielded { .. }
-                            | codex_code_mode::RuntimeResponse::ExplicitYield { .. }
-                    )
+                    codex_code_mode::WaitOutcome::LiveCell(response)
+                        if !super::runtime_response_is_terminal(response)
                 );
                 // Observation errors do not prove that the cell stopped. Only
                 // retire a confirmed terminal response, after packet formatting.
@@ -241,11 +242,7 @@ impl CodeModeWaitHandler {
                 }
                 let mut terminal_parent_call_id = None;
                 if let codex_code_mode::WaitOutcome::LiveCell(response) = &wait_response
-                    && !matches!(
-                        response,
-                        codex_code_mode::RuntimeResponse::Yielded { .. }
-                            | codex_code_mode::RuntimeResponse::ExplicitYield { .. }
-                    )
+                    && super::runtime_response_is_terminal(response)
                 {
                     // Only a live-cell wait can close a CodeCell. A missing
                     // cell is still an ordinary `wait` tool result, but there
@@ -261,18 +258,6 @@ impl CodeModeWaitHandler {
                         .services
                         .code_mode_service
                         .cell_parent_call_id(runtime_cell_id);
-                    if exec.session.services.rollout_thread_trace.is_enabled() {
-                        let trace = exec
-                            .session
-                            .services
-                            .rollout_thread_trace
-                            .code_cell_trace_context(
-                                exec.turn.sub_id.as_str(),
-                                runtime_cell_id.as_str(),
-                            );
-                        let response = response.clone();
-                        dispatch_lease.record_trace(move || trace.record_ended(&response));
-                    }
                 }
                 // The response is already captured. Cancellation releases only
                 // this delivery gate, not the result or unrelated UI leases.
@@ -306,7 +291,7 @@ impl CodeModeWaitHandler {
                     .session
                     .services
                     .code_mode_service
-                    .observe_packet_retention(&cell_id, args.terminate, &cancellation_token)
+                    .observe_packet_retention(&cell_id, args.terminate || super::observation_failed(&response), &cancellation_token)
                     .await;
                 let delivery = exec
                     .session
@@ -413,6 +398,7 @@ fn terminal_wait_owner_signal(
         codex_code_mode::WaitOutcome::MissingCell(_) => return None,
     };
     let state = match response {
+        response if super::observation_failed(response) => return None,
         codex_code_mode::RuntimeResponse::Terminated { .. } => "terminated",
         codex_code_mode::RuntimeResponse::Result { error_text, .. } => {
             if error_text.is_some() {

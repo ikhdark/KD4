@@ -51,14 +51,27 @@ impl LoadableToolSpec {
     /// Normalize persisted discovery output, including legacy flat functions.
     /// Unknown shapes must stay raw rather than become a complete name receipt.
     pub fn callable_names_from_value(value: &serde_json::Value) -> Option<Vec<String>> {
-        let name = |value: &serde_json::Value| {
+        fn name(value: &serde_json::Value) -> Option<&str> {
             value
-                .get("name")
-                .and_then(serde_json::Value::as_str)
-                .filter(|name| !name.is_empty())
-                .map(str::to_owned)
-        };
+                .get("name")?
+                .as_str()
+                .filter(|name| !name.is_empty() && name.trim() == *name)
+        }
+        fn scope(value: &serde_json::Value) -> Option<Option<&str>> {
+            match value.get("namespace") {
+                None => Some(None),
+                Some(serde_json::Value::String(scope))
+                    if !scope.is_empty() && scope.trim() == scope =>
+                {
+                    Some(Some(scope))
+                }
+                Some(_) => None,
+            }
+        }
         if value.get("type").and_then(serde_json::Value::as_str) == Some("namespace") {
+            if value.get("namespace").is_some() || value.get("function").is_some() {
+                return None;
+            }
             let namespace = name(value)?;
             return value
                 .get("tools")?
@@ -67,6 +80,11 @@ impl LoadableToolSpec {
                 .map(|tool| {
                     (tool.get("type").and_then(serde_json::Value::as_str) == Some("function"))
                         .then_some(())?;
+                    if tool.get("function").is_some()
+                        || scope(tool)?.is_some_and(|scope| scope != namespace)
+                    {
+                        return None;
+                    }
                     Some(format!("{namespace}.{}", name(tool)?))
                 })
                 .collect();
@@ -74,15 +92,23 @@ impl LoadableToolSpec {
         if value.get("type").is_some_and(|kind| kind != "function") {
             return None;
         }
-        let function = value.get("function").unwrap_or(value);
+        let namespace = scope(value)?;
+        let function = if let Some(function) = value.get("function") {
+            if value.get("name").is_some()
+                || function.get("namespace").is_some()
+                || function.get("function").is_some()
+                || function.get("type").is_some_and(|kind| kind != "function")
+            {
+                return None;
+            }
+            function
+        } else {
+            value
+        };
         let name = name(function)?;
-        Some(vec![match value
-            .get("namespace")
-            .and_then(serde_json::Value::as_str)
-            .filter(|namespace| !namespace.is_empty())
-        {
+        Some(vec![match namespace {
             Some(namespace) => format!("{namespace}.{name}"),
-            None => name,
+            None => name.to_owned(),
         }])
     }
 

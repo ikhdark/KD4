@@ -1,5 +1,57 @@
 use super::*;
 
+#[tokio::test]
+async fn explicit_local_environment_selection_skips_fallback_snapshot() {
+    let home = tempfile::tempdir().unwrap();
+    let selected = AbsolutePathBuf::from_absolute_path(home.path().join("selected")).unwrap();
+    let fallback = AbsolutePathBuf::from_absolute_path(home.path().join("fallback")).unwrap();
+    let calls = std::cell::Cell::new(0);
+    let selections = vec![TurnEnvironmentSelection {
+        environment_id: LOCAL_ENVIRONMENT_ID.into(),
+        cwd: codex_utils_path_uri::PathUri::from_abs_path(&selected),
+    }];
+    let actual = environment_fallback_cwd(&selections, async {
+        calls.set(calls.get() + 1);
+        fallback.clone()
+    }).await;
+    assert_eq!(actual, selected);
+    assert_eq!(calls.get(), 0, "explicit local cwd must not load a config snapshot");
+    for selections in [Vec::new(), vec![TurnEnvironmentSelection {
+        environment_id: "remote".into(),
+        cwd: codex_utils_path_uri::PathUri::from_abs_path(&selected),
+    }]] {
+        assert_eq!(environment_fallback_cwd(&selections, async {
+            calls.set(calls.get() + 1);
+            fallback.clone()
+        }).await, fallback);
+    }
+    assert_eq!(calls.get(), 2, "missing local cwd loads exactly one fallback per request");
+}
+
+#[test]
+fn task_fingerprint_envelope_moves_request_and_preserves_previous_hash() {
+    let payload = "escaped \"\\\n é".repeat(1024);
+    let allocation = payload.as_ptr();
+    let identity = task_fingerprint_envelope(Value::String(payload), "workspace", "settings");
+    assert_eq!(identity["request"].as_str().unwrap().as_ptr(), allocation, "the existing Value payload must move into its envelope");
+    for input in ["ordinary", "escaped \"\\\n é"] {
+        let params = TurnStartParams {
+            thread_id: "thread".into(), client_user_message_id: Some("retry".into()),
+            run_independently: Some(true),
+            input: vec![V2UserInput::Text { text: input.repeat(1024), text_elements: Vec::new() }],
+            ..Default::default()
+        };
+        let mut request = serde_json::to_value(&params).unwrap();
+        let object = request.as_object_mut().unwrap();
+        object.remove("clientUserMessageId");
+        object.remove("runIndependently");
+        canonicalize_task_fingerprint_json(&mut request);
+        let previous_identity = serde_json::json!({"request": request, "workspace": "C:/repo", "settings": "model=o3"});
+        let expected = hex::encode(Sha256::digest(serde_json::to_vec(&previous_identity).unwrap()));
+        assert_eq!(normalized_task_fingerprint(&params, "C:/repo", "model=o3"), Some(expected));
+    }
+}
+
 #[test]
 fn turn_interrupt_requires_matching_live_target_or_running_startup_race() {
     for status in [

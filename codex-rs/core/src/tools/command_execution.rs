@@ -18,12 +18,10 @@ use tokio::sync::Mutex;
 
 use crate::digest_writer::DigestWriter;
 use crate::tools::command_output_artifact::RawOutputArtifact;
-use crate::tools::handlers::command_search::RgSearchBreadth;
-use crate::tools::handlers::command_search::RgSearchNarrowing;
 
 const MAX_TRACKED_COMMANDS: usize = 128;
-const COMMAND_EXECUTION_CACHE_SCHEMA_VERSION: u32 = 5;
-const COMMAND_FINGERPRINT_VERSION: &str = "v2";
+const COMMAND_EXECUTION_CACHE_SCHEMA_VERSION: u32 = 6;
+const COMMAND_FINGERPRINT_VERSION: &str = "v3";
 static NEXT_COMMAND_EXECUTION_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
@@ -50,52 +48,7 @@ pub(crate) struct CommandAttemptKey {
     cwd: String,
     command: Vec<String>,
     execution_context: BTreeMap<String, String>,
-    search_narrowing: Option<SearchNarrowingAttempt>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
-struct SearchNarrowingAttempt {
-    turn_id: String,
-    environment_id: String,
-    repository_identity: String,
-    breadth: RgSearchBreadth,
-    query_identity: String,
-    search_identity: String,
-    scope_identity: String,
-    parent_scope_identity: Option<String>,
-    scope_state_identity: Option<String>,
-    can_record_miss: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-struct SearchMissCacheKey {
-    environment_id: String,
-    repository_identity: String,
-    search_identity: String,
-    scope_state_identity: String,
-    execution_context: BTreeMap<String, String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-struct SearchNarrowingScope {
-    turn_id: String,
-    environment_id: String,
-    repository_identity: String,
-    query_identity: String,
-    scope_identity: String,
-}
-
-impl SearchNarrowingAttempt {
-    fn parent_scope(&self) -> Option<SearchNarrowingScope> {
-        let scope_identity = self.parent_scope_identity.as_ref()?;
-        Some(SearchNarrowingScope {
-            turn_id: self.turn_id.clone(),
-            environment_id: self.environment_id.clone(),
-            repository_identity: self.repository_identity.clone(),
-            query_identity: self.query_identity.clone(),
-            scope_identity: scope_identity.clone(),
-        })
-    }
+    search_no_match_eligible: bool,
 }
 
 impl CommandAttemptKey {
@@ -122,7 +75,7 @@ impl CommandAttemptKey {
             cwd: cwd.into(),
             command: command.to_vec(),
             execution_context: BTreeMap::new(),
-            search_narrowing: None,
+            search_no_match_eligible: false,
         }
     }
 
@@ -174,88 +127,24 @@ impl CommandAttemptKey {
         }
     }
 
-    pub(crate) fn with_search_narrowing(
-        mut self,
-        turn_id: &str,
-        repository_identity: &str,
-        search: Option<RgSearchNarrowing>,
-    ) -> Self {
-        self.search_narrowing = search.map(|search| SearchNarrowingAttempt {
-            turn_id: turn_id.to_string(),
-            environment_id: self.environment_id.clone(),
-            repository_identity: repository_identity.to_string(),
-            breadth: search.breadth,
-            query_identity: search.query_identity,
-            search_identity: search.search_identity,
-            scope_identity: search.scope_identity,
-            parent_scope_identity: search.parent_scope_identity,
-            scope_state_identity: search.scope_state_identity,
-            can_record_miss: search.can_record_miss,
-        });
+    pub(crate) fn with_search_no_match_eligibility(mut self, eligible: bool) -> Self {
+        self.search_no_match_eligible = eligible;
         self
     }
 
     pub(crate) fn with_search_environment(mut self, environment: &HashMap<String, String>) -> Self {
-        let Some(search) = self.search_narrowing.as_mut() else {
-            return self;
-        };
-        // Both production command routes call this after selecting their actual
-        // environment. A host scope scan cannot identify the image selected by
-        // that runtime (PATH, aliases, wrappers, or replacement at launch).
-        // Until the process owner supplies that proof, keep narrowing advice but
-        // never suppress a new execution using negative evidence.
-        search.scope_state_identity = None;
-        // The scope snapshot cannot account for options or further file inputs
-        // loaded from external configuration. Run the search instead of caching
-        // a negative result based only on the unchanged configuration pathname.
         if environment.iter().any(|(key, value)| {
             !value.is_empty()
-                && [
-                    "RIPGREP_CONFIG_PATH",
-                    "GIT_CONFIG_GLOBAL",
-                    "GIT_CONFIG_SYSTEM",
-                ]
-                .iter()
-                .any(|name| key.eq_ignore_ascii_case(name))
+                && ["RIPGREP_CONFIG_PATH", "GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM"]
+                    .iter().any(|name| key.eq_ignore_ascii_case(name))
         }) {
-            search.can_record_miss = false;
+            self.search_no_match_eligible = false;
         }
         self
     }
 
-    fn search_miss_cache_key(&self) -> Option<SearchMissCacheKey> {
-        let search = self.eligible_search_miss()?;
-        self.search_miss_cache_key_for(search)
-    }
-
-    fn eligible_search_miss(&self) -> Option<&SearchNarrowingAttempt> {
-        self.search_narrowing
-            .as_ref()
-            .filter(|search| search.can_record_miss)
-    }
-
     pub(crate) fn is_search_no_match(&self, exit_code: Option<i32>) -> bool {
-        exit_code == Some(1) && self.eligible_search_miss().is_some()
-    }
-
-    fn search_miss_cache_key_for(
-        &self,
-        search: &SearchNarrowingAttempt,
-    ) -> Option<SearchMissCacheKey> {
-        Some(SearchMissCacheKey {
-            environment_id: search.environment_id.clone(),
-            repository_identity: search.repository_identity.clone(),
-            search_identity: search.search_identity.clone(),
-            scope_state_identity: search.scope_state_identity.clone()?,
-            execution_context: self
-                .execution_context
-                .iter()
-                .filter(|(label, _)| {
-                    !matches!(label.as_str(), "repository_epoch" | "workspace_identity")
-                })
-                .map(|(label, fingerprint)| (label.clone(), fingerprint.clone()))
-                .collect(),
-        })
+        exit_code == Some(1) && self.search_no_match_eligible
     }
 
     pub(crate) fn fingerprint(&self) -> String {
@@ -308,13 +197,9 @@ pub(crate) struct CommandAttemptBlocked {
 enum CommandAttemptBlockedReason {
     DeterministicFailure(DeterministicFailureRecord),
     PersistedInputFailure(PersistedInputFailure),
-    SearchMiss,
 }
 
 impl CommandAttemptBlocked {
-    pub(crate) fn is_search_miss(&self) -> bool {
-        matches!(self.reason, CommandAttemptBlockedReason::SearchMiss)
-    }
 
     pub(crate) fn render_for_model(&self) -> String {
         match &self.reason {
@@ -336,10 +221,6 @@ impl CommandAttemptBlocked {
                 failure.proof.outcome_class(),
                 self.fingerprint,
                 failure.exit_code,
-            ),
-            CommandAttemptBlockedReason::SearchMiss => format!(
-                "Search returned no matches: an equivalent search already produced a negative result under the unchanged repository and execution context (fingerprint `{}`); execution was suppressed. Change the query or scope, or use read_file or list_files when available to revalidate current filesystem evidence when external state changed.",
-                self.fingerprint,
             ),
         }
     }
@@ -458,7 +339,6 @@ struct CommandExecutionPersistence {
 struct CommandExecutionCacheDocument {
     schema_version: u32,
     workspace_identity: crate::git_workspace::WorkspaceEvidenceIdentity,
-    search_misses: Vec<SearchMissCacheKey>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     input_failures: BTreeMap<String, PersistedInputFailure>,
 }
@@ -479,18 +359,13 @@ struct CommandRepositoryState {
     observed_workspace_identity: Option<(u64, crate::git_workspace::WorkspaceEvidenceIdentity)>,
     observed_workspace_identity_hash: Option<(u64, String)>,
     observed_turn_mutation_revisions: HashMap<String, u64>,
-    uncertain_command_baselines: HashMap<String, UncertainCommandBaseline>,
+
 }
 
-struct UncertainCommandBaseline {
-    turn_id: String,
-    workspace_identity: Option<crate::git_workspace::WorkspaceEvidenceIdentity>,
-    /// Bounded tree identity of a local workspace outside any Git repository.
-    non_git_tree_identity: Option<String>,
-}
 
 #[derive(Default)]
 struct CommandRetryState {
+    persisted_cache_loaded: bool,
     attempts: HashMap<CommandAttemptKey, AttemptEntry>,
     insertion_order: VecDeque<CommandAttemptKey>,
     input_failures: BTreeMap<String, PersistedInputFailure>,
@@ -498,33 +373,11 @@ struct CommandRetryState {
 }
 
 #[derive(Default)]
-struct CommandSearchState {
-    revision: u64,
-    persisted_cache_loaded: bool,
-    allowed_expansions: HashSet<SearchNarrowingScope>,
-    misses: HashSet<SearchMissCacheKey>,
-    miss_order: VecDeque<SearchMissCacheKey>,
-    /// Exact bounded streams are session-local; persisted set membership alone
-    /// must never be promoted to typed execution evidence.
-    retained_misses: HashMap<SearchMissCacheKey, RetainedSearchMiss>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub(crate) struct RetainedSearchMiss {
-    pub(crate) evidence_id: String,
-    pub(crate) original_execution_id: String,
-    pub(crate) validity_scope_fingerprint: String,
-    pub(crate) stdout: String,
-    pub(crate) stderr: String,
-}
-
-#[derive(Default)]
 struct CommandExecutionState {
-    persisted_revision: Option<(crate::git_workspace::WorkspaceEvidenceIdentity, u64, u64)>,
+    persisted_revision: Option<(crate::git_workspace::WorkspaceEvidenceIdentity, u64)>,
     retry: CommandRetryState,
     process: CommandProcessState,
     repository: CommandRepositoryState,
-    search: CommandSearchState,
 }
 
 pub(crate) struct CommandExecutionLedger {
@@ -600,99 +453,6 @@ impl CommandExecutionLedger {
         self
     }
 
-    pub(crate) async fn admit_search_narrowing(
-        &self,
-        key: &CommandAttemptKey,
-    ) -> Result<(), String> {
-        let Some(search) = key.search_narrowing.as_ref() else {
-            return Ok(());
-        };
-        if search.breadth == RgSearchBreadth::Narrow {
-            return Ok(());
-        }
-        let scope = SearchNarrowingScope {
-            turn_id: search.turn_id.clone(),
-            environment_id: search.environment_id.clone(),
-            repository_identity: search.repository_identity.clone(),
-            query_identity: search.query_identity.clone(),
-            scope_identity: search.scope_identity.clone(),
-        };
-        let preceded_by_narrow_miss = self
-            .state
-            .lock()
-            .await
-            .search
-            .allowed_expansions
-            .contains(&scope);
-        tracing::debug!(
-            preceded_by_narrow_miss,
-            query_identity = %search.query_identity,
-            "admitting broad rg search"
-        );
-        Ok(())
-    }
-
-    #[cfg(test)]
-    pub(crate) async fn record_uncertain_command_baseline(
-        &self,
-        call_id: &str,
-        turn_id: &str,
-        baseline: Option<crate::git_workspace::WorkspaceEvidenceIdentity>,
-    ) {
-        self.record_uncertain_command_baseline_with_tree(call_id, turn_id, baseline, None)
-            .await;
-    }
-
-    /// A non-Git tree identity accompanies only a `None` workspace identity:
-    /// a completed capture outside any Git repository.
-    pub(crate) async fn record_uncertain_command_baseline_with_tree(
-        &self,
-        call_id: &str,
-        turn_id: &str,
-        baseline: Option<crate::git_workspace::WorkspaceEvidenceIdentity>,
-        non_git_tree_identity: Option<String>,
-    ) {
-        self.state
-            .lock()
-            .await
-            .repository
-            .uncertain_command_baselines
-            .insert(
-                call_id.to_string(),
-                UncertainCommandBaseline {
-                    turn_id: turn_id.to_string(),
-                    workspace_identity: baseline,
-                    non_git_tree_identity,
-                },
-            );
-    }
-
-    pub(crate) async fn has_uncertain_command_baseline(&self, call_id: &str) -> bool {
-        self.state
-            .lock()
-            .await
-            .repository
-            .uncertain_command_baselines
-            .contains_key(call_id)
-    }
-
-    /// The pre-command workspace identity and, outside any Git repository, the
-    /// bounded tree identity captured with it.
-    pub(crate) async fn take_uncertain_command_baseline(
-        &self,
-        call_id: &str,
-    ) -> Option<(
-        Option<crate::git_workspace::WorkspaceEvidenceIdentity>,
-        Option<String>,
-    )> {
-        self.state
-            .lock()
-            .await
-            .repository
-            .uncertain_command_baselines
-            .remove(call_id)
-            .map(|baseline| (baseline.workspace_identity, baseline.non_git_tree_identity))
-    }
 
     /// Reuse a snapshot captured under the dispatch workspace lease. The ledger
     /// belongs to its original local cwd; another workspace must not seed it.
@@ -725,6 +485,22 @@ impl CommandExecutionLedger {
             .load(Ordering::Relaxed)
     }
 
+    /// Invalidate cached command observations without acquiring a workspace
+    /// snapshot. The next command admission owns any required fresh capture.
+    pub(crate) async fn invalidate_repository_revision(&self, turn_id: &str, mutation_revision: u64) {
+        let mut state = self.state.lock().await;
+        let previous = state.repository.observed_turn_mutation_revisions
+            .entry(turn_id.to_owned()).or_default();
+        let delta = mutation_revision.saturating_sub(*previous);
+        *previous = (*previous).max(mutation_revision);
+        if delta == 0 { return; }
+        state.repository.epoch = state.repository.epoch.saturating_add(delta);
+        state.repository.observed_workspace_identity = None;
+        state.repository.observed_workspace_identity_hash = None;
+        state.repository.workspace_identity_observation_epoch = None;
+        state.repository.workspace_identity_observation_turn = None;
+    }
+
     pub(crate) async fn observe_repository_revision(
         &self,
         turn_id: &str,
@@ -738,191 +514,10 @@ impl CommandExecutionLedger {
         &self,
         turn_id: &str,
         mutation_revision: u64,
-        observed_workspace_identity: Option<crate::git_workspace::WorkspaceEvidenceIdentity>,
+        _observed_workspace_identity: Option<crate::git_workspace::WorkspaceEvidenceIdentity>,
     ) -> u64 {
-        let requested_repository_epoch = {
-            let mut state = self.state.lock().await;
-            let delta = {
-                let observed_revision = state
-                    .repository
-                    .observed_turn_mutation_revisions
-                    .entry(turn_id.to_string())
-                    .or_default();
-                let delta = mutation_revision.saturating_sub(*observed_revision);
-                *observed_revision = (*observed_revision).max(mutation_revision);
-                delta
-            };
-            state.repository.epoch = state.repository.epoch.saturating_add(delta);
-            state.repository.epoch
-        };
-
-        let Ok(_refresh_permit) = self.workspace_identity_refresh.acquire().await else {
-            unreachable!("command-execution workspace refresh semaphore is never closed");
-        };
-        let (repository_epoch, expected_repository_root) = {
-            let mut state = self.state.lock().await;
-            let repository_epoch = state.repository.epoch;
-            // Local mutation revisions do not include external edits. A supplied
-            // dispatch baseline must agree before reusing the cached identity.
-            if state
-                .repository
-                .observed_workspace_identity
-                .as_ref()
-                .is_some_and(|(epoch, identity)| {
-                    *epoch == repository_epoch
-                        && observed_workspace_identity
-                            .as_ref()
-                            .is_none_or(|observed| observed == identity)
-                })
-                || (observed_workspace_identity.is_none()
-                    && state.repository.workspace_identity_observation_epoch
-                        == Some(repository_epoch)
-                    && state
-                        .repository
-                        .workspace_identity_observation_turn
-                        .as_deref()
-                        == Some(turn_id))
-            {
-                return repository_epoch;
-            }
-            let expected_repository_root = state
-                .repository
-                .observed_workspace_identity
-                .as_ref()
-                .and_then(|(_, identity)| identity.repository_root.clone());
-            state.repository.observed_workspace_identity = None;
-            state.repository.observed_workspace_identity_hash = None;
-            (repository_epoch, expected_repository_root)
-        };
-        let observed_workspace_identity = observed_workspace_identity.filter(|identity| {
-            identity.repository_root.is_some()
-                && requested_repository_epoch == repository_epoch
-                && expected_repository_root
-                    .as_ref()
-                    .is_none_or(|root| identity.repository_root.as_ref() == Some(root))
-        });
-        let observed_workspace_identity = match observed_workspace_identity {
-            Some(identity) => Some(identity),
-            None => match self.persistence.as_ref() {
-                Some(persistence) => {
-                    #[cfg(test)]
-                    self.workspace_identity_capture_count
-                        .fetch_add(1, Ordering::Relaxed);
-                    match &self.workspace_cache {
-                        Some(cache) => {
-                            cache
-                                .workspace_evidence_identity_with_attribution(&persistence.cwd)
-                                .await
-                                .identity
-                        }
-                        None => {
-                            crate::git_workspace::capture_workspace_evidence_identity(
-                                &persistence.cwd,
-                            )
-                            .await
-                        }
-                    }
-                }
-                None => None,
-            },
-        };
-        // A failed capture never authorizes reuse, so it must not be recorded as
-        // an observation either: keeping it would make the retry gate below treat
-        // this turn's failure as a settled answer for the rest of the session.
-        let observed_workspace_identity =
-            observed_workspace_identity.filter(|identity| !identity.unavailable);
-        let load_persisted_cache = !self.state.lock().await.search.persisted_cache_loaded;
-        let cached_document = if load_persisted_cache {
-            match self.persistence.as_ref() {
-                Some(persistence) => tokio::fs::read(&persistence.cache_path)
-                    .await
-                    .ok()
-                    .and_then(|bytes| {
-                        serde_json::from_slice::<CommandExecutionCacheDocument>(&bytes).ok()
-                    })
-                    .filter(|document| {
-                        matches!(
-                            document.schema_version,
-                            COMMAND_EXECUTION_CACHE_SCHEMA_VERSION
-                        )
-                    }),
-                None => None,
-            }
-        } else {
-            None
-        };
-        let workspace_identity_hash = observed_workspace_identity
-            .as_ref()
-            .map(workspace_identity_hash);
-        let cached_document = cached_document.filter(|document| {
-            // Each miss proves its own scope at lookup. Only the repository
-            // namespace, not unrelated dirty files, governs restoring entries.
-            observed_workspace_identity
-                .as_ref()
-                .is_some_and(|identity| {
-                    identity.repository_root.is_some()
-                        && identity.repository_root == document.workspace_identity.repository_root
-                })
-        });
-        let mut state = self.state.lock().await;
-        if state.repository.epoch == repository_epoch {
-            state.search.persisted_cache_loaded |=
-                load_persisted_cache && workspace_identity_hash.is_some();
-            state.repository.workspace_identity_observation_epoch = Some(repository_epoch);
-            state.repository.workspace_identity_observation_turn = Some(turn_id.to_owned());
-            if let (Some(workspace_identity), Some(workspace_identity_hash)) =
-                (observed_workspace_identity, workspace_identity_hash)
-            {
-                state.repository.observed_workspace_identity =
-                    Some((repository_epoch, workspace_identity));
-                state.repository.observed_workspace_identity_hash =
-                    Some((repository_epoch, workspace_identity_hash));
-            }
-            if let Some(document) = cached_document {
-                let complete_document = state
-                    .repository
-                    .observed_workspace_identity
-                    .as_ref()
-                    .is_some_and(|(_, identity)| identity == &document.workspace_identity)
-                    && state.search.miss_order.is_empty()
-                    && document.search_misses.len() <= MAX_TRACKED_COMMANDS
-                    && state.retry.input_failures.is_empty()
-                    && document.input_failures.len() <= MAX_TRACKED_COMMANDS;
-                for search_miss in document
-                    .search_misses
-                    .into_iter()
-                    .take(MAX_TRACKED_COMMANDS)
-                {
-                    if state.search.misses.insert(search_miss.clone()) {
-                        state.search.miss_order.push_back(search_miss);
-                        state.search.revision = state.search.revision.wrapping_add(1);
-                    }
-                }
-                for (fingerprint, failure) in document
-                    .input_failures
-                    .into_iter()
-                    .take(MAX_TRACKED_COMMANDS)
-                {
-                    if let std::collections::btree_map::Entry::Vacant(entry) =
-                        state.retry.input_failures.entry(fingerprint)
-                    {
-                        entry.insert(failure);
-                        state.retry.revision = state.retry.revision.wrapping_add(1);
-                    }
-                }
-                while state.retry.input_failures.len() > MAX_TRACKED_COMMANDS {
-                    state.retry.input_failures.pop_first();
-                }
-                if complete_document {
-                    state.persisted_revision = Some((
-                        document.workspace_identity,
-                        state.search.revision,
-                        state.retry.revision,
-                    ));
-                }
-            }
-        }
-        state.repository.epoch
+        self.invalidate_repository_revision(turn_id, mutation_revision).await;
+        self.state.lock().await.repository.epoch
     }
 
     pub(crate) async fn current_workspace_identity_hash(
@@ -997,15 +592,6 @@ impl CommandExecutionLedger {
                     reason: CommandAttemptBlockedReason::PersistedInputFailure(failure.clone()),
                 });
             }
-            if let Some(search_miss_key) = key.search_miss_cache_key()
-                && state.search.misses.contains(&search_miss_key)
-            {
-                touch_search_miss_locked(&mut state.search, &search_miss_key);
-                return Err(CommandAttemptBlocked {
-                    fingerprint: fingerprint_value(&search_miss_key),
-                    reason: CommandAttemptBlockedReason::SearchMiss,
-                });
-            }
         }
         let entry = attempt_entry_locked(&mut state, key);
         entry.attempts = entry.attempts.saturating_add(1);
@@ -1017,60 +603,7 @@ impl CommandExecutionLedger {
 
     pub(crate) async fn record_exit(&self, key: &CommandAttemptKey, exit_code: i32) {
         let mut state = self.state.lock().await;
-        // Exit-only observations cannot prove a negative search result.
-        if exit_code != 1 {
-            record_search_result_locked(&mut state, key, false);
-        }
         record_exit_locked(&mut state, key, exit_code);
-    }
-
-    pub(crate) async fn record_verified_search_result(
-        &self,
-        key: &CommandAttemptKey,
-        no_match: bool,
-    ) {
-        record_search_result_locked(&mut *self.state.lock().await, key, no_match);
-    }
-
-    pub(crate) async fn record_retained_search_miss(
-        &self,
-        key: &CommandAttemptKey,
-        original_execution_id: String,
-        stdout: String,
-        stderr: String,
-    ) {
-        if stdout.len().saturating_add(stderr.len()) > 16 * 1024 {
-            return;
-        }
-        let Some(cache_key) = key.search_miss_cache_key() else {
-            return;
-        };
-        let mut state = self.state.lock().await;
-        record_search_result_locked(&mut state, key, true);
-        state.search.retained_misses.insert(
-            cache_key.clone(),
-            RetainedSearchMiss {
-                evidence_id: uuid::Uuid::now_v7().to_string(),
-                original_execution_id,
-                validity_scope_fingerprint: fingerprint_value(&cache_key),
-                stdout,
-                stderr,
-            },
-        );
-    }
-
-    pub(crate) async fn retained_search_miss(
-        &self,
-        key: &CommandAttemptKey,
-    ) -> Option<RetainedSearchMiss> {
-        let cache_key = key.search_miss_cache_key()?;
-        let state = self.state.lock().await;
-        state
-            .search
-            .misses
-            .contains(&cache_key)
-            .then(|| state.search.retained_misses.get(&cache_key).cloned())
-            .flatten()
     }
 
     /// Enrich the existing identity even when an exit-only watcher got there
@@ -1091,12 +624,10 @@ impl CommandExecutionLedger {
             sampling_signal: None,
         };
         let mut state = self.state.lock().await;
-        let mut search = None;
         let process = &mut state.process;
         let slot = if let Some(running) = process.running.get_mut(&process_id).filter(|command| {
             command.parent_tool_execution_id.0 == parent && command.incarnation == incarnation
         }) {
-            search = Some(running.key.clone());
             Some(&mut running.terminal_facts)
         } else if let Some(pending) = process
             .pending_by_execution_id
@@ -1107,7 +638,6 @@ impl CommandExecutionLedger {
                     && pending.command.incarnation == incarnation
             })
         {
-            search = Some(pending.command.key.clone());
             Some(&mut pending.command.terminal_facts)
         } else {
             process
@@ -1120,7 +650,6 @@ impl CommandExecutionLedger {
                 })
                 .map(|receipt| &mut receipt.terminal_facts)
         };
-        let mut accepted_no_match = false;
         if let Some(slot) = slot {
             if let Some(previous) = slot.as_ref() {
                 facts.sampling_signal = previous.sampling_signal.clone();
@@ -1138,12 +667,6 @@ impl CommandExecutionLedger {
             {
                 *slot = Some(facts);
             }
-            accepted_no_match = slot
-                .as_ref()
-                .is_some_and(|facts| facts.success && facts.search_no_match);
-        }
-        if let Some(key) = search {
-            record_search_result_locked(&mut state, &key, accepted_no_match);
         }
     }
 
@@ -1447,9 +970,7 @@ impl CommandExecutionLedger {
         let commit_guard = Arc::clone(&self.cache_persist).lock_owned().await;
         let Some((
             workspace_identity,
-            search_revision,
             retry_revision,
-            search_misses,
             input_failures,
         )) = ({
             let state = self.state.lock().await;
@@ -1460,9 +981,8 @@ impl CommandExecutionLedger {
                 .filter(|(epoch, _)| *epoch == state.repository.epoch)
                 .filter(|(_, identity)| {
                     state.persisted_revision.as_ref().is_none_or(
-                        |(persisted, revision, retry_revision)| {
+                        |(persisted, retry_revision)| {
                             persisted != identity
-                                || *revision != state.search.revision
                                 || *retry_revision != state.retry.revision
                         },
                     )
@@ -1470,9 +990,7 @@ impl CommandExecutionLedger {
                 .map(|(_, workspace_identity)| {
                     (
                         workspace_identity.clone(),
-                        state.search.revision,
                         state.retry.revision,
-                        state.search.miss_order.iter().cloned().collect::<Vec<_>>(),
                         state.retry.input_failures.clone(),
                     )
                 })
@@ -1483,7 +1001,6 @@ impl CommandExecutionLedger {
         let document = CommandExecutionCacheDocument {
             schema_version: COMMAND_EXECUTION_CACHE_SCHEMA_VERSION,
             workspace_identity: workspace_identity.clone(),
-            search_misses,
             input_failures,
         };
         let Ok(bytes) = serde_json::to_vec_pretty(&document) else {
@@ -1494,7 +1011,7 @@ impl CommandExecutionLedger {
                 #[cfg(test)]
                 self.cache_commit_count.fetch_add(1, Ordering::Relaxed);
                 self.state.lock().await.persisted_revision =
-                    Some((workspace_identity, search_revision, retry_revision));
+                    Some((workspace_identity, retry_revision));
             }
             Err(error) => tracing::warn!(%error, "failed to persist command execution cache"),
         }
@@ -1506,14 +1023,7 @@ impl CommandExecutionLedger {
             .repository
             .observed_turn_mutation_revisions
             .remove(turn_id);
-        state
-            .search
-            .allowed_expansions
-            .retain(|scope| scope.turn_id != turn_id);
-        state
-            .repository
-            .uncertain_command_baselines
-            .retain(|_, baseline| baseline.turn_id != turn_id);
+
     }
 
     pub(crate) async fn update_running_artifact(
@@ -1915,59 +1425,7 @@ fn record_running_exit_locked(
     running: &RunningCommand,
     exit_code: i32,
 ) {
-    if exit_code != 1 {
-        record_search_result_locked(state, &running.key, false);
-    }
     record_exit_locked(state, &running.key, exit_code);
-}
-
-fn touch_search_miss_locked(search: &mut CommandSearchState, key: &SearchMissCacheKey) {
-    if search.miss_order.back() == Some(key) {
-        return;
-    }
-    if let Some(position) = search.miss_order.iter().position(|cached| cached == key)
-        && let Some(cached) = search.miss_order.remove(position)
-    {
-        search.miss_order.push_back(cached);
-        search.revision = search.revision.wrapping_add(1);
-    }
-}
-
-fn record_search_result_locked(
-    state: &mut CommandExecutionState,
-    key: &CommandAttemptKey,
-    verified_no_match: bool,
-) {
-    let Some(search) = key.eligible_search_miss() else {
-        return;
-    };
-    if verified_no_match && let Some(parent_scope) = search.parent_scope() {
-        state.search.allowed_expansions.insert(parent_scope);
-    }
-    let Some(search_miss_key) = key.search_miss_cache_key_for(search) else {
-        return;
-    };
-    if verified_no_match && state.search.misses.insert(search_miss_key.clone()) {
-        state.search.revision = state.search.revision.wrapping_add(1);
-        state.search.miss_order.push_back(search_miss_key);
-        while state.search.misses.len() > MAX_TRACKED_COMMANDS {
-            if let Some(oldest) = state.search.miss_order.pop_front() {
-                state.search.misses.remove(&oldest);
-                state.search.retained_misses.remove(&oldest);
-            }
-        }
-    } else if verified_no_match {
-        touch_search_miss_locked(&mut state.search, &search_miss_key);
-    } else if state.search.misses.remove(&search_miss_key) {
-        state.search.retained_misses.remove(&search_miss_key);
-        // A fresh execution error supersedes an older negative result too.
-        // Only an attributable no-match exit can keep that result authoritative.
-        state.search.revision = state.search.revision.wrapping_add(1);
-        state
-            .search
-            .miss_order
-            .retain(|cached| cached != &search_miss_key);
-    }
 }
 
 fn record_exit_locked(state: &mut CommandExecutionState, key: &CommandAttemptKey, exit_code: i32) {
@@ -2139,8 +1597,8 @@ pub(crate) fn persist_synced_file(
 mod outcome_tests;
 
 #[cfg(test)]
-#[path = "command_execution_audit149_followup_tests.rs"]
-mod audit149_regressions;
+#[path = "command_execution_recovery_identity_tests.rs"]
+mod recovery_identity_tests;
 
 #[cfg(test)]
 mod tests {
@@ -2205,440 +1663,6 @@ mod tests {
             .status()
             .expect("launch git init");
         assert!(status.success(), "git init failed");
-    }
-
-    #[tokio::test]
-    async fn token_efficiency_broad_rg_is_admitted_with_or_without_narrow_miss() {
-        let ledger = CommandExecutionLedger::default();
-        let narrow = key("rg needle src").with_search_narrowing(
-            "turn-a",
-            "repo-a",
-            Some(RgSearchNarrowing {
-                breadth: RgSearchBreadth::Narrow,
-                query_identity: "needle".to_string(),
-                search_identity: "needle:src".to_string(),
-                scope_identity: "src".to_string(),
-                parent_scope_identity: Some("repo".to_string()),
-                scope_state_identity: Some("scope-state".to_string()),
-                state_paths: Vec::new(),
-                can_record_miss: true,
-            }),
-        );
-        let broad = key("rg needle .").with_search_narrowing(
-            "turn-a",
-            "repo-a",
-            Some(RgSearchNarrowing {
-                breadth: RgSearchBreadth::Broad,
-                query_identity: "needle".to_string(),
-                search_identity: "needle:repo".to_string(),
-                scope_identity: "repo".to_string(),
-                parent_scope_identity: None,
-                scope_state_identity: Some("scope-state".to_string()),
-                state_paths: Vec::new(),
-                can_record_miss: true,
-            }),
-        );
-
-        ledger
-            .admit_search_narrowing(&broad)
-            .await
-            .expect("a justified broad search is advisory, not rejected");
-        ledger
-            .admit_search_narrowing(&narrow)
-            .await
-            .expect("narrow search is admitted without prior state");
-        ledger.record_exit(&narrow, 1).await;
-        ledger.record_verified_search_result(&narrow, true).await;
-        ledger
-            .admit_search_narrowing(&broad)
-            .await
-            .expect("a narrow miss authorizes its immediate parent scope");
-
-        ledger.finish_turn("turn-a").await;
-        ledger
-            .admit_search_narrowing(&broad)
-            .await
-            .expect("admission remains advisory after narrow-miss state expires");
-    }
-
-    #[tokio::test]
-    async fn runtime_without_executable_proof_never_reuses_search_absence() {
-        let ledger = CommandExecutionLedger::default();
-        let search = RgSearchNarrowing {
-            breadth: RgSearchBreadth::Narrow,
-            query_identity: "needle".into(),
-            search_identity: "rg:needle:source.txt".into(),
-            scope_identity: "source.txt".into(),
-            parent_scope_identity: None,
-            scope_state_identity: Some("unchanged-source".into()),
-            state_paths: Vec::new(),
-            can_record_miss: true,
-        };
-        let make = |program: &str| {
-            CommandAttemptKey::new(
-                "exec_command",
-                "local",
-                "/repo",
-                &[program.to_string(), "needle".into(), "source.txt".into()],
-            )
-            .with_search_narrowing("turn", "repo", Some(search.clone()))
-        };
-        // Even a legacy weak entry cannot suppress a request assembled by either
-        // production route, including another image at the same executable path.
-        let weak = make("/tool-a/rg");
-        ledger.record_exit(&weak, 1).await;
-        ledger.record_verified_search_result(&weak, true).await;
-        assert!(ledger.begin_attempt(&weak, false).await.is_err());
-        for program in ["/tool-b/rg", "/tool-a/rg", "rg"] {
-            let current = make(program).with_search_environment(&HashMap::new());
-            assert!(
-                current.is_search_no_match(Some(1)),
-                "preserve real exit attribution"
-            );
-            assert!(current.search_miss_cache_key().is_none());
-            ledger.begin_attempt(&current, false).await.unwrap();
-            ledger.record_exit(&current, 1).await;
-            ledger.record_verified_search_result(&current, true).await;
-            ledger.begin_attempt(&current, false).await.unwrap();
-        }
-    }
-    #[tokio::test]
-    async fn token_efficiency_different_query_miss_does_not_block_broad_rg() {
-        let ledger = CommandExecutionLedger::default();
-        let narrow = key("rg other src").with_search_narrowing(
-            "turn-a",
-            "repo-a",
-            Some(RgSearchNarrowing {
-                breadth: RgSearchBreadth::Narrow,
-                query_identity: "other".to_string(),
-                search_identity: "other:src".to_string(),
-                scope_identity: "src".to_string(),
-                parent_scope_identity: Some("repo".to_string()),
-                scope_state_identity: Some("scope-state".to_string()),
-                state_paths: Vec::new(),
-                can_record_miss: true,
-            }),
-        );
-        let broad = key("rg needle .").with_search_narrowing(
-            "turn-a",
-            "repo-a",
-            Some(RgSearchNarrowing {
-                breadth: RgSearchBreadth::Broad,
-                query_identity: "needle".to_string(),
-                search_identity: "needle:repo".to_string(),
-                scope_identity: "repo".to_string(),
-                parent_scope_identity: None,
-                scope_state_identity: Some("scope-state".to_string()),
-                state_paths: Vec::new(),
-                can_record_miss: true,
-            }),
-        );
-
-        ledger.record_exit(&narrow, 1).await;
-        ledger.record_verified_search_result(&narrow, true).await;
-
-        ledger
-            .admit_search_narrowing(&broad)
-            .await
-            .expect("broad search guidance is not a runtime rejection gate");
-    }
-
-    #[tokio::test]
-    async fn unattributable_search_does_not_record_miss_state() {
-        let ledger = CommandExecutionLedger::default();
-        let compound = key("rg needle src; echo finished").with_search_narrowing(
-            "turn-a",
-            "repo-a",
-            Some(RgSearchNarrowing {
-                breadth: RgSearchBreadth::Narrow,
-                query_identity: "needle".to_string(),
-                search_identity: "needle:src".to_string(),
-                scope_identity: "src".to_string(),
-                parent_scope_identity: Some("repo".to_string()),
-                scope_state_identity: Some("scope-state".to_string()),
-                state_paths: Vec::new(),
-                can_record_miss: false,
-            }),
-        );
-
-        ledger.record_exit(&compound, 1).await;
-        ledger.record_verified_search_result(&compound, true).await;
-
-        let state = ledger.state.lock().await;
-        assert!(state.search.allowed_expansions.is_empty());
-        assert!(state.search.misses.is_empty());
-        assert!(state.search.miss_order.is_empty());
-    }
-
-    #[tokio::test]
-    async fn equivalent_search_miss_is_cached_for_unchanged_workspace_identity() {
-        let ledger = CommandExecutionLedger::default();
-        let search = |search_identity: &str| RgSearchNarrowing {
-            breadth: RgSearchBreadth::Narrow,
-            query_identity: "needle".to_string(),
-            search_identity: search_identity.to_string(),
-            scope_identity: search_identity.to_string(),
-            parent_scope_identity: Some("repo".to_string()),
-            scope_state_identity: Some("scope-state".to_string()),
-            state_paths: Vec::new(),
-            can_record_miss: true,
-        };
-        let first = key("rg needle src")
-            .with_repository_epoch(1)
-            .with_workspace_identity(Some("workspace-a"))
-            .with_search_narrowing("turn-a", "repo-a", Some(search("needle:src")));
-        let equivalent = key("rg needle ./src")
-            .with_repository_epoch(2)
-            .with_workspace_identity(Some("workspace-a"))
-            .with_search_narrowing("turn-b", "repo-a", Some(search("needle:src")));
-        let compound = key("rg needle ./src; echo finished")
-            .with_repository_epoch(1)
-            .with_search_narrowing(
-                "turn-b",
-                "repo-a",
-                Some(RgSearchNarrowing {
-                    can_record_miss: false,
-                    ..search("needle:src")
-                }),
-            );
-
-        ledger
-            .begin_attempt(&first, false)
-            .await
-            .expect("first search");
-        ledger.record_exit(&first, 1).await;
-        ledger.record_verified_search_result(&first, true).await;
-        assert!(
-            ledger.retained_search_miss(&equivalent).await.is_none(),
-            "set membership is not stream evidence"
-        );
-        ledger
-            .record_retained_search_miss(
-                &first,
-                "original-search".into(),
-                String::new(),
-                "warning\n".into(),
-            )
-            .await;
-        let retained = ledger.retained_search_miss(&equivalent).await.unwrap();
-        assert_eq!(retained.original_execution_id, "original-search");
-        assert_eq!(retained.stderr, "warning\n");
-        let blocked = ledger
-            .begin_attempt(&equivalent, false)
-            .await
-            .expect_err("equivalent miss should be reused");
-        let message = blocked.render_for_model();
-        assert!(message.contains("equivalent search"));
-        assert!(message.contains("read_file or list_files"));
-        assert!(!message.contains("force_fresh"));
-        ledger
-            .begin_attempt(&compound, false)
-            .await
-            .expect("an unattributable compound command must not be blocked by an rg miss");
-
-        for exit_code in [0, 2, 130] {
-            ledger.record_exit(&first, 1).await;
-            ledger.record_verified_search_result(&first, true).await;
-            assert!(
-                ledger
-                    .begin_attempt(&equivalent, false)
-                    .await
-                    .unwrap_err()
-                    .is_search_miss()
-            );
-            ledger
-                .begin_attempt_with_freshness(&equivalent, false, true)
-                .await
-                .expect("force_fresh bypasses the negative cache");
-            ledger.record_exit(&equivalent, exit_code).await;
-            assert!(ledger.retained_search_miss(&equivalent).await.is_none());
-            ledger
-                .begin_attempt(&equivalent, false)
-                .await
-                .expect("a fresh match, error, or interruption supersedes the cached miss");
-        }
-
-        // Scope changes must be admitted while the original miss is still cached.
-        ledger.record_exit(&first, 1).await;
-        ledger.record_verified_search_result(&first, true).await;
-        ledger
-            .begin_attempt(
-                &key("rg needle tests")
-                    .with_repository_epoch(1)
-                    .with_search_narrowing("turn-b", "repo-a", Some(search("needle:tests"))),
-                false,
-            )
-            .await
-            .expect("changed scope executes");
-        ledger
-            .begin_attempt(
-                &key("rg needle src")
-                    .with_repository_epoch(3)
-                    .with_workspace_identity(Some("workspace-b"))
-                    .with_search_narrowing(
-                        "turn-b",
-                        "repo-a",
-                        Some(RgSearchNarrowing {
-                            scope_state_identity: Some("scope-state-b".to_string()),
-                            ..search("needle:src")
-                        }),
-                    ),
-                false,
-            )
-            .await
-            .expect("changed search scope state executes");
-        assert!(
-            ledger
-                .begin_attempt(&equivalent, false)
-                .await
-                .unwrap_err()
-                .is_search_miss()
-        );
-    }
-
-    #[tokio::test]
-    async fn reused_search_misses_survive_cache_pressure() {
-        for cwd in ["C:/repo", "/repo"] {
-            for refresh_by_execution in [false, true] {
-                let ledger = CommandExecutionLedger::default();
-                let keys = (0..=MAX_TRACKED_COMMANDS)
-                    .map(|index| {
-                        let query = format!("needle-{index}");
-                        CommandAttemptKey::new(
-                            "exec_command",
-                            "local",
-                            cwd,
-                            &[format!("rg {query} src")],
-                        )
-                        .with_workspace_identity(Some("workspace-a"))
-                        .with_search_narrowing(
-                            "turn-a",
-                            "repo-a",
-                            Some(RgSearchNarrowing {
-                                breadth: RgSearchBreadth::Narrow,
-                                query_identity: query.clone(),
-                                search_identity: query,
-                                scope_identity: "src".to_string(),
-                                parent_scope_identity: Some("repo".to_string()),
-                                scope_state_identity: Some("scope-state".to_string()),
-                                state_paths: Vec::new(),
-                                can_record_miss: true,
-                            }),
-                        )
-                    })
-                    .collect::<Vec<_>>();
-                for key in keys.iter().take(MAX_TRACKED_COMMANDS) {
-                    ledger.begin_attempt(key, false).await.unwrap();
-                    ledger.record_exit(key, 1).await;
-                    ledger.record_verified_search_result(key, true).await;
-                }
-                if refresh_by_execution {
-                    ledger
-                        .begin_attempt_with_freshness(&keys[0], false, true)
-                        .await
-                        .unwrap();
-                    ledger.record_exit(&keys[0], 1).await;
-                    ledger.record_verified_search_result(&keys[0], true).await;
-                } else {
-                    assert!(
-                        ledger
-                            .begin_attempt(&keys[0], false)
-                            .await
-                            .unwrap_err()
-                            .is_search_miss()
-                    );
-                }
-                let replacement = &keys[MAX_TRACKED_COMMANDS];
-                ledger.begin_attempt(replacement, false).await.unwrap();
-                ledger.record_exit(replacement, 1).await;
-                ledger
-                    .record_verified_search_result(replacement, true)
-                    .await;
-                assert!(
-                    ledger
-                        .begin_attempt(&keys[0], false)
-                        .await
-                        .unwrap_err()
-                        .is_search_miss()
-                );
-                assert!(
-                    ledger
-                        .begin_attempt(replacement, false)
-                        .await
-                        .unwrap_err()
-                        .is_search_miss()
-                );
-                ledger
-                    .begin_attempt(&keys[1], false)
-                    .await
-                    .expect("the least recently used miss is evicted");
-            }
-        }
-    }
-
-    #[tokio::test]
-    async fn background_search_miss_populates_the_same_negative_cache() {
-        let ledger = CommandExecutionLedger::default();
-        let search = RgSearchNarrowing {
-            breadth: RgSearchBreadth::Narrow,
-            query_identity: "needle".to_string(),
-            search_identity: "needle:src".to_string(),
-            scope_identity: "repo/src".to_string(),
-            parent_scope_identity: Some("repo".to_string()),
-            scope_state_identity: Some("scope-state".to_string()),
-            state_paths: Vec::new(),
-            can_record_miss: true,
-        };
-        let first = key("rg needle src")
-            .with_repository_epoch(1)
-            .with_search_narrowing("turn-a", "repo-a", Some(search.clone()));
-        let equivalent = key("rg needle ./src")
-            .with_repository_epoch(1)
-            .with_search_narrowing("turn-b", "repo-a", Some(search));
-
-        ledger
-            .begin_attempt(&first, false)
-            .await
-            .expect("first search");
-        ledger
-            .track_running_process(
-                42,
-                first,
-                RawOutputArtifact::unavailable("background search fixture"),
-            )
-            .await
-            .expect("track running process");
-        assert!(
-            ledger
-                .mark_running_process_completed(42, 1)
-                .await
-                .accepted()
-        );
-        let pending = ledger
-            .state
-            .lock()
-            .await
-            .process
-            .pending_by_execution_id
-            .values()
-            .next()
-            .unwrap()
-            .command
-            .clone();
-        ledger
-            .record_terminal_facts(
-                42,
-                &pending.parent_tool_execution_id.0,
-                pending.incarnation,
-                Some(1),
-                None,
-                true,
-            )
-            .await;
-        ledger
-            .begin_attempt(&equivalent, false)
-            .await
-            .expect_err("background miss should be reused");
     }
 
     #[tokio::test]
@@ -3105,7 +2129,7 @@ mod tests {
     fn persisted_command_fingerprint_is_versioned_and_stable() {
         assert_eq!(
             fingerprint_value("fixed"),
-            "v2:69c37b82ff4edd189160d6845a76c70a130a0e25c7918f58bc4b9ed04ed1f9cb"
+            "v3:462675e7a390d1809f834632b7777ab89a039626355c114186b8f18f1550bc4e"
         );
     }
 
@@ -3182,16 +2206,6 @@ mod tests {
     #[test]
     fn audit189_retry_identity_covers_every_semantic_dimension() {
         let environment = HashMap::from([("LANG".to_string(), "en-US".to_string())]);
-        let search = RgSearchNarrowing {
-            breadth: RgSearchBreadth::Narrow,
-            query_identity: "needle".to_string(),
-            search_identity: "needle:src".to_string(),
-            scope_identity: "src".to_string(),
-            parent_scope_identity: Some("repo".to_string()),
-            scope_state_identity: Some("scope-state".to_string()),
-            state_paths: Vec::new(),
-            can_record_miss: true,
-        };
         let base = CommandAttemptKey::new(
             "exec_command",
             "local",
@@ -3207,7 +2221,7 @@ mod tests {
         .with_runtime_context(&"unified")
         .with_repository_epoch(7)
         .with_workspace_identity(Some("workspace-a"))
-        .with_search_narrowing("turn-a", "repo-a", Some(search.clone()));
+        .with_search_no_match_eligibility(true);
 
         let mut changed_tool = base.clone();
         changed_tool.tool_name = "shell_command".to_string();
@@ -3245,18 +2259,7 @@ mod tests {
                 "workspace_identity",
                 base.clone().with_workspace_identity(Some("workspace-b")),
             ),
-            (
-                "search_identity",
-                base.clone().with_search_narrowing(
-                    "turn-a",
-                    "repo-a",
-                    Some(RgSearchNarrowing {
-                        search_identity: "needle:tests".to_string(),
-                        scope_identity: "tests".to_string(),
-                        ..search
-                    }),
-                ),
-            ),
+            ("search_exit_classification", base.clone().with_search_no_match_eligibility(false)),
         ];
 
         for (dimension, variant) in variants {
@@ -3266,285 +2269,6 @@ mod tests {
                 "{dimension} must participate in retry identity"
             );
         }
-    }
-    #[tokio::test]
-    async fn rg_pattern_file_changes_invalidate_cached_misses() {
-        use crate::tools::handlers::command_search::classify_rg_search_narrowing;
-        use crate::tools::handlers::command_search::observe_rg_search_scope_state;
-
-        for pattern_args in [
-            vec!["-f", "patterns.txt"],
-            vec!["--file", "patterns.txt"],
-            vec!["-fpatterns.txt"],
-            vec!["--file=patterns.txt"],
-        ] {
-            let fixture = tempfile::tempdir().unwrap();
-            let root = fixture.path();
-            std::fs::create_dir(root.join("src")).unwrap();
-            std::fs::write(root.join("src/example.txt"), "present\n").unwrap();
-            std::fs::write(root.join("patterns.txt"), "absent\n").unwrap();
-            let command = std::iter::once("rg")
-                .chain(["--no-ignore-global", "--no-ignore-parent"])
-                .chain(pattern_args.iter().copied())
-                .chain(std::iter::once("src"))
-                .map(ToString::to_string)
-                .collect::<Vec<_>>();
-            let run_search = || {
-                std::process::Command::new("rg")
-                    .args(&command[1..])
-                    .current_dir(root)
-                    .output()
-                    .expect("run ripgrep")
-            };
-            let classify = || {
-                classify_rg_search_narrowing(&command, None, root, root)
-                    .unwrap()
-                    .expect("rg search")
-            };
-            let mut before = classify();
-            observe_rg_search_scope_state(&mut before).await;
-            assert!(before.scope_state_identity.is_some());
-            let attempt =
-                CommandAttemptKey::new("exec_command", "local", root.to_string_lossy(), &command)
-                    .with_search_narrowing("turn-a", "repo-a", Some(before));
-            let ledger = CommandExecutionLedger::default();
-            ledger.begin_attempt(&attempt, false).await.unwrap();
-            let miss = run_search();
-            assert_eq!(miss.status.code(), Some(1));
-            assert!(miss.stdout.is_empty());
-            ledger
-                .record_exit(&attempt, miss.status.code().unwrap())
-                .await;
-            ledger.record_verified_search_result(&attempt, true).await;
-            ledger
-                .begin_attempt(&attempt, false)
-                .await
-                .expect_err("unchanged pattern-file miss should be cached");
-
-            std::fs::write(root.join("patterns.txt"), "present\n").unwrap();
-            let actual = run_search();
-            assert_eq!(actual.status.code(), Some(0));
-            assert!(
-                String::from_utf8(actual.stdout)
-                    .unwrap()
-                    .contains("present")
-            );
-            let mut after = classify();
-            observe_rg_search_scope_state(&mut after).await;
-            assert!(after.scope_state_identity.is_some());
-            let updated = attempt.with_search_narrowing("turn-b", "repo-a", Some(after));
-            ledger
-                .begin_attempt(&updated, false)
-                .await
-                .expect("changed pattern file must admit a search that now has a match");
-        }
-    }
-
-    #[tokio::test]
-    async fn distinct_rg_argument_vectors_do_not_share_negative_search_evidence() {
-        use crate::tools::handlers::command_search::classify_rg_search_narrowing;
-        use crate::tools::handlers::command_search::observe_rg_search_scope_state;
-
-        let fixture = tempfile::tempdir().unwrap();
-        let root = fixture.path();
-        std::fs::write(root.join("example.txt"), "needle\n").unwrap();
-        // One literal pattern containing the old identity delimiter is not
-        // equivalent to two separate -e patterns. The real searches prove it.
-        let commands = [
-            vec![
-                "rg",
-                "--no-config",
-                "--no-ignore-global",
-                "--no-ignore-parent",
-                "-e",
-                "needle\u{1e}-e\u{1e}other",
-                "example.txt",
-            ],
-            vec![
-                "rg",
-                "--no-config",
-                "--no-ignore-global",
-                "--no-ignore-parent",
-                "-e",
-                "needle",
-                "-e",
-                "other",
-                "example.txt",
-            ],
-        ]
-        .map(|args| args.into_iter().map(str::to_string).collect::<Vec<_>>());
-        let ledger = CommandExecutionLedger::default();
-        for (index, command) in commands.iter().enumerate() {
-            let actual = std::process::Command::new("rg")
-                .args(&command[1..])
-                .current_dir(root)
-                .output()
-                .expect("run ripgrep");
-            assert_eq!(actual.status.code(), Some(if index == 0 { 1 } else { 0 }));
-            assert_eq!(
-                actual.stdout,
-                if index == 0 {
-                    Vec::new()
-                } else {
-                    b"needle\n".to_vec()
-                }
-            );
-            let mut search = classify_rg_search_narrowing(command, None, root, root)
-                .unwrap()
-                .expect("rg search");
-            observe_rg_search_scope_state(&mut search).await;
-            assert!(search.scope_state_identity.is_some());
-            let attempt =
-                CommandAttemptKey::new("exec_command", "local", root.to_string_lossy(), command)
-                    .with_search_narrowing("turn-a", "repo-a", Some(search));
-            ledger
-                .begin_attempt(&attempt, false)
-                .await
-                .expect("a different executable query must not inherit a cached miss");
-            ledger
-                .record_exit(&attempt, actual.status.code().unwrap())
-                .await;
-            if index == 0 {
-                ledger.record_verified_search_result(&attempt, true).await;
-                ledger
-                    .begin_attempt(&attempt, false)
-                    .await
-                    .expect_err("the exact original miss must still be cached");
-            }
-        }
-    }
-
-    #[tokio::test]
-    async fn audit189_rg_classifier_drives_narrowing_ledger_for_real_commands() {
-        use crate::shell::ShellType;
-        use crate::tools::handlers::command_search::classify_rg_search_narrowing;
-
-        let fixture = tempfile::tempdir().unwrap();
-        let root = fixture.path();
-        std::fs::create_dir_all(root.join("codex-rs/core/src/tools")).unwrap();
-        let argv = |args: &[&str]| args.iter().map(ToString::to_string).collect::<Vec<_>>();
-        let narrow_command = argv(&[
-            "rg",
-            "--no-ignore-global",
-            "--no-ignore-parent",
-            "-n",
-            "needle with space",
-            "codex-rs/core/src/tools",
-        ]);
-        let equivalent_command = argv(&[
-            "rg",
-            "--no-ignore-global",
-            "--no-ignore-parent",
-            "-n",
-            "needle with space",
-            "./codex-rs/core/src/tools",
-        ]);
-        let broad_command = argv(&["rg", "-n", "needle with space", "."]);
-        let classify = |command: &[String], shell| {
-            classify_rg_search_narrowing(command, shell, root, root)
-                .expect("rg command classifies")
-                .expect("rg search is present")
-        };
-        let mut narrow_search = classify(&narrow_command, None);
-        let mut equivalent_search = classify(&equivalent_command, None);
-        crate::tools::handlers::command_search::observe_rg_search_scope_state(&mut narrow_search)
-            .await;
-        crate::tools::handlers::command_search::observe_rg_search_scope_state(
-            &mut equivalent_search,
-        )
-        .await;
-        assert!(narrow_search.scope_state_identity.is_some());
-        assert_eq!(
-            narrow_search.search_identity,
-            equivalent_search.search_identity
-        );
-        let narrow = CommandAttemptKey::new(
-            "exec_command",
-            "local",
-            root.to_string_lossy(),
-            &narrow_command,
-        )
-        .with_repository_epoch(1)
-        .with_workspace_identity(Some("workspace-a"))
-        .with_search_narrowing("turn-a", "repo-a", Some(narrow_search));
-        let equivalent = CommandAttemptKey::new(
-            "exec_command",
-            "local",
-            root.to_string_lossy(),
-            &equivalent_command,
-        )
-        .with_repository_epoch(2)
-        .with_workspace_identity(Some("workspace-a"))
-        .with_search_narrowing("turn-b", "repo-a", Some(equivalent_search.clone()));
-        let changed_workspace = CommandAttemptKey::new(
-            "exec_command",
-            "local",
-            root.to_string_lossy(),
-            &equivalent_command,
-        )
-        .with_repository_epoch(2)
-        .with_workspace_identity(Some("workspace-b"))
-        .with_search_narrowing("turn-b", "repo-a", Some(equivalent_search));
-        let ledger = CommandExecutionLedger::default();
-        ledger.record_exit(&narrow, 1).await;
-        ledger.record_verified_search_result(&narrow, true).await;
-        ledger
-            .begin_attempt(&equivalent, false)
-            .await
-            .expect_err("equivalent real rg miss is cached");
-        ledger
-            .begin_attempt(&changed_workspace, false)
-            .await
-            .expect_err(
-                "an unchanged search scope remains reusable after unrelated workspace changes",
-            );
-        std::fs::write(
-            root.join("codex-rs/core/src/tools/new.txt"),
-            "needle with space",
-        )
-        .unwrap();
-        let mut changed_search = classify(&equivalent_command, None);
-        crate::tools::handlers::command_search::observe_rg_search_scope_state(&mut changed_search)
-            .await;
-        assert!(changed_search.scope_state_identity.is_some());
-        let changed_scope =
-            changed_workspace.with_search_narrowing("turn-b", "repo-a", Some(changed_search));
-        ledger
-            .begin_attempt(&changed_scope, false)
-            .await
-            .expect("a relevant source change invalidates the real rg miss");
-
-        let compound_command = argv(&[
-            "pwsh",
-            "-NoProfile",
-            "-Command",
-            "rg -n 'needle with space' codex-rs/core/src/tools | Measure-Object",
-        ]);
-        let compound_search = classify(&compound_command, Some(ShellType::PowerShell));
-        assert!(!compound_search.can_record_miss);
-        let compound = CommandAttemptKey::new(
-            "exec_command",
-            "local",
-            root.to_string_lossy(),
-            &compound_command,
-        )
-        .with_search_narrowing("turn-c", "repo-a", Some(compound_search));
-        let broad = CommandAttemptKey::new(
-            "exec_command",
-            "local",
-            root.to_string_lossy(),
-            &broad_command,
-        )
-        .with_search_narrowing("turn-c", "repo-a", Some(classify(&broad_command, None)));
-        let compound_ledger = CommandExecutionLedger::default();
-        compound_ledger.record_exit(&compound, 1).await;
-        compound_ledger
-            .record_verified_search_result(&compound, true)
-            .await;
-        compound_ledger
-            .admit_search_narrowing(&broad)
-            .await
-            .expect("compound output does not turn advisory guidance into a rejection");
     }
 
     #[tokio::test]
@@ -3606,365 +2330,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn implicit_global_ignore_changes_never_replay_negative_searches() {
-        use crate::tools::handlers::command_search::classify_rg_search_narrowing;
-        use crate::tools::handlers::command_search::observe_rg_search_scope_state;
-        let fixture = tempfile::tempdir().unwrap();
-        let root = fixture.path().join("repo");
-        let home = fixture.path().join("home");
-        std::fs::create_dir_all(root.join(".git")).unwrap();
-        std::fs::create_dir_all(root.join("src")).unwrap();
-        std::fs::create_dir_all(home.join(".config/git")).unwrap();
-        let ignore = home.join(".config/git/ignore");
-        std::fs::write(&ignore, "*.txt\n").unwrap();
-        std::fs::write(root.join("src/input.txt"), "needle\n").unwrap();
-        let command = ["rg", "needle", "src"].map(str::to_string).to_vec();
-        let run = || {
-            std::process::Command::new("rg")
-                .args(&command[1..])
-                .current_dir(&root)
-                .env("HOME", &home)
-                .env("USERPROFILE", &home)
-                .env("XDG_CONFIG_HOME", home.join(".config"))
-                .env_remove("GIT_CONFIG_GLOBAL")
-                .env_remove("RIPGREP_CONFIG_PATH")
-                .output()
-                .unwrap()
-        };
-        let mut scope = classify_rg_search_narrowing(&command, None, &root, &root)
-            .unwrap()
-            .unwrap();
-        observe_rg_search_scope_state(&mut scope).await;
-        assert!(!scope.can_record_miss);
-        assert!(scope.scope_state_identity.is_none());
-        let key = CommandAttemptKey::new("exec_command", "local", root.to_string_lossy(), &command)
-            .with_search_narrowing("turn", "repo", Some(scope));
-        let ledger = CommandExecutionLedger::default();
-        assert_eq!(run().status.code(), Some(1));
-        ledger.record_exit(&key, 1).await;
-        ledger.record_verified_search_result(&key, true).await;
-        std::fs::write(&ignore, "").unwrap();
-        ledger
-            .begin_attempt(&key, false)
-            .await
-            .expect("default global ignore inputs are unproven");
-        assert_eq!(run().status.code(), Some(0));
-    }
-
-    #[tokio::test]
-    async fn external_preprocessor_output_changes_never_replay_negative_searches() {
-        use crate::tools::handlers::command_search::classify_rg_search_narrowing;
-        let fixture = tempfile::tempdir().unwrap();
-        let root = fixture.path();
-        std::fs::create_dir(root.join("src")).unwrap();
-        std::fs::write(
-            root.join("src/input.py"),
-            "from pathlib import Path\nprint(Path('output.txt').read_text())\n",
-        )
-        .unwrap();
-        let python = if cfg!(windows) { "python" } else { "python3" };
-        for pre in [
-            vec!["--pre".to_string(), python.to_string()],
-            vec![format!("--pre={python}")],
-        ] {
-            let mut command = ["rg", "--no-ignore-global", "--no-ignore-parent"]
-                .map(str::to_string)
-                .to_vec();
-            command.extend(pre);
-            command.extend(["needle", "src"].map(str::to_string));
-            let scope = classify_rg_search_narrowing(&command, None, root, root)
-                .unwrap()
-                .unwrap();
-            assert!(!scope.can_record_miss);
-            let key =
-                CommandAttemptKey::new("exec_command", "local", root.to_string_lossy(), &command)
-                    .with_search_narrowing("turn", "repo", Some(scope));
-            let run = || {
-                std::process::Command::new("rg")
-                    .args(&command[1..])
-                    .current_dir(root)
-                    .env_remove("RIPGREP_CONFIG_PATH")
-                    .output()
-                    .unwrap()
-            };
-            std::fs::write(root.join("output.txt"), "absent").unwrap();
-            assert_eq!(run().status.code(), Some(1));
-            let ledger = CommandExecutionLedger::default();
-            ledger.record_exit(&key, 1).await;
-            ledger.record_verified_search_result(&key, true).await;
-            std::fs::write(root.join("output.txt"), "needle").unwrap();
-            ledger.begin_attempt(&key, false).await.unwrap();
-            assert_eq!(run().status.code(), Some(0));
-        }
-    }
-
-    #[tokio::test]
-    async fn external_ripgrep_config_changes_cannot_replay_a_cached_miss() {
-        use crate::tools::handlers::command_search::classify_rg_search_narrowing;
-        use crate::tools::handlers::command_search::observe_rg_search_scope_state;
-
-        let fixture = tempfile::tempdir().unwrap();
-        let root = fixture.path().join("repo");
-        std::fs::create_dir(&root).unwrap();
-        std::fs::write(root.join("example.txt"), "needle\n").unwrap();
-        let config = fixture.path().join("rg.conf");
-        std::fs::write(&config, "--glob\n!*.txt\n").unwrap();
-        let environment = HashMap::from([(
-            "RIPGREP_CONFIG_PATH".to_string(),
-            config.to_string_lossy().into_owned(),
-        )]);
-        let command = [
-            "rg",
-            "--no-ignore-global",
-            "--no-ignore-parent",
-            "needle",
-            ".",
-        ]
-        .map(str::to_string)
-        .to_vec();
-        let attempt = async || {
-            let mut scope = classify_rg_search_narrowing(&command, None, &root, &root)
-                .unwrap()
-                .unwrap();
-            observe_rg_search_scope_state(&mut scope).await;
-            assert!(scope.scope_state_identity.is_some());
-            CommandAttemptKey::new("exec_command", "local", root.to_string_lossy(), &command)
-                .with_search_narrowing("turn", "repo", Some(scope))
-                .with_search_environment(&environment)
-        };
-        let run = || {
-            std::process::Command::new("rg")
-                .args(&command[1..])
-                .current_dir(&root)
-                .envs(&environment)
-                .output()
-                .unwrap()
-        };
-        let ledger = CommandExecutionLedger::default();
-        let first = attempt().await;
-        ledger.begin_attempt(&first, false).await.unwrap();
-        let miss = run();
-        assert_eq!(miss.status.code(), Some(1));
-        ledger.record_exit(&first, 1).await;
-        ledger.record_verified_search_result(&first, true).await;
-        std::fs::write(&config, "--glob\n*.txt\n").unwrap();
-        let second = attempt().await;
-        ledger
-            .begin_attempt(&second, false)
-            .await
-            .expect("config contents can change without changing its environment value");
-        let hit = run();
-        assert_eq!(hit.status.code(), Some(0));
-        assert!(String::from_utf8(hit.stdout).unwrap().contains("needle"));
-    }
-
-    #[tokio::test]
-    async fn workspace_identity_and_persisted_search_misses_load_on_first_command() {
-        use crate::tools::handlers::command_search::classify_rg_search_narrowing;
-        use crate::tools::handlers::command_search::observe_rg_search_scope_state;
-        let temp = tempfile::tempdir().expect("workspace identity fixture");
-        let repository = temp.path().join("repo");
-        let codex_home = temp.path().join("codex-home");
-        initialize_git_repository(&repository);
-        std::fs::create_dir(repository.join("src")).unwrap();
-        std::fs::write(repository.join("src/lib.rs"), "original content").unwrap();
-        let command = [
-            "rg",
-            "--no-ignore-global",
-            "--no-ignore-parent",
-            "needle",
-            "src",
-        ]
-        .map(str::to_string)
-        .to_vec();
-        let search = async |turn_id: &str, repository_epoch: u64, workspace_identity: &str| {
-            let mut scope = classify_rg_search_narrowing(&command, None, &repository, &repository)
-                .unwrap()
-                .expect("real scoped search");
-            observe_rg_search_scope_state(&mut scope).await;
-            assert!(scope.scope_state_identity.is_some(), "scope must be proven");
-            CommandAttemptKey::new(
-                "exec_command",
-                codex_exec_server::LOCAL_ENVIRONMENT_ID,
-                repository.to_string_lossy(),
-                &command,
-            )
-            .with_repository_epoch(repository_epoch)
-            .with_workspace_identity(Some(workspace_identity))
-            .with_search_narrowing(turn_id, &repository.to_string_lossy(), Some(scope))
-        };
-
-        let mut producer = CommandExecutionLedger::load_or_new(
-            codex_home.clone(),
-            "thread".to_string(),
-            &repository,
-        )
-        .await;
-        let producer_epoch = producer.observe_repository_revision("turn-a", 0).await;
-        let producer_identity = producer
-            .current_workspace_identity_hash(codex_exec_server::LOCAL_ENVIRONMENT_ID, &repository)
-            .await
-            .expect("first command observes the workspace");
-        let first_search = search("turn-a", producer_epoch, &producer_identity).await;
-        producer
-            .begin_attempt(&first_search, false)
-            .await
-            .expect("first search runs");
-        producer.record_exit(&first_search, 1).await;
-        producer
-            .record_verified_search_result(&first_search, true)
-            .await;
-        producer.finish_turn("turn-a").await;
-        assert_eq!(producer.cache_commit_count.load(Ordering::Relaxed), 1);
-        producer.persist_cache_after_terminal().await;
-        assert_eq!(
-            producer.cache_commit_count.load(Ordering::Relaxed),
-            1,
-            "unchanged state must not commit the cache again"
-        );
-
-        let unused = CommandExecutionLedger::load_or_new(
-            codex_home.clone(),
-            "unused-thread".to_string(),
-            &repository,
-        )
-        .await;
-        unused.finish_turn("unused-turn").await;
-        assert!(
-            unused
-                .state
-                .lock()
-                .await
-                .repository
-                .observed_workspace_identity
-                .is_none(),
-            "finishing a turn without a command must not inspect the workspace"
-        );
-
-        let matching = CommandExecutionLedger::load_or_new(
-            codex_home.clone(),
-            "thread".to_string(),
-            &repository,
-        )
-        .await;
-        let supplied_identity =
-            crate::git_workspace::capture_workspace_evidence_identity(&repository)
-                .await
-                .expect("matching supplied identity");
-        let matching_epoch = matching
-            .observe_repository_revision_with_identity("turn-match", 1, Some(supplied_identity))
-            .await;
-        assert!(
-            matching_epoch > 0,
-            "first observation follows a mutation revision"
-        );
-        let matching_identity = matching
-            .current_workspace_identity_hash(codex_exec_server::LOCAL_ENVIRONMENT_ID, &repository)
-            .await
-            .expect("supplied identity initializes the ledger");
-        assert_eq!(matching_identity, producer_identity);
-        assert!(
-            matches!(
-                matching
-                    .begin_attempt(
-                        &search("turn-match", matching_epoch, &matching_identity).await,
-                        false,
-                    )
-                    .await,
-                Err(CommandAttemptBlocked {
-                    reason: CommandAttemptBlockedReason::SearchMiss,
-                    ..
-                })
-            ),
-            "the first supplied identity observation must load a matching persisted miss"
-        );
-
-        let consumer =
-            CommandExecutionLedger::load_or_new(codex_home, "thread".to_string(), &repository)
-                .await;
-        {
-            let state = consumer.state.lock().await;
-            assert!(
-                state.repository.observed_workspace_identity.is_none(),
-                "ledger construction must not inspect the workspace"
-            );
-            assert!(state.search.misses.is_empty());
-        }
-
-        tokio::fs::write(
-            repository.join("external-edit.txt"),
-            b"changed before first command",
-        )
-        .await
-        .expect("external workspace edit");
-        let consumer_epoch = consumer.observe_repository_revision("turn-b", 0).await;
-        let consumer_identity = consumer
-            .current_workspace_identity_hash(codex_exec_server::LOCAL_ENVIRONMENT_ID, &repository)
-            .await
-            .expect("first command observes the edited workspace");
-        assert_ne!(producer_identity, consumer_identity);
-        assert!(
-            matches!(
-                consumer
-                    .begin_attempt(
-                        &search("turn-b", consumer_epoch, &consumer_identity).await,
-                        false
-                    )
-                    .await,
-                Err(CommandAttemptBlocked {
-                    reason: CommandAttemptBlockedReason::SearchMiss,
-                    ..
-                })
-            ),
-            "an unrelated pre-command edit preserves a persisted scoped miss"
-        );
-        std::fs::write(repository.join("src/lib.rs"), "needle now exists").unwrap();
-        let changed_scope = search("turn-b", consumer_epoch, &consumer_identity).await;
-        consumer
-            .begin_attempt(&changed_scope, false)
-            .await
-            .expect("a changed search scope must execute again");
-
-        let cache_path = producer.persistence.as_ref().unwrap().cache_path.clone();
-        let prior_bytes = std::fs::read(&cache_path).unwrap();
-        producer.record_exit(&first_search, 0).await;
-        // Replacing a directory is a real commit failure on both supported platforms.
-        producer.persistence.as_mut().unwrap().cache_path = temp.path().to_path_buf();
-        producer.persist_cache_after_terminal().await;
-        assert_eq!(producer.cache_commit_count.load(Ordering::Relaxed), 1);
-        assert_eq!(std::fs::read(&cache_path).unwrap(), prior_bytes);
-        producer.persistence.as_mut().unwrap().cache_path = cache_path.clone();
-        tokio::join!(
-            producer.persist_cache_after_terminal(),
-            producer.persist_cache_after_terminal()
-        );
-        assert_eq!(
-            producer.cache_commit_count.load(Ordering::Relaxed),
-            2,
-            "a failed revision stays dirty; concurrent retries commit it once"
-        );
-        let document: CommandExecutionCacheDocument =
-            serde_json::from_slice(&std::fs::read(&cache_path).unwrap()).unwrap();
-        assert!(
-            document.search_misses.is_empty(),
-            "successful searches remove persisted misses"
-        );
-        producer.record_exit(&first_search, 1).await;
-        producer
-            .record_verified_search_result(&first_search, true)
-            .await;
-        producer.persist_cache_after_terminal().await;
-        assert_eq!(producer.cache_commit_count.load(Ordering::Relaxed), 3);
-        let document: CommandExecutionCacheDocument =
-            serde_json::from_slice(&std::fs::read(&cache_path).unwrap()).unwrap();
-        assert_eq!(
-            document.search_misses.len(),
-            1,
-            "new misses must be persisted"
-        );
-    }
-
-    #[tokio::test]
     async fn finish_turn_persists_the_last_authoritative_workspace_identity_without_recapture() {
         let temp = tempfile::tempdir().expect("workspace identity fixture");
         let repository = temp.path().join("repo");
@@ -4004,45 +2369,7 @@ mod tests {
         assert_eq!(document.workspace_identity, expected_identity);
     }
 
-    #[tokio::test]
-    async fn duplicate_repository_reads_revision_reuses_supplied_workspace_identity() {
-        let temp = tempfile::tempdir().expect("workspace identity fixture");
-        let repository = temp.path().join("repo");
-        initialize_git_repository(&repository);
-        let ledger = CommandExecutionLedger::load_or_new(
-            temp.path().join("codex-home"),
-            "candidate-snapshot".to_string(),
-            &repository,
-        )
-        .await;
-        tokio::fs::write(repository.join("first.txt"), b"first")
-            .await
-            .expect("first mutation");
-        let identity = crate::git_workspace::capture_workspace_evidence_identity(&repository)
-            .await
-            .expect("candidate identity");
-        tokio::fs::write(repository.join("second.txt"), b"second")
-            .await
-            .expect("mutation after candidate capture");
 
-        assert_eq!(
-            ledger
-                .observe_repository_revision_with_identity("turn", 1, Some(identity.clone()))
-                .await,
-            1
-        );
-
-        let identity_hash = workspace_identity_hash(&identity);
-        let state = ledger.state.lock().await;
-        assert_eq!(
-            state.repository.observed_workspace_identity,
-            Some((1, identity))
-        );
-        assert_eq!(
-            state.repository.observed_workspace_identity_hash,
-            Some((1, identity_hash))
-        );
-    }
 
     #[tokio::test]
     async fn repository_refresh_uses_shared_workspace_cache_after_mutation() {
@@ -4084,218 +2411,11 @@ mod tests {
         assert_ne!(first.unwrap().1, second.unwrap().1);
     }
 
-    #[tokio::test]
-    async fn failed_workspace_identity_retries_once_in_a_later_turn() {
-        let temp = tempfile::tempdir().expect("workspace recovery fixture");
-        let repository = temp.path().join("missing-repo");
-        let ledger = CommandExecutionLedger::load_or_new(
-            temp.path().join("home"),
-            "recovery".to_string(),
-            &repository,
-        )
-        .await;
-        assert_eq!(ledger.observe_repository_revision("first", 0).await, 0);
-        assert_eq!(ledger.workspace_identity_capture_count(), 1);
-        assert!(
-            ledger
-                .state
-                .lock()
-                .await
-                .repository
-                .observed_workspace_identity
-                .is_none()
-        );
 
-        initialize_git_repository(&repository);
-        assert_eq!(ledger.observe_repository_revision("first", 0).await, 0);
-        assert_eq!(ledger.workspace_identity_capture_count(), 1);
-        assert_eq!(ledger.observe_repository_revision("second", 0).await, 0);
-        assert_eq!(ledger.workspace_identity_capture_count(), 2);
-        assert!(
-            ledger
-                .state
-                .lock()
-                .await
-                .repository
-                .observed_workspace_identity
-                .is_some()
-        );
 
-        assert_eq!(ledger.observe_repository_revision("third", 0).await, 0);
-        assert_eq!(ledger.workspace_identity_capture_count(), 2);
-    }
 
-    #[tokio::test]
-    async fn workspace_baseline_reuse_rejects_other_cwds_and_tracks_mutations() {
-        let temp = tempfile::tempdir().expect("workspace baseline fixture");
-        let repository = temp.path().join("repo");
-        initialize_git_repository(&repository);
-        let ledger = CommandExecutionLedger::load_or_new(
-            temp.path().join("home"),
-            "baseline".to_string(),
-            &repository,
-        )
-        .await;
-        let first = crate::git_workspace::capture_workspace_evidence_identity(&repository)
-            .await
-            .expect("first identity");
-        ledger
-            .observe_workspace_baseline("turn", 0, &temp.path().join("other"), Some(first.clone()))
-            .await;
-        assert!(
-            ledger
-                .current_workspace_identity_hash(
-                    codex_exec_server::LOCAL_ENVIRONMENT_ID,
-                    &repository
-                )
-                .await
-                .is_none()
-        );
-        ledger
-            .observe_workspace_baseline("turn", 0, &repository, Some(first.clone()))
-            .await;
-        ledger.observe_repository_revision("turn", 0).await;
-        assert_eq!(ledger.workspace_identity_capture_count(), 0);
-        assert_eq!(
-            ledger
-                .state
-                .lock()
-                .await
-                .repository
-                .observed_workspace_identity
-                .as_ref()
-                .map(|(_, identity)| identity),
-            Some(&first)
-        );
 
-        std::fs::write(repository.join("changed.txt"), "changed").expect("mutation");
-        let changed = crate::git_workspace::capture_workspace_evidence_identity(&repository)
-            .await
-            .expect("changed identity");
-        assert_ne!(changed, first);
-        ledger
-            .observe_workspace_baseline("turn", 1, &repository, Some(changed.clone()))
-            .await;
-        ledger.observe_repository_revision("turn", 1).await;
-        assert_eq!(ledger.workspace_identity_capture_count(), 0);
-        assert_eq!(
-            ledger
-                .state
-                .lock()
-                .await
-                .repository
-                .observed_workspace_identity
-                .as_ref()
-                .map(|(_, identity)| identity),
-            Some(&changed)
-        );
-    }
 
-    #[tokio::test]
-    async fn workspace_baseline_same_epoch_external_edit_does_not_reuse_running_process() {
-        let temp = tempfile::tempdir().expect("workspace baseline fixture");
-        let repository = temp.path().join("repo");
-        initialize_git_repository(&repository);
-        let source = repository.join("input.txt");
-        std::fs::write(&source, "original input").expect("initial input");
-        let ledger = CommandExecutionLedger::load_or_new(
-            temp.path().join("home"),
-            "external-edit".to_string(),
-            &repository,
-        )
-        .await;
-        let first = crate::git_workspace::capture_workspace_evidence_identity(&repository)
-            .await
-            .expect("first baseline");
-        ledger
-            .observe_workspace_baseline("turn", 0, &repository, Some(first.clone()))
-            .await;
-        let epoch = ledger.observe_repository_revision("turn", 0).await;
-        let first_hash = ledger
-            .current_workspace_identity_hash(codex_exec_server::LOCAL_ENVIRONMENT_ID, &repository)
-            .await
-            .expect("first workspace identity");
-        let command = ["cargo", "test", "-p", "app"].map(str::to_string);
-        let attempt = |identity: &str| {
-            CommandAttemptKey::new(
-                "exec_command",
-                codex_exec_server::LOCAL_ENVIRONMENT_ID,
-                repository.to_string_lossy(),
-                &command,
-            )
-            .with_repository_epoch(epoch)
-            .with_workspace_identity(Some(identity))
-        };
-        ledger
-            .track_running_process(
-                42,
-                attempt(&first_hash),
-                RawOutputArtifact::unavailable("fixture"),
-            )
-            .await
-            .expect("track original validation");
-
-        // Equal endpoint observations are not execution-lifetime input proof.
-        ledger
-            .observe_workspace_baseline("turn", 0, &repository, Some(first.clone()))
-            .await;
-        let unchanged_hash = ledger
-            .current_workspace_identity_hash(codex_exec_server::LOCAL_ENVIRONMENT_ID, &repository)
-            .await
-            .expect("unchanged workspace identity");
-        assert_eq!(unchanged_hash, first_hash);
-        assert_eq!(
-            ledger
-                .identical_running_process(&attempt(&unchanged_hash))
-                .await
-                .map(|(id, _)| id),
-            None
-        );
-
-        // An external write changes the supplied evidence, not the local revision.
-        std::fs::write(&source, "externally changed input").expect("external edit");
-        let changed = crate::git_workspace::capture_workspace_evidence_identity(&repository)
-            .await
-            .expect("changed baseline");
-        assert_eq!(changed.head_identity, first.head_identity);
-        assert_eq!(changed.index_identity, first.index_identity);
-        assert_ne!(changed.worktree_identity, first.worktree_identity);
-        ledger
-            .observe_workspace_baseline("turn", 0, &repository, Some(changed.clone()))
-            .await;
-        assert_eq!(ledger.observe_repository_revision("turn", 0).await, epoch);
-        let changed_hash = ledger
-            .current_workspace_identity_hash(codex_exec_server::LOCAL_ENVIRONMENT_ID, &repository)
-            .await
-            .expect("changed workspace identity");
-        assert_ne!(changed_hash, first_hash);
-        assert!(
-            ledger
-                .identical_running_process(&attempt(&changed_hash))
-                .await
-                .is_none()
-        );
-        assert!(
-            ledger.running_process(42).await.is_some(),
-            "the old run is not cancelled"
-        );
-        assert_eq!(ledger.workspace_identity_capture_count(), 0);
-
-        ledger.finish_turn("turn").await;
-        let cache_path = &ledger
-            .persistence
-            .as_ref()
-            .expect("persistent ledger")
-            .cache_path;
-        let document: CommandExecutionCacheDocument = serde_json::from_slice(
-            &tokio::fs::read(cache_path)
-                .await
-                .expect("persist latest baseline"),
-        )
-        .expect("valid command cache document");
-        assert_eq!(document.workspace_identity, changed);
-        assert_eq!(ledger.workspace_identity_capture_count(), 0);
-    }
 
     #[tokio::test]
     async fn terminal_turn_cleanup_forgets_its_observed_repository_revision() {
@@ -4303,12 +2423,7 @@ mod tests {
 
         ledger.observe_repository_revision("finished-turn", 1).await;
         ledger.observe_repository_revision("active-turn", 2).await;
-        ledger
-            .record_uncertain_command_baseline("finished-call", "finished-turn", None)
-            .await;
-        ledger
-            .record_uncertain_command_baseline("active-call", "active-turn", None)
-            .await;
+
         ledger.finish_turn("finished-turn").await;
 
         let state = ledger.state.lock().await;
@@ -4324,18 +2439,7 @@ mod tests {
                 .observed_turn_mutation_revisions
                 .contains_key("active-turn")
         );
-        assert!(
-            !state
-                .repository
-                .uncertain_command_baselines
-                .contains_key("finished-call")
-        );
-        assert!(
-            state
-                .repository
-                .uncertain_command_baselines
-                .contains_key("active-call")
-        );
+
     }
 
     #[tokio::test]

@@ -36,12 +36,16 @@ pub async fn check_managed_cargo_lane(
     cwd: &Path,
     env: &HashMap<String, String>,
 ) -> Result<(), String> {
-    // Ordinary inspection and managed entrypoints need no filesystem work or
-    // blocking worker. This boundary recognizes Cargo, not arbitrary programs
-    // that might secretly spawn it.
-    if !command
-        .iter()
-        .any(|arg| arg.to_ascii_lowercase().contains("cargo"))
+    // Decode identity before taking the non-Cargo path: shell quoting and
+    // EncodedCommand can hide even a literal Cargo program from a raw scan.
+    if infer_direct_shell_type(command).is_none()
+        && command.first().is_none_or(|program| {
+            !matches!(
+                program_name(program).to_ascii_lowercase().as_str(),
+                "cargo" | "env" | "command" | "time" | "exec" | "call" | "rustup"
+                    | "start-process" | "invoke-expression" | "iex" | "start"
+            )
+        })
     {
         return Ok(());
     }
@@ -75,6 +79,36 @@ fn check(
         ));
     }
     if let Some(shell) = infer_direct_shell_type(command) {
+        if shell == ShellType::PowerShell
+            && let Some(index) = args
+                .iter()
+                .take_while(|arg| {
+                    !matches!(arg.to_ascii_lowercase().as_str(), "-command" | "-c" | "-file" | "-f")
+                })
+                .position(|arg| {
+                    matches!(arg.to_ascii_lowercase().as_str(), "-encodedcommand" | "-enc" | "-ec" | "-e")
+                })
+        {
+            use base64::Engine as _;
+            let [encoded] = &args[index + 1..] else {
+                return Err(rejected("Cannot resolve PowerShell EncodedCommand arguments."));
+            };
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(encoded)
+                .map_err(|_| rejected("Cannot decode PowerShell EncodedCommand."))?;
+            if bytes.len() % 2 != 0 {
+                return Err(rejected("PowerShell EncodedCommand is not UTF-16LE."));
+            }
+            let units = bytes
+                .chunks_exact(2)
+                .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+                .collect::<Vec<_>>();
+            let script = String::from_utf16(&units)
+                .map_err(|_| rejected("PowerShell EncodedCommand is not UTF-16LE."))?;
+            let mut decoded = command[..index + 1].to_vec();
+            decoded.extend(["-Command".into(), script]);
+            return check(&decoded, cwd, env, depth + 1);
+        }
         let parsed = argv_commands(command, Some(shell));
         // A flattened command list cannot model assignments, cd, functions or
         // expansion. Only a standalone literal command proves its environment.
@@ -97,49 +131,7 @@ fn check(
         if let Some(argv) = standalone {
             return check(&argv, cwd, env, depth + 1);
         }
-        // Inspect parsed leaves so read-only Cargo/ordinary text searches stay
-        // usable. Reject opaque Cargo-bearing scripts rather than guessing the
-        // effective directory after shell-local environment/cwd changes.
-        let inspection_only = parsed.as_ref().is_some_and(|stages| {
-            !stages.is_empty()
-                && stages.iter().all(|stage| {
-                    stage.first().is_some_and(|program| {
-                        read_only_inspection_program(program)
-                            || (program_name(program).eq_ignore_ascii_case("cargo")
-                                && !potential_build(stage))
-                    })
-                })
-        });
-        // A trustworthy parse already carries clause boundaries, and each stage
-        // is checked below. Scanning the flattened script text in that case only
-        // reintroduces false positives from Cargo names inside string literals
-        // and argument lists, so keep the text fallback for opaque scripts.
-        if let Some(offending) = parsed
-            .as_ref()
-            .and_then(|stages| stages.iter().find(|stage| potential_build(stage)))
-        {
-            return Err(rejected_build(
-                &format!(
-                    "Cannot resolve a raw Cargo build's effective target through this script; the `{}` clause would build. Run each Cargo command as its own standalone call with an explicit workdir, setting environment through the call rather than the script, so configuration and directory ownership can be resolved. Do not wait for or poll other Cargo processes first: Cargo waits on its own build lock, and the harness reports or queues a busy validation holder itself.",
-                    offending.join(" ")
-                ),
-                cwd,
-            ));
-        }
-        let visible_build = match shell {
-            ShellType::Bash | ShellType::Sh | ShellType::Zsh => args.last().is_some_and(|script| {
-                codex_shell_command::bash::possible_command_argvs(script)
-                    .iter()
-                    .any(|argv| visibly_builds_argv(argv, 0))
-            }),
-            _ => args.iter().any(|script| visibly_builds(script)),
-        };
-        if parsed.is_none() && !inspection_only && visible_build {
-            return Err(rejected_build(
-                "Cannot resolve a raw Cargo build's effective target through this script, which names a Cargo build token but could not be parsed into separate commands. Reissue each Cargo command as standalone argv, or as a command whose program is recognizably read-only, so the effective target can be resolved. Do not wrap it in a wait for or poll of other Cargo processes: Cargo waits on its own build lock, and the harness reports or queues a busy validation holder itself.",
-                cwd,
-            ));
-        }
+        // Inspect each recognizable command without rejecting compound scripts.
         if let Some(stages) = parsed {
             for stage in stages {
                 check(&stage, cwd, env, depth + 1)?;
@@ -147,17 +139,45 @@ fn check(
         }
         return Ok(());
     }
-    if program_name(program).eq_ignore_ascii_case("env") {
+    let binary = program_name(program).to_ascii_lowercase();
+    if matches!(binary.as_str(), "env" | "command" | "time" | "exec" | "rustup") {
+        use codex_shell_command::validation::ExecutionWrapper;
+        let start = match codex_shell_command::validation::decode_execution_wrapper(&binary, args) {
+            ExecutionWrapper::Child(index) => index,
+            ExecutionWrapper::NonExecution => return Ok(()),
+            ExecutionWrapper::Opaque => {
+                if args
+                    .iter()
+                    .any(|arg| arg.to_ascii_lowercase().contains("cargo"))
+                {
+                    return Err(rejected("Unsupported execution wrapper; use literal Cargo argv."));
+                }
+                return Ok(());
+            }
+        };
         let mut child = env.clone();
+        let mut child_cwd = cwd.to_path_buf();
         let mut index = 0;
-        while let Some(arg) = args.get(index) {
-            if matches!(arg.as_str(), "-i" | "--ignore-environment") {
+        if binary == "exec" && args[..start].iter().any(|arg| arg == "-c") {
+            child.clear();
+        }
+        let mut options = true;
+        while binary == "env" && index < start {
+            let arg = &args[index];
+            if options && matches!(arg.as_str(), "-i" | "--ignore-environment" | "-") {
                 child.clear();
                 index += 1;
                 continue;
             }
-            if matches!(arg.as_str(), "-u" | "--unset") || arg.starts_with("--unset=") {
-                let key = if let Some((_, key)) = arg.split_once('=') {
+            if options
+                && (matches!(arg.as_str(), "-u" | "--unset")
+                    || arg.starts_with("--unset=")
+                    || (arg.starts_with("-u") && arg.len() > 2))
+            {
+                let key = if let Some(key) = arg
+                    .strip_prefix("--unset=")
+                    .or_else(|| arg.strip_prefix("-u").filter(|key| !key.is_empty()))
+                {
                     key
                 } else {
                     index += 1;
@@ -175,11 +195,31 @@ fn check(
                 index += 1;
                 continue;
             }
-            if arg == "--" {
+            if options
+                && (matches!(arg.as_str(), "-C" | "--chdir")
+                    || arg.starts_with("--chdir=")
+                    || (arg.starts_with("-C") && arg.len() > 2))
+            {
+                let path = if let Some(path) = arg
+                    .strip_prefix("--chdir=")
+                    .or_else(|| arg.strip_prefix("-C").filter(|path| !path.is_empty()))
+                {
+                    path
+                } else {
+                    index += 1;
+                    &args[index]
+                };
+                child_cwd = child_cwd.join(path);
                 index += 1;
-                break;
+                continue;
+            }
+            if options && arg == "--" {
+                options = false;
+                index += 1;
+                continue;
             }
             if let Some((key, value)) = arg.split_once('=') {
+                options = false;
                 if cfg!(windows) {
                     child.retain(|name, _| !name.eq_ignore_ascii_case(key));
                 }
@@ -191,23 +231,15 @@ fn check(
                 break;
             }
         }
-        return check(&args[index..], cwd, &child, depth + 1);
+        return check(&args[start..], &child_cwd, &child, depth + 1);
     }
-    if matches!(
-        program_name(program).to_ascii_lowercase().as_str(),
-        "command" | "exec" | "call"
-    ) {
+    if program_name(program).eq_ignore_ascii_case("call") {
         return check(
             args.strip_prefix(&["--".to_string()]).unwrap_or(args),
             cwd,
             env,
             depth + 1,
         );
-    }
-    if program_name(program).eq_ignore_ascii_case("rustup")
-        && args.first().is_some_and(|arg| arg == "run")
-    {
-        return check(args.get(2..).unwrap_or_default(), cwd, env, depth + 1);
     }
     if !program_name(program).eq_ignore_ascii_case("cargo") {
         return Ok(());
@@ -619,8 +651,49 @@ fn workspace_root(
     }
     for parent in directory.ancestors().skip(1) {
         let manifest = parent.join("Cargo.toml");
-        if config_exists(&manifest)? && read_toml(&manifest, budget)?.get("workspace").is_some() {
-            return Ok(parent.to_path_buf());
+        if config_exists(&manifest)?
+            && let Some(workspace) = read_toml(&manifest, budget)?.get("workspace")
+        {
+            let parent = resolved(parent)?;
+            let directory = resolved(directory)?;
+            let relative = directory
+                .strip_prefix(&parent)
+                .map_err(|_| rejected("Cannot prove Cargo workspace membership."))?;
+            let matches = |key| -> Result<bool, String> {
+                let Some(patterns) = workspace.get(key) else {
+                    return Ok(false);
+                };
+                let patterns = patterns
+                    .as_array()
+                    .ok_or_else(|| rejected("Cargo workspace membership is not an array."))?;
+                for pattern in patterns {
+                    let pattern = pattern
+                        .as_str()
+                        .ok_or_else(|| rejected("Cargo workspace member is not a path."))?;
+                    let pattern = glob::Pattern::new(pattern)
+                        .map_err(|_| rejected("Cannot parse Cargo workspace member pattern."))?;
+                    if pattern.matches_path_with(
+                        relative,
+                        glob::MatchOptions {
+                            require_literal_separator: true,
+                            ..glob::MatchOptions::new()
+                        },
+                    ) {
+                        return Ok(true);
+                    }
+                }
+                Ok(false)
+            };
+            if matches("exclude")? {
+                return Ok(directory);
+            }
+            if matches("members")? {
+                return Ok(parent);
+            }
+            // Cargo can infer members through path dependencies. Without the
+            // dependency graph, an unmatched nested package is not proof that
+            // the ancestor owns its default target directory.
+            return Err(rejected("Cannot prove this package's Cargo workspace membership; use an explicit target directory."));
         }
     }
     Ok(directory.to_path_buf())
@@ -826,23 +899,6 @@ fn potential_build(argv: &[String]) -> bool {
 /// Programs that only report on existing processes or text. None of them can
 /// start a build, so a Cargo name appearing in their filters or arguments is
 /// data, not an invocation, and must not reach the build rejection.
-fn read_only_inspection_program(program: &str) -> bool {
-    matches!(
-        program_name(program).to_ascii_lowercase().as_str(),
-        "rg" | "rga"
-            | "echo"
-            | "write-output"
-            | "get-content"
-            | "select-string"
-            | "get-process"
-            | "get-ciminstance"
-            | "get-wmiobject"
-            | "tasklist"
-            | "ps"
-            | "pgrep"
-            | "pidof"
-    )
-}
 
 fn visibly_builds(script: &str) -> bool {
     visibly_builds_at_depth(script, 0)
@@ -1599,5 +1655,72 @@ mod audit36_lane_regressions {
         assert!(visibly_builds(
             "$env:CARGO_TARGET_DIR='managed'; cargo build"
         ));
+    }
+}
+
+#[cfg(test)]
+mod audit04_lane_regressions {
+    use super::*;
+
+    fn fixture() -> (tempfile::TempDir, PathBuf, HashMap<String, String>) {
+        let root = tempfile::tempdir().unwrap();
+        let managed = root.path().join("managed");
+        std::fs::create_dir_all(&managed).unwrap();
+        std::fs::write(managed.join(".codex-cargo-lanes-root"), "").unwrap();
+        let env = HashMap::from([("CARGO_HOME".into(), root.path().join("cargo-home").display().to_string())]);
+        (root, managed, env)
+    }
+
+    #[tokio::test]
+    async fn quoted_cargo_identity_is_checked_through_the_public_entrypoint() {
+        let (root, managed, env) = fixture();
+        let command = ["bash".into(), "-c".into(), format!("carg\"\"o build --target-dir '{}'", managed.display())];
+        assert!(check_managed_cargo_lane(&command, root.path(), &env).await.is_err());
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn encoded_powershell_cargo_is_checked_through_the_public_entrypoint() {
+        use base64::Engine as _;
+        let (root, managed, env) = fixture();
+        let script = format!("cargo build --target-dir '{}'", managed.display());
+        let bytes = script.encode_utf16().flat_map(u16::to_le_bytes).collect::<Vec<_>>();
+        let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
+        let command = ["pwsh".into(), "-NoProfile".into(), "-EncodedCommand".into(), encoded];
+        assert!(check_managed_cargo_lane(&command, root.path(), &env).await.is_err());
+        let ordinary = ["pwsh".into(), "-NoProfile".into(), "-Command".into(), script];
+        assert!(check_managed_cargo_lane(&ordinary, root.path(), &env).await.is_err());
+    }
+
+    #[test]
+    fn env_separator_assignments_and_time_share_structural_wrapper_decoding() {
+        let (root, managed, env) = fixture();
+        for command in [
+            vec!["env".into(), "--".into(), format!("CARGO_TARGET_DIR={}", managed.display()), "cargo".into(), "build".into()],
+            vec!["/usr/bin/time".into(), "cargo".into(), "build".into(), "--target-dir".into(), managed.display().to_string()],
+        ] {
+            assert!(check(&command, root.path(), &env, 0).is_err(), "{command:?}");
+        }
+        assert!(check(&["command".into(), "-v".into(), "cargo".into(), "build".into()], root.path(), &env, 0).is_ok());
+    }
+
+    #[test]
+    fn excluded_package_uses_its_own_default_target_not_the_ancestor_workspace() {
+        let root = tempfile::tempdir().unwrap();
+        let package = root.path().join("standalone");
+        std::fs::create_dir_all(package.join("target")).unwrap();
+        std::fs::write(root.path().join("Cargo.toml"), "[workspace]\nmembers=[]\nexclude=['standalone']\n").unwrap();
+        std::fs::write(package.join("Cargo.toml"), "[package]\nname='standalone'\nversion='0.1.0'\n").unwrap();
+        let marker = package.join("target/.codex-cargo-lanes-root");
+        std::fs::write(&marker, "").unwrap();
+        let env = HashMap::from([("CARGO_HOME".into(), root.path().join("cargo-home").display().to_string())]);
+        let command = ["cargo".into(), "build".into()];
+        assert!(check(&command, &package, &env, 0).is_err());
+        std::fs::remove_file(marker).unwrap();
+        std::fs::create_dir_all(root.path().join("target")).unwrap();
+        std::fs::write(root.path().join("target/.codex-cargo-lanes-root"), "").unwrap();
+        assert!(check(&command, &package, &env, 0).is_ok());
+        std::fs::write(root.path().join("Cargo.toml"), "[workspace]\nmembers=[]\n").unwrap();
+        assert!(check(&command, &package, &env, 0).is_err());
     }
 }

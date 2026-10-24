@@ -180,6 +180,7 @@ pub struct CloudConfigBundleLoader {
     state: std::sync::Arc<std::sync::Mutex<BundleLoadState>>,
     retry_factory: Option<std::sync::Arc<dyn Fn() -> BundleLoadFuture + Send + Sync>>,
     publication_guard: Option<std::sync::Arc<BundlePublicationGuard>>,
+    loaded_generation: Option<std::sync::Arc<std::sync::Mutex<Option<u64>>>>,
 }
 
 type BundlePublicationGuard =
@@ -207,6 +208,7 @@ impl CloudConfigBundleLoader {
             })),
             retry_factory: None,
             publication_guard: None,
+            loaded_generation: None,
         }
     }
 
@@ -229,6 +231,7 @@ impl CloudConfigBundleLoader {
             })),
             retry_factory: Some(factory),
             publication_guard: None,
+            loaded_generation: None,
         }
     }
 
@@ -274,16 +277,29 @@ impl CloudConfigBundleLoader {
         }
     }
 
-    pub fn candidate_generation(&self) -> u64 {
-        self.state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .generation
+    /// Creates a scope for one effective-config load. Clones of this scope record
+    /// the generation acquired by `get`, not whichever attempt is current later.
+    pub fn for_load(&self) -> Self {
+        let mut loader = self.clone();
+        loader.loaded_generation = Some(std::sync::Arc::new(std::sync::Mutex::new(None)));
+        loader
+    }
+
+    /// Rejects only the candidate acquired by this load scope, if it acquired one.
+    pub fn reject_loaded_candidate(&self) {
+        let generation = self.loaded_generation.as_ref().and_then(|generation| {
+            *generation
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+        });
+        if let Some(generation) = generation {
+            self.reject_candidate(generation);
+        }
     }
 
     /// A download is only a candidate until the complete effective config validates.
     /// Do not discard a newer attempt, an in-flight attempt, or a terminal request error.
-    pub fn reject_candidate(&self, generation: u64) {
+    fn reject_candidate(&self, generation: u64) {
         if self.retry_factory.is_none() {
             return;
         }
@@ -348,7 +364,16 @@ impl CloudConfigBundleLoader {
                 state.future = None;
             }
         }
-        self.publish_if_current(|| result)?
+        self.publish_if_current(|| {
+            if result.is_ok()
+                && let Some(loaded_generation) = &self.loaded_generation
+            {
+                *loaded_generation
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(generation);
+            }
+            result
+        })?
     }
 }
 

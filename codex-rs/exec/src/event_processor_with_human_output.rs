@@ -348,14 +348,13 @@ impl EventProcessor for EventProcessorWithHumanOutput {
             }
             ServerNotification::TurnCompleted(notification) => match notification.turn.status {
                 TurnStatus::Completed => {
-                    if let Some(surfaced_result) = notification
-                        .surfaced_result
-                        .as_ref()
-                        .or(notification.turn.surfaced_result.as_ref())
+                    if let Some(message) =
+                        crate::event_processor::authoritative_final_message(&notification)
                     {
-                        self.final_message_rendered = self.final_message_rendered
-                            && self.final_message == surfaced_result.canonical_message;
-                        self.final_message = surfaced_result.canonical_message.clone();
+                        let message = message.map(str::to_string);
+                        self.final_message_rendered =
+                            self.final_message_rendered && self.final_message == message;
+                        self.final_message = message;
                     } else {
                         let timing = notification
                             .timing

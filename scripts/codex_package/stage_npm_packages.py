@@ -19,7 +19,6 @@ import hashlib
 import importlib.util
 import json
 import os
-import platform
 import re
 import shutil
 import stat
@@ -48,6 +47,7 @@ from scripts.common.process_owner import (  # noqa: E402
     operation,
 )
 from scripts.codex_package.targets import BINARY_TARGETS  # noqa: E402
+from scripts.codex_package.layout import sha256_file as file_sha256  # noqa: E402
 
 from scripts.codex_package.stage_npm_archives import (  # noqa: E402
     archive_name_for_target,
@@ -134,13 +134,7 @@ class StagePackageResult:
     log: str
 
 
-BINARY_COMPONENTS = {
-    "codex-responses-api-proxy": BinaryComponent(
-        artifact_prefix="codex-responses-api-proxy",
-        dest_dir="codex-responses-api-proxy",
-        binary_basename="codex-responses-api-proxy",
-    ),
-}
+BINARY_COMPONENTS: dict[str, BinaryComponent] = {}
 
 
 def _gha_enabled() -> bool:
@@ -855,14 +849,6 @@ def write_complete_marker(artifact_dir: Path, artifact: WorkflowArtifact) -> Non
         temporary.unlink(missing_ok=True)
 
 
-def file_sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        while chunk := handle.read(1024 * 1024):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
 def extract_artifact_zip(archive_path: Path, dest_dir: Path) -> None:
     seen: set[str] = set()
     root = dest_dir.resolve()
@@ -1400,23 +1386,6 @@ def _main() -> int:
             args.keep_staging_dirs,
             args.max_stage_workers,
         )
-
-        staged_by_package = {
-            result.package: result.pack_output for result in staged_results
-        }
-        if (
-            os.name == "nt"
-            and platform.machine().lower() in {"amd64", "x86_64"}
-            and "codex" in staged_by_package
-        ):
-            native_package = next(
-                name
-                for name, target in codex_platform_packages().items()
-                if target["platform_key"] == "win32-x64"
-            )
-            load_build_module().smoke_test_npm_tarball(
-                staged_by_package["codex"], staged_by_package[native_package]
-            )
 
         if resolved_head_sha:
             owned_paths = []

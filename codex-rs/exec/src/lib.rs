@@ -615,6 +615,61 @@ async fn load_bootstrap_config_or_exit(
     }
 }
 
+type PendingInterrupt = std::pin::Pin<
+    Box<dyn std::future::Future<Output = Result<TurnInterruptResponse, String>> + Send>,
+>;
+
+#[derive(Default)]
+struct ExecInterrupts {
+    requested: bool,
+    channel_closed: bool,
+    pending: Option<PendingInterrupt>,
+    deadline: Option<tokio::time::Instant>,
+}
+
+impl ExecInterrupts {
+    /// Poll one operation without restarting it when interruption makes progress.
+    async fn wait_for<T>(
+        &mut self,
+        operation: impl std::future::Future<Output = T>,
+        interrupt_rx: &mut mpsc::UnboundedReceiver<()>,
+        mut request_interrupt: impl FnMut() -> PendingInterrupt,
+    ) -> Result<T, String> {
+        tokio::pin!(operation);
+        loop {
+            tokio::select! {
+                _ = async {
+                    match self.deadline {
+                        Some(deadline) => tokio::time::sleep_until(deadline).await,
+                        None => std::future::pending().await,
+                    }
+                } => return Err("turn interruption deadline expired; shutdown remains unconfirmed".into()),
+                result = async {
+                    match self.pending.as_mut() {
+                        Some(interrupt) => interrupt.await,
+                        None => std::future::pending().await,
+                    }
+                }, if self.pending.is_some() => {
+                    self.pending = None;
+                    if let Err(error) = result { warn!("turn/interrupt failed: {error}"); }
+                }
+                signal = interrupt_rx.recv(), if !self.channel_closed => {
+                    if signal.is_none() {
+                        self.channel_closed = true;
+                    } else if self.requested {
+                        return Err("second interrupt requested forced shutdown; turn settlement is unconfirmed".into());
+                    } else {
+                        self.requested = true;
+                        self.deadline = Some(tokio::time::Instant::now() + std::time::Duration::from_secs(10));
+                        self.pending = Some(request_interrupt());
+                    }
+                }
+                result = &mut operation => return Ok(result),
+            }
+        }
+    }
+}
+
 /// Returns whether the turn failed after its failure was reported, so the caller
 /// can exit nonzero once session state and telemetry are released.
 async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<bool> {
@@ -854,66 +909,44 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<bool> {
     let mut streamed_final_message_seen = false;
     let mut recovery_state = recovery::ExecRecoveryState::default();
     let mut delivery_error = None;
-    let mut interrupt_channel_open = true;
     let primary_thread_id_for_requests = primary_thread_id.to_string();
-    let mut interrupt_requested = false;
-    type PendingInterrupt = std::pin::Pin<
-        Box<dyn std::future::Future<Output = Result<TurnInterruptResponse, String>> + Send>,
-    >;
-    let mut pending_interrupt: Option<PendingInterrupt> = None;
-    let mut interrupt_deadline = None;
+    let mut interrupts = ExecInterrupts::default();
     loop {
-        let server_event = tokio::select! {
-            _ = async {
-                match interrupt_deadline {
-                    Some(deadline) => tokio::time::sleep_until(deadline).await,
-                    None => std::future::pending().await,
-                }
-            } => {
-                delivery_error = Some("turn interruption deadline expired; shutdown remains unconfirmed".to_string());
+        let request_handle = client.request_handle();
+        let mut request_interrupt = || {
+            let handle = request_handle.clone();
+            let request = ClientRequest::TurnInterrupt {
+                request_id: request_ids.next(),
+                params: TurnInterruptParams {
+                    thread_id: primary_thread_id_for_requests.clone(),
+                    turn_id: task_id.clone(),
+                },
+            };
+            Box::pin(async move {
+                handle
+                    .request_typed::<TurnInterruptResponse>(request)
+                    .await
+                    .map_err(|error| error.to_string())
+            }) as PendingInterrupt
+        };
+        let server_event = match interrupts
+            .wait_for(
+                async {
+                    match bootstrap_events.pop_front() {
+                        Some(event) => Some(event),
+                        None => client.next_event().await,
+                    }
+                },
+                &mut interrupt_rx,
+                &mut request_interrupt,
+            )
+            .await
+        {
+            Ok(event) => event,
+            Err(message) => {
+                delivery_error = Some(message);
                 break;
             }
-            result = async {
-                match pending_interrupt.as_mut() {
-                    Some(interrupt) => interrupt.await,
-                    None => std::future::pending().await,
-                }
-            }, if pending_interrupt.is_some() => {
-                pending_interrupt = None;
-                if let Err(error) = result { warn!("turn/interrupt failed: {error}"); }
-                continue;
-            }
-            maybe_interrupt = interrupt_rx.recv(), if interrupt_channel_open => {
-                if maybe_interrupt.is_none() {
-                    interrupt_channel_open = false;
-                    continue;
-                }
-                if interrupt_requested {
-                    delivery_error = Some("second interrupt requested forced shutdown; turn settlement is unconfirmed".to_string());
-                    break;
-                }
-                interrupt_requested = true;
-                interrupt_deadline = Some(tokio::time::Instant::now() + std::time::Duration::from_secs(10));
-                let handle = client.request_handle();
-                let request = ClientRequest::TurnInterrupt {
-                        request_id: request_ids.next(),
-                        params: TurnInterruptParams {
-                            thread_id: primary_thread_id_for_requests.clone(),
-                            turn_id: task_id.clone(),
-                        },
-                    };
-                pending_interrupt = Some(Box::pin(async move {
-                    handle.request_typed::<TurnInterruptResponse>(request).await
-                        .map_err(|error| error.to_string())
-                }));
-                continue;
-            }
-            maybe_event = async {
-                match bootstrap_events.pop_front() {
-                    Some(event) => Some(event),
-                    None => client.next_event().await,
-                }
-            } => maybe_event,
         };
 
         let Some(server_event) = server_event else {
@@ -933,34 +966,58 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<bool> {
                     continue;
                 }
                 recovery_state.backfill_complete_stream(&mut notification);
-                match prepare_server_notification(
-                    thread_ephemeral,
-                    &primary_thread_id_for_requests,
-                    &task_id,
-                    streamed_final_message_seen,
-                    &mut notification,
-                    async |thread_id| {
-                        send_request_with_response::<ThreadReadResponse>(
-                            &client,
-                            ClientRequest::ThreadRead {
+                if should_backfill_turn_completed_items(thread_ephemeral, &notification) {
+                    let read_request_id = request_ids.next();
+                    let read_handle = client.request_handle();
+                    // Keep the recovery future alive while polling the same interrupt
+                    // state as the event loop. Dropping it on forced shutdown cancels
+                    // this local wait; it does not claim server settlement.
+                    let preparation = prepare_server_notification(
+                        thread_ephemeral,
+                        &primary_thread_id_for_requests,
+                        &task_id,
+                        streamed_final_message_seen,
+                        &mut notification,
+                        async |thread_id| {
+                            read_handle
+                                .request_typed::<ThreadReadResponse>(ClientRequest::ThreadRead {
+                                    request_id: read_request_id,
+                                    params: ThreadReadParams {
+                                        thread_id,
+                                        include_turns: true,
+                                    },
+                                })
+                                .await
+                                .map_err(|error| format!("thread/read: {error}"))
+                        },
+                    );
+                    let request_handle = client.request_handle();
+                    match interrupts
+                        .wait_for(preparation, &mut interrupt_rx, || {
+                            let handle = request_handle.clone();
+                            let request = ClientRequest::TurnInterrupt {
                                 request_id: request_ids.next(),
-                                params: ThreadReadParams {
-                                    thread_id,
-                                    include_turns: true,
+                                params: TurnInterruptParams {
+                                    thread_id: primary_thread_id_for_requests.clone(),
+                                    turn_id: task_id.clone(),
                                 },
-                            },
-                            "thread/read",
-                        )
+                            };
+                            Box::pin(async move {
+                                handle
+                                    .request_typed::<TurnInterruptResponse>(request)
+                                    .await
+                                    .map_err(|error| error.to_string())
+                            }) as PendingInterrupt
+                        })
                         .await
-                    },
-                )
-                .await
-                {
-                    Ok(false) => continue,
-                    Ok(true) => {}
-                    Err(message) => {
-                        delivery_error = Some(message);
-                        break;
+                        .and_then(std::convert::identity)
+                    {
+                        Ok(false) => continue,
+                        Ok(true) => {}
+                        Err(message) => {
+                            delivery_error = Some(message);
+                            break;
+                        }
                     }
                 }
                 recovery_state.observe(&notification);
@@ -1241,7 +1298,6 @@ fn session_configured_from_thread_response(
         cwd,
         reasoning_effort,
         initial_messages: None,
-        network_proxy: None,
         rollout_path,
     })
 }
@@ -1350,7 +1406,7 @@ async fn prepare_server_notification(
         Err(error) => {
             let message = format!("failed to recover completed turn output: {error}");
             if payload.turn.status == codex_app_server_protocol::TurnStatus::Completed
-                && payload.surfaced_result.is_none()
+                && event_processor::authoritative_final_message(payload).is_none()
                 && !streamed_final_message_seen
             {
                 return Err(message);
@@ -1442,6 +1498,28 @@ fn cwds_match(current_cwd: &Path, session_cwd: &Path) -> bool {
     path_utils::paths_match_after_normalization(current_cwd, session_cwd)
 }
 
+async fn last_resumable_thread_in_page(
+    threads: Vec<AppServerThread>,
+    cwd: &Path,
+    all: bool,
+    cwd_filtered_out: &mut bool,
+    ineligible_filtered_out: &mut bool,
+) -> anyhow::Result<Option<String>> {
+    for thread in threads {
+        // Scope the candidate before fallible spawned-worker hydration.
+        if !all && !cwds_match(cwd, latest_thread_cwd(&thread)) {
+            *cwd_filtered_out = true;
+            continue;
+        }
+        if !resume_candidate_accepts_direct_input(&thread).await? {
+            *ineligible_filtered_out = true;
+            continue;
+        }
+        return Ok(Some(thread.id));
+    }
+    Ok(None)
+}
+
 async fn resolve_resume_thread_id(
     client: &InProcessAppServerClient,
     config: &Config,
@@ -1479,15 +1557,16 @@ async fn resolve_resume_thread_id(
             )
             .await
             .map_err(anyhow::Error::msg)?;
-            for thread in response.data {
-                if !resume_candidate_accepts_direct_input(&thread).await? {
-                    ineligible_filtered_out = true;
-                    continue;
-                }
-                if args.all || cwds_match(config.cwd.as_path(), latest_thread_cwd(&thread)) {
-                    return Ok(thread.id);
-                }
-                cwd_filtered_out = true;
+            if let Some(id) = last_resumable_thread_in_page(
+                response.data,
+                config.cwd.as_path(),
+                args.all,
+                &mut cwd_filtered_out,
+                &mut ineligible_filtered_out,
+            )
+            .await?
+            {
+                return Ok(id);
             }
             let Some(next_cursor) = response.next_cursor else {
                 if cwd_filtered_out {

@@ -619,11 +619,13 @@ async fn step_refresh_timeout_keeps_preparation_scope_and_releases_gate() {
         filesystem.clone(),
     ));
     let environment_manager = manager_registering(&environment);
-    let environments = environment_snapshot_with_environment(&config.cwd, 3, environment);
+    let mut environments = environment_snapshot_with_environment(&config.cwd, 3, environment);
     let manager = AgentsMdManager::new(None);
-    let cached = manager
+    manager
         .refresh_and_observe_shared(&config, &environments)
         .await;
+    // Only a new scope needs I/O after a complete session load.
+    environments.generation += 1;
     let thread_environments = ThreadEnvironments::new(
         environment_manager,
         default_user_shell(),
@@ -655,19 +657,94 @@ async fn step_refresh_timeout_keeps_preparation_scope_and_releases_gate() {
     .await
     .expect("instruction timeout must not retain the gate while waiting for preparation");
 
-    assert_eq!(snapshot.generation, 3);
+    assert_eq!(snapshot.generation, 4);
     assert_eq!(prepared_generation, snapshot.generation);
-    assert_eq!(observation.freshness, AgentsMdFreshness::CachedFallback);
-    assert_eq!(
-        observation.loaded.unwrap().text(),
-        cached.loaded.unwrap().text()
-    );
+    assert_eq!(observation.freshness, AgentsMdFreshness::IncompleteRead);
+    assert!(observation.loaded.is_none());
     assert!(
         thread_environments
             .snapshot_now()
             .await
             .turn_environments
             .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn sampling_steps_keep_session_instructions_until_scope_changes() {
+    let root = tempfile::tempdir().expect("workspace");
+    let path = root.path().join("AGENTS.md");
+    fs::write(&path, "session instructions").unwrap();
+    let config = Arc::new(config_for(&root).await);
+    let filesystem = Arc::new(ControlledFileSystem::new(config.cwd.join("AGENTS.md")));
+    let environment = Arc::new(Environment::default_for_tests_with_filesystem(
+        filesystem.clone(),
+    ));
+    let mut environments = environment_snapshot_with_environment(&config.cwd, 3, environment.clone());
+    let manager = AgentsMdManager::new(None);
+    let first = manager
+        .refresh_and_observe_shared(&config, &environments)
+        .await;
+    fs::write(&path, "edited instructions").unwrap();
+    let thread_environments = ThreadEnvironments::new(
+        manager_registering(&environment),
+        default_user_shell(),
+        ShellSnapshot::disabled(),
+        environments.clone(),
+        /*non_blocking_snapshots*/ false,
+    );
+    let (_, second, ()) = manager
+        .refresh_for_step(&config, &thread_environments, |_| async {})
+        .await;
+    let third = manager
+        .refresh_and_observe_shared(&config, &environments)
+        .await;
+    assert_eq!(filesystem.target_stream_calls(), 1);
+    assert!(Arc::ptr_eq(
+        first.loaded.as_ref().unwrap(),
+        second.loaded.as_ref().unwrap(),
+    ));
+    assert!(Arc::ptr_eq(
+        first.loaded.as_ref().unwrap(),
+        third.loaded.as_ref().unwrap(),
+    ));
+    assert!(second.loaded.unwrap().text().contains("session instructions"));
+
+    environments.generation += 1;
+    let changed = manager
+        .refresh_and_observe_shared(&config, &environments)
+        .await;
+    assert_eq!(filesystem.target_stream_calls(), 2);
+    assert!(changed.loaded.unwrap().text().contains("edited instructions"));
+}
+
+#[tokio::test]
+async fn sampling_step_retries_incomplete_instruction_load() {
+    let root = tempfile::tempdir().expect("workspace");
+    fs::write(root.path().join("AGENTS.md"), "recovered instructions").unwrap();
+    let config = Arc::new(config_for(&root).await);
+    let filesystem = Arc::new(ControlledFileSystem::new(config.cwd.join("AGENTS.md")));
+    let environment = Arc::new(Environment::default_for_tests_with_filesystem(
+        filesystem.clone(),
+    ));
+    let environments = environment_snapshot_with_environment(&config.cwd, 3, environment);
+    let manager = AgentsMdManager::new(None);
+    filesystem.set_next_project_read(NextProjectRead::Fail(io::ErrorKind::PermissionDenied));
+    let first = manager
+        .refresh_and_observe_shared(&config, &environments)
+        .await;
+    assert_ne!(first.freshness, AgentsMdFreshness::Refreshed);
+    let second = manager
+        .refresh_and_observe_shared(&config, &environments)
+        .await;
+    assert_eq!(filesystem.target_stream_calls(), 2);
+    assert_eq!(second.freshness, AgentsMdFreshness::Refreshed);
+    assert!(
+        second
+            .loaded
+            .unwrap()
+            .text()
+            .contains("recovered instructions")
     );
 }
 

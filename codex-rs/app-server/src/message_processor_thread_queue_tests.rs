@@ -20,6 +20,59 @@ fn text_input(text: &str) -> serde_json::Value {
     json!([{"type":"text", "text":text, "text_elements":[]}])
 }
 
+#[tokio::test]
+#[serial(app_server_tracing)]
+async fn recovery_publication_backpressure_does_not_hold_the_queue_file_lock() -> Result<()> {
+    use std::time::Duration;
+    let server = create_mock_responses_server_repeating_assistant("Done").await;
+    let mut harness = TracingHarness::new_with_features(server, Arc::new(codex_config::NoopThreadConfigLoader), false, true).await?;
+    let started: ThreadStartResponse = harness.request(ClientRequest::ThreadStart {
+        request_id: RequestId::Integer(70_000), params: ThreadStartParams::default(),
+    }, None).await;
+    read_thread_started_notification(&mut harness.outgoing_rx).await;
+    let id = ThreadId::from_string(&started.thread.id)?;
+    let thread = harness.processor.thread_manager.get_thread(id).await?;
+    thread.ensure_rollout_materialized().await;
+    thread.flush_rollout().await?;
+    let db = thread.state_db().expect("persistent thread state");
+    db.write_thread_queue(id, &json!({
+        "version": 1, "revision": 0, "paused": false,
+        "submissions": [{"id":"queued", "clientUserMessageId":null, "input":text_input("before")}],
+        "pendingStart": {"submissionId":"queued", "turnId":"unrecorded"},
+    }).to_string()).await?;
+    let capacity = harness.outgoing_rx.capacity();
+    for index in 0..capacity {
+        harness.processor.outgoing.send_error(crate::outgoing_message::ConnectionRequestId {
+            connection_id: TEST_CONNECTION_ID, request_id: RequestId::Integer(71_000 + index as i64),
+        }, crate::error_code::internal_error("fill outgoing")).await;
+    }
+    let params = || codex_app_server_protocol::ThreadQueueListParams { thread_id: id.to_string(), cursor: None, limit: None };
+    let page = tokio::time::timeout(Duration::from_secs(2), harness.processor.thread_queue_processor.list(params())).await?.map_err(|error| anyhow::anyhow!(error.message))?;
+    assert!(page.snapshot.unwrap().paused);
+    // The request has ended, but recovery still owns its blocked publication.
+    let processor = Arc::clone(&harness.processor);
+    let mutation = tokio::spawn(async move {
+        processor.thread_queue_processor.update(codex_app_server_protocol::ThreadQueueUpdateParams {
+            thread_id: id.to_string(), queued_submission_id: "queued".into(),
+            input: vec![codex_app_server_protocol::UserInput::Text { text: "after".into(), text_elements: Vec::new() }],
+        }).await
+    });
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let payload = db.read_thread_queue(id).await.unwrap().unwrap();
+            if serde_json::from_str::<serde_json::Value>(&payload).unwrap()["revision"] == 2 { break; }
+            tokio::task::yield_now().await;
+        }
+    }).await?;
+    assert!(!mutation.is_finished(), "transport remains full after the independent mutation commits");
+    let page = tokio::time::timeout(Duration::from_secs(2), harness.processor.thread_queue_processor.list(params())).await?.map_err(|error| anyhow::anyhow!(error.message))?;
+    assert_eq!(page.data[0].input, vec![codex_app_server_protocol::UserInput::Text { text: "after".into(), text_elements: Vec::new() }]);
+    for _ in 0..capacity { harness.outgoing_rx.recv().await.unwrap(); }
+    tokio::time::timeout(Duration::from_secs(2), mutation).await??.map_err(|error| anyhow::anyhow!(error.message))?;
+    harness.shutdown().await;
+    Ok(())
+}
+
 #[test]
 #[serial(app_server_tracing)]
 fn thread_queue_rpc_lifecycle_and_automatic_follow_up() -> Result<()> {

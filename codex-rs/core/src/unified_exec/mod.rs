@@ -31,7 +31,6 @@ use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 use std::sync::Weak;
 
-use codex_network_proxy::NetworkProxy;
 use codex_protocol::models::AdditionalPermissionProfile;
 use codex_protocol::request_permissions::UriAdditionalPermissionProfile;
 use codex_utils_output_truncation::TruncationPolicy;
@@ -50,7 +49,6 @@ use crate::tools::command_execution::CommandAttemptKey;
 use crate::tools::command_output_artifact::RawOutputArtifact;
 use crate::tools::context::SharedTurnDiffTracker;
 use crate::tools::context::ToolCallSource;
-use crate::tools::network_approval::DeferredNetworkApproval;
 
 mod async_watcher;
 mod errors;
@@ -163,7 +161,6 @@ pub(crate) struct ExecCommandRequest {
     pub normalization_cwd: Option<PathBuf>,
     pub sandbox_cwd: PathUri,
     pub turn_environment: TurnEnvironment,
-    pub network: Option<NetworkProxy>,
     pub tty: bool,
     pub sandbox_permissions: SandboxPermissions,
     pub additional_permissions: Option<AdditionalPermissionProfile>,
@@ -180,7 +177,6 @@ pub(crate) struct ExecCommandRequest {
 pub(crate) struct PendingSpawnRegistration {
     processes: Arc<StdMutex<Vec<Arc<UnifiedExecProcess>>>>,
     termination_owner: Option<process::ProcessTerminationOwner>,
-    workspace_operation: Option<Arc<dyn Send + Sync>>,
 }
 
 #[cfg(test)]
@@ -199,24 +195,13 @@ impl PendingSpawnRegistration {
         Self {
             processes: Arc::default(),
             termination_owner: Some(owner),
-            workspace_operation: None,
         }
     }
 
-    pub(crate) fn with_workspace_operation<T: Send + Sync + 'static>(&self, permit: T) -> Self {
-        Self {
-            processes: Arc::clone(&self.processes),
-            termination_owner: self.termination_owner.clone(),
-            workspace_operation: Some(Arc::new(permit)),
-        }
-    }
 
     pub(crate) fn register(&self, process: Arc<UnifiedExecProcess>) {
         if let Some(owner) = self.termination_owner.as_ref() {
             process.set_termination_owner(owner.clone());
-        }
-        if let Some(permit) = &self.workspace_operation {
-            process.hold_workspace_operation_until_exit(Arc::clone(permit));
         }
         self.processes
             .lock()
@@ -395,6 +380,10 @@ impl ProcessStore {
         self.reserved_process_ids.remove(&process_id);
         self.reserved_process_slots.remove(&process_id);
         let entry = self.processes.remove(&process_id)?;
+        // A transport ID can never authorize a previous owner's completion.
+        // Successful retirement republishes this owner's result immediately;
+        // failure retirement must not leave an older same-ID replay behind.
+        self.finished.retain(|(id, _)| *id != process_id);
         self.used_process_ids.insert(
             process_id,
             Some(entry.process.session_capabilities(entry.tty).incarnation),
@@ -460,7 +449,6 @@ struct ProcessEntry {
     /// A quiet period would end an empty poll at the first gap and bill another
     /// model round trip, so later polls keep waiting for the requested yield.
     validation_launch: bool,
-    network_approval: Option<DeferredNetworkApproval>,
     session: Weak<Session>,
     last_used: tokio::time::Instant,
 }

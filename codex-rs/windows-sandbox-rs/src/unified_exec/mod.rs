@@ -83,6 +83,10 @@ pub async fn spawn_windows_sandbox_session_for_level(
         )
         .await
     } else {
+        anyhow::ensure!(
+            request.read_roots_override.is_none() && request.write_roots_override.is_none(),
+            "restricted-token sandbox does not support read/write root overrides; use the elevated backend"
+        );
         spawn_windows_sandbox_session_legacy(
             request.permission_profile,
             request.workspace_roots,

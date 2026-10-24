@@ -27,6 +27,7 @@ use std::sync::Mutex;
 #[cfg(test)]
 use tokio::sync::Notify;
 
+#[derive(Default)]
 pub struct PlanHandler;
 
 pub struct PlanToolOutput {
@@ -40,7 +41,19 @@ const PLAN_UNCHANGED_MESSAGE: &str = "Plan unchanged";
 
 impl PlanToolOutput {
     fn response_result(&self) -> JsonValue {
-        self.response_with_lineage(false)
+        let mut response = self.response_with_lineage(false);
+        if let Some(fields) = response.as_object_mut() {
+            fields.remove("obligations");
+        }
+        if let Some(lineage) = response.get_mut("lineage").and_then(JsonValue::as_object_mut) {
+            lineage.remove("requirements");
+            lineage.remove("step_requirements");
+        }
+        if let Some(fields) = response.as_object_mut() {
+            fields.remove("lineage");
+            fields.remove("lineage_complete");
+        }
+        response
     }
 
     fn durable_response(&self) -> JsonValue {
@@ -54,7 +67,7 @@ impl PlanToolOutput {
             lineage: if lineage_complete {
                 self.lineage.compact_for_plan(&self.current_plan)
             } else {
-                self.lineage.active_for_plan(&self.current_plan)
+                self.lineage.checklist_metadata()
             },
             lineage_complete,
             revision: crate::plan_store::plan_revision_with_lineage(
@@ -152,8 +165,8 @@ impl ToolOutput for PlanToolOutput {
     }
 
     fn sampling_request_signal(&self) -> Option<JsonValue> {
-        // Preserve the tool-outcome bookkeeping signal. Turn settlement reads
-        // authoritative revision and obligations directly from the plan owner.
+        // Preserve the tool-outcome bookkeeping signal without prompting for
+        // checklist reconciliation.
         Some(serde_json::json!({
             "kind": "plan_update",
             "plan": self.current_plan,
@@ -268,39 +281,6 @@ impl PlanHandler {
             return Err(FunctionCallError::RespondToModel(
                 "update_plan was cancelled before the plan update began".to_string(),
             ));
-        }
-        if let Some(workflow) = &requested_args.workflow {
-            if workflow.len() > 128 {
-                return Err(FunctionCallError::RespondToModel(
-                    "workflow may link at most 128 existing assignments".into(),
-                ));
-            }
-            let mut resolved = std::collections::BTreeMap::new();
-            let coordinator = session.services.agent_control.task_coordinator();
-            for (step_id, assignment_id) in workflow {
-                let task = coordinator
-                    .get_agent_task(*assignment_id, Some(0))
-                    .await
-                    .map_err(|error| FunctionCallError::RespondToModel(error.to_string()))?;
-                // Assignments carry the tree's shared session ID; a spawned
-                // agent's own thread ID never equals it.
-                if task.assignment.root_session_id
-                    != session.services.agent_control.session_id().to_string()
-                {
-                    return Err(FunctionCallError::RespondToModel(
-                        "workflow assignments must belong to this root session".into(),
-                    ));
-                }
-                resolved.insert(
-                    step_id.clone(),
-                    crate::plan_store::PlanExecutionNode {
-                        assignment_id: *assignment_id,
-                        dependencies: task.assignment.dependencies,
-                        capability_profile: task.assignment.capability_profile,
-                    },
-                );
-            }
-            requested_args.resolved_workflow = Some(resolved);
         }
         // Own the accepted publication through cancellation or a dropped caller,
         // just like ordered history commits. Check cancellation again after lock

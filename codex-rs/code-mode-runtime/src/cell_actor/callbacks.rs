@@ -114,6 +114,7 @@ pub(super) fn spawn_tool<H: CellHost>(
         let timeout_tool_name = tool_name.clone();
         let timeout = invocation.timeout;
         let timeout_cancellation = cancellation.clone();
+        let receipt_cancellation = cancellation.clone();
         // Publish the same instant the wrapper enforces, so every stage before
         // observation is charged against one budget and a handler that can
         // yield cooperatively knows exactly how long it has.
@@ -134,15 +135,22 @@ pub(super) fn spawn_tool<H: CellHost>(
                     // Record before signalling: an observer woken by the
                     // cancellation must already be able to read why.
                     timeout_cancellation.cancel_with(CancellationCause::NestedDeadline);
-                    Err(format!(
-                        "nested tool `{timeout_tool_name}` exceeded its {}ms timeout",
-                        timeout.as_millis()
-                    ))
+                    Err(if timeout_cancellation.cause() == Some(CancellationCause::NestedDeadline) {
+                        format!("nested tool `{timeout_tool_name}` exceeded its {}ms timeout", timeout.as_millis())
+                    } else {
+                        timeout_cancellation.cause().map(|cause| cause.describe()).unwrap_or_else(|| "nested tool cancelled".into())
+                    })
                 }
             }
         })
         .catch_unwind()
         .await;
+        // A callback's construction or first poll can synchronously cross the
+        // deadline and still return Ready. Recheck when accepting its receipt.
+        let overdue = deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline);
+        if overdue {
+            receipt_cancellation.cancel_with(CancellationCause::NestedDeadline);
+        }
         let wrapper_received_at = std::time::Instant::now();
         let outcome = match &callback {
             Ok(Ok(_)) => "transport_completed",
@@ -157,6 +165,18 @@ pub(super) fn spawn_tool<H: CellHost>(
             "code mode wrapper received nested tool result"
         );
         let (command, failure_reason) = match callback {
+            Ok(Ok(result)) if overdue => (
+                RuntimeCommand::ToolResponseAfterDeadline {
+                    id: id.clone(),
+                    result,
+                    error_text: if receipt_cancellation.cause() == Some(CancellationCause::NestedDeadline) {
+                        format!("nested tool `{tool_name}` exceeded its {}ms timeout; completed evidence is in error.results.completed.value; do not replay its effects", timeout.as_millis())
+                    } else {
+                        receipt_cancellation.cause().map(|cause| cause.describe()).unwrap_or_else(|| "nested tool cancelled".into())
+                    },
+                },
+                None,
+            ),
             Ok(Ok(result)) => (
                 RuntimeCommand::ToolResponse {
                     id: id.clone(),

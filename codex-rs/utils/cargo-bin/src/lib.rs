@@ -5,6 +5,10 @@ use std::path::PathBuf;
 
 #[derive(Debug, thiserror::Error)]
 pub enum CargoBinError {
+    #[error(
+        "cannot verify that binary {name:?} at {path:?} was built from current inputs; use the repository test runner or an explicit CARGO_BIN_EXE path"
+    )]
+    UnverifiedFallback { name: String, path: PathBuf },
     #[error("CARGO_BIN_EXE env var {key} resolved to {path:?}, which is not an existing file")]
     ResolvedPathIsNotAFile { key: String, path: PathBuf },
     #[error("CARGO_BIN_EXE env var {key} resolved to {path:?}, but an absolute path is required")]
@@ -59,20 +63,26 @@ pub fn cargo_bin(name: &str) -> Result<PathBuf, CargoBinError> {
     })?;
     // Nothing rebuilds a binary from another package before this test runs, so
     // the file found here may predate the sources it was built from.
+    validate_fallback(name, path)
+}
+
+fn validate_fallback(name: &str, path: PathBuf) -> Result<PathBuf, CargoBinError> {
     match stale_build_input(&path) {
         Some(input) => Err(CargoBinError::StaleFallback {
             name: name.to_owned(),
             path,
             input,
         }),
-        None => Ok(path),
+        None => Err(CargoBinError::UnverifiedFallback {
+            name: name.to_owned(),
+            path,
+        }),
     }
 }
 
 /// Returns the first input recorded in the Cargo dep-info file beside `binary`
-/// that is missing or newer than `binary`: the same comparison Cargo uses to
-/// decide that the binary needs a rebuild. A binary without dep-info is not
-/// Cargo's build output, so there is nothing to compare.
+/// that is missing or newer than `binary`. None means unverifiable, not fresh:
+/// executable/dep-info mtimes cannot identify an edit made during compilation.
 fn stale_build_input(binary: &Path) -> Option<PathBuf> {
     let built = std::fs::metadata(binary)
         .and_then(|metadata| metadata.modified())
@@ -186,6 +196,52 @@ pub fn repo_root() -> io::Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn fallback_does_not_certify_edits_during_compilation() -> std::io::Result<()> {
+        use std::time::{Duration, SystemTime};
+        let dir = tempfile::tempdir()?;
+        let binary = dir.path().join("helper.exe");
+        let source = dir.path().join("main.rs");
+        std::fs::write(&binary, "old compiled bytes")?;
+        std::fs::write(&source, "new source")?;
+        let escape = |path: &Path| path.display().to_string().replace(' ', "\\ ");
+        std::fs::write(
+            binary.with_extension("d"),
+            format!("{}: {}\n", escape(&binary), escape(&source)),
+        )?;
+        let start = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let set_modified = |path: &Path, time: SystemTime| -> std::io::Result<()> {
+            std::fs::File::options()
+                .write(true)
+                .open(path)?
+                .set_modified(time)
+        };
+        set_modified(&binary, start + Duration::from_secs(20))?;
+        for edited in [
+            start - Duration::from_secs(10),
+            start + Duration::from_secs(10),
+        ] {
+            set_modified(&source, edited)?;
+            assert!(matches!(
+                validate_fallback("helper", binary.clone()),
+                Err(CargoBinError::UnverifiedFallback { .. })
+            ));
+        }
+        set_modified(&source, start + Duration::from_secs(30))?;
+        assert!(
+            matches!(validate_fallback("helper", binary.clone()), Err(CargoBinError::StaleFallback { input, .. }) if input == source)
+        );
+        std::fs::remove_file(binary.with_extension("d"))?;
+        assert!(matches!(
+            validate_fallback("helper", binary.clone()),
+            Err(CargoBinError::UnverifiedFallback { .. })
+        ));
+        assert_eq!(
+            resolve_bin_from_env("CARGO_BIN_EXE_helper", binary.clone().into()).ok(),
+            Some(binary)
+        );
+        Ok(())
+    }
 
     #[test]
     fn missing_binary_returns_not_found_instead_of_panicking() {

@@ -10,7 +10,6 @@ use codex_app_server_protocol::JSONRPCMessage;
 use std::collections::HashMap;
 use std::io;
 use std::io::ErrorKind;
-use std::io::Write;
 use tokio::time::Instant;
 use tracing::warn;
 
@@ -20,6 +19,8 @@ pub(super) const REMOTE_CONTROL_REASSEMBLED_MAX_BYTES: usize = 100 * 1024 * 1024
 pub(super) const REMOTE_CONTROL_SEGMENT_COUNT_MAX: usize = 1024;
 const REMOTE_CONTROL_SEGMENT_ASSEMBLY_MAX_COUNT: usize = 128;
 const REMOTE_CONTROL_SEGMENT_ASSEMBLY_MAX_BYTES: usize = REMOTE_CONTROL_REASSEMBLED_MAX_BYTES;
+pub(super) const REMOTE_CONTROL_SEGMENT_ASSEMBLY_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(10 * 60);
 
 #[derive(Debug)]
 struct ClientSegmentAssembly {
@@ -50,6 +51,7 @@ pub(super) enum ClientSegmentObservation {
 
 impl ClientSegmentReassembler {
     pub(super) fn observe(&mut self, envelope: ClientEnvelope) -> ClientSegmentObservation {
+        self.expire_assemblies();
         let ClientEvent::ClientMessageChunk {
             segment_id,
             segment_count,
@@ -239,6 +241,19 @@ impl ClientSegmentReassembler {
         }
     }
 
+    pub(super) fn expire_assemblies(&mut self) {
+        let now = Instant::now();
+        self.assemblies.retain(|_, assembly| {
+            if now.duration_since(assembly.last_chunk_seen_at)
+                < REMOTE_CONTROL_SEGMENT_ASSEMBLY_TIMEOUT
+            {
+                return true;
+            }
+            self.reserved_bytes -= assembly.metadata.message_size_bytes;
+            false
+        });
+    }
+
     pub(super) fn invalidate_stream(&mut self, client_id: &ClientId, stream_id: &StreamId) {
         self.remove_assembly(client_id, stream_id);
     }
@@ -319,22 +334,33 @@ impl ClientSegmentMetadata {
     }
 }
 
+#[cfg(test)]
 pub(super) fn split_server_envelope_for_transport(
     envelope: ServerEnvelope,
 ) -> io::Result<Vec<ServerEnvelope>> {
-    if !matches!(envelope.event, ServerEvent::ServerMessage { .. }) {
-        return Ok(vec![envelope]);
+    Ok(encode_server_envelope_for_transport(envelope)?
+        .into_iter().map(|(envelope, _)| envelope).collect())
+}
+
+pub(super) fn encode_server_envelope_for_transport(
+    envelope: ServerEnvelope,
+) -> io::Result<Vec<(ServerEnvelope, String)>> {
+    let payload = serde_json::to_string(&envelope).map_err(io::Error::other)?;
+    if !matches!(envelope.event, ServerEvent::ServerMessage { .. })
+        || payload.len() <= REMOTE_CONTROL_SEGMENT_MAX_BYTES
+    {
+        return Ok(vec![(envelope, payload)]);
     }
 
-    let envelope_size_bytes = serialized_len(&envelope)?;
-    if envelope_size_bytes <= REMOTE_CONTROL_SEGMENT_MAX_BYTES {
-        return Ok(vec![envelope]);
+    #[derive(serde::Deserialize)]
+    struct SerializedMessage<'a> {
+        #[serde(borrow)]
+        message: &'a serde_json::value::RawValue,
     }
-
-    let ServerEvent::ServerMessage { message } = &envelope.event else {
-        unreachable!("server message variant checked above");
-    };
-    let raw = serde_json::to_vec(message.as_ref()).map_err(io::Error::other)?;
+    // Borrow the inner JSON already serialized above, rather than serializing
+    // the original application message a second time.
+    let serialized: SerializedMessage<'_> = serde_json::from_str(&payload).map_err(io::Error::other)?;
+    let raw = serialized.message.get().as_bytes();
     let message_size_bytes = raw.len();
     if message_size_bytes > REMOTE_CONTROL_REASSEMBLED_MAX_BYTES {
         return Err(io::Error::new(
@@ -343,16 +369,17 @@ pub(super) fn split_server_envelope_for_transport(
         ));
     }
 
+    // Measure escaped routing metadata once. Base64 is ASCII without JSON
+    // escapes, so every candidate size is exact arithmetic, without allocations.
+    let metadata_len = serde_json::to_vec(&build_chunk_envelope(&envelope, 0, 1, message_size_bytes, &[])?)
+        .map_err(io::Error::other)?.len() - 2;
+    let chunk_len = |id: usize, count: usize, bytes: usize| {
+        metadata_len + decimal_len(id) + decimal_len(count) + bytes.div_ceil(3) * 4
+    };
     let minimal_segment_count =
         usize::min(message_size_bytes.max(1), REMOTE_CONTROL_SEGMENT_COUNT_MAX);
-    let minimal_chunk = &raw[..usize::min(raw.len(), 1)];
-    if serialized_chunk_len(
-        &envelope,
-        /*segment_id*/ 0,
-        minimal_segment_count,
-        message_size_bytes,
-        minimal_chunk,
-    )? > REMOTE_CONTROL_SEGMENT_MAX_BYTES
+    if chunk_len(0, minimal_segment_count, usize::min(raw.len(), 1))
+        > REMOTE_CONTROL_SEGMENT_MAX_BYTES
     {
         return Err(io::Error::new(
             ErrorKind::InvalidData,
@@ -371,34 +398,28 @@ pub(super) fn split_server_envelope_for_transport(
         // segment id changes their wire size, so check the largest full-chunk
         // id and the possibly shorter final chunk before allocating the batch.
         let last_id = segment_count - 1;
+        if segment_count > REMOTE_CONTROL_SEGMENT_COUNT_MAX {
+            return Err(io::Error::new(ErrorKind::InvalidData, "remote-control segment count exceeds maximum"));
+        }
         let full_chunks_fit = segment_count == 1
-            || serialized_chunk_len(
-                &envelope,
-                last_id - 1,
-                segment_count,
-                message_size_bytes,
-                &raw[..chunk_size],
-            )? <= REMOTE_CONTROL_SEGMENT_MAX_BYTES;
+            || chunk_len(last_id - 1, segment_count, chunk_size) <= REMOTE_CONTROL_SEGMENT_MAX_BYTES;
         if full_chunks_fit
-            && serialized_chunk_len(
-                &envelope,
-                last_id,
-                segment_count,
-                message_size_bytes,
-                &raw[last_id * chunk_size..],
-            )? <= REMOTE_CONTROL_SEGMENT_MAX_BYTES
+            && chunk_len(last_id, segment_count, raw.len() - last_id * chunk_size)
+                <= REMOTE_CONTROL_SEGMENT_MAX_BYTES
         {
             return raw
                 .chunks(chunk_size)
                 .enumerate()
                 .map(|(segment_id, chunk)| {
-                    build_chunk_envelope(
+                    let chunk = build_chunk_envelope(
                         &envelope,
                         segment_id,
                         segment_count,
                         message_size_bytes,
                         chunk,
-                    )
+                    )?;
+                    let payload = serde_json::to_string(&chunk).map_err(io::Error::other)?;
+                    Ok((chunk, payload))
                 })
                 .collect();
         }
@@ -419,42 +440,8 @@ pub(super) fn split_server_envelope_for_transport(
     }
 }
 
-fn serialized_chunk_len(
-    envelope: &ServerEnvelope,
-    segment_id: usize,
-    segment_count: usize,
-    message_size_bytes: usize,
-    chunk: &[u8],
-) -> io::Result<usize> {
-    serialized_len(&build_chunk_envelope(
-        envelope,
-        segment_id,
-        segment_count,
-        message_size_bytes,
-        chunk,
-    )?)
-}
-
-#[derive(Default)]
-struct CountingWriter {
-    len: usize,
-}
-
-impl Write for CountingWriter {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.len += buf.len();
-        Ok(buf.len())
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
-    }
-}
-
-fn serialized_len(value: &impl serde::Serialize) -> io::Result<usize> {
-    let mut writer = CountingWriter::default();
-    serde_json::to_writer(&mut writer, value).map_err(io::Error::other)?;
-    Ok(writer.len)
+fn decimal_len(value: usize) -> usize {
+    value.checked_ilog10().unwrap_or(0) as usize + 1
 }
 
 fn build_chunk_envelope(

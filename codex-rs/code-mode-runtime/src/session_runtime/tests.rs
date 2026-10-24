@@ -1214,12 +1214,19 @@ async fn durable_cells_restore_values_and_terminal_receipts_without_reexecution(
 
     let restored = SessionRuntime::new(Arc::new(RecordingDelegate));
     let mut request = execute_request(r#"text(load("artifact").artifact_id);"#);
+    // A completed read in another UUID namespace cannot collide with a
+    // recovered receipt having the same numeric suffix.
+    let preliminary = restored.execute(execute_request("text('read only');"), ObserveMode::Decision).await.unwrap();
+    let preliminary_id = preliminary.cell_id.clone();
+    preliminary.initial_event().await.unwrap();
+    restored.terminate(&preliminary_id).await.unwrap();
     request.state_path = Some(path);
     let started = restored
         .execute(request, ObserveMode::Decision)
         .await
         .unwrap();
     assert_ne!(started.cell_id, old_id, "restored IDs must never be reused");
+    assert_ne!(started.cell_id, preliminary_id);
     assert_eq!(
         started.initial_event().await.unwrap(),
         CellEvent::Completed {
@@ -2150,5 +2157,36 @@ async fn stalled_optional_spills_keep_count_and_payload_admission_until_settleme
         runtime.inner.spill_bytes.available_permits(),
         TERMINAL_SPILL_BYTES
     );
+    runtime.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn durable_receipt_survives_volatile_cache_eviction() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("durable.json");
+    let runtime = SessionRuntime::new(Arc::new(RecordingDelegate));
+    runtime.restore_durable_state(Some(&path)).await.unwrap();
+    let id = CellId::new("1");
+    let event = CellEvent::Completed {
+        content_items: vec![OutputItem::Text { text: "durable evidence".into() }],
+        error_text: None, output_loss: None,
+    };
+    let durable = runtime.inner.durable_state.get().unwrap();
+    durable.publish(durable.stage("receipt".into(), HashMap::new(), id.to_string(), event.clone()).unwrap()).unwrap();
+    {
+        let mut cache = runtime.inner.terminal_cells.lock().unwrap();
+        cache.insert(id.clone(), event.clone());
+        for index in 0..TERMINAL_CELL_CACHE_CAPACITY {
+            cache.insert(CellId::new(format!("volatile/{index}")), CellEvent::Completed {
+                content_items: Vec::new(), error_text: None, output_loss: None,
+            });
+        }
+        assert!(matches!(cache.lookup(&id), Err(Error::ExpiredResult { .. })));
+    }
+    let admission = runtime.inner.replay_bytes.acquire_many(TERMINAL_REPLAY_MAX_BYTES as u32).await.unwrap();
+    let mut recovery = Box::pin(runtime.begin_observe(&id, ObserveMode::Decision));
+    assert!(matches!(futures::poll!(&mut recovery), std::task::Poll::Pending));
+    drop(admission);
+    assert_eq!(recovery.await.unwrap().event().await.unwrap(), event);
     runtime.shutdown().await.unwrap();
 }

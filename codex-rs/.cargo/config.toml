@@ -16,8 +16,10 @@ RUST_TEST_THREADS = { value = "4", force = false }
 # Setting RUSTFLAGS or CARGO_ENCODED_RUSTFLAGS, even to an empty value, replaces
 # these tables outright and silently drops the 8 MiB stack and static CRT. Add
 # flags with CARGO_TARGET_<TRIPLE>_RUSTFLAGS instead; Cargo joins it with them.
+# Native CPU tuning is detected at build time and applies to all Windows profiles.
+# These builds target this machine, not portable distribution or cross-compilation.
 [target.'cfg(all(windows, target_env = "msvc"))']
-rustflags = ["-C", "link-arg=/STACK:8388608", "-C", "target-feature=+crt-static"]
+rustflags = ["-C", "link-arg=/STACK:8388608", "-C", "target-feature=+crt-static", "-C", "target-cpu=native"]
 
 [target.'cfg(all(windows, target_env = "gnu"))']
-rustflags = ["-C", "link-arg=-Wl,--stack,8388608"]
+rustflags = ["-C", "link-arg=-Wl,--stack,8388608", "-C", "target-cpu=native"]

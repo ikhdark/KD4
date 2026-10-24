@@ -819,3 +819,94 @@ describe("CodexExec", () => {
     );
   });
 });
+
+describe("CodexExec mocked framing and parse failures", () => {
+  it("decodes split UTF-8 and CRLF frames, including the final record without a newline", async () => {
+    const { CodexExec } = await import("../src/exec");
+    const { Thread } = await import("../src/thread");
+    const child = new FakeChildProcess();
+    const spawned = new Promise<void>((resolve) => {
+      spawnMock.mockImplementationOnce(() => {
+        resolve();
+        return child as unknown as child_process.ChildProcess;
+      });
+    });
+    const item = { id: "answer", type: "agent_message", text: "hello \u{1f642}" };
+    const usage = { input_tokens: 3, cached_input_tokens: 0, output_tokens: 2 };
+    const frames = [
+      { type: "thread.started", thread_id: "fragmented-thread" },
+      { type: "item.completed", item },
+      { type: "turn.completed", usage },
+    ];
+    const wire = Buffer.from(frames.map((frame) => JSON.stringify(frame)).join("\r\n"));
+    const crlf = wire.indexOf("\r\n");
+    const emoji = wire.indexOf(Buffer.from("\u{1f642}"));
+    const run = new Thread(new CodexExec("codex"), {}, {}).run("hello");
+    await spawned;
+    child.stdout.write(wire.subarray(0, crlf + 1));
+    child.stdout.write(wire.subarray(crlf + 1, emoji + 2));
+    child.stdout.end(wire.subarray(emoji + 2));
+    child.stderr.end();
+    child.emit("exit", 0, null);
+
+    await expect(run).resolves.toMatchObject({ items: [item], finalResponse: item.text, usage });
+    expect(child.killSignals).toEqual([]);
+    expect(child.stdout.destroyed).toBe(true);
+    expect(child.stderr.destroyed).toBe(true);
+  });
+
+  it("retains partial evidence on a malformed envelope, reaps its child, and permits resume", async () => {
+    const { CodexExec } = await import("../src/exec");
+    const { Thread, TurnRunError } = await import("../src/thread");
+    const child = new FakeChildProcess();
+    child.onKill = (signal) => child.emit("exit", null, signal);
+    const spawned = new Promise<void>((resolve) => {
+      spawnMock.mockImplementationOnce(() => {
+        resolve();
+        return child as unknown as child_process.ChildProcess;
+      });
+    });
+    const thread = new Thread(new CodexExec("codex"), {}, {});
+    const item = { id: "partial", type: "agent_message", text: "observed answer" };
+    const result = thread.run("first").catch((error: unknown) => error);
+    await spawned;
+    child.stdout.write(
+      [
+        { type: "thread.started", thread_id: "parse-thread" },
+        { type: "item.completed", item },
+        { type: "item.completed", item: { id: "bad", type: "agent_message", text: 42 } },
+      ]
+        .map((frame) => JSON.stringify(frame) + "\n")
+        .join(""),
+    );
+
+    const error = await result;
+    expect(error).toBeInstanceOf(TurnRunError);
+    expect(error).toMatchObject({
+      threadId: "parse-thread",
+      items: [item],
+      finalResponse: item.text,
+      cause: { message: expect.stringContaining("Failed to parse item") },
+    });
+    expect(child.killSignals).toEqual(["SIGTERM"]);
+    expect(child.stdout.destroyed).toBe(true);
+    expect(child.stderr.destroyed).toBe(true);
+
+    const resumed = new FakeChildProcess();
+    spawnMock.mockImplementationOnce(() => {
+      setImmediate(() => {
+        resumed.stdout.end(JSON.stringify({ type: "turn.completed", usage: null }) + "\n");
+        resumed.stderr.end();
+        resumed.emit("exit", 0, null);
+      });
+      return resumed as unknown as child_process.ChildProcess;
+    });
+    await expect(thread.run("retry")).resolves.toMatchObject({
+      items: [],
+      finalResponse: "",
+      usage: null,
+    });
+    expect(spawnMock.mock.calls.at(-1)?.[1]).toEqual(expect.arrayContaining(["resume", "parse-thread"]));
+    expect(resumed.killSignals).toEqual([]);
+  });
+});

@@ -284,7 +284,7 @@ fn exec_command_tool_matches_expected_spec() {
     });
 
     let description = format!(
-        "Runs a command through `cmd`, returning output or a session ID for ongoing interaction. Resume a returned session_id with write_stdin; do not restart the command while it is live or its effects are uncertain. Supports typed retained search misses (search_miss_v1): exact streams, original evidence identity, and verified validity scope; reused results execute no new process.{}",
+        "Runs a command through `cmd`, returning output or a session ID for ongoing interaction. Resume a returned session_id with write_stdin; do not restart the command while it is live or its effects are uncertain.{}",
         exec_command_guidance_description()
     );
 

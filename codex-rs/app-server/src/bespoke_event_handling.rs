@@ -52,7 +52,6 @@ use codex_app_server_protocol::RawResponseItemCompletedNotification;
 use codex_app_server_protocol::RequestId;
 use codex_app_server_protocol::ServerNotification;
 use codex_app_server_protocol::ServerRequestPayload;
-use codex_app_server_protocol::ThreadGoalUpdatedNotification;
 use codex_app_server_protocol::ThreadItem;
 use codex_app_server_protocol::ThreadRollbackResponse;
 use codex_app_server_protocol::ThreadSettingsUpdatedNotification;
@@ -163,8 +162,8 @@ pub(crate) async fn apply_bespoke_event_handling(
             let is_current = thread_state
                 .lock()
                 .await
-                .active_turn_snapshot()
-                .is_some_and(|turn| turn.id == payload.turn_id);
+                .active_turn_id()
+                .is_some_and(|turn_id| turn_id == payload.turn_id);
             if is_current {
                 thread_watch_manager
                     .note_harness_phases(&conversation_id.to_string(), payload.phases)
@@ -944,7 +943,7 @@ pub(crate) async fn apply_bespoke_event_handling(
             };
 
             if let Some(request_id) = pending {
-                let _thread_list_state_permit = match thread_list_state_permit.acquire().await {
+                let thread_list_state_guard = match thread_list_state_permit.acquire().await {
                     Ok(permit) => permit,
                     Err(err) => {
                         outgoing
@@ -967,6 +966,7 @@ pub(crate) async fn apply_bespoke_event_handling(
                 {
                     Ok(stored_thread) => stored_thread,
                     Err(err) => {
+                        drop(thread_list_state_guard);
                         outgoing
                             .send_error(
                                 request_id.clone(),
@@ -981,6 +981,9 @@ pub(crate) async fn apply_bespoke_event_handling(
                 let loaded_status = thread_watch_manager
                     .loaded_status_for_thread(&conversation_id.to_string())
                     .await;
+                // This immutable view is coherent now. Projection and transport
+                // backpressure must not hold up other thread-list consumers.
+                drop(thread_list_state_guard);
                 let response = match thread_rollback_response_from_stored_thread(
                     stored_thread,
                     conversation.session_configured().session_id.to_string(),
@@ -1000,18 +1003,8 @@ pub(crate) async fn apply_bespoke_event_handling(
                 outgoing.send_response(request_id, response).await;
             }
         }
-        EventMsg::ThreadGoalUpdated(thread_goal_event) => {
-            let notification = ThreadGoalUpdatedNotification {
-                thread_id: thread_goal_event.thread_id.to_string(),
-                turn_id: thread_goal_event.turn_id,
-                goal: thread_goal_event.goal.clone().into(),
-            };
-            outgoing
-                .send_global_server_notification(ServerNotification::ThreadGoalUpdated(
-                    notification,
-                ))
-                .await;
-        }
+        // Historical rollouts may contain goal events; the removed feature has no live API.
+        EventMsg::ThreadGoalUpdated(_) => {}
         EventMsg::ThreadSettingsApplied(thread_settings_event) => {
             let thread_settings =
                 thread_settings_from_core_snapshot(thread_settings_event.thread_settings);
@@ -1448,9 +1441,10 @@ async fn respond_to_pending_interrupts(
         state.take_pending_interrupts(turn_id)
     };
 
+    let deadline = tokio::time::Instant::now() + crate::outgoing_message::RESOURCE_DELIVERY_TIMEOUT;
     for request_id in pending {
         outgoing
-            .send_response(request_id, TurnInterruptResponse {})
+            .send_response_before(request_id, TurnInterruptResponse {}, deadline)
             .await;
     }
 }
@@ -2054,6 +2048,33 @@ fn now_unix_timestamp_ms() -> i64 {
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::AtomicBool;
+
+    #[tokio::test(start_paused = true)]
+    async fn pending_interrupts_share_one_terminal_delivery_budget() {
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let _congestion = tx.clone().reserve_owned().await.unwrap();
+        let outgoing = Arc::new(OutgoingMessageSender::new(tx, codex_analytics::AnalyticsEventsClient::disabled()));
+        let state = Arc::new(Mutex::new(ThreadState::default()));
+        let mut guards = Vec::new();
+        for id in 1..=3 {
+            let connection_id = ConnectionId(id % 2);
+            outgoing.connection_opened(connection_id, Arc::new(AtomicBool::new(true))).await;
+            let request_id = crate::outgoing_message::ConnectionRequestId {
+                connection_id, request_id: codex_app_server_protocol::RequestId::Integer(id as i64),
+            };
+            outgoing.register_request_context(crate::outgoing_message::RequestContext::new(request_id.clone(), tracing::Span::none(), None)).await;
+            guards.push(state.lock().await.reserve_interrupt(request_id, "turn".into()));
+        }
+        let scoped = ThreadScopedOutgoingMessageSender::new(Arc::clone(&outgoing), vec![ConnectionId(0), ConnectionId(1)], ThreadId::new());
+        let task = tokio::spawn(async move { respond_to_pending_interrupts(&state, &scoped, "turn").await; });
+        tokio::task::yield_now().await;
+        tokio::time::advance(crate::outgoing_message::RESOURCE_DELIVERY_TIMEOUT).await;
+        tokio::task::yield_now().await;
+        tokio::time::timeout(std::time::Duration::ZERO, task).await
+            .expect("interrupt drain must not renew the terminal delivery budget").unwrap();
+        assert!(outgoing.lock_request_contexts_for_test().await.is_empty());
+        drop(guards);
+    }
 
     use super::*;
     use crate::CHANNEL_CAPACITY;

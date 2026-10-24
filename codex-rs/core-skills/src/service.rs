@@ -40,6 +40,7 @@ struct SnapshotCacheOptions<'a> {
     force_reload: bool,
     cache_result: bool,
     cwd_cache_key: Option<&'a AbsolutePathBuf>,
+    plugin_skill_preload: Option<&'a PluginSkillSnapshots>,
 }
 
 #[derive(Debug, Clone)]
@@ -87,6 +88,8 @@ pub struct SkillsService {
     cache_generation: AtomicU64,
     input_snapshot_cache: RwLock<HashMap<SkillsInputCacheKey, InputSnapshot>>,
     snapshot_cache: RwLock<HashMap<SkillsCacheKey, HostSkillsSnapshot>>,
+    input_loads: std::sync::Mutex<HashMap<SkillsInputCacheKey, std::sync::Weak<tokio::sync::Mutex<()>>>>,
+    snapshot_loads: std::sync::Mutex<HashMap<SkillsCacheKey, std::sync::Weak<tokio::sync::Mutex<()>>>>,
     cache_reuse_disabled: AtomicBool,
 }
 
@@ -112,6 +115,8 @@ impl SkillsService {
             cache_generation: AtomicU64::new(0),
             input_snapshot_cache: RwLock::new(HashMap::new()),
             snapshot_cache: RwLock::new(HashMap::new()),
+            input_loads: Default::default(),
+            snapshot_loads: Default::default(),
             cache_reuse_disabled: AtomicBool::new(false),
         };
         if !bundled_skills_enabled {
@@ -157,6 +162,17 @@ impl SkillsService {
         if let Some(snapshot) = self.cached_input_snapshot(&input_cache_key) {
             return snapshot;
         }
+        let _flight = if self.cache_reuse_disabled.load(Ordering::Acquire) {
+            None
+        } else {
+            match snapshot_load_flight(&self.input_loads, &input_cache_key) {
+                Some(flight) => Some(flight.lock_owned().await),
+                None => None,
+            }
+        };
+        if let Some(snapshot) = self.cached_input_snapshot(&input_cache_key) {
+            return snapshot;
+        }
         let roots = self.skill_roots_for_config(input, fs).await;
         let root_dependencies = roots.iter().map(|root| root.path.clone()).collect();
         let skill_config_rules = skill_config_rules_from_stack(&input.config_layer_stack);
@@ -170,6 +186,7 @@ impl SkillsService {
                     force_reload: false,
                     cache_result: true,
                     cwd_cache_key: None,
+                    plugin_skill_preload: None,
                 },
             )
             .await;
@@ -202,10 +219,29 @@ impl SkillsService {
         force_reload: bool,
         fs: Option<Arc<dyn ExecutorFileSystem>>,
     ) -> HostSkillsSnapshot {
+        self.snapshot_for_cwd_with_plugin_skill_preload(input, force_reload, fs, None)
+            .await
+    }
+
+    /// Reuse request-local plugin parsing on a cache miss. Unlike the persistent
+    /// snapshots attached to `SkillsLoadInput`, this preload does not select a
+    /// new cache identity: cwd listings keep their existing until-reload cache.
+    /// Capture `snapshot_generation()` before parsing; invalidated preloads are
+    /// ignored rather than published into a newer generation.
+    pub async fn snapshot_for_cwd_with_plugin_skill_preload(
+        &self,
+        input: &SkillsLoadInput,
+        force_reload: bool,
+        fs: Option<Arc<dyn ExecutorFileSystem>>,
+        plugin_skill_preload: Option<(u64, &PluginSkillSnapshots)>,
+    ) -> HostSkillsSnapshot {
         if force_reload {
             self.clear_cache();
         }
         let generation = self.cache_generation.load(Ordering::SeqCst);
+        let plugin_skill_preload = plugin_skill_preload
+            .filter(|(preload_generation, _)| *preload_generation == generation)
+            .map(|(_, snapshots)| snapshots);
         let cache_result = true;
         let mut roots = skill_roots(
             fs,
@@ -228,6 +264,7 @@ impl SkillsService {
                 force_reload,
                 cache_result,
                 cwd_cache_key: Some(&input.cwd),
+                plugin_skill_preload,
             },
         )
         .await
@@ -245,6 +282,7 @@ impl SkillsService {
             force_reload,
             cache_result,
             cwd_cache_key,
+            plugin_skill_preload,
         } = cache_options;
         let cache_key = skills_cache_key(
             &roots,
@@ -259,9 +297,20 @@ impl SkillsService {
         {
             return snapshot;
         }
+        let _flight = if !cache_result || force_reload || self.cache_reuse_disabled.load(Ordering::Acquire) {
+            None
+        } else {
+            match snapshot_load_flight(&self.snapshot_loads, &cache_key) {
+                Some(flight) => Some(flight.lock_owned().await),
+                None => None,
+            }
+        };
+        if cache_result && !force_reload && let Some(snapshot) = self.cached_snapshot(&cache_key) {
+            return snapshot;
+        }
 
         let snapshot = HostSkillsSnapshot::new(Arc::new(
-            self.build_skill_outcome(input, roots, &skill_config_rules)
+            self.build_skill_outcome(input, roots, &skill_config_rules, plugin_skill_preload)
                 .await,
         ));
         if cache_result {
@@ -286,12 +335,28 @@ impl SkillsService {
         input: &SkillsLoadInput,
         roots: Vec<SkillRoot>,
         skill_config_rules: &SkillConfigRules,
+        plugin_skill_preload: Option<&PluginSkillSnapshots>,
     ) -> SkillLoadOutcome {
-        let outcome = load_skills_from_roots(roots, input.plugin_skill_snapshots.as_ref()).await;
+        let snapshots = input.plugin_skill_snapshots.as_ref().or(plugin_skill_preload);
+        let outcome = load_skills_from_roots(roots, snapshots).await;
         let outcome =
             crate::filter_skill_load_outcome_for_product(outcome, self.restriction_product);
         let disabled_paths = resolve_disabled_skill_paths(&outcome.skills, skill_config_rules);
         finalize_skill_outcome(outcome, disabled_paths)
+    }
+
+    /// Capture before loading external preloads so invalidation fences them too.
+    pub fn snapshot_generation(&self) -> u64 {
+        self.cache_generation.load(Ordering::SeqCst)
+    }
+
+    /// External discovery may reuse this epoch only while its observer is live.
+    pub fn reusable_snapshot_generation(&self) -> Option<u64> {
+        if self.cache_reuse_disabled.load(Ordering::Acquire) {
+            None
+        } else {
+            Some(self.snapshot_generation())
+        }
     }
 
     pub fn clear_cache(&self) {
@@ -414,6 +479,25 @@ impl SkillsService {
             Err(err) => err.into_inner().clone(),
         }
     }
+}
+
+// Weak keyed gates share acquisition, not a detached initializer or permanent
+// degraded result. Cancellation releases the gate so the next waiter can retry.
+fn snapshot_load_flight<K: Clone + Eq + Hash>(
+    flights: &std::sync::Mutex<HashMap<K, std::sync::Weak<tokio::sync::Mutex<()>>>>,
+    key: &K,
+) -> Option<Arc<tokio::sync::Mutex<()>>> {
+    let mut flights = flights.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    flights.retain(|_, flight| flight.strong_count() != 0);
+    if let Some(flight) = flights.get(key).and_then(std::sync::Weak::upgrade) {
+        return Some(flight);
+    }
+    if flights.len() >= MAX_CACHED_SKILL_SNAPSHOTS {
+        return None;
+    }
+    let flight = Arc::new(tokio::sync::Mutex::new(()));
+    flights.insert(key.clone(), Arc::downgrade(&flight));
+    Some(flight)
 }
 
 #[derive(Clone, Debug)]

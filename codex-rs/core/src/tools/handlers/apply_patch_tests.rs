@@ -207,25 +207,6 @@ fn sample_patch() -> &'static str {
 *** End Patch"#
 }
 
-#[test]
-fn destination_only_session_overlap_is_reported_for_move_hunks() {
-    let parsed = codex_apply_patch::parse_patch(
-        "*** Begin Patch\n*** Update File: source\n*** Move to: destination\n*** End Patch",
-    )
-    .unwrap();
-    let root = TempDir::new().unwrap();
-    let endpoints = hunk_endpoints(&parsed.hunks)
-        .into_iter()
-        .map(|path| root.path().join(path))
-        .collect::<Vec<_>>();
-    let other = serde_json::from_value(json!({
-        "version": 1, "thread_id": "peer", "workspace": root.path(), "intent": "destination writer",
-        "edited_paths": [root.path().join("destination")], "updated_at_ms": 0,
-    }))
-    .unwrap();
-    let note = crate::live_sessions::overlapping_edits(&[other], &endpoints, root.path()).unwrap();
-    assert!(note.contains("destination writer"));
-}
 
 #[tokio::test]
 async fn delayed_environment_never_executes_already_sampled_patches_or_commands() {
@@ -2389,7 +2370,7 @@ fn audit147_intercepted_failure_carries_canonical_recovery_text() {
         environment_id: None,
         retry: Some(json!({ "patch_id": "audit147-receipt" })),
         diagnostics: Vec::new(),
-        concurrent_sessions: None,
+
     };
     for offered in [true, false] {
         let FunctionCallError::RespondToModel(text) = intercepted_patch_failure(failed(), offered)

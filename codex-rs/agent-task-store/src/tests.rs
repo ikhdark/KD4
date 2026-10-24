@@ -12,10 +12,12 @@ use uuid::Uuid;
 
 static TEST_MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
 
-#[path = "audit142_tests.rs"]
-mod audit142_tests;
-#[path = "audit149_tests.rs"]
-mod audit149_tests;
+#[path = "persistence_recovery_tests.rs"]
+mod persistence_recovery_tests;
+#[path = "evidence_lifecycle_tests.rs"]
+mod evidence_lifecycle_tests;
+#[path = "verified_coordination_tests.rs"]
+mod verified_coordination_tests;
 
 #[tokio::test]
 async fn evaluation_workspace_uses_target_binding_and_rejects_foreign_authority() {
@@ -806,7 +808,7 @@ async fn ma009_incomplete_stages_do_not_block_healthy_capsules_or_reattachment()
 }
 
 #[tokio::test]
-async fn ma009_published_corruption_is_isolated_but_stage_io_errors_remain_errors() {
+async fn published_corruption_and_stage_io_failures_are_isolated() {
     let fixture = Fixture::new().await;
     let directory = fixture
         .state
@@ -887,16 +889,16 @@ async fn ma009_published_corruption_is_isolated_but_stage_io_errors_remain_error
     );
     restarted.close().await;
     std::fs::remove_file(&final_path).unwrap();
-    // Reading a directory is a real I/O error on the supported platforms, not
-    // malformed provisional JSON, and must not be swallowed or quarantined.
+    // A sidecar I/O failure must not disable healthy assignments or be
+    // misclassified as malformed JSON and quarantined.
     let stage = directory.join(format!(".{}.staged.json", AssignmentId::new()));
     std::fs::create_dir(&stage).unwrap();
-    assert!(matches!(
-        LocalAgentTaskStore::initialize(&fixture.state).await,
-        Err(StoreError::Io(_))
-    ));
+    let reopened = LocalAgentTaskStore::initialize(&fixture.state).await
+        .expect("an inaccessible sidecar must not disable unrelated assignments");
+    assert_eq!(reopened.get_agent_task(healthy.assignment_id, None).await.unwrap().assignment.task_capsule.as_deref(), Some(canonical.as_str()));
     assert!(stage.is_dir());
     assert!(!stage.with_extension("invalid").exists());
+    reopened.close().await;
 }
 
 #[tokio::test]
@@ -1532,7 +1534,6 @@ async fn copy_fixture_seed(root: &std::path::Path, destination: &std::path::Path
     let relative_paths = [
         std::path::PathBuf::from(codex_state::state_db_filename()),
         std::path::PathBuf::from(codex_state::logs_db_filename()),
-        std::path::PathBuf::from(codex_state::goals_db_filename()),
         std::path::PathBuf::from("agent-task-coordination/agent_tasks.sqlite"),
     ];
     if !ready.exists() {
@@ -1886,6 +1887,16 @@ async fn upgrade_reclaims_retired_pages_and_drops_duplicate_wake_indexes() {
         .await
         .expect("predecessor freelist reads");
     assert!(retired_pages > 0, "the predecessor retains freed pages");
+    // Check reclamation at its owning migration boundary. Subsequent schema
+    // rebuilds may legitimately leave new free pages; they are not retired data.
+    task_store_migrator_through(21).run(&predecessor_pool).await
+        .expect("retired storage reclamation applies");
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("PRAGMA freelist_count")
+            .fetch_one(&predecessor_pool).await.unwrap(),
+        0,
+        "the reclamation migration must release every retired payload page"
+    );
     predecessor_pool.close().await;
 
     let store = LocalAgentTaskStore::initialize(&state)
@@ -1898,13 +1909,6 @@ async fn upgrade_reclaims_retired_pages_and_drops_duplicate_wake_indexes() {
         store,
     };
     let pool = coordination_pool(&fixture).await;
-    assert_eq!(
-        sqlx::query_scalar::<_, i64>("PRAGMA freelist_count")
-            .fetch_one(&pool)
-            .await
-            .expect("upgraded freelist reads"),
-        0
-    );
     assert_eq!(
         sqlx::query_scalar::<_, String>(
             "SELECT name FROM sqlite_master
@@ -3879,235 +3883,7 @@ async fn receipts_are_sealed_and_validation_calls_are_attempt_owned() {
     );
 }
 
-#[tokio::test]
-async fn criterion_execution_reference_is_validated_persisted_and_projected() {
-    let fixture = Fixture::new().await;
-    initialize_validation_repository(fixture.repo.path());
-    let command = "cargo test -p evidence focused-proof";
-    let mut assignment_draft =
-        validation_worker_draft("criterion-evidence-root", "src/lib.rs", command);
-    assignment_draft
-        .acceptance_criteria
-        .push(AcceptanceCriterion {
-            evidence_policy: None,
-            id: "unverified-outcome".to_string(),
-            text: "a separately promised outcome".to_string(),
-        });
-    assignment_draft
-        .acceptance_criteria
-        .push(AcceptanceCriterion {
-            evidence_policy: None,
-            id: "shared-proof".to_string(),
-            text: "another criterion supported by the same execution".to_string(),
-        });
-    let (assignment, attempt) = fixture
-        .store
-        .create_assignment(fixture.repo.path(), assignment_draft)
-        .await
-        .expect("assignment");
-    let call = finish_focused_validation(
-        &fixture.store,
-        start_focused_validation(
-            &fixture.store,
-            attempt.attempt_id,
-            "criterion-proof",
-            command,
-        )
-        .await,
-    )
-    .await;
-    let reference = CriterionEvidenceRef {
-        call_id: call.call_id.clone(),
-        workspace_id: assignment.workspace_id.clone(),
-        evidence_epoch: call.evidence.end_epoch.expect("recorded epoch"),
-        kind: CriterionEvidenceKind::ValidationExecution,
-    };
-    let mut draft = completed_receipt(vec![call.call_id.clone()]);
-    draft.summary = "Every outcome tested; the new Desktop build is running".to_string();
-    draft.criterion_results[0].evidence_ref = Some(reference.clone());
-    draft.criterion_results.push(CriterionResult {
-        criterion_id: "unverified-outcome".to_string(),
-        status: CriterionStatus::Passed,
-        evidence: Some("trust the narrative".to_string()),
-        evidence_ref: None,
-    });
-    draft.criterion_results.push(CriterionResult {
-        criterion_id: "shared-proof".to_string(),
-        status: CriterionStatus::Passed,
-        evidence: None,
-        evidence_ref: Some(reference.clone()),
-    });
-    for invalid in [
-        CriterionEvidenceRef {
-            workspace_id: "another-workspace".to_string(),
-            ..reference.clone()
-        },
-        CriterionEvidenceRef {
-            evidence_epoch: reference.evidence_epoch + 1,
-            ..reference.clone()
-        },
-        CriterionEvidenceRef {
-            call_id: "unlisted-or-foreign-call".to_string(),
-            ..reference.clone()
-        },
-        CriterionEvidenceRef {
-            kind: CriterionEvidenceKind::SourceInspection,
-            ..reference.clone()
-        },
-    ] {
-        let mut rejected = draft.clone();
-        rejected.criterion_results[0].evidence_ref = Some(invalid);
-        assert!(matches!(
-            fixture
-                .store
-                .submit_agent_receipt(attempt.attempt_id, rejected)
-                .await,
-            Err(StoreError::CriterionResultsInvalid(_))
-        ));
-        let task = fixture
-            .store
-            .get_agent_task(assignment.assignment_id, Some(0))
-            .await
-            .expect("unsealed task");
-        assert!(task.receipt.is_none());
-        assert_eq!(task.current_attempt.state, AttemptState::Active);
-    }
-    fixture
-        .store
-        .submit_agent_receipt(attempt.attempt_id, draft)
-        .await
-        .expect("valid reference seals");
-    let mut task = fixture
-        .store
-        .get_agent_task(assignment.assignment_id, Some(0))
-        .await
-        .expect("sealed task reloads");
-    assert_eq!(
-        task.receipt.as_ref().unwrap().criterion_results[0]
-            .evidence_ref
-            .as_ref(),
-        Some(&reference)
-    );
-    let summary = task.completion_evidence_summary();
-    assert!(summary.contains("criterion-1: supported by a successful validation execution"));
-    assert!(summary.contains("unverified-outcome: reported complete; behavior unverified"));
-    assert!(summary.contains("shared-proof: supported by a successful validation execution"));
-    assert_eq!(
-        task.receipt.as_ref().unwrap().validation_call_ids,
-        vec![call.call_id]
-    );
-    assert!(summary.contains("Running Desktop build: not established"));
-    assert!(!summary.contains("Every outcome tested"));
-    // The loaded workspace can advance without upgrading or rerunning old proof.
-    task.workspace_status.epoch += 1;
-    assert!(
-        task.completion_evidence_summary()
-            .contains("freshness unverified")
-    );
-    task.validation_calls[0].status = ValidationCallStatus::Cancelled;
-    assert!(
-        !task
-            .completion_evidence_summary()
-            .contains("supported by a successful")
-    );
-    // Old persisted JSON remains readable and acquires no proof from prose.
-    let mut legacy = serde_json::to_value(task.receipt.as_ref().unwrap()).unwrap();
-    legacy["criterion_results"][0]
-        .as_object_mut()
-        .unwrap()
-        .remove("evidence_ref");
-    task.receipt = Some(serde_json::from_value(legacy).unwrap());
-    assert!(
-        task.receipt.as_ref().unwrap().criterion_results[0]
-            .evidence_ref
-            .is_none()
-    );
-}
 
-#[tokio::test]
-async fn source_inspection_receipts_bind_kind_without_workspace_tracking() {
-    use sha2::Digest;
-    let fixture = Fixture::new().await;
-    initialize_validation_repository(fixture.repo.path());
-    let path = fixture.repo.path().join("src/lib.rs");
-    let (assignment, attempt) = fixture
-        .store
-        .create_assignment(
-            fixture.repo.path(),
-            validation_worker_draft("inspection", "src/lib.rs", "inspect:src/lib.rs"),
-        )
-        .await
-        .unwrap();
-    let bytes = std::fs::read(&path).unwrap();
-    let hash = hex::encode(sha2::Sha256::digest(&bytes));
-    let fresh = fixture
-        .store
-        .prepare_source_inspection(attempt.attempt_id, path.to_string_lossy().into_owned())
-        .await
-        .unwrap()
-        .unwrap();
-    let reference = fixture
-        .store
-        .record_source_inspection(fresh, "source-read".into(), hash, bytes.len() as u64)
-        .await
-        .unwrap();
-    assert_eq!(reference.kind, CriterionEvidenceKind::SourceInspection);
-    let mut draft = completed_receipt(vec![reference.call_id.clone()]);
-    draft.criterion_results[0].evidence_ref = Some(CriterionEvidenceRef {
-        kind: CriterionEvidenceKind::ValidationExecution,
-        ..reference.clone()
-    });
-    assert!(matches!(
-        fixture
-            .store
-            .submit_agent_receipt(attempt.attempt_id, draft.clone())
-            .await,
-        Err(StoreError::CriterionResultsInvalid(_))
-    ));
-    draft.criterion_results[0].evidence_ref = Some(reference);
-    fixture
-        .store
-        .submit_agent_receipt(attempt.attempt_id, draft)
-        .await
-        .unwrap();
-    let task = fixture
-        .store
-        .get_agent_task(assignment.assignment_id, Some(0))
-        .await
-        .unwrap();
-    assert!(task.completion_evidence_summary().contains(
-        "supported by complete source acquisition (semantic inspection and correctness not established; freshness unverified)"
-    ));
-    let stale_fixture = Fixture::new().await;
-    initialize_validation_repository(stale_fixture.repo.path());
-    let stale_path = stale_fixture.repo.path().join("src/lib.rs");
-    let (_, stale_attempt) = stale_fixture
-        .store
-        .create_assignment(
-            stale_fixture.repo.path(),
-            validation_worker_draft("stale-inspection", "src/lib.rs", "inspect:src/lib.rs"),
-        )
-        .await
-        .unwrap();
-    let stale = stale_fixture
-        .store
-        .prepare_source_inspection(
-            stale_attempt.attempt_id,
-            stale_path.to_string_lossy().into_owned(),
-        )
-        .await
-        .unwrap()
-        .unwrap();
-    std::fs::write(&stale_path, "pub fn changed() {}\n").unwrap();
-    let bytes = std::fs::read(&stale_path).unwrap();
-    let hash = hex::encode(sha2::Sha256::digest(&bytes));
-    let reference = stale_fixture
-        .store
-        .record_source_inspection(stale, "stale-read".into(), hash, bytes.len() as u64)
-        .await
-        .expect("source inspection no longer scans workspace changes");
-    assert_eq!(reference.kind, CriterionEvidenceKind::SourceInspection);
-}
 
 #[tokio::test]
 async fn source_inspections_namespace_session_local_call_ids_by_attempt() {
@@ -4227,10 +4003,6 @@ async fn completed_receipt_retains_validation_without_workspace_tracking() {
         .unwrap();
     assert!(task.receipt.is_some());
     assert!(
-        task.completion_evidence_summary()
-            .contains("freshness unverified")
-    );
-    assert!(
         !fixture
             .state
             .codex_home()
@@ -4267,87 +4039,6 @@ async fn completed_receipt_retains_validation_without_workspace_tracking() {
     restarted.close().await;
 }
 
-#[tokio::test]
-async fn missing_evidence_is_rebuilt_from_current_calls_on_every_submission() {
-    let fixture = Fixture::new().await;
-    let first_command = "cargo test -p first";
-    let second_command = "cargo test -p second";
-    let mut draft = worker_draft("current-evidence-root", "src");
-    draft.required_evidence = vec![first_command.to_string(), second_command.to_string()];
-    let (assignment, attempt) = fixture
-        .store
-        .create_assignment(fixture.repo.path(), draft)
-        .await
-        .expect("worker assignment");
-    bind_test_agent(
-        &fixture.store,
-        assignment.assignment_id,
-        attempt.attempt_id,
-        "current-evidence-root",
-    )
-    .await;
-    let empty_receipt = completed_receipt(Vec::new());
-    let initial_error = fixture
-        .store
-        .submit_agent_receipt(attempt.attempt_id, empty_receipt)
-        .await
-        .expect_err("both current results are initially missing");
-    let StoreError::RequiredEvidenceMissing {
-        obligations: initial_obligations,
-    } = initial_error
-    else {
-        panic!("unexpected error: {initial_error}");
-    };
-    assert_eq!(initial_obligations.len(), 2);
-    assert!(
-        initial_obligations[0]
-            .id
-            .contains(&assignment.assignment_id.to_string())
-    );
-    assert!(initial_obligations[0].id.contains(":0001:"));
-    assert!(initial_obligations[1].id.contains(":0002:"));
-
-    let first = start_focused_validation(
-        &fixture.store,
-        attempt.attempt_id,
-        "current-first",
-        first_command,
-    )
-    .await;
-    finish_focused_validation(&fixture.store, first).await;
-    let partial_receipt = completed_receipt(vec!["current-first".to_string()]);
-    let error = fixture
-        .store
-        .submit_agent_receipt(attempt.attempt_id, partial_receipt)
-        .await
-        .expect_err("the current gate still requires the second result");
-    let StoreError::RequiredEvidenceMissing { obligations } = error else {
-        panic!("unexpected error: {error}");
-    };
-    assert_eq!(obligations.len(), 1);
-    assert_eq!(obligations[0].requirement, second_command);
-
-    let second = start_focused_validation(
-        &fixture.store,
-        attempt.attempt_id,
-        "current-second",
-        second_command,
-    )
-    .await;
-    finish_focused_validation(&fixture.store, second).await;
-    let receipt = fixture
-        .store
-        .submit_agent_receipt(
-            attempt.attempt_id,
-            completed_receipt(vec![
-                "current-first".to_string(),
-                "current-second".to_string(),
-            ]),
-        )
-        .await
-        .expect("the gate rebuild sees both current successful results");
-    assert_eq!(receipt.status, AgentStatusClaim::Completed);
-}
 
 #[tokio::test]
 async fn host_legacy_outcome_persists_final_response_without_fabricating_evidence() {
@@ -6066,6 +5757,109 @@ async fn exhausted_review_and_failed_verification_transition_to_needs_main() {
 }
 
 #[tokio::test]
+async fn deferred_host_completion_wakes_after_receipt_boundary_without_hiding_other_progress() {
+    let fixture = Fixture::new().await;
+    let (assignment, attempt) = fixture.store.create_assignment(
+        fixture.repo.path(), worker_draft("completion-root", "src"),
+    ).await.unwrap();
+    let observer = LocalAgentTaskStore::initialize(&fixture.state).await.unwrap();
+    let after = observer.read_wake_events("completion-root".into(), None).await.unwrap().latest_event_id;
+    let before = fixture.store.wake_revision();
+    let mut publication = fixture.store.record_host_completion_deferred(
+        attempt.attempt_id, "host:turn".into(), "successful host terminal".into(),
+    ).await.unwrap();
+    assert_eq!(fixture.store.wake_revision(), before);
+    let task = fixture.store.get_agent_task(assignment.assignment_id, Some(10)).await.unwrap();
+    assert!(!task.observations.iter().any(|item| item.kind == ObservationKind::HostCompletion));
+    assert!(observer.read_wake_events("completion-root".into(), after).await.unwrap().updated_agents.is_empty(),
+        "a second store must not observe a durable host-only wake before receipt sealing");
+    let mut wait = Box::pin(observer.wait_for_wake_events("completion-root".into(), after));
+    assert!(futures::poll!(&mut wait).is_pending());
+    fixture.store.append_observation(attempt.attempt_id, ObservationKind::Reading,
+        "unrelated progress remains immediate".into(), None).await.unwrap();
+    let progress = tokio::time::timeout(std::time::Duration::from_secs(5), wait).await.unwrap().unwrap();
+    assert_eq!(progress.updated_agents.len(), 1);
+    assert_eq!(progress.updated_agents[0].reason, ObservationKind::Reading);
+    assert!(fixture.store.wake_revision() > before);
+    let mut wait = Box::pin(observer.wait_for_wake_events("completion-root".into(), progress.latest_event_id));
+    assert!(futures::poll!(&mut wait).is_pending());
+    let mut receipt = completed_receipt(Vec::new());
+    receipt.status = AgentStatusClaim::NeedsMain;
+    for result in &mut receipt.criterion_results {
+        result.status = CriterionStatus::NotRun;
+        result.evidence = None;
+    }
+    let sealed = publication.seal_receipt(receipt, false).await.unwrap();
+    let wake = tokio::time::timeout(std::time::Duration::from_secs(5), wait).await.unwrap().unwrap();
+    assert_eq!(wake.updated_agents.len(), 2);
+    assert_eq!(wake.updated_agents[0].reason, ObservationKind::HostCompletion);
+    assert_eq!(wake.updated_agents[0].summary, "successful host terminal");
+    assert_eq!(wake.updated_agents[1].summary, "agent receipt sealed");
+    assert!(wake.updated_agents.iter().all(|event| event.attempt_id == attempt.attempt_id));
+    let task = observer.get_agent_task(assignment.assignment_id, Some(10)).await.unwrap();
+    assert_eq!(task.receipt.as_ref(), Some(&sealed));
+    assert_eq!(sealed.attempt_id, attempt.attempt_id);
+    drop(publication);
+    assert!(observer.read_wake_events("completion-root".into(), wake.latest_event_id).await.unwrap().updated_agents.is_empty());
+    observer.close().await;
+}
+
+#[tokio::test]
+async fn deferred_host_completion_notifies_when_its_owner_is_cancelled() {
+    let fixture = Fixture::new().await;
+    let (assignment, attempt) = fixture.store.create_assignment(
+        fixture.repo.path(), worker_draft("completion-cancel-root", "src"),
+    ).await.unwrap();
+    let observer = LocalAgentTaskStore::initialize(&fixture.state).await.unwrap();
+    let after = observer.read_wake_events("completion-cancel-root".into(), None).await.unwrap().latest_event_id;
+    let store = fixture.store.clone();
+    let (ready, started) = tokio::sync::oneshot::channel();
+    let before = fixture.store.wake_revision();
+    let owner = tokio::spawn(async move {
+        let _wake = store.record_host_completion_deferred(attempt.attempt_id,
+            "host:cancelled".into(), "completion awaits receipt".into()).await.unwrap();
+        ready.send(()).unwrap();
+        std::future::pending::<()>().await;
+    });
+    started.await.unwrap();
+    assert_eq!(fixture.store.wake_revision(), before);
+    assert!(observer.read_wake_events("completion-cancel-root".into(), after).await.unwrap().updated_agents.is_empty());
+    let mut wait = Box::pin(observer.wait_for_wake_events("completion-cancel-root".into(), after));
+    assert!(futures::poll!(&mut wait).is_pending());
+    owner.abort();
+    assert!(owner.await.unwrap_err().is_cancelled());
+    let wake = tokio::time::timeout(std::time::Duration::from_secs(5), wait).await.unwrap().unwrap();
+    assert_eq!(wake.updated_agents.len(), 1);
+    assert_eq!(wake.updated_agents[0].attempt_id, attempt.attempt_id);
+    assert_eq!(wake.updated_agents[0].reason, ObservationKind::HostCompletion);
+    assert_eq!(wake.updated_agents[0].summary, "completion awaits receipt");
+    let task = observer.get_agent_task(assignment.assignment_id, Some(10)).await.unwrap();
+    assert!(task.receipt.is_none(), "observer cancellation must not fabricate receipt success");
+    assert_eq!(task.current_attempt.state, AttemptState::Active);
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while fixture.store.wake_revision() <= before {
+            tokio::task::yield_now().await;
+        }
+    }).await.expect("cancellation publication must notify local waiters too");
+    // Sealing failure must keep the same bounded evidence available to its
+    // fallback owner instead of consuming it before the failed await.
+    let mut failed = fixture.store.record_host_completion_deferred(
+        attempt.attempt_id, "host:seal-error".into(), "host boundary with failed receipt settlement".into(),
+    ).await.unwrap();
+    let mut invalid = completed_receipt(Vec::new());
+    invalid.summary.clear();
+    assert!(failed.seal_receipt(invalid, false).await.is_err());
+    drop(failed);
+    let wake = tokio::time::timeout(std::time::Duration::from_secs(5),
+        observer.wait_for_wake_events("completion-cancel-root".into(), wake.latest_event_id),
+    ).await.unwrap().unwrap();
+    assert_eq!(wake.updated_agents.len(), 1);
+    assert_eq!(wake.updated_agents[0].summary, "host boundary with failed receipt settlement");
+    assert_eq!(wake.updated_agents[0].attempt_id, attempt.attempt_id);
+    observer.close().await;
+}
+
+#[tokio::test]
 async fn wake_wait_is_event_driven_and_observes_the_next_commit() {
     let fixture = Fixture::new().await;
     let (_, attempt) = fixture
@@ -7605,8 +7399,8 @@ async fn attempt_ordinal_migration_initializes_fresh_and_upgrades_existing_store
             1
         );
         if predecessor {
-            // Every predecessor trigger survives the rebuild byte-for-byte; the
-            // only additions are migration 26's task-state revision fence.
+            // Every predecessor trigger survives the rebuild byte-for-byte.
+            // Later migrations also add global and root-local revision fences.
             let mut expected_attempt_triggers = prior_attempt_triggers;
             expected_attempt_triggers.extend(["DELETE", "INSERT", "UPDATE"].map(|event| {
                 let name = format!("task_revision_attempts_{}", event.to_lowercase());
@@ -7616,13 +7410,16 @@ async fn attempt_ordinal_migration_initializes_fresh_and_upgrades_existing_store
                 (name, sql)
             }));
             expected_attempt_triggers.sort();
-            assert_eq!(
-                sqlx::query_as::<_, (String, String)>(
+            let actual_attempt_triggers = sqlx::query_as::<_, (String, String)>(
                     "SELECT name, sql FROM sqlite_master WHERE type = 'trigger' AND tbl_name = 'attempts' ORDER BY name",
-                ).fetch_all(&pool).await.unwrap(),
-                expected_attempt_triggers,
-                "the migration preserves every live attempts trigger"
-            );
+                ).fetch_all(&pool).await.unwrap();
+            for trigger in &expected_attempt_triggers {
+                assert!(actual_attempt_triggers.contains(trigger), "the migration must preserve {trigger:?} byte-for-byte");
+            }
+            let mut expected_names: Vec<_> = expected_attempt_triggers.iter().map(|(name, _)| name.clone()).collect();
+            expected_names.extend(["delete", "insert", "update"].map(|event| format!("root_task_revision_attempts_{event}")));
+            expected_names.sort();
+            assert_eq!(actual_attempt_triggers.iter().map(|(name, _)| name.clone()).collect::<Vec<_>>(), expected_names);
             let attempts =
                 sqlx::query_as::<_, (String, i64, Option<String>, String, String, Option<String>)>(
                     "SELECT attempt_id, ordinal, amendment_json, state, created_at, sealed_at
@@ -8051,29 +7848,20 @@ async fn admission_overlaps_missing_case_aliases_only_where_the_directory_ignore
         .store
         .create_admitted_assignment(
             fixture.repo.path(),
-            selective_worker_draft("case-alias-root-b", "src/new.rs", &[]),
+            selective_worker_draft("case-alias-root-a", "src/new.rs", &[]),
             true,
         )
-        .await;
+        .await
+        .expect("same-root overlapping writers are admitted");
     if ignores_case {
-        assert!(
-            matches!(
-                alias,
-                Err(StoreError::AdmissionRejected {
-                    reason: AdmissionRejectionReason::ExternalWorkspaceWriter,
-                    reusable_assignment_id: None,
-                })
-            ),
-            "{alias:?}"
-        );
+        assert_eq!(alias.integration_plan, IntegrationPlan::RootOwned);
     } else {
-        let admitted = alias.expect("case-distinct names are independent files here");
-        assert_eq!(admitted.integration_plan, IntegrationPlan::SingleWriter);
+        assert_eq!(alias.integration_plan, IntegrationPlan::SingleWriter);
     }
 }
 
 #[tokio::test]
-async fn read_only_candidate_contract_overlap_with_external_writer_stays_advisory() {
+async fn external_writer_contract_overlap_does_not_constrain_admission() {
     let fixture = Fixture::new().await;
     let contract = "parser-contract".to_string();
     let mut writer = selective_worker_draft("contract-writer-root", "src", &[]);
@@ -8100,28 +7888,27 @@ async fn read_only_candidate_contract_overlap_with_external_writer_stays_advisor
 
     let mut disjoint_writer = selective_worker_draft("contract-reader-root", "docs", &[]);
     disjoint_writer.contract_claims = vec![contract];
-    let rejected = fixture
+    let admitted = fixture
         .store
         .create_admitted_assignment(fixture.repo.path(), disjoint_writer, true)
         .await
-        .expect_err("a writing candidate still conflicts on the shared contract");
-    assert!(matches!(
-        rejected,
-        StoreError::AdmissionRejected {
-            reason: AdmissionRejectionReason::ExternalWorkspaceWriter,
-            reusable_assignment_id: None,
-        }
-    ));
+        .expect("another root's contract claims do not constrain a writer");
+    assert_eq!(admitted.integration_plan, IntegrationPlan::SingleWriter);
 }
 
 #[tokio::test]
 async fn audit142_reused_launch_name_is_caller_conflict_not_storage_failure() {
     let fixture = Fixture::new().await;
+    let draft = |root, scope| {
+        let mut draft = worker_draft(root, scope);
+        draft.required_evidence.push("cargo test launch_names".into());
+        draft
+    };
     let first = fixture
         .store
         .create_admitted_assignment_for_agent(
             fixture.repo.path(),
-            worker_draft("launch-names", "first"),
+            draft("launch-names", "first"),
             false,
             "/root/dup".into(),
             "dup".into(),
@@ -8134,7 +7921,7 @@ async fn audit142_reused_launch_name_is_caller_conflict_not_storage_failure() {
         .store
         .create_admitted_assignment_for_agent(
             fixture.repo.path(),
-            worker_draft("launch-names", "second"),
+            draft("launch-names", "second"),
             false,
             "/root/dup".into(),
             "dup".into(),
@@ -8165,7 +7952,7 @@ async fn audit142_reused_launch_name_is_caller_conflict_not_storage_failure() {
         .store
         .create_admitted_assignment_for_agent(
             fixture.repo.path(),
-            worker_draft("launch-names", "third"),
+            draft("launch-names", "third"),
             false,
             "/root/other".into(),
             "other".into(),
@@ -8177,7 +7964,7 @@ async fn audit142_reused_launch_name_is_caller_conflict_not_storage_failure() {
         .store
         .create_admitted_assignment_for_agent(
             fixture.repo.path(),
-            worker_draft("launch-names-other-root", "fourth"),
+            draft("launch-names-other-root", "fourth"),
             false,
             "/root/dup".into(),
             "dup".into(),

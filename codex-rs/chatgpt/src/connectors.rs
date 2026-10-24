@@ -166,7 +166,8 @@ pub fn connectors_for_plugin_apps(
 
     plugin_apps
         .iter()
-        .filter_map(|connector_id| connectors_by_id.remove(connector_id.0.as_str()))
+        .filter_map(|connector_id| codex_connectors::canonical_connector_id(&connector_id.0))
+        .filter_map(|connector_id| connectors_by_id.remove(connector_id))
         .collect()
 }
 
@@ -178,11 +179,14 @@ pub fn merge_connectors_with_accessible(
     let accessible_connectors = if all_connectors_loaded {
         let connector_ids: HashSet<&str> = connectors
             .iter()
-            .map(|connector| connector.id.as_str())
+            .filter_map(|connector| codex_connectors::canonical_connector_id(&connector.id))
             .collect();
         accessible_connectors
             .into_iter()
-            .filter(|connector| connector_ids.contains(connector.id.as_str()))
+            .filter(|connector| {
+                codex_connectors::canonical_connector_id(&connector.id)
+                    .is_some_and(|id| connector_ids.contains(id))
+            })
             .collect()
     } else {
         accessible_connectors
@@ -372,6 +376,30 @@ mod tests {
         assert_eq!(
             connectors,
             vec![merged_app("gmail", /*is_accessible*/ false), app("alpha")]
+        );
+    }
+
+    #[test]
+    fn raw_plugin_ids_and_directory_filters_use_canonical_identity() {
+        assert_eq!(
+            connectors_for_plugin_apps(
+                vec![app(" calendar ")],
+                &[
+                    AppConnectorId(" calendar ".to_string()),
+                    AppConnectorId("calendar".to_string()),
+                    AppConnectorId(" \t ".to_string()),
+                    AppConnectorId("Calendar".to_string()),
+                ],
+            ),
+            vec![app("calendar"), merged_app("Calendar", false)]
+        );
+        assert_eq!(
+            merge_connectors_with_accessible(
+                vec![app(" calendar ")],
+                vec![app("\tcalendar"), app("other"), app(" ")],
+                true,
+            ),
+            vec![merged_app("calendar", true)]
         );
     }
 

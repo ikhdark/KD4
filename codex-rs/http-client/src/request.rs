@@ -14,6 +14,7 @@ use std::time::Duration;
 pub struct EncodedJsonBody {
     bytes: Bytes,
     prepared: bool,
+    generated_content_encoding: Option<HeaderValue>,
 }
 
 impl EncodedJsonBody {
@@ -22,6 +23,7 @@ impl EncodedJsonBody {
         serde_json::to_vec(value).map(|bytes| Self {
             bytes: Bytes::from(bytes),
             prepared: false,
+            generated_content_encoding: None,
         })
     }
 
@@ -99,6 +101,7 @@ impl Request {
     }
 
     pub fn with_json<T: Serialize>(mut self, body: &T) -> Self {
+        self.clear_prepared_body_headers();
         self.body = Some(match serde_json::to_value(body) {
             Ok(value) => RequestBody::Json(value),
             Err(error) => RequestBody::InvalidJson(error.to_string()),
@@ -107,8 +110,33 @@ impl Request {
     }
 
     pub fn with_raw_body(mut self, body: impl Into<Bytes>) -> Self {
+        self.clear_prepared_body_headers();
         self.body = Some(RequestBody::Raw(body.into()));
         self
+    }
+
+    fn clear_prepared_body_headers(&mut self) {
+        if let Some(RequestBody::EncodedJson(body)) = &self.body
+            && body.prepared
+        {
+            if let Some(generated) = &body.generated_content_encoding {
+                let mut encodings = self
+                    .headers
+                    .get_all(http::header::CONTENT_ENCODING)
+                    .iter()
+                    .cloned()
+                    .collect::<Vec<_>>();
+                if let Some(index) = encodings.iter().position(|value| value == generated) {
+                    encodings.remove(index);
+                    self.headers.remove(http::header::CONTENT_ENCODING);
+                    for encoding in encodings {
+                        self.headers
+                            .append(http::header::CONTENT_ENCODING, encoding);
+                    }
+                }
+            }
+            self.headers.remove(http::header::CONTENT_LENGTH);
+        }
     }
 
     pub fn with_compression(mut self, compression: RequestCompression) -> Self {
@@ -154,11 +182,20 @@ impl Request {
             Some(RequestBody::Json(_) | RequestBody::EncodedJson(_))
         );
         let prepared = self.prepare_body_for_send()?;
+        let generated_content_encoding = (self.compression != RequestCompression::None)
+            .then(|| {
+                prepared
+                    .headers
+                    .get(http::header::CONTENT_ENCODING)
+                    .cloned()
+            })
+            .flatten();
         self.headers = prepared.headers;
         self.body = match (is_json, prepared.body) {
             (true, Some(bytes)) => Some(RequestBody::EncodedJson(EncodedJsonBody {
                 bytes,
                 prepared: true,
+                generated_content_encoding,
             })),
             (false, Some(body)) => Some(RequestBody::Raw(body)),
             (_, None) => None,
@@ -273,6 +310,69 @@ mod tests {
     use http::HeaderValue;
     use pretty_assertions::assert_eq;
     use serde_json::json;
+
+    #[test]
+    fn replacing_prepared_json_preserves_caller_content_encoding() {
+        let mut request = Request::new(Method::POST, "https://example.com/".into())
+            .with_json(&json!({"old": true}));
+        request.headers.insert(
+            http::header::CONTENT_ENCODING,
+            HeaderValue::from_static("custom"),
+        );
+        let replacement = request
+            .into_prepared()
+            .unwrap()
+            .with_json(&json!({"new": true}));
+        assert_eq!(
+            replacement.headers[http::header::CONTENT_ENCODING],
+            "custom"
+        );
+        let mut compressed = Request::new(Method::POST, "https://example.com/".into())
+            .with_json(&json!({"old":true}))
+            .with_compression(RequestCompression::Zstd)
+            .into_prepared()
+            .unwrap();
+        compressed.headers.append(
+            http::header::CONTENT_ENCODING,
+            HeaderValue::from_static("custom"),
+        );
+        let raw = compressed.with_raw_body(Bytes::from_static(b"caller encoded"));
+        assert_eq!(
+            raw.headers
+                .get_all(http::header::CONTENT_ENCODING)
+                .iter()
+                .collect::<Vec<_>>(),
+            vec![&HeaderValue::from_static("custom")]
+        );
+    }
+
+    #[test]
+    fn replacing_prepared_json_removes_stale_wire_headers() {
+        let mut request = Request::new(Method::POST, "https://example.com/".into())
+            .with_json(&json!({"original": true}))
+            .with_compression(RequestCompression::Zstd);
+        request
+            .headers
+            .insert(http::header::CONTENT_LENGTH, HeaderValue::from_static("1"));
+        let prepared = request.into_prepared().unwrap();
+        for replacement in [
+            prepared.clone().with_json(&json!({"replacement": true})),
+            prepared.with_raw_body(Bytes::from_static(b"raw replacement")),
+        ] {
+            let wire = replacement
+                .into_prepared()
+                .unwrap()
+                .prepare_body_for_send()
+                .unwrap();
+            assert!(!wire.headers.contains_key(http::header::CONTENT_ENCODING));
+            assert!(!wire.headers.contains_key(http::header::CONTENT_LENGTH));
+            let bytes = wire.body.unwrap();
+            assert!(
+                bytes.as_ref() == br#"{"replacement":true}"#
+                    || bytes.as_ref() == b"raw replacement"
+            );
+        }
+    }
 
     #[test]
     fn prepare_body_for_send_serializes_json_and_sets_content_type() {

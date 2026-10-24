@@ -435,6 +435,13 @@ pub(crate) fn parse_mcp_input_schema(input: JsonValue) -> Result<JsonSchema, ser
 }
 
 fn project_mcp_schema(value: &mut JsonValue) {
+    // This lossy presentation can relocate or remove referenced schema nodes.
+    // Widen the entire reference node (including draft-07 ignored siblings)
+    // rather than publish a dangling reference or introduce new constraints.
+    if value.get("$ref").is_some() {
+        *value = json!({});
+        return;
+    }
     if value == &JsonValue::Bool(false) {
         *value = json!({});
     }
@@ -444,6 +451,14 @@ fn project_mcp_schema(value: &mut JsonValue) {
     if map.contains_key("patternProperties") {
         // Keys accepted by a removed pattern must not become forbidden extras.
         map.remove("additionalProperties");
+    }
+    if map
+        .get("prefixItems")
+        .and_then(JsonValue::as_array)
+        .is_some_and(|items| !items.is_empty())
+    {
+        // `items` constrains only the tail in 2020-12, not the tuple prefix.
+        map.insert("items".into(), json!({}));
     }
     for key in UNSUPPORTED_ASSERTION_KEYS {
         map.remove(*key);
@@ -779,7 +794,9 @@ fn collect_refs(
             if let Some(JsonValue::String(schema_ref)) = map.get("$ref") {
                 if let Some(pointer) = parse_local_definition_ref(schema_ref) {
                     refs.push(pointer);
-                } else if schema_ref.starts_with('#') {
+                } else {
+                    // URI references can target embedded $id resources. If this
+                    // walker cannot resolve one, retaining definitions is safe.
                     return false;
                 }
             }

@@ -94,6 +94,7 @@ struct TerminalCellCache {
 
 enum CachedCellEvent {
     Inline(CellEvent),
+    Durable(Arc<snapshot::CompletedSnapshotEvent>),
     // Lifecycle survives payload eviction without reopening the spill under a lock.
     Spilled(tempfile::NamedTempFile, usize, Option<bool>),
 }
@@ -136,6 +137,7 @@ impl CachedCellEvent {
     fn read(&self) -> Result<CellEvent, Error> {
         match self {
             Self::Inline(event) => Ok(event.clone()),
+            Self::Durable(event) => Ok(event.read()),
             Self::Spilled(file, _, _) => file.reopen()
                 .map_err(|error| Error::Runtime(format!(
                     "terminal cell result is unavailable: {error}; the cell completed; do not replay its effects"
@@ -153,7 +155,7 @@ impl TerminalCellCache {
             .get(cell_id)
             .map(|(event, retained_bytes)| {
                 let bytes = match event.as_ref() {
-                    CachedCellEvent::Inline(_) => *retained_bytes,
+                    CachedCellEvent::Inline(_) | CachedCellEvent::Durable(_) => *retained_bytes,
                     CachedCellEvent::Spilled(_, bytes, _) => *bytes,
                 };
                 (Arc::clone(event), bytes)
@@ -201,6 +203,7 @@ impl TerminalCellCache {
                 // interruption. Do not hydrate disk data under this cache lock.
                 let completed = match event.as_ref() {
                     CachedCellEvent::Inline(event) => terminal_completion(event),
+                    CachedCellEvent::Durable(event) => event.completion(),
                     CachedCellEvent::Spilled(_, _, completed) => *completed,
                 };
                 if let Some(completed) = completed {
@@ -223,6 +226,14 @@ fn terminal_completion(event: &CellEvent) -> Option<bool> {
 }
 
 fn cell_event_bytes(event: &CellEvent) -> usize {
+    let mut counter = crate::runtime::JsonByteCounter::default();
+    if serde_json::to_writer(&mut counter, event).is_err() {
+        return usize::MAX;
+    }
+    cell_event_bytes_with_encoded_len(event, counter.bytes)
+}
+
+fn cell_event_bytes_with_encoded_len(event: &CellEvent, encoded_len: usize) -> usize {
     let content_items = match event {
         CellEvent::Yielded { content_items }
         | CellEvent::ExplicitYield { content_items }
@@ -231,12 +242,7 @@ fn cell_event_bytes(event: &CellEvent) -> usize {
     };
     // Reuse output admission's allocation-free JSON counter. Count escaping,
     // item envelopes, error/loss metadata, and in-memory item storage as well.
-    let mut counter = crate::runtime::JsonByteCounter::default();
-    if serde_json::to_writer(&mut counter, event).is_err() {
-        return usize::MAX;
-    }
-    counter
-        .bytes
+    encoded_len
         .saturating_add(std::mem::size_of::<CellEvent>())
         .saturating_add(
             content_items
@@ -259,6 +265,7 @@ struct Inner<D: SessionRuntimeDelegate> {
     #[cfg(test)]
     spill_gate: StdMutex<Option<Arc<StorageTestGate>>>,
     durable_state: tokio::sync::OnceCell<Arc<snapshot::DurableState>>,
+    restored_cell_ids: StdMutex<std::collections::HashSet<CellId>>,
     // Initialization excludes only snapshot/permit admission, never native
     // actor startup or execution. This closes the restore-versus-start race.
     state_admission: Arc<tokio::sync::RwLock<()>>,
@@ -274,6 +281,7 @@ struct Inner<D: SessionRuntimeDelegate> {
     storage_tasks: TaskTracker,
     storage_admission: StdMutex<bool>,
     shutdown_token: CancellationToken,
+    shutdown_cancellation: NestedCancellation,
     delegate: Arc<D>,
     task_failure_handler: Option<TaskFailureHandler>,
     cell_id_namespace: uuid::Uuid,
@@ -306,6 +314,7 @@ impl<D: SessionRuntimeDelegate> SessionRuntime<D> {
             .map(usize::from)
             .unwrap_or(2)
             .clamp(2, MAX_ACTIVE_CELLS);
+        let shutdown_cancellation = NestedCancellation::new(CancellationToken::new());
         Self {
             inner: Arc::new(Inner {
                 stored_values: Mutex::new(HashMap::new()),
@@ -313,6 +322,7 @@ impl<D: SessionRuntimeDelegate> SessionRuntime<D> {
                 #[cfg(test)]
                 spill_gate: StdMutex::new(None),
                 durable_state: tokio::sync::OnceCell::new(),
+                restored_cell_ids: StdMutex::new(std::collections::HashSet::new()),
                 state_admission: Arc::new(tokio::sync::RwLock::new(())),
                 cells: Mutex::new(HashMap::new()),
                 terminal_cells: StdMutex::new(TerminalCellCache::default()),
@@ -325,7 +335,8 @@ impl<D: SessionRuntimeDelegate> SessionRuntime<D> {
                 cell_tasks: TaskTracker::new(),
                 storage_tasks: TaskTracker::new(),
                 storage_admission: StdMutex::new(true),
-                shutdown_token: CancellationToken::new(),
+                shutdown_token: shutdown_cancellation.token().clone(),
+                shutdown_cancellation,
                 delegate,
                 task_failure_handler,
                 cell_id_namespace: uuid::Uuid::new_v4(),
@@ -440,21 +451,36 @@ impl<D: SessionRuntimeDelegate> SessionRuntime<D> {
     ) -> Result<PendingEvent, Error> {
         // Only IDs restored from this snapshot may cross a host generation.
         // An absent snapshot must not alias a freshly executed, non-durable ID.
-        if !self.inner.durable_state.get().is_some_and(|state| {
-            cell_id_sequence(cell_id.as_str()).is_some_and(|id| id < state.first_cell_id)
-        }) {
+        if self.inner.durable_state.get().is_none()
+            || !self.inner.restored_cell_ids.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner).contains(cell_id)
+        {
             return Err(Error::MissingCell(cell_id.clone()));
         }
         self.cached_terminal_observation(cell_id).await
     }
 
     async fn cached_terminal_observation(&self, cell_id: &CellId) -> Result<PendingEvent, Error> {
-        let (event, bytes) = self
+        let cached = self
             .inner
             .terminal_cells
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .lookup(cell_id)?;
+            .lookup(cell_id);
+        let (event, bytes) = match cached {
+            Ok(cached) => cached,
+            Err(error) => {
+                // Volatile eviction is not loss of an exact, still-retained
+                // durable receipt. Recovery never reruns the cell's effects.
+                let Some((event, bytes)) = self.inner.durable_state.get()
+                    .and_then(|state| state.completed_cell_for_replay(cell_id.as_str())) else {
+                    return Err(error);
+                };
+                // Hold shared custody while awaiting replay-byte admission;
+                // clone the terminal payload only after that permit is owned.
+                (Arc::new(CachedCellEvent::Durable(event)), bytes)
+            }
+        };
         let permit = tokio::select! {
             biased;
             _ = self.inner.shutdown_token.cancelled() => return Err(Error::ShuttingDown),
@@ -464,7 +490,7 @@ impl<D: SessionRuntimeDelegate> SessionRuntime<D> {
         // The blocking owner retains admission if its async waiter is dropped.
         // Successful hydration keeps it through the observation handoff, not
         // merely until the disk read completes.
-        let (event, permit) = if matches!(event.as_ref(), CachedCellEvent::Inline(_))
+        let (event, permit) = if matches!(event.as_ref(), CachedCellEvent::Inline(_) | CachedCellEvent::Durable(_))
             && bytes <= TERMINAL_CELL_CACHE_MAX_BYTES
         {
             (event.read(), permit)
@@ -556,8 +582,8 @@ impl<D: SessionRuntimeDelegate> SessionRuntime<D> {
                 // Keep admission through blocking publication even if the caller cancels.
                 let admission = owned_admission;
                 let (state, restored) = snapshot::DurableState::open_with_values(selected_path, initial_values, minimum_cell_id)?;
-                let completed = state.completed_cells().into_iter().map(|(id, event)| {
-                    (id, CachedCellEvent::new(event))
+                let completed = state.completed_cells_for_replay().into_iter().map(|(id, event, bytes)| {
+                    (id, (Arc::new(CachedCellEvent::Durable(event)), bytes))
                 }).collect::<Vec<_>>();
                 Ok::<_, String>((state, restored, completed, admission))
             })?.await.map_err(|error| Error::Runtime(error.to_string()))?
@@ -570,12 +596,20 @@ impl<D: SessionRuntimeDelegate> SessionRuntime<D> {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             let allocated_before = self.inner.next_cell_id.load(Ordering::Acquire);
             if completed.iter().any(|(id, _)| {
-                cell_id_sequence(id).is_some_and(|id| id < allocated_before)
+                // Modern identities are scoped by incarnation, not merely by
+                // their suffix. Keep conservative overlap checks for legacy IDs.
+                let same_namespace = id.split_once('/').is_none_or(|(namespace, _)| {
+                    uuid::Uuid::parse_str(namespace).ok() == Some(self.inner.cell_id_namespace)
+                });
+                same_namespace && cell_id_sequence(id).is_some_and(|id| id < allocated_before)
             }) {
                 return Err(Error::Runtime(
                     "durable cell IDs overlap cells already observed in this runtime; enable persistence before starting cells; no live state was replaced".into()
                 ));
             }
+            *self.inner.restored_cell_ids.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = completed.iter()
+                .map(|(id, _)| CellId::new(id.clone())).collect();
             for (id, event) in completed {
                 terminal.insert_cached(CellId::new(id), event);
             }
@@ -656,7 +690,7 @@ impl<D: SessionRuntimeDelegate> SessionRuntime<D> {
             cell_permit: Mutex::new(Some(cell_permit)),
         });
         drop(admission);
-        let cell_state = Arc::new(CellState::new(self.inner.shutdown_token.child_token()));
+        let cell_state = Arc::new(CellState::with_cancellation(self.inner.shutdown_cancellation.child(self.inner.shutdown_token.child_token())));
         // Prepare outside the registry lock: native startup can take seconds and
         // must not block observing, terminating, or closing other cells.
         let (handle, initial_event, task) = tokio::select! {
@@ -706,7 +740,7 @@ impl<D: SessionRuntimeDelegate> SessionRuntime<D> {
     }
 
     fn begin_shutdown(&self) {
-        self.inner.shutdown_token.cancel();
+        self.inner.shutdown_cancellation.cancel_with(codex_code_mode_protocol::CancellationCause::RuntimeShutdown);
         self.inner.cell_tasks.close();
     }
 }
@@ -965,10 +999,6 @@ impl<D: SessionRuntimeDelegate> CellHost for RuntimeCellHost<D> {
             None
         };
         let completed = event.clone();
-        let terminal_completed = crate::cell_actor::prepend_initial_yield(
-            completed.clone(),
-            pending_initial_yield_items.clone(),
-        );
         let commit =
             cell_state.commit_completion_with_event(event, pending_initial_yield_items, |event| {
                 if writes_fit && !conflicting_write && !conflicting_read {
@@ -1013,12 +1043,13 @@ impl<D: SessionRuntimeDelegate> CellHost for RuntimeCellHost<D> {
                 // Settlement owns refinement, even after the observation deadline.
                 // No timed-out waiter may subsequently overwrite this receipt.
                 cell_state.update_unclaimed_completion(event);
-                if result.is_ok() {
-                    let bytes = cell_event_bytes(&terminal_completed);
+                if result.is_ok()
+                    && let Some((event, bytes)) = durable.completed_cell_for_replay(cell_id.as_str())
+                {
                     let mut cache = inner.terminal_cells.lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner);
                     if cache.entry(&cell_id).is_some() {
-                        cache.insert_cached(cell_id, (Arc::new(CachedCellEvent::Inline(terminal_completed)), bytes));
+                        cache.insert_cached(cell_id, (Arc::new(CachedCellEvent::Durable(event)), bytes));
                     }
                 }
                 result
@@ -1073,17 +1104,21 @@ impl<D: SessionRuntimeDelegate> CellHost for RuntimeCellHost<D> {
         }
         // Transfer receipt custody before releasing execution capacity. Spilling
         // is only an optimization of an already recoverable terminal receipt.
-        let mut cached = event.as_ref().map(|event| {
+        // Payload-proportional preparation must not hold either lifecycle lock.
+        let durable_candidate = event.as_ref().and_then(|_| self.inner.durable_state.get())
+            .and_then(|durable| durable.completed_cell_for_replay(self.cell_id.as_str()));
+        let inline_candidate = event.as_ref().filter(|_| durable_candidate.is_none()).map(|event| {
             let bytes = cell_event_bytes(event);
             (Arc::new(CachedCellEvent::Inline(event.clone())), bytes)
         });
+        let mut cached = None;
         {
             let mut cells = self.inner.cells.lock().await;
             let removed = cells.remove(&self.cell_id);
             if removed.is_none() {
                 return event;
             }
-            if let Some(cached) = cached.as_mut() {
+            if event.is_some() {
                 let mut terminal = self
                     .inner
                     .terminal_cells
@@ -1096,18 +1131,28 @@ impl<D: SessionRuntimeDelegate> CellHost for RuntimeCellHost<D> {
                     .inner
                     .durable_state
                     .get()
-                    .and_then(|durable| durable.completed_cell(self.cell_id.as_str()))
+                    .and_then(|durable| durable.completed_cell_for_replay(self.cell_id.as_str()))
+                    .or(durable_candidate)
                 {
-                    let bytes = cell_event_bytes(&completed);
-                    event = Some(completed.clone());
-                    *cached = (Arc::new(CachedCellEvent::Inline(completed)), bytes);
+                    let (completed, bytes) = completed;
+                    cached = Some((Arc::new(CachedCellEvent::Durable(completed)), bytes));
+                } else {
+                    cached = inline_candidate;
                 }
-                terminal.insert_cached(self.cell_id.clone(), cached.clone());
+                if let Some(cached) = &cached {
+                    terminal.insert_cached(self.cell_id.clone(), cached.clone());
+                }
             }
         }
         self.cell_permit.lock().await.take();
         self.inner.delegate.cell_closed(&self.cell_id);
+        if let Some((cached, _)) = &cached
+            && let CachedCellEvent::Durable(completed) = cached.as_ref()
+        {
+            event = Some(completed.read());
+        }
         if let Some((inline, bytes)) = cached
+            && matches!(inline.as_ref(), CachedCellEvent::Inline(_))
             && bytes > TERMINAL_CELL_CACHE_MAX_BYTES
             && let Ok(job) = Arc::clone(&self.inner.spill_jobs).try_acquire_owned()
             && let Ok(weight) = u32::try_from(bytes)

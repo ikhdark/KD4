@@ -31,7 +31,7 @@ use codex_windows_sandbox::sandbox_secrets_dir;
 use codex_windows_sandbox::setup_protocol::SetupMode;
 use codex_windows_sandbox::setup_protocol::SetupPayload as Payload;
 use codex_windows_sandbox::string_from_sid_bytes;
-use codex_windows_sandbox::sync_persistent_deny_read_acls;
+use codex_windows_sandbox::sync_shared_principal_deny_read_acls as sync_persistent_deny_read_acls;
 use codex_windows_sandbox::to_wide;
 use codex_windows_sandbox::workspace_write_cap_sid_for_root;
 use codex_windows_sandbox::workspace_write_root_overlaps_path;
@@ -149,17 +149,18 @@ fn spawn_read_acl_helper(payload: &Payload, _log: &mut dyn Write) -> Result<()> 
     let mut read_payload = payload.clone();
     read_payload.mode = SetupMode::ReadAclsOnly;
     read_payload.refresh_only = true;
-    let payload_json = serde_json::to_vec(&read_payload)?;
-    let payload_b64 = BASE64.encode(payload_json);
     let exe = std::env::current_exe().context("locate setup helper")?;
-    Command::new(&exe)
-        .arg(payload_b64)
+    let staged = codex_windows_sandbox::setup_protocol::PreparedSetupRequest::new(&read_payload)?;
+    let (request_path, request_args) = staged.into_background()?;
+    let result = Command::new(&exe)
+        .args(&request_args)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .creation_flags(0x08000000) // CREATE_NO_WINDOW
-        .spawn()
-        .context("spawn read ACL helper")?;
+        .spawn();
+    if result.is_err() { let _ = std::fs::remove_file(&request_path); }
+    result.context("spawn read ACL helper")?;
     Ok(())
 }
 
@@ -452,26 +453,25 @@ pub fn main() -> Result<()> {
 }
 
 fn real_main() -> Result<()> {
-    let mut args = std::env::args().collect::<Vec<_>>();
-    if args.len() != 2 {
-        return Err(anyhow::Error::new(SetupFailure::new(
-            SetupErrorCode::HelperRequestArgsFailed,
-            "expected payload argument",
-        )));
-    }
-    let payload_b64 = args.remove(1);
-    let payload_json = BASE64.decode(payload_b64).map_err(|err| {
+    let args = std::env::args().skip(1).collect::<Vec<_>>();
+    let payload: Payload = if args.len() != 1 {
+        codex_windows_sandbox::setup_protocol::read_setup_request(&args).map_err(|err| {
+            anyhow::Error::new(SetupFailure::new(SetupErrorCode::HelperRequestArgsFailed, format!("invalid setup request: {err:#}")))
+        })?
+    } else {
+    let payload_json = BASE64.decode(&args[0]).map_err(|err| {
         anyhow::Error::new(SetupFailure::new(
             SetupErrorCode::HelperRequestArgsFailed,
             format!("failed to decode payload b64: {err}"),
         ))
     })?;
-    let payload: Payload = serde_json::from_slice(&payload_json).map_err(|err| {
+    serde_json::from_slice(&payload_json).map_err(|err| {
         anyhow::Error::new(SetupFailure::new(
             SetupErrorCode::HelperRequestArgsFailed,
             format!("failed to parse payload json: {err}"),
         ))
-    })?;
+    })?
+    };
     if payload.version != SETUP_VERSION {
         return Err(anyhow::Error::new(SetupFailure::new(
             SetupErrorCode::HelperRequestArgsFailed,

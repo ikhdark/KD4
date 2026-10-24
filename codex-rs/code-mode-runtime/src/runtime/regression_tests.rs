@@ -12,6 +12,216 @@ use tokio::sync::mpsc;
 
 use super::*;
 
+#[path = "storage_lookup_admission_tests.rs"]
+mod storage_lookup_admission_tests;
+
+#[tokio::test]
+async fn audit144_sparse_catalog_defers_description_work_until_access() {
+    for size in [128, 16384, 65536] {
+        let descriptions = (0..256)
+            .map(|i| format!("{}-{i}", "d".repeat(size)))
+            .collect::<Vec<_>>();
+        let definitions = descriptions
+            .iter()
+            .enumerate()
+            .map(|(i, description)| ToolDefinition {
+                name: format!("tool_{i}"),
+                tool_name: ToolName::plain(format!("tool_{i}")),
+                kind: CodeModeToolKind::Function,
+                description: description.clone().into(),
+                input_schema: None,
+                output_schema: None,
+                namespace_description: None,
+                default_timeout_ms: None,
+            })
+            .collect();
+        let source = format!(
+            r#"
+        text(ALL_TOOL_NAMES.length); const tool=resolve_tool('tool_0'); await tool({{}});
+        if(tool.description !== {expected} || tool.description !== {expected}) throw Error('description');
+        await tool({{}});
+        if(JSON.parse(JSON.stringify(tool)).description !== {expected}) throw Error('metadata');
+        if(ALL_TOOLS.length !== 256 || ALL_TOOLS[0].description !== {expected}) throw Error('inventory');
+        await tool({{}});
+    "#,
+            expected = serde_json::to_string(&descriptions[0]).unwrap()
+        );
+        let (tx, _termination, mut rx) = start_with_tools(&source, definitions).await;
+        assert_eq!(text(next(&mut rx).await), "256");
+        for expected in [0, 1, 258] {
+            let RuntimeEvent::ToolCall { id, .. } = next(&mut rx).await else {
+                panic!("barrier");
+            };
+            assert_eq!(inspect(&tx).await.description_materializations, expected);
+            tx.send(RuntimeCommand::ToolResponse {
+                id,
+                result: json!(null),
+            })
+            .unwrap();
+        }
+        assert!(matches!(
+            next(&mut rx).await,
+            RuntimeEvent::Result {
+                error_text: None,
+                ..
+            }
+        ));
+        closed(&mut rx).await;
+    }
+}
+
+#[tokio::test]
+async fn audit144_await_command_stops_before_consuming_more_evidence() {
+    let (tx, _termination, mut rx) = start_with_tool(r#"
+    const packet={output:'x'.repeat(16384),session_id:17,execution_state:'running',
+        process_exited:false,session_capabilities:{polling:true,incarnation:'EXACT'}};
+    try { await await_command(packet,{max_bytes:65536}); throw Error('unbounded success'); }
+    catch(error) {
+        if(!error.message.includes('byte limit')) throw error;
+        const e=error.evidence;
+        if(e.terminal.session_capabilities.incarnation !== 'EXACT') throw Error('lost handle');
+        if(e.observations.some(p=>p.output !== packet.output)) throw Error('lost bytes');
+        text({count:e.observations.length,bytes:e.observations.reduce((n,p)=>n+p.output.length,0)});
+    }
+"#, ToolDefinition {name:"write_stdin".into(),tool_name:ToolName::plain("write_stdin"),kind:CodeModeToolKind::Function,
+    description:"poll".into(),input_schema:None,output_schema:None,namespace_description:None,default_timeout_ms:None}).await;
+    let mut polls = 0;
+    let summary = loop {
+        match next(&mut rx).await {
+            RuntimeEvent::ToolCall { id, input, .. } => {
+                polls += 1;
+                assert!(polls < 5, "byte guard did not stop destructive polling");
+                assert_eq!(input.unwrap()["incarnation"], "EXACT");
+                tx.send(RuntimeCommand::ToolResponse{id,result:json!({"output":"x".repeat(16384),"session_id":17,"execution_state":"running","process_exited":false,"session_capabilities":{"polling":true,"incarnation":"EXACT"}})}).unwrap();
+            }
+            event => break serde_json::from_str::<JsonValue>(&text(event)).unwrap(),
+        }
+    };
+    assert_eq!(summary["count"], polls + 1);
+    assert_eq!(summary["bytes"], (polls + 1) * 16384);
+    assert!(polls > 0);
+    assert!(matches!(
+        next(&mut rx).await,
+        RuntimeEvent::Result {
+            error_text: None,
+            ..
+        }
+    ));
+    closed(&mut rx).await;
+}
+
+#[tokio::test]
+async fn audit144_uncaught_preflight_names_missing_capability_without_dispatch() {
+    let (_tx,_termination,mut rx)=start("await run_graph([{id:'read-source',requires:['missing_native_tool'],run:()=>{throw Error('started');},accept:()=>true}]);").await;
+    let RuntimeEvent::Result {
+        error_text: Some(error),
+        ..
+    } = next(&mut rx).await
+    else {
+        panic!("preflight");
+    };
+    assert!(
+        error.contains("read-source") && error.contains("missing_native_tool"),
+        "{error}"
+    );
+    assert!(!error.contains("Error: started"));
+    closed(&mut rx).await;
+}
+
+#[tokio::test]
+async fn audit144_nested_graph_fallback_keeps_exact_leaf_controls() {
+    let (_tx, _termination, mut rx) = start(
+        r#"
+    await run_graph([{id:'outer', run:() => run_graph(Array.from({length:16}, (_,i) => ({
+        id:'n'+i, run:() => ({body:'x'.repeat(600*1024), receipt:'receipt-'+i,
+            session_id:i, session_capabilities:{incarnation:'c'.repeat(17*1024)+'-EXACT-INCARNATION-'+i}}),
+        accept:() => i !== 15
+    }))), accept:() => true}]);
+"#,
+    )
+    .await;
+    // Large exception details use admitted text plus a terminal failure marker.
+    // Validate the complete owning event path, not only its short final field.
+    let mut error = String::new();
+    loop {
+        match next(&mut rx).await {
+            RuntimeEvent::Result {error_text:Some(terminal),..} => {
+                error.push_str(&terminal);
+                break;
+            }
+            event @ RuntimeEvent::ContentItem {..} => error.push_str(&text(event)),
+            event => panic!("graph failure expected: {event:?}"),
+        }
+    }
+    for i in 0..16 {
+        assert!(
+            error.contains(&format!("receipt-{i}\"")),
+            "missing receipt {i}"
+        );
+        assert!(
+            error.contains(&format!("{}-EXACT-INCARNATION-{i}\"", "c".repeat(17*1024))),
+            "missing exact control {i}"
+        );
+    }
+    assert!(error.len() < super::value::MAX_PAYLOAD_BYTES);
+    closed(&mut rx).await;
+}
+
+#[tokio::test]
+async fn audit144_timeout_types_are_rejected_before_dispatch() {
+    let (_tx, _termination, mut rx) = start(r#"
+    for (const timeout_ms of [true, [1], '1', {valueOf() { throw Error('coerced'); }}]) {
+        try { await tools.sample_tool({}, {timeout_ms}); throw Error('accepted'); }
+        catch (error) {
+            if (!(error instanceof TypeError) || !error.message.includes('timeout_ms')) throw error;
+        }
+    }
+    text('no dispatch');
+"#).await;
+    assert_eq!(text(next(&mut rx).await), "no dispatch");
+    assert!(matches!(
+        next(&mut rx).await,
+        RuntimeEvent::Result {
+            error_text: None,
+            ..
+        }
+    ));
+    closed(&mut rx).await;
+}
+
+#[tokio::test]
+async fn audit144_console_keeps_helper_receipts() {
+    let (_tx, _termination, mut rx) = start(
+        r#"
+    try {
+        await run_graph([
+            {id:'committed', run:() => ({receipt:'exact-receipt', session_id:17,
+                session_capabilities:{incarnation:'EXACT-INCARNATION'}}), accept:() => true},
+            {id:'rejected', run:() => 1, accept:() => false}
+        ]);
+    } catch (error) {
+        console.log(error); console.error(error);
+        if (error.results.committed.value.receipt !== 'exact-receipt') throw Error('mutated');
+    }
+"#,
+    )
+    .await;
+    for _ in 0..2 {
+        let printed = text(next(&mut rx).await);
+        for expected in ["exact-receipt", "EXACT-INCARNATION", "rejected"] {
+            assert!(printed.contains(expected), "{printed}");
+        }
+    }
+    assert!(matches!(
+        next(&mut rx).await,
+        RuntimeEvent::Result {
+            error_text: None,
+            ..
+        }
+    ));
+    closed(&mut rx).await;
+}
+
 #[tokio::test]
 async fn storage_inventory_reports_admission_bytes_without_loading_values() {
     let (_tx, _termination, mut rx) = start(r#"
@@ -185,9 +395,10 @@ async fn published_settled_batch_prints_every_sibling_when_one_call_fails() {
         if read_fails {
             assert!(printed.contains("src/lib.rs:7:x"), "{printed}");
         } else {
-            // A read inside the batch still prints its source body as text.
-            assert!(printed.contains("[source "), "{printed}");
-            assert!(printed.contains("\nfn found()"), "{printed}");
+            // Tiny source bodies remain inline rather than growing a source
+            // frame. Check the exact bytes, not their display encoding.
+            let batch: JsonValue = serde_json::from_str(&printed).unwrap();
+            assert_eq!(batch[0]["value"]["results"][0]["text"], "fn found()\n");
         }
         let RuntimeEvent::Result { error_text, .. } = next(&mut rx).await else {
             panic!("result");
@@ -1078,16 +1289,17 @@ async fn uncaught_oversized_helpers_keep_every_settled_status_and_recovery_handl
     "#,
     )
     .await;
-    let error = text(next(&mut rx).await);
     let RuntimeEvent::Result {
-        error_text: Some(summary),
+        error_text: Some(error),
         output_loss,
         ..
     } = next(&mut rx).await
     else {
         panic!("helper failure");
     };
-    assert!(summary.len() <= MAX_ERROR_TEXT_BYTES);
+    // Uncaught exceptions belong to the terminal error channel, like the
+    // adjacent small-helper case; no duplicate ContentItem is promised.
+    assert!(error.len() <= MAX_ERROR_TEXT_BYTES);
     assert_eq!(output_loss, None);
     assert!(error.len() < 8 * 1024 * 1024);
     let (_, json) = error.split_once("\nHelper results:\n").unwrap();
@@ -2113,5 +2325,80 @@ async fn uncaught_missing_tool_call_names_resolution_candidates() {
     };
     assert!(error.contains("is not a function"), "{error}");
     assert!(!error.contains("Hint: no nested tool"), "{error}");
+    closed(&mut rx).await;
+}
+
+#[tokio::test]
+async fn generated_declarations_never_advertise_ambiguous_legacy_aliases() {
+    for generated in [false, true] {
+        let description = if generated {
+            "declare const tools: { acme__lookup__stable_identity(args: {}): Promise<unknown>; };"
+        } else { "contract" };
+        let definitions = vec![
+            ToolDefinition { name:"acme__lookup__stable_identity".into(),
+                tool_name:ToolName::namespaced("acme", "lookup"), kind:CodeModeToolKind::Function,
+                description:description.into(), input_schema:None, output_schema:None,
+                namespace_description:None, default_timeout_ms:None },
+            ToolDefinition { name:"acme__lookup".into(), tool_name:ToolName::plain("acme__lookup"),
+                kind:CodeModeToolKind::Function, description:"contract".into(),
+                input_schema:None, output_schema:None, namespace_description:None, default_timeout_ms:None },
+        ];
+        let (tx, _termination, mut rx) = start_with_tools(r#"
+            if(tools.acme?.lookup !== undefined) throw Error('ambiguous alias installed');
+            if(ALL_TOOL_NAMES[0] !== 'acme__lookup__stable_identity') throw Error('advertised missing alias');
+            if(ALL_TOOLS[0].description.includes('acme: { lookup(')) throw Error('rewritten missing alias');
+            if(resolve_tool('acme.lookup') !== tools.acme__lookup__stable_identity) throw Error('identity');
+            await resolve_tool(ALL_TOOL_NAMES[0])({});
+        "#, definitions).await;
+        let RuntimeEvent::ToolCall { id, name, .. } = next(&mut rx).await else { panic!("dispatch"); };
+        assert_eq!(name, ToolName::namespaced("acme", "lookup"));
+        tx.send(RuntimeCommand::ToolResponse{id, result:json!(null)}).unwrap();
+        assert!(matches!(next(&mut rx).await, RuntimeEvent::Result{error_text:None,..}));
+        closed(&mut rx).await;
+    }
+}
+
+#[tokio::test]
+async fn multiline_command_bigints_print_and_restore_with_the_display_codec() {
+    let tool = ToolDefinition { name:"exec_command".into(), tool_name:ToolName::plain("exec_command"),
+        kind:CodeModeToolKind::Function, description:"".into(), input_schema:None,
+        output_schema:None, namespace_description:None, default_timeout_ms:None };
+    let (tx, _termination, mut rx) = start_with_tool(r#"
+        const r=await tools.exec_command({});
+        store('bigint-command',r);
+        r.extra=1n; text(r); console.log(r);
+        const restored=load('bigint-command'); restored.extra=1n; text(restored);
+    "#,tool).await;
+    let RuntimeEvent::ToolCall {id,..} = next(&mut rx).await else {panic!("command");};
+    tx.send(RuntimeCommand::ToolResponse{id,result:json!({"output":"ok\n".repeat(256),
+        "exit_code":0,"extra_native":9_007_199_254_740_993_u64,"session_id":9_007_199_254_740_995_u64})}).unwrap();
+    for _ in 0..3 {
+        let rendered = text(next(&mut rx).await);
+        let envelope:JsonValue = serde_json::from_str(rendered.lines().next().unwrap()).unwrap();
+        assert_eq!(envelope["extra"], json!({"$bigint":"1"}));
+        assert_eq!(envelope["extra_native"], json!({"$bigint":"9007199254740993"}));
+        assert_eq!(envelope["session_id"], json!({"$bigint":"9007199254740995"}));
+        assert!(rendered.contains("[source "));
+        assert!(rendered.contains("\"session_id\":{\"$bigint\":\"9007199254740995\"}"));
+    }
+    assert!(matches!(next(&mut rx).await, RuntimeEvent::Result{error_text:None,..}));
+    closed(&mut rx).await;
+}
+
+#[tokio::test]
+async fn standalone_depth_admission_rejects_overdeep_writes_atomically() {
+    let (_tx, _termination, mut rx) = start(r#"
+        store('kept',true);
+        let deep=0; for(let i=0;i<127;i++) deep=[deep];
+        store('deep',deep);
+        let rejected=false; try{store('kept',[deep]);}catch{rejected=true;}
+        if(!rejected || load('kept') !== true) throw Error('overdeep write was not atomic');
+        text(true);
+    "#).await;
+    assert_eq!(text(next(&mut rx).await), "true");
+    let RuntimeEvent::Result{error_text, stored_value_writes,..} = next(&mut rx).await else {panic!("result");};
+    assert_eq!(error_text,None);
+    assert_eq!(*stored_value_writes["kept"].value,json!(true));
+    assert!(stored_value_writes.contains_key("deep"));
     closed(&mut rx).await;
 }

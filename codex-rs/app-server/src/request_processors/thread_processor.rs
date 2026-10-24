@@ -2,6 +2,8 @@ use super::token_usage_replay::TokenUsageReplaySnapshot;
 use super::*;
 use crate::error_code::method_not_found;
 use crate::thread_state::OutOfBandElicitationLeaseKey;
+use crate::thread_state::clone_turn_with_items_view;
+use crate::thread_state::turn_summary_item_indices;
 use codex_app_server_protocol::SelectedCapabilityRoot;
 use codex_app_server_protocol::ThreadErrorData;
 use codex_app_server_protocol::ThreadErrorReason;
@@ -340,7 +342,6 @@ pub(crate) struct ThreadRequestProcessor {
     pub(crate) thread_state_manager: ThreadStateManager,
     pub(crate) thread_watch_manager: ThreadWatchManager,
     pub(super) thread_list_state_permit: Arc<Semaphore>,
-    pub(super) thread_goal_processor: ThreadGoalRequestProcessor,
     pub(super) state_db: Option<StateDbHandle>,
     pub(super) log_db: Option<LogDbLayer>,
     pub(crate) background_tasks: TaskTracker,
@@ -482,13 +483,12 @@ impl ThreadRequestProcessor {
         thread_state_manager: ThreadStateManager,
         thread_watch_manager: ThreadWatchManager,
         thread_list_state_permit: Arc<Semaphore>,
-        thread_goal_processor: ThreadGoalRequestProcessor,
         state_db: Option<StateDbHandle>,
         log_db: Option<LogDbLayer>,
         skills_watcher: Arc<SkillsWatcher>,
         initial_config_warnings: Vec<ConfigWarningNotification>,
     ) -> Self {
-        let background_tasks = thread_goal_processor.background_tasks.clone();
+        let background_tasks = TaskTracker::new();
         Self {
             auth_manager,
             thread_manager,
@@ -501,7 +501,6 @@ impl ThreadRequestProcessor {
             thread_state_manager,
             thread_watch_manager,
             thread_list_state_permit,
-            thread_goal_processor,
             state_db,
             log_db,
             background_tasks,
@@ -2418,6 +2417,7 @@ impl ThreadRequestProcessor {
         }
         let fallback_thread =
             build_thread_from_loaded_snapshot(thread_id, &config_snapshot, loaded_thread);
+        let has_persisted_metadata = persisted_thread.is_some();
         let mut thread = if let Some(mut thread) = persisted_thread {
             if thread.path.is_none() {
                 thread.path = fallback_thread.path.clone();
@@ -2428,6 +2428,10 @@ impl ThreadRequestProcessor {
         } else {
             fallback_thread
         };
+        if !has_persisted_metadata {
+            // Keep a single persisted metadata snapshot when one was loaded.
+            self.attach_thread_name(thread_id, &mut thread).await;
+        }
         self.apply_thread_read_store_fields(thread_id, &mut thread, include_turns, loaded_thread)
             .await?;
         if config_snapshot.ephemeral {
@@ -2446,8 +2450,6 @@ impl ThreadRequestProcessor {
         include_turns: bool,
         loaded_thread: &CodexThread,
     ) -> Result<(), ThreadReadViewError> {
-        self.attach_thread_name(thread_id, thread).await;
-
         if include_turns {
             let history = loaded_thread
                 .load_history(/*include_archived*/ true)
@@ -2606,6 +2608,7 @@ impl ThreadRequestProcessor {
                         .map(|anchor| (anchor.turn_id.as_str(), anchor.include_anchor)),
                     page_size,
                     sort_direction,
+                    items_view,
                 ),
                 state.in_progress_turn_id().is_some(),
                 state.turn_index_history_generation(),
@@ -2633,6 +2636,7 @@ impl ThreadRequestProcessor {
                             .map(|anchor| (anchor.turn_id.as_str(), anchor.include_anchor)),
                         page_size,
                         sort_direction,
+                        items_view,
                     )
                     .map_err(|()| {
                         invalid_request("invalid cursor: anchor turn is no longer present")
@@ -2658,7 +2662,6 @@ impl ThreadRequestProcessor {
             .await;
         let has_live_in_progress_turn = has_live_running_thread || indexed_live_in_progress;
         normalize_thread_turns_status(&mut page.turns, loaded_status, has_live_in_progress_turn);
-        apply_thread_turns_items_view(&mut page.turns, items_view);
         let backwards_cursor = page
             .turns
             .first()
@@ -3445,7 +3448,7 @@ impl ThreadRequestProcessor {
 
                 let connection_id = request_id.connection_id;
                 // Own response delivery through idle finalization so disconnects
-                // cannot strand an already resumed goal-enabled thread.
+                // cannot strand an already resumed thread.
                 let processor = self.clone();
                 self.background_tasks
                     .spawn(async move {
@@ -3471,13 +3474,7 @@ impl ThreadRequestProcessor {
                             )
                             .await;
                         }
-                        processor
-                            .thread_goal_processor
-                            .emit_resume_goal_snapshot_and_continue(
-                                thread_id,
-                                codex_thread.as_ref(),
-                            )
-                            .await;
+                        codex_thread.emit_thread_idle_lifecycle_if_idle().await;
                     })
                     .await
                     .map_err(|error| {
@@ -3699,11 +3696,6 @@ impl ThreadRequestProcessor {
                 None
             };
 
-            let (emit_thread_goal_update, thread_goal_state_db) = self
-                .thread_goal_processor
-                .pending_resume_goal_state(existing_thread.as_ref())
-                .await;
-
             let command = crate::thread_state::ThreadListenerCommand::SendThreadResumeResponse(
                 Box::new(crate::thread_state::PendingThreadResumeRequest {
                     request_id: request_id.clone(),
@@ -3712,8 +3704,6 @@ impl ThreadRequestProcessor {
                     config_snapshot,
                     instruction_sources,
                     thread_summary,
-                    emit_thread_goal_update,
-                    thread_goal_state_db,
                     include_turns,
                     initial_turns_page: params.initial_turns_page.clone(),
                     prepared_initial_turns_page,
@@ -4176,21 +4166,6 @@ impl ThreadRequestProcessor {
         })?;
 
         let fork_setup_result = async {
-            if session_configured.rollout_path.is_some()
-                && let Some(id) = source_thread.project_id.as_ref()
-            {
-                self.thread_manager
-                    .update_thread_metadata(
-                        thread_id,
-                        StoreThreadMetadataPatch {
-                            project_id: Some(Some(id.clone())),
-                            ..Default::default()
-                        },
-                        true,
-                    )
-                    .await
-                    .map_err(|err| core_thread_write_error("inherit source project", err))?;
-            }
             Self::set_app_server_client_info(
                 forked_thread.as_ref(),
                 app_server_client_name,
@@ -4198,19 +4173,20 @@ impl ThreadRequestProcessor {
             )
             .await?;
             if session_configured.rollout_path.is_some()
-                && let Some(name) = source_thread_name.clone()
+                && (source_thread.project_id.is_some() || source_thread_name.is_some())
             {
                 self.thread_manager
                     .update_thread_metadata(
                         thread_id,
                         StoreThreadMetadataPatch {
-                            name: Some(Some(name)),
+                            project_id: source_thread.project_id.clone().map(Some),
+                            name: source_thread_name.clone().map(Some),
                             ..Default::default()
                         },
                         /*include_archived*/ true,
                     )
                     .await
-                    .map_err(|err| core_thread_write_error("inherit source thread name", err))?;
+                    .map_err(|err| core_thread_write_error("inherit source thread metadata", err))?;
             }
 
             let instruction_sources = forked_thread.legacy_instruction_sources().await;
@@ -4701,12 +4677,18 @@ fn build_thread_turns_page_response(
     active_turn: Option<Turn>,
     options: ThreadTurnsPageOptions<'_>,
 ) -> Result<ThreadTurnsListResponse, JSONRPCErrorError> {
-    let turns = reconstruct_thread_turns_for_turns_list(
-        items,
-        loaded_status,
-        has_live_running_thread,
-        active_turn,
+    let has_live_in_progress_turn = has_live_running_thread
+        || active_turn.as_ref().is_some_and(|turn| matches!(turn.status, TurnStatus::InProgress));
+    let mut turns = codex_app_server_protocol::build_turns_from_rollout_items_with_items_view(
+        items.iter().filter(|item| codex_rollout::is_persisted_rollout_item(
+            item, codex_protocol::protocol::ThreadHistoryMode::Legacy,
+        )),
+        options.items_view,
     );
+    normalize_thread_turns_status(&mut turns, loaded_status, has_live_in_progress_turn);
+    if let Some(active_turn) = active_turn {
+        merge_turn_history_with_active_turn(&mut turns, active_turn);
+    }
     let mut page =
         paginate_thread_turns(turns, options.cursor, options.limit, options.sort_direction)?;
     apply_thread_turns_items_view(&mut page.turns, options.items_view);
@@ -4724,19 +4706,20 @@ pub(super) fn build_thread_resume_initial_turns_page(
     let page_size = thread_page_size(params.limit);
     let sort_direction = params.sort_direction.unwrap_or(SortDirection::Desc);
     let more_turns_available = turns.len() > page_size;
-    let mut page_turns = match sort_direction {
-        SortDirection::Asc => turns.iter().take(page_size).cloned().collect::<Vec<_>>(),
+    let items_view = params.items_view.unwrap_or(TurnItemsView::Summary);
+    let page_turns = match sort_direction {
+        SortDirection::Asc => turns
+            .iter()
+            .take(page_size)
+            .map(|turn| clone_turn_with_items_view(turn, items_view))
+            .collect::<Vec<_>>(),
         SortDirection::Desc => turns
             .iter()
             .rev()
             .take(page_size)
-            .cloned()
+            .map(|turn| clone_turn_with_items_view(turn, items_view))
             .collect::<Vec<_>>(),
     };
-    apply_thread_turns_items_view(
-        &mut page_turns,
-        params.items_view.unwrap_or(TurnItemsView::Summary),
-    );
     let backwards_cursor = page_turns
         .first()
         .map(|turn| serialize_thread_turns_cursor(&turn.id, /*include_anchor*/ true))
@@ -4786,27 +4769,16 @@ fn apply_thread_turns_items_view(turns: &mut [Turn], items_view: TurnItemsView) 
                 turn.items_view = TurnItemsView::NotLoaded;
             }
             TurnItemsView::Summary => {
-                let first_user_message = turn
-                    .items
-                    .iter()
-                    .find(|item| matches!(item, ThreadItem::UserMessage { .. }))
-                    .cloned();
-                let final_agent_message = turn
-                    .items
-                    .iter()
-                    .rev()
-                    .find(|item| matches!(item, ThreadItem::AgentMessage { .. }))
-                    .cloned();
-                turn.items = match (first_user_message, final_agent_message) {
-                    (Some(user_message), Some(agent_message))
-                        if user_message.id() != agent_message.id() =>
-                    {
-                        vec![user_message, agent_message]
+                let (user_index, agent_index) = turn_summary_item_indices(&turn.items);
+                let (mut user, mut agent) = (None, None);
+                for (index, item) in std::mem::take(&mut turn.items).into_iter().enumerate() {
+                    if Some(index) == user_index {
+                        user = Some(item);
+                    } else if Some(index) == agent_index {
+                        agent = Some(item);
                     }
-                    (Some(user_message), _) => vec![user_message],
-                    (None, Some(agent_message)) => vec![agent_message],
-                    (None, None) => Vec::new(),
-                };
+                }
+                turn.items = user.into_iter().chain(agent).collect();
                 turn.items_view = TurnItemsView::Summary;
             }
             TurnItemsView::Full => {
@@ -4816,6 +4788,7 @@ fn apply_thread_turns_items_view(turns: &mut [Turn], items_view: TurnItemsView) 
     }
 }
 
+#[cfg(test)]
 fn reconstruct_thread_turns_for_turns_list(
     items: &[RolloutItem],
     loaded_status: ThreadStatus,
@@ -5398,6 +5371,10 @@ mod thread_api_policy_tests {
         assert_eq!(internal.code, -32603);
     }
 }
+
+#[cfg(test)]
+#[path = "thread_processor_projection_tests.rs"]
+mod thread_processor_projection_tests;
 
 #[cfg(test)]
 #[path = "thread_processor_tests.rs"]

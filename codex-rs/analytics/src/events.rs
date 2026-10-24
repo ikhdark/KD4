@@ -2,14 +2,14 @@ use crate::facts::AcceptedLineFingerprint;
 use crate::facts::AppInvocation;
 use crate::facts::CodexCompactionEvent;
 use crate::facts::CodexErrKind;
-use crate::facts::CodexGoalEvent;
+
 use crate::facts::CompactionImplementation;
 use crate::facts::CompactionPhase;
 use crate::facts::CompactionReason;
 use crate::facts::CompactionStatus;
 use crate::facts::CompactionStrategy;
 use crate::facts::CompactionTrigger;
-use crate::facts::GoalEventKind;
+
 use crate::facts::HookRunFact;
 use crate::facts::InvocationType;
 use crate::facts::PluginInstallRequested;
@@ -55,7 +55,7 @@ pub(crate) enum TrackEventRequest {
     AppUsed(CodexAppUsedEventRequest),
     HookRun(CodexHookRunEventRequest),
     Compaction(Box<CodexCompactionEventRequest>),
-    Goal(Box<CodexGoalEventRequest>),
+
     TurnEvent(Box<CodexTurnEventRequest>),
     TurnDelivery(Box<CodexTurnDeliveryEventRequest>),
     TurnSteer(CodexTurnSteerEventRequest),
@@ -75,8 +75,6 @@ pub(crate) enum TrackEventRequest {
     PluginEnabled(CodexPluginEventRequest),
     PluginDisabled(CodexPluginEventRequest),
     PluginInstallFailed(CodexPluginInstallFailedEventRequest),
-    ExternalAgentConfigImportCompleted(CodexOnboardingExternalAgentImportCompleteEventRequest),
-    ExternalAgentConfigImportFailure(CodexOnboardingExternalAgentImportFailureEventRequest),
 }
 
 impl TrackEventRequest {
@@ -218,6 +216,9 @@ pub(crate) struct CodexToolItemEventBase {
     // for tools where app-server only sees part of the upstream flow.
     pub(crate) duration_ms: Option<u64>,
     pub(crate) execution_duration_ms: Option<u64>,
+    /// When false, review counts are observed lower bounds and negative
+    /// permission flags are unknown, not proof that no review occurred.
+    pub(crate) review_history_complete: bool,
     pub(crate) review_count: u64,
     pub(crate) user_review_count: u64,
     pub(crate) final_approval_outcome: FinalApprovalOutcome,
@@ -502,29 +503,9 @@ pub(crate) struct CodexCompactionEventRequest {
     pub(crate) event_params: CodexCompactionEventParams,
 }
 
-#[derive(Serialize)]
-pub(crate) struct CodexGoalEventParams {
-    pub(crate) thread_id: String,
-    pub(crate) session_id: String,
-    pub(crate) turn_id: Option<String>,
-    pub(crate) app_server_client: CodexAppServerClientMetadata,
-    pub(crate) runtime: CodexRuntimeMetadata,
-    pub(crate) thread_source: Option<ThreadSource>,
-    pub(crate) subagent_source: Option<String>,
-    pub(crate) parent_thread_id: Option<String>,
-    pub(crate) goal_id: String,
-    pub(crate) event_kind: GoalEventKind,
-    pub(crate) goal_status: codex_state::ThreadGoalStatus,
-    pub(crate) has_token_budget: bool,
-    pub(crate) cumulative_tokens_accounted: Option<i64>,
-    pub(crate) cumulative_time_accounted_seconds: Option<i64>,
-}
 
-#[derive(Serialize)]
-pub(crate) struct CodexGoalEventRequest {
-    pub(crate) event_type: &'static str,
-    pub(crate) event_params: CodexGoalEventParams,
-}
+
+
 
 #[derive(Serialize)]
 pub(crate) struct CodexTurnEventParams {
@@ -698,39 +679,9 @@ pub(crate) struct CodexPluginInstallFailedEventRequest {
     pub(crate) event_params: CodexPluginInstallFailedMetadata,
 }
 
-#[derive(Serialize)]
-pub(crate) struct CodexOnboardingExternalAgentImportCompleteMetadata {
-    pub(crate) import_id: String,
-    pub(crate) source: String,
-    #[serde(rename = "type")]
-    pub(crate) item_type: String,
-    pub(crate) success_count: usize,
-    pub(crate) failed_count: usize,
-    pub(crate) product_client_id: Option<String>,
-}
 
-#[derive(Serialize)]
-pub(crate) struct CodexOnboardingExternalAgentImportCompleteEventRequest {
-    pub(crate) event_type: &'static str,
-    pub(crate) event_params: CodexOnboardingExternalAgentImportCompleteMetadata,
-}
 
-#[derive(Serialize)]
-pub(crate) struct CodexOnboardingExternalAgentImportFailureMetadata {
-    pub(crate) import_id: String,
-    pub(crate) source: String,
-    #[serde(rename = "type")]
-    pub(crate) item_type: String,
-    pub(crate) failure_stage: String,
-    pub(crate) error_type: String,
-    pub(crate) product_client_id: Option<String>,
-}
 
-#[derive(Serialize)]
-pub(crate) struct CodexOnboardingExternalAgentImportFailureEventRequest {
-    pub(crate) event_type: &'static str,
-    pub(crate) event_params: CodexOnboardingExternalAgentImportFailureMetadata,
-}
 
 #[derive(Serialize)]
 pub(crate) struct CodexPluginUsedEventRequest {
@@ -860,32 +811,7 @@ pub(crate) fn codex_compaction_event_params(
     }
 }
 
-pub(crate) fn codex_goal_event_params(
-    input: CodexGoalEvent,
-    session_id: String,
-    app_server_client: CodexAppServerClientMetadata,
-    runtime: CodexRuntimeMetadata,
-    thread_source: Option<ThreadSource>,
-    subagent_source: Option<String>,
-    parent_thread_id: Option<String>,
-) -> CodexGoalEventParams {
-    CodexGoalEventParams {
-        thread_id: input.thread_id,
-        session_id,
-        turn_id: input.turn_id,
-        app_server_client,
-        runtime,
-        thread_source,
-        subagent_source,
-        parent_thread_id,
-        goal_id: input.goal_id,
-        event_kind: input.event_kind,
-        goal_status: input.goal_status,
-        has_token_budget: input.has_token_budget,
-        cumulative_tokens_accounted: input.cumulative_tokens_accounted,
-        cumulative_time_accounted_seconds: input.cumulative_time_accounted_seconds,
-    }
-}
+
 
 pub(crate) fn codex_plugin_used_metadata(
     tracking: &TrackEventsContext,

@@ -370,6 +370,7 @@ static SYNC_BARRIERS: OnceLock<tokio::sync::Mutex<HashMap<String, SyncBarrierSta
 struct SyncBarrierState {
     barrier: Arc<Barrier>,
     participants: usize,
+    admitted: usize,
 }
 
 #[derive(Debug, Deserialize)]
@@ -748,12 +749,24 @@ async fn wait_on_sync_barrier(args: SyncBarrierArgs) -> Result<(), McpError> {
     }
 
     let barrier_id = args.id.clone();
+    let barrier = admit_sync_barrier(&barrier_id, args.participants).await?;
+
+    match tokio::time::timeout(Duration::from_millis(args.timeout_ms), barrier.wait()).await {
+        Ok(_) => Ok(()),
+        Err(_) => {
+            remove_sync_barrier_if_current(&barrier_id, &barrier).await;
+            Err(McpError::invalid_params("sync barrier wait timed out", None))
+        }
+    }
+}
+
+async fn admit_sync_barrier(barrier_id: &str, participants: usize) -> Result<Arc<Barrier>, McpError> {
     let barrier = {
         let mut map = sync_barrier_map().lock().await;
-        match map.entry(barrier_id.clone()) {
-            Entry::Occupied(entry) => {
-                let state = entry.get();
-                if state.participants != args.participants {
+        match map.entry(barrier_id.to_string()) {
+            Entry::Occupied(mut entry) => {
+                let state = entry.get_mut();
+                if state.participants != participants {
                     let existing = state.participants;
                     return Err(McpError::invalid_params(
                         format!(
@@ -762,36 +775,24 @@ async fn wait_on_sync_barrier(args: SyncBarrierArgs) -> Result<(), McpError> {
                         None,
                     ));
                 }
-                state.barrier.clone()
+                state.admitted += 1;
+                let barrier = state.barrier.clone();
+                if state.admitted == participants { entry.remove(); }
+                barrier
             }
             Entry::Vacant(entry) => {
-                let barrier = Arc::new(Barrier::new(args.participants));
-                entry.insert(SyncBarrierState {
-                    barrier: barrier.clone(),
-                    participants: args.participants,
-                });
+                let barrier = Arc::new(Barrier::new(participants));
+                if participants > 1 {
+                    entry.insert(SyncBarrierState {
+                        barrier: barrier.clone(), participants, admitted: 1,
+                    });
+                }
                 barrier
             }
         }
     };
 
-    let wait_result =
-        match tokio::time::timeout(Duration::from_millis(args.timeout_ms), barrier.wait()).await {
-            Ok(wait_result) => wait_result,
-            Err(_) => {
-                remove_sync_barrier_if_current(&barrier_id, &barrier).await;
-                return Err(McpError::invalid_params(
-                    "sync barrier wait timed out",
-                    None,
-                ));
-            }
-        };
-
-    if wait_result.is_leader() {
-        remove_sync_barrier_if_current(&barrier_id, &barrier).await;
-    }
-
-    Ok(())
+    Ok(barrier)
 }
 
 async fn remove_sync_barrier_if_current(barrier_id: &str, barrier: &Arc<Barrier>) {
@@ -800,6 +801,43 @@ async fn remove_sync_barrier_if_current(barrier_id: &str, barrier: &Arc<Barrier>
         && Arc::ptr_eq(&state.barrier, barrier)
     {
         map.remove(barrier_id);
+    }
+}
+
+#[cfg(test)]
+mod audit20261023_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn audit20261023_barrier_cohorts_close_before_async_cleanup() {
+        let id = "audit-cohort-close";
+        let a = admit_sync_barrier(id, 2).await.unwrap();
+        let b = admit_sync_barrier(id, 2).await.unwrap();
+        assert!(Arc::ptr_eq(&a, &b));
+        let c = admit_sync_barrier(id, 2).await.unwrap();
+        remove_sync_barrier_if_current(id, &a).await;
+        let d = admit_sync_barrier(id, 2).await.unwrap();
+        assert!(!Arc::ptr_eq(&a, &c));
+        assert!(Arc::ptr_eq(&c, &d));
+        tokio::time::timeout(Duration::from_secs(1), async {
+            tokio::join!(a.wait(), b.wait(), c.wait(), d.wait());
+        }).await.expect("both complete cohorts must finish");
+    }
+
+    #[tokio::test]
+    async fn audit20261023_barrier_partial_counts_and_timeout_reuse_are_isolated() {
+        let id = "audit-cohort-reuse";
+        let old = admit_sync_barrier(id, 2).await.unwrap();
+        assert!(admit_sync_barrier(id, 3).await.is_err());
+        remove_sync_barrier_if_current(id, &old).await;
+        let a = admit_sync_barrier(id, 3).await.unwrap();
+        let b = admit_sync_barrier(id, 3).await.unwrap();
+        let c = admit_sync_barrier(id, 3).await.unwrap();
+        assert!(!Arc::ptr_eq(&old, &a));
+        assert!(Arc::ptr_eq(&a, &b) && Arc::ptr_eq(&a, &c));
+        let single = admit_sync_barrier(id, 1).await.unwrap();
+        assert!(!Arc::ptr_eq(&a, &single));
+        tokio::time::timeout(Duration::from_secs(1), async { tokio::join!(a.wait(), b.wait(), c.wait(), single.wait()); }).await.unwrap();
     }
 }
 

@@ -757,6 +757,8 @@ class TurnHandle:
         self._epoch = self._client.process_epoch
 
     def _ensure_current(self) -> None:
+        if self._closed:
+            raise TransportClosedError("turn handle is closed")
         if self._client.process_epoch != self._epoch:
             raise TransportClosedError("turn handle belongs to a closed Codex process")
 

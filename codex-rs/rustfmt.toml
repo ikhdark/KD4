@@ -14,7 +14,6 @@ ignore = [
     "model-provider-info",
     "process-hardening",
     "response-debug-context",
-    "responses-api-proxy",
     "utils/rustls-provider",
     "stdio-to-uds",
     "terminal-detection",

@@ -11,7 +11,6 @@ use codex_code_mode_protocol::NestedCancellation;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 use tokio::task::JoinSet;
-use tokio_util::sync::CancellationToken;
 
 use self::callbacks::CallbackCompletion;
 use self::callbacks::NotificationInvocation;
@@ -134,7 +133,7 @@ async fn run_cell<H: CellHost>(
         output_admission,
     } = context;
     let cancellation_token = cell_state.cancellation_token();
-    let tool_cancellation = NestedCancellation::new(cancellation_token.child_token());
+    let tool_cancellation = cell_state.tool_cancellation();
     let notification_cancellation_token = cancellation_token.child_token();
     let mut content_items = Vec::new();
     let mut admitted_output_bytes = 0usize;
@@ -162,7 +161,7 @@ async fn run_cell<H: CellHost>(
                 begin_termination(
                     &runtime_tx,
                     &runtime_terminate_handle,
-                    &cancellation_token,
+                    &tool_cancellation,
                 );
                 if runtime_closed {
                     finish_callbacks(
@@ -190,7 +189,7 @@ async fn run_cell<H: CellHost>(
                 }
             } => {
                 let Some(CellCommand::Observe { mode, response_tx }) = maybe_command else {
-                    cancellation_token.cancel();
+                    tool_cancellation.cancel_with(codex_code_mode_protocol::CancellationCause::RuntimeShutdown);
                     continue;
                 };
                 if response_tx.is_closed() {
@@ -514,7 +513,7 @@ async fn run_cell<H: CellHost>(
     // Reject requests that arrive while asynchronous terminal cleanup runs.
     cell_state.tombstone();
     drop(command_rx.take());
-    begin_termination(&runtime_tx, &runtime_terminate_handle, &cancellation_token);
+    begin_termination(&runtime_tx, &runtime_terminate_handle, &tool_cancellation);
     finish_callbacks(
         &notification_cancellation_token,
         &tool_cancellation,
@@ -607,9 +606,9 @@ fn observer_timer(
 fn begin_termination(
     runtime_tx: &std::sync::mpsc::Sender<RuntimeCommand>,
     runtime_terminate_handle: &crate::runtime::RuntimeTerminationHandle,
-    cancellation_token: &CancellationToken,
+    cancellation: &NestedCancellation,
 ) {
-    cancellation_token.cancel();
+    cancellation.cancel_with(codex_code_mode_protocol::CancellationCause::RuntimeShutdown);
     let _ = runtime_tx.send(RuntimeCommand::Terminate);
     let _ = runtime_terminate_handle.terminate_execution();
 }

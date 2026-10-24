@@ -230,6 +230,7 @@ impl ConnectionDriver {
             PendingRequest::Terminate {
                 session,
                 cell_id,
+                automatic,
                 response_tx,
             } => {
                 let result = match result {
@@ -253,7 +254,11 @@ impl ConnectionDriver {
                         return false;
                     }
                     Err(err) => {
-                        let _ = response_tx.send(Err(err));
+                        let _ = response_tx.send(Err(err.clone()));
+                        if automatic {
+                            self.fail(format!("code-mode abandoned-cell cleanup failed: {err}; external effects are unknown; do not replay work"));
+                            return false;
+                        }
                         return true;
                     }
                 };
@@ -379,6 +384,7 @@ impl ConnectionDriver {
             PendingRequest::Terminate {
                 session,
                 cell_id,
+                automatic: true,
                 response_tx,
             },
         )

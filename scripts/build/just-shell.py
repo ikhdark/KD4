@@ -20,9 +20,7 @@ import re
 import shutil
 import subprocess
 import sys
-import tempfile
 import time
-from hashlib import sha256
 from collections.abc import Callable
 from collections.abc import Mapping
 from pathlib import Path
@@ -41,7 +39,6 @@ POWERSHELL_ARGS = "@($args | Select-Object -Skip 1)"
 # PowerShell expansion also exits with the command's last exit code.
 POWERSHELL_STDERR_NULL = "2>$null; exit $LASTEXITCODE"
 PROBE_CACHE_TTL_SECONDS = 60 * 60
-TOOL_RUN_TIMEOUT_SECONDS = 2.0
 PYTHON_CPU_COUNT_ENV_VAR = "PYTHON_CPU_COUNT"
 MAX_DEFAULT_PYTHON_CPU_COUNT = 30
 DISABLE_SCRIPT_VENV_VALUES = frozenset({"1", "true", "yes", "on"})
@@ -132,7 +129,6 @@ def command_needs_rust_tooling(command: str) -> bool:
     return bool(
         RUST_COMMAND_PATTERN.search(command)
         or "rust_build_status.py" in command
-        or "rust_test_runner.py" in command
         or "cargo-lane" in command
     )
 
@@ -204,37 +200,6 @@ def normalize_path_for_compare(path: str) -> str:
     return os.path.normcase(os.path.normpath(path))
 
 
-def cached_tool_runs(command: list[str], *, cache_dir: Path | None = None) -> bool:
-    cached_result = read_cached_tool_run(command, cache_dir)
-    if cached_result is not None:
-        return cached_result
-
-    result = tool_runs(command)
-    if result is None:
-        # A timeout/launch failure is transient (machine under load, AV
-        # rescan). Let the real invocation proceed and report its own error if
-        # the tool is actually unusable; do not cache an inconclusive probe.
-        return True
-    write_cached_tool_run(command, cache_dir, result)
-    return result
-
-
-def tool_runs(
-    command: list[str], *, timeout: float = TOOL_RUN_TIMEOUT_SECONDS
-) -> bool | None:
-    try:
-        result = subprocess.run(
-            command,
-            check=False,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            timeout=timeout,
-        )
-    except (OSError, subprocess.TimeoutExpired):
-        return None
-    return result.returncode == 0
-
-
 def is_ci(env: Mapping[str, str]) -> bool:
     value = env.get("CI", "")
     return value.lower() not in ("", "0", "false", "no")
@@ -242,27 +207,6 @@ def is_ci(env: Mapping[str, str]) -> bool:
 
 def probe_cache_dir(repo_root: Path) -> Path:
     return repo_root / "codex-rs" / "target" / "just-shell"
-
-
-def tool_run_cache_path(command: list[str], cache_dir: Path) -> Path:
-    label = sanitize_cache_part(Path(command[0]).name if command else "tool")
-    digest = sha256(tool_run_cache_identity(command).encode("utf-8")).hexdigest()
-    return cache_dir / f"{label}-{digest}.probe"
-
-
-def tool_run_cache_identity(command: list[str]) -> str:
-    parts = list(command)
-    if command:
-        executable = shutil.which(command[0]) or command[0]
-        parts.append(f"resolved={executable}")
-        try:
-            stat = Path(executable).stat()
-        except OSError:
-            pass
-        else:
-            parts.append(f"mtime_ns={stat.st_mtime_ns}")
-            parts.append(f"size={stat.st_size}")
-    return "\0".join(parts)
 
 
 def sanitize_cache_part(part: str) -> str:
@@ -273,60 +217,6 @@ def sanitize_cache_part(part: str) -> str:
         else:
             safe.append("_")
     return "".join(safe).strip("_")[:64] or "empty"
-
-
-def read_cached_tool_run(
-    command: list[str],
-    cache_dir: Path | None,
-    *,
-    ttl_seconds: float = PROBE_CACHE_TTL_SECONDS,
-) -> bool | None:
-    if cache_dir is None:
-        return None
-    path = tool_run_cache_path(command, cache_dir)
-    try:
-        age = time.time() - path.stat().st_mtime
-        if not -0.001 <= age <= ttl_seconds:
-            return None
-        value = path.read_text(encoding="utf-8").strip()
-    except (OSError, UnicodeError):
-        return None
-    if value == "ok":
-        return True
-    if value == "fail":
-        return False
-    return None
-
-
-def write_cached_tool_run(
-    command: list[str], cache_dir: Path | None, result: bool
-) -> None:
-    if cache_dir is None:
-        return
-    temporary_path: Path | None = None
-    try:
-        cache_dir.mkdir(parents=True, exist_ok=True)
-        destination = tool_run_cache_path(command, cache_dir)
-        with tempfile.NamedTemporaryFile(
-            mode="w",
-            encoding="utf-8",
-            dir=cache_dir,
-            prefix=f".{destination.name}.",
-            suffix=".tmp",
-            delete=False,
-        ) as temporary:
-            temporary.write("ok" if result else "fail")
-            temporary_path = Path(temporary.name)
-        os.replace(temporary_path, destination)
-        temporary_path = None
-    except OSError:
-        return
-    finally:
-        if temporary_path is not None:
-            try:
-                temporary_path.unlink()
-            except OSError:
-                pass
 
 
 def warn_once(
@@ -371,7 +261,6 @@ def run_powershell(
     recipe_args: list[str],
     *,
     which: Callable[[str], str | None] = shutil.which,
-    can_run: Callable[[list[str]], bool] | None = None,
     cache_dir: Path | None = None,
     stderr=sys.stderr,
 ) -> int:
@@ -383,16 +272,6 @@ def run_powershell(
             file=stderr,
         )
         return 1
-    if not powershell_supports_command_with_args(
-        pwsh, can_run=can_run, cache_dir=cache_dir
-    ):
-        print(
-            "PowerShell 7.5 or newer is required for Windows just recipes. "
-            "Upgrade pwsh, then rerun the recipe.",
-            file=stderr,
-        )
-        return 1
-
     command = render_command(
         command, args=POWERSHELL_ARGS, stderr_null=POWERSHELL_STDERR_NULL
     )
@@ -413,25 +292,6 @@ def run_powershell(
     except OSError as exc:
         print(f"Failed to launch PowerShell ('pwsh'): {exc}", file=stderr)
         return 1
-
-
-def powershell_supports_command_with_args(
-    pwsh: str,
-    *,
-    can_run: Callable[[list[str]], bool] | None = None,
-    cache_dir: Path | None = None,
-) -> bool:
-    command = [
-        pwsh,
-        "-NoLogo",
-        "-NoProfile",
-        "-NonInteractive",
-        "-Command",
-        "if ($PSVersionTable.PSVersion -lt [version]'7.5') { exit 1 }",
-    ]
-    if can_run is None:
-        return cached_tool_runs(command, cache_dir=cache_dir)
-    return can_run(command)
 
 
 def render_command(command: str, *, args: str, stderr_null: str) -> str:

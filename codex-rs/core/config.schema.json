@@ -479,16 +479,6 @@
         }
       ]
     },
-    "FeatureToml_for_NetworkProxyConfigToml": {
-      "anyOf": [
-        {
-          "type": "boolean"
-        },
-        {
-          "$ref": "#/definitions/NetworkProxyConfigToml"
-        }
-      ]
-    },
     "FeedbackConfigToml": {
       "additionalProperties": false,
       "properties": {
@@ -1222,257 +1212,14 @@
       ],
       "type": "object"
     },
-    "NetworkDomainPermissionToml": {
-      "enum": [
-        "allow",
-        "deny"
-      ],
-      "type": "string"
-    },
-    "NetworkDomainPermissionsToml": {
-      "type": "object"
-    },
-    "NetworkMitmActionToml": {
-      "properties": {
-        "inject_request_headers": {
-          "default": [],
-          "items": {
-            "$ref": "#/definitions/NetworkMitmInjectedHeaderToml"
-          },
-          "type": "array"
-        },
-        "strip_request_headers": {
-          "default": [],
-          "items": {
-            "type": "string"
-          },
-          "type": "array"
-        }
-      },
-      "type": "object"
-    },
-    "NetworkMitmHookToml": {
-      "additionalProperties": false,
-      "properties": {
-        "action": {
-          "items": {
-            "type": "string"
-          },
-          "type": "array"
-        },
-        "body": true,
-        "headers": {
-          "additionalProperties": {
-            "items": {
-              "type": "string"
-            },
-            "type": "array"
-          },
-          "default": {},
-          "type": "object"
-        },
-        "host": {
-          "type": "string"
-        },
-        "methods": {
-          "items": {
-            "type": "string"
-          },
-          "type": "array"
-        },
-        "path_prefixes": {
-          "items": {
-            "type": "string"
-          },
-          "type": "array"
-        },
-        "query": {
-          "additionalProperties": {
-            "items": {
-              "type": "string"
-            },
-            "type": "array"
-          },
-          "default": {},
-          "type": "object"
-        }
-      },
-      "required": [
-        "action",
-        "host",
-        "methods",
-        "path_prefixes"
-      ],
-      "type": "object"
-    },
-    "NetworkMitmInjectedHeaderToml": {
-      "properties": {
-        "name": {
-          "default": "",
-          "type": "string"
-        },
-        "prefix": {
-          "default": null,
-          "type": "string"
-        },
-        "secret_env_var": {
-          "default": null,
-          "type": "string"
-        },
-        "secret_file": {
-          "default": null,
-          "type": "string"
-        }
-      },
-      "type": "object"
-    },
-    "NetworkMitmToml": {
-      "additionalProperties": false,
-      "properties": {
-        "actions": {
-          "additionalProperties": {
-            "$ref": "#/definitions/NetworkMitmActionToml"
-          },
-          "type": "object"
-        },
-        "hooks": {
-          "additionalProperties": {
-            "$ref": "#/definitions/NetworkMitmHookToml"
-          },
-          "type": "object"
-        }
-      },
-      "type": "object"
-    },
-    "NetworkModeSchema": {
-      "enum": [
-        "limited",
-        "full"
-      ],
-      "type": "string"
-    },
-    "NetworkProxyConfigToml": {
-      "additionalProperties": false,
-      "properties": {
-        "allow_local_binding": {
-          "type": "boolean"
-        },
-        "allow_upstream_proxy": {
-          "type": "boolean"
-        },
-        "dangerously_allow_all_unix_sockets": {
-          "type": "boolean"
-        },
-        "dangerously_allow_non_loopback_proxy": {
-          "type": "boolean"
-        },
-        "domains": {
-          "additionalProperties": {
-            "$ref": "#/definitions/NetworkProxyDomainPermissionToml"
-          },
-          "type": "object"
-        },
-        "enable_socks5": {
-          "type": "boolean"
-        },
-        "enable_socks5_udp": {
-          "type": "boolean"
-        },
-        "enabled": {
-          "type": "boolean"
-        },
-        "mode": {
-          "$ref": "#/definitions/NetworkProxyModeToml"
-        },
-        "proxy_url": {
-          "type": "string"
-        },
-        "socks_url": {
-          "type": "string"
-        },
-        "unix_sockets": {
-          "additionalProperties": {
-            "$ref": "#/definitions/NetworkProxyUnixSocketPermissionToml"
-          },
-          "type": "object"
-        }
-      },
-      "type": "object"
-    },
-    "NetworkProxyDomainPermissionToml": {
-      "enum": [
-        "allow",
-        "deny"
-      ],
-      "type": "string"
-    },
-    "NetworkProxyModeToml": {
-      "enum": [
-        "limited",
-        "full"
-      ],
-      "type": "string"
-    },
-    "NetworkProxyUnixSocketPermissionToml": {
-      "enum": [
-        "allow",
-        "deny"
-      ],
-      "type": "string"
-    },
     "NetworkToml": {
       "additionalProperties": false,
       "properties": {
-        "allow_local_binding": {
-          "type": "boolean"
-        },
-        "allow_upstream_proxy": {
-          "type": "boolean"
-        },
-        "dangerously_allow_all_unix_sockets": {
-          "type": "boolean"
-        },
-        "dangerously_allow_non_loopback_proxy": {
-          "type": "boolean"
-        },
-        "domains": {
-          "$ref": "#/definitions/NetworkDomainPermissionsToml"
-        },
-        "enable_socks5": {
-          "type": "boolean"
-        },
-        "enable_socks5_udp": {
-          "type": "boolean"
-        },
         "enabled": {
+          "description": "Allow network access inside the platform sandbox.",
           "type": "boolean"
-        },
-        "mitm": {
-          "$ref": "#/definitions/NetworkMitmToml"
-        },
-        "mode": {
-          "$ref": "#/definitions/NetworkModeSchema"
-        },
-        "proxy_url": {
-          "type": "string"
-        },
-        "socks_url": {
-          "type": "string"
-        },
-        "unix_sockets": {
-          "$ref": "#/definitions/NetworkUnixSocketPermissionsToml"
         }
       },
-      "type": "object"
-    },
-    "NetworkUnixSocketPermissionToml": {
-      "enum": [
-        "allow",
-        "deny"
-      ],
-      "type": "string"
-    },
-    "NetworkUnixSocketPermissionsToml": {
       "type": "object"
     },
     "Notice": {
@@ -3760,6 +3507,16 @@
         }
       ]
     },
+    "ValidationMode": {
+      "description": "Authoritative runtime policy for validation command execution.",
+      "enum": [
+        "off",
+        "compile",
+        "benchmark",
+        "full"
+      ],
+      "type": "string"
+    },
     "Verbosity": {
       "description": "Controls output length/detail on GPT-5 models via the Responses API. Serialized with lowercase values to match the OpenAI API.",
       "enum": [
@@ -3996,9 +3753,6 @@
       "default": null,
       "description": "Centralized feature flags (new). Prefer this over individual toggles.",
       "properties": {
-        "analytics_plan_history": {
-          "type": "boolean"
-        },
         "apply_patch_streaming_events": {
           "type": "boolean"
         },
@@ -4056,9 +3810,6 @@
         "fast_mode": {
           "type": "boolean"
         },
-        "goals": {
-          "type": "boolean"
-        },
         "hooks": {
           "type": "boolean"
         },
@@ -4091,9 +3842,6 @@
         },
         "multi_agent_v2": {
           "$ref": "#/definitions/FeatureToml_for_MultiAgentV2ConfigToml"
-        },
-        "network_proxy": {
-          "$ref": "#/definitions/FeatureToml_for_NetworkProxyConfigToml"
         },
         "non_prefixed_mcp_tool_names": {
           "type": "boolean"
@@ -4538,6 +4286,20 @@
         }
       ],
       "description": "Collection of settings that are specific to the TUI."
+    },
+    "validation_full_budget": {
+      "description": "Maximum BENCHMARK/FULL validation attempts per root turn, including children. Defaults to 2.",
+      "format": "uint",
+      "minimum": 0.0,
+      "type": "integer"
+    },
+    "validation_mode": {
+      "allOf": [
+        {
+          "$ref": "#/definitions/ValidationMode"
+        }
+      ],
+      "description": "Default validation execution policy. Defaults to `benchmark` (targeted compilation and benchmark-only workloads, not tests)."
     },
     "web_search": {
       "allOf": [

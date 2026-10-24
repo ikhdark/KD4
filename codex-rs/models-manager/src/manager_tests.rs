@@ -3346,6 +3346,7 @@ fn bundled_catalog_preserves_upstream_membership_and_reasoning_efforts() {
             .collect::<Vec<_>>(),
         vec![
             "gpt-6-astra",
+            "gpt-6.1-sol",
             "gpt-6-sol",
             "gpt-6-luna",
             "gpt-5.6-sol",
@@ -3438,6 +3439,21 @@ async fn audit_sol_catalog_membership_and_explicit_pinning() {
             );
         }
     }
+}
+
+#[tokio::test]
+async fn sol_6_1_is_available_offline_with_extra_high_support() {
+    let home = tempdir().unwrap();
+    let endpoint = TestModelsEndpoint::without_refresh(Vec::new());
+    let manager = openai_manager_for_tests_with_auth(home.path().to_path_buf(), endpoint.clone(), None);
+    let models = manager.list_models(RefreshStrategy::Offline, DEFAULT_HTTP_CLIENT_FACTORY).await.unwrap();
+    let sol = models.iter().find(|model| model.model == "gpt-6.1-sol").expect("the subagent default must exist offline");
+    assert!(sol.supported_reasoning_efforts.iter().any(|preset| preset.effort == ReasoningEffort::XHigh));
+    let info = manager.get_model_info("gpt-6.1-sol", &ModelsManagerConfig::default()).await;
+    assert!(!info.used_fallback_model_metadata);
+    assert_eq!(info.context_window, Some(500_000));
+    assert_eq!(info.get_model_instructions(None), codex_protocol::models::BASE_INSTRUCTIONS_DEFAULT.trim());
+    assert_eq!(endpoint.fetch_count(), 0);
 }
 
 #[tokio::test]
@@ -3555,4 +3571,211 @@ async fn invalid_numeric_remote_and_cache_never_replace_last_good_catalog() {
     assert!(manager.try_load_cache().await.is_err());
     assert_eq!(manager.get_etag().await.as_deref(), Some("good"));
     assert!(manager.get_remote_models().await.contains(&good));
+}
+
+#[derive(Debug)]
+struct EligibilityProbeEndpoint {
+    command_auth: bool,
+    eligibility: Option<bool>,
+    eligibility_count: AtomicUsize,
+    inner: Arc<TestModelsEndpoint>,
+}
+
+impl ModelsEndpointClient for EligibilityProbeEndpoint {
+    fn has_command_auth(&self) -> bool {
+        self.command_auth
+    }
+
+    fn uses_codex_backend(&self) -> ModelsEndpointFuture<'_, bool> {
+        Box::pin(async {
+            self.eligibility_count.fetch_add(1, Ordering::SeqCst);
+            match self.eligibility {
+                Some(eligible) => eligible,
+                None => std::future::pending().await,
+            }
+        })
+    }
+
+    fn list_models<'a>(
+        &'a self,
+        client_version: &'a str,
+        http_client_factory: HttpClientFactory,
+    ) -> ModelsEndpointFuture<'a, CoreResult<(Vec<ModelInfo>, Option<String>)>> {
+        ModelsEndpointClient::list_models(self.inner.as_ref(), client_version, http_client_factory)
+    }
+}
+
+#[tokio::test]
+async fn fresh_disk_catalog_does_not_resolve_auth_eligibility() {
+    for command_auth in [false, true] {
+        let home = tempdir().unwrap();
+        let endpoint = Arc::new(EligibilityProbeEndpoint {
+            command_auth,
+            eligibility: None,
+            eligibility_count: AtomicUsize::new(0),
+            inner: TestModelsEndpoint::new(Vec::new()),
+        });
+        let manager = openai_manager_for_tests(home.path().into(), endpoint.clone());
+        let disk_model = remote_model("disk-without-auth", "Disk", 1);
+        manager
+            .cache_manager
+            .persist_cache(
+                &[disk_model.clone()],
+                Some("disk-etag".into()),
+                crate::client_version_to_whole(),
+            )
+            .await;
+        let catalog = timeout(
+            Duration::from_secs(1),
+            manager.raw_model_catalog(
+                RefreshStrategy::OnlineIfUncached,
+                DEFAULT_HTTP_CLIENT_FACTORY,
+            ),
+        )
+        .await
+        .expect("fresh disk must not await auth eligibility")
+        .unwrap();
+        assert!(catalog.models.contains(&disk_model));
+        assert_eq!(endpoint.eligibility_count.load(Ordering::SeqCst), 0);
+        assert_eq!(endpoint.inner.fetch_count(), 0);
+    }
+}
+
+#[tokio::test]
+async fn command_auth_short_circuits_backend_eligibility_on_network_refresh() {
+    let home = tempdir().unwrap();
+    let model = remote_model("command-model", "Command", 1);
+    let endpoint = Arc::new(EligibilityProbeEndpoint {
+        command_auth: true,
+        eligibility: None,
+        eligibility_count: AtomicUsize::new(0),
+        inner: TestModelsEndpoint::new(vec![vec![model.clone()]]),
+    });
+    let manager = openai_manager_for_tests(home.path().into(), endpoint.clone());
+    let catalog = timeout(
+        Duration::from_secs(1),
+        manager.raw_model_catalog(RefreshStrategy::Online, DEFAULT_HTTP_CLIENT_FACTORY),
+    )
+    .await
+    .expect("command auth must not await backend eligibility")
+    .unwrap();
+    assert!(catalog.models.contains(&model));
+    assert_eq!(endpoint.eligibility_count.load(Ordering::SeqCst), 0);
+    assert_eq!(endpoint.inner.fetch_count(), 1);
+}
+
+#[tokio::test]
+#[expect(
+    clippy::await_holding_invalid_type,
+    reason = "Holds the refresh transaction to prove ineligible readers do not queue"
+)]
+async fn ineligible_uncached_reader_does_not_queue_behind_refresh_transaction() {
+    let home = tempdir().unwrap();
+    let endpoint = Arc::new(EligibilityProbeEndpoint {
+        command_auth: false,
+        eligibility: Some(false),
+        eligibility_count: AtomicUsize::new(0),
+        inner: TestModelsEndpoint::new(Vec::new()),
+    });
+    let manager = openai_manager_for_tests(home.path().into(), endpoint.clone());
+    let _refresh = manager.refresh_gate.lock().await;
+    let catalog = timeout(
+        Duration::from_secs(1),
+        manager.raw_model_catalog(
+            RefreshStrategy::OnlineIfUncached,
+            DEFAULT_HTTP_CLIENT_FACTORY,
+        ),
+    )
+    .await
+    .expect("ineligible reader must return while the refresh gate remains held")
+    .unwrap();
+    assert!(!catalog.models.is_empty());
+    assert_eq!(endpoint.eligibility_count.load(Ordering::SeqCst), 1);
+    assert_eq!(endpoint.inner.fetch_count(), 0);
+}
+
+#[test]
+fn matching_etag_does_not_use_the_blocking_pool_or_renew_freshness() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .max_blocking_threads(1)
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let home = tempdir().unwrap();
+        let endpoint = TestModelsEndpoint::new(Vec::new());
+        let manager = Arc::new(openai_manager_for_tests(home.path().into(), endpoint.clone()));
+        {
+            let mut state = manager.state.write().await;
+            state.etag = Some("same-etag".into());
+            state.fresh_until = Some(Instant::now());
+        }
+        let expiry = manager.state.read().await.fresh_until;
+        let (release, wait) = std::sync::mpsc::channel();
+        let (started, ready) = tokio::sync::oneshot::channel();
+        let blocker = tokio::task::spawn_blocking(move || {
+            started.send(()).unwrap();
+            wait.recv().unwrap();
+        });
+        ready.await.unwrap();
+        let completed = timeout(
+            Duration::from_secs(1),
+            Arc::clone(&manager).notify_etag("same-etag".into(), DEFAULT_HTTP_CLIENT_FACTORY),
+        )
+        .await;
+        // Always release before assertions, including on regression, so shutdown cannot hang.
+        release.send(()).unwrap();
+        blocker.await.unwrap();
+        manager.wait_for_etag_refresh().await;
+        assert!(completed.is_ok(), "matching ETag must not dispatch filesystem work");
+        assert_eq!(manager.state.read().await.fresh_until, expiry);
+        assert_eq!(endpoint.fetch_count(), 0);
+        assert!(!home.path().join(MODEL_CACHE_FILE).exists());
+    });
+}
+
+#[test]
+fn normalized_metadata_and_picker_projections_preserve_untrusted_boundary_results() {
+    let short = remote_model("lookup", "Short", 2);
+    let long = remote_model("lookup-specific", "Long", 1);
+    let conflict = remote_model("lookup-specific", "Conflict", 1);
+    let mut invalid = remote_model("invalid", "Invalid", 0);
+    invalid.context_window = Some(0);
+    for models in [
+        vec![long.clone(), short.clone(), short.clone()],
+        vec![short.clone(), long.clone()],
+        vec![conflict, long, short],
+        vec![invalid],
+        Vec::new(),
+    ] {
+        let normalized = normalize_model_catalog(models.clone());
+        for auth in [false, true] {
+            assert_eq!(
+                *AvailableModelPresets::from_normalized(&normalized).for_auth(auth),
+                build_available_models_for_auth(models.clone(), auth)
+            );
+        }
+        for query in [
+            "lookup", "lookup-specific-preview", "openai/lookup-specific",
+            "openai/lookup", "ns1/ns2/lookup", "invalid", "unknown",
+        ] {
+            if let Some(found) = find_normalized_model_by_longest_prefix(query, &normalized) {
+                assert!(normalized.iter().any(|candidate| std::ptr::eq(candidate, found)));
+            }
+            for config in [
+                ModelsManagerConfig::default(),
+                ModelsManagerConfig {
+                    model_context_window: Some(123_456),
+                    base_instructions: Some("explicit prompt".into()),
+                    personality_enabled: true,
+                    ..Default::default()
+                },
+            ] {
+                assert_eq!(
+                    construct_model_info_from_normalized(query, &normalized, &config),
+                    construct_model_info_from_candidates(query, &models, &config)
+                );
+            }
+        }
+    }
 }

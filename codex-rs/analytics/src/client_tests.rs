@@ -130,6 +130,7 @@ fn unique_capture_path(name: &str) -> PathBuf {
 fn client_with_receiver() -> (AnalyticsEventsClient, mpsc::Receiver<AnalyticsFact>) {
     let (sender, receiver) = mpsc::channel(8);
     let queue = AnalyticsEventsQueue {
+        auth_manager: None,
         sender,
         loss_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         app_used_emitted_keys: Arc::new(Mutex::new(HashSet::new())),
@@ -618,7 +619,7 @@ fn track_request_only_enqueues_analytics_relevant_requests() {
         (RequestId::Integer(2), sample_turn_steer_request()),
     ] {
         client.track_request(/*connection_id*/ 7, request_id.clone(), &request);
-        let Ok(AnalyticsFact::ClientRequest {
+        let Ok(AnalyticsFact::TurnRequest {
             connection_id,
             request_id: queued_id,
             request: queued,
@@ -628,10 +629,15 @@ fn track_request_only_enqueues_analytics_relevant_requests() {
         };
         assert_eq!(connection_id, 7);
         assert_eq!(queued_id, request_id);
-        assert_eq!(
-            serde_json::to_value(queued).unwrap(),
-            serde_json::to_value(request).unwrap()
-        );
+        let expected = match request {
+            ClientRequest::TurnStart { params, .. } => crate::facts::TurnRequestFact::Start {
+                thread_id: params.thread_id, num_input_images: crate::reducer::num_input_images(&params.input) },
+            ClientRequest::TurnSteer { params, .. } => crate::facts::TurnRequestFact::Steer {
+                thread_id: params.thread_id, expected_turn_id: params.expected_turn_id,
+                num_input_images: crate::reducer::num_input_images(&params.input) },
+            _ => unreachable!(),
+        };
+        assert_eq!(queued, expected);
     }
 
     let ignored_request = sample_thread_archive_request();

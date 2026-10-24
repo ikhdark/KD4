@@ -20,9 +20,6 @@ use codex_exec::Cli as ExecCli;
 use codex_exec::Command as ExecCommand;
 use codex_exec::ReviewArgs;
 use codex_execpolicy::ExecPolicyCheckCommand;
-use codex_responses_api_proxy::Args as ResponsesApiProxyArgs;
-use codex_rollout_trace::REDUCED_STATE_FILE_NAME;
-use codex_rollout_trace::replay_bundle;
 
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_cli::ApprovalModeCliArg;
@@ -181,10 +178,6 @@ enum Subcommand {
     #[clap(visible_alias = "a")]
     Apply(ApplyCommand),
 
-    /// Internal: run the responses API proxy.
-    #[clap(hide = true)]
-    ResponsesApiProxy(ResponsesApiProxyArgs),
-
     /// Internal: relay stdio to a Unix domain socket.
     #[clap(hide = true, name = "stdio-to-uds")]
     StdioToUds(StdioToUdsCommand),
@@ -243,9 +236,7 @@ impl Subcommand {
             Self::Debug(DebugCommand { subcommand }) => {
                 let (name, supports_profile) = match subcommand {
                     DebugSubcommand::Models(_) => ("debug models", false),
-                    DebugSubcommand::AppServer(_) => ("debug app-server", false),
                     DebugSubcommand::PromptInput(_) => ("debug prompt-input", true),
-                    DebugSubcommand::TraceReduce(_) => ("debug trace-reduce", false),
                 };
                 SubcommandRoutingPolicy::new(name, supports_profile, false)
                     .with_strict_config_name("debug")
@@ -258,9 +249,6 @@ impl Subcommand {
                     .with_strict_config_name("execpolicy")
             }
             Self::Apply(_) => SubcommandRoutingPolicy::new("apply", false, false),
-            Self::ResponsesApiProxy(_) => {
-                SubcommandRoutingPolicy::new("responses-api-proxy", false, false)
-            }
             Self::StdioToUds(_) => SubcommandRoutingPolicy::new("stdio-to-uds", false, false),
             Self::ExecServer(_) => SubcommandRoutingPolicy::new("exec-server", false, true),
             Self::Features(FeaturesCli { sub }) => {
@@ -293,33 +281,9 @@ enum DebugSubcommand {
     /// Render the raw model catalog as JSON.
     Models(DebugModelsCommand),
 
-    /// Tooling: helps debug the app server.
-    AppServer(DebugAppServerCommand),
-
     /// Render the model-visible prompt input list as JSON.
     PromptInput(DebugPromptInputCommand),
 
-    /// Replay a rollout trace bundle and write reduced state JSON.
-    #[clap(hide = true)]
-    TraceReduce(DebugTraceReduceCommand),
-}
-
-#[derive(Debug, Parser)]
-struct DebugAppServerCommand {
-    #[command(subcommand)]
-    subcommand: DebugAppServerSubcommand,
-}
-
-#[derive(Debug, clap::Subcommand)]
-enum DebugAppServerSubcommand {
-    // Send message to app server V2.
-    SendMessageV2(DebugAppServerSendMessageV2Command),
-}
-
-#[derive(Debug, Parser)]
-struct DebugAppServerSendMessageV2Command {
-    #[arg(value_name = "USER_MESSAGE", required = true)]
-    user_message: String,
 }
 
 #[derive(Debug, Parser)]
@@ -354,17 +318,6 @@ struct ReviewCommand {
 
     #[clap(flatten)]
     args: ReviewArgs,
-}
-
-#[derive(Debug, Parser)]
-struct DebugTraceReduceCommand {
-    /// Trace bundle directory containing manifest.json and trace.jsonl.
-    #[arg(value_name = "TRACE_BUNDLE")]
-    trace_bundle: PathBuf,
-
-    /// Output path for reduced RolloutTrace JSON. Defaults to TRACE_BUNDLE/state.json.
-    #[arg(long = "output", short = 'o', value_name = "FILE")]
-    output: Option<PathBuf>,
 }
 
 #[derive(Debug, Parser)]
@@ -593,27 +546,6 @@ struct StdioToUdsCommand {
 fn parse_socket_path(raw: &str) -> Result<AbsolutePathBuf, String> {
     AbsolutePathBuf::relative_to_current_dir(raw)
         .map_err(|err| format!("failed to resolve socket path `{raw}`: {err}"))
-}
-
-async fn run_debug_app_server_command(
-    cmd: DebugAppServerCommand,
-    config_overrides: CliConfigOverrides,
-) -> anyhow::Result<()> {
-    config_overrides
-        .parse_overrides()
-        .map_err(anyhow::Error::msg)?;
-    match cmd.subcommand {
-        DebugAppServerSubcommand::SendMessageV2(cmd) => {
-            let codex_bin = std::env::current_exe()?;
-            codex_app_server_test_client::send_message_v2(
-                &codex_bin,
-                &config_overrides.raw_overrides,
-                cmd.user_message,
-                &None,
-            )
-            .await
-        }
-    }
 }
 
 #[derive(Debug, Default, Parser, Clone)]
@@ -868,11 +800,6 @@ fn main() -> anyhow::Result<()> {
     let remote_control_disabled = codex_app_server::take_remote_control_disabled_env();
     arg0_dispatch_or_else_with_pre_runtime(move || {
         let cli = parse_multitool_cli(std::env::args_os());
-        if matches!(&cli.subcommand, Some(Subcommand::ResponsesApiProxy(_))) {
-            // SAFETY: arg0 has finished loading dotenv and has not created any
-            // threads. Only the proxy opts into environment sanitation.
-            unsafe { codex_process_hardening::pre_main_hardening() };
-        }
         move |arg0_paths: Arg0DispatchPaths| async move {
             cli_main(cli, arg0_paths, remote_control_disabled).await
         }
@@ -1121,9 +1048,6 @@ async fn cli_main(
             DebugSubcommand::Models(cmd) => {
                 run_debug_models_command(cmd, root_config_overrides).await?;
             }
-            DebugSubcommand::AppServer(cmd) => {
-                run_debug_app_server_command(cmd, root_config_overrides).await?;
-            }
             DebugSubcommand::PromptInput(cmd) => {
                 run_debug_prompt_input_command(
                     cmd,
@@ -1132,9 +1056,6 @@ async fn cli_main(
                     arg0_paths.clone(),
                 )
                 .await?;
-            }
-            DebugSubcommand::TraceReduce(cmd) => {
-                run_debug_trace_reduce_command(cmd).await?;
             }
         },
         Some(Subcommand::Execpolicy(ExecpolicyCommand { sub })) => match sub {
@@ -1146,10 +1067,6 @@ async fn cli_main(
                 root_config_overrides.clone(),
             );
             run_apply_command(apply_cli, root.shared.cwd.clone()).await?;
-        }
-        Some(Subcommand::ResponsesApiProxy(args)) => {
-            tokio::task::spawn_blocking(move || codex_responses_api_proxy::run_main(args))
-                .await??;
         }
         Some(Subcommand::StdioToUds(cmd)) => {
             let socket_path = cmd.socket_path;
@@ -1490,19 +1407,6 @@ async fn maybe_print_under_development_feature_warning(
     {
         eprintln!("{}", warning.message);
     }
-}
-
-async fn run_debug_trace_reduce_command(cmd: DebugTraceReduceCommand) -> anyhow::Result<()> {
-    let output = cmd
-        .output
-        .unwrap_or_else(|| cmd.trace_bundle.join(REDUCED_STATE_FILE_NAME));
-
-    let trace = replay_bundle(&cmd.trace_bundle)?;
-    let reduced_json = serde_json::to_vec_pretty(&trace)?;
-    tokio::fs::write(&output, reduced_json).await?;
-    println!("{}", output.display());
-
-    Ok(())
 }
 
 async fn run_debug_prompt_input_command(

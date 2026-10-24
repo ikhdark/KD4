@@ -185,3 +185,47 @@ async fn shutdown_before_open_does_not_spawn_the_host() {
 
     assert_eq!(error, "code mode session is shutting down");
 }
+
+#[tokio::test]
+async fn stale_wait_pruning_preserves_newer_retained_result() {
+    let key = (2, codex_code_mode_protocol::CellId::new("newer".into()));
+    let release = tokio_util::sync::CancellationToken::new();
+    let retained = super::RetainedWait {
+        future: Box::pin(async { Err("retained result".into()) }),
+        release: release.clone(),
+    };
+    let mut waits = std::collections::HashMap::from([(
+        key.clone(), Arc::new(tokio::sync::Mutex::new(Some(retained))),
+    )]);
+    super::prune_pending_waits(&mut waits, 1);
+    assert!(!release.is_cancelled());
+    let retained = waits.get(&key).unwrap().lock().await.take().unwrap();
+    assert_eq!(retained.future.await, Err("retained result".into()));
+}
+
+#[tokio::test]
+async fn cancelled_queued_wait_slots_are_reclaimed_before_admission() {
+    let mut waits = std::collections::HashMap::new();
+    for index in 0..codex_code_mode_protocol::host::MAX_IN_FLIGHT_REQUESTS {
+        let pending = Arc::new(tokio::sync::Mutex::new(None));
+        waits.insert((1, codex_code_mode_protocol::CellId::new(index.to_string())), Arc::clone(&pending));
+        let first = pending.lock().await;
+        let mut queued = Box::pin(pending.lock());
+        assert!(futures::poll!(&mut queued).is_pending());
+        drop(first);
+        drop(queued);
+        drop(pending);
+    }
+    super::prune_pending_waits(&mut waits, 1);
+    assert!(waits.is_empty());
+}
+
+#[test]
+fn stale_execute_cannot_erase_replacement_generation_state() {
+    let session = ProcessOwnedCodeModeSession::new();
+    session.inner.record_execution_generation(1);
+    session.inner.record_execution_generation(2);
+    // The older execute resumes after a replacement host has executed work.
+    session.inner.record_execution_generation(1);
+    assert_eq!(session.inner.executed_generation.load(std::sync::atomic::Ordering::Acquire), 2);
+}

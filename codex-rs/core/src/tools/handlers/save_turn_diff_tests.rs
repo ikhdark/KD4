@@ -3,14 +3,14 @@ use crate::session::step_context::StepContext;
 use crate::session::tests::make_session_and_context;
 use crate::session::turn_context::TurnEnvironment;
 use crate::tools::context::ToolCallSource;
-use crate::turn_diff_tracker::CommandMutation;
+
 use crate::turn_diff_tracker::TurnDiffTracker;
 use codex_exec_server::LOCAL_ENVIRONMENT_ID;
 use codex_exec_server::LOCAL_FS;
 use codex_protocol::models::PermissionProfile;
 use codex_utils_path_uri::PathUri;
 use pretty_assertions::assert_eq;
-use std::collections::BTreeSet;
+
 use std::path::Path;
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -228,37 +228,7 @@ async fn saved_diff_replays_content_preserving_moves_with_and_without_other_edit
     }
 }
 
-#[tokio::test]
-async fn refuses_a_partial_diff_and_names_the_untracked_paths() {
-    let root = tempfile::tempdir().unwrap();
-    let mut tracker = tracker_for(root.path());
-    let delta = apply_patch_in(
-        root.path(),
-        "*** Begin Patch\n*** Add File: added.txt\n+new\n*** End Patch",
-    )
-    .await;
-    tracker.track_delta(LOCAL_ENVIRONMENT_ID, &delta);
-    // A script wrote a file the tracker has no exact diff for.
-    tracker.record_exec_command_end_with_mutation_at(
-        &["python".to_string(), "generate.py".to_string()],
-        /*exit_code*/ 0,
-        /*timed_out*/ false,
-        LOCAL_ENVIRONMENT_ID,
-        Some(root.path()),
-        CommandMutation::KnownMutation {
-            paths: Some(BTreeSet::from([root.path().join("generated.txt")])),
-        },
-    );
 
-    let result = SaveTurnDiffHandler
-        .handle(invocation(root.path(), tracker, "partial").await)
-        .await;
-    let Err(FunctionCallError::RespondToModel(message)) = result else {
-        panic!("a partial diff must not be saved");
-    };
-    assert!(message.contains("generated.txt"), "{message}");
-    assert!(!root.path().join(".codex").exists(), "nothing was written");
-}
 
 #[tokio::test]
 async fn audit107_refuses_foreign_hunks_between_exact_patches_without_exec() {

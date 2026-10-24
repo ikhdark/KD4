@@ -23,15 +23,13 @@ use crate::tools::handlers::allows_inline_sandbox_approval;
 use crate::tools::handlers::apply_granted_turn_permissions_uri;
 use crate::tools::handlers::apply_patch::intercept_apply_patch;
 use crate::tools::handlers::command_preflight::preflight_invocation_for_kd4_runtime;
-use crate::tools::handlers::command_search::classify_rg_search_narrowing_without_native_scope;
-use crate::tools::handlers::command_search::classify_rg_search_with_repository;
+use crate::tools::handlers::command_search::rg_search_no_match_eligible;
 use crate::tools::handlers::command_search::missing_rg_path_advisory_with_cancellation;
 use crate::tools::handlers::command_shape::CommandInvocation;
 use crate::tools::handlers::command_shape::powershell_script_failure_advisory;
 use crate::tools::handlers::normalize_and_validate_additional_permissions_uri;
 use crate::tools::handlers::parse_arguments;
 use crate::tools::handlers::parse_arguments_with_base_path;
-use crate::tools::handlers::resolve_search_repository_root;
 use crate::tools::handlers::rewrite_function_command_invocation;
 use crate::tools::hook_names::HookToolName;
 use crate::tools::registry::CoreToolRuntime;
@@ -424,7 +422,7 @@ impl ExecCommandHandler {
             turn.network_sandbox_policy(),
             SandboxablePreference::Auto,
             turn.windows_sandbox_level,
-            turn.network.is_some(),
+            false,
         );
         // `to_abs_path()` alone cannot identify foreign drive paths: `file:///C:/repo` is
         // representable as `/C:/repo` on POSIX. Require the inferred convention to match too.
@@ -491,6 +489,18 @@ impl ExecCommandHandler {
         )
         .await?;
         let original_invocation = args.command_invocation();
+        let policy_cwd = if environment_is_remote { None } else {
+            native_cwd.as_ref().map(codex_utils_absolute_path::AbsolutePathBuf::as_path)
+        };
+        let (mut policy_classification, mut policy_selection) =
+            crate::validation::analyze_validation_policy_with_shell(
+                original_invocation, original_resolved_command.preflight_shell_type, policy_cwd,
+            ).await;
+        if let Some(refusal) = crate::validation_task::mode_refusal(
+            &turn, policy_classification, args.validation.is_some(),
+        ) {
+            return Ok(boxed_tool_output(refusal));
+        }
         let direct_runtime = turn.config.features.enabled(Feature::DirectRuntime);
         let preflight = preflight_invocation_for_kd4_runtime(
             turn.config.features.enabled(Feature::Kd4Runtime),
@@ -513,23 +523,6 @@ impl ExecCommandHandler {
             ))
         })?;
         let repaired = preflight.repaired();
-        let full_suite = if turn.config.features.enabled(Feature::Kd4Runtime) {
-            crate::tools::handlers::command_preflight::check_full_suite_command(
-                &original_resolved_command.safety_command,
-                original_resolved_command.preflight_shell_type,
-                if environment_is_remote {
-                    None
-                } else {
-                    native_cwd
-                        .as_ref()
-                        .map(codex_utils_absolute_path::AbsolutePathBuf::as_path)
-                },
-            )
-            .await
-            .map_err(FunctionCallError::RespondToModel)?
-        } else {
-            false
-        };
         let repair_notice = {
             let mut notices = args.argument_notices.clone();
             notices.extend(preflight.model_notice());
@@ -539,6 +532,15 @@ impl ExecCommandHandler {
         let command_invocation = preflight.invocation;
         let invocation_changed = &command_invocation != original_invocation;
         if invocation_changed {
+            (policy_classification, policy_selection) =
+                crate::validation::analyze_validation_policy_with_shell(
+                    &command_invocation, original_resolved_command.preflight_shell_type, policy_cwd,
+                ).await;
+            if let Some(refusal) = crate::validation_task::mode_refusal(
+                &turn, policy_classification, args.validation.is_some(),
+            ) {
+                return Ok(boxed_tool_output(refusal));
+            }
             args.replace_command_invocation(&command_invocation);
         }
         let resolved_command = if invocation_changed {
@@ -567,50 +569,16 @@ impl ExecCommandHandler {
             args.validation.clone(),
         );
         let search_analysis = async {
-            let search_narrowing = if !environment_is_remote {
-                if let Some(native_cwd) = native_cwd.as_ref() {
-                    let search_command = resolved_command.safety_command.clone();
-                    let search_shell_type = resolved_command.preflight_shell_type;
-                    let search_cwd = native_cwd.clone();
-                    let search = crate::tools::run_blocking_command_analysis(move || {
-                        classify_rg_search_with_repository(
-                            &search_command,
-                            search_shell_type,
-                            search_cwd.as_path(),
-                            || resolve_search_repository_root(search_cwd.as_path()),
-                        )
-                    })
-                    .await
-                    .map_err(|error| {
-                        FunctionCallError::RespondToModel(format!(
-                            "command search worker failed: {error}"
-                        ))
-                    })?
-                    .map_err(FunctionCallError::RespondToModel)?;
-                    // Source-only snapshots cannot identify the image executed
-                    // by this runtime. Leave optional negative-replay proof unset.
-                    search.map(|(root, search)| (root.to_string_lossy().into_owned(), search))
-                } else {
-                    let search_command = resolved_command.safety_command.clone();
-                    let search_shell_type = resolved_command.preflight_shell_type;
-                    crate::tools::run_blocking_command_analysis(move || {
-                        classify_rg_search_narrowing_without_native_scope(
-                            &search_command,
-                            search_shell_type,
-                        )
-                    })
-                    .await
-                    .map_err(|error| {
-                        FunctionCallError::RespondToModel(format!(
-                            "command search worker failed: {error}"
-                        ))
-                    })?
-                    .map(|search| (String::new(), search))
-                }
-            } else {
-                None
-            };
-            Ok::<_, FunctionCallError>(search_narrowing)
+            if environment_is_remote || native_cwd.is_none() {
+                return Ok(false);
+            }
+            let command = resolved_command.safety_command.clone();
+            let shell_type = resolved_command.preflight_shell_type;
+            crate::tools::run_blocking_command_analysis(move || {
+                rg_search_no_match_eligible(&command, shell_type)
+            }).await.map_err(|error| FunctionCallError::RespondToModel(format!(
+                "command search worker failed: {error}"
+            )))
         };
         let safety_command = resolved_command.safety_command.clone();
         let direct_argv = command_invocation.is_argv();
@@ -623,23 +591,22 @@ impl ExecCommandHandler {
         });
         // Pure launch analyses share inputs but not results. Join them before
         // applying observation/approval policy; no process starts in this phase.
-        let ((mut validation, long_running), search_narrowing, inspection_command) =
+        let ((mut validation, long_running), search_no_match_eligible, inspection_command) =
             tokio::join!(validation_analysis, search_analysis, safety_analysis);
         args.apply_validation_observation_policy(
             long_running || validation
                 .as_ref()
                 .is_some_and(crate::validation::CommandValidation::is_validation),
         );
-        let validation_launch = !direct_runtime
-            && (validation.is_some()
+        let validation_launch = validation.is_some()
                 || matches!(
                     classify_validation_invocations(&validation_invocations),
                     ValidationClassification::Validation { .. }
-                ));
-        let search_narrowing = if validation_launch {
-            None
+                ) || policy_classification.is_validation();
+        let search_no_match_eligible = if validation_launch {
+            false
         } else {
-            search_narrowing?
+            search_no_match_eligible?
         };
         let inspection_command = inspection_command.map_err(|error| {
             FunctionCallError::RespondToModel(format!("command safety worker failed: {error}"))
@@ -760,7 +727,7 @@ impl ExecCommandHandler {
         );
         let runtime_context = format!(
             "shell={shell_type:?};login={use_login_shell};tty={tty};stall_timeout_ms={stall_timeout_ms:?};network={:?}",
-            context.turn.network,
+            context.turn.network_sandbox_policy(),
         );
         let input_context = format!("prefix={prefix_rule:?}");
         let effective_environment = manager.effective_environment(&context);
@@ -826,23 +793,10 @@ impl ExecCommandHandler {
         .with_runtime_context(&runtime_context)
         .with_repository_epoch(repository_epoch)
         .with_workspace_identity(workspace_identity.as_deref());
-        let attempt_key = if let Some((repository_identity, search)) = search_narrowing {
-            attempt_key.with_search_narrowing(&turn.sub_id, &repository_identity, Some(search))
-        } else {
-            attempt_key
-        }
-        .with_search_environment(&effective_environment);
+        let attempt_key = attempt_key
+            .with_search_no_match_eligibility(search_no_match_eligible)
+            .with_search_environment(&effective_environment);
         drop(key_phase);
-        if !validation_launch {
-            let _phase =
-                crate::tools::tool_dispatch_trace::begin_tool_phase("exec_search_admission");
-            session
-                .services
-                .command_execution
-                .admit_search_narrowing(&attempt_key)
-                .await
-                .map_err(FunctionCallError::RespondToModel)?;
-        }
         let validation_attempt = validation_launch;
         let reuse_phase =
             crate::tools::tool_dispatch_trace::begin_tool_phase("exec_running_validation_reuse");
@@ -866,18 +820,16 @@ impl ExecCommandHandler {
             return Ok(boxed_tool_output(response));
         }
         drop(reuse_phase);
-        // Validation shares ordinary attempt accounting. Only input-state
-        // determined failures are replayed; focused failing tests remain rerunnable.
-        if full_suite {
-            turn.full_suite_budget.refresh_owned_nonexecution().await;
-        }
-        let _suite_permit = turn
-            .full_suite_budget
-            .reserve(
-                full_suite,
-                crate::validation_task::reservation_owner(&session, &turn, &call_id),
-            )
-            .map_err(FunctionCallError::RespondToModel)?;
+        let _suite_permit = match crate::validation_task::reserve_policy(
+            &session, &turn, &call_id, policy_classification,
+            validation_launch,
+            policy_selection,
+            &format!("{validation_cwd}:{environment_hash}"),
+            workspace_identity.as_deref(),
+        ).await {
+            Ok(permit) => permit,
+            Err(refusal) => return Ok(boxed_tool_output(refusal)),
+        };
         let attempt_phase =
             crate::tools::tool_dispatch_trace::begin_tool_phase("exec_attempt_freshness");
         if let Err(blocked) = session
@@ -886,34 +838,7 @@ impl ExecCommandHandler {
             .begin_attempt_with_freshness(&attempt_key, repaired, force_fresh)
             .await
         {
-            if blocked.is_search_miss() {
-                let receipt = ExecCommandToolOutput::cached_search_miss(blocked.render_for_model());
-                if let Some(evidence) = session
-                    .services
-                    .command_execution
-                    .retained_search_miss(&attempt_key)
-                    .await
-                {
-                    return Ok(boxed_tool_output(receipt.with_evidence(evidence)));
-                }
-                if !nested {
-                    return Ok(boxed_tool_output(receipt));
-                }
-                // A persisted/prose miss has no exact streams. Structured callers
-                // execute afresh instead of receiving fabricated empty output.
-                session
-                    .services
-                    .command_execution
-                    .begin_attempt_with_freshness(&attempt_key, repaired, true)
-                    .await
-                    .map_err(|blocked| {
-                        FunctionCallError::RespondToModel(blocked.render_for_model())
-                    })?;
-            } else {
-                return Err(FunctionCallError::RespondToModel(
-                    blocked.render_for_model(),
-                ));
-            }
+            return Err(FunctionCallError::RespondToModel(blocked.render_for_model()));
         }
         drop(attempt_phase);
 
@@ -1032,7 +957,6 @@ impl ExecCommandHandler {
                     },
                     sandbox_cwd: native_environment_cwd,
                     turn_environment: turn_environment.clone(),
-                    network: context.turn.network.clone(),
                     tty,
                     sandbox_permissions: effective_additional_permissions.sandbox_permissions,
                     additional_permissions: normalized_additional_permissions,
@@ -1070,26 +994,6 @@ impl ExecCommandHandler {
         };
         let result = match exec_result {
             Ok(mut response) => {
-                if response.search_no_match_is_success()
-                    && let Some(snapshot) = response.process_output.as_ref()
-                    && snapshot.streams_are_exact
-                    && snapshot.stdout.len().saturating_add(snapshot.stderr.len()) <= 16 * 1024
-                    && let (Ok(stdout), Ok(stderr)) = (
-                        String::from_utf8(snapshot.stdout.clone()),
-                        String::from_utf8(snapshot.stderr.clone()),
-                    )
-                {
-                    session
-                        .services
-                        .command_execution
-                        .record_retained_search_miss(
-                            &attempt_key,
-                            response.event_call_id.clone(),
-                            stdout,
-                            stderr,
-                        )
-                        .await;
-                }
                 background_process_expected = response.process_id.is_some();
                 let finalized_artifact = response
                     .raw_output_artifact

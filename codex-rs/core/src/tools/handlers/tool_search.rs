@@ -5253,6 +5253,26 @@ text('one-cell-complete');
         search_info(search_text, Some(source_name), source_name, tool_name)
     }
 
+    #[test]
+    fn wrapped_prohibitions_do_not_activate_tool_search_matches() {
+        for description in [
+            "Read records. Cannot\ndelete files.",
+            "Read records. Can’t delete files.",
+            "Read records. **Cannot** delete files.",
+            "Read records. Do\nnot delete files.",
+        ] {
+            let handler = ToolSearchHandler::new(vec![search_info(
+                description, None, "files", "lookup",
+            )]);
+            let result = handler.search("delete files", 1).unwrap();
+            assert!(result.activation_tools.is_empty(), "{description}");
+            assert_eq!(result.unactivated_matches.len(), 1, "{description}");
+            for query in ["read records", "lookup"] {
+                assert_eq!(handler.search(query, 1).unwrap().activation_tools.len(), 1);
+            }
+        }
+    }
+
     fn search_info(
         search_text: &str,
         source_name: Option<&str>,

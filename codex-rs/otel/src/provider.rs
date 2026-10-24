@@ -62,6 +62,9 @@ pub struct OtelProvider {
 
 impl OtelProvider {
     pub fn shutdown(&self) {
+        if let Some(metrics) = &self.metrics {
+            crate::metrics::uninstall_global(metrics);
+        }
         if let Some(tracer_provider) = &self.tracer_provider {
             let _ = tracer_provider.shutdown();
         }
@@ -146,12 +149,12 @@ impl OtelProvider {
             global::set_text_map_propagator(TraceContextPropagator::new());
         }
         if let Some(metrics) = metrics.as_ref() {
-            crate::metrics::install_global(metrics.clone());
-            if matches!(settings.metrics_exporter, OtelExporter::Statsig) {
-                crate::metrics::install_global_statsig_settings(StatsigMetricsSettings {
+            let statsig = matches!(settings.metrics_exporter, OtelExporter::Statsig).then(|| {
+                StatsigMetricsSettings {
                     environment: settings.environment.clone(),
-                });
-            }
+                }
+            });
+            crate::metrics::install_global(metrics.clone(), statsig);
         }
         Ok(Some(Self {
             logger,

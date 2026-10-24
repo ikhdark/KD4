@@ -486,7 +486,7 @@ fn additional_context_developer_match_requires_application_kind() {
 }
 
 fn budget_with_remaining(remaining_bytes: usize) -> ModelContextBudget {
-    let mut budget = ModelContextBudget::new(100);
+    let mut budget = ModelContextBudget::new(remaining_bytes.div_ceil(4));
     assert!(budget.try_take_bytes(budget.remaining_bytes() - remaining_bytes));
     budget
 }
@@ -559,6 +559,69 @@ fn fragment_budget_matches_text_budget_for_unmarked_fragments() {
             fragment_budget.remaining_bytes(),
             text_budget.remaining_bytes()
         );
+    }
+}
+
+#[test]
+fn additional_context_budget_admits_only_complete_recognizable_fragments() {
+    for (source, value) in [
+        ("s".to_string(), "x".repeat(200)),
+        ("s".to_string(), "&".repeat(200)),
+        ("<&\"'>".repeat(400), "<>&😀".repeat(300)),
+        ("source".to_string(), String::new()),
+    ] {
+        let fragment = AdditionalContextUserFragment::new(source, value);
+        let rendered = fragment.render();
+        assert!(AdditionalContextUserFragment::matches_text(&rendered));
+        // Cover every opening attribute, closing tag, escaped entity, and
+        // UTF-8 cut point, including exact fits and a byte left over.
+        for remaining in 0..=rendered.len() + 1 {
+            let mut budget = budget_with_remaining(remaining);
+            if remaining < rendered.len() {
+                assert_eq!(budget.take_fragment(&fragment), None);
+                assert_eq!(budget.remaining_bytes(), remaining);
+                continue;
+            }
+            let admitted = budget.take_fragment(&fragment).expect("whole fragment fits");
+            assert_eq!(admitted, rendered);
+            assert!(AdditionalContextUserFragment::matches_text(&admitted));
+            assert_eq!(budget.remaining_bytes(), remaining - rendered.len());
+            let mut item =
+                ContextualUserFragment::into(RenderedContextFragment::new("user", admitted));
+            assert!(!codex_context_fragments::is_user_turn_boundary(&item));
+            item.set_id(Some(codex_protocol::ResponseItemId::with_suffix(
+                "msg_sctx",
+                "budget_test",
+            )));
+            assert!(!codex_context_fragments::is_user_turn_boundary(&item));
+        }
+    }
+}
+
+#[test]
+fn additional_context_budget_keeps_application_policy_whole() {
+    let fragment = AdditionalContextDeveloperFragment::new(
+        "policy".to_string(),
+        format!(
+            "{}Never modify X.{}",
+            "before & ".repeat(500),
+            " after".repeat(500)
+        ),
+    );
+    let rendered = fragment.render();
+    for remaining in [100, 200, rendered.len() - 1, rendered.len()] {
+        let mut budget = budget_with_remaining(remaining);
+        let admitted = budget.take_fragment(&fragment);
+        if remaining < rendered.len() {
+            assert_eq!(admitted, None);
+            assert_eq!(budget.remaining_bytes(), remaining);
+        } else {
+            let admitted = admitted.expect("whole policy fits");
+            assert_eq!(admitted, rendered);
+            assert!(admitted.contains("Never modify X."));
+            assert!(AdditionalContextDeveloperFragment::matches_text(&admitted));
+            assert_eq!(budget.remaining_bytes(), 0);
+        }
     }
 }
 

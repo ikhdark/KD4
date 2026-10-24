@@ -20,7 +20,6 @@ use super::wait_handler::OwnerHeldCodeModeExit;
 use super::wait_handler::attach_drained_wait_evidence;
 use super::wait_handler::hold_until_state_change;
 use super::wait_handler::input_activity_response;
-use super::wait_handler::record_internally_drained_waits;
 use super::wait_handler::terminate_interrupted_cell;
 
 pub struct CodeModeExecuteHandler {
@@ -61,9 +60,13 @@ fn direct_delivery_text(
         return Err(serde_json::json!({"category":category}));
     };
     let mut parts = Vec::with_capacity(content_items.len());
+    let mut text_parts = Vec::new();
     for item in content_items {
         match item {
-            FunctionCallOutputContentItem::InputText { text } => parts.push(text.clone()),
+            FunctionCallOutputContentItem::InputText { text } => {
+                text_parts.push(text.as_str());
+                parts.push(text.clone());
+            }
             FunctionCallOutputContentItem::InputImage { image_url, .. } => {
                 // Use the already-produced media; never fetch or re-encode it.
                 // Reject Markdown delimiters/control characters rather than
@@ -91,7 +94,9 @@ fn direct_delivery_text(
     if message.trim().is_empty() {
         return Err(serde_json::json!({"category":"empty_output"}));
     }
-    if codex_utils_output_truncation::model_token_count(&message) > limit {
+    // Native media already crossed runtime byte admission. Charge only its
+    // accompanying text, never base64 image bytes as model text tokens.
+    if codex_utils_output_truncation::model_token_count(&text_parts.join("\n")) > limit {
         return Err(serde_json::json!({"category":"output_budget", "limit":limit}));
     }
     Ok(message)
@@ -209,41 +214,6 @@ impl CellDispatchLease {
             .store(true, std::sync::atomic::Ordering::Release);
     }
 
-    pub(super) fn record_trace(&self, record: impl FnOnce() + Send + 'static) {
-        // Queue ordered persistence without gating dispatch or response delivery.
-        // Each accepted write owns cleanup even if its tool caller is cancelled.
-        let lease = self.clone();
-        let (done, tail) = tokio::sync::oneshot::channel();
-        let previous = self
-            .state
-            .session
-            .services
-            .code_mode_service
-            .trace_tails
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(self.state.cell_id.to_string(), tail);
-        let tasks = self.state.session.terminal_tasks.clone();
-        self.state.session.terminal_tasks.spawn(async move {
-            if let Some(previous) = previous {
-                let _ = previous.await;
-            }
-            let runtime = tokio::runtime::Handle::current();
-            if let Err(error) = tasks
-                .spawn_blocking_on(
-                    move || {
-                        record();
-                        let _ = done.send(());
-                        drop(lease);
-                    },
-                    &runtime,
-                )
-                .await
-            {
-                tracing::warn!(%error, "code mode trace recording task failed");
-            }
-        });
-    }
 }
 
 impl Drop for CellDispatchLeaseState {
@@ -263,13 +233,32 @@ impl CodeModeExecuteHandler {
         direct_nested_tool_specs: Vec<ToolSpec>,
         deferred_nested_tool_specs: Vec<ToolSpec>,
     ) -> Result<Self, String> {
+        Self::new_with_input_schemas(
+            spec,
+            direct_nested_tool_specs,
+            deferred_nested_tool_specs,
+            &HashMap::new(),
+        )
+    }
+
+    pub(crate) fn new_with_input_schemas(
+        spec: ToolSpec,
+        direct_nested_tool_specs: Vec<ToolSpec>,
+        deferred_nested_tool_specs: Vec<ToolSpec>,
+        canonical_input_schemas: &HashMap<codex_tools::ToolName, serde_json::Value>,
+    ) -> Result<Self, String> {
         let mut nested_tool_specs = direct_nested_tool_specs;
         // Deferred tools stay out of the model-visible `exec` description, but
         // code running inside the isolate can discover and invoke them through
         // `ALL_TOOLS`. Cache the complete runtime registry once per handler so
         // every cell does not rebuild it from cloned tool specs.
         nested_tool_specs.extend(deferred_nested_tool_specs);
-        let mut enabled_tools = codex_tools::collect_code_mode_tool_definitions(&nested_tool_specs);
+        // Keep multi-member namespace expansion and sorting with the shared
+        // collector, but render provider constraints from their canonical owner.
+        let mut enabled_tools = codex_tools::collect_code_mode_tool_definitions_with_input_schemas(
+            &nested_tool_specs,
+            canonical_input_schemas,
+        );
         // The collector assigns unique normalized names. The runtime also
         // validates catalogs at its host boundary; no second pass is needed here.
         // The rendered descriptions already contain the schema-derived TypeScript
@@ -425,7 +414,7 @@ impl CodeModeExecuteHandler {
                         .min(codex_code_mode::MAX_OUTPUT_TOKENS_PER_EXEC_CALL),
                 ),
             );
-        // Establish cleanup ownership before queuing trace work.
+        // Establish cleanup ownership before opening dispatch.
         let dispatch_lease = CellDispatchLease::new(Arc::clone(&exec.session), cell_id.clone());
         // Register one owned publication before opening dispatch. Downstream
         // presentation pressure must not gate the cell's nested tool work.
@@ -442,25 +431,13 @@ impl CodeModeExecuteHandler {
                 ).await;
             }
         });
-        let trace_enabled = exec.session.services.rollout_thread_trace.is_enabled();
-        let code_cell_trace = exec
-            .session
-            .services
-            .rollout_thread_trace
-            .code_cell_trace_context(exec.turn.sub_id.as_str(), runtime_cell_id.as_str());
-        if trace_enabled {
-            let trace = code_cell_trace.clone();
-            let parent_call_id = call_id.clone();
-            let source = args.code.to_owned();
-            dispatch_lease.record_trace(move || trace.record_started(parent_call_id, source));
-        }
         exec.session
             .services
             .code_mode_service
             .mark_cell_ready_for_dispatch(&cell_id);
-        // Any early return after registration must release both the dispatch
-        // gate and the outer-call ownership record. A yielded live cell is the
-        // only path that deliberately transfers that lease to a later wait.
+        // Early returns before observing the cell release both the dispatch
+        // gate and outer-call ownership. Live or uncertain observations instead
+        // transfer that lease to a later wait.
         let turn_state = exec
             .session
             .input_queue
@@ -484,10 +461,10 @@ impl CodeModeExecuteHandler {
             biased;
             _ = cancellation_token.cancelled() => {
                 terminate_interrupted_cell(&exec, &cell_id).await
-                    .map_err(FunctionCallError::RespondToModel)?.into()
+                    .map(Into::into).unwrap_or_else(|error| super::observation_error_response(&cell_id, error))
             }
             response = started_cell.initial_response() => {
-                response.map_err(FunctionCallError::RespondToModel)?
+                response.unwrap_or_else(|error| super::observation_error_response(&cell_id, error))
             }
         };
         let initial_is_automatic_yield = matches!(
@@ -529,17 +506,17 @@ impl CodeModeExecuteHandler {
                         exit: OwnerHeldCodeModeExit::Runtime(
                             terminate_interrupted_cell(&exec, &cell_id)
                                 .await
-                                .map_err(FunctionCallError::RespondToModel)?,
+                                .unwrap_or_else(|error| codex_code_mode::WaitOutcome::LiveCell(super::observation_error_response(&cell_id, error))),
                         ),
                         drained_observations: error.drained_observations,
                     }
                 }
                 Err(error) => {
-                    record_internally_drained_waits(
-                        &exec,
-                        error.drained_observations.saturating_add(1),
-                    );
-                    return Err(FunctionCallError::RespondToModel(error.message));
+                    super::wait_handler::OwnerHeldCodeModeWait {
+                        exit: OwnerHeldCodeModeExit::Runtime(codex_code_mode::WaitOutcome::LiveCell(
+                            super::observation_error_response(&cell_id, error.message))),
+                        drained_observations: error.drained_observations,
+                    }
                 }
             };
             let drained_observations = held.drained_observations.saturating_add(1);
@@ -569,23 +546,11 @@ impl CodeModeExecuteHandler {
             initial_output.append(tail);
             *tail = initial_output;
         }
-        // Record the raw runtime boundary. The model-visible custom-tool output
-        // is produced by `handle_runtime_response` and later linked through
-        // `CodeCell.output_item_ids` in the reduced trace.
-        // Yielded cells keep running, so terminal lifecycle is only emitted
-        // here when the first response also ended the runtime.
-        let keep_dispatch_open = live_cell
-            && matches!(
-                response,
-                codex_code_mode::RuntimeResponse::Yielded { .. }
-                    | codex_code_mode::RuntimeResponse::ExplicitYield { .. }
-            );
-        if trace_enabled {
-            let traced_response = response.clone();
-            dispatch_lease.record_trace(move || {
-                code_cell_trace
-                    .record_initial_response(&traced_response, live_cell && !keep_dispatch_open);
-            });
+        // Observation failure is not terminal evidence. Transfer ownership
+        // before fallible delivery/packaging so those failures cannot retire
+        // a cell whose runtime may still be dispatching nested work.
+        if live_cell && !super::runtime_response_is_terminal(&response) {
+            dispatch_lease.keep_open();
         }
         // Preserve the captured response while allowing cancellation to finish
         // delivery and dispatch cleanup despite an unrelated open dialog.
@@ -624,7 +589,7 @@ impl CodeModeExecuteHandler {
                 matches!(
                     &response,
                     codex_code_mode::RuntimeResponse::Terminated { .. }
-                ),
+                ) || super::observation_failed(&response),
                 &cancellation_token,
             )
             .await;
@@ -651,9 +616,6 @@ impl CodeModeExecuteHandler {
         })?.map_err(|error| {
             FunctionCallError::RespondToModel(format!("code-mode started publication failed: {error}"))
         })?;
-        if keep_dispatch_open {
-            dispatch_lease.keep_open();
-        }
         Ok(attach_drained_wait_evidence(
             &exec,
             output,
@@ -731,6 +693,82 @@ mod tests {
     use codex_code_mode::CellId;
 
     use super::*;
+
+    #[test]
+    fn audit144_canonical_input_schema_reaches_cached_code_mode_metadata() {
+        let spec = codex_tools::ToolSpec::Function(codex_tools::ResponsesApiTool {
+            name: "conditional".into(),
+            description: "provider".into(),
+            strict: false,
+            defer_loading: None,
+            parameters: codex_tools::JsonSchema::default(),
+            output_schema: None,
+        });
+        let canonical = serde_json::json!({"type":"object","properties":{"mode":{"type":"string"},"text":{"type":"string"}},
+        "if":{"properties":{"mode":{"const":"edit"}},"required":["mode"]},"then":{"required":["text"]},"dependentSchemas":{"text":{"required":["mode"]}},"not":{"required":["forbidden"]}});
+        let handler = CodeModeExecuteHandler::new_with_input_schemas(
+            super::super::execute_spec::create_code_mode_tool(false, true, &[], &[]),
+            Vec::new(),
+            vec![spec],
+            &HashMap::from([(
+                codex_tools::ToolName::plain("conditional"),
+                canonical.clone(),
+            )]),
+        )
+        .unwrap();
+        let description = &handler.enabled_tools[0].description;
+        for keyword in ["dependentSchemas", "if", "then", "not"] {
+            assert!(description.contains(keyword), "{description}");
+        }
+        let validator = jsonschema::validator_for(&canonical).unwrap();
+        for valid in [
+            serde_json::json!({"mode":"edit","text":"ok"}),
+            serde_json::json!({"mode":"view"}),
+            serde_json::json!({}),
+        ] {
+            assert!(validator.is_valid(&valid));
+        }
+        for invalid in [
+            serde_json::json!({"mode":"edit"}),
+            serde_json::json!({"text":"orphan"}),
+            serde_json::json!({"forbidden":true}),
+        ] {
+            assert!(!validator.is_valid(&invalid));
+        }
+    }
+
+    #[test]
+    fn audit144_native_image_bytes_are_not_charged_as_caption_tokens() {
+        use base64::Engine;
+        let pixels = image::RgbImage::from_fn(256, 256, |x, y| {
+            image::Rgb([(x * y) as u8, (x + y) as u8, (x ^ y) as u8])
+        });
+        let mut png = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgb8(pixels)
+            .write_to(&mut png, image::ImageFormat::Png)
+            .unwrap();
+        let uri = format!(
+            "data:image/png;base64,{}",
+            base64::engine::general_purpose::STANDARD.encode(png.into_inner())
+        );
+        assert!(uri.len() > 1024);
+        let response = codex_code_mode::RuntimeResponse::Result {
+            cell_id: CellId::new("media".into()),
+            error_text: None,
+            output_loss: None,
+            content_items: vec![
+                codex_code_mode::FunctionCallOutputContentItem::InputText {
+                    text: "caption".into(),
+                },
+                codex_code_mode::FunctionCallOutputContentItem::InputImage {
+                    image_url: uri.clone(),
+                    detail: None,
+                },
+            ],
+        };
+        let delivered = direct_delivery_text(&response, 10).unwrap();
+        assert!(delivered.contains(&uri));
+    }
 
     #[tokio::test]
     async fn completed_code_cell_cancellation_bypasses_unrelated_elicitation() {
@@ -1120,405 +1158,234 @@ mod tests {
         service.finish_cell_dispatch(&cell_id);
     }
 
-    #[tokio::test]
-    async fn registered_code_cells_persist_ordered_initial_and_terminal_traces()
-    -> anyhow::Result<()> {
-        use crate::session::step_context::StepContext;
-        use crate::tools::context::ToolDispatchState;
-        use crate::tools::router::ToolCall;
-        use crate::tools::router::ToolCallSource;
-        use crate::tools::router::ToolRouter;
-        use crate::tools::router::ToolRouterParams;
-        use codex_code_mode::FunctionCallOutputContentItem;
-        use codex_rollout_trace::CodeCellRuntimeStatus;
-        use codex_rollout_trace::RawTraceEvent;
-        use codex_rollout_trace::RawTraceEventPayload;
-        let root = tempfile::tempdir()?;
-        let (mut session, mut turn) = crate::session::tests::make_session_and_context().await;
-        session.services.code_mode_service = super::super::CodeModeService::new(Arc::new(
-            codex_code_mode_runtime::InProcessCodeModeSessionProvider,
-        ));
-        turn.model_info.tool_mode = Some(codex_protocol::openai_models::ToolMode::CodeMode);
-        session.services.rollout_thread_trace =
-            codex_rollout_trace::ThreadTraceContext::start_root_in_root_for_test(
-                root.path(),
-                codex_rollout_trace::ThreadStartedTraceMetadata {
-                    thread_id: session.thread_id.to_string(),
-                    agent_path: "/root".to_string(),
-                    task_name: None,
-                    nickname: None,
-                    agent_role: None,
-                    session_source: codex_protocol::protocol::SessionSource::Exec,
-                    cwd: turn.cwd().to_path_buf(),
-                    rollout_path: None,
-                    model: turn.model_info.slug.clone(),
-                    provider_name: "test-provider".to_string(),
-                    approval_policy: "never".to_string(),
-                    sandbox_policy: "danger-full-access".to_string(),
-                },
-            )?;
-        session
-            .services
-            .rollout_thread_trace
-            .record_codex_turn_started(turn.sub_id.as_str());
-        let bundle = std::fs::read_dir(root.path())?
-            .next()
-            .expect("one trace bundle")?
-            .path();
-        let session = Arc::new(session);
-        let turn = Arc::new(turn);
-        let step = StepContext::for_test(Arc::clone(&turn));
-        let router = ToolRouter::try_from_context(
-            &step,
-            ToolRouterParams {
-                mcp_tools: None,
-                deferred_mcp_tools: None,
-                tool_suggest_candidates: None,
-                extension_tool_executors: Vec::new(),
-                dynamic_tools: &[],
-                exposure_identity: Default::default(),
-            },
-            &Default::default(),
-        )
-        .map_err(anyhow::Error::msg)?;
-        let tracker = Arc::new(tokio::sync::Mutex::new(
-            crate::turn_diff_tracker::TurnDiffTracker::new(),
-        ));
-        let read_events = || -> anyhow::Result<Vec<RawTraceEvent>> {
-            std::fs::read_to_string(bundle.join("trace.jsonl"))?
-                .lines()
-                .map(|line| serde_json::from_str(line).map_err(Into::into))
-                .collect()
-        };
-        for (case, code, terminal_status, terminal_text) in [
-            (
-                "completed",
-                "text('ready');",
-                CodeCellRuntimeStatus::Completed,
-                "ready",
-            ),
-            (
-                "waited",
-                "text('first'); await yield_control(); text('second');",
-                CodeCellRuntimeStatus::Completed,
-                "second",
-            ),
-            (
-                "terminated",
-                "text('first'); await yield_control(); await new Promise(resolve => setTimeout(resolve, 60_000));",
-                CodeCellRuntimeStatus::Terminated,
-                "",
-            ),
-        ] {
-            let call_id = format!("trace-{case}");
-            let state = Arc::new(ToolDispatchState::new());
-            assert!(state.try_admit());
-            let result = router
-                .dispatch_tool_call_with_terminal_outcome(
-                    Arc::clone(&session),
-                    Arc::clone(&step),
-                    tokio_util::sync::CancellationToken::new(),
-                    Arc::clone(&tracker),
-                    ToolCall {
-                        tool_name: codex_tools::ToolName::plain("exec"),
-                        call_id: call_id.clone(),
-                        payload: ToolPayload::Custom {
-                            input: code.to_string(),
-                        },
-                    },
-                    ToolCallSource::Direct,
-                    state,
-                )
-                .await?;
-            let preview = result.result.log_preview();
-            assert!(
-                preview.contains(if case == "completed" {
-                    "ready"
-                } else {
-                    "first"
-                }),
-                "{preview}"
-            );
-            session.terminal_tasks.close();
-            session.terminal_tasks.wait().await;
-            session.terminal_tasks.reopen();
-            let events = read_events()?;
-            let cell_id = events
-                .iter()
-                .find_map(|event| match &event.payload {
-                    RawTraceEventPayload::CodeCellStarted {
-                        runtime_cell_id,
-                        model_visible_call_id,
-                        source_js,
-                    } if model_visible_call_id == &call_id => {
-                        assert_eq!(source_js, code);
-                        Some(runtime_cell_id.clone())
-                    }
-                    _ => None,
-                })
-                .expect("actual exec start trace is durable before returning");
-            let runtime_id = codex_code_mode::CellId::new(cell_id.clone());
-            if case != "completed" {
-                assert_eq!(
-                    session
-                        .services
-                        .code_mode_service
-                        .cell_parent_call_id(&runtime_id),
-                    Some(call_id.clone())
-                );
-                assert!(!events.iter().any(|event| matches!(&event.payload,
-                    RawTraceEventPayload::CodeCellEnded { runtime_cell_id, .. } if runtime_cell_id == &cell_id)));
-                let state = Arc::new(ToolDispatchState::new());
-                assert!(state.try_admit());
-                let wait_payload = ToolPayload::Function {
-                    arguments:
-                        serde_json::json!({"cell_id":cell_id,"terminate":case == "terminated"})
-                            .to_string(),
-                };
-                let result = router
-                    .dispatch_tool_call_with_terminal_outcome(
-                        Arc::clone(&session),
-                        Arc::clone(&step),
-                        tokio_util::sync::CancellationToken::new(),
-                        Arc::clone(&tracker),
-                        ToolCall {
-                            tool_name: codex_tools::ToolName::plain("wait"),
-                            call_id: format!("wait-{case}"),
-                            payload: wait_payload.clone(),
-                        },
-                        ToolCallSource::Direct,
-                        state,
-                    )
-                    .await?;
-                if case == "waited" {
-                    let waited_preview = result.result.log_preview();
-                    let observed = format!("{preview}\n{waited_preview}");
-                    assert_eq!(
-                        observed
-                            .lines()
-                            .filter(|line| matches!(*line, "first" | "second"))
-                            .collect::<Vec<_>>(),
-                        vec!["first", "second"],
-                        "initial={preview:?}; wait={waited_preview:?}; signal={:?}; canonical={:?}",
-                        result.result.sampling_request_signal(),
-                        result.result.canonical_result(&wait_payload)
-                    );
-                    assert_eq!(
-                        result.result.outcome_for_logging(),
-                        codex_tools::ToolOutputOutcome::Success
-                    );
-                }
-            }
-            session.terminal_tasks.close();
-            session.terminal_tasks.wait().await;
-            session.terminal_tasks.reopen();
-            assert_eq!(
-                session
-                    .services
-                    .code_mode_service
-                    .cell_parent_call_id(&runtime_id),
-                None
-            );
-            let events = read_events()?;
-            let mut sequence = Vec::new();
-            let mut yielded_trace_output = Vec::new();
-            for event in &events {
-                match &event.payload {
-                    RawTraceEventPayload::CodeCellStarted {
-                        runtime_cell_id, ..
-                    } if runtime_cell_id == &cell_id => sequence.push("started"),
-                    RawTraceEventPayload::CodeCellInitialResponse {
-                        runtime_cell_id,
-                        status,
-                        response_payload,
-                    } if runtime_cell_id == &cell_id => {
-                        sequence.push("initial");
-                        assert_eq!(
-                            *status,
-                            if case == "completed" {
-                                CodeCellRuntimeStatus::Completed
-                            } else {
-                                CodeCellRuntimeStatus::Yielded
-                            }
-                        );
-                        let raw: serde_json::Value = serde_json::from_slice(&std::fs::read(
-                            bundle.join(&response_payload.as_ref().expect("initial payload").path),
-                        )?)?;
-                        let response: codex_code_mode::RuntimeResponse =
-                            serde_json::from_value(raw["response"].clone())?;
-                        let content_items = match response {
-                            codex_code_mode::RuntimeResponse::Result {
-                                content_items,
-                                error_text: None,
-                                ..
-                            } if case == "completed" => content_items,
-                            codex_code_mode::RuntimeResponse::ExplicitYield {
-                                content_items,
-                                ..
-                            } if case != "completed" => content_items,
-                            other => panic!("unexpected initial response: {other:?}"),
-                        };
-                        if case == "waited" {
-                            // The script continues after yielding; already-buffered output
-                            // may be delivered with either response, but never lost or repeated.
-                            yielded_trace_output.extend(content_items);
+    struct ObservationFailureSession {
+        initial_fails: bool,
+        observation_fails: std::sync::atomic::AtomicBool,
+    }
+
+    const OBSERVATION_CAPACITY_ERROR: &str =
+        "code-mode pending observation capacity reached; resume an existing cell";
+
+    impl codex_code_mode::CodeModeSession for ObservationFailureSession {
+        fn execute<'a>(
+            &'a self,
+            _request: codex_code_mode::ExecuteRequest,
+        ) -> codex_code_mode::CodeModeSessionResultFuture<'a, codex_code_mode::StartedCell>
+        {
+            let initial_fails = self.initial_fails;
+            Box::pin(async move {
+                let cell_id = CellId::new("observation-failure-cell".into());
+                let response_cell_id = cell_id.clone();
+                Ok(codex_code_mode::StartedCell::from_result_future(
+                    cell_id,
+                    Box::pin(async move {
+                        if initial_fails {
+                            Err(OBSERVATION_CAPACITY_ERROR.into())
                         } else {
-                            assert_eq!(
-                                content_items,
-                                vec![FunctionCallOutputContentItem::InputText {
-                                    text: if case == "completed" {
-                                        "ready"
-                                    } else {
-                                        "first"
-                                    }
-                                    .to_string()
-                                }]
-                            );
+                            Ok(codex_code_mode::RuntimeResponse::Yielded {
+                                cell_id: response_cell_id,
+                                content_items: Vec::new(),
+                            })
                         }
-                    }
-                    RawTraceEventPayload::CodeCellEnded {
-                        runtime_cell_id,
-                        status,
-                        response_payload,
-                    } if runtime_cell_id == &cell_id => {
-                        sequence.push("ended");
-                        assert_eq!(status, &terminal_status);
-                        let raw: serde_json::Value = serde_json::from_slice(&std::fs::read(
-                            bundle.join(&response_payload.as_ref().expect("terminal payload").path),
-                        )?)?;
-                        let response: codex_code_mode::RuntimeResponse =
-                            serde_json::from_value(raw["response"].clone())?;
-                        let content_items = match response {
-                            codex_code_mode::RuntimeResponse::Result {
-                                content_items,
-                                error_text: None,
-                                ..
-                            } if case != "terminated" => content_items,
-                            codex_code_mode::RuntimeResponse::Terminated {
-                                content_items, ..
-                            } if case == "terminated" => content_items,
-                            other => panic!("unexpected terminal response: {other:?}"),
-                        };
-                        if case == "waited" {
-                            yielded_trace_output.extend(content_items);
-                        } else {
-                            assert_eq!(
-                                content_items,
-                                if terminal_text.is_empty() {
-                                    vec![]
-                                } else {
-                                    vec![FunctionCallOutputContentItem::InputText {
-                                        text: terminal_text.to_string(),
-                                    }]
-                                }
-                            );
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            assert_eq!(sequence, vec!["started", "initial", "ended"]);
-            if case == "waited" {
-                assert_eq!(
-                    yielded_trace_output,
-                    vec![
-                        FunctionCallOutputContentItem::InputText {
-                            text: "first".to_string()
-                        },
-                        FunctionCallOutputContentItem::InputText {
-                            text: "second".to_string()
-                        },
-                    ]
-                );
-            }
+                    }),
+                ))
+            })
         }
-        session
-            .services
-            .code_mode_service
-            .shutdown()
-            .await
-            .map_err(anyhow::Error::msg)?;
-        Ok(())
+
+        fn wait<'a>(
+            &'a self,
+            request: codex_code_mode::WaitRequest,
+        ) -> codex_code_mode::CodeModeSessionResultFuture<'a, codex_code_mode::WaitOutcome>
+        {
+            Box::pin(async move {
+                if self.observation_fails.load(std::sync::atomic::Ordering::Acquire) {
+                    Err(OBSERVATION_CAPACITY_ERROR.into())
+                } else {
+                    Ok(codex_code_mode::WaitOutcome::LiveCell(
+                        codex_code_mode::RuntimeResponse::Result {
+                            cell_id: request.cell_id,
+                            content_items: Vec::new(),
+                            error_text: None,
+                            output_loss: None,
+                        },
+                    ))
+                }
+            })
+        }
+
+        fn terminate<'a>(
+            &'a self,
+            cell_id: CellId,
+        ) -> codex_code_mode::CodeModeSessionResultFuture<'a, codex_code_mode::WaitOutcome>
+        {
+            Box::pin(async move {
+                if self.observation_fails.load(std::sync::atomic::Ordering::Acquire) {
+                    Err(OBSERVATION_CAPACITY_ERROR.into())
+                } else {
+                    Ok(codex_code_mode::WaitOutcome::LiveCell(
+                        codex_code_mode::RuntimeResponse::Terminated {
+                            cell_id,
+                            content_items: Vec::new(),
+                        },
+                    ))
+                }
+            })
+        }
+
+        fn shutdown<'a>(&'a self) -> codex_code_mode::CodeModeSessionResultFuture<'a, ()> {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    struct ObservationFailureProvider(Arc<ObservationFailureSession>);
+
+    impl codex_code_mode::CodeModeSessionProvider for ObservationFailureProvider {
+        fn create_session<'a>(
+            &'a self,
+            _delegate: Arc<dyn codex_code_mode::CodeModeSessionDelegate>,
+        ) -> codex_code_mode::CodeModeSessionProviderFuture<'a> {
+            Box::pin(
+                async move { Ok(Arc::clone(&self.0) as Arc<dyn codex_code_mode::CodeModeSession>) },
+            )
+        }
     }
 
     #[tokio::test]
-    async fn queued_code_cell_trace_returns_before_storage_and_retains_ordered_cleanup()
-    -> anyhow::Result<()> {
-        let (session, _) = crate::session::tests::make_session_and_context().await;
-        let session = Arc::new(session);
-        let cell_id = codex_code_mode::CellId::new("trace-cancelled-owner".to_string());
-        session
-            .services
-            .code_mode_service
-            .record_cell_parent_call_id(&cell_id, "outer-trace-call");
-        session
-            .services
-            .code_mode_service
-            .mark_cell_ready_for_dispatch(&cell_id);
-        let lease = CellDispatchLease::new(Arc::clone(&session), cell_id.clone());
-        let root = tempfile::tempdir()?;
-        let output_path = root.path().join("trace-write.txt");
-        let write_path = output_path.clone();
-        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
-        let (release_tx, release_rx) = std::sync::mpsc::channel();
-        lease.record_trace(move || {
-            started_tx.send(()).expect("recording caller still waits");
-            release_rx
-                .recv_timeout(std::time::Duration::from_secs(5))
-                .expect("release writer");
-            std::fs::write(write_path, "accepted trace write").expect("persist actual trace work");
-        });
-        let second_path = output_path.clone();
-        lease.record_trace(move || {
+    async fn observation_failures_preserve_dispatch_until_confirmed_terminal_recovery() {
+        // Exercise both exec observation owners: the initial receiver and the
+        // held wait after automatic yield. Refusals are injected, not timed.
+        for initial_fails in [false, true] {
+            let runtime = Arc::new(ObservationFailureSession {
+                initial_fails,
+                observation_fails: std::sync::atomic::AtomicBool::new(true),
+            });
+            let (mut session, turn) = crate::session::tests::make_session_and_context().await;
+            session.services.code_mode_service = super::super::CodeModeService::new(Arc::new(
+                ObservationFailureProvider(Arc::clone(&runtime)),
+            ));
+            let session = Arc::new(session);
+            let step = crate::session::step_context::StepContext::for_test(Arc::new(turn));
+            let handler = CodeModeExecuteHandler::new(
+                super::super::execute_spec::create_code_mode_tool(true, false, &[], &[]),
+                Vec::new(),
+                Vec::new(),
+            )
+            .unwrap();
+            let output = handler
+                .execute(
+                    Arc::clone(&session),
+                    Arc::clone(&step),
+                    "outer-observation-call".into(),
+                    "text('not replayed');".into(),
+                    tokio_util::sync::CancellationToken::new(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(output.essential_inline["cell_execution_state"], "unknown");
+
+            let service = &session.services.code_mode_service;
+            let cell_id = CellId::new("observation-failure-cell".into());
+            assert!(service.dispatch_broker.has_waitable_cells());
             assert_eq!(
-                std::fs::read_to_string(&second_path).unwrap(),
-                "accepted trace write"
+                service.cell_parent_call_id(&cell_id).as_deref(),
+                Some("outer-observation-call")
             );
-            std::fs::write(second_path, "ordered second trace").unwrap();
-        });
-        drop(lease);
-        tokio::time::timeout(std::time::Duration::from_secs(2), started_rx).await??;
-        assert_eq!(
-            session
-                .services
-                .code_mode_service
-                .cell_parent_call_id(&cell_id)
-                .as_deref(),
-            Some("outer-trace-call")
-        );
-        assert!(
-            session
-                .services
-                .code_mode_service
-                .dispatch_broker
-                .has_waitable_cells()
-        );
-        assert!(!output_path.exists());
-        release_tx.send(())?;
-        session.terminal_tasks.close();
-        tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            session.terminal_tasks.wait(),
-        )
-        .await?;
-        assert_eq!(
-            std::fs::read_to_string(output_path)?,
-            "ordered second trace"
-        );
-        assert_eq!(
-            session
-                .services
-                .code_mode_service
-                .cell_parent_call_id(&cell_id),
-            None
-        );
-        assert!(
-            !session
-                .services
-                .code_mode_service
-                .dispatch_broker
-                .has_waitable_cells()
-        );
-        Ok(())
+            // Dispatch admission must still work after the observation error.
+            // Its required outcome must survive subsequent uncertain packets.
+            let pending = service.begin_packet_call(&cell_id).expect("live dispatch admission");
+            service.complete_packet_call(
+                &cell_id,
+                pending,
+                Vec::new(),
+                None,
+                Some((
+                    crate::tools::context::RequiredToolTerminalCause::Failure,
+                    "REQUIRED_AFTER_OBSERVATION_FAILURE".into(),
+                )),
+            );
+
+            for (call_id, terminate) in [("wait-refused", false), ("terminate-refused", true)] {
+                let output = super::super::CodeModeWaitHandler
+                    .handle(ToolInvocation {
+                        session: Arc::clone(&session),
+                        step_context: Arc::clone(&step),
+                        cancellation_token: tokio_util::sync::CancellationToken::new(),
+                        tracker: Arc::new(tokio::sync::Mutex::new(
+                            crate::turn_diff_tracker::TurnDiffTracker::new(),
+                        )),
+                        call_id: call_id.into(),
+                        tool_name: ToolName::plain(super::super::WAIT_TOOL_NAME),
+                        source: crate::tools::router::ToolCallSource::Direct,
+                        payload: ToolPayload::Function {
+                            arguments: serde_json::json!({
+                                "cell_id": cell_id.as_str(), "terminate": terminate,
+                            }).to_string(),
+                        },
+                    })
+                    .await
+                    .unwrap();
+                assert!(output.log_preview().contains(OBSERVATION_CAPACITY_ERROR));
+                assert!(output.sampling_request_signal().as_ref().is_none_or(|signal| {
+                    signal.get("authoritative_wait_owner_v1").is_none()
+                }));
+                assert!(service.dispatch_broker.has_waitable_cells());
+                assert_eq!(
+                    service.cell_parent_call_id(&cell_id).as_deref(),
+                    Some("outer-observation-call")
+                );
+                assert!(service.packet_admission.lock().unwrap().cells[cell_id.as_str()]
+                    .first_required_terminal.is_some());
+            }
+
+            runtime.observation_fails.store(false, std::sync::atomic::Ordering::Release);
+            let output = super::super::CodeModeWaitHandler
+                .handle(ToolInvocation {
+                    session: Arc::clone(&session),
+                    step_context: step,
+                    cancellation_token: tokio_util::sync::CancellationToken::new(),
+                    tracker: Arc::new(tokio::sync::Mutex::new(
+                        crate::turn_diff_tracker::TurnDiffTracker::new(),
+                    )),
+                    call_id: "terminal-recovery".into(),
+                    tool_name: ToolName::plain(super::super::WAIT_TOOL_NAME),
+                    source: crate::tools::router::ToolCallSource::Direct,
+                    payload: ToolPayload::Function {
+                        arguments: serde_json::json!({
+                            "cell_id": cell_id.as_str(), "terminate": initial_fails,
+                        }).to_string(),
+                    },
+                })
+                .await
+                .unwrap();
+            let signal = output.sampling_request_signal().unwrap();
+            assert_eq!(signal["outcome"], "failure");
+            assert_eq!(
+                signal["authoritative_wait_owner_v1"]["state_revision"],
+                if initial_fails { "terminated" } else { "completed" }
+            );
+            assert!(!service.dispatch_broker.has_waitable_cells());
+            assert_eq!(service.cell_parent_call_id(&cell_id), None);
+            assert_eq!(service.begin_packet_call(&cell_id), None);
+            service.shutdown().await.unwrap();
+        }
     }
+
+    #[test]
+    fn observation_failure_does_not_publish_a_terminal_cell_item() {
+        let cell_id = CellId::new("uncertain-cell".into());
+        let response = super::super::observation_error_response(
+            &cell_id,
+            OBSERVATION_CAPACITY_ERROR.into(),
+        );
+        let item = super::super::failed_code_mode_cell_item(
+            "outer-call",
+            &response,
+            std::time::Duration::ZERO,
+        ).unwrap();
+        assert_eq!(item.status, codex_protocol::items::DynamicToolCallStatus::InProgress);
+        assert_eq!(item.success, None);
+        assert_eq!(item.arguments["state"], "in_progress");
+        assert!(item.error.as_deref().unwrap().contains(OBSERVATION_CAPACITY_ERROR));
+    }
+
 }

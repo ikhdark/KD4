@@ -254,9 +254,26 @@ fn rewrite_input_schema_for_local_file_paths(input_schema: &mut JsonValue, file_
 }
 
 fn rewrite_input_property_schema_as_local_file_path(schema: &mut JsonValue) {
+    if schema == &JsonValue::Bool(true) {
+        *schema = serde_json::json!({"type": "string"});
+        return;
+    }
     let Some(object) = schema.as_object_mut() else {
         return;
     };
+
+    let null_only = object.get("type").and_then(JsonValue::as_str) == Some("null")
+        || object.get("const").is_some_and(JsonValue::is_null)
+        || object.get("enum").and_then(JsonValue::as_array)
+            .is_some_and(|values| !values.is_empty() && values.iter().all(JsonValue::is_null));
+    if null_only { return; }
+    let mut composed = false;
+    for keyword in ["anyOf", "oneOf", "allOf"] {
+        if let Some(branches) = object.get_mut(keyword).and_then(JsonValue::as_array_mut) {
+            composed = true;
+            for branch in branches { rewrite_input_property_schema_as_local_file_path(branch); }
+        }
+    }
 
     let mut description = object
         .get("description")
@@ -264,6 +281,8 @@ fn rewrite_input_property_schema_as_local_file_path(schema: &mut JsonValue) {
         .map(str::to_string)
         .unwrap_or_default();
     let is_array = object.get("type").and_then(JsonValue::as_str) == Some("array")
+        || object.get("type").and_then(JsonValue::as_array)
+            .is_some_and(|types| types.iter().any(|kind| kind.as_str() == Some("array")))
         || object.get("items").is_some();
     let guidance = if is_array {
         "Paths to the files to upload, relative to the primary execution environment's working directory. Absolute paths and parent-directory (`..`) components are not allowed."
@@ -276,13 +295,23 @@ fn rewrite_input_property_schema_as_local_file_path(schema: &mut JsonValue) {
         description = format!("{description} {guidance}");
     }
 
-    object.clear();
     object.insert("description".to_string(), JsonValue::String(description));
     if is_array {
-        object.insert("type".to_string(), JsonValue::String("array".to_string()));
-        object.insert("items".to_string(), serde_json::json!({ "type": "string" }));
-    } else {
-        object.insert("type".to_string(), JsonValue::String("string".to_string()));
+        let items = object.entry("items").or_insert_with(|| serde_json::json!({}));
+        let had_description = items.get("description").is_some();
+        rewrite_input_property_schema_as_local_file_path(items);
+        if !had_description && let Some(items) = items.as_object_mut() {
+            items.remove("description");
+        }
+    } else if !composed || object.contains_key("type") || object.contains_key("properties") {
+        let nullable = object.get("type").and_then(JsonValue::as_array)
+            .is_some_and(|types| types.iter().any(|kind| kind.as_str() == Some("null")));
+        for keyword in ["properties", "required", "additionalProperties", "enum", "const", "default", "examples"] {
+            object.remove(keyword);
+        }
+        object.insert("type".to_string(), if nullable {
+            serde_json::json!(["string", "null"])
+        } else { JsonValue::String("string".to_string()) });
     }
 }
 

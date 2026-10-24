@@ -15,6 +15,7 @@ sha1 = { workspace = true }
 
 [dev-dependencies]
 pretty_assertions = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
 
 [lib]
 doctest = false

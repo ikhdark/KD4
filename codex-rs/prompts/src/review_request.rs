@@ -43,9 +43,9 @@ pub fn resolve_review_request(
     if let ReviewTarget::Commit { sha, .. } = &mut target {
         *sha = codex_git_utils::resolve_commit(cwd, sha)?;
     }
-    let prompt = review_prompt(&target, cwd)?;
     let source_scope =
         codex_git_utils::ReviewSourceScope::capture(cwd, &target).map_err(anyhow::Error::msg)?;
+    let prompt = review_prompt_for_scope(&target, cwd, &source_scope)?;
     let user_facing_hint = request
         .user_facing_hint
         .unwrap_or_else(|| user_facing_hint(&target));
@@ -56,6 +56,20 @@ pub fn resolve_review_request(
         user_facing_hint,
         source_scope,
     })
+}
+
+fn review_prompt_for_scope(
+    target: &ReviewTarget,
+    cwd: &AbsolutePathBuf,
+    source_scope: &codex_git_utils::ReviewSourceScope,
+) -> anyhow::Result<String> {
+    if let ReviewTarget::BaseBranch { branch } = target {
+        let revision = source_scope.comparison_revision()
+            .ok_or_else(|| anyhow::anyhow!("missing captured review comparison"))?;
+        return Ok(render_review_prompt(&BASE_BRANCH_PROMPT_TEMPLATE,
+            [("base_branch", branch.as_str()), ("merge_base_sha", revision)]));
+    }
+    review_prompt(target, cwd)
 }
 
 pub fn review_prompt(target: &ReviewTarget, cwd: &AbsolutePathBuf) -> anyhow::Result<String> {

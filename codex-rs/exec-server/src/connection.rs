@@ -186,15 +186,15 @@ impl StdioTransport {
         let completed = timeout(wait_timeout, async {
             loop {
                 if *terminated_rx.borrow() {
-                    break;
+                    return true;
                 }
                 if terminated_rx.changed().await.is_err() {
-                    break;
+                    return false;
                 }
             }
         })
         .await
-        .is_ok();
+        .unwrap_or(false);
         if !completed {
             warn!("exec-server stdio child supervisor exceeded its termination deadline");
         }
@@ -229,30 +229,31 @@ fn spawn_stdio_child_supervisor(
 ) {
     let process_group_id = child_process.id();
     tokio::spawn(async move {
-        let _completion = StdioChildSupervisorCompletion(terminated_tx);
         tokio::select! {
             result = child_process.wait() => {
-                log_stdio_child_wait_result(result);
-                kill_process_tree(&mut child_process, process_group_id).await;
+                match result {
+                    Ok(_) => {
+                        // wait() released the root handle: its numeric PID is no
+                        // longer a safe cleanup identity. The Job still owns descendants.
+                        if let Some(root) = managed_root.as_ref()
+                            && let Err(err) = root.terminate()
+                        {
+                            debug!("failed to terminate exec-server stdio descendants: {err}");
+                        }
+                    }
+                    Err(err) => {
+                        debug!("failed to wait for exec-server stdio child: {err}");
+                        terminate_stdio_child(&mut child_process, managed_root.as_deref(), process_group_id).await;
+                    }
+                }
             }
             () = wait_for_stdio_termination(&mut terminate_rx) => {
-                if let Some(managed_root) = managed_root.as_ref()
-                    && let Err(err) = managed_root.terminate()
-                {
-                    debug!("failed to terminate managed exec-server stdio process tree: {err}");
-                }
-                terminate_stdio_child(&mut child_process, process_group_id).await;
+                terminate_stdio_child(&mut child_process, managed_root.as_deref(), process_group_id).await;
             }
         }
+        drop(managed_root);
+        terminated_tx.send_replace(true);
     });
-}
-
-struct StdioChildSupervisorCompletion(watch::Sender<bool>);
-
-impl Drop for StdioChildSupervisorCompletion {
-    fn drop(&mut self) {
-        self.0.send_replace(true);
-    }
 }
 
 async fn wait_for_stdio_termination(terminate_rx: &mut watch::Receiver<bool>) {
@@ -266,43 +267,44 @@ async fn wait_for_stdio_termination(terminate_rx: &mut watch::Receiver<bool>) {
     }
 }
 
-async fn terminate_stdio_child(child_process: &mut Child, process_group_id: Option<u32>) {
-    terminate_process_tree(child_process, process_group_id).await;
-    match timeout(STDIO_TERMINATION_GRACE_PERIOD, child_process.wait()).await {
-        Ok(result) => {
-            log_stdio_child_wait_result(result);
-        }
-        Err(_) => {
-            kill_process_tree(child_process, process_group_id).await;
-            match timeout(STDIO_FORCE_REAP_TIMEOUT, child_process.wait()).await {
-                Ok(result) => log_stdio_child_wait_result(result),
-                Err(_) => warn!(
-                    "exec-server stdio child did not exit after forced termination within {STDIO_FORCE_REAP_TIMEOUT:?}"
-                ),
+async fn terminate_stdio_child(
+    child_process: &mut Child,
+    managed_root: Option<&ManagedRootProcess>,
+    process_group_id: Option<u32>,
+) {
+    let mut wait_timeout = STDIO_TERMINATION_GRACE_PERIOD;
+    loop {
+        if let Some(root) = managed_root {
+            if let Err(err) = root.terminate() {
+                debug!("failed to terminate managed exec-server stdio process tree: {err}");
+                kill_direct_child(child_process, "kill");
             }
+        } else {
+            kill_process_tree(child_process, process_group_id).await;
         }
-    }
-}
-
-async fn terminate_process_tree(child_process: &mut Child, process_group_id: Option<u32>) {
-    let Some(process_group_id) = process_group_id else {
-        kill_direct_child(child_process, "terminate");
-        return;
-    };
-
-    if !kill_windows_process_tree(process_group_id).await {
-        kill_direct_child(child_process, "terminate");
+        match timeout(wait_timeout, child_process.wait()).await {
+            Ok(Ok(_)) => return,
+            Ok(Err(err)) => {
+                debug!("failed to wait for exec-server stdio child; retaining admission: {err}");
+                if matches!(child_process.try_wait(), Ok(Some(_))) {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            Err(_) => warn!("exec-server stdio child exit remains unconfirmed; retaining admission"),
+        }
+        wait_timeout = STDIO_FORCE_REAP_TIMEOUT;
     }
 }
 
 async fn kill_process_tree(child_process: &mut Child, process_group_id: Option<u32>) {
     let Some(process_group_id) = process_group_id else {
-        kill_direct_child(child_process, "kill");
+        kill_direct_child(child_process, "terminate");
         return;
     };
 
     if !kill_windows_process_tree(process_group_id).await {
-        kill_direct_child(child_process, "kill");
+        kill_direct_child(child_process, "terminate");
     }
 }
 
@@ -330,12 +332,6 @@ async fn kill_windows_process_tree(pid: u32) -> bool {
             warn!("failed to run taskkill for exec-server stdio process tree {pid}: {err}");
             false
         }
-    }
-}
-
-fn log_stdio_child_wait_result(result: std::io::Result<std::process::ExitStatus>) {
-    if let Err(err) = result {
-        debug!("failed to wait for exec-server stdio child: {err}");
     }
 }
 
@@ -773,7 +769,49 @@ where
 }
 
 fn serialize_jsonrpc_message(message: &JSONRPCMessage) -> Result<String, serde_json::Error> {
-    serde_json::to_string(message)
+    serialize_jsonrpc_message_with_limit(message, MAX_JSONRPC_MESSAGE_LEN)
+}
+
+fn serialize_jsonrpc_message_with_limit(message: &JSONRPCMessage, limit: usize) -> Result<String, serde_json::Error> {
+    let encode = |message: &JSONRPCMessage| {
+        let mut buffer = BoundedJsonBuffer { bytes: Vec::new(), limit };
+        serde_json::to_writer(&mut buffer, message)?;
+        String::from_utf8(buffer.bytes).map_err(|error| serde_json::Error::io(std::io::Error::other(error)))
+    };
+    match encode(message) {
+        Ok(wire) => Ok(wire),
+        Err(error) => {
+            let id = match message {
+                JSONRPCMessage::Response(response) => &response.id,
+                JSONRPCMessage::Error(response) => &response.id,
+                _ => return Err(error),
+            };
+            // An operation's oversized response must not tear down unrelated
+            // sessions. Echo the admitted identity in a bounded error instead.
+            encode(&JSONRPCMessage::Error(codex_exec_server_protocol::JSONRPCError {
+                id: id.clone(),
+                error: crate::rpc::internal_error("exec-server response exceeds the JSON-RPC byte limit".into()),
+            }))
+        }
+    }
+}
+
+struct BoundedJsonBuffer { bytes: Vec<u8>, limit: usize }
+
+impl std::io::Write for BoundedJsonBuffer {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        if bytes.len() > self.limit.saturating_sub(self.bytes.len()) {
+            return Err(std::io::Error::other("JSON-RPC byte limit exceeded"));
+        }
+        let required = self.bytes.len() + bytes.len();
+        if required > self.bytes.capacity() {
+            let capacity = required.max(self.bytes.capacity().saturating_mul(2)).min(self.limit);
+            self.bytes.try_reserve_exact(capacity - self.bytes.len()).map_err(std::io::Error::other)?;
+        }
+        self.bytes.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
 }
 
 #[cfg(test)]
@@ -796,6 +834,22 @@ mod tests {
     use tokio_tungstenite::connect_async;
 
     use super::*;
+
+    #[test]
+    fn response_serialization_bounds_the_complete_envelope_and_preserves_correlation() {
+        let response = JSONRPCMessage::Response(codex_exec_server_protocol::JSONRPCResponse {
+            id: RequestId::String("\u{1}".repeat(8)),
+            result: serde_json::json!({"payload":"x".repeat(1024)}),
+        });
+        let expected = serde_json::to_string(&response).unwrap();
+        assert_eq!(serialize_jsonrpc_message_with_limit(&response, expected.len()).unwrap(), expected);
+        for limit in [expected.len() - 1, 256] {
+            let wire = serialize_jsonrpc_message_with_limit(&response, limit).unwrap();
+            assert!(wire.len() <= limit);
+            let JSONRPCMessage::Error(error) = serde_json::from_str(&wire).unwrap() else { panic!("bounded response error"); };
+            assert_eq!(error.id, RequestId::String("\u{1}".repeat(8)));
+        }
+    }
 
     #[tokio::test(start_paused = true)]
     async fn stdio_transport_close_has_a_deadline_without_discarding_supervisor_state() {

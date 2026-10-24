@@ -10,6 +10,7 @@
 //! decides only how long to wait; it never decides who cancelled.
 
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::OnceLock;
 
 use codex_protocol::protocol::TurnAbortReason;
@@ -60,6 +61,50 @@ fn turn_abort_reason_label(reason: &TurnAbortReason) -> &'static str {
     }
 }
 
+/// Read-only stable effective cause, including an earlier ancestor cause.
+#[derive(Debug)]
+pub struct CancellationCauseCell {
+    value: OnceLock<CancellationCause>,
+    parent: Option<Arc<Self>>,
+    arbitration: Arc<Mutex<()>>,
+}
+
+impl CancellationCauseCell {
+    fn new() -> Self {
+        Self { value: OnceLock::new(), parent: None, arbitration: Arc::new(Mutex::new(())) }
+    }
+
+    fn inherited(parent: Arc<Self>) -> Self {
+        Self { value: OnceLock::new(), arbitration: Arc::clone(&parent.arbitration), parent: Some(parent) }
+    }
+
+    // Caller holds the tree-wide lock; no callbacks or asynchronous waits.
+    fn resolve(&self) -> Option<&CancellationCause> {
+        if self.value.get().is_none()
+            && let Some(cause) = self.parent.as_ref().and_then(|parent| parent.resolve())
+        {
+            let _ = self.value.set(cause.clone());
+        }
+        self.value.get()
+    }
+
+    pub fn get(&self) -> Option<&CancellationCause> {
+        let _guard = self.arbitration.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.resolve()
+    }
+
+    fn record(&self, cause: CancellationCause) -> bool {
+        let _guard = self.arbitration.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if self.resolve().is_some() { return false; }
+        self.value.set(cause).is_ok()
+    }
+}
+
+impl PartialEq for CancellationCauseCell {
+    fn eq(&self, other: &Self) -> bool { self.get() == other.get() }
+}
+impl Eq for CancellationCauseCell {}
+
 /// A cancellation token paired with the write-once record of why it fired.
 ///
 /// Arbitration between competing origins is deterministic by construction: the
@@ -69,34 +114,20 @@ fn turn_abort_reason_label(reason: &TurnAbortReason) -> &'static str {
 #[derive(Clone, Debug)]
 pub struct NestedCancellation {
     token: CancellationToken,
-    cause: Arc<OnceLock<CancellationCause>>,
-    /// Cause cell of the scope this one was derived from, consulted when this
-    /// call recorded none of its own.
-    ///
-    /// A scope-wide origin — the cell closing, the dispatcher shutting down —
-    /// signals one token that cancels every call under it, and cannot write
-    /// into cells it does not enumerate. The per-call cause still wins, so a
-    /// call cancelled by its own deadline keeps that attribution even while the
-    /// enclosing scope is also tearing down.
-    inherited_cause: Option<Arc<OnceLock<CancellationCause>>>,
+    cause: Arc<CancellationCauseCell>,
 }
 
 impl NestedCancellation {
     pub fn new(token: CancellationToken) -> Self {
         Self {
             token,
-            cause: Arc::new(OnceLock::new()),
-            inherited_cause: None,
+            cause: Arc::new(CancellationCauseCell::new()),
         }
     }
 
     /// Wraps a token whose cause is recorded elsewhere, sharing that cell.
-    pub fn with_cause(token: CancellationToken, cause: Arc<OnceLock<CancellationCause>>) -> Self {
-        Self {
-            token,
-            cause,
-            inherited_cause: None,
-        }
+    pub fn with_cause(token: CancellationToken, cause: Arc<CancellationCauseCell>) -> Self {
+        Self { token, cause }
     }
 
     /// A cancellation for one call inside this scope: its own write-once cell,
@@ -104,8 +135,7 @@ impl NestedCancellation {
     pub fn child(&self, token: CancellationToken) -> Self {
         Self {
             token,
-            cause: Arc::new(OnceLock::new()),
-            inherited_cause: Some(Arc::clone(&self.cause)),
+            cause: Arc::new(CancellationCauseCell::inherited(Arc::clone(&self.cause))),
         }
     }
 
@@ -115,7 +145,7 @@ impl NestedCancellation {
 
     /// The shared cell, for an origin that signals a different token derived
     /// from the same cancellation.
-    pub fn cause_cell(&self) -> Arc<OnceLock<CancellationCause>> {
+    pub fn cause_cell(&self) -> Arc<CancellationCauseCell> {
         Arc::clone(&self.cause)
     }
 
@@ -125,7 +155,7 @@ impl NestedCancellation {
     /// A losing origin is not an error: two origins can genuinely race, and the
     /// first to record is the one that decided the outcome.
     pub fn record_cause(&self, cause: CancellationCause) -> bool {
-        self.cause.set(cause).is_ok()
+        self.cause.record(cause)
     }
 
     /// Records the cause, then cancels. Ordering matters: an observer that
@@ -137,11 +167,10 @@ impl NestedCancellation {
 
     /// The recorded cause, or `None` when nothing recorded one.
     ///
-    /// This call's own cause wins over the enclosing scope's.
+    /// An earlier local or inherited cause wins permanently.
     pub fn cause(&self) -> Option<CancellationCause> {
         self.cause
             .get()
-            .or_else(|| self.inherited_cause.as_ref()?.get())
             .cloned()
     }
 
@@ -160,6 +189,36 @@ mod tests {
     use super::NestedCancellation;
     use codex_protocol::protocol::TurnAbortReason;
     use tokio_util::sync::CancellationToken;
+
+    #[test]
+    fn inherited_cause_is_stable_through_exported_cells_and_multiple_generations() {
+        let parent = NestedCancellation::new(CancellationToken::new());
+        let child = parent.child(parent.token().child_token());
+        let grandchild = child.child(child.token().child_token());
+        let exported = grandchild.cause_cell();
+        parent.cancel_with(CancellationCause::RuntimeShutdown);
+        assert_eq!(exported.get(), Some(&CancellationCause::RuntimeShutdown));
+        assert!(!grandchild.record_cause(CancellationCause::NestedDeadline));
+        assert_eq!(grandchild.cause(), Some(CancellationCause::RuntimeShutdown));
+        assert!(grandchild.is_cancelled());
+    }
+
+    #[test]
+    fn racing_parent_and_child_causes_cannot_change_after_observation() {
+        for _ in 0..100 {
+            let parent = NestedCancellation::new(CancellationToken::new());
+            let child = parent.child(parent.token().child_token());
+            let barrier = std::sync::Barrier::new(2);
+            std::thread::scope(|scope| {
+                scope.spawn(|| { barrier.wait(); parent.cancel_with(CancellationCause::RuntimeShutdown); });
+                barrier.wait();
+                child.cancel_with(CancellationCause::NestedDeadline);
+                let observed = child.cause();
+                parent.cancel_with(CancellationCause::RuntimeShutdown);
+                assert_eq!(child.cause(), observed);
+            });
+        }
+    }
 
     #[test]
     fn the_first_recorded_cause_wins_and_cannot_be_overwritten() {

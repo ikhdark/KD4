@@ -49,7 +49,7 @@ pub(super) fn run(
     });
     prepare_capture_file(&capture_path)?;
     let mut client = spawn_client(codex_bin, config_overrides, &capture_path)?;
-    wait_until_capture_is_ready(&capture_path)?;
+    wait_until_capture_is_ready(&capture_path, &mut client)?;
     client.initialize()?;
 
     let initial = read_remote_plugin(&mut client, remote_plugin_id)?;

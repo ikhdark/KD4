@@ -1,10 +1,23 @@
-fn main() -> anyhow::Result<()> {
+fn main() -> std::process::ExitCode {
+    match run() {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(error) => {
+            tracing::error!(%error, "code-mode host failed");
+            std::process::ExitCode::FAILURE
+        }
+    }
+}
+
+fn run() -> anyhow::Result<()> {
     // A stalled parent must not block the single runtime thread on stderr.
     let (telemetry_writer, telemetry_guard) = host_telemetry_writer(std::io::stderr());
     // The appender guard's full-queue shutdown fallback prints to stdout.
     // This dedicated process owns one bounded worker for its entire lifetime;
     // leave its best-effort queue to process teardown rather than corrupt IPC.
     std::mem::forget(telemetry_guard);
+    // Never invoke the default synchronous stderr panic hook. The lossy sink
+    // also bounds panic reporting before supervised tasks can unwind.
+    std::panic::set_hook(Box::new(|panic| tracing::error!(%panic, "code-mode host panicked")));
     tracing_subscriber::fmt()
         .with_max_level(tracing::Level::INFO)
         .with_ansi(false)

@@ -18,7 +18,6 @@ prompt.md
 /codex-rs/model-provider-info/**
 /codex-rs/process-hardening/**
 /codex-rs/response-debug-context/**
-/codex-rs/responses-api-proxy/**
 /codex-rs/utils/rustls-provider/**
 /codex-rs/stdio-to-uds/**
 /codex-rs/terminal-detection/**

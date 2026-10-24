@@ -167,7 +167,7 @@ fn selector_schema(include_sections: bool) -> JsonSchema {
 pub(crate) fn create_read_tool_output_tool() -> ToolSpec {
     let selector_schema = tool_output_selector_schema();
     let artifact_id = JsonSchema::string(Some(
-        "Opaque UUID from the original tool projection.".to_string(),
+        "Opaque UUID from a tool projection retained by this thread; other agents cannot read it.".to_string(),
     ));
     let selectors = bounded_array(
         selector_schema.clone(),
@@ -178,7 +178,7 @@ pub(crate) fn create_read_tool_output_tool() -> ToolSpec {
 
     ToolSpec::Function(ResponsesApiTool {
         name: READ_TOOL_OUTPUT_TOOL_NAME.to_string(),
-        description: "Read a saved tool-output snapshot without rerunning the tool. Batch known searches or selections in one call to share authenticated snapshot validation. Search results include matching text in results[].value.hydrated_ranges; a complete search page can still have more matches. Returns exact text or data_base64 for arbitrary bytes up to max_bytes plus continuation metadata; complete indicates requested-selection delivery, not full capture or current workspace freshness. Raw command capture retains at most 16 MiB; capture gaps or safety limits mean missing bytes cannot be recovered by paging. Check retained_artifact_complete and continuation_stop.reason/resumable; preserve successful siblings and retry only missing selections. In scripts consume recovered data and print only needed evidence to avoid another enclosing display truncation. Never rerun the producer merely to recover output.".to_string(),
+        description: "Read a saved tool-output snapshot without rerunning the tool. Artifacts are thread-private: passing an ID to another agent does not grant access. Have the owning agent recover and share the needed evidence instead. Batch known searches or selections in one call to share authenticated snapshot validation. Search results include matching text in results[].value.hydrated_ranges; a complete search page can still have more matches. Returns exact text or data_base64 for arbitrary bytes up to max_bytes plus continuation metadata; complete indicates requested-selection delivery, not full capture or current workspace freshness. Command logs retain full output on disk and support line ranges only. Source snapshots retain advanced selectors. Capture gaps and disk failures remain explicitly incomplete. Check retained_artifact_complete and continuation_stop.reason/resumable; preserve successful siblings and retry only missing selections. In scripts consume recovered data and print only needed evidence to avoid another enclosing display truncation. Never rerun the producer merely to recover output.".to_string(),
         strict: false,
         defer_loading: None,
         parameters: JsonSchema::object(
@@ -224,7 +224,7 @@ pub(crate) fn read_tool_output_output_schema(mut selector_schema: JsonSchema) ->
             "delivered_selection_complete": {"type": "boolean", "description": "All requested selectors were delivered completely; legacy complete has the same meaning."},
             "criterion_evidence": {
                 "type": "object",
-                "description": "Host-recorded source acquisition for the original active typed attempt after all exact snapshot bytes were delivered. Not semantic correctness or current-source proof.",
+                "description": "Durable source_inspection evidence reference for the original active typed attempt's exact inspect:path obligation, after all exact native snapshot bytes were acquired and the authorized current file matched its hash. Also discoverable in get_agent_task.validation_calls. Search hydration, listings and retained bytes alone are not acquisition; this is not semantic correctness or a continuing freshness guarantee.",
                 "properties": {
                     "call_id": {"type": "string"}, "workspace_id": {"type": "string"},
                     "evidence_epoch": {"type": "integer", "minimum": 0},
@@ -233,7 +233,7 @@ pub(crate) fn read_tool_output_output_schema(mut selector_schema: JsonSchema) ->
                 "required": ["call_id", "workspace_id", "evidence_epoch", "kind"],
                 "additionalProperties": false
             },
-            "inspection_proof_error": {"type": "string"},
+            "inspection_proof_error": {"type": "string", "description": "The native selection remains usable, but source-inspection proof could not be published (for example, the source changed or persistence failed). Never interpret this as an acquisition receipt."},
             "unavailable_ranges": {"type": "array", "items": {"$ref": "#/$defs/range"}},
             "results": {"type": "array", "items": {"$ref": "#/$defs/result"}},
             "continuation_stop": {

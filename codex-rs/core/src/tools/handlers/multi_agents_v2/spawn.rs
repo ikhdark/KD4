@@ -1,7 +1,7 @@
 use super::*;
 #[cfg(test)]
-#[path = "spawn_audit151_tests.rs"]
-mod audit151_tests;
+#[path = "spawn_producer_liveness_tests.rs"]
+mod producer_liveness_tests;
 use crate::agent::control::SpawnAgentForkMode;
 use crate::agent::control::SpawnAgentOptions;
 use crate::agent::next_thread_spawn_depth;
@@ -168,6 +168,11 @@ async fn handle_spawn_agent(
     let turn = Arc::clone(&step_context.turn);
     let arguments = function_arguments(payload)?;
     let mut args: SpawnAgentArgs = parse_arguments(&arguments)?;
+    // Reject the canonical lexical domain before configuration, environment
+    // observation, task-store startup or workspace preparation can run.
+    AgentPath::root()
+        .join(&args.task_name)
+        .map_err(FunctionCallError::RespondToModel)?;
     if turn.session_source.is_non_root_agent() && args.assignment.is_some() {
         return Err(FunctionCallError::RespondToModel(
             "spawn_agent: durable typed assignments are root-only".to_string(),
@@ -337,52 +342,7 @@ async fn handle_spawn_agent(
             "spawned agent is missing a canonical task name".to_string(),
         )
     })?;
-    if typed_role == AgentRole::Explorer
-        && let Some(assignment) = args.assignment.as_ref()
-        && assignment.workspace_strategy != WorkspaceStrategy::Isolated
-    {
-        let coordinator = session.services.agent_control.task_coordinator();
-        if coordinator.store().is_none() {
-            coordinator
-                .initialize_for_workspace_coordination(
-                    session.services.state_db.clone(),
-                    config.sqlite_home.clone(),
-                    config.model_provider_id.clone(),
-                    session.services.agent_control.session_id().to_string(),
-                )
-                .await
-                .map_err(typed_task_store_error)?;
-        }
-        if let (Some(store), Some(root)) = (coordinator.store(), coordinator.root_session_id()) {
-            let cwd = admission_cwd.to_path_buf();
-            let repo_root = get_git_repo_root(&cwd).unwrap_or(cwd);
-            if let Some(existing) = store
-                .reusable_explorer_assignment(
-                    &repo_root,
-                    assignment.clone().into_draft(root, typed_role),
-                )
-                .await
-                .map_err(typed_task_store_error)?
-            {
-                let requested_handles = reuse_request_handles(
-                    matches!(fork_mode, Some(SpawnAgentForkMode::TaskCapsule)),
-                    &repo_root,
-                    &assignment.read_scope,
-                    &assignment.write_scope,
-                    assignment.relevant_handles.clone(),
-                )
-                .await?;
-                let result = reusable_spawn_result(
-                    &session.services.agent_control,
-                    existing,
-                    requested_handles.as_deref(),
-                )
-                .await?;
-                emit_admission_reuse_metric(&turn.session_telemetry);
-                return Ok(result);
-            }
-        }
-    }
+
     // Typed spawns reserve execution, registry identity, and V2 residency before any
     // worktree or durable assignment preparation. The token holds only logical RAII
     // reservations; all synchronization guards used to create it have already been released.
@@ -1085,11 +1045,6 @@ fn emit_admission_rejection_metric(session_telemetry: &SessionTelemetry, error: 
             AdmissionRejectionReason::IsolatedIntegratorUnavailable => {
                 ("isolated_integrator_unavailable", None, 0)
             }
-            AdmissionRejectionReason::ExternalWorkspaceWriter => (
-                "external_workspace_writer",
-                Some("external_write_overlap"),
-                1,
-            ),
         },
         _ => ("other", None, 0),
     };

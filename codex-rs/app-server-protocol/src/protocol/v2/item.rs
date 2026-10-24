@@ -539,7 +539,8 @@ impl From<CoreTurnItem> for ThreadItem {
                 stdout: command.stdout,
                 stderr: command.stderr,
                 command: command_display_string(&command.command),
-                cwd: command.cwd.clone().into(),
+                command_actions: command_actions_for_path_uri(&command.parsed_cmd, &command.cwd),
+                cwd: command.cwd.into(),
                 process_id: command.process_id,
                 parent_call_id: command.parent_call_id,
                 parent_cell_id: command.parent_cell_id,
@@ -547,7 +548,6 @@ impl From<CoreTurnItem> for ThreadItem {
                 execution_id: command.execution_id,
                 source: command.source.into(),
                 status: command.status.into(),
-                command_actions: command_actions_for_path_uri(&command.parsed_cmd, &command.cwd),
                 aggregated_output: command
                     .aggregated_output
                     .filter(|output| !output.is_empty()),
@@ -625,6 +625,7 @@ impl From<CoreTurnItem> for ThreadItem {
                     status: image.status,
                     revised_prompt: image.revised_prompt,
                     result: image.result,
+                    error: image.error,
                     saved_path: image.saved_path,
                     provider_usage: image.provider_usage,
                 })

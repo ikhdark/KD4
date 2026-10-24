@@ -8,7 +8,6 @@ use super::select_initial;
 use super::transform;
 
 use super::transform_for_direct_spawn_with_codex_home;
-use super::with_managed_mitm_ca_readable_root;
 use codex_protocol::config_types::WindowsSandboxLevel;
 use codex_protocol::models::AdditionalPermissionProfile;
 use codex_protocol::models::FileSystemPermissions;
@@ -123,14 +122,10 @@ fn unsandboxed_transform_preserves_foreign_cwd_and_unrestricted_file_system_poli
             args: Vec::new(),
             cwd: cwd_uri.clone(),
             env: HashMap::new(),
-            managed_network: None,
             additional_permissions: None,
         },
         permissions: &permissions,
         sandbox: SandboxType::None,
-        enforce_managed_network: false,
-        environment_id: None,
-        network: None,
         sandbox_policy_cwd: &cwd_uri,
         windows_sandbox_level: WindowsSandboxLevel::Disabled,
         windows_sandbox_private_desktop: false,
@@ -167,7 +162,6 @@ fn transform_additional_permissions_enable_network_for_external_sandbox() {
             args: Vec::new(),
             cwd: cwd_uri.clone(),
             env: HashMap::new(),
-            managed_network: None,
             additional_permissions: Some(AdditionalPermissionProfile {
                 network: Some(NetworkPermissions {
                     enabled: Some(true),
@@ -180,9 +174,6 @@ fn transform_additional_permissions_enable_network_for_external_sandbox() {
         },
         permissions: &permissions,
         sandbox: SandboxType::None,
-        enforce_managed_network: false,
-        environment_id: None,
-        network: None,
         sandbox_policy_cwd: &cwd_uri,
         windows_sandbox_level: WindowsSandboxLevel::Disabled,
         windows_sandbox_private_desktop: false,
@@ -236,7 +227,6 @@ fn transform_additional_permissions_preserves_denied_entries() {
             args: Vec::new(),
             cwd: cwd_uri.clone(),
             env: HashMap::new(),
-            managed_network: None,
             additional_permissions: Some(AdditionalPermissionProfile {
                 file_system: Some(FileSystemPermissions::from_read_write_roots(
                     /*read*/ None,
@@ -247,9 +237,6 @@ fn transform_additional_permissions_preserves_denied_entries() {
         },
         permissions: &permissions,
         sandbox: SandboxType::None,
-        enforce_managed_network: false,
-        environment_id: None,
-        network: None,
         sandbox_policy_cwd: &cwd_uri,
         windows_sandbox_level: WindowsSandboxLevel::Disabled,
         windows_sandbox_private_desktop: false,
@@ -281,47 +268,6 @@ fn transform_additional_permissions_preserves_denied_entries() {
     );
 }
 
-#[test]
-fn managed_mitm_ca_bundle_becomes_readable_for_restricted_sandbox() {
-    let cwd = TempDir::new().expect("create cwd");
-    let cwd =
-        AbsolutePathBuf::from_absolute_path(canonicalize(cwd.path()).expect("canonicalize cwd"))
-            .expect("absolute cwd");
-    let managed_bundle_dir = TempDir::new().expect("create managed bundle dir");
-    let managed_bundle_path =
-        AbsolutePathBuf::from_absolute_path(managed_bundle_dir.path().join("ca-bundle.pem"))
-            .expect("absolute managed bundle path");
-    let permission_profile = PermissionProfile::from_runtime_permissions(
-        &FileSystemSandboxPolicy::restricted(vec![FileSystemSandboxEntry {
-            path: FileSystemPath::Path { path: cwd.clone() },
-            access: FileSystemAccessMode::Read,
-        }]),
-        NetworkSandboxPolicy::Restricted,
-    );
-
-    let permission_profile = with_managed_mitm_ca_readable_root(
-        permission_profile,
-        Some(&managed_bundle_path),
-        cwd.as_path(),
-    );
-    let (file_system_sandbox_policy, _) = permission_profile.to_runtime_permissions();
-
-    assert_eq!(
-        file_system_sandbox_policy,
-        FileSystemSandboxPolicy::restricted(vec![
-            FileSystemSandboxEntry {
-                path: FileSystemPath::Path { path: cwd },
-                access: FileSystemAccessMode::Read,
-            },
-            FileSystemSandboxEntry {
-                path: FileSystemPath::Path {
-                    path: managed_bundle_path,
-                },
-                access: FileSystemAccessMode::Read,
-            },
-        ])
-    );
-}
 
 #[test]
 fn transform_for_direct_spawn_windows_preserves_only_wrapper_setup_identity() {
@@ -404,14 +350,10 @@ fn transform_for_direct_spawn_windows_materializes_inner_helper() {
                     args: vec!["--codex-run-as-fs-helper".to_string()],
                     cwd: cwd_uri.clone(),
                     env: HashMap::from([("Path".to_string(), r"C:\Windows\System32".to_string())]),
-                    managed_network: None,
                     additional_permissions: None,
                 },
                 permissions: &permissions,
                 sandbox: SandboxType::WindowsRestrictedToken,
-                enforce_managed_network: false,
-                environment_id: None,
-                network: None,
                 sandbox_policy_cwd: &cwd_uri,
                 windows_sandbox_level: WindowsSandboxLevel::Elevated,
                 windows_sandbox_private_desktop: false,

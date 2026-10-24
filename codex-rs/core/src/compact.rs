@@ -1752,7 +1752,9 @@ pub fn content_items_to_text(content: &[ContentItem]) -> Option<String> {
     let mut pieces = Vec::new();
     for item in content {
         match item {
-            ContentItem::InputText { text } | ContentItem::OutputText { text } => {
+            ContentItem::InputText { text }
+            | ContentItem::OutputText { text }
+            | ContentItem::Refusal { refusal: text } => {
                 if !text.is_empty() {
                     pieces.push(text.as_str());
                 }
@@ -1815,7 +1817,6 @@ fn collect_user_messages_with_indices(
                         !is_trusted_stable_context_item(item)
                             || retain_latest_task_state_fragment(part, &mut seen_task_state)
                     })
-                    .cloned()
                     .collect::<Vec<_>>();
                 retained.reverse();
                 if retained.is_empty() && !content.is_empty() {
@@ -1824,7 +1825,7 @@ fn collect_user_messages_with_indices(
                 // Compaction is not a UI projection: path/number wrappers are
                 // part of the image's model-visible source identity.
                 let content = retained
-                    .iter()
+                    .into_iter()
                     .filter_map(|part| match part {
                         ContentItem::InputText { text } => Some(UserInput::Text {
                             text: text.clone(),
@@ -1834,7 +1835,7 @@ fn collect_user_messages_with_indices(
                             image_url: image_url.clone(),
                             detail: *detail,
                         }),
-                        ContentItem::OutputText { .. } => None,
+                        ContentItem::OutputText { .. } | ContentItem::Refusal { .. } => None,
                     })
                     .collect();
                 Some((
@@ -1970,20 +1971,27 @@ fn compaction_summary_items(items: &[ResponseItem]) -> Vec<ResponseItem> {
         .map_or(0, |index| index + 1);
     let pairs = crate::tool_occurrence::pairs(items);
     let unpaired = unpaired_compaction_outputs(items, &pairs, end);
-    items
+    let retained = items
         .iter()
         .enumerate()
-        .filter(|(index, item)| {
+        .map(|(index, item)| {
             // A tail phase checkpoint still retires consumed outputs above it;
             // a pinned summarizer input applies it as sampling did.
-            (*index < end
+            (index < end
                 || is_compaction_summary_item(item)
                 || crate::tool_history::phase_checkpoint_ids(item).is_some())
-                && !pairs[*index].is_some_and(|paired| *index < end && paired >= end)
+                && !pairs[index].is_some_and(|paired| index < end && paired >= end)
                 && !crate::tool_occurrence::identity(item)
                     .is_some_and(|(kind, call, id)| call && unpaired.contains(&(kind, id)))
         })
-        .map(|(_, item)| item.clone())
+        .collect::<Vec<_>>();
+    // The pairing keys borrow `current`; keep only the small selection mask
+    // before moving the selected items out of the already-owned snapshot.
+    drop(unpaired);
+    current
+        .into_iter()
+        .zip(retained)
+        .filter_map(|(item, retain)| retain.then_some(item))
         .collect()
 }
 
@@ -2164,8 +2172,8 @@ pub(crate) fn task_compaction_items(items: &[ResponseItem]) -> Vec<ResponseItem>
     );
     let latest_summary = items.iter().rposition(is_compaction_summary_item);
     let mut retained = strip_compaction_startup_envelopes(
-        items
-            .iter()
+        current
+            .into_iter()
             .enumerate()
             .filter(|(index, item)| {
                 *index >= unresolved_start
@@ -2184,7 +2192,7 @@ pub(crate) fn task_compaction_items(items: &[ResponseItem]) -> Vec<ResponseItem>
                     || (matches!(item, ResponseItem::Message { role, .. } if role == "user")
                         && !is_compaction_summary_item(item))
             })
-            .map(|(_, item)| item.clone())
+            .map(|(_, item)| item)
             .collect::<Vec<_>>(),
     );
     let mut seen_task_state = false;
@@ -2540,7 +2548,9 @@ fn response_item_text_tokens(item: &ResponseItem) -> usize {
         ResponseItem::Message { content, .. } => content
             .iter()
             .filter_map(|item| match item {
-                ContentItem::InputText { text } | ContentItem::OutputText { text } => {
+                ContentItem::InputText { text }
+                | ContentItem::OutputText { text }
+                | ContentItem::Refusal { refusal: text } => {
                     Some(approx_token_count(text))
                 }
                 ContentItem::InputImage { .. } => None,
@@ -2616,15 +2626,16 @@ pub(crate) async fn retained_plan_context(sess: &Session) -> CodexResult<Option<
     };
     let retained = serde_json::json!({
         "revision": crate::plan_store::plan_revision_with_lineage(Some(&plan), &lineage),
-        "lineage": lineage.active_for_plan(&plan),
+        "current_plan": plan,
+        "step_ids": plan.plan.iter().map(|step| lineage.step_id(&step.step)).collect::<Vec<_>>(),
+        "lineage": lineage.checklist_metadata(),
     });
     let serialized = serde_json::to_string(&retained)
         .map_err(|error| CodexErr::Fatal(format!("could not preserve compaction plan: {error}")))?;
     let bounded = truncate_text_to_token_ceiling(&serialized, COMPACT_TASK_STATE_MAX_TOKENS);
     let mut body = format!(
-        "Active requirement lineage only, not current instructions or proof of completion. \
-The reconstructed codex_task_state owns the sole current plan and its execution suspension state. \
-Retired details remain in durable plan history.\n{bounded}"
+        "Stored checklist restored after compaction, not new instructions or proof of completion. \
+Later update_plan results replace it. Legacy scope metadata remains in durable history.\n{bounded}"
     );
     if bounded != serialized {
         let recovery = persist_compaction_recovery(
@@ -2633,7 +2644,7 @@ Retired details remain in durable plan history.\n{bounded}"
         )
         .await?;
         body.push_str(
-            "\nLineage excerpt is incomplete. Recover exact historical lineage at /items/0.\n",
+            "\nChecklist excerpt is incomplete. Recover the stored checklist at /items/0.\n",
         );
         body.push_str(&recovery);
     }
@@ -3161,15 +3172,17 @@ fn append_bounded_user_messages(
     }
     selected_messages.reverse();
 
-    for (_, message) in &selected_messages {
+    let mut selected_indices = Vec::with_capacity(selected_messages.len());
+    for (index, message) in selected_messages {
+        selected_indices.push(index);
         let content = message
             .content
-            .iter()
+            .into_iter()
             .filter_map(|item| match item {
-                UserInput::Text { text, .. } => Some(ContentItem::InputText { text: text.clone() }),
+                UserInput::Text { text, .. } => Some(ContentItem::InputText { text }),
                 UserInput::Image { image_url, detail } => Some(ContentItem::InputImage {
-                    image_url: image_url.clone(),
-                    detail: *detail,
+                    image_url,
+                    detail,
                 }),
                 _ => None,
             })
@@ -3177,21 +3190,15 @@ fn append_bounded_user_messages(
         history.push(ResponseItem::Message {
             id: message
                 .source_item_id
-                .clone()
                 .map(codex_protocol::ResponseItemId::from_server),
             role: "user".to_string(),
             content,
             phase: None,
             internal_chat_message_metadata_passthrough: message
-                .internal_chat_message_metadata_passthrough
-                .clone(),
+                .internal_chat_message_metadata_passthrough,
         });
     }
 
-    let selected_indices = selected_messages
-        .into_iter()
-        .map(|(index, _)| index)
-        .collect();
     (
         history,
         retained_image_count,
@@ -3265,17 +3272,6 @@ async fn drain_to_completed(
     client_session.set_turn_timing(Arc::clone(&turn_context.turn_timing_state));
     client_session.set_startup_timing(Arc::clone(&sess.startup_timing));
     let model_request_timing_guard = turn_context.turn_timing_state.begin_model_request_wait();
-    // Local compaction is one classified inference attempt, not a second
-    // compaction trace receipt. Transport retries retain their own identities.
-    let inference_trace_context = sess
-        .services
-        .rollout_thread_trace
-        .inference_trace_context(
-            turn_context.sub_id.as_str(),
-            turn_context.model_info.slug.as_str(),
-            turn_context.provider.info().name.as_str(),
-        )
-        .with_request_metadata(|| serde_json::json!({"request_kind": "local_compaction"}));
     let stream_result = tokio::select! {
         _ = cancellation_token.cancelled() => return Err(CodexErr::TurnAborted),
         result = async {
@@ -3288,7 +3284,6 @@ async fn drain_to_completed(
             codex_protocol::config_types::ReasoningSummary::None,
             service_tier,
             responses_metadata,
-            &inference_trace_context,
             ).await
         } => result,
     };
@@ -3366,5 +3361,5 @@ mod tests;
 mod generation_tests;
 
 #[cfg(test)]
-#[path = "compact_audit146_tests.rs"]
-mod audit146_tests;
+#[path = "compact_checkpoint_preservation_tests.rs"]
+mod checkpoint_preservation_tests;

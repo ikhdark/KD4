@@ -1,6 +1,6 @@
 use super::*;
-#[path = "task_coordinator_audit142_tests.rs"]
-mod audit142;
+#[path = "task_coordinator_terminal_recovery_tests.rs"]
+mod terminal_recovery_tests;
 use crate::agent::task_metrics::MAX_RECORDED_EVENTS;
 use codex_agent_task_store::AcceptanceCriterion;
 use codex_agent_task_store::AgentRole;
@@ -10,6 +10,93 @@ use codex_agent_task_store::CriterionStatus;
 use codex_agent_task_store::WorkspaceStrategy;
 use codex_protocol::ThreadId;
 use tempfile::TempDir;
+
+#[test]
+fn validation_budgets_share_root_turn_not_task_grant_lifetime() {
+    let coordinator = AgentTaskCoordinator::default();
+    let scope = ("root".to_string(), "turn-one".to_string());
+    let root = coordinator.validation_budget_for_turn(&scope);
+    let child = coordinator.validation_budget_for_turn(&scope);
+    assert!(Arc::ptr_eq(&root, &child));
+    root.restore_policy_attempts(&[("selection".into(), "revision".into())]);
+    assert_eq!(child.policy_snapshot(2).admitted, 1);
+
+    let next = coordinator.validation_budget_for_turn(&(scope.0, "turn-two".into()));
+    assert!(!Arc::ptr_eq(&root, &next));
+    assert_eq!(next.policy_snapshot(2).admitted, 0);
+}
+
+#[tokio::test]
+async fn host_terminal_publication_seals_same_attempt_and_preserves_failure_diagnostics() {
+    let home = TempDir::new().unwrap();
+    let repo = TempDir::new().unwrap();
+    let state = StateRuntime::init(home.path().to_path_buf(), "test-provider".into()).await.unwrap();
+    let observer = LocalAgentTaskStore::initialize(&state).await.unwrap();
+    let coordinator = AgentTaskCoordinator::default();
+    coordinator.initialize(state, "root-session".into()).await.unwrap();
+    for (index, (status, legacy)) in [
+        (AgentStatus::Completed(Some("done".into())), false),
+        (AgentStatus::Errored("failed".into()), false),
+        (AgentStatus::Completed(Some("legacy done".into())), true),
+    ]
+        .into_iter().enumerate()
+    {
+        let mut draft = assignment_draft();
+        if legacy {
+            draft.admission_origin = AssignmentAdmissionOrigin::LegacyMessage { parent_assignment_id: None };
+            draft.workspace_strategy = WorkspaceStrategy::Shared;
+            draft.required_evidence.clear();
+        }
+        let (assignment, attempt) = coordinator.create_assignment(repo.path(), draft).await.unwrap();
+        let task_name = format!("terminal_publish_{index}");
+        let path = AgentPath::root().join(&task_name).unwrap();
+        let thread_id = ThreadId::new();
+        let binding = coordinator.bind_agent_task(AgentTaskBindingDraft {
+            assignment_id: assignment.assignment_id, attempt_id: attempt.attempt_id,
+            agent_path: path.to_string(), task_name, thread_id: Some(thread_id.to_string()),
+        }).await.unwrap();
+        let after = observer.read_wake_events("root-session".into(), None).await.unwrap().latest_event_id;
+        let observe = async {
+            let wake = tokio::time::timeout(std::time::Duration::from_secs(5),
+                observer.wait_for_wake_events("root-session".into(), after),
+            ).await.unwrap().unwrap();
+            let task = observer.get_agent_task(assignment.assignment_id, Some(10)).await.unwrap();
+            (wake, task)
+        };
+        let publish = coordinator.record_host_completion_and_seal(&binding, &path, thread_id, "turn",
+            "host diagnostics remain attached to exact attempt".into(), &status);
+        let (publication, (wake, at_wake)) = tokio::join!(publish, observe);
+        publication.unwrap();
+        assert!(wake.updated_agents.iter().all(|event| event.attempt_id == attempt.attempt_id));
+        assert!(wake.updated_agents.iter().any(|event| event.reason == ObservationKind::HostCompletion));
+        if matches!(status, AgentStatus::Completed(_)) {
+            assert!(at_wake.receipt.is_some(), "success cannot expose a durable host-only boundary");
+            assert_eq!(at_wake.receipt.as_ref().unwrap().attempt_id, attempt.attempt_id);
+            assert!(at_wake.observations.iter().any(|item| item.summary == "host diagnostics remain attached to exact attempt"));
+        }
+        let task = coordinator.get_agent_task(assignment.assignment_id, Some(10)).await.unwrap();
+        assert_eq!(task.current_attempt.attempt_id, attempt.attempt_id);
+        assert!(task.receipt.is_some());
+        assert!(task.observations.iter().any(|item| item.summary == "host diagnostics remain attached to exact attempt"));
+        if legacy {
+            let receipt = task.receipt.as_ref().unwrap();
+            assert_eq!(receipt.status, AgentStatusClaim::Completed);
+            assert!(receipt.validation_call_ids.is_empty());
+            assert!(receipt.blockers.is_empty());
+            assert!(receipt.next_action.is_none());
+        }
+        // An authored/already-ready receipt does not defer later host evidence.
+        let after = observer.read_wake_events("root-session".into(), None).await.unwrap().latest_event_id;
+        coordinator.record_host_completion_and_seal(&binding, &path, thread_id, "later-turn",
+            "later host diagnostics".into(), &status).await.unwrap();
+        let later = observer.wait_for_wake_events("root-session".into(), after).await.unwrap();
+        assert_eq!(later.updated_agents.len(), 1);
+        assert_eq!(later.updated_agents[0].reason, ObservationKind::HostCompletion);
+        assert_eq!(later.updated_agents[0].attempt_id, attempt.attempt_id);
+        assert_eq!(coordinator.get_agent_task(assignment.assignment_id, Some(10)).await.unwrap().receipt, task.receipt);
+    }
+    observer.close().await;
+}
 
 #[tokio::test]
 async fn pathless_turn_does_not_wait_for_binding_publication() {

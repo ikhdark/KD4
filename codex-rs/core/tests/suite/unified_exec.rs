@@ -1395,78 +1395,7 @@ async fn exec_command_interrupt_closes_unpublished_retained_process_before_turn_
     Ok(())
 }
 
-#[allow(dead_code)]
-async fn unified_exec_network_denial_test(
-    server: &wiremock::MockServer,
-) -> Result<(TestCodex, PermissionProfile)> {
-    use codex_config::Constrained;
-    use std::sync::Arc;
-    use tempfile::TempDir;
 
-    let home = Arc::new(TempDir::new()?);
-    fs::write(
-        home.path().join("config.toml"),
-        r#"default_permissions = "workspace"
-
-[permissions.workspace.filesystem]
-":minimal" = "read"
-
-[permissions.workspace.network]
-enabled = true
-mode = "limited"
-allow_local_binding = true
-"#,
-    )?;
-    let permission_profile_for_config = PermissionProfile::workspace_write_with(
-        &[],
-        NetworkSandboxPolicy::Enabled,
-        /*exclude_tmpdir_env_var*/ false,
-        /*exclude_slash_tmp*/ false,
-    );
-    let permission_profile = permission_profile_for_config.clone();
-    let mut builder = test_codex()
-        .with_home(home)
-        .with_cloud_config_bundle(managed_network_requirements_loader())
-        .with_config(move |config| {
-            config
-                .features
-                .enable(Feature::UnifiedExec)
-                .expect("test config should allow feature update");
-            config.permissions.approval_policy = Constrained::allow_any(AskForApproval::Never);
-            config
-                .permissions
-                .set_permission_profile(permission_profile_for_config)
-                .expect("set permission profile");
-        });
-    let test = builder.build(server).await?;
-    assert!(
-        test.config.permissions.network.is_some(),
-        "expected managed network proxy config to be present"
-    );
-
-    Ok((test, permission_profile))
-}
-
-#[allow(dead_code)]
-async fn mount_unified_exec_network_denial_responses(
-    server: &wiremock::MockServer,
-    call_id: &str,
-    args: &Value,
-) -> Result<core_test_support::responses::ResponseMock> {
-    let responses = vec![
-        sse(vec![
-            ev_response_created("resp-1"),
-            ev_function_call(call_id, "exec_command", &serde_json::to_string(&args)?),
-            ev_completed("resp-1"),
-        ]),
-        sse(vec![
-            ev_response_created("resp-2"),
-            ev_assistant_message("msg-1", "finished"),
-            ev_completed("resp-2"),
-        ]),
-    ];
-    Ok(mount_sse_sequence(server, responses).await)
-}
 
 #[allow(dead_code)]
 async fn wait_for_unified_exec_end(

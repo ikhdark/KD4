@@ -106,6 +106,52 @@ fn network_amendments_preserve_latest_decision_after_reload() -> Result<()> {
 }
 
 #[test]
+fn scoped_ipv6_network_amendments_preserve_identity_across_reloads() -> Result<()> {
+    for (raw, expected) in [
+        ("[fe80::1%2525]", "fe80::1%25"),
+        ("[fe80::1%25250]", "fe80::1%250"),
+        ("[fe80::1%25251]:443", "fe80::1%251"),
+        ("fe80::1%25", "fe80::1%25"),
+        ("fe80::1%250", "fe80::1%250"),
+        ("fe80::1%251", "fe80::1%251"),
+        ("fe80::1%2525", "fe80::1%2525"),
+        ("fe80::1%25250", "fe80::1%25250"),
+        ("[fe80::1%25ETH0]", "fe80::1%eth0"),
+        ("fe80::1%eth0", "fe80::1%eth0"),
+    ] {
+        let dir = tempdir()?;
+        let path = dir.path().join("default.rules");
+        // Re-amend the already canonical host to check normalization idempotence,
+        // not just the first parse of user input.
+        for host in [raw, expected] {
+            blocking_append_network_rule(
+                &path,
+                host,
+                NetworkRuleProtocol::Https,
+                Decision::Allow,
+                None,
+            )?;
+            let contents = fs::read_to_string(&path)?;
+            let mut parser = PolicyParser::new();
+            parser.parse("default.rules", &contents)?;
+            let policy = parser.build();
+            assert!(
+                policy
+                    .network_rules()
+                    .iter()
+                    .all(|rule| rule.host == expected),
+                "identity changed for {raw}: {contents}"
+            );
+            assert_eq!(
+                policy.compiled_network_domains(),
+                (tokens(&[expected]), Vec::new())
+            );
+        }
+    }
+    Ok(())
+}
+
+#[test]
 fn prefix_amendment_rejects_empty_tokens_before_creating_file() -> Result<()> {
     let tmp = tempdir()?;
     let path = tmp.path().join("rules/default.rules");

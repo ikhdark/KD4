@@ -23,7 +23,6 @@ pub(super) async fn spawn_review_thread(
     let mut review_features = sess.features.clone();
     let _ = review_features.disable(Feature::WebSearchRequest);
     let _ = review_features.disable(Feature::WebSearchCached);
-    let _ = review_features.disable(Feature::Goals);
     let review_web_search_mode = WebSearchMode::Disabled;
     let available_models = sess
         .services
@@ -95,7 +94,7 @@ pub(super) async fn spawn_review_thread(
         review_turn_id.clone(),
         &parent_turn_context.permission_profile,
         parent_turn_context.windows_sandbox_level,
-        parent_turn_context.network.is_some(),
+        false,
         parent_turn_context
             .turn_metadata_state
             .git_metadata_source(),
@@ -133,10 +132,12 @@ pub(super) async fn spawn_review_thread(
         developer_instructions: None,
         collaboration_mode: parent_turn_context.collaboration_mode.clone(),
         multi_agent_version: MultiAgentVersion::Disabled,
+        validation_mode: parent_turn_context.validation_mode,
+        validation_full_budget: parent_turn_context.validation_full_budget,
+        validation_root_turn: parent_turn_context.validation_root_turn.clone(),
         personality: parent_turn_context.personality,
         approval_policy: parent_turn_context.approval_policy.clone(),
         permission_profile: parent_turn_context.permission_profile(),
-        network: parent_turn_context.network.clone(),
         windows_sandbox_level: parent_turn_context.windows_sandbox_level,
         final_output_json_schema: None,
         dynamic_tools: parent_turn_context.dynamic_tools.clone(),

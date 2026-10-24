@@ -38,118 +38,31 @@ fn model_preset(id: &str, show_in_picker: bool) -> ModelPreset {
     }
 }
 
-#[test]
-fn v1_structured_input_schemas_require_decodable_variant_payloads() {
-    use codex_protocol::user_input::UserInput;
 
-    for tool in [
-        create_spawn_agent_tool_v1(SpawnAgentToolOptions::default()),
-        create_send_input_tool_v1(),
+#[test]
+fn spawn_agent_descriptions_reference_policy_owners() {
+    let policy = codex_protocol::models::BASE_INSTRUCTIONS_DEFAULT;
+    for required in [
+        "When implementation is authorized, finish verified in-scope follow-through",
+        "Do not ask for renewed permission to perform already-authorized changes",
+        "record the evidence instead of making unnecessary edits",
+        "Respect review-only, diagnosis-only, and no-write intent",
+        "Trace changed contracts through defaults, registration, consumers, schemas, and persistence",
     ] {
-        let ToolSpec::Namespace(namespace) = tool else {
-            panic!("V1 namespace");
-        };
-        let ResponsesApiNamespaceTool::Function(function) = &namespace.tools[0];
-        let schema = serde_json::to_value(&function.parameters).unwrap();
-        let validator = jsonschema::validator_for(&schema).unwrap();
-        for mut arguments in [
-            json!({}),
-            json!({"items":[]}),
-            json!({"message":"task","items":[{"type":"text","text":"task"}]}),
-        ] {
-            if function.name == "send_input" {
-                arguments["target"] = json!("agent");
-            }
-            let message = arguments
-                .get("message")
-                .map(|value| value.as_str().unwrap().to_string());
-            let items = arguments
-                .get("items")
-                .map(|value| serde_json::from_value::<Vec<UserInput>>(value.clone()).unwrap());
-            assert!(super::super::multi_agents_common::parse_collab_input(message, items).is_err());
-            assert!(
-                !validator.is_valid(&arguments),
-                "schema admits invalid input choice {arguments}"
-            );
-        }
-        let mut message = json!({"message":"task"});
-        if function.name == "send_input" {
-            message["target"] = json!("agent");
-        }
-        assert!(validator.is_valid(&message));
-        for item in [
-            json!({"type":"text","text":"task"}),
-            json!({"type":"image","image_url":"data:image/png;base64,AA=="}),
-            json!({"type":"local_image","path":"image.png"}),
-            json!({"type":"skill","name":"review","path":"SKILL.md"}),
-            json!({"type":"mention","name":"app","path":"app://connector"}),
-            // Previously accepted extra advertised fields remain accepted.
-            json!({"type":"text","text":"task","name":"label"}),
-        ] {
-            let mut arguments = json!({"items":[item]});
-            if function.name == "send_input" {
-                arguments["target"] = json!("agent");
-            }
-            assert!(validator.is_valid(&arguments), "{arguments}");
-            let items: Vec<UserInput> = serde_json::from_value(arguments["items"].clone()).unwrap();
-            assert!(
-                super::super::multi_agents_common::parse_collab_input(None, Some(items)).is_ok()
-            );
-        }
-        for item in [
-            json!({}),
-            json!({"text":"missing tag"}),
-            json!({"type":"unknown"}),
-            json!({"type":"text"}),
-            json!({"type":"text","text":42}),
-            json!({"type":"image"}),
-            json!({"type":"local_image"}),
-            json!({"type":"skill","path":"SKILL.md"}),
-            json!({"type":"mention","name":"app"}),
-        ] {
-            assert!(serde_json::from_value::<UserInput>(item.clone()).is_err());
-            let mut arguments = json!({"items":[item]});
-            if function.name == "send_input" {
-                arguments["target"] = json!("agent");
-            }
-            assert!(
-                !validator.is_valid(&arguments),
-                "schema admits undecodable {arguments}"
-            );
-        }
+        assert!(policy.contains(required), "missing base policy: {required}");
     }
-}
 
-#[test]
-fn spawn_agent_descriptions_require_report_reconciliation() {
-    // V1's custom hint replaces its default guidance; V2 retains its base contract.
     let descriptions = [
-        spawn_agent_tool_description(None, None, "", None),
         spawn_agent_tool_description_v2(None, None, None, None),
         spawn_agent_tool_description_v2(None, None, None, Some("Custom guidance.".to_string())),
     ];
     for description in descriptions {
-        for required in [
-            "Read every returned report in full",
-            "recovering omitted portions from retained output",
-            "Account for every substantive finding, including read-only reviews",
-            "implement and verify it, reject it with evidence",
-            "outside the user's scope",
-            "keep it unresolved with a next action or blocker",
-            "Investigate unresolved in-scope findings before finalizing",
-            "do not discharge obtainable work",
-            "When implementation is authorized, implement verified, applicable, in-scope suggestions",
-            "validate the resulting behavior through affected consumers",
-            "Do not stop at acknowledging them, listing them in a plan, or describing future work",
-            "do not ask for renewed permission to perform already-authorized changes",
-            "record the evidence instead of making unnecessary edits",
-            "Respect review-only/no-write scope and do not blindly implement recommendations",
-        ] {
-            assert!(
-                description.contains(required),
-                "missing report policy: {required}"
-            );
-        }
+        assert!(description.contains(
+            "Apply the base instructions for audit/review scope, verification, validation, and completion"
+        ));
+        assert!(description.contains("team guidance for ownership and coordination"));
+        assert!(!description.contains("Read every returned report in full"));
+        assert!(!description.contains("When implementation is authorized"));
     }
 }
 
@@ -192,7 +105,7 @@ fn spawn_agent_tool_v2_exposes_typed_assignments_and_lists_visible_models() {
     assert!(description.contains(&spawn_agent_default_guidance()));
     assert!(
         description
-            .contains("Available model overrides (optional; `gpt-6-astra` is the spawn default):")
+            .contains("Available model overrides (optional; `gpt-6.1-sol` is the spawn default):")
     );
     assert!(description.contains(
         "- `visible-model`: visible description Reasoning efforts: medium (catalog default). Service tiers: priority."
@@ -326,74 +239,27 @@ fn spawn_agent_tool_v2_accepts_task_text_aliases_exclusively() {
 }
 
 #[test]
-fn spawn_agent_tool_v1_keeps_legacy_fork_context_field() {
-    let tool = create_spawn_agent_tool_v1(SpawnAgentToolOptions {
-        available_models: Arc::new(Vec::new()),
-        agent_type_description: "role help".to_string(),
-        hide_agent_type_model_reasoning: false,
-        usage_hint_text: None,
-    });
-
-    let ToolSpec::Namespace(namespace) = tool else {
-        panic!("spawn_agent v1 should be a namespace tool");
-    };
-    assert_eq!(namespace.name, MULTI_AGENT_V1_NAMESPACE);
-    let Some(ResponsesApiNamespaceTool::Function(ResponsesApiTool {
-        parameters,
-        description,
-        ..
-    })) = namespace.tools.first()
+fn spawn_agent_task_name_schema_matches_canonical_validator() {
+    let ToolSpec::Function(ResponsesApiTool { parameters, .. }) =
+        create_spawn_agent_tool_v2(SpawnAgentToolOptions::default())
     else {
-        panic!("spawn_agent should be a namespace function tool");
+        panic!("spawn_agent should be a function tool");
     };
-    assert!(description.contains("Sub-agents share the parent's workspace."));
-    assert!(description.contains("preserve others' changes"));
-    assert!(!description.contains("forked workspace"));
-    assert!(!description.contains("uploaded changes"));
-    assert_eq!(
-        parameters.schema_type.clone(),
-        Some(JsonSchemaType::Single(JsonSchemaPrimitiveType::Object))
-    );
-    let properties = parameters
-        .properties
-        .as_ref()
-        .expect("spawn_agent should use object params");
-
-    assert!(properties.contains_key("fork_context"));
-    assert!(!properties.contains_key("fork_turns"));
-    assert!(
-        properties
-            .get("fork_context")
-            .and_then(|schema| schema.description.as_deref())
-            .is_some_and(|description| {
-                description.contains(SPAWN_AGENT_V1_FULL_HISTORY_OVERRIDE_GUIDANCE)
-            })
-    );
-    assert_eq!(
-        properties
-            .get("message")
-            .and_then(|schema| schema.encrypted),
-        None
-    );
-    assert_eq!(
-        properties
-            .get("model")
-            .and_then(|schema| schema.description.as_deref()),
-        Some(spawn_agent_model_override_description().as_str())
-    );
-    assert_eq!(
-        properties
-            .get("reasoning_effort")
-            .and_then(|schema| schema.description.as_deref()),
-        Some(spawn_agent_reasoning_override_description().as_str())
-    );
-    assert_eq!(
-        properties
-            .get("service_tier")
-            .and_then(|schema| schema.description.as_deref()),
-        Some(SPAWN_AGENT_SERVICE_TIER_OVERRIDE_DESCRIPTION)
-    );
+    let schema = serde_json::to_value(parameters).unwrap();
+    let validator = jsonschema::validator_for(&schema).unwrap();
+    for name in [
+        "worker", "a", "_", "0", "rooted", "root_", "repo_ownership", "morpheus",
+        "", "root", "repo-ownership", "BadName", "/worker", ".", "..", "é",
+        "worker\n", "root\n", "worker\r\n", "worker/child", "worker ",
+    ] {
+        assert_eq!(
+            validator.is_valid(&json!({"task_name": name, "message": "inspect"})),
+            codex_protocol::AgentPath::root().join(name).is_ok(),
+            "{name:?}",
+        );
+    }
 }
+
 
 #[test]
 fn spawn_agent_tool_caps_visible_model_summaries() {
@@ -613,52 +479,6 @@ fn followup_task_tool_requires_message_and_has_no_output_schema() {
     assert_eq!(output_schema, None);
 }
 
-#[test]
-fn wait_agent_tool_v1_advertises_first_and_all() {
-    let ToolSpec::Namespace(namespace) = create_wait_agent_tool_v1(WaitAgentTimeoutOptions {
-        default_timeout_ms: 30_000,
-        min_timeout_ms: 10_000,
-        max_timeout_ms: 3_600_000,
-    }) else {
-        panic!("wait_agent v1 should be a namespace tool");
-    };
-    let Some(ResponsesApiNamespaceTool::Function(ResponsesApiTool { parameters, .. })) =
-        namespace.tools.first()
-    else {
-        panic!("wait_agent should be a namespace function tool");
-    };
-    let return_when = parameters
-        .properties
-        .as_ref()
-        .and_then(|properties| properties.get("return_when"))
-        .expect("return_when schema");
-    assert_eq!(
-        return_when.enum_values.as_ref(),
-        Some(&vec![json!("first"), json!("all")])
-    );
-    assert_eq!(
-        parameters
-            .properties
-            .as_ref()
-            .and_then(|properties| properties.get("timeout_ms"))
-            .and_then(|schema| schema.description.as_deref()),
-        Some(
-            "Explicit caller deadline in milliseconds. Omit to wait without a caller deadline until the requested target condition or input activity. Values below 10000 use that normal wait; values above 3600000 are capped. Completed targets return immediately."
-        )
-    );
-    let timeout = parameters
-        .properties
-        .as_ref()
-        .and_then(|properties| properties.get("timeout_ms"))
-        .expect("timeout_ms schema");
-    assert_eq!(
-        timeout.schema_type,
-        Some(JsonSchemaType::Single(JsonSchemaPrimitiveType::Integer))
-    );
-    assert_eq!(timeout.minimum, None);
-    assert_eq!(timeout.maximum, None);
-    assert_wait_timeout_schema_matches_runtime_bounds(parameters);
-}
 
 #[test]
 fn wait_agent_tool_v2_uses_timeout_only_summary_output() {

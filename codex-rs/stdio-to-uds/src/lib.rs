@@ -93,24 +93,19 @@ async fn relay<S: AsyncRead + AsyncWrite + Unpin>(
     output: std::sync::mpsc::SyncSender<OutputOperation>,
 ) -> anyhow::Result<()> {
     let (mut socket_reader, mut socket_writer) = tokio::io::split(stream);
-    let upload = async {
-        while let Some(bytes) = input.recv().await {
-            socket_writer
-                .write_all(&bytes?)
-                .await
-                .context("failed to copy stdin to socket")?;
+    let upload = async move {
+        let input_result = async {
+            while let Some(bytes) = input.recv().await {
+                socket_writer
+                    .write_all(&bytes?)
+                    .await
+                    .context("failed to copy stdin to socket")?;
+            }
+            anyhow::Ok(())
         }
+        .await;
 
-        // The peer can close immediately after sending its response; in that
-        // race, half-closing our write side can report NotConnected on some
-        // platforms.
-        if let Err(err) = socket_writer.shutdown().await
-            && err.kind() != io::ErrorKind::NotConnected
-        {
-            return Err(err).context("failed to shutdown socket writer");
-        }
-
-        anyhow::Ok(())
+        (input_result, socket_writer)
     };
 
     let download = async {
@@ -136,10 +131,20 @@ async fn relay<S: AsyncRead + AsyncWrite + Unpin>(
     tokio::select! {
         biased;
         // Preserve an input failure already ready when output EOF arrives.
-        result = &mut upload => match result {
-            Ok(()) => download.await,
+        (result, mut writer) = &mut upload => match result {
+            Ok(()) => {
+                shutdown_upload(&mut writer).await?;
+                download.await
+            },
             Err(input_error) => {
-                match tokio::time::timeout(DRAIN_TIMEOUT, &mut download).await {
+                // Keep the already-observed input error outside shutdown's
+                // await, so simultaneous output EOF cannot turn it into success.
+                let finish = async {
+                    let shutdown = shutdown_upload(&mut writer).await;
+                    let delivered = download.await;
+                    shutdown.and(delivered)
+                };
+                match tokio::time::timeout(DRAIN_TIMEOUT, finish).await {
                     Ok(Ok(())) => Err(input_error),
                     Ok(Err(output_error)) => Err(input_error.context(format!("output delivery also failed: {output_error:#}"))),
                     Err(_) => Err(input_error.context("output delivery incomplete: drain timed out")),
@@ -148,6 +153,15 @@ async fn relay<S: AsyncRead + AsyncWrite + Unpin>(
         },
         // EOF plus acknowledged flush terminates without waiting for stdin.
         result = &mut download => result,
+    }
+}
+
+async fn shutdown_upload<W: AsyncWrite + Unpin>(writer: &mut W) -> anyhow::Result<()> {
+    match tokio::time::timeout(DRAIN_TIMEOUT, writer.shutdown()).await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(err)) if err.kind() == io::ErrorKind::NotConnected => Ok(()),
+        Ok(Err(err)) => Err(err).context("failed to shutdown socket writer"),
+        Err(_) => anyhow::bail!("socket writer shutdown timed out"),
     }
 }
 
@@ -241,6 +255,31 @@ mod tests {
         let (result, ()) = tokio::join!(relay(stream, rx, output), peer);
         assert!(format!("{:#}", result.unwrap_err()).contains("injected input failure"));
         assert_eq!(*observed.0.lock().unwrap(), expected);
+    }
+
+    #[tokio::test]
+    async fn input_error_half_closes_before_draining_eof_dependent_peer() {
+        let (stream, mut peer) = tokio::io::duplex(128);
+        let (tx, rx) = mpsc::channel(1);
+        let sink = Sink::default();
+        let observed = sink.clone();
+        tx.send(Err(io::Error::other("injected input failure")))
+            .await
+            .unwrap();
+        let peer = async move {
+            let mut uploaded = Vec::new();
+            peer.read_to_end(&mut uploaded).await.unwrap();
+            assert!(uploaded.is_empty());
+            peer.write_all(b"response after EOF").await.unwrap();
+            peer.shutdown().await.unwrap();
+        };
+        let (result, ()) = tokio::time::timeout(Duration::from_secs(1), async {
+            tokio::join!(relay(stream, rx, native_output(sink).unwrap()), peer)
+        })
+        .await
+        .expect("input failure must not withhold EOF until the drain timeout");
+        assert!(format!("{:#}", result.unwrap_err()).contains("injected input failure"));
+        assert_eq!(*observed.0.lock().unwrap(), b"response after EOF");
     }
 
     #[tokio::test]

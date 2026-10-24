@@ -13,6 +13,22 @@ use pretty_assertions::assert_eq;
 use tempfile::tempdir;
 use toml::Value as TomlValue;
 
+#[tokio::test]
+async fn core_mcp_edits_keep_explicit_layer_defaults() {
+    for original in [
+        "[mcp_servers.worker]\ncommand = 'worker'\nargs = []\nenv_vars = []\nenvironment_id = 'local'\nsupports_parallel_tool_calls = false\n",
+        "mcp_servers = {worker = {command = 'worker', args = [], env_vars = [], environment_id = 'local', supports_parallel_tool_calls = false}}\n",
+    ] {
+        let home = tempdir().unwrap();
+        let path = home.path().join(CONFIG_TOML_FILE);
+        std::fs::write(&path, original).unwrap();
+        let servers = codex_config::load_global_mcp_servers(home.path()).await.unwrap();
+        ConfigEditsBuilder::for_config_path(&path).replace_mcp_servers(&servers).apply().await.unwrap();
+        let saved: TomlValue = toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(saved, toml::from_str::<TomlValue>(original).unwrap());
+    }
+}
+
 #[test]
 fn config_alias_and_target_share_the_persistence_lock() {
     let tmp = tempdir().expect("tmpdir");

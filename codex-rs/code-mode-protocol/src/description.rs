@@ -563,7 +563,7 @@ mod tests {
                     (keyword): [{"properties": {"timeout": {"type": "number"}}}]
                 }),
                 &format!(
-                    "({{ cmd: string; }}) & (string | number | boolean | null | unknown[] | {{ timeout?: number; }}){}",
+                    "({{ cmd: string; }}) & (string | (number | bigint) | boolean | null | unknown[] | {{ timeout?: (number | bigint); }}){}",
                     if keyword == "oneOf" {
                         " /* oneOf: exactly one branch must match */"
                     } else {
@@ -596,7 +596,7 @@ mod tests {
         });
         assert_input_declaration(
             schema.clone(),
-            "(string | number | boolean | null | unknown[] | { path: string; }) & ({ cmd: string; })",
+            "(string | (number | bigint) | boolean | null | unknown[] | { path: string; }) & ({ cmd: string; })",
         );
         schema["$schema"] = json!("http://json-schema.org/draft-07/schema#");
         assert_input_declaration(schema, "{ cmd: string; }");
@@ -663,7 +663,7 @@ mod tests {
                 "type": "object", "properties": {"name": {"type": "string"}},
                 "required": ["name"], "additionalProperties": {"type": "number"}
             }),
-            "{ name: string; [key: string]: unknown; /* additional keys: number */ }",
+            "{ name: string; [key: string]: unknown; /* additional keys: (number | bigint) */ }",
         );
         assert_input_declaration(
             json!({
@@ -740,15 +740,15 @@ mod tests {
             ),
             (
                 json!({"const": "ok", "required": ["id"]}),
-                "(string | number | boolean | null | unknown[] | { id: unknown; [key: string]: unknown; }) & (\"ok\")",
+                "(string | (number | bigint) | boolean | null | unknown[] | { id: unknown; [key: string]: unknown; }) & (\"ok\")",
             ),
             (
                 json!({"items": false}),
-                "string | number | boolean | null | Array<never> | { [key: string]: unknown; }",
+                "string | (number | bigint) | boolean | null | Array<never> | { [key: string]: unknown; }",
             ),
             (
                 json!({"required": ["id"], "items": false}),
-                "string | number | boolean | null | Array<never> | { id: unknown; [key: string]: unknown; }",
+                "string | (number | bigint) | boolean | null | Array<never> | { id: unknown; [key: string]: unknown; }",
             ),
             (
                 json!({"type": "string", "pattern": "^[a-z]+$", "minLength": 1, "maxLength": 5}),
@@ -760,11 +760,11 @@ mod tests {
             ),
             (
                 json!({"oneOf": [{"type": "number"}, {"type": "number"}]}),
-                "number | number /* oneOf: exactly one branch must match */",
+                "(number | bigint) | (number | bigint) /* oneOf: exactly one branch must match */",
             ),
             (
                 json!({"type": "number", "not": {"const": 0}}),
-                "number /* unprojected keyword: not */",
+                "(number | bigint) /* unprojected keyword: not */",
             ),
         ] {
             assert_input_declaration(schema, expected);

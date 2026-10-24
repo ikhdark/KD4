@@ -561,7 +561,10 @@ impl OauthLoginFlow {
             http_client,
         } = http_context;
         let default_headers = build_default_headers(http_headers, env_http_headers)?;
-        let oauth_http_client = Arc::new(OAuthHttpClientAdapter::new(http_client, default_headers));
+        let oauth_http_client = Arc::new(
+            OAuthHttpClientAdapter::new(http_client, server_url, default_headers)
+                .map_err(anyhow::Error::from_boxed)?,
+        );
 
         let scope_refs: Vec<&str> = scopes.iter().map(String::as_str).collect();
         let oauth_state = start_authorization(
@@ -964,10 +967,14 @@ mod tests {
         let (base_url, _) = spawn_oauth_metadata_server().await;
         let oauth_state = start_authorization(
             &format!("{base_url}/mcp"),
-            Arc::new(OAuthHttpClientAdapter::new(
-                Arc::new(ReqwestHttpClient),
-                HeaderMap::new(),
-            )),
+            Arc::new(
+                OAuthHttpClientAdapter::new(
+                    Arc::new(ReqwestHttpClient),
+                    &format!("{base_url}/mcp"),
+                    HeaderMap::new(),
+                )
+                .unwrap(),
+            ),
             &[],
             "http://127.0.0.1/callback",
             Some("eci-prd-pub-codex-123"),

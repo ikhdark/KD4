@@ -54,7 +54,13 @@ impl CookieStore for ChatGptCloudflareCookieStore {
 
     fn cookies(&self, url: &reqwest::Url) -> Option<HeaderValue> {
         if is_chatgpt_cookie_url(url) {
-            self.jar.cookies(url).and_then(only_cloudflare_cookies)
+            self.jar
+                .cookies(url)
+                .and_then(only_cloudflare_cookies)
+                .map(|mut header| {
+                    header.set_sensitive(true);
+                    header
+                })
         } else {
             None
         }
@@ -75,12 +81,10 @@ impl CookieStore for ChatGptCookieStore {
             return self.cloudflare.cookies(url);
         }
         let cloudflare = self.cloudflare.cookies(url);
-        let mut sensitive = cloudflare.as_ref().is_some_and(HeaderValue::is_sensitive);
         let mut cookies = cloudflare
             .map(|cloudflare| cloudflare.as_bytes().to_vec())
             .unwrap_or_default();
         for cookie in &self.cookies {
-            sensitive |= cookie.is_sensitive();
             if !cookies.is_empty() {
                 cookies.extend_from_slice(b"; ");
             }
@@ -90,7 +94,7 @@ impl CookieStore for ChatGptCookieStore {
             None
         } else {
             let mut header = HeaderValue::from_bytes(&cookies).ok()?;
-            header.set_sensitive(sensitive);
+            header.set_sensitive(true);
             Some(header)
         }
     }
@@ -233,7 +237,7 @@ mod tests {
             store.cookies(&url),
             Some(HeaderValue::from_static("additional=true"))
         );
-        assert!(!store.cookies(&url).unwrap().is_sensitive());
+        assert!(store.cookies(&url).unwrap().is_sensitive());
     }
 
     #[test]

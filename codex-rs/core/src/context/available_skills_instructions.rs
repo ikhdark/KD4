@@ -12,24 +12,19 @@ const SKILLS_USAGE_INSTRUCTIONS_CLOSE_TAG: &str = "</skills_usage_instructions>"
 /// Model-context fragment describing the skills available to Codex.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AvailableSkillsInstructions {
-    skill_lines: Vec<String>,
+    body: String,
 }
 
 impl AvailableSkillsInstructions {
     /// Creates a skills context fragment from pre-rendered catalog lines.
     pub fn from_skill_lines(skill_lines: Vec<String>) -> Self {
-        Self { skill_lines }
+        Self { body: render_available_skills_body(&skill_lines) }
     }
 
-    pub fn from_available_skills(available_skills: &AvailableSkills) -> Self {
-        let mut skill_lines = available_skills.skill_lines.clone();
-        if available_skills.report.omitted_count > 0 {
-            skill_lines.push(format!(
-                "Catalog incomplete: {} additional skills omitted to fit the context budget. An unlisted skill may still be available; use supplied instructions or a relevant discovery route when needed for the task.",
-                available_skills.report.omitted_count
-            ));
+    pub fn from_available_skills(_available_skills: &AvailableSkills) -> Self {
+        Self {
+            body: "\n## Skills\nBefore task actions, discover applicable or named skills with read_file(path=\"skill:catalog\") and read their full instructions; use provider-specific discovery for other skill sources.\n".to_string(),
         }
-        Self { skill_lines }
     }
 }
 
@@ -72,7 +67,7 @@ impl ContextualUserFragment for AvailableSkillsInstructions {
     }
 
     fn body(&self) -> std::borrow::Cow<'_, str> {
-        std::borrow::Cow::Owned(render_available_skills_body(&self.skill_lines))
+        std::borrow::Cow::Borrowed(&self.body)
     }
 }
 
@@ -148,16 +143,9 @@ mod tests {
             assert_eq!(available.report.omitted_count, omitted);
             assert_eq!(available.skill_lines.len(), 2 - omitted);
             let rendered = AvailableSkillsInstructions::from_available_skills(&available).render();
-            if omitted > 0 {
-                assert!(
-                    rendered.contains("Catalog incomplete: 2 additional skills omitted"),
-                    "{rendered}"
-                );
-                assert!(rendered.contains("An unlisted skill may still be available"));
-            } else {
-                assert!(!rendered.contains("Catalog incomplete:"));
-                assert!(rendered.contains("alpha") && rendered.contains("beta"));
-            }
+            assert!(rendered.contains("skill:catalog"), "{rendered}");
+            assert!(rendered.contains("read their full instructions"), "{rendered}");
+            assert!(!rendered.contains("alpha") && !rendered.contains("beta"));
         }
     }
 

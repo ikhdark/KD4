@@ -1462,6 +1462,7 @@
         },
         {
           "properties": {
+            "error": true,
             "id": {
               "type": "string"
             },
@@ -1477,7 +1478,10 @@
               "description": "Separate image-model receipt; never add these tokens to text inference."
             },
             "result": {
-              "type": "string"
+              "type": [
+                "string",
+                "null"
+              ]
             },
             "revisedPrompt": {
               "type": [
@@ -1508,7 +1512,6 @@
           },
           "required": [
             "id",
-            "result",
             "status",
             "type"
           ],

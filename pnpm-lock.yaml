@@ -36,8 +36,6 @@ importers:
 
   codex-cli: {}
 
-  codex-rs/responses-api-proxy/npm: {}
-
   sdk/typescript:
     dependencies:
       '@modelcontextprotocol/sdk':

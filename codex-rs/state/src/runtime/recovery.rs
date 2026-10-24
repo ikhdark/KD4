@@ -12,32 +12,22 @@ use std::path::PathBuf;
 const BACKUP_DIR_NAME: &str = "db-backups";
 
 /// All initializers and quarantine operations acquire the same per-database
-/// owners in stable order. Locks live beside the home so a blocking home file
-/// can be quarantined without replacing the ownership identity.
+/// owners in stable order. A deterministic application-owned cache namespace
+/// avoids requiring writes to the SQLite home's parent. It also survives
+/// quarantining a file that blocks the home directory. Never fall back to a
+/// different namespace after a permission failure: that would split ownership.
 pub(super) async fn lock_runtime_initialization(
     home: &Path,
 ) -> std::io::Result<Vec<std::fs::File>> {
     let home = home.to_path_buf();
     tokio::task::spawn_blocking(move || {
-        let home = match std::fs::canonicalize(&home) {
-            Ok(home) => home,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => home,
-            Err(error) => return Err(error),
-        };
-        let parent = home
-            .parent()
-            .ok_or_else(|| std::io::Error::other("SQLite home has no parent"))?;
-        std::fs::create_dir_all(parent)?;
-        let parent = std::fs::canonicalize(parent)?;
-        let home_name = home
-            .file_name()
-            .ok_or_else(|| std::io::Error::other("SQLite home has no name"))?;
+        let home = initialization_home_identity(&home)?;
+        let parent = initialization_lock_directory(&home)?;
+        std::fs::create_dir_all(&parent)?;
         let mut paths = super::runtime_db_paths(&home)
             .into_iter()
             .map(|db| {
-                let mut name = std::ffi::OsString::from(".");
-                name.push(home_name);
-                name.push(".");
+                let mut name = std::ffi::OsString::new();
                 name.push(file_name(&db.path)?);
                 name.push(".initialize.lock");
                 Ok(parent.join(name))
@@ -60,6 +50,55 @@ pub(super) async fn lock_runtime_initialization(
     })
     .await
     .map_err(std::io::Error::other)?
+}
+
+fn initialization_home_identity(home: &Path) -> std::io::Result<PathBuf> {
+    let mut ancestor = std::path::absolute(home)?;
+    let mut missing = Vec::new();
+    loop {
+        match std::fs::canonicalize(&ancestor) {
+            Ok(mut canonical) => {
+                for component in missing.into_iter().rev() { canonical.push(component); }
+                return Ok(canonical);
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                missing.push(ancestor.file_name().ok_or_else(|| std::io::Error::other("SQLite home has no stable identity"))?.to_os_string());
+                ancestor = ancestor.parent().ok_or_else(|| std::io::Error::other("SQLite home has no existing ancestor"))?.to_path_buf();
+            }
+            Err(err) => return Err(err),
+        }
+    }
+}
+
+fn initialization_lock_directory(home: &Path) -> std::io::Result<PathBuf> {
+    use sha2::Digest;
+    let key = sha2::Sha256::digest(home.as_os_str().as_encoded_bytes()).iter()
+        .map(|byte| format!("{byte:02x}")).collect::<String>();
+    let cache = dirs::cache_dir().ok_or_else(|| std::io::Error::other("application cache directory is unavailable for SQLite initialization locks"))?;
+    Ok(cache.join("codex").join("sqlite-initialization-v1").join(key))
+}
+
+#[cfg(test)]
+mod audit20261023_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn audit20261023_initialization_ownership_never_writes_home_siblings() -> anyhow::Result<()> {
+        let parent = tempfile::tempdir()?;
+        let home = parent.path().join("sqlite");
+        let before = initialization_home_identity(&home)?;
+        std::fs::create_dir(&home)?;
+        assert_eq!(before, initialization_home_identity(&home.join("."))?);
+        let owners = lock_runtime_initialization(&home).await?;
+        let entries = std::fs::read_dir(parent.path())?.map(|entry| entry.map(|entry| entry.path())).collect::<std::io::Result<Vec<_>>>()?;
+        assert_eq!(entries, vec![home.clone()]);
+        let mut contender = Box::pin(lock_runtime_initialization(&home));
+        assert!(tokio::time::timeout(std::time::Duration::from_millis(50), &mut contender).await.is_err());
+        drop(owners);
+        let owners = tokio::time::timeout(std::time::Duration::from_secs(2), contender).await??;
+        drop(owners);
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

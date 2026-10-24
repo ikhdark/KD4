@@ -376,24 +376,27 @@ impl ResolvedMcpCatalog {
         self.servers == other.servers
     }
 
-    /// Replaces the resolved server set while preserving known server sources.
+    /// Replaces resolved configurations while preserving sources, precedence, and name vetoes.
     ///
     /// Names not present in the existing catalog are treated as config-owned.
     pub fn with_materialized_servers(&self, servers: HashMap<String, McpServerConfig>) -> Self {
-        let mut builder = Self::builder();
+        let mut builder = McpCatalogBuilder {
+            disabled_server_names: self.disabled_server_names.clone(),
+            ..McpCatalogBuilder::default()
+        };
+        let winning_actions = self
+            .actions
+            .iter()
+            .map(|action| (action.name(), action))
+            .collect::<HashMap<_, _>>();
         for (name, config) in servers {
-            let source = self
-                .server(&name)
-                .map(|server| server.source.clone())
-                .unwrap_or(McpServerSource::Config);
-            let precedence = match &source {
-                McpServerSource::Plugin(_) => RegistrationPrecedence::Plugin(Reverse(0)),
-                McpServerSource::SelectedPlugin(_) => {
-                    RegistrationPrecedence::SelectedPlugin(Reverse(0))
+            let (source, precedence) = match winning_actions.get(name.as_str()) {
+                Some(CatalogAction::Register(registration)) => {
+                    (registration.source.clone(), registration.precedence)
                 }
-                McpServerSource::Config => RegistrationPrecedence::Config,
-                McpServerSource::Compatibility { .. } => RegistrationPrecedence::Compatibility,
-                McpServerSource::Extension { .. } => RegistrationPrecedence::Extension(0),
+                Some(CatalogAction::Remove { .. }) | None => {
+                    (McpServerSource::Config, RegistrationPrecedence::Config)
+                }
             };
             builder.register(McpServerRegistration::new(name, source, config, precedence));
         }

@@ -1,238 +1,169 @@
-//! Full-suite grants belong to accepted tasks, never inferred from prose/turns.
-//!
-//! Root clients may submit Application additional_context under
-//! `codex.validation_task.v1` with `{"task_id":"...","grant_id":"..."}`.
-//! Omission continues the existing task; reusing IDs never replenishes it.
-//! Children inherit their parent's captured scope and cannot mint grants.
+//! Per-turn validation mode policy.
 
 use crate::session::session::Session;
 use crate::session::turn_context::TurnContext;
 use crate::tools::sandboxing::ToolCtx;
-use codex_command_analysis::command_preflight::owned_suite_nonexecution;
-use std::collections::HashMap;
-use std::path::Path;
 
-pub(crate) const METADATA_KEY: &str = "codex.validation_task.v1";
-
-#[derive(Default)]
-struct AdmissionRefusals(std::sync::Mutex<HashMap<String, bool>>);
-
-/// `validation_proof` is the launch owner's repository-runner-aware proof
-/// capability. Settlement cannot recover it: call-argument classification has
-/// no runner manifest, so a refused `just`/runner validation would otherwise
-/// vanish. `false` defers to that call-argument classification.
-pub(crate) fn record_admission_refusal(ctx: &ToolCtx, validation_proof: bool) {
-    ctx.turn
-        .extension_data
-        .get_or_init(AdmissionRefusals::default)
-        .0
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .insert(ctx.call_id.clone(), validation_proof);
+/// A policy refusal is not an execution failure or a busy validation lane.
+pub(crate) fn policy_refusal(
+    turn: &TurnContext,
+    reason: impl Into<String>,
+) -> crate::tools::context::FunctionToolOutput {
+    let signal = serde_json::json!({
+        "validation_policy_refusal": true,
+        "mode": turn.validation_mode,
+        "execution_state": "not_started",
+        "status": "unvalidated",
+        "reason": reason.into(),
+    });
+    let mut output = crate::tools::context::FunctionToolOutput::from_text(
+        signal.to_string(), Some(false),
+    ).with_sampling_request_signal(signal.clone());
+    output.essential_inline = signal.as_object().cloned().unwrap_or_default();
+    output
 }
 
-/// `Some(validation_proof)` when this call was refused before launch.
-pub(crate) fn take_admission_refusal(turn: &TurnContext, call: &str) -> Option<bool> {
-    turn.extension_data
-        .get::<AdmissionRefusals>()
-        .and_then(|refusals| {
-            refusals
-                .0
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .remove(call)
-        })
+pub(crate) fn policy_limit(turn: &TurnContext) -> usize {
+    use codex_protocol::validation::ValidationMode;
+    match turn.validation_mode {
+        ValidationMode::Off => 0,
+        ValidationMode::Compile => 2,
+        ValidationMode::Benchmark | ValidationMode::Full => turn.validation_full_budget,
+    }
 }
 
-#[derive(serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-struct TaskGrant {
-    task_id: String,
-    grant_id: String,
+pub(crate) fn mode_refusal(
+    turn: &TurnContext,
+    classification: codex_command_analysis::validation::ValidationPolicyClassification,
+    declared: bool,
+) -> Option<crate::tools::context::FunctionToolOutput> {
+    use codex_command_analysis::validation::ValidationPolicyClassification as Class;
+    use codex_protocol::validation::ValidationMode;
+    if classification == Class::ReadOnly { return None; }
+    let recognized = classification.is_validation();
+    if !recognized && !declared { return None; }
+    let reason = match turn.validation_mode {
+        ValidationMode::Off => "Validation is disabled for this turn. No command was launched; report unvalidated rather than retrying.",
+        ValidationMode::Compile if classification != Class::TargetedCompilation =>
+            "COMPILE permits only targeted cargo check, not tests, gates, formatting, Clippy, or full builds. No command was launched.",
+        ValidationMode::Benchmark if !matches!(classification, Class::TargetedCompilation | Class::Benchmark) =>
+            "BENCHMARK permits only targeted cargo check and recognized benchmark-only workloads, not tests, mixed or unclassified validation, gates, formatting, Clippy, or full builds. No command was launched.",
+        _ => return None,
+    };
+    Some(policy_refusal(turn, reason))
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn reserve_policy(
+    session: &Session,
+    turn: &TurnContext,
+    call_id: &str,
+    classification: codex_command_analysis::validation::ValidationPolicyClassification,
+    declared: bool,
+    selection: String,
+    execution_scope: &str,
+    source_revision: Option<&str>,
+) -> Result<Option<codex_command_analysis::command_preflight::FullSuitePermit>, crate::tools::context::FunctionToolOutput> {
+    use codex_command_analysis::validation::ValidationPolicyClassification as Class;
+    if classification == Class::ReadOnly { return Ok(None); }
+    if let Some(refusal) = mode_refusal(turn, classification, declared) { return Err(refusal); }
+    if !declared && !classification.is_validation() {
+        return Ok(None);
+    }
+    // Count executions, not shell envelopes: a compound script must not hide
+    // multiple checks in one reservation. A runner's own batch is one leaf.
+    if serde_json::from_str::<Vec<Vec<String>>>(&selection).is_ok_and(|commands| {
+        commands.iter().filter(|argv| argv.split_first().is_some_and(|(program, args)| {
+            crate::validation::classify_validation_policy(
+                &crate::tools::handlers::command_shape::CommandInvocation::Argv {
+                    program: program.clone(), args: args.to_vec(),
+                },
+            ).is_validation()
+        })).count() > 1
+    }) {
+        return Err(policy_refusal(turn, "Multiple validation launches in one shell command are not permitted; use one targeted check or one authorized runner batch."));
+    }
+    // Missing source identity must not grant unlimited retries. This sentinel is
+    // deliberately stable, and cannot be used as verification evidence.
+    let revision = source_revision.unwrap_or("source-identity-unavailable").to_owned();
+    turn.full_suite_budget.reserve_policy(
+        reservation_owner(session, turn, call_id),
+        serde_json::json!([execution_scope, selection]).to_string(), revision,
+        policy_limit(turn), turn.validation_mode == codex_protocol::validation::ValidationMode::Compile
+            || (turn.validation_mode == codex_protocol::validation::ValidationMode::Benchmark
+                && classification == Class::TargetedCompilation),
+    ).map(Some).map_err(|reason| policy_refusal(turn, reason))
 }
 
 pub(crate) fn reservation_owner(session: &Session, turn: &TurnContext, call: &str) -> String {
     format!("{}:{}:{call}", session.thread_id(), turn.sub_id)
 }
 
-pub(crate) async fn accept_metadata(
-    session: &Session,
-    entry: &codex_protocol::protocol::AdditionalContextEntry,
-    root: bool,
-) -> Result<(), String> {
-    if entry.kind != codex_protocol::protocol::AdditionalContextKind::Application || !root {
-        return Err(
-            "validation task grants require accepted root-client application metadata".into(),
-        );
-    }
-    let grant: TaskGrant = serde_json::from_str(&entry.value).map_err(|error| error.to_string())?;
-    for id in [&grant.task_id, &grant.grant_id] {
-        if id.is_empty()
-            || id.len() > 128
-            || !id
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || b"-_.:".contains(&byte))
-        {
-            return Err(
-                "validation task and grant IDs must be nonempty bounded identifiers".into(),
-            );
-        }
-    }
-    let store = session
-        .services
-        .agent_control
-        .task_coordinator()
-        .store()
-        .ok_or("validation task persistence is unavailable")?;
-    // Qualify caller IDs by the durable root-session identity, not a repository.
-    let task = format!("{}:{}", session.session_id(), grant.task_id);
-    store
-        .accept_validation_task_grant(&session.thread_id().to_string(), &task, &grant.grant_id)
-        .await
-        .map_err(|error| error.to_string())
-}
-
-/// The owner's acknowledgement channel for one local full-suite launch.
-pub(crate) struct FullSuiteDispatch {
-    path: std::path::PathBuf,
-    attempt: String,
-}
-
-impl FullSuiteDispatch {
-    /// Only for a launch whose process creation definitely failed: no child
-    /// exists to own this record, so the next reservation may refund the
-    /// attempt. First write wins; an existing record is never replaced.
-    pub(crate) async fn acknowledge_not_spawned(self) {
-        use tokio::io::AsyncWriteExt as _;
-
-        let record = serde_json::json!({
-            "version": 1,
-            "attempt": self.attempt,
-            "status": "not_started",
-        })
-        .to_string();
-        let Ok(mut file) = tokio::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&self.path)
-            .await
-        else {
-            return;
-        };
-        // A partial record does not parse, so a failed write stays spent.
-        if file.write_all(record.as_bytes()).await.is_ok() {
-            let _ = file.sync_all().await;
-        }
-    }
-}
-
-/// Called only after owner preflight/admission and immediately before possible
-/// spawn. No Rust lock is held across storage; a lost/uncertain commit fails closed.
-/// Returns the local acknowledgement channel when this call started a reserved suite.
-pub(crate) async fn begin_dispatch(
-    ctx: &ToolCtx,
-    env: &mut HashMap<String, String>,
-    local: bool,
-) -> Result<Option<FullSuiteDispatch>, String> {
+/// Checkpoint consumption before launch. Only proven nonexecution permits retry.
+pub(crate) async fn begin_policy_attempt(ctx: &ToolCtx) -> Result<(), String> {
     let owner = reservation_owner(&ctx.session, &ctx.turn, &ctx.call_id);
     let budget = &ctx.turn.full_suite_budget;
+    if !budget.reserved_for(&owner) && !budget.started_for(&owner) {
+        return Ok(());
+    }
+    let _checkpoint = budget.checkpoint_guard().await;
     if budget.started_for(&owner) {
-        return Err("full-suite launch blocked: this tool call already crossed the possible-start boundary; sandbox retries cannot create another suite".into());
+        return Err("Validation already crossed the possible-start boundary for this call; retain its result or resume its live process instead of relaunching.".into());
     }
     if !budget.reserved_for(&owner) {
-        return Ok(None);
+        return Ok(());
     }
-    let Some((task, grant)) = budget.task_scope() else {
-        // isolated, nonpersistent test contexts
-        return budget.start(&owner, None).map(|()| None);
-    };
-    let store = ctx
-        .session
-        .services
-        .agent_control
-        .task_coordinator()
-        .store()
-        .ok_or("full-suite launch blocked: durable task budget is unavailable")?;
-    let previous = store
-        .validation_suite_attempt(task, grant)
-        .await
-        .map_err(|error| error.to_string())?;
-    let refunded = tokio::task::spawn_blocking(move || {
-        previous
-            .filter(|(attempt, path)| owned_suite_nonexecution(Path::new(path), attempt))
-            .map(|(attempt, _)| attempt)
-    })
-    .await
-    .map_err(|error| error.to_string())?;
-    let attempt = uuid::Uuid::new_v4().to_string();
-    let directory = ctx.turn.config.codex_home.join("tmp/full-suite-dispatch");
-    tokio::fs::create_dir_all(&directory)
-        .await
-        .map_err(|error| error.to_string())?;
-    let path = directory.join(format!("{attempt}.json"));
-    if !store
-        .reserve_validation_suite(
-            task,
-            grant,
-            &attempt,
-            &path.to_string_lossy(),
-            refunded.as_deref(),
-        )
-        .await
-        .map_err(|error| error.to_string())?
-    {
-        return Err("Full-suite launch blocked: this task/grant already has a reserved, started, or uncertain run; another full suite requires explicit user permission.".into());
+    budget.start(&owner, None)?;
+    if let Err(error) = persist_policy_checkpoint(&ctx.session, &ctx.turn).await {
+        budget.acknowledge_not_spawned(&owner);
+        return Err(error);
     }
-    if !store
-        .start_validation_suite(task, grant, &attempt)
-        .await
-        .map_err(|error| error.to_string())?
-    {
-        return Err("full-suite launch blocked: task reservation ownership changed".into());
+    Ok(())
+}
+
+pub(crate) async fn policy_attempt_not_started(ctx: &ToolCtx) {
+    let owner = reservation_owner(&ctx.session, &ctx.turn, &ctx.call_id);
+    if !ctx.turn.full_suite_budget.started_for(&owner) {
+        return;
     }
-    budget.start(&owner, local.then(|| (path.to_path_buf(), attempt.clone())))?;
-    // Remote/opaque starts stay spent when their dispatch cannot be observed.
-    if !local {
-        return Ok(None);
-    }
-    env.insert(
-        "CODEX_FULL_SUITE_ACK_PATH".into(),
-        path.to_string_lossy().into_owned(),
+    let _checkpoint = ctx.turn.full_suite_budget.checkpoint_guard().await;
+    ctx.turn.full_suite_budget.acknowledge_not_spawned(
+        &owner,
     );
-    env.insert("CODEX_FULL_SUITE_ATTEMPT".into(), attempt.clone());
-    Ok(Some(FullSuiteDispatch { path: path.to_path_buf(), attempt }))
+    let _ = persist_policy_checkpoint(&ctx.session, &ctx.turn).await;
+}
+
+async fn persist_policy_checkpoint(session: &Session, turn: &TurnContext) -> Result<(), String> {
+    session.services.agent_control.persist_root_validation_checkpoint(turn).await?;
+    session.persist_rollout_items_durable(&[
+        codex_protocol::protocol::RolloutItem::TurnContext(turn.to_turn_context_item()),
+    ]).await.map_err(|error| format!("validation admission checkpoint failed before launch: {error}"))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
 
     #[tokio::test]
-    async fn unspawned_dispatch_acknowledges_nonexecution_without_replacing_owner_records() {
-        let root = tempfile::tempdir().unwrap();
-        let path = root.path().join("attempt.json");
-        FullSuiteDispatch {
-            path: path.clone(),
-            attempt: "nonce".into(),
-        }
-        .acknowledge_not_spawned()
-        .await;
-        assert!(owned_suite_nonexecution(&path, "nonce"));
-        assert!(!owned_suite_nonexecution(&path, "other"));
-
-        // A child that reached its dispatch boundary first keeps the suite spent.
-        let started = root.path().join("started.json");
-        std::fs::write(
-            &started,
-            r#"{"version":1,"attempt":"nonce","status":"started"}"#,
-        )
-        .unwrap();
-        FullSuiteDispatch {
-            path: started.clone(),
-            attempt: "nonce".into(),
-        }
-        .acknowledge_not_spawned()
-        .await;
-        assert!(!owned_suite_nonexecution(&started, "nonce"));
+    async fn dispatch_retry_requires_proven_nonexecution_and_keeps_budget_bounded() {
+        let (session, turn) = crate::session::tests::make_session_and_context().await;
+        let ctx = ToolCtx {
+            session: Arc::new(session), turn: Arc::new(turn), call_id: "compile".into(),
+            tool_name: codex_tools::ToolName::plain("exec_command"),
+        };
+        let owner = reservation_owner(&ctx.session, &ctx.turn, &ctx.call_id);
+        let permit = ctx.turn.full_suite_budget.reserve_policy(
+            owner, "cargo check -p example".into(), "source".into(), 2, true,
+        ).unwrap();
+        begin_policy_attempt(&ctx).await.unwrap();
+        assert_eq!(ctx.turn.full_suite_budget.policy_snapshot(2).admitted, 1);
+        assert!(begin_policy_attempt(&ctx).await.is_err());
+        policy_attempt_not_started(&ctx).await;
+        assert_eq!(ctx.turn.full_suite_budget.policy_snapshot(2).admitted, 0);
+        begin_policy_attempt(&ctx).await.unwrap();
+        assert!(begin_policy_attempt(&ctx).await.is_err());
+        drop(permit);
+        assert_eq!(ctx.turn.full_suite_budget.policy_snapshot(2).admitted, 1);
     }
 }

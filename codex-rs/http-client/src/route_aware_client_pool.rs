@@ -209,8 +209,11 @@ impl RouteAwareRequestBuilder {
     {
         let request = url
             .into_url()
-            .map(|url| reqwest::Request::new(method, url))
-            .map_err(RouteAwareRequestError::Request);
+            .map_err(RouteAwareRequestError::Request)
+            .and_then(|url| {
+                validate_request_url(&url)?;
+                Ok(reqwest::Request::new(method, url))
+            });
         Self { pool, request }
     }
 
@@ -513,6 +516,7 @@ impl RouteAwareClientPool {
     /// This is intended for higher-level API clients that own request encoding but still need
     /// the configured outbound-proxy route and thread-scoped transport reuse.
     pub async fn client_for_url(&self, url: &str) -> Result<HttpClient, RouteAwareRequestError> {
+        validate_request_url(&into_reqwest_url(url)?)?;
         Ok(self
             .client_for_url_with_resolver(url, |request_url| {
                 let http_client_factory = self.http_client_factory.clone();
@@ -545,13 +549,9 @@ impl RouteAwareClientPool {
         request: reqwest::Request,
     ) -> Result<reqwest::Response, RouteAwareRequestError> {
         let http_client_factory = self.http_client_factory.clone();
-        let force_direct = self.force_direct;
         self.send_with_resolver(request, move |request_url| {
             let http_client_factory = http_client_factory.clone();
             async move {
-                if force_direct {
-                    return Ok(OutboundProxyRoute::Direct);
-                }
                 http_client_factory
                     .resolve_proxy_route_async(request_url)
                     .await
@@ -573,9 +573,7 @@ impl RouteAwareClientPool {
         self.client_builder
             .apply_default_headers(request.headers_mut());
         let request_url = request.url().to_string();
-        let follows_redirects_manually = self.client_builder.follows_redirects()
-            && self.http_client_factory.outbound_proxy_policy()
-                == OutboundProxyPolicy::RespectSystemProxy;
+        let follows_redirects_manually = self.client_builder.follows_redirects();
         let timeout_deadline = request
             .timeout()
             .copied()
@@ -585,6 +583,7 @@ impl RouteAwareClientPool {
         let mut previous_route = None;
         loop {
             let current_url = request.url().clone();
+            validate_request_url(&current_url)?;
             let (current_route, client) = match timeout_deadline {
                 Some(timeout_deadline) => tokio::time::timeout_at(
                     timeout_deadline,
@@ -699,9 +698,13 @@ impl RouteAwareClientPool {
         Fut: Future<Output = io::Result<OutboundProxyRoute>>,
     {
         let route_start = std::time::Instant::now();
-        let route = resolve_route(request_url.to_string())
-            .await
-            .map_err(RouteAwareClientPoolError::Resolve)?;
+        let route = if self.force_direct {
+            OutboundProxyRoute::Direct
+        } else {
+            resolve_route(request_url.to_string())
+                .await
+                .map_err(RouteAwareClientPoolError::Resolve)?
+        };
         crate::transport::record_timing(|timing| {
             timing.proxy_resolution =
                 Some(timing.proxy_resolution.unwrap_or_default() + route_start.elapsed());
@@ -735,12 +738,7 @@ impl RouteAwareClientPool {
             return Ok((route, client));
         }
 
-        let client_builder = match self.http_client_factory.outbound_proxy_policy() {
-            OutboundProxyPolicy::ReqwestDefault => self.client_builder.clone(),
-            OutboundProxyPolicy::RespectSystemProxy => {
-                self.client_builder.clone().without_redirects()
-            }
-        };
+        let client_builder = self.client_builder.clone().without_redirects();
         let http_client_factory = self.http_client_factory.clone();
         let route_class = self.route_class;
         let route_for_build = route.clone();
@@ -765,6 +763,19 @@ impl RouteAwareClientPool {
         trace_client_selection(selection_start.elapsed(), false);
         Ok((route, client))
     }
+}
+
+fn into_reqwest_url(url: impl IntoUrl) -> reqwest::Result<reqwest::Url> {
+    url.into_url()
+}
+
+fn validate_request_url(url: &reqwest::Url) -> Result<(), RouteAwareRequestError> {
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err(RouteAwareRequestError::Build(
+            "URL userinfo is unsupported for route-aware requests; use an explicit Authorization header".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn trace_client_selection(duration: Duration, client_cache_hit: bool) {

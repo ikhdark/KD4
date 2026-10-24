@@ -734,9 +734,8 @@ pub(super) async fn ensure_listener_task_running(
                     break;
                 }
                 _ = listener_overflow.cancelled() => {
-                    // A goal update was not admitted. Continuing the stream could
-                    // leave clients on an older goal indefinitely. Resume sends
-                    // the authoritative goal snapshot before live updates.
+                    // A listener command was not admitted. Disconnect subscribers
+                    // so a subsequent resume can restore an ordered snapshot.
                     for connection_id in thread_state_manager.subscribed_connection_ids(conversation_id).await {
                         outgoing_for_task.fail_connection_delivery(connection_id).await;
                     }
@@ -1255,29 +1254,6 @@ pub(super) async fn handle_thread_listener_command(
             )
             .await;
         }
-        ThreadListenerCommand::EmitThreadGoalUpdated { turn_id, goal } => {
-            outgoing
-                .send_server_notification(ServerNotification::ThreadGoalUpdated(
-                    ThreadGoalUpdatedNotification {
-                        thread_id: conversation_id.to_string(),
-                        turn_id,
-                        goal,
-                    },
-                ))
-                .await;
-        }
-        ThreadListenerCommand::EmitThreadGoalCleared => {
-            outgoing
-                .send_server_notification(ServerNotification::ThreadGoalCleared(
-                    ThreadGoalClearedNotification {
-                        thread_id: conversation_id.to_string(),
-                    },
-                ))
-                .await;
-        }
-        ThreadListenerCommand::EmitThreadGoalSnapshot { state_db } => {
-            send_thread_goal_snapshot_notification(outgoing, conversation_id, &state_db).await;
-        }
         ThreadListenerCommand::ResolveServerRequest {
             request_id,
             completion_tx,
@@ -1499,16 +1475,6 @@ pub(super) async fn handle_pending_thread_resume_request(
         )
         .await;
     }
-    if pending.emit_thread_goal_update {
-        if let Some(state_db) = pending.thread_goal_state_db {
-            send_thread_goal_snapshot_notification(outgoing, conversation_id, &state_db).await;
-        } else {
-            tracing::warn!(
-                thread_id = %conversation_id,
-                "state db unavailable when reading thread goal for running thread resume"
-            );
-        }
-    }
     let experimental_api_enabled = thread_state_manager
         .connection_supports_experimental_api(connection_id)
         .await;
@@ -1521,50 +1487,13 @@ pub(super) async fn handle_pending_thread_resume_request(
         .await;
     // App-server owns resume response and snapshot ordering, so wait until
     // replay completes before letting extensions react to the idle thread.
-    if pending.emit_thread_goal_update {
-        conversation.emit_thread_idle_lifecycle_if_idle().await;
-    }
+    conversation.emit_thread_idle_lifecycle_if_idle().await;
 }
 
 fn resume_listener_changed_error(conversation_id: ThreadId) -> JSONRPCErrorError {
     internal_error(format!(
         "thread {conversation_id} listener changed while composing resume response"
     ))
-}
-
-pub(super) async fn send_thread_goal_snapshot_notification(
-    outgoing: &Arc<OutgoingMessageSender>,
-    thread_id: ThreadId,
-    state_db: &StateDbHandle,
-) {
-    match state_db.thread_goals().get_thread_goal(thread_id).await {
-        Ok(Some(goal)) => {
-            outgoing
-                .send_server_notification(ServerNotification::ThreadGoalUpdated(
-                    ThreadGoalUpdatedNotification {
-                        thread_id: thread_id.to_string(),
-                        turn_id: None,
-                        goal: api_thread_goal_from_state(goal),
-                    },
-                ))
-                .await;
-        }
-        Ok(None) => {
-            outgoing
-                .send_server_notification(ServerNotification::ThreadGoalCleared(
-                    ThreadGoalClearedNotification {
-                        thread_id: thread_id.to_string(),
-                    },
-                ))
-                .await;
-        }
-        Err(err) => {
-            tracing::warn!(
-                thread_id = %thread_id,
-                "failed to read thread goal for resume snapshot: {err}"
-            );
-        }
-    }
 }
 
 pub(crate) fn populate_thread_turns_from_history(
@@ -2347,8 +2276,8 @@ mod tests {
         for _ in 0..8 {
             fixture
                 .outgoing
-                .send_server_notification(ServerNotification::ThreadGoalCleared(
-                    ThreadGoalClearedNotification {
+                .send_server_notification(ServerNotification::ThreadClosed(
+                    ThreadClosedNotification {
                         thread_id: fixture.thread_id.to_string(),
                     },
                 ))
@@ -2368,7 +2297,10 @@ mod tests {
         .await
         .expect("listener consumes first resolution");
         while command_tx
-            .try_send(ThreadListenerCommand::EmitThreadGoalCleared)
+            .try_send(ThreadListenerCommand::ResolveServerRequest {
+                request_id: RequestId::Integer(0),
+                completion_tx: tokio::sync::oneshot::channel().0,
+            })
             .is_ok()
         {}
         let queue_waiter = resolve_server_request_on_thread_listener(
@@ -2561,7 +2493,10 @@ mod tests {
                 .same_channel(&command_tx)
         );
         command_tx
-            .send(ThreadListenerCommand::EmitThreadGoalCleared)
+            .send(ThreadListenerCommand::ResolveServerRequest {
+                request_id: RequestId::Integer(0),
+                completion_tx: tokio::sync::oneshot::channel().0,
+            })
             .await
             .expect("cancelling attachment must retain the published listener receiver");
         drop(authority_guard);
@@ -2585,9 +2520,9 @@ mod tests {
         };
         assert!(matches!(
             message,
-            OutgoingMessage::AppServerNotification(ServerNotification::ThreadGoalCleared(
+            OutgoingMessage::AppServerNotification(ServerNotification::ServerRequestResolved(
                 notification
-            )) if notification.thread_id == thread_id.to_string()
+            )) if notification.thread_id == thread_id.to_string() && notification.request_id == RequestId::Integer(0)
         ));
         {
             let state = fixture.original_thread_state.lock().await;
@@ -3097,8 +3032,8 @@ mod tests {
             for _ in 0..8 {
                 fixture
                     .outgoing
-                    .send_server_notification(ServerNotification::ThreadGoalCleared(
-                        ThreadGoalClearedNotification {
+                    .send_server_notification(ServerNotification::ThreadClosed(
+                        ThreadClosedNotification {
                             thread_id: fixture.thread_id.to_string(),
                         },
                     ))

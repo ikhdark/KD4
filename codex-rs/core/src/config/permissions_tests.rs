@@ -21,6 +21,38 @@ use std::collections::BTreeMap;
 use tempfile::TempDir;
 
 #[test]
+fn unsafe_verbatim_exact_paths_remain_literal_and_unchanged() {
+    for raw in [
+        r"\\?\C:\name.",
+        r"\\?\C:\name ",
+        r"\\?\C:\NUL",
+        r"\\?\UNC\server\share\name.",
+    ] {
+        assert!(!contains_glob_chars_for_platform(raw, true), "{raw}");
+        assert_eq!(
+            normalize_absolute_path_for_platform(raw, true).as_ref(),
+            Path::new(raw)
+        );
+        #[cfg(windows)]
+        for access in [
+            FileSystemAccessMode::Read,
+            FileSystemAccessMode::Write,
+            FileSystemAccessMode::Deny,
+        ] {
+            let parsed =
+                compile_filesystem_access_path(raw, access, &mut Vec::new()).expect("literal");
+            assert!(
+                matches!(parsed,FileSystemPath::Path { path } if path.as_path()==Path::new(raw))
+            );
+        }
+    }
+    assert!(contains_glob_chars_for_platform(
+        r"\\?\C:\name.\*.env",
+        true
+    ));
+}
+
+#[test]
 fn builtin_permission_descriptor_drives_identity_and_runtime_profiles() {
     let profiles = builtin_permission_profiles().collect::<Vec<_>>();
     assert_eq!(
@@ -99,15 +131,15 @@ fn windows_verbatim_path_prefix_does_not_count_as_glob_syntax() {
 }
 
 #[test]
-fn network_toml_ignores_legacy_network_list_keys() {
-    let parsed = toml::from_str::<NetworkToml>(
+fn network_toml_rejects_legacy_network_list_keys() {
+    let err = toml::from_str::<NetworkToml>(
         r#"
 allowed_domains = ["openai.com"]
 "#,
     )
-    .expect("legacy network list keys should be ignored");
+    .expect_err("removed network restrictions must not be silently ignored");
 
-    assert_eq!(parsed, NetworkToml::default());
+    assert!(err.to_string().contains("unknown field `allowed_domains`"), "{err}");
 }
 
 #[test]
@@ -168,64 +200,6 @@ fn network_permission_containers_project_allowed_and_denied_entries() {
     );
 }
 
-#[test]
-fn network_toml_overlays_unix_socket_permissions_by_path() {
-    let mut config = NetworkProxyConfig::default();
-
-    NetworkToml {
-        unix_sockets: Some(NetworkUnixSocketPermissionsToml {
-            entries: BTreeMap::from([
-                (
-                    "/tmp/base.sock".to_string(),
-                    NetworkUnixSocketPermissionToml::Allow,
-                ),
-                (
-                    "/tmp/override.sock".to_string(),
-                    NetworkUnixSocketPermissionToml::Allow,
-                ),
-            ]),
-        }),
-        ..Default::default()
-    }
-    .apply_to_network_proxy_config(&mut config);
-
-    NetworkToml {
-        unix_sockets: Some(NetworkUnixSocketPermissionsToml {
-            entries: BTreeMap::from([
-                (
-                    "/tmp/extra.sock".to_string(),
-                    NetworkUnixSocketPermissionToml::Allow,
-                ),
-                (
-                    "/tmp/override.sock".to_string(),
-                    NetworkUnixSocketPermissionToml::Deny,
-                ),
-            ]),
-        }),
-        ..Default::default()
-    }
-    .apply_to_network_proxy_config(&mut config);
-
-    assert_eq!(
-        config.unix_sockets,
-        Some(codex_network_proxy::NetworkUnixSocketPermissions {
-            entries: BTreeMap::from([
-                (
-                    "/tmp/base.sock".to_string(),
-                    ProxyNetworkUnixSocketPermission::Allow,
-                ),
-                (
-                    "/tmp/extra.sock".to_string(),
-                    ProxyNetworkUnixSocketPermission::Allow,
-                ),
-                (
-                    "/tmp/override.sock".to_string(),
-                    ProxyNetworkUnixSocketPermission::Deny,
-                ),
-            ]),
-        })
-    );
-}
 
 #[test]
 fn permissions_profiles_resolve_extends_parent_first_with_child_overrides() {
@@ -246,14 +220,6 @@ docs = "read"
 [base.network]
 enabled = true
 
-[base.network.domains]
-"base.example.com" = "allow"
-"SHARED.EXAMPLE.COM." = "deny"
-
-[base.network.unix_sockets]
-"/tmp/base.sock" = "allow"
-"/tmp/blocked.sock" = "deny"
-
 [child]
 extends = "base"
 
@@ -267,14 +233,6 @@ src = "read"
 
 [child.network]
 enabled = false
-allow_local_binding = true
-
-[child.network.domains]
-"child.example.com" = "allow"
-"shared.example.com" = "allow"
-
-[child.network.unix_sockets]
-"/tmp/child.sock" = "allow"
 "#,
     )
     .expect("permissions should deserialize");
@@ -297,17 +255,6 @@ src = "read"
 
 [network]
 enabled = false
-allow_local_binding = true
-
-[network.domains]
-"base.example.com" = "allow"
-"child.example.com" = "allow"
-"shared.example.com" = "allow"
-
-[network.unix_sockets]
-"/tmp/base.sock" = "allow"
-"/tmp/blocked.sock" = "deny"
-"/tmp/child.sock" = "allow"
 "#,
     )
     .expect("expected profile should deserialize");
@@ -375,42 +322,6 @@ extends = "alpha"
     );
 }
 
-#[test]
-fn profile_network_proxy_config_keeps_proxy_disabled_for_proxy_policy() {
-    let bare_network = NetworkToml {
-        enabled: Some(true),
-        ..Default::default()
-    };
-    for network in [None, Some(&bare_network)] {
-        assert!(!network_proxy_config_from_profile_network(network).enabled);
-    }
-
-    let config = network_proxy_config_from_profile_network(Some(&NetworkToml {
-        enabled: Some(true),
-        proxy_url: Some("http://127.0.0.1:43128".to_string()),
-        enable_socks5: Some(false),
-        domains: Some(NetworkDomainPermissionsToml {
-            entries: BTreeMap::from([(
-                "openai.com".to_string(),
-                NetworkDomainPermissionToml::Allow,
-            )]),
-        }),
-        ..Default::default()
-    }));
-
-    assert!(!config.enabled);
-    assert_eq!(config.proxy_url, "http://127.0.0.1:43128");
-    assert!(!config.enable_socks5);
-    assert_eq!(
-        config.domains,
-        Some(codex_network_proxy::NetworkDomainPermissions {
-            entries: vec![codex_network_proxy::NetworkDomainPermissionEntry {
-                pattern: "openai.com".to_string(),
-                permission: codex_network_proxy::NetworkDomainPermission::Allow,
-            }],
-        })
-    );
-}
 
 #[test]
 fn compile_permission_profile_workspace_roots_resolves_enabled_entries() -> std::io::Result<()> {

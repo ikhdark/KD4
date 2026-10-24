@@ -515,25 +515,10 @@ fn apply_reconstructed_settings_to_config(
             }
             None => PermissionProfileSnapshot::legacy(permission_profile.clone()),
         };
-        let network = if let Some(active_permission_profile) = active_permission_profile.as_ref() {
-            Some(
-                config
-                    .network_proxy_spec_for_active_permission_profile(
-                        active_permission_profile,
-                        permission_profile,
-                    )
-                    .map_err(invalid_reconstructed_setting)?,
-            )
-        } else {
-            None
-        };
         config
             .permissions
             .set_permission_profile_from_session_snapshot(snapshot)
             .map_err(invalid_reconstructed_setting)?;
-        if let Some(network) = network {
-            config.permissions.network = network;
-        }
         config.explicit_permission_profile_mode = true;
     } else if let Some(sandbox_policy) = settings.sandbox_policy.as_ref() {
         config
@@ -1131,7 +1116,8 @@ impl ThreadManager {
         let history = stored_thread_to_initial_history(stored_thread, fork_source.rollout_path())?;
         let inherited_multi_agent_version = fork_source
             .multi_agent_version()
-            .unwrap_or(MultiAgentVersion::V1);
+            .unwrap_or(MultiAgentVersion::V2)
+            .runtime_version();
         options.initial_history = fork_history_from_snapshot(
             ForkSnapshot::TruncateToLastSamplingBoundary,
             history,
@@ -1458,8 +1444,12 @@ impl ThreadManager {
                 let owner = tokio::spawn(async move {
                     let shutdown_result = thread.shutdown_and_wait().await;
                     let drain_result = thread.wait_until_drained().await;
-                    shutdown_result?;
                     drain_result?;
+                    if shutdown_result.is_err() {
+                        // A bounded observation may have expired before the
+                        // independently owned persistence retirement succeeded.
+                        thread.shutdown_and_wait().await?;
+                    }
                     state.remove_thread_if_same(&thread_id, &thread).await;
                     CodexResult::Ok(())
                 });
@@ -2604,9 +2594,6 @@ impl ThreadManagerState {
         let user_instructions = self
             .user_instructions_for_spawn(&session_source, parent_thread_id, forked_from_thread_id)
             .await;
-        let parent_rollout_thread_trace = self
-            .parent_rollout_thread_trace_for_source(&session_source)
-            .await;
         let tracked_session_source = session_source.clone();
         let multi_agent_version = self
             .initial_multi_agent_version_for_spawn(
@@ -2659,7 +2646,6 @@ impl ThreadManagerState {
             metrics_service_name,
             inherited_environments,
             inherited_exec_policy,
-            parent_rollout_thread_trace,
             user_shell_override,
             parent_trace,
             environment_selections: environments,
@@ -2801,28 +2787,6 @@ impl ThreadManagerState {
         let _ = self.thread_created_tx.send(thread_id);
     }
 
-    async fn parent_rollout_thread_trace_for_source(
-        &self,
-        session_source: &SessionSource,
-    ) -> codex_rollout_trace::ThreadTraceContext {
-        // Fresh and cold-reloaded children share their parent's bundle. Session
-        // startup chooses an original start or an explicit resumed activation.
-        let SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
-            parent_thread_id, ..
-        }) = session_source
-        else {
-            return codex_rollout_trace::ThreadTraceContext::disabled();
-        };
-        // Parent lookup can fail if the parent was closed or released between
-        // spawn preparation and session construction. Tracing is diagnostic, so
-        // that race should not block child creation; the child simply starts
-        // without a parent rollout trace.
-        self.get_thread(*parent_thread_id)
-            .await
-            .ok()
-            .map(|thread| thread.codex.session.services.rollout_thread_trace.clone())
-            .unwrap_or_else(codex_rollout_trace::ThreadTraceContext::disabled)
-    }
 }
 
 fn stored_thread_to_initial_history(

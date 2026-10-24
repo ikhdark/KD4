@@ -31,10 +31,6 @@ pub use feature_configs::CurrentTimeReminderConfigToml;
 pub use feature_configs::CurrentTimeReminderDeliveryMode;
 pub use feature_configs::CurrentTimeSource;
 pub use feature_configs::MultiAgentV2ConfigToml;
-pub use feature_configs::NetworkProxyConfigToml;
-pub use feature_configs::NetworkProxyDomainPermissionToml;
-pub use feature_configs::NetworkProxyModeToml;
-pub use feature_configs::NetworkProxyUnixSocketPermissionToml;
 use feature_configs::RemovedAppsMcpPathOverrideConfigToml;
 
 /// High-level lifecycle stage for a feature.
@@ -110,8 +106,6 @@ pub enum Feature {
     SecretAuthStorage,
 
     // Experimental
-    /// Show the optional consumer plan-limit history analytics report.
-    AnalyticsPlanHistory,
     /// Enable JavaScript code mode.
     CodeMode,
     /// Run code mode cells in the standalone `codex-code-mode-host` process.
@@ -151,8 +145,6 @@ pub enum Feature {
     LocalThreadStoreCompression,
     /// Compress request bodies (zstd) when sending streaming requests to codex-backend.
     EnableRequestCompression,
-    /// Start the managed network proxy for sandboxed sessions.
-    NetworkProxy,
     /// Respect host system proxy settings for Codex-owned network clients.
     RespectSystemProxy,
     /// Enable collab tools.
@@ -217,8 +209,6 @@ pub enum Feature {
     SkillMcpDependencyInstall,
     /// Allow request_user_input in Default collaboration mode.
     DefaultModeRequestUserInput,
-    /// Enable persisted thread goals and automatic goal continuation.
-    Goals,
     /// Add current-time reminders to model-visible context.
     CurrentTimeReminder,
     /// Route MCP tool approval prompts through the MCP elicitation request path.
@@ -551,7 +541,6 @@ pub struct FeaturesToml {
     #[serde(default, rename = "apps_mcp_path_override", skip_serializing)]
     #[schemars(skip)]
     removed_apps_mcp_path_override: Option<FeatureToml<RemovedAppsMcpPathOverrideConfigToml>>,
-    pub network_proxy: Option<FeatureToml<NetworkProxyConfigToml>>,
     /// Boolean feature toggles keyed by canonical feature name.
     #[serde(flatten, deserialize_with = "deserialize_feature_entries")]
     entries: BTreeMap<String, bool>,
@@ -564,6 +553,14 @@ where
     let values = BTreeMap::<String, toml::Value>::deserialize(deserializer)?;
     let mut entries = BTreeMap::new();
     for (key, value) in values {
+        if key == "network_proxy" {
+            if value != toml::Value::Boolean(false) {
+                return Err(serde::de::Error::custom(
+                    "network_proxy was removed; refusing to run without the requested network enforcement",
+                ));
+            }
+            continue;
+        }
         match value {
             toml::Value::Boolean(enabled) => {
                 entries.insert(key, enabled);
@@ -585,11 +582,6 @@ where
 
 impl Features {
     fn apply_toml(&mut self, features: &FeaturesToml) {
-        if features.removed_apps_mcp_path_override.is_some() {
-            tracing::warn!(
-                "[features].apps_mcp_path_override has been removed and is ignored; remove it from your config"
-            );
-        }
         let entries = features.entries();
         self.apply_map(&entries);
     }
@@ -618,9 +610,6 @@ impl FeaturesToml {
         {
             entries.insert(Feature::CurrentTimeReminder.key().to_string(), enabled);
         }
-        if let Some(enabled) = self.network_proxy.as_ref().and_then(FeatureToml::enabled) {
-            entries.insert(Feature::NetworkProxy.key().to_string(), enabled);
-        }
         entries
     }
 
@@ -631,7 +620,6 @@ impl FeaturesToml {
             multi_agent_v2,
             current_time_reminder,
             removed_apps_mcp_path_override: _,
-            network_proxy,
             entries,
         } = self;
         for spec in FEATURES {
@@ -649,9 +637,6 @@ impl FeaturesToml {
             } else if spec.id == Feature::CurrentTimeReminder {
                 entries.remove(spec.key);
                 materialize_resolved_feature_enabled(current_time_reminder, enabled);
-            } else if spec.id == Feature::NetworkProxy {
-                entries.remove(spec.key);
-                materialize_resolved_feature_enabled(network_proxy, enabled);
             } else {
                 entries.insert(spec.key.to_string(), enabled);
             }
@@ -680,9 +665,6 @@ impl From<BTreeMap<String, bool>> for FeaturesToml {
                 .map(FeatureToml::Enabled),
             current_time_reminder: entries
                 .remove(Feature::CurrentTimeReminder.key())
-                .map(FeatureToml::Enabled),
-            network_proxy: entries
-                .remove(Feature::NetworkProxy.key())
                 .map(FeatureToml::Enabled),
             removed_apps_mcp_path_override: entries
                 .remove("apps_mcp_path_override")
@@ -799,13 +781,6 @@ macro_rules! define_features {
 }
 
 define_features! {
-    FeatureSpec {
-        id: Feature::AnalyticsPlanHistory,
-        key: "analytics_plan_history",
-        stage: Stage::UnderDevelopment,
-        default_enabled: false,
-        consumer: FeatureConsumer::Client,
-    },
     // Stable features.
     FeatureSpec {
         id: Feature::Kd4Runtime,
@@ -944,16 +919,6 @@ define_features! {
         key: "enable_request_compression",
         stage: Stage::Stable,
         default_enabled: true,
-    },
-    FeatureSpec {
-        id: Feature::NetworkProxy,
-        key: "network_proxy",
-        stage: Stage::Experimental {
-            name: "Network proxy",
-            menu_description: "Apply network proxy restrictions to sandboxed sessions that already have network access.",
-            announcement: "NEW: Network proxy can now be enabled from /experimental. Restart Codex after enabling it.",
-        },
-        default_enabled: false,
     },
     FeatureSpec {
         id: Feature::RespectSystemProxy,
@@ -1109,12 +1074,6 @@ define_features! {
         default_enabled: false,
     },
     FeatureSpec {
-        id: Feature::Goals,
-        key: "goals",
-        stage: Stage::Stable,
-        default_enabled: true,
-    },
-    FeatureSpec {
         id: Feature::CurrentTimeReminder,
         key: "current_time_reminder",
         stage: Stage::UnderDevelopment,
@@ -1190,6 +1149,9 @@ pub fn unknown_features_warning_event_with_origins(
 ) -> Option<Event> {
     let unknown = effective_features?
         .keys()
+        // Desktop still sends this compatibility-only key. It is parsed and
+        // ignored below; it is not an actionable configuration warning.
+        .filter(|key| key.as_str() != "apps_mcp_path_override")
         .filter(|key| canonical_feature_for_key(key).is_none())
         .cloned()
         .collect::<BTreeSet<_>>();
@@ -1203,13 +1165,9 @@ pub fn unknown_features_warning_event_with_origins(
     // Classify only migrations established by this registry. Never guess a
     // replacement from spelling similarity or silently change user settings.
     let compatibility = unknown.iter().map(|key| {
-        // `apps_mcp_path_override` is parsed by a dedicated removed-key field
-        // (`FeaturesToml::removed_apps_mcp_path_override`), which already logs
-        // that it is removed and ignored. Classifying it as "unknown" here told
-        // the user to check their spelling for a key the parser recognizes.
         let removed = matches!(key.as_str(), "memories" | "memory_tool" | "auto_review"
             | "guardian_approval" | "artifact" | "enable_mcp_apps" | "realtime_conversation"
-            | "apps_mcp_path_override" | "token_budget" | "context_management");
+            | "analytics_plan_history" | "token_budget" | "context_management");
         let origin = origins.get(key).and_then(Option::as_deref);
         serde_json::json!({
             "key": key,

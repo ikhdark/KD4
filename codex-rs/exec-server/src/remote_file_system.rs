@@ -129,14 +129,21 @@ impl RemoteFileSystem {
         response
             .data_base64
             .map(|data_base64| {
-                STANDARD.decode(data_base64).map_err(|err| {
+                if data_base64.len() > max_bytes.div_ceil(3).saturating_mul(4) {
+                    return Err(io::Error::new(io::ErrorKind::InvalidData, "remote fs/readFileBounded exceeded maxBytes"));
+                }
+                let bytes = STANDARD.decode(data_base64).map_err(|err| {
                     io::Error::new(
                         io::ErrorKind::InvalidData,
                         format!(
                             "remote fs/readFileBounded returned invalid base64 dataBase64: {err}"
                         ),
                     )
-                })
+                })?;
+                if bytes.len() > max_bytes {
+                    return Err(io::Error::new(io::ErrorKind::InvalidData, "remote fs/readFileBounded exceeded maxBytes"));
+                }
+                Ok(bytes)
             })
             .transpose()
     }

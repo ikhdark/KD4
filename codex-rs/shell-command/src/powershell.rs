@@ -43,6 +43,7 @@ pub fn prefix_powershell_script_with_utf8(command: &[String]) -> Vec<String> {
         .next()
         .unwrap_or_default();
     if trimmed.starts_with(['#', '[', '\u{feff}'])
+        || trimmed.starts_with("<#")
         || [
             "using",
             "param",
@@ -1131,6 +1132,9 @@ mod audit36_preamble_regressions {
         for script in [
             "using namespace System.Text; Write-Output ok",
             "# comment\nusing namespace System.Text\nWrite-Output ok",
+            "  <# multiline\ncomment #>\nusing namespace System.Text\nWrite-Output ok",
+            "<# comment #>\nparam($value) Write-Output $value",
+            "<# comment #>\n[CmdletBinding()] param() Write-Output ok",
             "\u{feff}using namespace System.Text; Write-Output ok",
             "param($value) Write-Output $value",
             "[CmdletBinding()] param() Write-Output ok",

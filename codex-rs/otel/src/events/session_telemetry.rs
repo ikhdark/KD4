@@ -71,6 +71,34 @@ pub(super) const RESPONSES_API_ENGINE_IAPI_TBT_FIELD: &str =
 pub(super) const RESPONSES_API_ENGINE_SERVICE_TBT_FIELD: &str =
     "engine_service_tbt_across_engine_calls_ms";
 
+/// Output dimensions recorded by tool-result events; the body is not retained.
+#[derive(Clone, Copy, Debug)]
+pub struct ToolResultOutputStats {
+    pub utf8_bytes: usize,
+    pub line_count: usize,
+}
+
+impl From<&str> for ToolResultOutputStats {
+    fn from(output: &str) -> Self {
+        Self {
+            utf8_bytes: output.len(),
+            line_count: output.lines().count(),
+        }
+    }
+}
+
+impl From<String> for ToolResultOutputStats {
+    fn from(output: String) -> Self {
+        Self::from(output.as_str())
+    }
+}
+
+impl From<(usize, usize)> for ToolResultOutputStats {
+    fn from((utf8_bytes, line_count): (usize, usize)) -> Self {
+        Self { utf8_bytes, line_count }
+    }
+}
+
 struct PendingObservation<F: FnOnce(Duration)> {
     started: Instant,
     abandoned: Option<F>,
@@ -1266,7 +1294,10 @@ impl SessionTelemetry {
         duration: Duration,
         logical_request_id: Option<&str>,
     ) {
-        if self.metrics.is_none() {
+        if self.metrics.is_none()
+            && !tracing::enabled!(target: crate::targets::OTEL_LOG_ONLY_TARGET, tracing::Level::INFO)
+            && !tracing::enabled!(target: crate::targets::OTEL_TRACE_SAFE_TARGET, tracing::Level::INFO)
+        {
             return;
         }
         let mut kind = None;
@@ -1288,7 +1319,7 @@ impl SessionTelemetry {
                                 );
                                 self.record_responses_websocket_timing_metrics(&value);
                             }
-                            if kind.as_deref() == Some("response.failed") {
+                            if matches!(kind.as_deref(), Some("response.failed" | "error")) {
                                 success = false;
                             }
                         }
@@ -1692,7 +1723,7 @@ impl SessionTelemetry {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub async fn log_tool_result_with_tags<F, Fut, T, E, IsSuccess, Describe>(
+    pub async fn log_tool_result_with_tags<F, Fut, T, E, IsSuccess, Describe, Output>(
         &self,
         tool_name: &str,
         call_id: &str,
@@ -1707,7 +1738,8 @@ impl SessionTelemetry {
         F: FnOnce() -> Fut,
         Fut: Future<Output = Result<T, E>>,
         IsSuccess: FnOnce(&T) -> bool,
-        Describe: FnOnce(&T) -> String,
+        Describe: FnOnce(&T) -> Output,
+        Output: Into<ToolResultOutputStats>,
         E: std::fmt::Display,
     {
         let observation = PendingObservation::new(|duration| {
@@ -1743,23 +1775,21 @@ impl SessionTelemetry {
             Ok(value) => is_success(value),
             Err(_) => false,
         };
+        self.record_tool_result_metrics(tool_name, duration, success, extra_tags);
         if tool_result_events_enabled() {
-            let output = match &result {
-                Ok(value) => describe(value),
-                Err(error) => error.to_string(),
+            let output: ToolResultOutputStats = match &result {
+                Ok(value) => describe(value).into(),
+                Err(error) => error.to_string().into(),
             };
-            self.tool_result_with_tags(
+            self.emit_tool_result_with_stats(
                 tool_name,
                 call_id,
                 arguments,
                 duration,
                 success,
-                &output,
-                extra_tags,
+                output,
                 extra_trace_fields,
             );
-        } else {
-            self.record_tool_result_metrics(tool_name, duration, success, extra_tags);
         }
 
         result
@@ -1813,7 +1843,23 @@ impl SessionTelemetry {
         if !tool_result_events_enabled() {
             return;
         }
-        let output_line_count = output.lines().count() as i64;
+        self.emit_tool_result_with_stats(
+            tool_name, call_id, arguments, duration, success, output.into(), extra_trace_fields,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn emit_tool_result_with_stats(
+        &self,
+        tool_name: &str,
+        call_id: &str,
+        arguments: &str,
+        duration: Duration,
+        success: bool,
+        output: ToolResultOutputStats,
+        extra_trace_fields: &[(&str, &str)],
+    ) {
+        let output_line_count = output.line_count as i64;
         let success_str = if success { "true" } else { "false" };
         let mcp_server = trace_field_value(extra_trace_fields, "mcp_server").unwrap_or("");
         let mcp_server_origin =
@@ -1826,8 +1872,8 @@ impl SessionTelemetry {
             duration_ms = %duration.as_millis(),
             success = %success_str,
             arguments_length = arguments.len() as i64,
-            output_length = output.len() as i64,
-            output_utf8_bytes = output.len() as i64,
+            output_length = output.utf8_bytes as i64,
+            output_utf8_bytes = output.utf8_bytes as i64,
             length_unit = "utf8_bytes",
             output_line_count = output_line_count,
             mcp_server = %mcp_server,
@@ -1841,8 +1887,8 @@ impl SessionTelemetry {
             duration_ms = %duration.as_millis(),
             success = %success_str,
             arguments_length = arguments.len() as i64,
-            output_length = output.len() as i64,
-            output_utf8_bytes = output.len() as i64,
+            output_length = output.utf8_bytes as i64,
+            output_utf8_bytes = output.utf8_bytes as i64,
             length_unit = "utf8_bytes",
             output_line_count = output_line_count,
             tool_origin = if mcp_server.is_empty() { "builtin" } else { "mcp" },
@@ -2039,6 +2085,9 @@ fn completed_usage_span_fields(
 #[cfg(test)]
 mod completed_usage_span_tests {
     use super::*;
+    mod websocket_signal_tests {
+        include!("websocket_signal_tests.rs");
+    }
     use codex_protocol::protocol::TokenUsage;
     use codex_protocol::protocol::TokenUsageCoverage;
     use std::collections::BTreeMap;

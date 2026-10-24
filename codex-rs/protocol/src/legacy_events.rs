@@ -424,6 +424,7 @@ impl ImageGenerationItem {
             status: self.status.clone(),
             revised_prompt: self.revised_prompt.clone(),
             result: self.result.clone(),
+            error: self.error.clone(),
             saved_path: self.saved_path.clone(),
         })
     }
@@ -557,6 +558,9 @@ impl HasLegacyEvent for ItemStartedEvent {
                 if item.namespace.as_deref() == Some("codex.internal")
                     && item.tool == "code_mode_cell"
                 {
+                    // Internal cells execute in Rust, not in the client. Do not
+                    // emit an actionable client request; terminal responses below
+                    // remain passive diagnostics, including instant failures.
                     return Vec::new();
                 }
                 vec![item.as_legacy_request_event(self.turn_id.clone(), self.started_at_ms)]

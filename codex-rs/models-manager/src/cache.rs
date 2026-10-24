@@ -100,9 +100,6 @@ impl ModelsCacheManager {
     }
 
     async fn acquire_file_lock(&self) -> io::Result<AtomicWriteLock> {
-        if let Some(parent) = self.cache_path.parent() {
-            fs::create_dir_all(parent).await?;
-        }
         let cache_path = self.cache_path.clone();
         // Persistence is optional: never leave a blocking worker waiting for
         // another process to release this cache's transaction lock.
@@ -148,12 +145,15 @@ impl ModelsCacheManager {
                 expected_version,
             "models cache: attempting load_fresh"
         );
-        let Some(contents) = self.read_contents(expected_identity).await? else {
+        let Some(snapshot) = self.read_contents().await? else {
+            return Ok(None);
+        };
+        let Some(entry) = select_cache_entry(&snapshot, expected_identity)? else {
             return Ok(None);
         };
         // Older caches can contain model shapes that no longer decode. Reject
         // unusable entries from their metadata before decoding any model.
-        let header = ModelsCacheHeader::parse(&contents)?;
+        let header = entry.header?;
         info!(
             cache_path = %self.cache_path.display(),
             cached_version = ?header.client_version,
@@ -186,7 +186,7 @@ impl ModelsCacheManager {
             );
             return Ok(None);
         }
-        let cache = decode_cache(&contents)?;
+        let cache = decode_cache(entry.contents)?;
         info!(
             cache_path = %self.cache_path.display(),
             cache_ttl_secs = self.cache_ttl.as_secs(),
@@ -308,7 +308,14 @@ impl ModelsCacheManager {
             );
             return CacheWriteOutcome::IdentityChanged;
         }
-        let current_basis = match self.read_write_basis(expected_identity).await {
+        let contents = match self.read_contents().await {
+            Ok(contents) => contents,
+            Err(err) => {
+                error!("failed to read models cache before write: {err}");
+                return CacheWriteOutcome::IoFailure;
+            }
+        };
+        let current_basis = match write_basis_from_snapshot(contents.as_deref(), expected_identity) {
             Ok(basis) => basis,
             Err(err) => {
                 error!("failed to re-read models cache before write: {err}");
@@ -339,7 +346,7 @@ impl ModelsCacheManager {
             return CacheWriteOutcome::IdentityChanged;
         }
         if let Err(err) = self
-            .save_internal(cache, expected_identity, _file_lock)
+            .save_internal(cache, expected_identity, contents, _file_lock)
             .await
         {
             error!("failed to write models cache: {err}");
@@ -393,12 +400,14 @@ impl ModelsCacheManager {
                 "cache identity changed before TTL renewal",
             ));
         }
-        let contents = self
-            .read_contents(expected_identity)
+        let snapshot = self
+            .read_contents()
             .await?
             .ok_or_else(|| io::Error::new(ErrorKind::NotFound, "cache identity not found"))?;
-        let header = ModelsCacheHeader::parse(&contents)?;
-        let current_basis = header.write_basis(&contents);
+        let entry = select_cache_entry(&snapshot, expected_identity)?
+            .ok_or_else(|| io::Error::new(ErrorKind::NotFound, "cache identity not found"))?;
+        let header = entry.header?;
+        let current_basis = header.write_basis(entry.contents);
         if &current_basis != expected_basis {
             return Err(io::Error::new(
                 ErrorKind::InvalidData,
@@ -420,7 +429,7 @@ impl ModelsCacheManager {
         if header.age().is_some_and(|age| age < self.cache_ttl / 2) {
             return Ok(());
         }
-        let mut cache = decode_cache(&contents)?;
+        let mut cache = decode_cache(entry.contents)?;
         cache.fetched_at = Utc::now();
         cache.revision = Some(next_revision(&current_basis.disk_revision));
         if !self.identity_is_current(expected_identity) {
@@ -429,69 +438,38 @@ impl ModelsCacheManager {
                 "cache identity changed during TTL renewal",
             ));
         }
-        self.save_internal(cache, expected_identity, _file_lock)
+        self.save_internal(cache, expected_identity, Some(snapshot), _file_lock)
             .await
     }
 
-    async fn read_contents(&self, expected_identity: &str) -> io::Result<Option<Vec<u8>>> {
-        let contents = match fs::read(&self.cache_path).await {
-            Ok(contents) => contents,
-            Err(err) if err.kind() == ErrorKind::NotFound => return Ok(None),
-            Err(err) => return Err(err),
-        };
-        // Keep corrupt bytes available to the revision guard. Loads still report
-        // corruption rather than treating it as a cache miss.
-        let Ok(header) = ModelsCacheHeader::parse(&contents) else {
-            return Ok(Some(contents));
-        };
-        if header.provider_cache_identity.as_deref() == Some(expected_identity) {
-            return Ok(Some(contents));
+    async fn read_contents(&self) -> io::Result<Option<Vec<u8>>> {
+        match fs::read(&self.cache_path).await {
+            Ok(contents) => Ok(Some(contents)),
+            Err(err) if err.kind() == ErrorKind::NotFound => Ok(None),
+            Err(err) => Err(err),
         }
-        for previous in header.previous {
-            let bytes = previous.get().as_bytes();
-            if ModelsCacheHeader::parse(bytes)?
-                .provider_cache_identity
-                .as_deref()
-                == Some(expected_identity)
-            {
-                return Ok(Some(bytes.to_vec()));
-            }
-        }
-        Ok(None)
     }
 
     #[cfg(test)]
     async fn load(&self) -> io::Result<Option<ModelsCache>> {
-        self.read_contents(&self.current_identity())
-            .await?
-            .map(|contents| decode_cache(&contents))
+        let Some(contents) = self.read_contents().await? else {
+            return Ok(None);
+        };
+        select_cache_entry(&contents, &self.current_identity())?
+            .map(|entry| decode_cache(entry.contents))
             .transpose()
     }
 
     async fn read_write_basis(&self, expected_identity: &str) -> io::Result<CacheWriteBasis> {
-        let Some(contents) = self.read_contents(expected_identity).await? else {
-            return Ok(CacheWriteBasis {
-                disk_revision: DiskRevision::Missing,
-                client_version: None,
-                provider_cache_identity: None,
-                etag: None,
-            });
-        };
-        match ModelsCacheHeader::parse(&contents) {
-            Ok(header) => Ok(header.write_basis(&contents)),
-            Err(_) => Ok(CacheWriteBasis {
-                disk_revision: DiskRevision::Opaque(contents),
-                client_version: None,
-                provider_cache_identity: None,
-                etag: None,
-            }),
-        }
+        let contents = self.read_contents().await?;
+        write_basis_from_snapshot(contents.as_deref(), expected_identity)
     }
 
     async fn save_internal(
         &self,
         cache: ModelsCache,
         replaced_identity: &str,
+        contents: Option<Vec<u8>>,
         file_lock: AtomicWriteLock,
     ) -> io::Result<()> {
         // Merge under the existing cross-process lock. Revisions are scoped to
@@ -502,11 +480,11 @@ impl ModelsCacheManager {
         tokio::task::spawn_blocking(move || {
             // Ownership of the lock moves into the worker before its first wait.
             let _file_lock = file_lock;
-            let existing = match std::fs::read(&cache_path) {
-                Ok(contents) => serde_json::from_slice::<serde_json::Value>(&contents).ok(),
-                Err(err) if err.kind() == ErrorKind::NotFound => None,
-                Err(err) => return Err(err),
-            };
+            // Reuse the exact snapshot checked under this same lock. Moving it
+            // with the lock keeps the writer protected even if its waiter is cancelled.
+            let existing = contents
+                .as_deref()
+                .and_then(|contents| serde_json::from_slice::<serde_json::Value>(contents).ok());
             // Decode siblings independently, just as the read path does. A
             // readable revision still participates in anti-ABA allocation even
             // when that entry's model schema is incompatible.
@@ -534,16 +512,18 @@ impl ModelsCacheManager {
             );
             let previous = entries
                 .into_iter()
-                .filter_map(|entry| serde_json::from_value::<ModelsCache>(entry).ok())
                 .filter(|entry| {
-                    entry.provider_cache_identity.is_some()
-                        && entry.provider_cache_identity.as_deref()
-                            != Some(replaced_identity.as_str())
-                        && entry.provider_cache_identity != current.provider_cache_identity
+                    let identity = entry
+                        .get("provider_cache_identity")
+                        .and_then(|value| value.as_str());
+                    identity.is_some()
+                        && identity != Some(replaced_identity.as_str())
+                        && identity != current.provider_cache_identity.as_deref()
                 })
+                .filter_map(|entry| serde_json::from_value::<ModelsCache>(entry).ok())
                 .take(MAX_CACHED_IDENTITIES - 1)
                 .collect();
-            let json = serde_json::to_vec_pretty(&ModelsCacheFile { current, previous })
+            let json = serde_json::to_vec(&ModelsCacheFile { current, previous })
                 .map_err(|err| io::Error::new(ErrorKind::InvalidData, err.to_string()))?;
             write_bytes_atomically(&cache_path, &json)
         })
@@ -572,7 +552,8 @@ impl ModelsCacheManager {
         let current_basis = self.read_write_basis(&self.current_identity()).await?;
         f(&mut cache.fetched_at);
         cache.revision = Some(next_revision(&current_basis.disk_revision));
-        self.save_internal(cache, &self.current_identity(), _file_lock)
+        let contents = self.read_contents().await?;
+        self.save_internal(cache, &self.current_identity(), contents, _file_lock)
             .await
     }
 
@@ -591,7 +572,8 @@ impl ModelsCacheManager {
         let current_basis = self.read_write_basis(&self.current_identity()).await?;
         f(&mut cache);
         cache.revision = Some(next_revision(&current_basis.disk_revision));
-        self.save_internal(cache, &self.current_identity(), _file_lock)
+        let contents = self.read_contents().await?;
+        self.save_internal(cache, &self.current_identity(), contents, _file_lock)
             .await
     }
 }
@@ -614,14 +596,14 @@ pub(crate) struct ModelsCache {
 /// Entry metadata decoded without the model list, which dominates the file.
 /// It decides whether an entry is usable, renewable, or safely replaceable.
 #[derive(Deserialize)]
-struct ModelsCacheHeader {
+struct ModelsCacheHeader<'a> {
     revision: Option<u64>,
     fetched_at: Option<DateTime<Utc>>,
     etag: Option<String>,
     client_version: Option<String>,
     provider_cache_identity: Option<String>,
-    #[serde(default)]
-    previous: Vec<Box<serde_json::value::RawValue>>,
+    #[serde(borrow, default)]
+    previous: Vec<&'a serde_json::value::RawValue>,
 }
 
 // Keep the latest entry at the legacy top level for older readers, while newer
@@ -634,8 +616,8 @@ struct ModelsCacheFile {
     previous: Vec<ModelsCache>,
 }
 
-impl ModelsCacheHeader {
-    fn parse(contents: &[u8]) -> io::Result<Self> {
+impl<'a> ModelsCacheHeader<'a> {
+    fn parse(contents: &'a [u8]) -> io::Result<Self> {
         serde_json::from_slice(contents)
             .map_err(|err| io::Error::new(ErrorKind::InvalidData, err.to_string()))
     }
@@ -666,6 +648,71 @@ impl ModelsCacheHeader {
     }
 }
 
+struct CacheEntry<'a> {
+    contents: &'a [u8],
+    header: io::Result<ModelsCacheHeader<'a>>,
+}
+
+/// Select borrowed bytes and metadata from a single owned file snapshot.
+fn select_cache_entry<'a>(
+    contents: &'a [u8],
+    expected_identity: &str,
+) -> io::Result<Option<CacheEntry<'a>>> {
+    let header = match ModelsCacheHeader::parse(contents) {
+        Ok(header) => header,
+        Err(error) => {
+            // Opaque bytes still participate in stale-writer rejection. Loads
+            // propagate the original corruption instead of reporting a cache miss.
+            return Ok(Some(CacheEntry {
+                contents,
+                header: Err(error),
+            }));
+        }
+    };
+    if header.provider_cache_identity.as_deref() == Some(expected_identity) {
+        return Ok(Some(CacheEntry {
+            contents,
+            header: Ok(header),
+        }));
+    }
+    for previous in header.previous {
+        let contents = previous.get().as_bytes();
+        let header = ModelsCacheHeader::parse(contents)?;
+        if header.provider_cache_identity.as_deref() == Some(expected_identity) {
+            return Ok(Some(CacheEntry {
+                contents,
+                header: Ok(header),
+            }));
+        }
+    }
+    Ok(None)
+}
+
+fn write_basis_from_snapshot(
+    contents: Option<&[u8]>,
+    expected_identity: &str,
+) -> io::Result<CacheWriteBasis> {
+    if let Some(contents) = contents
+        && let Some(entry) = select_cache_entry(contents, expected_identity)?
+    {
+        return Ok(match entry.header {
+            Ok(header) => header.write_basis(entry.contents),
+            Err(_) => CacheWriteBasis {
+                disk_revision: DiskRevision::Opaque(entry.contents.to_vec()),
+                client_version: None,
+                provider_cache_identity: None,
+                etag: None,
+            },
+        });
+    }
+    Ok(CacheWriteBasis {
+        disk_revision: DiskRevision::Missing,
+        client_version: None,
+        provider_cache_identity: None,
+        etag: None,
+    })
+}
+
 fn decode_cache(contents: &[u8]) -> io::Result<ModelsCache> {
     let cache: ModelsCache = serde_json::from_slice(contents)
         .map_err(|err| io::Error::new(ErrorKind::InvalidData, err.to_string()))?;
@@ -693,6 +740,111 @@ mod tests {
     fn fixed_identity(value: &str) -> ModelsCacheIdentity {
         let value = value.to_string();
         Arc::new(move || value.clone())
+    }
+
+    #[tokio::test]
+    async fn nested_missing_cache_uses_lock_parent_creation_and_compact_publication() {
+        let home = tempfile::tempdir().unwrap();
+        let path = home.path().join("nested/missing/models_cache.json");
+        let manager = ModelsCacheManager::new(
+            path.clone(),
+            Duration::from_secs(300),
+            fixed_identity("provider"),
+        );
+        assert!(manager.load_fresh("client").await.unwrap().is_none());
+        assert!(path.parent().unwrap().is_dir());
+        let models = crate::bundled_models_response().unwrap().models;
+        manager.persist_cache(&models, Some("etag".into()), "client".into()).await;
+        let contents = fs::read(&path).await.unwrap();
+        let file: ModelsCacheFile = serde_json::from_slice(&contents).unwrap();
+        assert_eq!(contents, serde_json::to_vec(&file).unwrap());
+        assert_eq!(file.current.models, models);
+        assert_eq!(manager.load_fresh("client").await.unwrap().unwrap().models, models);
+    }
+
+    #[test]
+    fn selected_metadata_and_previous_bytes_borrow_the_file_snapshot() {
+        let previous = r#"{
+            "fetched_at": "2026-01-01T00:00:00Z", "etag": "old",
+            "client_version": "client", "provider_cache_identity": "previous", "models": []
+        }"#;
+        let contents = format!(
+            r#"{{"revision": 10, "provider_cache_identity": "primary", "models": [], "previous": [{previous}]}}"#
+        ).into_bytes();
+        let primary = select_cache_entry(&contents, "primary").unwrap().unwrap();
+        assert_eq!(primary.contents.as_ptr(), contents.as_ptr());
+        let header = primary.header.unwrap();
+        assert_eq!(header.previous[0].get().as_bytes(), previous.as_bytes());
+        let selected = select_cache_entry(&contents, "previous").unwrap().unwrap();
+        let start = contents.as_ptr() as usize;
+        let selected_start = selected.contents.as_ptr() as usize;
+        assert!(selected_start >= start);
+        assert!(selected_start + selected.contents.len() <= start + contents.len());
+        assert_eq!(selected.contents, previous.as_bytes());
+        assert_eq!(
+            selected.header.unwrap().write_basis(selected.contents).disk_revision,
+            DiskRevision::Legacy(previous.as_bytes().to_vec())
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_previous_entry_rejects_byte_changed_writes_and_renewals() {
+        let home = tempfile::tempdir().unwrap();
+        let path = home.path().join("models_cache.json");
+        let previous = format!(
+            r#"{{"fetched_at": "{}", "etag": "etag", "client_version": "client", "provider_cache_identity": "previous", "models": []}}"#,
+            Utc::now().to_rfc3339()
+        );
+        let contents = format!(
+            r#"{{"revision": 10, "provider_cache_identity": "primary", "models": [], "previous": [{previous}]}}"#
+        );
+        std::fs::write(&path, &contents).unwrap();
+        let manager = ModelsCacheManager::new(
+            path.clone(), Duration::from_secs(300), fixed_identity("previous")
+        );
+        let basis = manager.write_basis_for_identity("previous").await.unwrap();
+        assert_eq!(basis.disk_revision, DiskRevision::Legacy(previous.into_bytes()));
+        // Semantically identical JSON is still a different legacy writer basis.
+        let changed = contents.replace("\"models\": []", "\"models\": [ ]");
+        std::fs::write(&path, &changed).unwrap();
+        assert!(!manager.persist_cache_for_identity_if_unchanged(
+            &[], Some("etag".into()), "client".into(), "previous", &basis
+        ).await);
+        assert_eq!(
+            manager.renew_cache_ttl_for_identity_if_unchanged(
+                "client", "etag", "previous", &basis
+            ).await.unwrap_err().kind(),
+            ErrorKind::InvalidData
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), changed.as_bytes());
+    }
+
+    #[tokio::test]
+    async fn renewing_previous_identity_retains_siblings_and_allocates_global_revision() {
+        let home = tempfile::tempdir().unwrap();
+        let path = home.path().join("models_cache.json");
+        let entry = |identity: &str, revision: u64| serde_json::json!({
+            "revision": revision,
+            "fetched_at": Utc::now() - chrono::Duration::hours(1),
+            "etag": identity, "client_version": "client",
+            "provider_cache_identity": identity, "models": [],
+        });
+        let mut contents = entry("primary", 20);
+        let mut incompatible = entry("incompatible", 99);
+        incompatible["models"] = serde_json::json!([{"slug":"undecodable"}]);
+        contents["previous"] = serde_json::json!([entry("renewed", 2), incompatible]);
+        std::fs::write(&path, serde_json::to_vec_pretty(&contents).unwrap()).unwrap();
+        let manager = ModelsCacheManager::new(
+            path.clone(), Duration::from_secs(300), fixed_identity("renewed")
+        );
+        manager.renew_cache_ttl("client", "renewed").await.unwrap();
+        let saved: ModelsCacheFile = serde_json::from_slice(&fs::read(&path).await.unwrap()).unwrap();
+        assert_eq!(saved.current.provider_cache_identity.as_deref(), Some("renewed"));
+        assert_eq!(saved.current.revision, Some(100));
+        assert_eq!(saved.previous.len(), 1);
+        assert_eq!(saved.previous[0].provider_cache_identity.as_deref(), Some("primary"));
+        assert_eq!(saved.previous[0].revision, Some(20));
+        assert!(manager.load_fresh("client").await.unwrap().is_some());
     }
 
     #[tokio::test]
@@ -1239,7 +1391,7 @@ mod tests {
                 wait.recv().expect("release");
             });
             ready.await.expect("blocking pool occupied");
-            let mut save = Box::pin(manager.save_internal(document, "provider", file_lock));
+            let mut save = Box::pin(manager.save_internal(document, "provider", None, file_lock));
             std::future::poll_fn(|cx| {
                 assert!(save.as_mut().poll(cx).is_pending());
                 std::task::Poll::Ready(())

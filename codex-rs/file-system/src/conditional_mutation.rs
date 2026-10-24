@@ -66,6 +66,18 @@ fn patch_capture_lock_path(path: &Path) -> io::Result<PathBuf> {
 
 fn open_patch_capture_file(path: &Path) -> io::Result<File> {
     let lock_path = patch_capture_lock_path(path)?;
+    open_patch_capture_lock(&lock_path)
+}
+
+fn open_patch_capture_lock(lock_path: &Path) -> io::Result<File> {
+    // LockFileEx needs read OR write access, even for an exclusive lock. Never
+    // request write access for an existing admission object: read-only agents
+    // may read source files but cannot write this shared temp namespace.
+    match File::open(lock_path) {
+        Ok(file) => return Ok(file),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
     std::fs::create_dir_all(
         lock_path
             .parent()
@@ -77,6 +89,15 @@ fn open_patch_capture_file(path: &Path) -> io::Result<File> {
         .create(true)
         .truncate(false)
         .open(lock_path)
+}
+
+/// Initialize only the temp-side admission object before entering a sandbox.
+/// The returned path may be granted read access; it contains no source bytes.
+pub fn prepare_patch_capture(path: &Path) -> io::Result<PathBuf> {
+    let resolved = crate::atomic_write::resolve_symlink_write_paths(path)?;
+    let lock_path = patch_capture_lock_path(&resolved.write_path)?;
+    drop(open_patch_capture_lock(&lock_path)?);
+    Ok(lock_path)
 }
 
 /// Nonblocking capture admission for cooperating native writers. This is not

@@ -2,7 +2,6 @@ use super::PreviousSectionState;
 use super::WorldStateSection;
 use crate::context::ContextualUserFragment;
 use crate::context::environment_context::FileSystemContext;
-use crate::context::environment_context::NetworkContext;
 use crate::context::environment_context::push_xml_escaped_attribute;
 use crate::context::environment_context::push_xml_escaped_text;
 use crate::environment_selection::TurnEnvironmentSnapshot;
@@ -19,7 +18,6 @@ pub(crate) struct EnvironmentsState {
     primary_environment_id: Option<String>,
     current_date: Option<String>,
     timezone: Option<String>,
-    network: Option<NetworkContext>,
     filesystem: Option<FileSystemContext>,
     subagents: Option<String>,
 }
@@ -37,7 +35,6 @@ impl EnvironmentsState {
                 .map(|selection| selection.environment_id.clone()),
             current_date: turn_context.current_date.clone(),
             timezone: turn_context.timezone.clone(),
-            network: network_from_turn_context(turn_context),
             filesystem: Some(
                 FileSystemContext::from_permission_profile(
                     &turn_context.permission_profile,
@@ -66,7 +63,6 @@ impl EnvironmentsState {
             replace_all: false,
             current_date: self.current_date.clone(),
             timezone: self.timezone.clone(),
-            network: self.network.as_ref().map(NetworkContext::render),
             filesystem: self.filesystem.as_ref().map(FileSystemContext::render),
             subagents: self.subagents.clone(),
         }
@@ -110,7 +106,6 @@ impl WorldStateSection for EnvironmentsState {
                 .collect(),
             current_date: self.current_date.clone(),
             timezone: self.timezone.clone(),
-            network: self.network.as_ref().map(NetworkContext::render),
             filesystem: self.filesystem.as_ref().map(FileSystemContext::render),
             subagents: self.subagents.clone(),
         }
@@ -130,7 +125,6 @@ impl WorldStateSection for EnvironmentsState {
         };
         let turn_context_values_changed = current.current_date != previous.current_date
             || current.timezone != previous.timezone
-            || current.network != previous.network
             || current.filesystem != previous.filesystem;
         let subagents_changed = current.subagents != previous.subagents;
         let mut updates =
@@ -208,11 +202,6 @@ impl WorldStateSection for EnvironmentsState {
                         "unknown",
                     ),
                     timezone: changed_value(&current.timezone, &previous.timezone, "unknown"),
-                    network: changed_value(
-                        &current.network,
-                        &previous.network,
-                        "<managed_network_proxy status=\"unspecified\" />",
-                    ),
                     filesystem: changed_value(
                         &current.filesystem,
                         &previous.filesystem,
@@ -249,7 +238,6 @@ struct RenderedEnvironments {
     replace_all: bool,
     current_date: Option<String>,
     timezone: Option<String>,
-    network: Option<String>,
     filesystem: Option<String>,
     subagents: Option<String>,
 }
@@ -319,11 +307,6 @@ impl ContextualUserFragment for RenderedEnvironments {
             }
             push_optional_element(&mut rendered, "current_date", self.current_date.as_deref());
             push_optional_element(&mut rendered, "timezone", self.timezone.as_deref());
-            if let Some(network) = &self.network {
-                rendered.push_str("  ");
-                rendered.push_str(network);
-                rendered.push('\n');
-            }
             if let Some(filesystem) = &self.filesystem {
                 rendered.push_str("  ");
                 rendered.push_str(filesystem);
@@ -424,7 +407,6 @@ pub(crate) struct EnvironmentsSnapshot {
     primary_environment_id: Option<String>,
     current_date: Option<String>,
     timezone: Option<String>,
-    network: Option<String>,
     filesystem: Option<String>,
     subagents: Option<String>,
 }
@@ -513,34 +495,6 @@ fn environment_context_markers() -> (&'static str, &'static str) {
     )
 }
 
-fn network_from_turn_context(turn_context: &TurnContext) -> Option<NetworkContext> {
-    let network_requirements = turn_context
-        .config
-        .config_layer_stack
-        .requirements()
-        .network
-        .as_ref()?;
-    let enabled = turn_context
-        .config
-        .permissions
-        .network
-        .as_ref()
-        .is_some_and(crate::config::NetworkProxySpec::enabled);
-
-    Some(NetworkContext::new(
-        enabled,
-        network_requirements
-            .domains
-            .as_ref()
-            .and_then(codex_config::NetworkDomainPermissionsToml::allowed_domains)
-            .unwrap_or_default(),
-        network_requirements
-            .domains
-            .as_ref()
-            .and_then(codex_config::NetworkDomainPermissionsToml::denied_domains)
-            .unwrap_or_default(),
-    ))
-}
 
 #[cfg(test)]
 #[path = "environment_tests.rs"]

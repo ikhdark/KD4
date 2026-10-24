@@ -23,8 +23,7 @@ const APPROVAL_POLICY_ON_REQUEST_RULE: &str =
 const APPROVAL_POLICY_ON_REQUEST_RULE_REQUEST_PERMISSION: &str =
     include_str!("../templates/permissions/approval_policy/on_request_rule_request_permission.md");
 const MAX_APPROVAL_MESSAGE_BYTES: usize = 12_000;
-const APPROVAL_MESSAGE_TRUNCATED_MARKER: &str =
-    "\n\n[Additional approval instructions were truncated.]";
+const OVERSIZED_APPROVAL_MESSAGE: &str = "The mandatory custom approval policy exceeds the supported size and could not be loaded in full. No tool execution, permission request, or other action is authorized. Stop and report this configuration error; do not infer permission from a partial policy.";
 const MAX_PERMISSION_LIST_ENTRIES: usize = 64;
 const MAX_PERMISSION_LIST_BYTES: usize = 4_096;
 const PERMISSION_LIST_TRUNCATED_MARKER: &str = "- ... [additional permission entries omitted; omitted roots or restrictions do not grant permission]";
@@ -223,11 +222,11 @@ fn approval_text(
     {
         let selected = approval_messages.on_request.as_ref();
         if let Some(selected) = selected {
-            return truncate_prompt_text(
-                selected,
-                MAX_APPROVAL_MESSAGE_BYTES,
-                APPROVAL_MESSAGE_TRUNCATED_MARKER,
-            );
+            return if selected.len() > MAX_APPROVAL_MESSAGE_BYTES {
+                OVERSIZED_APPROVAL_MESSAGE.to_string()
+            } else {
+                selected.clone()
+            };
         }
     }
 
@@ -292,12 +291,12 @@ fn writable_roots_text(writable_roots: Option<Vec<WritableRoot>>) -> Option<Stri
     let roots_list = roots
         .iter()
         .flat_map(|r| {
-            std::iter::once_with(move || format!("- `{}`", r.root.to_string_lossy()))
+            std::iter::once_with(move || format!("- `{}`", literal_permission_value(r.root.as_os_str())))
                 .chain(r.read_only_subpaths.iter().map(|path| {
-                    format!("  - Read-only subtree: `{}`", path.to_string_lossy())
+                    format!("  - Read-only subtree: `{}`", literal_permission_value(path.as_os_str()))
                 }))
                 .chain(r.protected_metadata_names.iter().map(|name| {
-                    format!("  - Protected metadata: `{name}` directly under this root (including descendants); do not create or replace it without an explicit write grant.")
+                    format!("  - Protected metadata: `{}` directly under this root (including descendants); do not create or replace it without an explicit write grant.", literal_permission_value(std::ffi::OsStr::new(name)))
                 }))
         });
     let roots_list = bounded_permission_entries(roots_list);
@@ -311,12 +310,12 @@ fn denied_reads_text(file_system_policy: &FileSystemSandboxPolicy, cwd: &Path) -
     let entries = file_system_policy
         .get_unreadable_roots_with_cwd(cwd)
         .into_iter()
-        .map(|root| format!("- path `{}`", root.to_string_lossy()))
+        .map(|root| format!("- path `{}`", literal_permission_value(root.as_os_str())))
         .chain(
             file_system_policy
                 .get_unreadable_globs_with_cwd(cwd)
                 .into_iter()
-                .map(|glob| format!("- glob `{glob}`")),
+                .map(|glob| format!("- glob `{}`", literal_permission_value(std::ffi::OsStr::new(&glob)))),
         );
     let entries = bounded_permission_entries(entries);
     if entries.is_empty() {
@@ -378,19 +377,15 @@ fn bounded_permission_entries(entries: impl IntoIterator<Item = String>) -> Vec<
     rendered
 }
 
-fn truncate_prompt_text(text: &str, max_bytes: usize, marker: &str) -> String {
-    if text.len() <= max_bytes {
-        return text.to_string();
-    }
-
-    let content_budget = max_bytes.saturating_sub(marker.len());
-    let mut end = content_budget.min(text.len());
-    while end > 0 && !text.is_char_boundary(end) {
-        end -= 1;
-    }
-    let mut truncated = text[..end].trim_end().to_string();
-    truncated.push_str(marker);
-    truncated
+fn literal_permission_value(value: &std::ffi::OsStr) -> String {
+    // OsStr's debug representation preserves native non-Unicode bytes/code
+    // units and escapes controls/backslashes. Escape prompt/Markdown delimiters
+    // too; these values are data, never additional developer instructions.
+    let encoded = format!("{value:?}");
+    encoded[1..encoded.len() - 1]
+        .replace('`', "\\u0060")
+        .replace('<', "\\u003c")
+        .replace('>', "\\u003e")
 }
 
 fn approved_command_prefixes_text(exec_policy: &Policy) -> Option<String> {

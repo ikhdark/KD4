@@ -141,9 +141,27 @@ pub fn model_visible_tool_result(tool: &ToolName, raw: &Value) -> Option<Value> 
         if object.get("artifact_id") == Some(&Value::Null) {
             projected.remove("artifact_id");
         }
-        // History groups delivered ranges by canonical URI and environment.
-        // Even a locally derivable URI must survive display projection; path
-        // text alone is deliberately treated as legacy, unattributed evidence.
+        // Native results retain source identity for history and scripts.
+        // Presentation need not repeat an exactly reconstructible file URI.
+        if let (Some(path), Some(uri)) = (
+            object.get("path").and_then(Value::as_str),
+            object.get("canonical_uri").and_then(Value::as_str),
+        ) {
+            let path = path.replace('\\', "/");
+            let expected = if path.starts_with('/') {
+                Some(format!("file://{path}"))
+            } else if path.as_bytes().get(1) == Some(&b':')
+                && path.as_bytes().get(2) == Some(&b'/')
+                && path.as_bytes().first().is_some_and(u8::is_ascii_alphabetic)
+            {
+                Some(format!("file:///{path}"))
+            } else {
+                None
+            };
+            if expected.as_deref() == Some(uri) {
+                projected.remove("canonical_uri");
+            }
+        }
         if object.get("complete") == Some(&Value::Bool(true))
             && object.get("selection_status").and_then(Value::as_str) == Some("complete")
         {
@@ -295,11 +313,9 @@ fn patch_without_repeated_summary(raw: &Value) -> Option<Value> {
     Some(Value::Object(projected))
 }
 
-/// Every plan change is followed in the same request by the task-state
-/// context, which carries the stored plan, its step IDs, revision, obligations
-/// and active lineage. The printed result is therefore a receipt: what this
-/// update did, the revision to pass on, and what remains. Scripts still read
-/// every field from the returned object.
+/// A compact plan receipt includes the identities needed for the next update.
+/// No separate task-state prompt repeats the checklist. Scripts can read the
+/// complete stored plan from the returned object.
 fn plan_receipt(raw: &Value) -> Option<Value> {
     let object = raw.as_object()?;
     // Only a successful plan response has this shape; errors print unchanged.
@@ -309,11 +325,15 @@ fn plan_receipt(raw: &Value) -> Option<Value> {
         .filter(|(key, _)| {
             matches!(
                 key.as_str(),
-                "message" | "effect" | "no_progress" | "revision" | "obligations"
+                "message" | "effect" | "no_progress" | "revision" | "step_ids"
             )
         })
         .map(|(key, value)| (key.clone(), value.clone()))
         .collect::<serde_json::Map<_, _>>();
+    let mut projected = projected;
+    if let Some(revisions) = raw["lineage"].get("step_revisions") {
+        projected.insert("step_revisions".into(), revisions.clone());
+    }
     Some(Value::Object(projected))
 }
 
@@ -658,16 +678,17 @@ mod tests {
     }
 
     #[test]
-    fn read_display_preserves_canonical_source_identity() {
+    fn read_display_leaves_source_identity_in_native_results() {
         let raw = json!({"artifact_id":null, "source_sha256":"sha", "complete":true,
             "path":r"C:\repo\src\main.rs", "canonical_uri":"file:///C:/repo/src/main.rs",
             "environment_id":"local",
             "results":[{"selector":{"kind":"bytes","start":0,"end":4}, "status":"ok",
                 "complete":true, "text":"body"}]});
         let compact = model_visible_tool_result(&ToolName::plain("read_file"), &raw).unwrap();
-        assert_eq!(compact["canonical_uri"], raw["canonical_uri"]);
+        assert!(compact.get("canonical_uri").is_none());
+        assert_eq!(raw["canonical_uri"], "file:///C:/repo/src/main.rs");
         assert_eq!(compact["environment_id"], raw["environment_id"]);
-        // Identity must survive for every path spelling, not only opaque URIs.
+        // Only exact restatements disappear; encoded and opaque identities stay.
         for (path, uri) in [
             ("/home/alice/src/main.rs", "file:///home/alice/src/main.rs"),
             (
@@ -684,9 +705,9 @@ mod tests {
             opaque["path"] = json!(path);
             opaque["canonical_uri"] = json!(uri);
             assert_eq!(
-                model_visible_tool_result(&ToolName::plain("read_file"), &opaque).unwrap()["canonical_uri"],
-                json!(uri),
-                "kept for {path}"
+                model_visible_tool_result(&ToolName::plain("read_file"), &opaque).unwrap().get("canonical_uri"),
+                if path.starts_with('/') { None } else { Some(&opaque["canonical_uri"]) },
+                "projection for {path}"
             );
         }
     }
@@ -750,13 +771,12 @@ mod tests {
         }
     }
 
-    /// Recorded sessions printed each update's whole plan, step IDs and lineage
-    /// right before the task-state context restated all of them.
+    /// Receipts carry update identities, not a second checklist or obligation ledger.
     #[test]
-    fn plan_display_is_a_receipt_beside_the_task_state_context() {
+    fn plan_display_is_a_receipt_without_obligation_accounting() {
         let receipt = json!({"effect":"status_only", "message":"Plan updated",
-            "no_progress":false, "revision":"rev",
-            "obligations":{"completed":1, "superseded":0, "unresolved":["b"]}});
+            "no_progress":false, "revision":"rev", "step_ids":["a", "b"],
+            "step_revisions":{"a":1}});
         let mut updated = receipt.clone();
         for (key, value) in [
             ("completion_authority", json!("checklist_only")),
@@ -770,12 +790,13 @@ mod tests {
             ),
             (
                 "lineage",
-                json!({"requirements":{"d":{"text":"Drop cache", "status":"pending",
+                json!({"step_revisions":{"a":1}, "requirements":{"d":{"text":"Drop cache", "status":"pending",
                 "superseded_reason":"not needed"}}, "step_requirements":{}}),
             ),
         ] {
             updated[key] = value;
         }
+        updated["obligations"] = json!({"unresolved":["legacy"]});
         assert_eq!(
             model_visible_tool_result(&ToolName::plain("update_plan"), &updated),
             Some(receipt)

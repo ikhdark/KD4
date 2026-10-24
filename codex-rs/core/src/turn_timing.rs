@@ -791,7 +791,6 @@ impl TurnTimingSnapshot {
             owner_drained_continuation_count: profile.counters.owner_drained_continuation_count,
             executed_validation_count: profile.counters.executed_validation_count,
             executed_validation_duration_ns: profile.counters.executed_validation_duration_ns,
-            suppressed_validation_output_count: profile.counters.suppressed_validation_output_count,
             ready_startup_prewarm_count: profile.counters.ready_startup_prewarm_count,
             // No aggregate tool-output budget runs; the fields stay for the wire schema.
             tool_output_budget_drop_count: 0,
@@ -915,10 +914,16 @@ impl TurnTimingSnapshot {
 /// Reuse the authenticated, bounded artifact store instead of inventing a
 /// second side-file lifecycle. Keep inline evidence if durable retention fails.
 pub(crate) async fn retain_turn_timing_details(
-    timing: TurnTiming,
+    mut timing: TurnTiming,
     codex_home: &std::path::Path,
     thread_id: &str,
 ) -> TurnTiming {
+    // Request details already live in sampling checkpoints. Terminal profiles
+    // keep cumulative metrics without duplicating the per-request history.
+    if !timing.model_requests.is_empty() {
+        timing.model_requests.clear();
+        timing.model_request_history_truncated = Some(true);
+    }
     if timing
         .tool_calls
         .iter()
@@ -1230,7 +1235,6 @@ pub(crate) struct TimingCounters {
     pub(crate) owner_drained_continuation_count: u32,
     pub(crate) executed_validation_count: u32,
     pub(crate) executed_validation_duration_ns: u64,
-    pub(crate) suppressed_validation_output_count: u32,
     pub(crate) ready_startup_prewarm_count: u32,
     pub(crate) same_purpose_continuation_count: u32,
     pub(crate) planning_generation_count: u32,

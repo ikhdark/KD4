@@ -146,8 +146,12 @@ impl<T: Send + Sync> Constrained<T> {
         self.value
     }
 
-    pub fn can_set(&self, candidate: &T) -> ConstraintResult<()> {
-        (self.validator)(candidate)
+    pub fn can_set(&self, candidate: &T) -> ConstraintResult<()>
+    where
+        T: Clone,
+    {
+        let candidate = self.normalize(candidate.clone());
+        (self.validator)(&candidate)
     }
 
     /// Composes an additional validator onto the current constraint.
@@ -171,12 +175,16 @@ impl<T: Send + Sync> Constrained<T> {
         Ok(())
     }
 
-    pub fn set(&mut self, value: T) -> ConstraintResult<()> {
-        let value = if let Some(normalizer) = &self.normalizer {
+    fn normalize(&self, value: T) -> T {
+        if let Some(normalizer) = &self.normalizer {
             normalizer(value)
         } else {
             value
-        };
+        }
+    }
+
+    pub fn set(&mut self, value: T) -> ConstraintResult<()> {
+        let value = self.normalize(value);
         (self.validator)(&value)?;
         self.value = value;
         Ok(())
@@ -209,6 +217,22 @@ impl<T: PartialEq> PartialEq for Constrained<T> {
 mod tests {
     use super::*;
     use pretty_assertions::assert_eq;
+
+    #[test]
+    fn probes_validate_the_same_normalized_candidate_as_assignment() {
+        let mut absolute = Constrained::normalized(0_i32, i32::abs).unwrap();
+        absolute.add_validator(|value| if *value <= 10 { Ok(()) } else { Err(ConstraintError::empty_field("upper")) }).unwrap();
+        assert!(absolute.can_set(&-11).is_err());
+        assert_eq!(absolute.value(), 0);
+        assert!(absolute.set(-11).is_err());
+        assert_eq!(absolute.value(), 0);
+        let mut clamped = Constrained::normalized(0_i32, |value| value.max(0)).unwrap();
+        clamped.add_validator(|value| if *value >= 0 { Ok(()) } else { Err(ConstraintError::empty_field("lower")) }).unwrap();
+        assert_eq!(clamped.can_set(&-1), Ok(()));
+        assert_eq!(clamped.value(), 0);
+        assert_eq!(clamped.set(-1), Ok(()));
+        assert_eq!(clamped.value(), 0);
+    }
 
     fn invalid_value(candidate: impl Into<String>, allowed: impl Into<String>) -> ConstraintError {
         ConstraintError::InvalidValue {

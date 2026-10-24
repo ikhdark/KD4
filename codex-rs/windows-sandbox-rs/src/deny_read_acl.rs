@@ -27,17 +27,16 @@ pub fn plan_deny_read_acl_paths(paths: &[PathBuf]) -> Vec<PathBuf> {
     planned
 }
 
-fn push_planned_path(planned: &mut Vec<PathBuf>, seen: &mut HashSet<String>, path: PathBuf) {
+fn push_planned_path(planned: &mut Vec<PathBuf>, seen: &mut HashSet<std::ffi::OsString>, path: PathBuf) {
     if seen.insert(lexical_path_key(&path)) {
         planned.push(path);
     }
 }
 
-pub(crate) fn lexical_path_key(path: &Path) -> String {
-    path.to_string_lossy()
-        .replace('\\', "/")
-        .trim_end_matches('/')
-        .to_ascii_lowercase()
+pub(crate) fn lexical_path_key(path: &Path) -> std::ffi::OsString {
+    // Security policy paths may be case-sensitive and need not be Unicode.
+    // Duplicate ACL checks are safe; losing a distinct path is not.
+    path.as_os_str().to_owned()
 }
 
 /// Applies deny-read ACEs to explicit paths. Missing paths are materialized as
@@ -67,15 +66,19 @@ pub(crate) unsafe fn apply_planned_deny_read_acls(
     let mut seen = HashSet::new();
     let mut added_in_this_call: Vec<PathBuf> = Vec::new();
     for path in planned {
-        let result = (|| -> Result<bool> {
+        let result = (|| -> Result<(bool, bool)> {
             if !path.exists() {
                 std::fs::create_dir_all(&path)
                     .with_context(|| format!("create deny-read path {}", path.display()))?;
             }
-            add_deny_read_ace(&path, psid)
-                .with_context(|| format!("apply deny-read ACE to {}", path.display()))
+            let (dacl, descriptor) = crate::acl::fetch_dacl_handle(&path)?;
+            let preexisting = crate::acl::dacl_has_any_read_deny_for_sid(dacl, psid);
+            if !descriptor.is_null() { windows_sys::Win32::Foundation::LocalFree(descriptor); }
+            let added = add_deny_read_ace(&path, psid)
+                .with_context(|| format!("apply deny-read ACE to {}", path.display()))?;
+            Ok((added, preexisting))
         })();
-        let added = match result {
+        let (added, preexisting) = match result {
             Ok(added) => added,
             Err(err) => {
                 let mut rollback_errors = Vec::new();
@@ -93,7 +96,8 @@ pub(crate) unsafe fn apply_planned_deny_read_acls(
                 return Err(err);
             }
         };
-        if added {
+        // Retain repairs to preexisting protection if a later path fails.
+        if added && !preexisting {
             added_in_this_call.push(path.clone());
         }
         push_planned_path(&mut applied, &mut seen, path);
@@ -108,6 +112,18 @@ mod tests {
     use std::collections::HashSet;
     use std::path::PathBuf;
     use tempfile::TempDir;
+
+    #[test]
+    fn plan_preserves_case_distinct_and_non_unicode_paths() {
+        use std::os::windows::ffi::OsStringExt;
+        let paths = vec![
+            PathBuf::from("C:\\sensitive\\Secret"),
+            PathBuf::from("C:\\sensitive\\secret"),
+            PathBuf::from(std::ffi::OsString::from_wide(&[b'C' as u16, 0xd800])),
+            PathBuf::from(std::ffi::OsString::from_wide(&[b'C' as u16, 0xd801])),
+        ];
+        assert_eq!(plan_deny_read_acl_paths(&paths), paths);
+    }
 
     #[test]
     fn plan_preserves_missing_paths() {

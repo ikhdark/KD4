@@ -293,12 +293,14 @@ pub(crate) fn build_blocking_reqwest_client_with_custom_ca_policy(
 /// the platform native roots and then adds the configured custom CA certificates. When no custom
 /// CA env var is set, this returns `Ok(None)` so websocket callers can keep using their ordinary
 /// default connector path.
+/// An empty SSL_CERT_FILE is rejected; unset it to select system roots.
 ///
 /// Callers that let tungstenite build its default TLS connector directly bypass this policy
 /// entirely. That bug only shows up in environments where secure websocket traffic needs the same
 /// enterprise root CA bundle as HTTPS traffic.
 pub fn maybe_build_rustls_client_config_with_custom_ca()
 -> Result<Option<Arc<ClientConfig>>, BuildCustomCaTransportError> {
+    validate_rustls_ca_environment(&ProcessEnv)?;
     let Some(bundle) = ProcessEnv.configured_ca_bundle() else {
         return Ok(None);
     };
@@ -310,8 +312,10 @@ pub fn maybe_build_rustls_client_config_with_custom_ca()
 /// Unlike [`maybe_build_rustls_client_config_with_custom_ca`], this always returns a config. Use
 /// this when the caller must perform TLS itself instead of delegating default configuration to a
 /// transport library.
+/// An empty SSL_CERT_FILE is rejected; unset it to select system roots.
 pub fn build_rustls_client_config_with_custom_ca()
 -> Result<Arc<ClientConfig>, BuildCustomCaTransportError> {
+    validate_rustls_ca_environment(&ProcessEnv)?;
     let bundle = ProcessEnv.configured_ca_bundle();
     cached_rustls_client_config(bundle.as_ref())
 }
@@ -695,6 +699,19 @@ trait EnvSource {
 /// This is the production `EnvSource` implementation used by
 /// [`build_reqwest_client_with_custom_ca`]. Tests substitute in-memory env maps so they can
 /// exercise precedence and empty-value behavior without mutating process-global variables.
+fn validate_rustls_ca_environment(
+    env_source: &dyn EnvSource,
+) -> Result<(), BuildCustomCaTransportError> {
+    if env_source.var(SSL_CERT_FILE_ENV).as_deref() == Some("") {
+        return Err(BuildCustomCaTransportError::InvalidCaFile {
+            source_env: SSL_CERT_FILE_ENV,
+            path: PathBuf::new(),
+            detail: "SSL_CERT_FILE is empty; unset SSL_CERT_FILE to use system roots".into(),
+        });
+    }
+    Ok(())
+}
+
 struct ProcessEnv;
 
 impl EnvSource for ProcessEnv {
@@ -939,6 +956,14 @@ mod tests {
             panic!("write cert fixture failed for {}: {error}", path.display())
         });
         path
+    }
+
+    #[test]
+    fn rustls_rejects_empty_ssl_cert_file_before_loading_roots() {
+        let error = super::validate_rustls_ca_environment(&map_env(&[(SSL_CERT_FILE_ENV, "")]))
+            .unwrap_err();
+        assert!(error.to_string().contains("unset SSL_CERT_FILE"));
+        super::validate_rustls_ca_environment(&map_env(&[])).unwrap();
     }
 
     #[test]

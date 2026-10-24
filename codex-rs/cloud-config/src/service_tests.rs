@@ -1106,12 +1106,12 @@ async fn a_rejected_effective_candidate_can_be_downloaded_again() {
         CLOUD_CONFIG_BUNDLE_TIMEOUT,
     );
     let loader = crate::bundle_loader::retryable_service_loader(service);
-    let generation = loader.candidate_generation();
-    assert_eq!(loader.get().await, Ok(Some(test_bundle())));
-    assert_eq!(loader.get().await, Ok(Some(test_bundle())));
-    loader.reject_candidate(generation);
+    let rejected_load = loader.for_load();
+    assert_eq!(rejected_load.get().await, Ok(Some(test_bundle())));
+    assert_eq!(rejected_load.get().await, Ok(Some(test_bundle())));
+    rejected_load.reject_loaded_candidate();
     assert_eq!(loader.get().await, Ok(None));
-    loader.reject_candidate(generation); // An obsolete consumer cannot retire the new candidate.
+    rejected_load.reject_loaded_candidate(); // An obsolete consumer cannot retire the new candidate.
     assert_eq!(loader.get().await, Ok(None));
     assert_eq!(client.request_count.load(Ordering::SeqCst), 2);
 }

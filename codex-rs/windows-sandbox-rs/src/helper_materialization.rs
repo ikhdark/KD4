@@ -1,21 +1,17 @@
 use anyhow::Context;
 use anyhow::Result;
 use anyhow::anyhow;
-use std::collections::HashMap;
+use sha2::{Digest, Sha256};
 use std::ffi::OsStr;
 use std::fs;
 use std::io::Write;
 use std::path::Path;
 use std::path::PathBuf;
-use std::sync::Mutex;
-use std::sync::OnceLock;
-use std::time::UNIX_EPOCH;
 use tempfile::NamedTempFile;
 
 use crate::logging::log_note;
 use crate::sandbox_bin_dir;
 
-const DEV_BUILD_VERSION_SENTINEL: &str = "0.0.0";
 pub(crate) const BIN_DIRNAME: &str = "bin";
 pub(crate) const RESOURCES_DIRNAME: &str = "codex-resources";
 
@@ -51,26 +47,25 @@ pub enum HelperMaterializationStatus {
     SourceFallback,
 }
 
-static HELPER_PATH_CACHE: OnceLock<Mutex<HashMap<String, PathBuf>>> = OnceLock::new();
 
 pub(crate) fn helper_bin_dir(codex_home: &Path) -> PathBuf {
     sandbox_bin_dir(codex_home)
 }
 
-pub(crate) fn legacy_lookup(kind: HelperExecutable) -> PathBuf {
+pub(crate) fn legacy_lookup(kind: HelperExecutable) -> Result<PathBuf> {
     if let Ok(exe) = std::env::current_exe()
         && let Some(candidate) = bundled_executable_path_for_exe(&exe, kind.file_name())
     {
-        return candidate;
+        if candidate.is_absolute() && candidate.is_file() { return Ok(candidate); }
     }
-    PathBuf::from(kind.file_name())
+    Err(anyhow!("packaged {} helper not found; refusing ambient executable lookup", kind.label()))
 }
 
 pub(crate) fn resolve_helper_for_launch(
     kind: HelperExecutable,
     codex_home: &Path,
     log_dir: Option<&Path>,
-) -> PathBuf {
+) -> Result<PathBuf> {
     match copy_helper_if_needed(kind, codex_home, log_dir) {
         Ok(path) => {
             log_note(
@@ -81,10 +76,10 @@ pub(crate) fn resolve_helper_for_launch(
                 ),
                 log_dir,
             );
-            path
+            Ok(path)
         }
         Err(err) => {
-            let fallback = legacy_lookup(kind);
+            let fallback = legacy_lookup(kind)?;
             log_note(
                 &format!(
                     "helper copy failed for {}: {err:#}; falling back to legacy path {}",
@@ -93,7 +88,7 @@ pub(crate) fn resolve_helper_for_launch(
                 ),
                 log_dir,
             );
-            fallback
+            Ok(fallback)
         }
     }
 }
@@ -132,8 +127,15 @@ pub fn resolve_exe_for_launch_with_status(
             HelperMaterializationStatus::SourceFallback,
         );
     };
-    let destination = helper_bin_dir(codex_home).join(file_name);
-    match copy_from_source_if_needed(source, &destination) {
+    let digest = match content_digest(source) {
+        Ok(digest) => digest,
+        Err(_) => return (source.to_path_buf(), HelperMaterializationStatus::SourceFallback),
+    };
+    let mut name = source.file_stem().unwrap_or(file_name).to_os_string();
+    name.push(format!("-{digest}"));
+    if let Some(extension) = source.extension() { name.push("."); name.push(extension); }
+    let destination = helper_bin_dir(codex_home).join(name);
+    match copy_from_source_with_digest(source, &destination, &digest) {
         Ok(CopyOutcome::Reused) => (destination, HelperMaterializationStatus::Reused),
         Ok(CopyOutcome::ReCopied) => (destination, HelperMaterializationStatus::ReCopied),
         Err(err) => {
@@ -158,21 +160,8 @@ pub(crate) fn copy_helper_if_needed(
     codex_home: &Path,
     log_dir: Option<&Path>,
 ) -> Result<PathBuf> {
-    let cache_key = format!("{}|{}", kind.file_name(), codex_home.display());
-    if let Some(path) = cached_helper_path(&cache_key) {
-        log_note(
-            &format!(
-                "helper copy: using in-memory cache for {} -> {}",
-                kind.label(),
-                path.display()
-            ),
-            log_dir,
-        );
-        return Ok(path);
-    }
-
     let source = sibling_source_path(kind)?;
-    let destination = helper_destination_for_source(kind, codex_home, &source)?;
+    let (destination, digest) = helper_destination_for_source(kind, codex_home, &source)?;
     log_note(
         &format!(
             "helper copy: validating {} source={} destination={}",
@@ -182,7 +171,7 @@ pub(crate) fn copy_helper_if_needed(
         ),
         log_dir,
     );
-    let outcome = copy_from_source_if_needed(&source, &destination)?;
+    let outcome = copy_from_source_with_digest(&source, &destination, &digest)?;
     let action = match outcome {
         CopyOutcome::Reused => "reused",
         CopyOutcome::ReCopied => "recopied",
@@ -197,28 +186,10 @@ pub(crate) fn copy_helper_if_needed(
         ),
         log_dir,
     );
-    store_helper_path(cache_key, destination.clone());
     Ok(destination)
 }
 
-fn cached_helper_path(cache_key: &str) -> Option<PathBuf> {
-    let cache = HELPER_PATH_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-    let mut guard = cache.lock().ok()?;
-    let path = guard.get(cache_key)?.clone();
-    if path.is_file() {
-        Some(path)
-    } else {
-        guard.remove(cache_key);
-        None
-    }
-}
 
-fn store_helper_path(cache_key: String, path: PathBuf) {
-    let cache = HELPER_PATH_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-    if let Ok(mut guard) = cache.lock() {
-        guard.insert(cache_key, path);
-    }
-}
 
 fn sibling_source_path(kind: HelperExecutable) -> Result<PathBuf> {
     let exe = std::env::current_exe().context("resolve current executable for helper lookup")?;
@@ -254,10 +225,11 @@ fn helper_destination_for_source(
     kind: HelperExecutable,
     codex_home: &Path,
     source: &Path,
-) -> Result<PathBuf> {
+) -> Result<(PathBuf, String)> {
     let suffix = helper_version_suffix(source)?;
     let file_name = materialized_file_name(kind, &suffix);
-    Ok(helper_bin_dir(codex_home).join(file_name))
+    let digest = suffix.rsplit_once('-').context("missing helper content identity")?.1.to_owned();
+    Ok((helper_bin_dir(codex_home).join(file_name), digest))
 }
 
 fn materialized_file_name(kind: HelperExecutable, suffix: &str) -> String {
@@ -276,28 +248,18 @@ fn materialized_file_name(kind: HelperExecutable, suffix: &str) -> String {
 }
 
 fn helper_version_suffix(source: &Path) -> Result<String> {
-    let version = env!("CARGO_PKG_VERSION");
-    if version == DEV_BUILD_VERSION_SENTINEL {
-        dev_build_suffix(source)
-    } else {
-        Ok(version.to_string())
-    }
+    Ok(format!("{}-{}", env!("CARGO_PKG_VERSION"), content_digest(source)?))
 }
 
-fn dev_build_suffix(source: &Path) -> Result<String> {
-    let metadata = fs::metadata(source)
-        .with_context(|| format!("read helper source metadata {}", source.display()))?;
-    let modified = metadata
-        .modified()
-        .with_context(|| format!("read helper source mtime {}", source.display()))?;
-    let duration = modified
-        .duration_since(UNIX_EPOCH)
-        .with_context(|| format!("convert helper source mtime {}", source.display()))?;
-    Ok(format!("{}-{:x}", metadata.len(), duration.as_secs(),))
-}
 
+#[cfg(test)]
 fn copy_from_source_if_needed(source: &Path, destination: &Path) -> Result<CopyOutcome> {
-    if destination_is_fresh(source, destination)? {
+    let expected = content_digest(source)?;
+    copy_from_source_with_digest(source, destination, &expected)
+}
+
+fn copy_from_source_with_digest(source: &Path, destination: &Path, expected: &str) -> Result<CopyOutcome> {
+    if destination_matches_digest(destination, expected)? {
         return Ok(CopyOutcome::Reused);
     }
 
@@ -346,10 +308,12 @@ fn copy_from_source_if_needed(source: &Path, destination: &Path) -> Result<CopyO
         .with_context(|| format!("flush temporary helper file {}", temp_path_buf.display()))?;
     drop(temp_file);
 
+    anyhow::ensure!(content_digest(&temp_path_buf)? == expected, "helper source changed while materializing {}", source.display());
+
     match replace_helper_file(&temp_path_buf, destination) {
         Ok(()) => Ok(CopyOutcome::ReCopied),
         Err(rename_err) => {
-            if destination_is_fresh(source, destination)? {
+            if destination_matches_digest(destination, expected)? {
                 Ok(CopyOutcome::Reused)
             } else {
                 Err(rename_err).with_context(|| {
@@ -369,51 +333,46 @@ fn replace_helper_file(temp_path: &Path, destination: &Path) -> std::io::Result<
     fs::rename(temp_path, destination)
 }
 
+#[cfg(test)]
 fn destination_is_fresh(source: &Path, destination: &Path) -> Result<bool> {
-    let source_meta = fs::metadata(source)
-        .with_context(|| format!("read helper source metadata {}", source.display()))?;
-    let destination_meta = match fs::metadata(destination) {
-        Ok(meta) => meta,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-        Err(err) => {
-            return Err(err).with_context(|| {
-                format!("read helper destination metadata {}", destination.display())
-            });
-        }
-    };
+    destination_matches_digest(destination, &content_digest(source)?)
+}
 
-    if source_meta.len() != destination_meta.len() {
-        return Ok(false);
+fn destination_matches_digest(destination: &Path, expected: &str) -> Result<bool> {
+    match content_digest(destination) {
+        Ok(digest) => Ok(digest == expected),
+        Err(err) if err.downcast_ref::<std::io::Error>().is_some_and(|err| err.kind() == std::io::ErrorKind::NotFound) => Ok(false),
+        Err(err) => Err(err),
     }
+}
 
-    let source_modified = source_meta
-        .modified()
-        .with_context(|| format!("read helper source mtime {}", source.display()))?;
-    let destination_modified = destination_meta
-        .modified()
-        .with_context(|| format!("read helper destination mtime {}", destination.display()))?;
-
-    Ok(destination_modified >= source_modified)
+fn content_digest(path: &Path) -> Result<String> {
+    use std::io::Read;
+    let mut file = fs::File::open(path).with_context(|| format!("open helper image {}", path.display()))?;
+    let mut hash = Sha256::new();
+    let mut bytes = [0; 64 * 1024];
+    loop {
+        let count = file.read(&mut bytes)?;
+        if count == 0 { break; }
+        hash.update(&bytes[..count]);
+    }
+    Ok(hash.finalize().iter().map(|byte| format!("{byte:02x}")).collect())
 }
 
 #[cfg(test)]
 mod tests {
     use super::BIN_DIRNAME;
     use super::CopyOutcome;
-    use super::DEV_BUILD_VERSION_SENTINEL;
     use super::HelperExecutable;
     use super::HelperMaterializationStatus;
     use super::RESOURCES_DIRNAME;
     use super::bundled_executable_path_for_exe;
-    use super::cached_helper_path;
     use super::copy_from_source_if_needed;
     use super::destination_is_fresh;
-    use super::dev_build_suffix;
     use super::helper_bin_dir;
     use super::helper_version_suffix;
     use super::materialized_file_name;
     use super::replace_helper_file;
-    use super::store_helper_path;
     use crate::resolve_exe_for_launch_with_status;
     use pretty_assertions::assert_eq;
     use std::fs;
@@ -427,7 +386,7 @@ mod tests {
     use windows_sys::Win32::Storage::FileSystem::FILE_SHARE_WRITE;
 
     #[test]
-    fn destination_is_fresh_uses_size_and_mtime() {
+    fn destination_is_fresh_uses_content_not_metadata() {
         let tmp = TempDir::new().expect("tempdir");
         let source = tmp.path().join("source.exe");
         let destination = tmp.path().join("destination.exe");
@@ -448,7 +407,10 @@ mod tests {
             &destination,
             source_time - std::time::Duration::from_secs(2),
         );
-        assert!(!destination_is_fresh(&source, &destination).expect("stale metadata"));
+        assert!(destination_is_fresh(&source, &destination).expect("identical image despite older metadata"));
+        fs::write(&destination, b"evil-size").unwrap();
+        assert!(!destination_is_fresh(&source, &destination).unwrap());
+        fs::write(&destination, b"same-size").unwrap();
 
         set_modified(
             &destination,
@@ -466,17 +428,17 @@ mod tests {
     }
 
     #[test]
-    fn deleted_cached_helper_path_is_invalidated() {
-        let tmp = TempDir::new().expect("tempdir");
-        let helper = tmp.path().join("cached-helper.exe");
-        let cache_key = format!("deleted-helper|{}", tmp.path().display());
-        fs::write(&helper, b"runner-v1").expect("write helper");
-        store_helper_path(cache_key.clone(), helper.clone());
-        assert_eq!(cached_helper_path(&cache_key), Some(helper.clone()));
-
-        fs::remove_file(&helper).expect("delete cached helper");
-
-        assert_eq!(cached_helper_path(&cache_key), None);
+    fn tampered_materialized_helper_is_revalidated() {
+        let tmp = TempDir::new().unwrap();
+        let source = tmp.path().join("source.exe");
+        let home = tmp.path().join("home");
+        fs::write(&source, b"trusted-image").unwrap();
+        let (path, _) = resolve_exe_for_launch_with_status(&source, &home);
+        fs::write(&path, b"hostile-image").unwrap();
+        let (repaired, status) = resolve_exe_for_launch_with_status(&source, &home);
+        assert_eq!(repaired, path);
+        assert_eq!(status, HelperMaterializationStatus::ReCopied);
+        assert_eq!(fs::read(repaired).unwrap(), b"trusted-image");
     }
 
     #[test]
@@ -487,10 +449,8 @@ mod tests {
         fs::write(&source, b"runner-v1").expect("write source");
 
         let (first_path, first_status) = resolve_exe_for_launch_with_status(&source, &codex_home);
-        assert_eq!(
-            first_path,
-            codex_home.join(".sandbox-bin").join("source.exe")
-        );
+        assert_eq!(first_path.parent(), Some(codex_home.join(".sandbox-bin").as_path()));
+        assert!(first_path.file_name().unwrap().to_string_lossy().starts_with("source-"));
         assert_eq!(
             fs::read(&first_path).expect("read first helper"),
             b"runner-v1"
@@ -548,7 +508,8 @@ mod tests {
 
         let (resolved, status) = resolve_exe_for_launch_with_status(&source, &codex_home);
 
-        assert_eq!(resolved, destination);
+        assert_ne!(resolved, destination);
+        assert_eq!(fs::read(&destination).unwrap(), b"old");
         assert_eq!(status, HelperMaterializationStatus::ReCopied);
         assert_eq!(
             fs::read(&resolved).expect("read replacement"),
@@ -558,7 +519,7 @@ mod tests {
             .expect("read helper directory")
             .map(|entry| entry.expect("helper directory entry").path())
             .collect::<Vec<_>>();
-        assert_eq!(entries, vec![destination]);
+        assert_eq!(entries.into_iter().collect::<std::collections::HashSet<_>>(), [destination, resolved].into_iter().collect());
     }
 
     #[test]
@@ -577,8 +538,9 @@ mod tests {
 
         let (resolved, status) = resolve_exe_for_launch_with_status(&source, &codex_home);
 
-        assert_eq!(resolved, source);
-        assert_eq!(status, HelperMaterializationStatus::SourceFallback);
+        assert_ne!(resolved, destination);
+        assert_ne!(resolved, source);
+        assert_eq!(status, HelperMaterializationStatus::ReCopied);
         assert_eq!(fs::read(&destination).expect("read old helper"), b"old");
         assert_eq!(
             fs::read(&resolved).expect("read fallback helper"),
@@ -588,12 +550,13 @@ mod tests {
             .expect("read helper directory")
             .map(|entry| entry.expect("helper directory entry").path())
             .collect::<Vec<_>>();
-        assert_eq!(entries, vec![destination.clone()]);
+        assert_eq!(entries.into_iter().collect::<std::collections::HashSet<_>>(), [destination.clone(), resolved.clone()].into_iter().collect());
+        let updated_destination = resolved;
         drop(reader);
 
         let (resolved, status) = resolve_exe_for_launch_with_status(&source, &codex_home);
-        assert_eq!(resolved, destination);
-        assert_eq!(status, HelperMaterializationStatus::ReCopied);
+        assert_eq!(resolved, updated_destination);
+        assert_eq!(status, HelperMaterializationStatus::Reused);
         assert_eq!(
             fs::read(&resolved).expect("read recovered helper"),
             b"replacement helper"
@@ -617,7 +580,7 @@ mod tests {
 
         let (resolved, status) = resolve_exe_for_launch_with_status(&source, &codex_home);
 
-        assert_eq!(resolved, destination);
+        assert_ne!(resolved, destination);
         assert_eq!(status, HelperMaterializationStatus::ReCopied);
         assert_eq!(
             fs::read(&resolved).expect("read replacement helper"),
@@ -632,7 +595,7 @@ mod tests {
             .expect("read helper directory")
             .map(|entry| entry.expect("helper directory entry").path())
             .collect::<Vec<_>>();
-        assert_eq!(entries, vec![destination]);
+        assert_eq!(entries.into_iter().collect::<std::collections::HashSet<_>>(), [destination, resolved].into_iter().collect());
     }
 
     #[test]
@@ -645,6 +608,8 @@ mod tests {
         assert_eq!(status, HelperMaterializationStatus::ReCopied);
         let replacement = vec![0x5a; 1024 * 1024];
         fs::write(&source, &replacement).expect("update source");
+        let previous_destination = destination;
+        let destination = helper_bin_dir(&codex_home).join(format!("source-{}.exe", super::content_digest(&source).unwrap()));
         let start = Barrier::new(8);
 
         std::thread::scope(|scope| {
@@ -676,7 +641,7 @@ mod tests {
             .expect("read helper directory")
             .map(|entry| entry.expect("helper directory entry").path())
             .collect::<Vec<_>>();
-        assert_eq!(entries, vec![destination]);
+        assert_eq!(entries.into_iter().collect::<std::collections::HashSet<_>>(), [previous_destination, destination].into_iter().collect());
     }
 
     #[test]
@@ -800,12 +765,10 @@ mod tests {
             .expect("set source timestamp");
         let suffix = helper_version_suffix(&source).expect("suffix");
 
-        if env!("CARGO_PKG_VERSION") == DEV_BUILD_VERSION_SENTINEL {
-            assert_eq!(suffix, "9-6553f100");
-            assert_eq!(suffix, dev_build_suffix(&source).expect("dev build suffix"));
-        } else {
-            assert_eq!(suffix, env!("CARGO_PKG_VERSION"));
-        }
+        let digest = super::content_digest(&source).unwrap();
+        assert_eq!(suffix, format!("{}-{digest}", env!("CARGO_PKG_VERSION")));
+        fs::write(&source, b"runner-v2").unwrap();
+        assert_ne!(helper_version_suffix(&source).unwrap(), suffix);
     }
 
     #[test]

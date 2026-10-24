@@ -168,15 +168,12 @@ fn test_exec_request(
 ) -> ExecRequest {
     let windows_sandbox_private_desktop = false;
     let permission_profile = turn.permission_profile();
-    let network = None;
     let arg0 = None;
     ExecRequest::new(
         command,
         turn.config.codex_home.clone(),
         cwd,
         env,
-        network,
-        /*network_environment_id*/ None,
         ExecExpiration::DefaultTimeout,
         ExecCapturePolicy::ShellTool,
         SandboxType::None,
@@ -294,8 +291,6 @@ async fn exec_argv(
         normalization_cwd: None,
         sandbox_cwd: cwd.into(),
         turn_environment: environment,
-        // Mirrors the exec_command handler, which forwards the turn's managed proxy.
-        network: turn.network.clone(),
         tty,
         sandbox_permissions: crate::sandboxing::SandboxPermissions::UseDefault,
         additional_permissions: None,
@@ -602,7 +597,6 @@ async fn register_pollable_process(
             hook_command: call_id.to_string(),
             tty: !validation_launch,
             validation_launch,
-            network_approval: None,
             session: Arc::downgrade(session),
             last_used: Instant::now(),
         },
@@ -1035,7 +1029,6 @@ async fn write_stdin_yield_deadlines_include_reaction_and_cap_background_wait() 
             hook_command: "interactive".to_string(),
             tty: true,
             validation_launch: false,
-            network_approval: None,
             session: Arc::downgrade(&session),
             last_used: Instant::now(),
         },
@@ -1662,81 +1655,11 @@ async fn unified_exec_noninteractive_bursts_finish_in_one_initial_call() -> anyh
     Ok(())
 }
 
-/// Managed network requirements attach a proxy even when nothing enables it, and only a sandbox
-/// enforces managed network. On a host without a sandbox backend, unified exec must refuse the
-/// launch like `build_exec_request`: not fail on the disabled proxy, and not run unenforced.
+
+/// An explicitly unsandboxed launch still runs without a sandbox backend.
 #[cfg(windows)]
 #[tokio::test]
-async fn managed_network_refuses_unified_exec_when_no_sandbox_is_available() -> anyhow::Result<()> {
-    let workspace = tempfile::tempdir()?;
-    let marker = workspace.path().join("unexpected-process.txt");
-    let (session, mut turn) = make_session_and_context().await;
-    turn.permission_profile = codex_protocol::models::PermissionProfile::Disabled;
-    turn.windows_sandbox_level = codex_protocol::config_types::WindowsSandboxLevel::Disabled;
-    turn.approval_policy
-        .set(codex_protocol::protocol::AskForApproval::Never)?;
-    // Requirements without `enabled = true` leave the configured proxy disabled but attached.
-    let requirements = codex_config::NetworkConstraints {
-        domains: Some(codex_config::NetworkDomainPermissionsToml {
-            entries: std::collections::BTreeMap::from([(
-                "example.com".to_string(),
-                codex_config::NetworkDomainPermissionToml::Allow,
-            )]),
-        }),
-        ..Default::default()
-    };
-    let spec = crate::config::NetworkProxySpec::from_config_and_constraints(
-        codex_network_proxy::NetworkProxyConfig::default(),
-        Some(requirements),
-        &turn.permission_profile(),
-    )?;
-    assert!(!spec.enabled());
-    let started_proxy = spec
-        .start_proxy(
-            turn.config.codex_home.as_path(),
-            &turn.permission_profile(),
-            /*policy_decider*/ None,
-            /*blocked_request_observer*/ None,
-            /*enable_network_approval_flow*/ true,
-            codex_network_proxy::NetworkProxyAuditMetadata::default(),
-        )
-        .await?;
-    turn.network = Some(started_proxy.proxy());
-    let session = Arc::new(session);
-    let turn = Arc::new(turn);
-
-    let command = format!(
-        "Set-Content -LiteralPath '{}' -Value unexpected",
-        marker.to_string_lossy().replace('\'', "''")
-    );
-    let (result, observed) = crate::tools::runtimes::unified_exec::test_observation::observe(
-        exec_command_with_tty(&session, &turn, &command, 10_000, None, false),
-    )
-    .await;
-    let message = match result {
-        Err(UnifiedExecError::CreateProcess { message }) => message,
-        Err(other) => panic!("expected the unavailable-sandbox refusal, got: {other}"),
-        Ok(_) => panic!("managed network must not run a command without a sandbox"),
-    };
-    assert!(message.contains("PermissionDenied"), "{message}");
-    assert!(
-        message.contains("no sandbox backend is available; refusing to run unsandboxed"),
-        "{message}"
-    );
-    assert_eq!(observed.process_launches, 0);
-    assert!(
-        !marker.exists(),
-        "a refused launch must not run the command"
-    );
-    drop(started_proxy);
-    Ok(())
-}
-
-/// The refusal is specific to managed network: without it, the same launch on a host without a
-/// sandbox backend still runs.
-#[cfg(windows)]
-#[tokio::test]
-async fn unified_exec_without_managed_network_still_runs_when_no_sandbox_is_available()
+async fn unified_exec_runs_when_no_sandbox_is_available()
 -> anyhow::Result<()> {
     let workspace = tempfile::tempdir()?;
     let marker = workspace.path().join("expected-process.txt");
@@ -1745,7 +1668,6 @@ async fn unified_exec_without_managed_network_still_runs_when_no_sandbox_is_avai
     turn.windows_sandbox_level = codex_protocol::config_types::WindowsSandboxLevel::Disabled;
     turn.approval_policy
         .set(codex_protocol::protocol::AskForApproval::Never)?;
-    assert!(turn.network.is_none());
     let session = Arc::new(session);
     let turn = Arc::new(turn);
 
@@ -1986,96 +1908,7 @@ async fn unified_exec_latency_benchmark() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Unified exec publishes Begin after its process starts. A baseline captured
-/// there can absorb the command's own write and record it as read-only.
-#[cfg(windows)]
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn uncertain_command_workspace_baseline_precedes_launch() -> anyhow::Result<()> {
-    let fixture = tempfile::tempdir()?;
-    assert!(
-        std::process::Command::new("git")
-            .args(["init", "--quiet"])
-            .current_dir(fixture.path())
-            .status()?
-            .success()
-    );
-    let script = "[System.IO.File]::WriteAllText('launched.txt', 'launched')";
-    let command = [
-        "powershell.exe",
-        "-NoLogo",
-        "-NoProfile",
-        "-Command",
-        script,
-    ]
-    .map(str::to_string);
-    assert!(matches!(
-        crate::turn_diff_tracker::command_mutation(&command, Some(fixture.path())),
-        crate::turn_diff_tracker::CommandMutation::Uncertain
-    ));
-    let marker = fixture.path().join("launched.txt");
-    let (session, mut turn) = test_session_and_turn().await;
-    Arc::get_mut(&mut turn)
-        .expect("turn is uniquely owned")
-        .approval_policy
-        .set(codex_protocol::protocol::AskForApproval::Never)?;
-    let tracker = Arc::new(tokio::sync::Mutex::new(
-        crate::turn_diff_tracker::TurnDiffTracker::new(),
-    ));
-    let pause = session
-        .services
-        .git_workspace
-        .pause_next_workspace_evidence_capture();
-    // The command runs on the test thread like the other exec tests; only this
-    // small monitor runs on a worker, and it always releases the capture.
-    let monitor = tokio::spawn({
-        let marker = marker.clone();
-        async move {
-            let started = tokio::time::timeout(Duration::from_secs(30), pause.wait_until_started())
-                .await
-                .is_ok();
-            // A process launched ahead of its baseline writes while this capture is held.
-            let written_during_baseline = started
-                && tokio::time::timeout(Duration::from_secs(5), async {
-                    while !marker.exists() {
-                        tokio::time::sleep(Duration::from_millis(20)).await;
-                    }
-                })
-                .await
-                .is_ok();
-            pause.release();
-            (started, written_during_baseline)
-        }
-    });
-    let result = exec_command_with_tracker(
-        &session,
-        &turn,
-        script,
-        /*yield_time_ms*/ 30_000,
-        Some(fixture.path().to_path_buf()),
-        /*tty*/ false,
-        Some(Arc::clone(&tracker)),
-    )
-    .await;
-    let (started, written_during_baseline) = monitor.await?;
-    let result = result?;
 
-    assert!(
-        started,
-        "the uncertain command captured no workspace baseline"
-    );
-    assert!(
-        !written_during_baseline,
-        "the command ran before its workspace baseline was captured"
-    );
-    assert_eq!(result.exit_code, Some(0));
-    assert_eq!(std::fs::read_to_string(&marker)?, "launched");
-    assert_eq!(
-        tracker.lock().await.current_mutation_revision(),
-        1,
-        "the command's write must be attributed to it"
-    );
-    Ok(())
-}
 
 #[cfg(windows)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2385,7 +2218,6 @@ async fn terminating_initial_exec_command_rechecks_initial_response_state() -> a
             hook_command: "Start-Sleep -Seconds 60".to_string(),
             tty: true,
             validation_launch: false,
-            network_approval: None,
             session: Arc::downgrade(&session),
             last_used: Instant::now(),
         },
@@ -2461,7 +2293,6 @@ async fn terminating_during_stdin_poll_returns_exited_response() -> anyhow::Resu
             hook_command: "Start-Sleep -Seconds 60".to_string(),
             tty: true,
             validation_launch: false,
-            network_approval: None,
             session: Arc::downgrade(&session),
             last_used,
         },

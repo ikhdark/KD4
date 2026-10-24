@@ -24,6 +24,23 @@ use super::types::RemoteSession;
 
 impl ConnectionDriver {
     pub(super) fn handle_command(&mut self, command: DriverCommand) -> bool {
+        if let Some(error) = self.admission_error() {
+            match command {
+                DriverCommand::ShutdownSession { response_tx, .. }
+                    if self.alive.load(std::sync::atomic::Ordering::Acquire) => {
+                    // Capacity refusal has no host effects, but storage still
+                    // belongs to the session. Keep its existing close observer
+                    // and host lease alive until shutdown can be admitted.
+                    let _ = response_tx.send(Err(codex_code_mode_protocol::host::SESSION_SHUTDOWN_PENDING.into()));
+                }
+                DriverCommand::OpenSession { response_tx, .. }
+                | DriverCommand::ShutdownSession { response_tx, .. } => { let _ = response_tx.send(Err(error)); }
+                DriverCommand::Execute { response_tx, .. } => { let _ = response_tx.send(Err(error)); }
+                DriverCommand::Wait { response_tx, .. }
+                | DriverCommand::Terminate { response_tx, .. } => { let _ = response_tx.send(Err(error)); }
+            }
+            return true;
+        }
         match command {
             DriverCommand::OpenSession {
                 session,
@@ -307,6 +324,7 @@ impl ConnectionDriver {
             PendingRequest::Terminate {
                 session,
                 cell_id: pending_cell_id,
+                automatic: false,
                 response_tx,
             },
         )

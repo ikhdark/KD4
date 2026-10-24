@@ -53,6 +53,7 @@ pub fn extract_response_debug_context(transport: &TransportError) -> ResponseDeb
 pub fn extract_response_debug_context_from_api_error(error: &ApiError) -> ResponseDebugContext {
     match error {
         ApiError::Transport(transport) => extract_response_debug_context(transport),
+        ApiError::TerminalResponse { source, .. } => extract_response_debug_context_from_api_error(source),
         _ => ResponseDebugContext::default(),
     }
 }
@@ -187,6 +188,25 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn audit20261023_terminal_wrappers_preserve_transport_debug_context() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-request-id", HeaderValue::from_static("request"));
+        headers.insert("cf-ray", HeaderValue::from_static("ray"));
+        headers.insert("x-error-json", HeaderValue::from_static("malformed"));
+        let mut error = ApiError::Transport(TransportError::Http {
+            retry_after: None, status: StatusCode::UNAUTHORIZED, url: None,
+            headers: Some(headers), body: None,
+        });
+        let expected = extract_response_debug_context_from_api_error(&error);
+        assert_eq!(expected.request_id.as_deref(), Some("request"));
+        for _ in 0..3 {
+            error = ApiError::TerminalResponse { source: Box::new(error), response_id: Some("response".into()), token_usage: None };
+            assert_eq!(extract_response_debug_context_from_api_error(&error), expected);
+        }
+        assert_eq!(extract_response_debug_context_from_api_error(&ApiError::Stream("error".into())), ResponseDebugContext::default());
     }
 
     #[test]

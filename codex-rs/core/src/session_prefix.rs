@@ -153,20 +153,17 @@ fn format_inter_agent_completion_message_with_diagnostics(
                     .unwrap_or("No authored report was delivered."),
                 TYPED_COMPLETION_NEXT_ACTION,
                 receipt,
-                Some(&format!(
-                    "Host execution stop cause: {cause}. Task acceptance is separate; reconcile remaining assigned scope.\n{}",
-                    protected_host_summary.unwrap_or_default()
-                )),
+                Some(&format!("Host execution stop cause: {cause}.")),
             ));
         }
         AgentStatus::Completed(Some(message)) => {
             return Some(format_bounded_inter_agent_completion_message(
                 task_name,
                 sender,
-                message,
+                without_protected_prefix(message, protected_host_summary),
                 TYPED_COMPLETION_NEXT_ACTION,
                 receipt,
-                protected_host_summary,
+                None,
             ));
         }
         AgentStatus::Completed(None) => String::new(),
@@ -177,10 +174,10 @@ fn format_inter_agent_completion_message_with_diagnostics(
             return Some(format_bounded_inter_agent_completion_message(
                 task_name,
                 sender,
-                message,
+                without_protected_prefix(message, protected_host_summary),
                 TYPED_COMPLETION_NEXT_ACTION,
                 receipt,
-                protected_host_summary,
+                None,
             ));
         }
         AgentStatus::CompletedWithSurface {
@@ -197,7 +194,7 @@ fn format_inter_agent_completion_message_with_diagnostics(
                 ),
                 ERROR_NEXT_ACTION,
                 receipt,
-                protected_host_summary,
+                None,
             ));
         }
         AgentStatus::Shutdown => "Agent shut down.".to_string(),
@@ -211,8 +208,8 @@ fn format_inter_agent_completion_message_with_diagnostics(
     )
 }
 
-/// Status projection places the protected host summary first. Remove only that
-/// exact leading copy so the bounded message reports it once, in protected space.
+/// Older status projections may carry a host completion summary. Remove only
+/// its exact leading copy; completion notifications deliver the authored report.
 fn without_protected_prefix<'a>(text: &'a str, protected_host_summary: Option<&str>) -> &'a str {
     match protected_host_summary
         .filter(|summary| !summary.is_empty())

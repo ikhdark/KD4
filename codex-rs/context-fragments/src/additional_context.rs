@@ -37,6 +37,10 @@ impl ContextualUserFragment for AdditionalContextUserFragment {
         ("", "")
     }
 
+    fn can_truncate_body(&self) -> bool {
+        false
+    }
+
     fn matches_text(text: &str) -> bool {
         let trimmed = text.trim();
         matches_explicit_context(
@@ -81,6 +85,10 @@ impl ContextualUserFragment for AdditionalContextDeveloperFragment {
 
     fn type_markers() -> (&'static str, &'static str) {
         ("", "")
+    }
+
+    fn can_truncate_body(&self) -> bool {
+        false
     }
 
     fn matches_text(text: &str) -> bool {

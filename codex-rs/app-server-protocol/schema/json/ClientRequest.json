@@ -452,7 +452,7 @@
       "description": "Write stdin bytes to a running `command/exec` session, close stdin, or both.",
       "properties": {
         "closeStdin": {
-          "description": "Close input after queued bytes. Unix PTYs send canonical VEOF (including flushing a partial line); raw/disabled-VEOF terminals return an error. Terminal EOF is not a permanent pipe half-close.",
+          "description": "Close input after queued bytes. Unix PTYs drain accepted input and return an error because terminal input cannot be half-closed reliably. No terminal-control bytes are synthesized; use pipe stdin for EOF.",
           "type": "boolean"
         },
         "deltaBase64": {
@@ -469,17 +469,6 @@
       },
       "required": [
         "processId"
-      ],
-      "type": "object"
-    },
-    "CommandMigration": {
-      "properties": {
-        "name": {
-          "type": "string"
-        }
-      },
-      "required": [
-        "name"
       ],
       "type": "object"
     },
@@ -666,6 +655,27 @@
           ],
           "title": "OutputTextContentItem",
           "type": "object"
+        },
+        {
+          "description": "Provider refusal content, retained as a distinct type in history and replay.",
+          "properties": {
+            "refusal": {
+              "type": "string"
+            },
+            "type": {
+              "enum": [
+                "refusal"
+              ],
+              "title": "RefusalContentItemType",
+              "type": "string"
+            }
+          },
+          "required": [
+            "refusal",
+            "type"
+          ],
+          "title": "RefusalContentItem",
+          "type": "object"
         }
       ]
     },
@@ -808,92 +818,6 @@
         }
       },
       "type": "object"
-    },
-    "ExternalAgentConfigDetectParams": {
-      "properties": {
-        "cwds": {
-          "description": "Zero or more working directories to include for repo-scoped detection.",
-          "items": {
-            "type": "string"
-          },
-          "type": [
-            "array",
-            "null"
-          ]
-        },
-        "includeHome": {
-          "description": "If true, include detection under the user's home directory.",
-          "type": "boolean"
-        }
-      },
-      "type": "object"
-    },
-    "ExternalAgentConfigImportParams": {
-      "properties": {
-        "migrationItems": {
-          "items": {
-            "$ref": "#/definitions/ExternalAgentConfigMigrationItem"
-          },
-          "type": "array"
-        },
-        "source": {
-          "description": "Source product that produced the migration items. Missing means unspecified.",
-          "type": [
-            "string",
-            "null"
-          ]
-        }
-      },
-      "required": [
-        "migrationItems"
-      ],
-      "type": "object"
-    },
-    "ExternalAgentConfigMigrationItem": {
-      "properties": {
-        "cwd": {
-          "description": "Null or empty means home-scoped migration; non-empty means repo-scoped migration.",
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "description": {
-          "type": "string"
-        },
-        "details": {
-          "anyOf": [
-            {
-              "$ref": "#/definitions/MigrationDetails"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "itemType": {
-          "$ref": "#/definitions/ExternalAgentConfigMigrationItemType"
-        }
-      },
-      "required": [
-        "description",
-        "itemType"
-      ],
-      "type": "object"
-    },
-    "ExternalAgentConfigMigrationItemType": {
-      "enum": [
-        "AGENTS_MD",
-        "CONFIG",
-        "SKILLS",
-        "PLUGINS",
-        "MCP_SERVER_CONFIG",
-        "SUBAGENTS",
-        "HOOKS",
-        "COMMANDS",
-        "SESSIONS"
-      ],
-      "type": "string"
     },
     "FeedbackUploadParams": {
       "properties": {
@@ -1462,17 +1386,6 @@
       },
       "type": "object"
     },
-    "HookMigration": {
-      "properties": {
-        "name": {
-          "type": "string"
-        }
-      },
-      "required": [
-        "name"
-      ],
-      "type": "object"
-    },
     "HooksListParams": {
       "properties": {
         "cwds": {
@@ -1899,17 +1812,6 @@
       ],
       "type": "object"
     },
-    "McpServerMigration": {
-      "properties": {
-        "name": {
-          "type": "string"
-        }
-      },
-      "required": [
-        "name"
-      ],
-      "type": "object"
-    },
     "McpServerOauthLoginParams": {
       "properties": {
         "name": {
@@ -1996,60 +1898,6 @@
           "type": "string"
         }
       ]
-    },
-    "MigrationDetails": {
-      "properties": {
-        "commands": {
-          "default": [],
-          "items": {
-            "$ref": "#/definitions/CommandMigration"
-          },
-          "type": "array"
-        },
-        "hooks": {
-          "default": [],
-          "items": {
-            "$ref": "#/definitions/HookMigration"
-          },
-          "type": "array"
-        },
-        "mcpServers": {
-          "default": [],
-          "items": {
-            "$ref": "#/definitions/McpServerMigration"
-          },
-          "type": "array"
-        },
-        "plugins": {
-          "default": [],
-          "items": {
-            "$ref": "#/definitions/PluginsMigration"
-          },
-          "type": "array"
-        },
-        "sessions": {
-          "default": [],
-          "items": {
-            "$ref": "#/definitions/SessionMigration"
-          },
-          "type": "array"
-        },
-        "skills": {
-          "default": [],
-          "items": {
-            "$ref": "#/definitions/SkillMigration"
-          },
-          "type": "array"
-        },
-        "subagents": {
-          "default": [],
-          "items": {
-            "$ref": "#/definitions/SubagentMigration"
-          },
-          "type": "array"
-        }
-      },
-      "type": "object"
     },
     "ModeKind": {
       "description": "Initial collaboration mode to use when the TUI starts.",
@@ -2481,24 +2329,6 @@
       },
       "required": [
         "pluginId"
-      ],
-      "type": "object"
-    },
-    "PluginsMigration": {
-      "properties": {
-        "marketplaceName": {
-          "type": "string"
-        },
-        "pluginNames": {
-          "items": {
-            "type": "string"
-          },
-          "type": "array"
-        }
-      },
-      "required": [
-        "marketplaceName",
-        "pluginNames"
       ],
       "type": "object"
     },
@@ -3218,6 +3048,7 @@
         },
         {
           "properties": {
+            "error": true,
             "id": {
               "type": [
                 "string",
@@ -3235,7 +3066,10 @@
               ]
             },
             "result": {
-              "type": "string"
+              "type": [
+                "string",
+                "null"
+              ]
             },
             "revised_prompt": {
               "type": [
@@ -3255,7 +3089,6 @@
             }
           },
           "required": [
-            "result",
             "status",
             "type"
           ],
@@ -3611,27 +3444,6 @@
       ],
       "type": "object"
     },
-    "SessionMigration": {
-      "properties": {
-        "cwd": {
-          "type": "string"
-        },
-        "path": {
-          "type": "string"
-        },
-        "title": {
-          "type": [
-            "string",
-            "null"
-          ]
-        }
-      },
-      "required": [
-        "cwd",
-        "path"
-      ],
-      "type": "object"
-    },
     "Settings": {
       "description": "Settings for a collaboration mode.",
       "properties": {
@@ -3657,17 +3469,6 @@
       },
       "required": [
         "model"
-      ],
-      "type": "object"
-    },
-    "SkillMigration": {
-      "properties": {
-        "name": {
-          "type": "string"
-        }
-      },
-      "required": [
-        "name"
       ],
       "type": "object"
     },
@@ -3736,17 +3537,6 @@
         "desc"
       ],
       "type": "string"
-    },
-    "SubagentMigration": {
-      "properties": {
-        "name": {
-          "type": "string"
-        }
-      },
-      "required": [
-        "name"
-      ],
-      "type": "object"
     },
     "TextElement": {
       "properties": {
@@ -3900,77 +3690,6 @@
         "threadId"
       ],
       "type": "object"
-    },
-    "ThreadGoalClearParams": {
-      "properties": {
-        "threadId": {
-          "type": "string"
-        }
-      },
-      "required": [
-        "threadId"
-      ],
-      "type": "object"
-    },
-    "ThreadGoalGetParams": {
-      "properties": {
-        "threadId": {
-          "type": "string"
-        }
-      },
-      "required": [
-        "threadId"
-      ],
-      "type": "object"
-    },
-    "ThreadGoalSetParams": {
-      "properties": {
-        "objective": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "replace": {
-          "description": "Replace the goal atomically, resetting usage and its identity. Requires an objective.",
-          "type": "boolean"
-        },
-        "status": {
-          "anyOf": [
-            {
-              "$ref": "#/definitions/ThreadGoalStatus"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "threadId": {
-          "type": "string"
-        },
-        "tokenBudget": {
-          "format": "int64",
-          "type": [
-            "integer",
-            "null"
-          ]
-        }
-      },
-      "required": [
-        "threadId"
-      ],
-      "type": "object"
-    },
-    "ThreadGoalStatus": {
-      "enum": [
-        "active",
-        "paused",
-        "blocked",
-        "usageLimited",
-        "budgetLimited",
-        "complete"
-      ],
-      "type": "string"
     },
     "ThreadHistoryMode": {
       "enum": [
@@ -5289,78 +5008,6 @@
         "params"
       ],
       "title": "Thread/name/setRequest",
-      "type": "object"
-    },
-    {
-      "properties": {
-        "id": {
-          "$ref": "#/definitions/RequestId"
-        },
-        "method": {
-          "enum": [
-            "thread/goal/set"
-          ],
-          "title": "Thread/goal/setRequestMethod",
-          "type": "string"
-        },
-        "params": {
-          "$ref": "#/definitions/ThreadGoalSetParams"
-        }
-      },
-      "required": [
-        "id",
-        "method",
-        "params"
-      ],
-      "title": "Thread/goal/setRequest",
-      "type": "object"
-    },
-    {
-      "properties": {
-        "id": {
-          "$ref": "#/definitions/RequestId"
-        },
-        "method": {
-          "enum": [
-            "thread/goal/get"
-          ],
-          "title": "Thread/goal/getRequestMethod",
-          "type": "string"
-        },
-        "params": {
-          "$ref": "#/definitions/ThreadGoalGetParams"
-        }
-      },
-      "required": [
-        "id",
-        "method",
-        "params"
-      ],
-      "title": "Thread/goal/getRequest",
-      "type": "object"
-    },
-    {
-      "properties": {
-        "id": {
-          "$ref": "#/definitions/RequestId"
-        },
-        "method": {
-          "enum": [
-            "thread/goal/clear"
-          ],
-          "title": "Thread/goal/clearRequestMethod",
-          "type": "string"
-        },
-        "params": {
-          "$ref": "#/definitions/ThreadGoalClearParams"
-        }
-      },
-      "required": [
-        "id",
-        "method",
-        "params"
-      ],
-      "title": "Thread/goal/clearRequest",
       "type": "object"
     },
     {
@@ -7207,77 +6854,6 @@
         "params"
       ],
       "title": "Config/readRequest",
-      "type": "object"
-    },
-    {
-      "properties": {
-        "id": {
-          "$ref": "#/definitions/RequestId"
-        },
-        "method": {
-          "enum": [
-            "externalAgentConfig/detect"
-          ],
-          "title": "ExternalAgentConfig/detectRequestMethod",
-          "type": "string"
-        },
-        "params": {
-          "$ref": "#/definitions/ExternalAgentConfigDetectParams"
-        }
-      },
-      "required": [
-        "id",
-        "method",
-        "params"
-      ],
-      "title": "ExternalAgentConfig/detectRequest",
-      "type": "object"
-    },
-    {
-      "properties": {
-        "id": {
-          "$ref": "#/definitions/RequestId"
-        },
-        "method": {
-          "enum": [
-            "externalAgentConfig/import"
-          ],
-          "title": "ExternalAgentConfig/importRequestMethod",
-          "type": "string"
-        },
-        "params": {
-          "$ref": "#/definitions/ExternalAgentConfigImportParams"
-        }
-      },
-      "required": [
-        "id",
-        "method",
-        "params"
-      ],
-      "title": "ExternalAgentConfig/importRequest",
-      "type": "object"
-    },
-    {
-      "properties": {
-        "id": {
-          "$ref": "#/definitions/RequestId"
-        },
-        "method": {
-          "enum": [
-            "externalAgentConfig/import/readHistories"
-          ],
-          "title": "ExternalAgentConfig/import/readHistoriesRequestMethod",
-          "type": "string"
-        },
-        "params": {
-          "type": "null"
-        }
-      },
-      "required": [
-        "id",
-        "method"
-      ],
-      "title": "ExternalAgentConfig/import/readHistoriesRequest",
       "type": "object"
     },
     {

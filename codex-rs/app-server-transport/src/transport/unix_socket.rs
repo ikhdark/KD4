@@ -88,7 +88,11 @@ async fn run_control_socket_acceptor(
                             continue;
                         }
                         error!("control socket accept error: {err}");
-                        tokio::time::sleep(Duration::from_secs(1)).await;
+                        tokio::select! {
+                            biased;
+                            _ = shutdown_token.cancelled() => break,
+                            _ = tokio::time::sleep(Duration::from_secs(1)) => {}
+                        }
                         continue;
                     }
                 }

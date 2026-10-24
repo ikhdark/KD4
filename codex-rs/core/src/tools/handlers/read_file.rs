@@ -34,56 +34,15 @@ use crate::tools::registry::ToolExecutor;
 
 const MAX_FILE_MIB: usize = 8;
 const MAX_FILE_BYTES: usize = MAX_FILE_MIB * 1024 * 1024;
+// Path-only reads are previews, not an implicit request to fill the context.
+const DEFAULT_FILE_READ_TOKEN_CEILING: usize = 2_000;
 
 #[cfg(test)]
 thread_local! { static SOURCE_FILE_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
 #[cfg(test)]
-#[path = "read_file_audit145_tests.rs"]
-mod audit145_tests;
+#[path = "read_file_snapshot_recovery_tests.rs"]
+mod snapshot_recovery_tests;
 
-pub(crate) struct CurrentReadFileSnapshot {
-    pub(crate) sha256: String,
-    pub(crate) canonical_bytes: u64,
-    bytes: Vec<u8>,
-    arguments: String,
-    environment_id: String,
-    canonical_uri: String,
-}
-
-pub(crate) struct ReadFileReplayMiss {
-    pub(crate) snapshot: CurrentReadFileSnapshot,
-    pub(crate) guard: crate::session::turn_execution::SuccessfulReplayGuard,
-    pub(crate) workspace_cwd: std::path::PathBuf,
-    pub(crate) mutation_revision: u64,
-}
-
-tokio::task_local! {
-    static REPLAY_MISS_SNAPSHOT: std::cell::RefCell<Option<ReadFileReplayMiss>>;
-}
-
-pub(crate) async fn scope_read_file_replay_miss<F: std::future::Future>(
-    snapshot: Option<ReadFileReplayMiss>, future: F,
-) -> F::Output {
-    REPLAY_MISS_SNAPSHOT.scope(std::cell::RefCell::new(snapshot), future).await
-}
-
-async fn take_replay_miss_bytes(invocation: &ToolInvocation, environment: &str, uri: &str) -> Option<Vec<u8>> {
-    let miss = REPLAY_MISS_SNAPSHOT.try_with(|slot| slot.borrow_mut().take()).ok().flatten()?;
-    let ToolPayload::Function { arguments } = &invocation.payload else { return None; };
-    if arguments != &miss.snapshot.arguments || environment != miss.snapshot.environment_id
-        || uri != miss.snapshot.canonical_uri || invocation.cancellation_token.is_cancelled()
-        || !miss.guard.matches_authorization(crate::tools::registry::authorized_tool_invocation_sha256(
-            &invocation.step_context.turn, miss.guard.authorization_payload(&invocation.payload), None,
-        ).as_deref())
-    { return None; }
-    // The new dispatch already owns its read lease. A changed generation,
-    // authorization, environment or watched dependency requires ordinary I/O.
-    let revision = invocation.tracker.lock().await.current_mutation_revision();
-    if revision != miss.mutation_revision { return None; }
-    let cache = invocation.session.services.git_workspace.as_ref();
-    let workspace = cache.workspace_evidence_for_turn(&invocation.step_context.turn, &miss.workspace_cwd).await.identity;
-    miss.guard.is_fresh(revision, cache, workspace.as_ref()).then_some(miss.snapshot.bytes)
-}
 
 #[path = "code_sections.rs"]
 pub(super) mod code_sections;
@@ -188,12 +147,6 @@ impl ToolExecutor<ToolInvocation> for ReadStatusHandler {
 }
 
 impl CoreToolRuntime for ReadStatusHandler {}
-
-struct PendingSourceInspection {
-    store: std::sync::Arc<codex_agent_task_store::LocalAgentTaskStore>,
-    start: codex_agent_task_store::SourceInspectionStart,
-    proof_error: Option<String>,
-}
 
 #[derive(Deserialize)]
 #[serde(try_from = "RawReadFileArgs")]
@@ -344,186 +297,6 @@ pub(crate) fn canonical_read_file_arguments(arguments: &str) -> Option<serde_jso
     }))
 }
 
-fn normalized_replay_ranges(selectors: &[serde_json::Value]) -> Option<Vec<serde_json::Value>> {
-    let mut ranges = selectors.iter().map(|selector| {
-        let kind = selector["kind"].as_str()?;
-        if !matches!(kind, "bytes" | "lines") { return None; }
-        let start = selector["start"].as_u64()?;
-        let end = selector["end"].as_u64()?;
-        (start <= end && (kind != "lines" || start > 0)).then_some((kind, start, end))
-    }).collect::<Option<Vec<_>>>()?;
-    ranges.sort_unstable();
-    let mut merged: Vec<(&str, u64, u64)> = Vec::new();
-    for (kind, start, end) in ranges {
-        if let Some(last) = merged.last_mut().filter(|last| last.0 == kind && start <= last.2) {
-            last.2 = last.2.max(end);
-        } else {
-            merged.push((kind, start, end));
-        }
-    }
-    Some(merged.into_iter().map(|(kind, start, end)| json!({"kind":kind, "start":start, "end":end})).collect())
-}
-
-/// Reuse only fully delivered, self-contained selections from the same request
-/// scope. This is a projection, not freshness proof: dispatch must still verify
-/// the original authorization, environment and source observations.
-pub(crate) fn reselect_read_file_output(
-    previous: &str,
-    requested: &str,
-    output: &serde_json::Value,
-) -> Option<serde_json::Value> {
-    let previous = canonical_read_file_arguments(previous)?;
-    let requested = canonical_read_file_arguments(requested)?;
-    if previous["path"] != requested["path"]
-        || previous["environment_id"] != requested["environment_id"]
-    {
-        return None;
-    }
-    let selectors = requested["selectors"].as_array()?;
-    if selectors.is_empty() || selectors.len() > READ_TOOL_OUTPUT_MAX_SELECTORS {
-        return None;
-    }
-    let retained = output["results"].as_array()?;
-    // Preserve the cheap exact-range path before rebuilding a full snapshot.
-    // Search hydration is not self-contained and must use the selector engine.
-    let normalized = normalized_replay_ranges(selectors);
-    let ranges = normalized.as_ref().and_then(|selectors| selectors.iter()
-        .map(|selector| {
-            if !matches!(selector["kind"].as_str(), Some("bytes" | "lines")) {
-                return None;
-            }
-            retained
-                .iter()
-                .find_map(|result| retained_read_selection(result, selector))
-        })
-        .collect::<Option<Vec<_>>>());
-    let selected = if let Some(ranges) = ranges {
-        json!(ranges)
-    } else if output["file_complete"] == true {
-        // Complete explicit reads carry the same authenticated source as default
-        // reads. Reuse either form without reopening unchanged workspace files.
-        let source = retained.first()?;
-        let text = source["text"].as_str()?;
-        if retained.len() != 1
-            || source["status"] != "ok"
-            || source["complete"] != true
-            || source["canonical_range"]["start"] != 0
-            || source["canonical_range"]["end"] != output["canonical_bytes"]
-            || output["canonical_bytes"].as_u64()? != text.len() as u64
-        {
-            return None;
-        }
-        let selectors: Vec<ToolOutputSelector> = serde_json::from_value(json!(selectors)).ok()?;
-        if selectors.iter().any(|selector| {
-            !matches!(
-                selector,
-                ToolOutputSelector::Bytes { .. }
-                    | ToolOutputSelector::Lines { .. }
-                    | ToolOutputSelector::Search { .. }
-                    | ToolOutputSelector::JsonPointer { .. }
-            )
-        }) {
-            return None;
-        }
-        let canonical = file_snapshot(text.to_owned(), Some(&selectors)).ok()?;
-        if output["canonical_sha256"].as_str()? != canonical.sha256 {
-            return None;
-        }
-        // This replay owner is registered by direct model dispatch only; nested
-        // code-mode results do not enter its successful-replay ledger. Match
-        // that consumer's policy once instead of projecting in both modes.
-        let (selection, continuation) = select_file_snapshot_with_ceiling(
-            &canonical,
-            Some(selectors),
-            RECOVERY_AGGREGATE_TOKEN_CEILING.saturating_sub(1_000),
-        )
-        .ok()?;
-        if !selection.complete || continuation.is_some() {
-            return None;
-        }
-        serde_json::to_value(selection.results).ok()?
-    } else {
-        return None;
-    };
-    // Ledger candidates may belong to another file or fail to satisfy this
-    // selection. Borrow their retained bytes until a reusable selection exists;
-    // cloning them during lookup adds work while the caller holds its ledger lock.
-    let mut output = output.clone();
-    output["results"] = json!(selected);
-    output["complete"] = json!(true);
-    output["delivered_selection_complete"] = json!(true);
-    // Complete inline reads use null instead of a retained artifact identity.
-    let mut typed = output.clone();
-    if typed["artifact_id"].is_null() {
-        typed["artifact_id"] = json!("");
-    }
-    let typed = serde_json::from_value::<ReadToolOutputResult>(typed).ok()?;
-    output["file_complete"] = json!(file_selection_complete(&typed));
-    let fields = output.as_object_mut()?;
-    for key in [
-        "continuation",
-        "page_selectors",
-        "recovery",
-        "criterion_evidence",
-        "inspection_proof_error",
-        "selector_errors",
-        "selector_bindings",
-    ] {
-        fields.remove(key);
-    }
-    Some(output)
-}
-
-fn retained_read_selection(
-    result: &serde_json::Value,
-    selector: &serde_json::Value,
-) -> Option<serde_json::Value> {
-    if result["status"] != "ok" || result["complete"] != true {
-        return None;
-    }
-    if result["selector"] == *selector
-        && (result["text"].is_string() || result["data_base64"].is_string())
-    {
-        return Some(result.clone());
-    }
-    // The owning selector engine merges adjacent ranges. A narrower request
-    // can still be projected from its exact text, never from line counts alone.
-    let text = result["text"].as_str()?;
-    let base = result["canonical_range"]["start"].as_u64()?;
-    let limit = result["canonical_range"]["end"].as_u64()?;
-    if limit.checked_sub(base)? != text.len() as u64
-        || result["selector"]["kind"] != selector["kind"]
-    {
-        return None;
-    }
-    let start = selector["start"].as_u64()?;
-    let end = selector["end"].as_u64()?;
-    let (start, end) = match selector["kind"].as_str()? {
-        "bytes" => (
-            usize::try_from(start.checked_sub(base)?).ok()?,
-            usize::try_from(end.checked_sub(base)?).ok()?,
-        ),
-        "lines" => {
-            let first = result["selector"]["start"].as_u64()?;
-            let start = usize::try_from(start.checked_sub(first)?).ok()?;
-            let end = usize::try_from(end.checked_sub(first)?.checked_add(1)?).ok()?;
-            let lines = text.split_inclusive('\n').collect::<Vec<_>>();
-            lines.get(start..end)?;
-            (
-                lines[..start].iter().map(|line| line.len()).sum(),
-                lines[..end].iter().map(|line| line.len()).sum(),
-            )
-        }
-        _ => return None,
-    };
-    let text = text.get(start..end)?;
-    let mut selected = result.clone();
-    selected["selector"] = selector.clone();
-    selected["canonical_range"] = json!({"start":base + start as u64, "end":base + end as u64});
-    selected["exact_bytes"] = json!(text.len());
-    selected["text"] = json!(text);
-    Some(selected)
-}
 
 impl ToolExecutor<ToolInvocation> for ReadFileHandler {
     fn tool_name(&self) -> ToolName {
@@ -540,7 +313,7 @@ impl ToolExecutor<ToolInvocation> for ReadFileHandler {
         output["properties"]["canonical_uri"] = json!({"type":"string", "description":"Canonical path URI in the resolved environment, or the host-owned locator."});
         output["properties"]["total_lines"] = json!({"type": "integer", "minimum": 0});
         output["properties"]["source_sha256"] = json!({"type": "string", "description": "SHA-256 of the complete selected source representation, including bytes outside this page. Default attached HTML can be rendered text: use explicit selectors to obtain the original file hash and exact bytes before a revision-bound codex-range patch."});
-        output["properties"]["artifact_id"] = json!({"type": ["string", "null"], "description": "Immutable snapshot identity when retained; omitted or null for complete inline reads or unavailable storage."});
+        output["properties"]["artifact_id"] = json!({"type": ["string", "null"], "description": "Immutable snapshot identity when retained; omitted or null for ordinary complete inline reads or unavailable storage. An active typed inspect:path obligation retains its acquisition identity even for a complete inline selection."});
         output["properties"]["canonical_sha256"]["description"] = json!(
             "Compatibility alias for source_sha256; omitted from model presentation when identical."
         );
@@ -622,20 +395,6 @@ impl ToolExecutor<ToolInvocation> for ReadFileHandler {
             "description": "First up to eight independent pages of continuation, in source order. Fetch in parallel; continuation retains the full remaining extent."
         });
         output["properties"]["snapshot_error"] = json!({"type": "string", "description": "Snapshot storage failed; inline evidence is still valid, but no recovery handle or continuation is available."});
-        output["properties"]["criterion_evidence"] = json!({
-            "type": "object",
-            "description": "Host-recorded source_inspection proof for a bound typed task requiring inspect:<repository-relative path>. A complete hash-bound read is not proof of semantic correctness.",
-            "properties": {
-                "call_id": {"type": "string"}, "workspace_id": {"type": "string"},
-                "evidence_epoch": {"type": "integer", "minimum": 0},
-                "kind": {"const": "source_inspection"}
-            },
-            "required": ["call_id", "workspace_id", "evidence_epoch", "kind"],
-            "additionalProperties": false
-        });
-        output["properties"]["inspection_proof_error"] = json!({
-            "type": "string", "description": "The read completed but no current task proof could be recorded."
-        });
         #[expect(
             clippy::expect_used,
             reason = "read_tool_output_output_schema constructs an object with a required array"
@@ -646,7 +405,7 @@ impl ToolExecutor<ToolInvocation> for ReadFileHandler {
             .extend([json!("path"), json!("total_lines"), json!("file_complete")]);
         ToolSpec::Function(ResponsesApiTool {
             name: "read_file".to_string(),
-            description: format!("Read a UTF-8 file without shell quoting. The entire file must be UTF-8 and at most {MAX_FILE_MIB} MiB, even for a small byte selector. Path alone returns the whole file if it fits, otherwise its first page plus continuation. Default HTML outside the workspace may be rendered as text: hashes, ranges and recovery then describe that text; use explicit selectors for exact original markup. Use read_tool_output with the artifact_id and continuation for the remaining immutable snapshot. complete describes the requested page or selectors; file_complete describes acquired source coverage, not final script display or semantic review. A complete inline read may have no retained artifact; that is not a read failure. Explicit lines, bytes and fixed-string search selectors remain exact; check each results[] status and recover only missing selections. In code mode a call returns up to 1 MiB to the script independently of its display budget: consume it there and print only needed evidence, not the entire recovered result. Workspace results are freshness-tracked and may reuse dependency-current evidence; force_fresh bypasses replay and reads current contents. Pass a skill: locator to read its SKILL.md; omit environment_id for host-owned skills."),
+            description: format!("Read a UTF-8 file without shell quoting. The entire file must be UTF-8 and at most {MAX_FILE_MIB} MiB, even for a small byte selector. Prefer explicit line ranges or Rust/Python symbols for known code; do not dump whole files to locate one function. Path alone returns a first page capped at about {DEFAULT_FILE_READ_TOKEN_CEILING} tokens plus continuation; small files fit inline. Host-owned skill/context guidance keeps its existing delivery budget. Default HTML outside the workspace may be rendered as text: hashes, ranges and recovery then describe that text; use explicit selectors for exact original markup. Use read_tool_output with the artifact_id and continuation only for needed remaining ranges of the immutable snapshot. complete describes the requested page or selectors; file_complete describes acquired source coverage, not final script display or semantic review. A complete inline read may have no retained artifact; that is not a read failure. Explicit lines, bytes and fixed-string search selectors remain exact; check each results[] status and recover only missing selections. In code mode explicit selections return up to 1 MiB to the script independently of its display budget: consume it there and print only needed evidence, not the entire recovered result. Each call reads current contents; retained snapshots are historical. Pass a skill: locator to read its SKILL.md; omit environment_id for host-owned skills."),
             strict: false,
             defer_loading: None,
             parameters: JsonSchema {
@@ -660,7 +419,7 @@ impl ToolExecutor<ToolInvocation> for ReadFileHandler {
                 ("offset".to_string(), JsonSchema { minimum: Some(1.into()), maximum: Some(usize::MAX.into()), ..JsonSchema::integer(Some("Legacy 1-based starting line; use instead of selectors, defaults to 1.".to_string())) }),
                 ("limit".to_string(), JsonSchema { minimum: Some(1.into()), maximum: Some(usize::MAX.into()), ..JsonSchema::integer(Some("Legacy positive line count; defaults to 2000 when offset is supplied.".to_string())) }),
                 ("environment_id".to_string(), JsonSchema::string(Some("Environment id; omit to use the primary environment.".to_string()))),
-                ("force_fresh".to_string(), JsonSchema::boolean(Some("Bypass retained-result replay and read current contents, even if dependencies appear unchanged.".to_string()))),
+                ("force_fresh".to_string(), JsonSchema::boolean(Some("Legacy compatibility option; every call reads current contents.".to_string()))),
                 ("selectors".to_string(), selectors),
                 ]), None, Some(false.into()))
             },
@@ -710,10 +469,12 @@ impl ToolExecutor<ToolInvocation> for ReadFileHandler {
                 ));
             }
             let turn = &invocation.step_context.turn;
+            let mut source_inspection = None;
+            let mut inspection_proof_error = None;
             // The catalog advertises `skill:<id>` locators, so this tool has to
             // resolve them. Without it the model can see every skill listed and
             // load none of them.
-            let (contents, resolved_path, inspection, environment_id, canonical_uri) = if args.path
+            let (contents, resolved_path, environment_id, canonical_uri) = if args.path
                 == crate::turn_diff_tracker::TURN_DIFF_LOCATOR
             {
                 return Err(FunctionCallError::RespondToModel(
@@ -736,7 +497,6 @@ impl ToolExecutor<ToolInvocation> for ReadFileHandler {
                 (
                     contents,
                     args.path.clone(),
-                    None,
                     "host-context".to_string(),
                     args.path.clone(),
                 )
@@ -774,7 +534,6 @@ impl ToolExecutor<ToolInvocation> for ReadFileHandler {
                         format!("{contents}\n\n{missing}")
                     },
                     args.path.clone(),
-                    None,
                     "host-context".to_string(),
                     args.path.clone(),
                 )
@@ -794,7 +553,6 @@ impl ToolExecutor<ToolInvocation> for ReadFileHandler {
                 (
                     contents.to_string(),
                     args.path.clone(),
-                    None,
                     "host-context".to_string(),
                     args.path.clone(),
                 )
@@ -808,9 +566,9 @@ impl ToolExecutor<ToolInvocation> for ReadFileHandler {
                     .ok()
                     .map(|path| codex_utils_path_uri::PathUri::from_abs_path(&path).to_string())
                     .unwrap_or_else(|| args.path.clone());
-                (contents, path, None, "host-skills".to_string(), uri)
+                (contents, path, "host-skills".to_string(), uri)
             } else {
-                read_environment_file(&invocation, &args).await?
+                read_environment_file(&invocation, &args, &mut source_inspection, &mut inspection_proof_error).await?
             };
             if invocation.cancellation_token.is_cancelled() {
                 return Err(FunctionCallError::RespondToModel(
@@ -824,7 +582,7 @@ impl ToolExecutor<ToolInvocation> for ReadFileHandler {
             // later request, and single-line documents leave no lines to page
             // by. Workspace files and explicit selections keep exact bytes.
             let render_html = !explicit_selection
-                && inspection.is_none()
+                && source_inspection.is_none()
                 && html_outside_workspace(&invocation, &environment_id, &resolved_path);
             let script_consumer = matches!(&invocation.source, ToolCallSource::CodeMode { .. });
             // Display-sized continuations remain useful for direct model reads.
@@ -850,6 +608,17 @@ impl ToolExecutor<ToolInvocation> for ReadFileHandler {
                 output_budget.saturating_sub(256)
             }
             .min(RECOVERY_AGGREGATE_TOKEN_CEILING.saturating_sub(1_000));
+            let default_preview = !explicit_selection
+                && !matches!(environment_id.as_str(), "host-context" | "host-skills");
+            let selection_ceiling = if default_preview {
+                if script_consumer {
+                    DEFAULT_FILE_READ_TOKEN_CEILING
+                } else {
+                    token_ceiling.min(DEFAULT_FILE_READ_TOKEN_CEILING)
+                }
+            } else {
+                token_ceiling
+            };
             let structure_path = args.path.clone();
             let (
                 canonical,
@@ -887,10 +656,10 @@ impl ToolExecutor<ToolInvocation> for ReadFileHandler {
                 let mut canonical = file_snapshot(contents, Some(&exact))?;
                 let (selectors, selector_errors, selector_bindings) =
                     structure::resolve_batch(&structure_path, &mut canonical, args.selectors);
-                let selection = if script_consumer {
+                let selection = if script_consumer && !default_preview {
                     select_file_snapshot_for_script(&canonical, selectors)
                 } else {
-                    select_file_snapshot_with_ceiling(&canonical, selectors, token_ceiling)
+                    select_file_snapshot_with_ceiling(&canonical, selectors, selection_ceiling)
                 };
                 selection.map(|(result, continuation)| {
                     let pages = match &continuation {
@@ -940,7 +709,8 @@ impl ToolExecutor<ToolInvocation> for ReadFileHandler {
             // Explicit selections retain the existing immutable-snapshot contract.
             // Complete default reads stay inline; omitted bytes need one durable
             // snapshot, but selecting them never rereads the file just written.
-            let artifact = if explicit_selection || continuation.is_some() {
+            let mut artifact_created = false;
+            let artifact = if explicit_selection || continuation.is_some() || source_inspection.is_some() {
                 let reused = if let Some(id) = invocation
                     .session
                     .reusable_tool_artifact(
@@ -965,11 +735,11 @@ impl ToolExecutor<ToolInvocation> for ReadFileHandler {
                 Some(match reused {
                     Some(artifact) => artifact,
                     None => {
+                        artifact_created = true;
                         let backing = invocation.session.source_snapshot_backing(canonical.exact_bytes, &canonical.sha256).await;
-                        crate::tools::command_output_artifact::create_source_snapshot_artifact(
-                            &turn.config.codex_home,
-                            &thread_id,
-                            &canonical,
+                        invocation.session.create_source_snapshot_artifact(
+                            invocation.call_id.clone(),
+                            Arc::clone(&canonical),
                             backing,
                         )
                         .await
@@ -982,7 +752,7 @@ impl ToolExecutor<ToolInvocation> for ReadFileHandler {
                 .as_ref()
                 .filter(|artifact| artifact.complete)
                 .and_then(CanonicalOutputArtifact::artifact_id);
-            let registration_error = if let Some(id) = &artifact_id {
+            let registration_error = if !artifact_created && let Some(id) = &artifact_id {
                 invocation
                     .session
                     .try_register_tool_artifact_origin(
@@ -1046,7 +816,7 @@ impl ToolExecutor<ToolInvocation> for ReadFileHandler {
             output["total_lines"] = json!(total_lines);
             output["source_sha256"] = json!(canonical.sha256);
             output["file_complete"] = json!(file_complete);
-            if let Some(error) = inspection.as_ref().and_then(|inspection| inspection.proof_error.clone()) {
+            if let Some(error) = inspection_proof_error {
                 output["inspection_proof_error"] = json!(error);
             }
             if !selector_errors.is_empty() {
@@ -1091,19 +861,12 @@ impl ToolExecutor<ToolInvocation> for ReadFileHandler {
                     // source snapshot; do not reread, reparse, or write it twice.
                     if artifact_id.is_none() && artifact.is_none() {
                         let backing = invocation.session.source_snapshot_backing(canonical.exact_bytes, &canonical.sha256).await;
-                        let retained = crate::tools::command_output_artifact::create_source_snapshot_artifact(
-                            &turn.config.codex_home, &thread_id, &canonical,
+                        let retained = invocation.session.create_source_snapshot_artifact(
+                            invocation.call_id.clone(), Arc::clone(&canonical),
                             backing,
                         ).await;
                         artifact_id = retained.complete.then(|| retained.artifact_id()).flatten();
-                        if let Some(id) = &artifact_id {
-                            if let Err(error) = invocation.session.try_register_tool_artifact_origin(
-                                id.clone(), invocation.call_id.clone(), canonical.exact_bytes, canonical.sha256.clone(),
-                            ).await {
-                                artifact_id = None;
-                                projected["snapshot_error"] = json!(error.to_string());
-                            }
-                        } else {
+                        if artifact_id.is_none() {
                             projected["snapshot_error"] = json!(retained.error.unwrap_or_else(|| "snapshot retention unavailable".into()));
                         }
                     }
@@ -1170,10 +933,12 @@ impl ToolExecutor<ToolInvocation> for ReadFileHandler {
             }
             // No inspection credit or history mutation for a packet the final
             // guard would reject. Extremely small budgets can fit no envelope.
-            crate::tools::context::ensure_exact_model_delivery(
-                &JsonToolOutput::with_success(projected.clone(), Some(successful)),
-                &invocation,
-            )?;
+            if !script_consumer {
+                crate::tools::context::ensure_exact_model_delivery(
+                    &JsonToolOutput::with_success(projected.clone(), Some(successful)),
+                    &invocation,
+                )?;
+            }
             // Raw script data keeps its full selection/diagnostics, but any
             // newly retained fallback snapshot has the same public identity.
             for field in ["artifact_id", "retained_artifact_complete", "retained_bytes", "snapshot_error"] {
@@ -1181,43 +946,25 @@ impl ToolExecutor<ToolInvocation> for ReadFileHandler {
                     output[field] = value.clone();
                 }
             }
-            if !file_complete && let (Some(inspection), Some(id)) = (&inspection, &artifact_id)
-                && inspection.proof_error.is_none()
-                && (script_consumer || file_projection_fits(&projected, &invocation))
+            if let (Some(source), Some(id)) = (source_inspection, artifact_id.as_ref())
+                && !invocation.cancellation_token.is_cancelled()
+                && source_inspection_delivery_eligible(if script_consumer { &output } else { &projected })
             {
-                let binding = invocation.session.bind_source_inspection_origin(
-                    id.clone(), invocation.call_id.clone(), canonical.exact_bytes, canonical.sha256.clone(),
-                    crate::tool_history::SourceInspectionOrigin {
-                        start: inspection.start.clone(), environment_id: environment_id.clone(), canonical_uri: canonical_uri.clone(),
-                    },
-                ).await;
-                match binding {
-                    Ok(()) => {
-                        let ranges = evidence.as_ref().and_then(|evidence| evidence["identity"]["ranges"].as_array());
-                        let selectors = ranges.into_iter().flatten().filter_map(|range| {
-                            Some(json!({"kind":"bytes", "start":range.get(0)?.as_u64()?, "end":range.get(1)?.as_u64()?}))
-                        }).collect();
-                        invocation.session.record_tool_history_recovery(id.clone(), invocation.call_id.clone(), selectors).await;
+                let acquired = source_inspection_selectors(if script_consumer { &output } else { &projected });
+                let proof = async {
+                    invocation.session.bind_source_inspection_origin(
+                        id.clone(), invocation.call_id.clone(), canonical.exact_bytes,
+                        canonical.sha256.clone(), source,
+                    ).await.map_err(|error| error.to_string())?;
+                    if acquired.is_empty() {
+                        return Ok(None);
                     }
-                    Err(error) => {
-                        output["inspection_proof_error"] = json!(error.to_string());
-                        add_file_projection_metadata(&mut projected, "inspection_proof_error", &output["inspection_proof_error"], &invocation);
-                    }
-                }
-            }
-            if file_complete && let Some(inspection) = inspection && inspection.proof_error.is_none() {
-                match inspection.store.record_source_inspection(
-                    inspection.start, invocation.call_id.clone(), canonical.sha256.clone(), canonical.exact_bytes,
-                ).await {
-                    Ok(reference) => {
-                        output["criterion_evidence"] = json!(reference);
-                        add_file_projection_metadata(&mut projected, "criterion_evidence", &output["criterion_evidence"], &invocation);
-                    }
-                    Err(error) => {
-                        output["inspection_proof_error"] = json!(error.to_string());
-                        add_file_projection_metadata(&mut projected, "inspection_proof_error", &output["inspection_proof_error"], &invocation);
-                    }
-                }
+                    invocation.session.record_tool_history_recovery(
+                        id.clone(), invocation.call_id.clone(), acquired,
+                    ).await;
+                    completed_source_inspection_evidence(&invocation, id, canonical.exact_bytes, &canonical.sha256).await
+                }.await;
+                attach_source_inspection_evidence(&mut output, &mut projected, proof, &invocation);
             }
             let mut output = JsonToolOutput::with_success(output, Some(successful))
                 .with_code_mode_failure_as_data();
@@ -1243,6 +990,86 @@ impl ToolExecutor<ToolInvocation> for ReadFileHandler {
 fn file_projection_fits(value: &serde_json::Value, invocation: &ToolInvocation) -> bool {
     let output = JsonToolOutput::with_success(value.clone(), None);
     crate::tools::context::ensure_exact_model_delivery(&output, invocation).is_ok()
+}
+
+/// Only exact source selections acquire inspection coverage. Search hydration,
+/// parsed JSON, outline listings and failed batches retain their ordinary read
+/// history without being promoted to a typed acquisition receipt.
+fn source_inspection_delivery_eligible(packet: &serde_json::Value) -> bool {
+    packet["selector_errors"].as_array().is_none_or(Vec::is_empty)
+        && packet["selector_errors_omitted"].as_u64().unwrap_or(0) == 0
+        && packet["results"].as_array().is_some_and(|results| !results.is_empty()
+            && results.iter().all(|result| matches!(result["status"].as_str(),
+                Some("ok" | "selector_too_large" | "aggregate_omitted"))))
+}
+
+pub(super) fn source_inspection_selectors(packet: &serde_json::Value) -> Vec<serde_json::Value> {
+    if !source_inspection_delivery_eligible(packet) { return Vec::new(); }
+    packet["results"].as_array().into_iter().flatten().filter_map(|result| {
+        if result["status"] != "ok"
+            || !matches!(result["selector"]["kind"].as_str(), Some("bytes" | "lines" | "section"))
+            || !(result["text"].is_string() || result["data_base64"].is_string())
+        {
+            return None;
+        }
+        let start = result["canonical_range"]["start"].as_u64()?;
+        let end = result["canonical_range"]["end"].as_u64()?;
+        (start <= end).then(|| json!({"kind":"bytes", "start":start, "end":end}))
+    }).collect()
+}
+
+pub(super) async fn completed_source_inspection_evidence(
+    invocation: &ToolInvocation,
+    artifact_id: &str,
+    bytes: u64,
+    sha256: &str,
+) -> Result<Option<codex_agent_task_store::CriterionEvidenceRef>, String> {
+    if invocation.cancellation_token.is_cancelled() { return Ok(None); }
+    let coordinator = invocation.session.services.agent_control.task_coordinator();
+    let Some(binding) = coordinator.binding_for_turn(&invocation.step_context.turn)
+        .filter(|binding| binding.thread_id.as_deref() == Some(invocation.session.thread_id.to_string().as_str()))
+    else { return Ok(None); };
+    let Some((call_id, source)) = invocation.session.completed_source_inspection(
+        artifact_id, bytes, sha256, binding.attempt_id,
+    ).await else { return Ok(None); };
+    let Some(store) = coordinator.store() else { return Ok(None); };
+    let authorization = store.get_agent_task_authorization(binding.assignment_id).await
+        .map_err(|error| error.to_string())?;
+    if authorization.current_attempt.attempt_id != binding.attempt_id
+        || authorization.current_attempt.state != codex_agent_task_store::AttemptState::Active
+        || authorization.current_attempt.sealed_at.is_some()
+    {
+        return Ok(None);
+    }
+    let Some(path) = source.start.canonical_path() else { return Ok(None); };
+    // A retained snapshot is historical. Reuse the authorized filesystem owner
+    // only once full acquisition is possible, never once per partial page.
+    let arguments = json!({"path":path, "environment_id":source.environment_id}).to_string();
+    if !current_file_fingerprint(&invocation.step_context, &arguments, Some(path)).await
+        .is_some_and(|(hash, size)| hash == sha256 && size == bytes)
+    {
+        return Err("Source snapshot no longer matches the authorized current file; no source_inspection receipt was recorded.".into());
+    }
+    if invocation.cancellation_token.is_cancelled() { return Ok(None); }
+    store.record_source_inspection(source.start, call_id, sha256.to_string(), bytes).await
+        .map(Some).map_err(|error| error.to_string())
+}
+
+pub(super) fn attach_source_inspection_evidence(
+    output: &mut serde_json::Value,
+    projected: &mut serde_json::Value,
+    proof: Result<Option<codex_agent_task_store::CriterionEvidenceRef>, String>,
+    invocation: &ToolInvocation,
+) {
+    let (field, value) = match proof {
+        Ok(Some(reference)) => ("criterion_evidence", json!(reference)),
+        Err(error) => ("inspection_proof_error", json!(error)),
+        Ok(None) => return,
+    };
+    output[field] = value.clone();
+    // The durable record is also discoverable through get_agent_task when a
+    // tiny direct envelope cannot fit this optional presentation metadata.
+    add_file_projection_metadata(projected, field, &value, invocation);
 }
 
 // Proof metadata is optional presentation, not source coverage. Never displace
@@ -1426,7 +1253,7 @@ async fn validate_retained_file_hash(
     expected_bytes: u64,
 ) -> bool {
     if expected_bytes > MAX_FILE_BYTES as u64 { return false; }
-    current_file_fingerprint(step, arguments).await
+    current_file_fingerprint(step, arguments, None).await
         .is_some_and(|(hash, bytes)| hash == expected_hash && bytes == expected_bytes)
 }
 
@@ -1434,13 +1261,9 @@ async fn validate_retained_file_hash(
 pub(crate) async fn current_file_fingerprint(
     step: &crate::session::step_context::StepContext,
     arguments: &str,
+    expected_source: Option<&std::path::Path>,
 ) -> Option<(String, u64)> {
-    current_file_snapshot(step, arguments).await.map(|snapshot| (snapshot.sha256, snapshot.canonical_bytes))
-}
 
-pub(crate) async fn current_file_snapshot(
-    step: &crate::session::step_context::StepContext, arguments: &str,
-) -> Option<CurrentReadFileSnapshot> {
     let Ok(args) = parse_arguments::<ReadFileArgs>(arguments) else {
         return None;
     };
@@ -1469,21 +1292,16 @@ pub(crate) async fn current_file_snapshot(
         .file_system_sandbox_context(None, environment.cwd());
     #[cfg(test)]
     SOURCE_FILE_READS.with(|count| count.set(count.get() + 1));
-    let Ok(Some(bytes)) = environment
-        .environment
-        .get_filesystem()
-        .read_file_bounded(&path, MAX_FILE_BYTES, Some(&sandbox))
-        .await
-    else {
-        return None;
+    let fs = environment.environment.get_filesystem();
+    let bytes = if let Some(expected) = expected_source {
+        let (bytes, source) = fs.read_file_bounded_with_source(&path, MAX_FILE_BYTES, Some(&sandbox))
+            .await.ok()??;
+        if source.as_deref() != Some(expected) { return None; }
+        bytes
+    } else {
+        fs.read_file_bounded(&path, MAX_FILE_BYTES, Some(&sandbox)).await.ok()??
     };
-    let arguments = arguments.to_owned();
-    let environment_id = environment.environment_id.clone();
-    let canonical_uri = path.to_string();
-    tokio::task::spawn_blocking(move || CurrentReadFileSnapshot {
-        sha256:crate::tool_history::sha256(&bytes), canonical_bytes:bytes.len() as u64,
-        bytes, arguments, environment_id, canonical_uri,
-    })
+    tokio::task::spawn_blocking(move || (crate::tool_history::sha256(&bytes), bytes.len() as u64))
         .await.ok()
 }
 
@@ -1531,11 +1349,12 @@ fn html_outside_workspace(invocation: &ToolInvocation, environment_id: &str, pat
 async fn read_environment_file(
     invocation: &ToolInvocation,
     args: &ReadFileArgs,
+    source_inspection: &mut Option<crate::tool_history::SourceInspectionOrigin>,
+    inspection_proof_error: &mut Option<String>,
 ) -> Result<
     (
         String,
         String,
-        Option<PendingSourceInspection>,
         String,
         String,
     ),
@@ -1559,52 +1378,40 @@ async fn read_environment_file(
     let turn = &invocation.step_context.turn;
     let sandbox = turn.file_system_sandbox_context(None, environment.cwd());
     let fs = environment.environment.get_filesystem();
-    let coordinator = invocation.session.services.agent_control.task_coordinator();
     crate::tools::parallel::wait_for_workspace_baseline().await;
-    let mut inspection = if !environment.environment.is_remote()
+    let coordinator = invocation.session.services.agent_control.task_coordinator();
+    if !environment.environment.is_remote()
         && let Some(binding) = coordinator.binding_for_turn(turn)
+        && binding.thread_id.as_deref() == Some(invocation.session.thread_id.to_string().as_str())
         && let Some(store) = coordinator.store()
+        && let Some(start) = store.prepare_source_inspection(
+            binding.attempt_id, path.inferred_native_path_string(),
+        ).await.map_err(|error| FunctionCallError::RespondToModel(error.to_string()))?
     {
-        store
-            .prepare_source_inspection(binding.attempt_id, path.inferred_native_path_string())
-            .await
-            .map_err(|error| {
-                FunctionCallError::RespondToModel(format!(
-                    "unable to prepare source inspection evidence: {error}"
-                ))
-            })?
-            .map(|start| PendingSourceInspection {
-                store,
-                start,
-                proof_error: None,
-            })
-    } else {
-        None
-    };
+        *source_inspection = Some(crate::tool_history::SourceInspectionOrigin {
+            start,
+            environment_id: environment.environment_id.clone(),
+            canonical_uri: path.to_string(),
+        });
+    }
     // Execution backends validate the opened regular file and enforce the
     // byte limit during the stable read. Avoid a separate RPC/helper launch
     // on success; retain metadata only to explain failures as before.
-    let carried = if inspection.is_none() {
-        take_replay_miss_bytes(invocation, &environment.environment_id, &path.to_string()).await
-    } else { None };
     #[cfg(test)]
-    if carried.is_none() { SOURCE_FILE_READS.with(|count| count.set(count.get() + 1)); }
-    let result = if let Some(bytes) = carried {
-        Ok(Some(bytes))
-    } else if let Some(inspection) = &mut inspection {
-        fs.read_file_bounded_with_source(&path, MAX_FILE_BYTES, Some(&sandbox))
-            .await.map(|read| read.map(|(bytes, source)| {
-                if source.as_deref().zip(inspection.start.canonical_path())
-                    .is_none_or(|(actual, expected)| actual != expected) {
-                    inspection.proof_error = Some(
-                        "opened source target does not match the prepared inspection; read bytes are retained without criterion proof".to_string(),
-                    );
+    SOURCE_FILE_READS.with(|count| count.set(count.get() + 1));
+    let result = if source_inspection.is_some() {
+        fs.read_file_bounded_with_source(&path, MAX_FILE_BYTES, Some(&sandbox)).await
+            .map(|result| result.map(|(bytes, opened)| {
+                if !source_inspection.as_ref().is_some_and(|source|
+                    source.start.canonical_path().is_some_and(|expected| opened.as_deref() == Some(expected)))
+                {
+                    *source_inspection = None;
+                    *inspection_proof_error = Some("Native read did not bind the opened source to the assignment's canonical inspection target; no source_inspection receipt was recorded.".into());
                 }
                 bytes
             }))
     } else {
-        fs.read_file_bounded(&path, MAX_FILE_BYTES, Some(&sandbox))
-            .await
+        fs.read_file_bounded(&path, MAX_FILE_BYTES, Some(&sandbox)).await
     };
     let contents = match result {
         Ok(Some(contents)) => contents,
@@ -1749,7 +1556,6 @@ async fn read_environment_file(
     Ok((
         contents,
         path.inferred_native_path_string(),
-        inspection,
         environment.environment_id.clone(),
         path.to_string(),
     ))
@@ -2826,7 +2632,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn actionability_symbol_bindings_survive_merging_and_do_not_leak_into_reselection() {
+    async fn actionability_symbol_bindings_survive_merging() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("bindings.rs");
         std::fs::write(&path, "fn first() {}\nfn second() {}\n").unwrap();
@@ -2866,14 +2672,6 @@ mod tests {
                     {"selector_index":1,"qualified_name":"first","kind":"fn","resolved_selectors":[{"kind":"lines","start":1,"end":1}]}
                 ])
             );
-            let ToolPayload::Function { arguments } = &call.payload else {
-                panic!("function");
-            };
-            let requested =
-                json!({"path":path,"selectors":[{"kind":"lines","start":1,"end":1}]}).to_string();
-            let reselected = reselect_read_file_output(arguments, &requested, &output).unwrap();
-            assert!(reselected.get("selector_bindings").is_none());
-            assert_eq!(reselected["source_sha256"], output["source_sha256"]);
         }
     }
 
@@ -3287,35 +3085,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn json_pointer_reselection_reuses_complete_source_without_io() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("config.json");
-        std::fs::write(&path, r#"{"config":{"enabled":true},"other":null}"#).unwrap();
-        let call = invocation(&path, json!(null), false).await;
-        let raw = ReadFileHandler
-            .handle(call.clone())
-            .await
-            .unwrap()
-            .code_mode_result(&call.payload);
-        let ToolPayload::Function {
-            arguments: previous,
-        } = &call.payload
-        else {
-            unreachable!()
-        };
-        let requested =
-            json!({"path":path,"selectors":[{"kind":"json_pointer","pointer":"/config"}]})
-                .to_string();
-        std::fs::remove_file(&path).unwrap();
-        let selected = reselect_read_file_output(previous, &requested, &raw).unwrap();
-        assert_eq!(selected["results"][0]["value"], json!({"enabled":true}));
-        assert_eq!(selected["complete"], true);
-        assert_eq!(selected["file_complete"], false);
-        let mut stale = raw;
-        stale["canonical_sha256"] = json!("wrong");
-        assert!(reselect_read_file_output(previous, &requested, &stale).is_none());
-    }
+
 
     #[test]
     fn json_pointer_indexing_is_opt_in_and_missing_is_not_invalid() {
@@ -4061,150 +3831,7 @@ mod tests {
         assert!(result["continuation"].is_null());
     }
 
-    #[tokio::test]
-    async fn registered_read_file_records_evidence_and_invalidates_after_changes() {
-        use crate::session::turn_context::TurnEnvironment;
-        use crate::tool_history::SourceDependencyV1;
-        use crate::tools::parallel::ToolCallRuntime;
-        use crate::tools::registry::ToolRegistry;
-        use crate::tools::router::ToolCall;
-        use crate::tools::router::ToolRouter;
-        use codex_protocol::models::ResponseItem;
-        use codex_utils_absolute_path::AbsolutePathBuf;
-        use codex_utils_path_uri::PathUri;
-        use std::collections::BTreeSet;
 
-        let workspace = tempfile::tempdir().unwrap();
-        assert!(
-            std::process::Command::new("git")
-                .args(["init", "--quiet"])
-                .current_dir(workspace.path())
-                .status()
-                .unwrap()
-                .success()
-        );
-        let path = workspace.path().join("file.txt");
-        std::fs::write(&path, "current text\n").unwrap();
-        let (session, mut turn) = make_session_and_context().await;
-        Arc::make_mut(&mut turn.config).cwd =
-            AbsolutePathBuf::from_absolute_path(workspace.path()).unwrap();
-        turn.permission_profile = PermissionProfile::Disabled;
-        turn.environments.turn_environments = vec![TurnEnvironment::new(
-            codex_exec_server::LOCAL_ENVIRONMENT_ID.into(),
-            Arc::new(codex_exec_server::Environment::default_for_tests()),
-            PathUri::from_host_native_path(workspace.path()).unwrap(),
-            None,
-        )];
-        let session = Arc::new(session);
-        let router = Arc::new(ToolRouter::from_parts(
-            ToolRegistry::from_tools([Arc::new(ReadFileHandler) as Arc<dyn CoreToolRuntime>]),
-            Vec::new(),
-        ));
-        let step = StepContext::for_test(Arc::new(turn)).with_tool_router_for_test(router);
-        let runtime = ToolCallRuntime::new(
-            session.clone(),
-            step,
-            Arc::new(Mutex::new(TurnDiffTracker::new())),
-        );
-        let arguments = json!({"path": "file.txt"}).to_string();
-        let result = runtime
-            .clone()
-            .handle_tool_call_with_source(
-                ToolCall {
-                    tool_name: ToolName::plain("read_file"),
-                    call_id: "registered-file-read".into(),
-                    payload: ToolPayload::Function {
-                        arguments: arguments.clone(),
-                    },
-                },
-                ToolCallSource::CodeMode {
-                    cell_id: "read-cell".into(),
-                    parent_call_id: Some("outer-exec".into()),
-                    runtime_tool_call_id: "runtime-read".into(),
-                    nested_deadline: None,
-                    cancellation_cause: None,
-                },
-                CancellationToken::new(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(
-            result.projected_source_dependencies(),
-            Some(&BTreeSet::from([SourceDependencyV1::new(&path, false)]))
-        );
-        let canonical: Arc<[ResponseItem]> = Arc::from([
-            ResponseItem::FunctionCall {
-                id: None,
-                name: "read_file".into(),
-                namespace: None,
-                arguments,
-                call_id: "registered-file-read".into(),
-                internal_chat_message_metadata_passthrough: None,
-            },
-            ResponseItem::from(result.response()),
-        ]);
-        // `code_mode_result` consumes the result, so project it once.
-        let code_mode_result = result.code_mode_result();
-        assert_eq!(code_mode_result["results"][0]["text"], "current text\n");
-        assert_eq!(code_mode_result["file_complete"], true);
-        assert_eq!(code_mode_result["artifact_id"], serde_json::Value::Null);
-        let mut history = session.clone_history().await.tool_history_state();
-        let revision = history
-            .workspace_evidence_revision_for_test("registered-file-read")
-            .unwrap();
-        assert!(
-            crate::tool_history::tests::freshness_notices(
-                &history,
-                &canonical,
-                revision.as_ref(),
-                &session.services.git_workspace,
-            )
-            .is_empty()
-        );
-        std::fs::write(&path, "changed text\n").unwrap();
-        assert!(
-            history
-                .invalidate_source_dependencies(Some(&BTreeSet::from([path])), revision.as_ref())
-        );
-        let mut notices = crate::tool_history::tests::freshness_notices(
-            &history,
-            &canonical,
-            revision.as_ref(),
-            &session.services.git_workspace,
-        );
-        assert_eq!(notices.len(), 1);
-        let notice = notices.remove(0);
-        assert_eq!(notice["reason_code"], "source_dependencies_invalidated");
-        assert_eq!(notice["rerun"]["tool"], "read_file");
-        let retry = notice["rerun"]["arguments"].clone();
-        assert_eq!(retry, json!({"path": "file.txt"}));
-        let ToolSpec::Function(spec) = ReadFileHandler.spec() else {
-            panic!("expected callable read schema");
-        };
-        let parameters = serde_json::to_value(spec.parameters).unwrap();
-        assert!(
-            jsonschema::validator_for(&parameters)
-                .unwrap()
-                .is_valid(&retry)
-        );
-        let recovered = runtime
-            .handle_tool_call_with_source(
-                ToolCall {
-                    tool_name: ToolName::plain(notice["rerun"]["tool"].as_str().unwrap()),
-                    call_id: "recovered-file-read".into(),
-                    payload: ToolPayload::Function {
-                        arguments: retry.to_string(),
-                    },
-                },
-                ToolCallSource::Direct,
-                CancellationToken::new(),
-            )
-            .await
-            .unwrap()
-            .code_mode_result();
-        assert_eq!(recovered["results"][0]["text"], "changed text\n");
-        assert_eq!(recovered["file_complete"], true);
-    }
 
     #[tokio::test]
     async fn omitted_selectors_deliver_text_before_recovery_and_skip_unneeded_storage() {
@@ -4279,6 +3906,55 @@ mod tests {
                 .unwrap();
         }
         assert!(!validator.is_valid(&json!({"path": path, "selectors": []})));
+    }
+
+    #[tokio::test]
+    async fn path_only_reads_are_small_but_explicit_ranges_keep_their_capacity() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("source.rs");
+        let source = "// a source line with enough text to expose accidental whole-file reads\n"
+            .repeat(1_000);
+        std::fs::write(&path, &source).unwrap();
+        for script in [false, true] {
+            let mut call = invocation(&path, json!(null), false).await;
+            if script {
+                call.source = ToolCallSource::CodeMode {
+                    cell_id: "small-default-read".into(),
+                    parent_call_id: Some("outer".into()),
+                    runtime_tool_call_id: "read".into(),
+                    nested_deadline: None,
+                    cancellation_cause: None,
+                };
+            }
+            let result = ReadFileHandler
+                .handle(call.clone())
+                .await
+                .unwrap()
+                .code_mode_result(&call.payload);
+            let delivered = result["results"][0]["text"].as_str().unwrap();
+            assert!(!delivered.is_empty());
+            assert!(delivered.len() < 8_000, "path-only reads must not dump a 60+ KB file");
+            assert!(source.starts_with(delivered));
+            assert_eq!(result["complete"], true);
+            assert_eq!(result["file_complete"], false);
+            assert_eq!(result["continuation"], json!({
+                "kind":"bytes", "start":delivered.len(), "end":source.len()
+            }));
+            assert_eq!(result["retained_artifact_complete"], true);
+            if script {
+                call.payload = ToolPayload::Function {
+                    arguments: json!({"path":path,
+                        "selectors":[{"kind":"lines","start":1,"end":1_000}]}).to_string(),
+                };
+                let explicit = ReadFileHandler
+                    .handle(call.clone())
+                    .await
+                    .unwrap()
+                    .code_mode_result(&call.payload);
+                assert_eq!(explicit["results"][0]["text"], source);
+                assert_eq!(explicit["file_complete"], true);
+            }
+        }
     }
 
     #[tokio::test]

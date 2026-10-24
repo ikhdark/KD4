@@ -933,4 +933,41 @@ for (const exitCode of [0, 7]) {
   held.resolve();
   await result;
 }
+// Regular callbacks never receive the private scheduler descriptor as `this`.
+{
+  let leaked = false;
+  const inspectReceiver = function () {
+    if (this?.claims || this?.deps) leaked = true;
+    return true;
+  };
+  const results = await run_graph([
+    node("receiver", inspectReceiver, {
+      accept: inspectReceiver,
+      resources: { write: ["repo"] },
+    }),
+    node("later", () => true, { resources: { write: ["repo"] } }),
+  ], { concurrency: 1 });
+  check(!leaked && results.later.status === "fulfilled", "scheduler receiver escaped");
+}
+// Diagnostics are bounded by serialized UTF-8, including JSON escaping.
+{
+  const names = ["\u0001".repeat(4000), "\\\"".repeat(1600), "\u03bb".repeat(1800), "\ud83d\ude00".repeat(1000)];
+  const error = await run_graph([node("escaped", () => 1, { requires: names })]).catch(e => e);
+  check(new TextEncoder().encode(JSON.stringify(error.missing_capabilities)).length <= 4096,
+    "escaped capability diagnostics exceeded their byte budget");
+  check(error.missing_capabilities.length + error.omitted_capabilities === names.length,
+    "diagnostic omissions lost count");
+}
+// Numeric IDs retain an explicit input-order witness through JSON persistence.
+for (const fail of [false, true]) {
+  const results = await run_graph([
+    node("2", () => 2),
+    node("1", () => { if (fail) throw Error("expected"); return 1; }),
+    node("ordinary", () => 3),
+    node("0", () => 0),
+  ]).catch(error => error.results);
+  const restored = JSON.parse(JSON.stringify(results));
+  const ids = Object.keys(restored).sort((a, b) => restored[a].input_index - restored[b].input_index);
+  check(ids.join() === "2,1,ordinary,0", "numeric IDs lost their input order");
+}
 text("dependency graph scenarios passed");

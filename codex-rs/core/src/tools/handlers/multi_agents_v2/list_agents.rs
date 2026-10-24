@@ -50,10 +50,10 @@ impl Handler {
             .services
             .agent_control
             .register_session_root(session.thread_id, turn.parent_thread_id);
-        let agents = session
+        let (agents, mut task_snapshots) = session
             .services
             .agent_control
-            .list_agents(&turn.session_source, args.path_prefix.as_deref())
+            .list_agents_with_task_snapshots(&turn.session_source, args.path_prefix.as_deref())
             .await
             .map_err(collab_spawn_error)?;
         let coordinator = session.services.agent_control.task_coordinator();
@@ -106,10 +106,13 @@ impl Handler {
                 {
                     continue;
                 }
-                let task = match coordinator
-                    .get_agent_task(binding.assignment_id, Some(0))
-                    .await
-                {
+                let snapshot = task_snapshots.remove(&binding.assignment_id)
+                    .filter(|task| task.current_attempt.attempt_id == binding.attempt_id);
+                let loaded = match snapshot {
+                    Some(task) => Ok(task),
+                    None => coordinator.get_agent_task(binding.assignment_id, Some(0)).await,
+                };
+                let task = match loaded {
                     Ok(task) => task,
                     Err(error) if assignment_local_failure(&error) => {
                         typed_tasks.push(json!({

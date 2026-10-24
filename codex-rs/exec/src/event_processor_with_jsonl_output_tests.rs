@@ -4,6 +4,188 @@ use serde_json::json;
 use tempfile::tempdir;
 
 #[test]
+fn nonterminal_completion_retains_identity_and_progress_until_real_completion() {
+    let mut items = in_progress_tool_items();
+    for yielded in [false, true] {
+        items.push(ThreadItem::DynamicToolCall {
+            id: format!("cell-{yielded}"),
+            namespace: Some("codex.internal".into()),
+            tool: "code_mode_cell".into(),
+            arguments: if yielded {
+                json!({"call_id": "call", "cell_id": "cell", "state": "yielded"})
+            } else {
+                json!({"call_id": "call", "cell_id": "cell"})
+            },
+            status: if yielded {
+                DynamicToolCallStatus::Completed
+            } else {
+                DynamicToolCallStatus::InProgress
+            },
+            content_items: None,
+            success: None,
+            error: None,
+            duration_ms: None,
+        });
+    }
+    for mut item in items {
+        let mut processor = EventProcessorWithJsonOutput::new(None);
+        let mut recovery = crate::recovery::ExecRecoveryState::default();
+        let started =
+            ServerNotification::ItemStarted(codex_app_server_protocol::ItemStartedNotification {
+                thread_id: "thread-1".into(),
+                turn_id: "turn-1".into(),
+                started_at_ms: 0,
+                item: item.clone(),
+            });
+        recovery.observe(&started);
+        let events = processor.collect_thread_events(started).events;
+        let [ThreadEvent::ItemStarted(event)] = events.as_slice() else {
+            panic!("start")
+        };
+        let exec_id = event.item.id.clone();
+        let update = ServerNotification::ItemCompleted(
+            codex_app_server_protocol::ItemCompletedNotification {
+                thread_id: "thread-1".into(),
+                turn_id: "turn-1".into(),
+                completed_at_ms: 0,
+                item: item.clone(),
+            },
+        );
+        recovery.observe(&update);
+        let events = processor.collect_thread_events(update).events;
+        let [ThreadEvent::ItemUpdated(event)] = events.as_slice() else {
+            panic!("nonterminal update")
+        };
+        assert_eq!(event.item.id, exec_id);
+        assert_eq!(processor.raw_to_exec_item_id.get(item.id()), Some(&exec_id));
+        if matches!(
+            &item,
+            ThreadItem::CommandExecution { .. } | ThreadItem::McpToolCall { .. }
+        ) {
+            let progress = if matches!(&item, ThreadItem::CommandExecution { .. }) {
+                ServerNotification::CommandExecutionOutputDelta(
+                    codex_app_server_protocol::CommandExecutionOutputDeltaNotification {
+                        thread_id: "thread-1".into(),
+                        turn_id: "turn-1".into(),
+                        item_id: item.id().into(),
+                        delta: "still running".into(),
+                        stream: None,
+                        decoding_lossy: None,
+                    },
+                )
+            } else {
+                ServerNotification::McpToolCallProgress(
+                    codex_app_server_protocol::McpToolCallProgressNotification {
+                        thread_id: "thread-1".into(),
+                        turn_id: "turn-1".into(),
+                        item_id: item.id().into(),
+                        message: "still running".into(),
+                        progress: None,
+                        total: None,
+                    },
+                )
+            };
+            let events = processor.collect_thread_events(progress).events;
+            let [ThreadEvent::ItemProgress(event)] = events.as_slice() else {
+                panic!("progress")
+            };
+            assert_eq!(event.item_id, exec_id);
+        }
+        // Nonterminal completion cannot make recovery treat the stream as settled.
+        recovery.observe(&ServerNotification::ItemCompleted(
+            codex_app_server_protocol::ItemCompletedNotification {
+                thread_id: "thread-1".into(),
+                turn_id: "turn-1".into(),
+                completed_at_ms: 0,
+                item: ThreadItem::Plan {
+                    id: "final".into(),
+                    text: "answer".into(),
+                },
+            },
+        ));
+        let mut turn = crate::tests::recovery_completion();
+        recovery.backfill_complete_stream(&mut turn);
+        let ServerNotification::TurnCompleted(turn) = turn else {
+            unreachable!()
+        };
+        assert!(turn.turn.items.is_empty());
+        match &mut item {
+            ThreadItem::CommandExecution {
+                status, exit_code, ..
+            } => {
+                *status = CommandExecutionStatus::Completed;
+                *exit_code = Some(0);
+            }
+            ThreadItem::FileChange { status, .. } => *status = PatchApplyStatus::Completed,
+            ThreadItem::McpToolCall { status, .. } => *status = McpToolCallStatus::Completed,
+            ThreadItem::CollabAgentToolCall { status, .. } => {
+                *status = CollabAgentToolCallStatus::Completed
+            }
+            ThreadItem::DynamicToolCall {
+                status, arguments, ..
+            } => {
+                *status = DynamicToolCallStatus::Completed;
+                arguments.as_object_mut().unwrap().remove("state");
+            }
+            _ => unreachable!(),
+        }
+        let events = processor
+            .collect_thread_events(ServerNotification::ItemCompleted(
+                codex_app_server_protocol::ItemCompletedNotification {
+                    thread_id: "thread-1".into(),
+                    turn_id: "turn-1".into(),
+                    completed_at_ms: 0,
+                    item,
+                },
+            ))
+            .events;
+        let [ThreadEvent::ItemCompleted(event)] = events.as_slice() else {
+            panic!("completion")
+        };
+        assert_eq!(event.item.id, exec_id);
+        assert!(processor.raw_to_exec_item_id.is_empty());
+    }
+}
+
+#[test]
+fn replayed_final_cannot_replace_latest_unique_answer_during_recovery() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("answer.txt");
+    let mut processor = EventProcessorWithJsonOutput::new(Some(path.clone()));
+    let mut recovery = crate::recovery::ExecRecoveryState::default();
+    for (id, text, count) in [
+        ("a", "answer A", 1),
+        ("b", "answer B", 1),
+        ("a", "answer A", 0),
+    ] {
+        let mut notification = agent_completion(id, text);
+        let ServerNotification::ItemCompleted(event) = &mut notification else {
+            unreachable!()
+        };
+        let ThreadItem::AgentMessage { phase, .. } = &mut event.item else {
+            unreachable!()
+        };
+        *phase = Some(codex_protocol::models::MessagePhase::FinalAnswer);
+        recovery.observe(&notification);
+        assert_eq!(
+            processor.collect_thread_events(notification).events.len(),
+            count
+        );
+    }
+    let mut terminal = crate::tests::recovery_completion();
+    recovery.backfill_complete_stream(&mut terminal);
+    let ServerNotification::TurnCompleted(event) = &terminal else {
+        unreachable!()
+    };
+    assert_eq!(event.turn.items[0].id(), "b");
+    let events = processor.collect_thread_events(terminal).events;
+    assert!(matches!(events.as_slice(), [ThreadEvent::TurnCompleted(_)]));
+    assert_eq!(processor.final_message(), Some("answer B"));
+    processor.print_final_output().unwrap();
+    assert_eq!(std::fs::read_to_string(path).unwrap(), "answer B");
+}
+
+#[test]
 fn accepted_final_receipt_controls_recovered_artifact_not_activity() {
     use codex_protocol::protocol::AcceptedFinalMessage;
     use codex_protocol::protocol::AcceptedFinalMessageOrigin;
@@ -398,9 +580,8 @@ fn agent_completion(id: &str, text: &str) -> ServerNotification {
     })
 }
 
-#[test]
-fn turn_recovery_preserves_in_progress_items_until_terminal_evidence() {
-    let items = vec![
+fn in_progress_tool_items() -> Vec<ThreadItem> {
+    vec![
         ThreadItem::CommandExecution {
             environment: None,
             output_metadata: None,
@@ -454,7 +635,12 @@ fn turn_recovery_preserves_in_progress_items_until_terminal_evidence() {
             reasoning_effort: None,
             agents_states: HashMap::new(),
         },
-    ];
+    ]
+}
+
+#[test]
+fn turn_recovery_preserves_in_progress_items_until_terminal_evidence() {
+    let items = in_progress_tool_items();
     for turn_status in [
         TurnStatus::Completed,
         TurnStatus::Failed,

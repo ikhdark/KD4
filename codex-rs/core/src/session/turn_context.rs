@@ -377,10 +377,12 @@ pub struct TurnContext {
     pub(crate) developer_instructions: Option<String>,
     pub(crate) collaboration_mode: CollaborationMode,
     pub(crate) multi_agent_version: MultiAgentVersion,
+    pub(crate) validation_mode: codex_protocol::validation::ValidationMode,
+    pub(crate) validation_full_budget: usize,
+    pub(crate) validation_root_turn: (String, String),
     pub(crate) personality: Option<Personality>,
     pub(crate) approval_policy: Constrained<AskForApproval>,
     pub(crate) permission_profile: PermissionProfile,
-    pub(crate) network: Option<NetworkProxy>,
     pub(crate) windows_sandbox_level: WindowsSandboxLevel,
     pub(crate) available_models: Arc<Vec<ModelPreset>>,
     pub(crate) final_output_json_schema: Option<Arc<PreparedOutputSchema>>,
@@ -446,6 +448,8 @@ fn same_turn_config_projection(left: &Config, right: &Config) -> bool {
         && left.model_reasoning_effort == right.model_reasoning_effort
         && left.model_reasoning_summary == right.model_reasoning_summary
         && left.service_tier == right.service_tier
+        && left.validation_mode == right.validation_mode
+        && left.validation_full_budget == right.validation_full_budget
         && left.personality == right.personality
         && left.web_search_mode == right.web_search_mode
         && left.features == right.features
@@ -818,10 +822,12 @@ impl TurnContext {
             developer_instructions: self.developer_instructions.clone(),
             collaboration_mode,
             multi_agent_version: self.multi_agent_version,
+            validation_mode: self.validation_mode,
+            validation_full_budget: self.validation_full_budget,
+            validation_root_turn: self.validation_root_turn.clone(),
             personality: self.personality,
             approval_policy: self.approval_policy.clone(),
             permission_profile: self.permission_profile.clone(),
-            network: self.network.clone(),
             windows_sandbox_level: self.windows_sandbox_level,
             available_models,
             final_output_json_schema: self.final_output_json_schema.clone(),
@@ -994,6 +1000,10 @@ impl TurnContext {
             multi_agent_version: Some(self.multi_agent_version),
             multi_agent_mode: super::multi_agents::effective_multi_agent_mode(self)
                 .map(|mode| mode.to_persisted_mode()),
+            validation_mode: Some(self.validation_mode),
+            validation_full_budget: Some(self.validation_full_budget),
+            validation_root_turn: Some(self.validation_root_turn.clone()),
+            validation_attempts: self.full_suite_budget.persisted_attempts(),
             effort: self.reasoning_effort.clone(),
             context_provenance: None,
         }
@@ -1050,6 +1060,8 @@ impl Session {
             session_configuration.collaboration_mode.reasoning_effort();
         per_turn_config.model_reasoning_summary = session_configuration.model_reasoning_summary;
         per_turn_config.service_tier = session_configuration.service_tier.clone();
+        per_turn_config.validation_mode = session_configuration.validation_mode;
+        per_turn_config.validation_full_budget = session_configuration.validation_full_budget;
         per_turn_config.personality = session_configuration.personality;
         session_configuration
             .apply_permission_profile_to_permissions(&mut per_turn_config.permissions);
@@ -1104,7 +1116,6 @@ impl Session {
         per_turn_config: Arc<Config>,
         model_info: ModelInfo,
         available_models: Arc<Vec<ModelPreset>>,
-        network: Option<NetworkProxy>,
         environments: TurnEnvironmentSnapshot,
         git_metadata_source: Option<GitWorkspaceMetadataSource>,
         sub_id: String,
@@ -1145,7 +1156,7 @@ impl Session {
             sub_id.clone(),
             &session_configuration.permission_profile(),
             session_configuration.windows_sandbox_level,
-            network.is_some(),
+            false,
             git_metadata_source,
         ));
         let (current_date, timezone) = local_time_context();
@@ -1155,6 +1166,10 @@ impl Session {
             text: model_info.base_instructions.clone(),
         });
         let effective_workspace_roots = per_turn_config.effective_workspace_roots().into();
+        let validation_root_turn = session_configuration
+            .validation_root_turn
+            .clone()
+            .unwrap_or_else(|| (thread_id.to_string(), sub_id.clone()));
         TurnContext {
             hook_context_budget: Default::default(),
             sub_id,
@@ -1181,10 +1196,12 @@ impl Session {
             developer_instructions: session_configuration.developer_instructions.clone(),
             collaboration_mode: session_configuration.collaboration_mode.clone(),
             multi_agent_version,
+            validation_mode: session_configuration.validation_mode,
+            validation_full_budget: session_configuration.validation_full_budget,
+            validation_root_turn,
             personality: session_configuration.personality,
             approval_policy: session_configuration.approval_policy.clone(),
             permission_profile: session_configuration.permission_profile(),
-            network,
             windows_sandbox_level: session_configuration.windows_sandbox_level,
             available_models,
             final_output_json_schema: None,
@@ -1332,7 +1349,8 @@ impl Session {
             TurnMultiAgentRuntime::Preview => self
                 .multi_agent_version()
                 .or(model_info.multi_agent_version)
-                .unwrap_or_else(|| per_turn_config.multi_agent_version_from_features()),
+                .unwrap_or_else(|| per_turn_config.multi_agent_version_from_features())
+                .runtime_version(),
         };
         let plugins_input = per_turn_config.plugins_config_input();
         let plugin_outcome = self
@@ -1403,16 +1421,6 @@ impl Session {
             per_turn_config,
             model_info,
             available_models,
-            self.services
-                .network_proxy
-                .load_full()
-                .as_ref()
-                .and_then(|started_proxy| {
-                    Self::managed_network_proxy_active_for_permission_profile(
-                        &session_configuration.permission_profile(),
-                    )
-                    .then(|| started_proxy.proxy())
-                }),
             turn_environments,
             git_metadata_source,
             sub_id,
@@ -1422,14 +1430,17 @@ impl Session {
             turn_context.final_output_json_schema = final_schema;
         }
         turn_context.code_mode_available = self.services.code_mode_service.is_available();
-        if turn_context.config.features.enabled(Feature::Kd4Runtime) {
-            turn_context.full_suite_budget = self
-                .services
-                .agent_control
-                .task_coordinator()
-                .validation_budget(self.thread_id())
-                .await;
+        turn_context.full_suite_budget = self.services.agent_control.task_coordinator()
+            .validation_budget_for_turn(
+                &turn_context.validation_root_turn,
+            );
+        if let Some(inherited) = self.services.agent_control.inherited_validation_context.as_ref()
+            && inherited.scope == turn_context.validation_root_turn
+        {
+            turn_context.full_suite_budget = Arc::clone(&inherited.budget);
         }
+        turn_context.full_suite_budget
+            .restore_policy_attempts(&session_configuration.validation_attempts);
         turn_context
             .turn_timing_state
             .bind_live_phase_events(turn_context.sub_id.clone(), self.tx_event.clone());
@@ -1512,6 +1523,47 @@ impl Session {
 #[cfg(test)]
 mod runtime_epoch_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn validation_policy_survives_context_rebuild_and_round_trip() {
+        use codex_protocol::validation::ValidationMode;
+
+        let (session, _) = crate::session::tests::make_session_and_context().await;
+        let turn = session.new_turn_with_sub_id(
+            "validation-turn".into(),
+            SessionSettingsUpdate {
+                validation_mode: Some(ValidationMode::Full),
+                ..Default::default()
+            },
+        ).await.unwrap();
+        assert_eq!(turn.validation_mode, ValidationMode::Full);
+        turn.full_suite_budget.restore_policy_attempts(&[("selection".into(), "revision".into())]);
+        let item = turn.to_turn_context_item();
+        let restored: TurnContextItem = serde_json::from_value(
+            serde_json::to_value(&item).unwrap(),
+        ).unwrap();
+        assert_eq!(restored.validation_mode, Some(ValidationMode::Full));
+        assert_eq!(restored.validation_full_budget, Some(2));
+        assert_eq!(restored.validation_attempts, vec![("selection".into(), "revision".into())]);
+
+        let mut configuration = session.state.lock().await.session_configuration.clone();
+        configuration.validation_root_turn = restored.validation_root_turn;
+        configuration.validation_attempts = restored.validation_attempts;
+        let rebuilt = session.new_turn_from_configuration(
+            "validation-rebuilt".into(), configuration, None,
+        ).await;
+        assert_eq!(rebuilt.validation_mode, ValidationMode::Full);
+        assert_eq!(rebuilt.full_suite_budget.policy_snapshot(2).admitted, 1);
+        assert!(Arc::ptr_eq(&turn.full_suite_budget, &rebuilt.full_suite_budget));
+        let next = session.new_turn_with_sub_id(
+            "ordinary-next-turn".into(),
+            SessionSettingsUpdate {
+                validation_mode: Some(ValidationMode::Compile),
+                ..Default::default()
+            },
+        ).await.unwrap();
+        assert_eq!(next.validation_mode, ValidationMode::Compile);
+    }
 
     #[tokio::test]
     async fn fresh_session_metadata_replaces_shell_and_discards_old_snapshot() {

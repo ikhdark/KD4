@@ -47,11 +47,17 @@ pub(crate) fn create_env_overlay_for_remote_mcp_server(
         .collect()
 }
 
-pub(crate) fn remote_mcp_env_var_names(env_vars: &[McpServerEnvVar]) -> Vec<String> {
+pub(crate) fn remote_mcp_env_var_names(env_vars: &[McpServerEnvVar]) -> Result<Vec<String>> {
     env_vars
         .iter()
         .filter(|var| var.is_remote_source())
-        .map(|var| var.name().to_string())
+        .map(|var| {
+            let name = var.name();
+            if name.is_empty() || name.chars().any(|ch| matches!(ch, '*' | '?' | '=' | '\0')) {
+                return Err(anyhow!("remote MCP environment variable name {name:?} must be a literal nonempty name without *, ?, =, or NUL"));
+            }
+            Ok(name.to_string())
+        })
         .collect()
 }
 
@@ -276,9 +282,24 @@ mod tests {
                 name: "REMOTE".to_string(),
                 source: Some("remote".to_string()),
             },
-        ]);
+        ])
+        .unwrap();
 
         assert_eq!(names, vec!["REMOTE".to_string()]);
+    }
+
+    #[test]
+    fn remote_mcp_env_names_reject_patterns_and_invalid_names() {
+        for name in ["*", "AWS_*", "AWS_?", "", "A=B", "A\0B"] {
+            assert!(
+                remote_mcp_env_var_names(&[McpServerEnvVar::Config {
+                    name: name.into(),
+                    source: Some("remote".into()),
+                }])
+                .is_err(),
+                "{name:?}"
+            );
+        }
     }
 
     #[test]

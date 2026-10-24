@@ -628,6 +628,8 @@ impl CatalogRequestProcessor {
             // One generation fence per RPC, before parallel cwd loads.
             skills_service.clear_cache();
         }
+        let skill_snapshot_generation = skills_service.snapshot_generation();
+        let plugin_discovery_generation = skills_service.reusable_snapshot_generation();
         let plugins_manager = self.thread_manager.plugins_manager();
         let fs = self
             .thread_manager
@@ -658,16 +660,17 @@ impl CatalogRequestProcessor {
                             );
                         }
                     };
-                    let effective_skill_roots = if workspace_codex_plugins_enabled {
+                    let (effective_skill_roots, plugin_skill_snapshots) = if workspace_codex_plugins_enabled {
                         let plugins_input = config.plugins_config_input();
                         plugins_manager
-                            .effective_skill_roots_for_layer_stack(
+                            .effective_skill_roots_with_snapshots_for_layer_stack(
                                 &config_layer_stack,
                                 &plugins_input,
+                                plugin_discovery_generation,
                             )
                             .await
                     } else {
-                        Vec::new()
+                        (Vec::new(), None)
                     };
                     let skills_input = codex_core::skills::SkillsLoadInput::new(
                         cwd_abs.clone(),
@@ -677,7 +680,14 @@ impl CatalogRequestProcessor {
                     );
                     let snapshot = skills_service
                         // The RPC already fenced both cache tiers once, before parallel loads.
-                        .snapshot_for_cwd(&skills_input, false, fs)
+                        .snapshot_for_cwd_with_plugin_skill_preload(
+                            &skills_input,
+                            false,
+                            fs,
+                            plugin_skill_snapshots.as_ref().map(|snapshots| {
+                                (skill_snapshot_generation, snapshots)
+                            }),
+                        )
                         .await;
                     let outcome = snapshot.outcome();
                     let errors = errors_to_info(&outcome.errors);
@@ -734,7 +744,7 @@ impl CatalogRequestProcessor {
 
         let auth = self.auth_manager.auth().await;
         let plugins_manager = self.thread_manager.plugins_manager();
-        let data = futures::stream::iter(cwds.into_iter().map(|cwd| {
+        let jobs = cwds.into_iter().map(|cwd| {
             let auth = &auth;
             let plugins_manager = &plugins_manager;
             async move {
@@ -812,10 +822,8 @@ impl CatalogRequestProcessor {
                     errors: Vec::new(),
                 }
             }
-        }))
-        .buffered(SKILLS_LIST_CWD_CONCURRENCY)
-        .collect()
-        .await;
+        });
+        let data = collect_hook_entries(jobs).await;
         Ok(HooksListResponse { data })
     }
 
@@ -860,6 +868,37 @@ impl CatalogRequestProcessor {
     }
 }
 
+// Free completed slots immediately; response ordering is restored only after
+// every directory has been inspected, including entries containing errors.
+async fn collect_hook_entries<'a, T, I, F>(jobs: I) -> Vec<T>
+where
+    T: Send + 'a,
+    I: IntoIterator<Item = F>,
+    I::IntoIter: Send,
+    F: std::future::Future<Output = T> + Send + 'a,
+{
+    let mut jobs = jobs.into_iter().enumerate();
+    let mut pending =
+        futures::stream::FuturesUnordered::<futures::future::BoxFuture<'a, (usize, T)>>::new();
+    let mut entries = Vec::new();
+    loop {
+        // Erase each admitted future without retaining a higher-ranked map
+        // adapter across await. At most the concurrency limit is allocated.
+        while pending.len() < SKILLS_LIST_CWD_CONCURRENCY {
+            let Some((index, job)) = jobs.next() else {
+                break;
+            };
+            pending.push(Box::pin(async move { (index, job.await) }));
+        }
+        let Some(entry) = pending.next().await else {
+            break;
+        };
+        entries.push(entry);
+    }
+    entries.sort_unstable_by_key(|(index, _)| *index);
+    entries.into_iter().map(|(_, entry)| entry).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -868,6 +907,52 @@ mod tests {
     use codex_models_manager::manager::StaticModelsManager;
     use codex_protocol::openai_models::ModelsResponse;
     use pretty_assertions::assert_eq;
+
+    #[tokio::test]
+    async fn hook_discovery_admits_later_directories_behind_a_slow_first_entry() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let active = AtomicUsize::new(0);
+        let maximum = AtomicUsize::new(0);
+        let later_started = tokio::sync::Notify::new();
+        let jobs = (0..12).map(|index| {
+            let (active, maximum, later_started) = (&active, &maximum, &later_started);
+            async move {
+                let current = active.fetch_add(1, Ordering::SeqCst) + 1;
+                maximum.fetch_max(current, Ordering::SeqCst);
+                if index == 0 {
+                    later_started.notified().await;
+                } else if index == SKILLS_LIST_CWD_CONCURRENCY {
+                    later_started.notify_one();
+                }
+                tokio::task::yield_now().await;
+                active.fetch_sub(1, Ordering::SeqCst);
+                if index == 3 { Err(index) } else { Ok(index) }
+            }
+        });
+        fn require_send<T: Send>(value: T) -> T {
+            value
+        }
+        let entries = tokio::time::timeout(
+            Duration::from_secs(5),
+            require_send(collect_hook_entries(jobs)),
+        )
+        .await
+        .expect("later directories must start before the first finishes");
+        assert_eq!(
+            entries,
+            (0..12)
+                .map(|i| if i == 3 { Err(i) } else { Ok(i) })
+                .collect::<Vec<_>>()
+        );
+        assert!(maximum.load(Ordering::SeqCst) <= SKILLS_LIST_CWD_CONCURRENCY);
+        assert_eq!(active.load(Ordering::SeqCst), 0);
+        assert!(
+            collect_hook_entries(std::iter::empty::<std::future::Ready<()>>())
+                .await
+                .is_empty()
+        );
+        assert_eq!(collect_hook_entries([std::future::ready(7)]).await, vec![7]);
+    }
 
     #[test]
     fn identical_catalogs_do_not_allow_cross_identity_continuations() {

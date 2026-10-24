@@ -9,6 +9,42 @@ use tempfile::TempDir;
 use tokio::sync::mpsc;
 
 #[tokio::test]
+async fn listing_reads_overlap_and_keep_prompt_local_error_precedence() {
+    let (local_started_tx, local_started_rx) = tokio::sync::oneshot::channel();
+    let (remote_started_tx, remote_started_rx) = tokio::sync::oneshot::channel();
+    let result = join_plugin_listing_reads(
+        async {
+            local_started_tx.send(()).unwrap();
+            remote_started_rx.await.unwrap();
+            Ok::<_, &str>("local")
+        },
+        async {
+            remote_started_tx.send(()).unwrap();
+            local_started_rx.await.unwrap();
+            Ok::<_, &str>("remote")
+        },
+    ).await.unwrap();
+    assert_eq!(result, ("local", "remote"));
+    assert_eq!(join_plugin_listing_reads(async { Err::<(), _>("local error") }, std::future::pending::<Result<(), &str>>()).now_or_never(), Some(Err("local error")));
+    assert_eq!(join_plugin_listing_reads(async { Err::<(), _>("local error") }, async { Err::<(), _>("remote error") }).await, Err("local error"));
+}
+
+#[tokio::test]
+async fn nonlocal_plugin_reads_skip_corrupt_local_share_maps() {
+    let home = TempDir::new().unwrap();
+    let config = load_default_config_for_test(&home).await;
+    std::fs::create_dir_all(home.path().join(".tmp")).unwrap();
+    std::fs::write(home.path().join(".tmp/plugin-share-local-paths-v1.json"), "{").unwrap();
+    for source in [
+        MarketplacePluginSource::Git { url: "https://example.test/plugin.git".into(), path: None, ref_name: None, sha: None },
+        MarketplacePluginSource::Npm { package: "plugin".into(), version: None, registry: None },
+    ] {
+        assert!(load_share_context_for_source(&config, &source).await.unwrap().is_none());
+    }
+    assert!(load_share_context_for_source(&config, &MarketplacePluginSource::Local { path: AbsolutePathBuf::from_absolute_path(home.path()).unwrap() }).await.is_err());
+}
+
+#[tokio::test]
 async fn remote_local_version_requires_matching_materialized_package() {
     async fn assert_version(home: &Path, plugin: &mut PluginSummary, version: Option<&str>) {
         // Seed a stale value to prove rejection clears it, not merely leaves None untouched.
@@ -319,5 +355,37 @@ fn authoritative_auth_requirements_survive_missing_catalog_metadata() {
             install_url: Some("https://chatgpt.com/apps/missing/missing".to_string()),
             category: None,
         }]
+    );
+}
+
+#[test]
+fn raw_plugin_app_ids_keep_auth_requirements_and_categories() {
+    let ids = vec![
+        codex_plugin::AppConnectorId(" calendar ".to_string()),
+        codex_plugin::AppConnectorId("calendar".to_string()),
+        codex_plugin::AppConnectorId(" \t ".to_string()),
+    ];
+    let apps = connectors::connectors_for_plugin_apps(Vec::new(), &ids);
+    let summaries = plugin_apps_needing_auth(&apps, &[], &ids, true);
+    assert_eq!(summaries.len(), 1);
+    assert_eq!(summaries[0].id, "calendar");
+    assert_eq!(
+        summaries[0].install_url.as_deref(),
+        Some("https://chatgpt.com/apps/calendar/calendar")
+    );
+    let mut accessible = apps.clone();
+    accessible[0].id = "\tcalendar ".to_string();
+    assert!(plugin_apps_needing_auth(&apps, &accessible, &ids, true).is_empty());
+    assert!(plugin_apps_needing_auth(&apps, &[], &ids, false).is_empty());
+
+    let categories = plugin_app_category_by_id_from_value(&serde_json::json!({
+        "apps": {
+            "Calendar": {"id": " calendar ", "category": "productivity"},
+            "Blank": {"id": " \t ", "category": "invalid"}
+        }
+    }));
+    assert_eq!(
+        categories,
+        HashMap::from([("calendar".to_string(), "productivity".to_string())])
     );
 }

@@ -2,9 +2,13 @@ use crate::config_manager::ConfigManager;
 use codex_core::CodexThread;
 use codex_core::ThreadManager;
 use codex_protocol::protocol::McpServerRefreshConfig;
+use futures::StreamExt;
+use futures::TryStreamExt;
 use std::io;
 use std::sync::Arc;
 use tracing::warn;
+
+const REFRESH_PLAN_CONCURRENCY: usize = 4;
 
 pub(crate) async fn queue_strict_refresh(
     thread_manager: &Arc<ThreadManager>,
@@ -14,15 +18,20 @@ pub(crate) async fn queue_strict_refresh(
         .load_latest_config(/*fallback_cwd*/ None)
         .await?;
     let thread_ids = thread_manager.list_thread_ids().await;
-    let mut refreshes = Vec::with_capacity(thread_ids.len());
-    for thread_id in thread_ids {
+    // Poll independent plans concurrently, but retain enumeration/error order.
+    // Dropping the stream on failure cancels unfinished planning; no refresh is
+    // published until every required plan has succeeded.
+    let refreshes = futures::stream::iter(thread_ids.into_iter().map(|thread_id| async move {
         let thread = thread_manager
             .get_thread(thread_id)
             .await
             .map_err(|err| io::Error::other(format!("failed to load thread {thread_id}: {err}")))?;
         let config = build_refresh_config(thread.as_ref(), config_manager).await?;
-        refreshes.push((thread_id, thread, config));
-    }
+        Ok::<_, io::Error>((thread_id, thread, config))
+    }))
+    .buffered(REFRESH_PLAN_CONCURRENCY)
+    .try_collect::<Vec<_>>()
+    .await?;
     thread_manager
         .queue_mcp_server_refreshes_atomically(refreshes)
         .await
@@ -35,24 +44,20 @@ pub(crate) async fn queue_best_effort_refresh(
     config_manager: &ConfigManager,
 ) {
     let thread_ids = thread_manager.list_thread_ids().await;
-    let mut refreshes = Vec::with_capacity(thread_ids.len());
-    for thread_id in thread_ids {
-        let thread = match thread_manager.get_thread(thread_id).await {
-            Ok(thread) => thread,
-            Err(err) => {
-                warn!("failed to load thread {thread_id} for MCP refresh: {err}");
-                continue;
-            }
-        };
-        let config = match build_refresh_config(thread.as_ref(), config_manager).await {
-            Ok(config) => config,
-            Err(err) => {
-                warn!("failed to build MCP refresh config for thread {thread_id}: {err}");
-                continue;
-            }
-        };
-        refreshes.push((thread_id, thread, config));
-    }
+    let plans = futures::stream::iter(thread_ids.into_iter().map(|thread_id| async move {
+        let thread = thread_manager.get_thread(thread_id).await
+            .map_err(|err| format!("failed to load thread {thread_id} for MCP refresh: {err}"))?;
+        let config = build_refresh_config(thread.as_ref(), config_manager).await
+            .map_err(|err| format!("failed to build MCP refresh config for thread {thread_id}: {err}"))?;
+        Ok::<_, String>((thread_id, thread, config))
+    }))
+    .buffered(REFRESH_PLAN_CONCURRENCY)
+    .collect::<Vec<_>>()
+    .await;
+    let refreshes = plans.into_iter().filter_map(|plan| match plan {
+        Ok(plan) => Some(plan),
+        Err(err) => { warn!("{err}"); None }
+    }).collect();
     if let Err(err) = thread_manager
         .queue_mcp_server_refreshes_atomically(refreshes)
         .await
@@ -88,7 +93,6 @@ mod tests {
     use crate::extensions::thread_extensions;
     use codex_arg0::Arg0DispatchPaths;
     use codex_builtin_extensions::BuiltinExtensionDependencies;
-    use codex_builtin_extensions::GoalService;
     use codex_config::CloudConfigBundleLoader;
     use codex_config::LoaderOverrides;
     use codex_config::ThreadConfigContext;
@@ -116,6 +120,30 @@ mod tests {
     use std::sync::atomic::AtomicUsize;
     use std::sync::atomic::Ordering;
     use tempfile::TempDir;
+
+    #[tokio::test]
+    async fn refresh_plans_overlap_before_atomic_publication() -> anyhow::Result<()> {
+        let (_temp_dir, thread_manager, config_manager, loader) = refresh_test_state().await?;
+        loader.block_plans.store(true, Ordering::Relaxed);
+        let task_manager = thread_manager.clone();
+        let task = tokio::spawn(async move {
+            queue_best_effort_refresh(&task_manager, &config_manager).await;
+        });
+        let overlap = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while loader.active_plans.load(Ordering::Relaxed) < 2 {
+                tokio::task::yield_now().await;
+            }
+        }).await;
+        // Release even on regression so failure cannot leave an owned task blocked.
+        loader.plan_release.add_permits(2);
+        task.await?;
+        overlap.expect("independent plans must overlap instead of waiting serially");
+        assert_eq!(loader.max_plans.load(Ordering::Relaxed), 2);
+        assert!(loader.max_plans.load(Ordering::Relaxed) <= REFRESH_PLAN_CONCURRENCY);
+        assert_eq!(loader.good_loads.load(Ordering::Relaxed), 1);
+        assert_eq!(loader.bad_loads.load(Ordering::Relaxed), 1);
+        Ok(())
+    }
 
     #[tokio::test]
     async fn strict_refresh_reports_thread_planning_failures() -> anyhow::Result<()> {
@@ -277,7 +305,7 @@ mod tests {
             .expect("refresh tests require state db");
         let thread_store = thread_store_from_config(&good_config, Some(state_db.clone()));
         let environment_manager = Arc::new(EnvironmentManager::default_for_tests());
-        let thread_manager = Arc::new_cyclic(|thread_manager| {
+        let thread_manager = Arc::new({
             ThreadManager::new(
                 &good_config,
                 auth_manager.clone(),
@@ -287,10 +315,6 @@ mod tests {
                     Arc::new(NoopExtensionEventSink),
                     BuiltinExtensionDependencies {
                         auth_manager: auth_manager.clone(),
-                        state_db: Some(state_db.clone()),
-                        analytics_events_client: None,
-                        thread_manager: thread_manager.clone(),
-                        goal_service: Arc::new(GoalService::new()),
                         environment_manager: Arc::clone(&environment_manager),
                         session_source: SessionSource::Exec,
                     },
@@ -316,6 +340,10 @@ mod tests {
             bad_loads: AtomicUsize::new(0),
             fail_on_second: AtomicBool::new(false),
             thread_loads: AtomicUsize::new(0),
+            block_plans: AtomicBool::new(false),
+            active_plans: AtomicUsize::new(0),
+            max_plans: AtomicUsize::new(0),
+            plan_release: tokio::sync::Semaphore::new(0),
         });
         let config_manager = ConfigManager::new(
             temp_dir.path().to_path_buf(),
@@ -337,6 +365,10 @@ mod tests {
         bad_loads: AtomicUsize,
         fail_on_second: AtomicBool,
         thread_loads: AtomicUsize,
+        block_plans: AtomicBool,
+        active_plans: AtomicUsize,
+        max_plans: AtomicUsize,
+        plan_release: tokio::sync::Semaphore,
     }
 
     impl CountingThreadConfigLoader {
@@ -352,6 +384,12 @@ mod tests {
             }
             let is_thread = context.cwd.as_ref() == Some(&self.good_cwd)
                 || context.cwd.as_ref() == Some(&self.bad_cwd);
+            if is_thread && self.block_plans.load(Ordering::Relaxed) {
+                let active = self.active_plans.fetch_add(1, Ordering::Relaxed) + 1;
+                self.max_plans.fetch_max(active, Ordering::Relaxed);
+                self.plan_release.acquire().await.expect("test plan release").forget();
+                self.active_plans.fetch_sub(1, Ordering::Relaxed);
+            }
             let should_fail = if is_thread {
                 let load = self.thread_loads.fetch_add(1, Ordering::Relaxed);
                 if self.fail_on_second.load(Ordering::Relaxed) {

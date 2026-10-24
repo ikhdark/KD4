@@ -99,27 +99,6 @@ impl Ord for TrackedPath {
     }
 }
 
-/// Maps turn mutation revisions to the source revisions that validation
-/// settles against. The mutation revision also invalidates cached evidence, so
-/// it still advances for an uncertain command whose Git-visible workspace (or,
-/// outside any Git repository, whose bounded workspace tree) was observed
-/// unchanged. Absent a mismatching tracked path, that observation is not a
-/// source change; every other recorded effect advances both revisions.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub(crate) struct ValidationRevisionMap {
-    /// Ascending mutation revisions that only invalidated evidence.
-    evidence_only: Vec<u64>,
-}
-
-impl ValidationRevisionMap {
-    pub(crate) fn validation_revision_at(&self, mutation_revision: u64) -> u64 {
-        let evidence_only = self
-            .evidence_only
-            .partition_point(|revision| *revision <= mutation_revision);
-        mutation_revision.saturating_sub(evidence_only as u64)
-    }
-}
-
 struct OwnedPatchOperation {
     sequence: u64,
     environment_id: String,
@@ -146,12 +125,9 @@ pub struct TurnDiffTracker {
     origin_by_current_path: HashMap<TrackedPath, TrackedPath>,
     mutation_revision: u64,
     attributed_mutation_revision: u64,
-    validation_revisions: ValidationRevisionMap,
     /// Exact patch effects since each validation baseline, in validation
     /// revisions. Unknown effects invalidate the proof without discarding the
     /// ordinary net diff.
-    validation_path_revisions: HashMap<TrackedPath, u64>,
-    validation_unknown_revision: u64,
     rendered_diffs: BTreeMap<(String, TrackedPath), String>,
     unavailable_paths: BTreeSet<TrackedPath>,
     /// Observed workspace changes that no command declared and no tracked path
@@ -191,9 +167,6 @@ impl Default for TurnDiffTracker {
             origin_by_current_path: HashMap::new(),
             mutation_revision: 0,
             attributed_mutation_revision: 0,
-            validation_revisions: ValidationRevisionMap::default(),
-            validation_path_revisions: HashMap::new(),
-            validation_unknown_revision: 0,
             rendered_diffs: BTreeMap::new(),
             unavailable_paths: BTreeSet::new(),
             unattributed_paths: BTreeSet::new(),
@@ -316,12 +289,10 @@ impl TurnDiffTracker {
         call_id: Option<&str>,
     ) {
         self.retain_owned_operation(environment_id, delta, call_id);
-        let previous_unknown_revision = self.validation_unknown_revision;
         if !delta.is_empty() {
             self.record_mutation();
         } else if !delta.is_exact() {
             self.mutation_revision = self.mutation_revision.saturating_add(1);
-            self.validation_unknown_revision = self.current_validation_revision();
         }
 
         if !self.valid {
@@ -341,8 +312,6 @@ impl TurnDiffTracker {
             return;
         }
 
-        self.validation_unknown_revision = previous_unknown_revision;
-        let validation_revision = self.current_validation_revision();
         if !self.remote_environments.contains(environment_id) {
             self.set_patch_modes(environment_id, delta.preimage_modes().clone());
         }
@@ -352,6 +321,9 @@ impl TurnDiffTracker {
             let change = delta.endpoint_change(original);
             let spelling = TrackedPath::new(environment_id, &original.path);
             let endpoint = TrackedPath::new(environment_id, &change.path);
+            // Check against previously observed endpoints before registering
+            // this operation, including known absence after add/delete cycles.
+            let continuous = self.patch_preimages_match(environment_id, &change);
             self.executor_paths.insert(endpoint.clone(), change.path_uri().clone());
             if let Some(destination) = change.move_path_uri() {
                 self.executor_paths.insert(TrackedPath::new(environment_id, &destination.to_path_buf()), destination.clone());
@@ -375,9 +347,6 @@ impl TurnDiffTracker {
             {
                 paths.push(TrackedPath::new(environment_id, path));
             }
-            // An exact operation is not necessarily a continuous owned chain:
-            // an independent writer can change the file between two patches.
-            let continuous = self.patch_preimages_match(environment_id, change);
             // An earlier recorded effect that made these paths unavailable left
             // stale expected content and recorded its own attribution (declared
             // command paths stay owned). Do not relabel them as another writer's.
@@ -386,8 +355,6 @@ impl TurnDiffTracker {
                 .all(|path| self.unavailable_paths.contains(path));
             let mut partners = HashSet::new();
             for path in &paths {
-                self.validation_path_revisions
-                    .insert(path.clone(), validation_revision);
                 self.collect_diff_partners(path, &mut changed);
                 self.collect_diff_partners(path, &mut partners);
             }
@@ -396,10 +363,6 @@ impl TurnDiffTracker {
                     .iter()
                     .any(|path| self.unavailable_paths.contains(path))
             {
-                for path in &partners {
-                    self.validation_path_revisions
-                        .insert(path.clone(), validation_revision);
-                }
                 self.unavailable_paths.extend(partners);
                 if !continuous && !already_unavailable {
                     self.unattributed_paths.extend(paths.iter().cloned());
@@ -506,6 +469,11 @@ impl TurnDiffTracker {
         self.unified_diff = None;
     }
 
+    /// Commands invalidate cached observations, not the apply-patch-only diff.
+    pub(crate) fn record_command_execution(&mut self) {
+        self.mutation_revision = self.mutation_revision.saturating_add(1);
+    }
+
     pub(crate) fn record_unknown_mutation(&mut self) {
         self.record_mutation();
         self.invalidate();
@@ -524,304 +492,6 @@ impl TurnDiffTracker {
         }
     }
 
-    pub(crate) fn record_command_invalidation_cause(
-        &mut self,
-        call_id: Option<&str>,
-        tool: &str,
-        command: &[String],
-        mutation: &CommandMutation,
-    ) {
-        let mutation_class = match mutation {
-            CommandMutation::ReadOnly => return,
-            CommandMutation::KnownMutation { paths: Some(paths) } if paths.is_empty() => return,
-            CommandMutation::KnownMutation { .. } => "known_mutation",
-            CommandMutation::ObservedChanges { .. } => "observed_changes_without_writer_proof",
-            CommandMutation::Uncertain => "uncertain",
-            CommandMutation::UnattributedWorkspaceChange => "unattributed_workspace_change",
-        };
-        let command_prefix: String = command
-            .iter()
-            .enumerate()
-            .flat_map(|(index, arg)| (index != 0).then_some(' ').into_iter().chain(arg.chars()))
-            .take(240)
-            .collect();
-        if call_id.is_none()
-            && self.invalidation_causes.last().is_some_and(|cause| {
-                cause["mutation_class"] == mutation_class
-                    && cause["command_prefix"] == command_prefix
-            })
-        {
-            return;
-        }
-        self.record_invalidation_cause(serde_json::json!({
-            "call_id": call_id, "tool": tool, "mutation_class": mutation_class,
-            "command_prefix": command_prefix,
-        }));
-    }
-
-    #[cfg(test)]
-    pub(crate) fn record_exec_command_end_at(
-        &mut self,
-        command: &[String],
-        exit_code: i32,
-        timed_out: bool,
-        environment_id: &str,
-        cwd: Option<&Path>,
-    ) {
-        let mutation = command_mutation(command, cwd);
-        self.record_exec_command_end_with_mutation_at(
-            command,
-            exit_code,
-            timed_out,
-            environment_id,
-            cwd,
-            mutation,
-        );
-    }
-
-    pub(crate) fn record_exec_command_end_with_mutation_at(
-        &mut self,
-        command: &[String],
-        _exit_code: i32,
-        _timed_out: bool,
-        environment_id: &str,
-        cwd: Option<&Path>,
-        mutation: CommandMutation,
-    ) {
-        self.record_command_end(command, environment_id, cwd, mutation, false);
-    }
-
-    /// Records an uncertain command whose own Git-visible workspace observation
-    /// (outside any Git repository, its bounded tree observation) was
-    /// unchanged. Its revision still invalidates cached evidence, including
-    /// ignored content. Only a mismatching tracked path, which reconciliation
-    /// reports as a known path, is a source change for validation.
-    pub(crate) fn record_git_unchanged_command_end_at(
-        &mut self,
-        command: &[String],
-        environment_id: &str,
-        cwd: Option<&Path>,
-        mutation: CommandMutation,
-    ) {
-        self.record_command_end(command, environment_id, cwd, mutation, true);
-    }
-
-    fn record_command_end(
-        &mut self,
-        command: &[String],
-        environment_id: &str,
-        cwd: Option<&Path>,
-        mutation: CommandMutation,
-        git_visible_unchanged: bool,
-    ) {
-        self.record_command_invalidation_cause(None, "shell", command, &mutation);
-        match mutation {
-            CommandMutation::KnownMutation { paths: Some(paths) } => {
-                let attributed = !paths.is_empty();
-                self.record_command_paths(
-                    environment_id,
-                    cwd,
-                    paths,
-                    attributed,
-                    git_visible_unchanged,
-                );
-            }
-            CommandMutation::ObservedChanges {
-                declared_paths,
-                unattributed_paths,
-            } => {
-                let attributed = !declared_paths.is_empty();
-                self.unattributed_paths.extend(
-                    unattributed_paths
-                        .iter()
-                        .map(|path| TrackedPath::new(environment_id, path)),
-                );
-                let paths = declared_paths
-                    .into_iter()
-                    .chain(unattributed_paths)
-                    .collect();
-                self.record_command_paths(environment_id, cwd, paths, attributed, false);
-            }
-            CommandMutation::KnownMutation { paths: None } => self.record_unknown_mutation(),
-            CommandMutation::Uncertain if git_visible_unchanged => {
-                self.mutation_revision = self.mutation_revision.saturating_add(1);
-                self.validation_revisions
-                    .evidence_only
-                    .push(self.mutation_revision);
-                self.invalidate();
-            }
-            CommandMutation::Uncertain | CommandMutation::UnattributedWorkspaceChange => {
-                self.mutation_revision = self.mutation_revision.saturating_add(1);
-                self.invalidate();
-            }
-            CommandMutation::ReadOnly => {}
-        }
-    }
-
-    fn record_command_paths(
-        &mut self,
-        environment_id: &str,
-        cwd: Option<&Path>,
-        paths: BTreeSet<PathBuf>,
-        attributed: bool,
-        git_visible_unchanged: bool,
-    ) {
-        if attributed {
-            self.record_mutation();
-        } else {
-            self.mutation_revision = self.mutation_revision.saturating_add(1);
-            if git_visible_unchanged && paths.is_empty() {
-                self.validation_revisions
-                    .evidence_only
-                    .push(self.mutation_revision);
-            } else {
-                self.validation_unknown_revision = self.current_validation_revision();
-            }
-        }
-        let mut affected = HashSet::new();
-        for path in paths {
-            let absolute = if path.is_absolute() {
-                path
-            } else {
-                cwd.map_or_else(|| path.clone(), |cwd| cwd.join(&path))
-            };
-            let path = TrackedPath::new(environment_id, &absolute);
-            self.collect_diff_partners(&path, &mut affected);
-            for tracked in self
-                .baseline_by_path
-                .keys()
-                .chain(self.current_by_path.keys())
-            {
-                if tracked.environment_id == path.environment_id
-                    && tracked.is_within(&path, cfg!(windows) && !self.remote_environments.contains(environment_id))
-                {
-                    self.collect_diff_partners(tracked, &mut affected);
-                }
-            }
-        }
-        if !self.valid {
-            // As for patches: keep naming known paths without rendering an
-            // invalid diff.
-            self.unavailable_paths.extend(affected);
-            return;
-        }
-        self.rendered_diffs
-            .retain(|(_, path), _| !affected.contains(path));
-        self.unavailable_paths.extend(affected);
-        self.aggregate_dirty = true;
-    }
-
-    /// Narrow uncertain effects to mismatching patch paths. The caller holds
-    /// the tracker lock through observation and recording, so a concurrent
-    /// patch cannot install newer expected content midway through this check.
-    pub(crate) async fn reconcile_command_mutation(
-        &mut self,
-        environment_id: &str,
-        mutation: CommandMutation,
-        fs: Option<&dyn codex_exec_server::ExecutorFileSystem>,
-    ) -> CommandMutation {
-        if fs.is_none() || !self.valid
-            || !matches!(
-                mutation,
-                CommandMutation::Uncertain | CommandMutation::UnattributedWorkspaceChange
-            )
-        {
-            return mutation;
-        }
-        let paths = self
-            .baseline_by_path
-            .keys()
-            .chain(self.current_by_path.keys())
-            .filter(|path| path.environment_id == environment_id)
-            .collect::<BTreeSet<_>>();
-        let mut mismatches = BTreeSet::new();
-        for path in paths {
-            let expected = self
-                .current_by_path
-                .get(path)
-                .map(|content| content.content.as_str());
-            let expected_mode = self.current_by_path.get(path).and_then(|content| content.mode.as_deref());
-            let mode_matches = expected_mode.is_none_or(|mode| self.observed_file_mode(path, fs) == Some(mode));
-            if !mode_matches || !content_matches(&path.path, self.executor_paths.get(path), expected, fs).await {
-                mismatches.insert(path.path.clone());
-            }
-        }
-        // Even an empty mismatch set advances the workspace evidence revision;
-        // it does not turn an unattributed change into proof of a read-only call.
-        if mismatches.is_empty() {
-            CommandMutation::KnownMutation {
-                paths: Some(mismatches),
-            }
-        } else {
-            CommandMutation::ObservedChanges {
-                declared_paths: BTreeSet::new(),
-                unattributed_paths: mismatches,
-            }
-        }
-    }
-
-    /// Declared paths can establish ownership; a mismatching tracked preimage
-    /// establishes only a source change. Preserve that distinction for both
-    /// diff invalidation and progress accounting. The caller holds the tracker
-    /// lock, as for `reconcile_command_mutation`.
-    pub(crate) async fn attribute_observed_changes(
-        &mut self,
-        environment_id: &str,
-        cwd: Option<&Path>,
-        declared: Option<&BTreeSet<PathBuf>>,
-        observed: &BTreeSet<PathBuf>,
-        fs: Option<&dyn codex_exec_server::ExecutorFileSystem>,
-    ) -> CommandMutation {
-        let attributed = declared
-            .into_iter()
-            .flatten()
-            .map(|path| match cwd {
-                Some(cwd) if !path.is_absolute() => cwd.join(path),
-                _ => path.clone(),
-            })
-            .collect::<BTreeSet<_>>();
-        let declared = attributed
-            .iter()
-            .map(|path| TrackedPath::new(environment_id, path))
-            .collect::<Vec<_>>();
-        let mut unattributed = Vec::new();
-        let mut mismatches = BTreeSet::new();
-        for path in observed {
-            let observed_path = TrackedPath::new(environment_id, path);
-            if declared.iter().any(|declared| {
-                observed_path.is_within(declared, cfg!(windows) && !self.remote_environments.contains(environment_id))
-            }) {
-                continue;
-            }
-            let tracked = self.baseline_by_path.contains_key(&observed_path)
-                || self.current_by_path.contains_key(&observed_path);
-            if !tracked {
-                unattributed.push(observed_path);
-                continue;
-            }
-            let expected = self.current_by_path.get(&observed_path);
-            let expected_mode = expected.and_then(|content| content.mode.as_deref());
-            // A coarse observer can include unchanged paths. Reconcile text
-            // only together with its semantic kind/mode; missing metadata is
-            // not proof that a reported source change was a no-op.
-            let mode_matches = expected_mode.is_some_and(|mode| self.observed_file_mode(&observed_path, fs) == Some(mode));
-            if !mode_matches || !content_matches(&observed_path.path, self.executor_paths.get(&observed_path), expected.map(|content| content.content.as_str()), fs).await {
-                mismatches.insert(path.clone());
-                unattributed.push(observed_path);
-            }
-        }
-        self.unattributed_paths.extend(unattributed);
-        if mismatches.is_empty() {
-            CommandMutation::KnownMutation {
-                paths: Some(attributed),
-            }
-        } else {
-            CommandMutation::ObservedChanges {
-                declared_paths: attributed,
-                unattributed_paths: mismatches,
-            }
-        }
-    }
 
     /// Display paths of observed changes this turn neither made nor declared.
     pub(crate) fn unattributed_display_paths(&self) -> Vec<String> {
@@ -895,33 +565,6 @@ impl TurnDiffTracker {
 
     pub(crate) fn current_mutation_revision(&self) -> u64 {
         self.mutation_revision
-    }
-
-    /// The source revision validation settlement and readiness compare.
-    pub(crate) fn current_validation_revision(&self) -> u64 {
-        self.validation_revisions
-            .validation_revision_at(self.mutation_revision)
-    }
-
-    pub(crate) fn validation_revisions(&self) -> &ValidationRevisionMap {
-        &self.validation_revisions
-    }
-
-    /// `revision` is a validation revision.
-    pub(crate) fn validation_changes_since(&self, revision: u64) -> Option<Vec<(String, PathBuf)>> {
-        if !self.valid
-            || self.validation_unknown_revision > revision
-            || revision > self.current_validation_revision()
-        {
-            return None;
-        }
-        Some(
-            self.validation_path_revisions
-                .iter()
-                .filter(|(_, changed_at)| **changed_at > revision)
-                .map(|(path, _)| (path.environment_id.clone(), path.path.clone()))
-                .collect(),
-        )
     }
 
     pub(crate) fn attributed_mutation_revision(&self) -> u64 {
@@ -1190,7 +833,6 @@ impl TurnDiffTracker {
 
     fn record_mutation(&mut self) {
         self.mutation_revision = self.mutation_revision.saturating_add(1);
-        self.validation_unknown_revision = self.current_validation_revision();
         self.attributed_mutation_revision = self.attributed_mutation_revision.saturating_add(1);
     }
 
@@ -1327,9 +969,8 @@ impl TurnDiffTracker {
     fn patch_preimages_match(&self, environment_id: &str, change: &AppliedPatchChange) -> bool {
         let matches = |path: &Path, incoming: Option<&str>| {
             let path = TrackedPath::new(environment_id, path);
-            // Revisions also retain known absence after an owned add/delete
-            // cancels out and neither content map has an entry anymore.
-            let known = self.validation_path_revisions.contains_key(&path)
+            // Endpoint metadata outlives a net-zero owned add/delete cycle.
+            let known = self.executor_paths.contains_key(&path)
                 || self.baseline_by_path.contains_key(&path)
                 || self.current_by_path.contains_key(&path);
             !known
@@ -1609,28 +1250,7 @@ impl TurnDiffTracker {
         self.patch_modes.get(path).map(String::as_str)
     }
 
-    /// Live metadata can reconcile a command, but never fills a historical
-    /// patch preimage. In particular a remote namesake is not a host path.
-    fn observed_file_mode(&self, path: &TrackedPath,
-        fs: Option<&dyn codex_exec_server::ExecutorFileSystem>) -> Option<&'static str>
-    {
-        if self.remote_environments.contains(&path.environment_id)
-            || !fs.is_some_and(|fs| fs.uses_host_native_paths()) { return None; }
-        let native = match self.executor_paths.get(path) {
-            Some(uri) => uri.to_abs_path().ok()?.to_path_buf(),
-            None if path.path.is_absolute() => path.path.clone(),
-            None => self.display_roots_by_environment.get(&path.environment_id)?.join(&path.path),
-        };
-        let metadata = std::fs::symlink_metadata(native).ok()?;
-        if metadata.file_type().is_symlink() { return Some("120000"); }
-        if !metadata.is_file() { return None; }
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            if metadata.permissions().mode() & 0o111 != 0 { return Some("100755"); }
-        }
-        Some(REGULAR_FILE_MODE)
-    }
+
 
     #[cfg(test)]
     fn rendered_diff_count(&self) -> usize {
@@ -1889,5 +1509,5 @@ fn git_blob_sha1_hex_bytes(data: &[u8]) -> Output<sha1::Sha1> {
 mod tests;
 
 #[cfg(test)]
-#[path = "turn_diff_tracker_audit147_tests.rs"]
-mod audit147_tests;
+#[path = "turn_diff_tracker_export_tests.rs"]
+mod export_tests;

@@ -603,7 +603,7 @@ for (let attempt = 0; attempt < 256; attempt++) {
             assert_eq!(
                 terminal_results.get(&format!("/root/batch_{worker}")),
                 Some(&AgentStatus::Completed(Some(format!(
-                    "Agent-reported result (behavior unverified): batch-result-{worker}"
+                    "batch-result-{worker}"
                 )))),
             );
         }
@@ -854,7 +854,7 @@ text("list-proof:" + JSON.stringify(listed));
                         let status = thread.agent_status().await;
                         match status {
                             AgentStatus::Completed(Some(ref message))
-                                if message == "Agent-reported result (behavior unverified): worker-completion-proof-7c49" =>
+                                if message == "worker-completion-proof-7c49" =>
                             {
                                 return Ok::<(), anyhow::Error>(());
                             }

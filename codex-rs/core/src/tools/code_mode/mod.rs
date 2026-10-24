@@ -109,8 +109,8 @@ pub(crate) struct CodeModeService {
     replacement_step: Mutex<std::sync::Weak<StepContext>>,
     dispatch_broker: Arc<CodeModeDispatchBroker>,
     packet_admission: Mutex<CodeModePacketAdmission>,
+    receipt_capacity: Arc<tokio::sync::Semaphore>,
     cell_parent_call_ids: Mutex<HashMap<String, String>>,
-    trace_tails: Mutex<HashMap<String, tokio::sync::oneshot::Receiver<()>>>,
     shutting_down: AtomicBool,
     /// Input of the latest sampling request, which issued the running cells.
     visible_prompt: Mutex<Option<Arc<[codex_protocol::models::ResponseItem]>>>,
@@ -121,11 +121,22 @@ pub(crate) struct CodeModeService {
 #[derive(Default)]
 struct CodeModePacketAdmission {
     cells: HashMap<String, CodeModePacketMetrics>,
+    terminal_cells: HashMap<String, CodeModePacketMetrics>,
     // Closed cells release execution state, not unresolved evidence. Keep only
     // exact recovery descriptors; the artifact owner retains the actual bytes.
     closed_recovery: HashMap<String, Vec<HashMap<String, DeliveryArtifactCoverage>>>,
     // By turn: the latest answer refused only for pending evidence recovery.
     retained_answers: HashMap<String, RetainedDeliveryAnswer>,
+}
+
+impl CodeModePacketAdmission {
+    fn metrics_mut(&mut self, cell_id: &str) -> Option<&mut CodeModePacketMetrics> {
+        if self.cells.contains_key(cell_id) {
+            self.cells.get_mut(cell_id)
+        } else {
+            self.terminal_cells.get_mut(cell_id)
+        }
+    }
 }
 
 /// A finished answer whose delivery waited only on evidence recovery. Once the
@@ -139,6 +150,8 @@ struct RetainedDeliveryAnswer {
 
 #[derive(Default)]
 struct CodeModePacketMetrics {
+    receipt_permit: Option<tokio::sync::OwnedSemaphorePermit>,
+    terminal_parent_call_id: Option<String>,
     retention_tail: Option<futures::future::Shared<futures::future::BoxFuture<'static, ()>>>,
     turn_id: Option<String>,
     delivery_retired: bool,
@@ -527,8 +540,8 @@ impl CodeModeService {
             replacement_step: Mutex::new(std::sync::Weak::new()),
             dispatch_broker,
             packet_admission: Mutex::new(CodeModePacketAdmission::default()),
+            receipt_capacity: Arc::new(tokio::sync::Semaphore::new(256)),
             cell_parent_call_ids: Mutex::new(HashMap::new()),
-            trace_tails: Mutex::new(HashMap::new()),
             shutting_down: AtomicBool::new(false),
             visible_prompt: Mutex::new(None),
             elided_bodies: Mutex::new(std::collections::HashSet::new()),
@@ -607,6 +620,12 @@ impl CodeModeService {
         request: codex_code_mode::ExecuteRequest,
         step_context: &Arc<StepContext>,
     ) -> Result<codex_code_mode::StartedCell, String> {
+        self.seal_completed_cells();
+        // Terminal custody cannot grow without bound when callers abandon
+        // yielded cells. Refuse only new execution; never evict known effects.
+        let permit = Arc::clone(&self.receipt_capacity).try_acquire_owned().map_err(|_| {
+            "Code Mode has 256 unobserved cells; use wait on returned cell IDs to collect their receipts before starting new work. No new cell started.".to_string()
+        })?;
         let replaced_earlier_in_step = self
             .replacement_step
             .lock()
@@ -634,6 +653,10 @@ impl CodeModeService {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner) = Arc::downgrade(step_context);
         }
+        if let Ok(started) = &result {
+            self.packet_admission.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+                .cells.entry(started.cell_id.to_string()).or_default().receipt_permit = Some(permit);
+        }
         result
     }
 
@@ -641,6 +664,8 @@ impl CodeModeService {
         &self,
         mut request: codex_code_mode::WaitRequest,
     ) -> Result<codex_code_mode::WaitOutcome, String> {
+        self.seal_completed_cells();
+        self.restore_terminal_packet(request.cell_id.as_str());
         request.recovery =
             self.recovery_path
                 .clone()
@@ -727,7 +752,38 @@ impl CodeModeService {
             .insert(cell_id.to_string(), call_id.to_string());
     }
 
+    fn seal_completed_cells(&self) {
+        for cell_id in self.dispatch_broker.take_closed_cells() {
+            let parent = self
+                .cell_parent_call_ids
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(cell_id.as_str());
+            let mut admission = self
+                .packet_admission
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(mut packet) = admission.cells.remove(cell_id.as_str()) {
+                packet.terminal_parent_call_id = parent;
+                admission.terminal_cells.insert(cell_id.to_string(), packet);
+            }
+        }
+    }
+
+    // This transfers observation custody only. The broker/runtime remain closed
+    // and cannot dispatch new actions on behalf of a terminal receipt.
+    fn restore_terminal_packet(&self, cell_id: &str) {
+        let mut admission = self
+            .packet_admission
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(packet) = admission.terminal_cells.remove(cell_id) {
+            admission.cells.insert(cell_id.to_string(), packet);
+        }
+    }
+
     pub(crate) fn record_output_budget(&self, cell_id: &CellId, budget: Option<usize>) {
+        self.restore_terminal_packet(cell_id.as_str());
         if let Some(metrics) = self
             .packet_admission
             .lock()
@@ -787,8 +843,7 @@ impl CodeModeService {
             .packet_admission
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .cells
-            .get_mut(cell_id.as_str())
+            .metrics_mut(cell_id.as_str())
         {
             if metrics.unobserved_settlements.len() < MAX_UNOBSERVED_SETTLEMENTS {
                 metrics
@@ -833,6 +888,7 @@ impl CodeModeService {
     }
 
     pub(crate) fn retire_delivery_turn(&self, turn_id: &str) {
+        self.seal_completed_cells();
         let mut admission = self
             .packet_admission
             .lock()
@@ -848,15 +904,18 @@ impl CodeModeService {
             metrics.delivery_intent = None;
             metrics.delivery_recovery.clear();
         }
+        for metrics in admission.terminal_cells.values_mut().filter(|metrics| metrics.turn_id.as_deref() == Some(turn_id)) {
+            metrics.delivery_retired = true;
+            metrics.delivery_intent = None;
+            metrics.delivery_recovery.clear();
+        }
     }
 
     pub(crate) fn output_budget(&self, cell_id: &str) -> Option<usize> {
-        self.packet_admission
+        let admission = self.packet_admission
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .cells
-            .get(cell_id)
-            .and_then(|metrics| metrics.output_budget)
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        admission.cells.get(cell_id).or_else(|| admission.terminal_cells.get(cell_id)).and_then(|metrics| metrics.output_budget)
     }
 
     pub(super) fn record_delivery_intent(
@@ -893,6 +952,7 @@ impl CodeModeService {
         turn: &TurnContext,
         response: &RuntimeResponse,
     ) -> Result<Option<String>, JsonValue> {
+        self.restore_terminal_packet(cell_id.as_str());
         let mut admission = self
             .packet_admission
             .lock()
@@ -901,6 +961,7 @@ impl CodeModeService {
             cells,
             closed_recovery,
             retained_answers,
+            ..
         } = &mut *admission;
         let prior_recovery_pending = closed_recovery
             .get(&turn.sub_id)
@@ -1044,11 +1105,23 @@ impl CodeModeService {
     }
 
     pub(crate) fn cell_parent_call_id(&self, cell_id: &CellId) -> Option<String> {
-        self.cell_parent_call_ids
+        let active = self
+            .cell_parent_call_ids
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(cell_id.as_str())
-            .cloned()
+            .cloned();
+        active.or_else(|| {
+            let admission = self
+                .packet_admission
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            admission
+                .cells
+                .get(cell_id.as_str())
+                .or_else(|| admission.terminal_cells.get(cell_id.as_str()))
+                .and_then(|metrics| metrics.terminal_parent_call_id.clone())
+        })
     }
 
     fn record_delivery_evidence(
@@ -1063,7 +1136,7 @@ impl CodeModeService {
             .packet_admission
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let metrics = admission.cells.get_mut(cell_id.as_str())?;
+        let metrics = admission.metrics_mut(cell_id.as_str())?;
         let mut recovery = None;
         if artifact_required {
             if let Some((id, sha256, bytes)) = artifact {
@@ -1172,6 +1245,39 @@ impl CodeModeService {
             && evidence["source"] == "artifact"
             && let Some(id) = evidence["scope"].as_str()
         {
+            // Authenticated recovery is turn evidence, not a property of the
+            // cell that happened to perform the read. Reconcile live siblings
+            // under the same owner/lock as closed obligations.
+            let turn_id = admission
+                .cells
+                .get(cell_id.as_str())
+                .and_then(|cell| cell.turn_id.clone());
+            if let Some(turn_id) = turn_id {
+                for cell in admission
+                    .cells
+                    .values_mut()
+                    .filter(|cell| cell.turn_id.as_ref() == Some(&turn_id))
+                {
+                    if let Some(required) = cell.delivery_recovery.get_mut(id) {
+                        required.observe(evidence);
+                        if required.recovered() {
+                            cell.delivery_recovery.remove(id);
+                        }
+                    }
+                }
+                for cell in admission
+                    .terminal_cells
+                    .values_mut()
+                    .filter(|cell| cell.turn_id.as_ref() == Some(&turn_id))
+                {
+                    if let Some(required) = cell.delivery_recovery.get_mut(id) {
+                        required.observe(evidence);
+                        if required.recovered() {
+                            cell.delivery_recovery.remove(id);
+                        }
+                    }
+                }
+            }
             admission.closed_recovery.retain(|_, cells| {
                 cells.retain_mut(|coverage| {
                     if let Some(required) = coverage.get_mut(id) {
@@ -1190,10 +1296,6 @@ impl CodeModeService {
 
     pub(crate) fn finish_cell_dispatch(&self, cell_id: &CellId) {
         self.dispatch_broker.close_cell(cell_id);
-        self.trace_tails
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(cell_id.as_str());
         // Only registration creates packet state. Accepted child operations
         // keep their own cleanup owner, but cannot recreate a closed packet.
         {
@@ -1201,7 +1303,7 @@ impl CodeModeService {
                 .packet_admission
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if let Some(metrics) = admission.cells.remove(cell_id.as_str())
+            if let Some(metrics) = admission.cells.remove(cell_id.as_str()).or_else(|| admission.terminal_cells.remove(cell_id.as_str()))
                 && !metrics.delivery_retired
                 && !metrics.delivery_recovery.is_empty()
                 && let Some(turn_id) = metrics.turn_id
@@ -1268,7 +1370,7 @@ impl CodeModeService {
             .packet_admission
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let Some(metrics) = admission.cells.get_mut(cell_id.as_str()) else {
+        let Some(metrics) = admission.metrics_mut(cell_id.as_str()) else {
             return false;
         };
         if result_bytes
@@ -1363,12 +1465,11 @@ impl CodeModeService {
     }
 
     fn record_packet_recovery(&self, cell_id: &CellId, ordinal: usize, recovery: JsonValue) -> bool {
-        if let Some(metrics) = self
-            .packet_admission
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .cells
-            .get_mut(cell_id.as_str())
+        let mut admission = self.packet_admission.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let metrics = if admission.cells.contains_key(cell_id.as_str()) {
+            admission.cells.get_mut(cell_id.as_str())
+        } else { admission.terminal_cells.get_mut(cell_id.as_str()) };
+        if let Some(metrics) = metrics
         {
             metrics.nested_recovery.insert(ordinal, recovery);
             return true;
@@ -1388,7 +1489,7 @@ impl CodeModeService {
             .packet_admission
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let Some(metrics) = admission.cells.get_mut(cell_id.as_str()) else {
+        let Some(metrics) = admission.metrics_mut(cell_id.as_str()) else {
             return;
         };
         metrics.pending_recovery_metadata.remove(&ordinal);
@@ -1461,6 +1562,7 @@ impl CodeModeService {
     }
 
     fn finish_packet(&self, cell_id: &str, retain_terminal: bool) -> CodeModePacketReceipt {
+        self.restore_terminal_packet(cell_id);
         let mut admission = self
             .packet_admission
             .lock()
@@ -1471,6 +1573,8 @@ impl CodeModeService {
             .map(|metrics| {
                 let next_nested_ordinal = metrics.next_nested_ordinal;
                 let mut packet = std::mem::take(metrics);
+                metrics.receipt_permit = packet.receipt_permit.take();
+                metrics.terminal_parent_call_id = packet.terminal_parent_call_id.take();
                 // A steered observer may leave storage or native callbacks
                 // pending. Keep their reservations until an observed drain;
                 // a slow disk must not let a new packet over-admit effects.
@@ -1557,6 +1661,7 @@ impl CodeModeService {
         tracker: SharedTurnDiffTracker,
         request_signals: crate::session::turn_execution::SamplingRequestSignalCollector,
     ) -> Option<CodeModeDispatchWorker> {
+        self.seal_completed_cells();
         let turn = &step_context.turn;
         let tool_mode = effective_tool_mode(turn);
         if !matches!(tool_mode, ToolMode::CodeMode | ToolMode::CodeModeOnly) {
@@ -1597,6 +1702,31 @@ impl CodeModeService {
     }
 }
 
+fn refresh_ready_command_states(exec: &ExecContext, packet: &mut CodeModePacketReceipt) {
+    use codex_tools::ToolOutput;
+    for state in &mut packet.command_states {
+        let Some(process_id) = state["session_id"].as_u64().and_then(|id| u32::try_from(id).ok()) else { continue; };
+        let Some(incarnation) = state.pointer("/session_capabilities/incarnation")
+            .and_then(JsonValue::as_str).and_then(|id| uuid::Uuid::parse_str(id).ok()) else { continue; };
+        let Some(result) = exec.session.services.unified_exec_manager.try_finish_for_packet(
+            process_id, incarnation, exec.turn.model_info.truncation_policy.into(),
+            Some(codex_code_mode::MAX_NESTED_COMMAND_OUTPUT_TOKENS),
+        ) else { continue; };
+        let result = result.code_mode_result(&ToolPayload::Function { arguments: "{}".into() });
+        let Some(mut refreshed) = command_result_state(&result) else { continue; };
+        for key in ["call_id", "tool", "polled_session_id", "pending_deferred_completions"] {
+            if let Some(value) = state.get(key) { refreshed[key] = value.clone(); }
+        }
+        packet.post_tool_use_feedback.push(FunctionCallOutputContentItem::InputText {
+            text: serde_json::json!({"nested_command_settlement": {
+                "call_id": state["call_id"], "result": result,
+                "notice": "This ready-only owner settlement supersedes the earlier command snapshot; no command was rerun.",
+            }}).to_string(),
+        });
+        *state = refreshed;
+    }
+}
+
 pub(super) fn handle_runtime_response(
     exec: &ExecContext,
     response: RuntimeResponse,
@@ -1615,13 +1745,11 @@ pub(super) fn handle_runtime_response(
     let original_image_detail_supported = can_request_original_image_detail(&exec.turn.model_info);
 
     let cell_id = runtime_response_cell_id(&response);
-    let packet = exec.session.services.code_mode_service.finish_packet(
+    let mut packet = exec.session.services.code_mode_service.finish_packet(
         cell_id,
-        matches!(
-            &response,
-            RuntimeResponse::Yielded { .. } | RuntimeResponse::ExplicitYield { .. }
-        ),
+        !runtime_response_is_terminal(&response),
     );
+    refresh_ready_command_states(exec, &mut packet);
     tracing::info!(
         target: "codex.code_mode.packet",
         cell_id,
@@ -1631,6 +1759,27 @@ pub(super) fn handle_runtime_response(
         "code-mode packet admission receipt"
     );
     let mut post_tool_use_feedback = packet.post_tool_use_feedback;
+    let cancelled_nested_calls = matches!(&response, RuntimeResponse::Terminated { .. }).then(|| {
+        let mut calls = packet.nested_recovery.values().map(|entry| {
+            // Reuse the existing exact-artifact index instead of placing a
+            // second full successful read into non-spillable native metadata.
+            let mut entry = compact_emitted_packet_recovery(entry.clone(), "");
+            let failed = entry["failed"].as_bool().or_else(|| packet.nested_results.iter()
+                .find(|result| Some(result.call_id.as_str()) == entry["call_id"].as_str())
+                .map(|result| result.failed));
+            let aborted = entry.pointer("/outcome/result/status").and_then(JsonValue::as_str) == Some("aborted");
+            entry["disposition"] = match failed.filter(|_| !aborted) {
+                Some(false) => "settled_success", Some(true) => "settled_failure", None => "unresolved",
+            }.into();
+            entry
+        }).collect::<Vec<_>>();
+        calls.extend(packet.unsettled_nested_calls.iter().map(|entry| {
+            let mut entry = entry.clone();
+            entry["disposition"] = "unresolved".into();
+            entry
+        }));
+        serde_json::json!({"calls":calls,"retry_safe":false})
+    });
     let needs_retained_results = response_needs_retained_nested_results(&response);
     let nested_results = if needs_retained_results {
         if packet.omitted_nested_result_count > 0
@@ -1796,7 +1945,32 @@ pub(super) fn handle_runtime_response(
             text: serde_json::json!({"nested_commands": canonical_states}).to_string(),
         });
     }
+    if let Some(calls) = cancelled_nested_calls {
+        output.essential_inline.insert("cancelled_nested_calls".into(), calls);
+    }
     Ok(output)
+}
+
+/// Host observation is not a rollback. Route failure through packet formatting
+/// so known effects and outstanding call identities survive observer cleanup.
+fn observation_error_response(cell_id: &CellId, error: String) -> RuntimeResponse {
+    RuntimeResponse::Result {
+        cell_id: cell_id.clone(),
+        content_items: Vec::new(),
+        error_text: Some(format!("Host observation failed: {error}. The enclosing cell state is uncertain; completed nested effects were not rolled back. Do not replay the cell.")),
+        output_loss: None,
+    }
+}
+
+fn observation_failed(response: &RuntimeResponse) -> bool {
+    matches!(response, RuntimeResponse::Result{error_text:Some(error),..} if error.starts_with("Host observation failed:"))
+}
+
+fn runtime_response_is_terminal(response: &RuntimeResponse) -> bool {
+    matches!(
+        response,
+        RuntimeResponse::Terminated { .. } | RuntimeResponse::Result { .. }
+    ) && !observation_failed(response)
 }
 
 fn command_control_receipts(
@@ -1872,6 +2046,16 @@ fn failed_code_mode_cell_item(
     duration: Duration,
 ) -> Option<DynamicToolCallItem> {
     let (cell_id, state, status, error) = match response {
+        RuntimeResponse::Result {
+            cell_id,
+            error_text: Some(error),
+            ..
+        } if observation_failed(response) => (
+            cell_id.as_str(),
+            "in_progress",
+            DynamicToolCallStatus::InProgress,
+            Some(bounded_failed_cell_error(error)),
+        ),
         RuntimeResponse::Result {
             cell_id,
             error_text: Some(error),
@@ -2041,8 +2225,9 @@ fn runtime_response_cell_id(response: &RuntimeResponse) -> &str {
 
 fn response_needs_retained_nested_results(response: &RuntimeResponse) -> bool {
     match response {
-        RuntimeResponse::Yielded { content_items, .. }
-        | RuntimeResponse::ExplicitYield { content_items, .. } => content_items.is_empty(),
+        // Progress and synthetic activity are not acknowledgment of nested
+        // effects. Hand their receipts to the model before draining the packet.
+        RuntimeResponse::Yielded { .. } | RuntimeResponse::ExplicitYield { .. } => true,
         RuntimeResponse::Terminated { .. } => true,
         RuntimeResponse::Result {
             content_items,
@@ -2089,6 +2274,9 @@ fn compact_emitted_packet_recovery(mut entry: JsonValue, emitted: &str) -> JsonV
     };
     if let Some(reference) = retained_artifact_reference(result) {
         entry["outcome"] = reference;
+        return entry;
+    }
+    if emitted.is_empty() {
         return entry;
     }
     let serialized = result.to_string();
@@ -2146,6 +2334,7 @@ fn format_runtime_response(
         | RuntimeResponse::Terminated { cell_id, .. }
         | RuntimeResponse::Result { cell_id, .. } => cell_id.to_string(),
     };
+    let execution_unknown = observation_failed(&response);
     let script_status = format_script_status(&response);
     let output_loss = match &response {
         RuntimeResponse::Result { output_loss, .. } => output_loss.clone(),
@@ -2324,6 +2513,10 @@ fn format_runtime_response(
             .essential_inline
             .insert("store_commit".to_string(), receipt);
     }
+    if execution_unknown {
+        output.essential_inline.insert("cell_execution_state".into(), "unknown".into());
+        output.essential_inline.insert("retry_safe".into(), false.into());
+    }
     if visible_output_truncated {
         output.essential_inline.insert(
             VISIBLE_OUTPUT_TRUNCATED_KEY.to_string(),
@@ -2343,6 +2536,9 @@ fn format_runtime_response(
 }
 
 fn format_script_status(response: &RuntimeResponse) -> String {
+    if observation_failed(response) {
+        return format!("Cell execution state unknown after host observation failure (cell ID {})", runtime_response_cell_id(response));
+    }
     match response {
         RuntimeResponse::Yielded { cell_id, .. } => {
             format!("Script running with cell ID {cell_id}")
@@ -2750,7 +2946,9 @@ async fn call_nested_tool(
                 packet_ordinal,
                 Vec::new(),
                 None,
-                Some((RequiredToolTerminalCause::Failure, message.clone())),
+                // No effect was dispatched. A caught routing error can be
+                // repaired by the native tool; uncaught errors still fail JS.
+                None,
             );
         return Err(FunctionCallError::RespondToModel(message));
     }
@@ -2763,12 +2961,7 @@ async fn call_nested_tool(
     // Filled by dispatch only after workspace admission, including any edits
     // that finish while this nested call waits for its lease.
     let admitted_revision = Arc::new(std::sync::Mutex::new(None));
-    // A nested read is a path-scoped observation in its own right. Capture the
-    // same pre-admission baseline the direct lane captures so an unchanged file
-    // can be replayed from retained bytes instead of re-delivered in full. Only
-    // reads need it: the enclosing cell keeps its own incomplete-scope evidence.
-    let nested_read_baseline_slot = (tool_name == ToolName::plain("read_file"))
-        .then(crate::tools::parallel::new_workspace_evidence_baseline_slot);
+
     let result = tool_runtime
         .clone()
         .handle_tool_call_with_admitted_revision(
@@ -2785,7 +2978,7 @@ async fn call_nested_tool(
             },
             cancellation_token,
             Some(Arc::clone(&admitted_revision)),
-            nested_read_baseline_slot.clone(),
+            None,
         )
         .await;
     let mut result = match result {
@@ -2794,41 +2987,14 @@ async fn call_nested_tool(
             let message = error.to_string();
             let (retained_output, output_truncated, _) = bounded_failed_nested_text(&message);
             let terminal_cause = required_tool_error_terminal_cause(&error);
-            if let Some(validation_proof) =
-                crate::validation_task::take_admission_refusal(&exec.turn, &nested_call_id)
-            {
-                // The dispatch owner proved that no validation started. Keep
-                // the requested launch pending, without inventing an executed
-                // failure under an identity the eventual result cannot match.
-                tool_runtime.record_code_mode_result(
-                    &nested_call_id,
-                    CodeModeToolResult {
-                        cell_id: cell_id.as_str(),
-                        tool_name: &tool_name,
-                        payload: &payload,
-                        source_dependencies: None,
-                        outcome_context: ToolOutputOutcomeContext::new(ToolOutputOutcome::Failure),
-                        signal: Some(&serde_json::json!({
-                            "outcome": "blocked", "validation_admission_pending": true,
-                            "validation_admission_proof": validation_proof
-                        })),
-                        result: &serde_json::json!({"error": message}),
-                        canonical_artifact_required: false,
-                    },
-                    &[],
-                );
-            } else {
-                tool_runtime
-                    .record_code_mode_failure(
-                        cell_id.as_str(),
-                        &tool_name,
-                        // Dispatch errors do not carry an executed payload.
-                        // Hooks may have rewritten the request before failing.
-                        None,
-                        nested_failure_fingerprint(&tool_name, &message),
-                    )
-                    .await;
-            }
+            tool_runtime
+                .record_code_mode_failure(
+                    cell_id.as_str(),
+                    &tool_name,
+                    None,
+                    nested_failure_fingerprint(&tool_name, &message),
+                )
+                .await;
             exec.session
                 .services
                 .code_mode_service
@@ -2897,14 +3063,11 @@ async fn call_nested_tool(
         .min(codex_code_mode::MAX_OUTPUT_TOKENS_PER_EXEC_CALL)
         * 4
         / 5;
-    let replay_response = (outcome_context.outcome == ToolOutputOutcome::Success
-        && nested_read_baseline_slot.is_some())
-    .then(|| {
-        result
-            .result
-            .to_response_item(&nested_call_id, &result.payload)
-    });
+
     let mut result_value = result.code_mode_result_with_budget(budget);
+    if tool_name == ToolName::plain("tool_search") {
+        annotate_search_execution_routes(&mut result_value, exec.turn.config.code_mode.excluded_tool_namespaces.iter());
+    }
     tracing::info!(event.name = "codex.code_mode_nested_tool.semantic_result",
         turn_id = %exec.turn.sub_id, runtime_cell_id = %cell_id,
         runtime_tool_call_id = %runtime_tool_call_id,
@@ -2987,6 +3150,26 @@ async fn call_nested_tool(
         crate::tools::command_output_artifact::reserve_canonical_retention(
             &exec.turn.config.codex_home, &exec.session.thread_id.to_string(), id,
         )
+    });
+    // Reserve a transport-safe representation before the remote bridge tries
+    // encoding. Raw result bytes remain canonical; transport never reruns the
+    // producer or converts its completed success into a frame-size failure.
+    let large_result_receipt = (result_bytes > 32 * 1024 * 1024).then(|| {
+        let artifact = recovery_artifact.as_ref().map(|(id, sha256, bytes)| serde_json::json!({
+            "artifact_id":id, "canonical_sha256":sha256,"canonical_bytes":bytes,
+            "canonical_retention":"complete",
+            "recovery":{"tool":"read_tool_output","arguments":{"artifact_id":id,
+                "selectors":[{"kind":"bytes","start":0,"end":bytes}]}}
+        })).unwrap_or_else(|| serde_json::json!({
+            "artifact_id":retention_id.map(|id| id.to_string()), "canonical_bytes":result_bytes,
+            "canonical_retention":"pending", "retry_safe":false,
+            "recovery":{"tool":"read_tool_output","arguments":{"artifact_id":retention_id.map(|id| id.to_string()),
+                "selectors":[{"kind":"bytes","start":0,"end":result_bytes}]}}
+        }));
+        serde_json::json!({"result_retained":true,"call_id":nested_call_id,
+            "completed":outcome_context.outcome == ToolOutputOutcome::Success,
+            "failed":nested_failed, "outcome":artifact,
+            "notice":"The raw result is retained, not inline. Recover it with bounded read_tool_output selections; do not replay the tool."})
     });
     if let Some(id) = retention_id {
         exec.session.services.code_mode_service.record_packet_recovery(&cell_id, packet_ordinal,
@@ -3107,12 +3290,12 @@ async fn call_nested_tool(
     } else {
         retention.await;
     }
-    let script_result = script_visible_nested_result(
+    let script_result = large_result_receipt.unwrap_or_else(|| script_visible_nested_result(
         &tool_name,
         result_value.clone(),
         &nested_call_id,
         packet_ordinal,
-    );
+    ));
     let nested_result = CodeModeNestedResultEvidence {
         failed: !matches!(
             outcome_context.outcome,
@@ -3136,7 +3319,7 @@ async fn call_nested_tool(
     };
     let post_context_failure = signal
         .as_ref()
-        .and_then(|signal| signal.get("post_tool_context_error"))
+        .and_then(|signal| signal.get("post_tool_context_error").or_else(|| signal.get("required_accounting_error")))
         .and_then(JsonValue::as_str)
         .map(|message| (RequiredToolTerminalCause::Failure, message.to_string()));
     let required_terminal = post_context_failure.or_else(|| {
@@ -3183,7 +3366,7 @@ async fn call_nested_tool(
             Some(nested_result),
             required_terminal,
         );
-    let replay_source_dependencies = source_dependencies.clone();
+
     tool_runtime.record_code_mode_result(
         &nested_call_id,
         CodeModeToolResult {
@@ -3198,26 +3381,7 @@ async fn call_nested_tool(
         },
         &receipts,
     );
-    // Seed selector-level reuse for a successful, exactly-scoped nested read.
-    // This records only what was observed; the dispatcher still re-proves the
-    // file hash and source paths under its own workspace read lease before it
-    // reuses these bytes, so a stale or mutated file can never be replayed.
-    if outcome_context.outcome == ToolOutputOutcome::Success
-        && compact_source_read
-        && let Some(baseline_slot) = nested_read_baseline_slot
-        && let Some(response) = replay_response
-    {
-        tool_runtime
-            .record_nested_read_replay_evidence(
-                &nested_call_id,
-                baseline_slot,
-                replay_source_dependencies,
-                &payload,
-                &result_value,
-                &response,
-            )
-            .await;
-    }
+
     if failure_is_error
         && matches!(
             outcome_context.outcome,
@@ -3231,6 +3395,46 @@ async fn call_nested_tool(
     // process completion, recover omitted output, and use patch change metadata
     // without returning to the model for another decision.
     Ok(script_result)
+}
+
+fn annotate_search_execution_routes<'a>(
+    result: &mut JsonValue,
+    excluded: impl Iterator<Item = &'a String>,
+) {
+    let excluded = excluded
+        .map(String::as_str)
+        .collect::<std::collections::HashSet<_>>();
+    let mut direct = std::collections::BTreeSet::new();
+    if let Some(tools) = result["tools"].as_array() {
+        for tool in tools {
+            if let Some(namespace) =
+                tool["name"].as_str().filter(|name| excluded.contains(name))
+                && let Some(members) = tool["tools"].as_array()
+            {
+                for member in members {
+                    if let Some(name) = member["name"].as_str() {
+                        direct.insert(format!("{namespace}.{name}"));
+                    }
+                }
+            }
+        }
+    }
+    if let Some(names) = result["activated_omitted_tools"].as_array() {
+        for name in names.iter().filter_map(JsonValue::as_str) {
+            if name
+                .split_once('.')
+                .is_some_and(|(namespace, _)| excluded.contains(namespace))
+            {
+                direct.insert(name.to_string());
+            }
+        }
+    }
+    if !direct.is_empty() {
+        result["direct_only_tools"] = serde_json::json!(direct);
+        result["direct_only_guidance"] = serde_json::json!(
+            "These tools were activated for the next direct model interface. They are excluded from this cell's immutable catalog: do not use resolve_tool for these names. End the cell and invoke their advertised direct schemas."
+        );
+    }
 }
 
 /// Remove nondeterministic diagnostics, not lifecycle or recovery controls.
@@ -3708,11 +3912,51 @@ fn build_freeform_tool_payload(
 mod response_tests;
 
 #[cfg(test)]
-#[path = "audit147_tests.rs"]
-mod audit147_tests;
+#[path = "retention_handle_tests.rs"]
+mod retention_handle_tests;
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn packet_emission_refreshes_ready_terminal_without_another_poll() {
+        let (session, turn) = crate::session::tests::make_session_and_context().await;
+        let session = Arc::new(session);
+        let turn = Arc::new(turn);
+        let (incarnation, terminal) = session.services.unified_exec_manager
+            .pending_packet_terminal_for_test(&session, &turn, 42).await;
+        for ready in [false, true] {
+            if ready { terminal.send_replace(Some(Ok(()))); }
+            let cell = CellId::new(format!("ready-packet-{ready}"));
+            let service = &session.services.code_mode_service;
+            service.record_cell_parent_call_id(&cell, "outer");
+            service.complete_packet_call(&cell, 0, Vec::new(), Some(super::CodeModeNestedResultEvidence {
+                ordinal: 0, call_id: "command".into(), parent_call_id: Some("outer".into()),
+                parent_cell_id: cell.to_string(), runtime_tool_call_id: "nested".into(),
+                tool_name: "exec_command".into(), output: "{}".into(), output_truncated: false,
+                failed: false, output_fingerprints: Vec::new(),
+                command_state: Some(json!({"call_id":"command", "tool":"exec_command", "session_id":42,
+                    "session_capabilities":{"incarnation":incarnation}, "process_exited":true,
+                    "exit_code":0, "output_complete":false, "streams_complete":false})),
+            }), None);
+            let output = super::handle_runtime_response(
+                &super::ExecContext { session: Arc::clone(&session), turn: Arc::clone(&turn) },
+                super::observation_error_response(&cell, "cell transport ended".into()),
+                None, std::time::Instant::now(),
+            ).unwrap();
+            let command = &output.essential_inline["nested_commands"][0];
+            let visible = super::code_mode_text_content(&output.body);
+            if ready {
+                assert!(command["session_id"].is_null());
+                assert_eq!(command["streams_complete"], true);
+                assert!(visible.contains("nested_command_settlement"), "{visible}");
+                assert!(visible.contains("late output"), "{visible}");
+            } else {
+                assert_eq!(command["session_id"], 42);
+                assert!(!visible.contains("nested_command_settlement"));
+            }
+        }
+    }
+
     use std::sync::Arc;
     use std::time::Duration;
 
@@ -3749,6 +3993,168 @@ mod tests {
 
     fn test_service() -> CodeModeService {
         CodeModeService::new(Arc::new(ProcessOwnedCodeModeSessionProvider::default()))
+    }
+
+    #[tokio::test]
+    async fn audit144_sibling_recovery_discharges_live_and_sealed_obligations() {
+        for sealed in [false, true] {
+            let service = test_service();
+            let a = CellId::new("owner".into());
+            let b = CellId::new("reader".into());
+            for cell in [&a, &b] {
+                service.record_cell_parent_call_id(cell, "outer");
+                service.record_cell_turn(cell, "turn");
+            }
+            service.record_delivery_evidence(
+                &a,
+                true,
+                Some(("artifact".into(), "hash".into(), 12)),
+                None,
+                &json!({}),
+            );
+            if sealed {
+                codex_code_mode::CodeModeSessionDelegate::cell_closed(
+                    service.dispatch_broker.as_ref(),
+                    &a,
+                );
+                service.seal_completed_cells();
+                assert!(
+                    !service
+                        .cell_parent_call_ids
+                        .lock()
+                        .unwrap()
+                        .contains_key(a.as_str())
+                );
+                assert_eq!(service.cell_parent_call_id(&a).as_deref(), Some("outer"));
+            }
+            for (hash, ranges, done) in [
+                ("wrong", json!([[0, 12]]), false),
+                ("hash", json!([[0, 5]]), false),
+                ("hash", json!([[5, 12]]), true),
+            ] {
+                service.record_delivery_evidence(&b,false,None,Some(&json!({"semantic_evidence":{"source":"artifact","scope":"artifact","identity":{"sha256":hash,"ranges":ranges}}})),&json!({}));
+                let mut admission = service.packet_admission.lock().unwrap();
+                assert_eq!(
+                    admission
+                        .metrics_mut(a.as_str())
+                        .unwrap()
+                        .delivery_recovery
+                        .is_empty(),
+                    done
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn audit144_terminal_sealing_retires_execution_owners_without_losing_receipts() {
+        let service = test_service();
+        for i in 0..256 {
+            let cell = CellId::new(format!("cell-{i}"));
+            service.record_cell_parent_call_id(&cell, "outer");
+            service
+                .packet_admission
+                .lock()
+                .unwrap()
+                .cells
+                .get_mut(cell.as_str())
+                .unwrap()
+                .receipt_permit = Some(
+                Arc::clone(&service.receipt_capacity)
+                    .try_acquire_owned()
+                    .unwrap(),
+            );
+            service.record_packet_recovery(&cell, 0, json!({"receipt":i}));
+            codex_code_mode::CodeModeSessionDelegate::cell_closed(
+                service.dispatch_broker.as_ref(),
+                &cell,
+            );
+            service.seal_completed_cells();
+        }
+        assert!(service.cell_parent_call_ids.lock().unwrap().is_empty());
+        assert!(service.packet_admission.lock().unwrap().cells.is_empty());
+        assert_eq!(
+            service
+                .packet_admission
+                .lock()
+                .unwrap()
+                .terminal_cells
+                .len(),
+            256
+        );
+        assert!(
+            Arc::clone(&service.receipt_capacity)
+                .try_acquire_owned()
+                .is_err()
+        );
+        let cell = CellId::new("cell-0".into());
+        assert_eq!(
+            service.finish_packet(cell.as_str(), false).nested_recovery[&0]["receipt"],
+            0
+        );
+        service.finish_cell_dispatch(&cell);
+        assert_eq!(service.receipt_capacity.available_permits(), 1);
+    }
+
+    #[test]
+    fn audit144_search_routes_cover_returned_and_omitted_excluded_tools() {
+        let mut value = json!({"tools":[{"type":"namespace","name":"excluded","tools":[{"name":"read"}]}],"activated_omitted_tools":["excluded.omitted","normal.read"]});
+        super::annotate_search_execution_routes(&mut value, ["excluded".to_string()].iter());
+        assert_eq!(
+            value["direct_only_tools"],
+            json!(["excluded.omitted", "excluded.read"])
+        );
+        assert!(
+            value["direct_only_guidance"]
+                .as_str()
+                .unwrap()
+                .contains("do not use resolve_tool")
+        );
+    }
+
+    #[tokio::test]
+    async fn audit144_host_observation_failure_formats_known_effect_before_retirement() {
+        let (mut session, turn) = crate::session::tests::make_session_and_context().await;
+        session.services.code_mode_service = test_service();
+        let session = Arc::new(session);
+        let service = &session.services.code_mode_service;
+        let cell = CellId::new("host-lost".into());
+        service.record_cell_parent_call_id(&cell, "outer");
+        service.complete_packet_call(
+            &cell,
+            0,
+            Vec::new(),
+            Some(super::CodeModeNestedResultEvidence {
+                ordinal: 0,
+                call_id: "committed-append".into(),
+                parent_call_id: Some("outer".into()),
+                parent_cell_id: cell.to_string(),
+                runtime_tool_call_id: "tool-1".into(),
+                tool_name: "apply_patch".into(),
+                output: "APPEND_COMMITTED".into(),
+                output_truncated: false,
+                failed: false,
+                command_state: None,
+                output_fingerprints: Vec::new(),
+            }),
+            None,
+        );
+        let output = super::handle_runtime_response(
+            &super::ExecContext {
+                session: Arc::clone(&session),
+                turn: Arc::new(turn),
+            },
+            super::observation_error_response(&cell, "transport lost".into()),
+            None,
+            std::time::Instant::now(),
+        )
+        .unwrap();
+        let visible = super::code_mode_text_content(&output.body);
+        assert!(visible.contains("APPEND_COMMITTED"), "{visible}");
+        assert!(visible.contains("uncertain"), "{visible}");
+        assert_eq!(output.success, Some(false));
+        service.finish_cell_dispatch(&cell);
+        assert!(service.packet_admission.lock().unwrap().cells.is_empty());
     }
 
     #[tokio::test]

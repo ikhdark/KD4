@@ -214,8 +214,15 @@ impl WsIngressReceiver {
 enum WsCommand {
     Send {
         message: Message,
-        tx_result: oneshot::Sender<Result<(), WsError>>,
+        dispatch_guard: Option<Arc<dyn codex_http_client::RequestDispatchGuard>>,
+        tx_result: oneshot::Sender<Result<(), WsSendError>>,
     },
+}
+
+#[derive(Debug)]
+enum WsSendError {
+    Admission(String),
+    Socket(WsError),
 }
 
 impl WsStream {
@@ -238,13 +245,16 @@ impl WsStream {
                             break;
                         };
                         match command {
-                            WsCommand::Send { message, tx_result } => {
+                            WsCommand::Send { message, dispatch_guard, tx_result } => {
                                 // A cancelled queued request must never be sent later.
                                 if tx_result.is_closed() {
                                     continue;
                                 }
-                                let result = inner.send(message).await;
-                                let should_break = result.is_err();
+                                let result = codex_http_client::with_dispatch_guard(dispatch_guard,
+                                    codex_http_client::admit_dispatch(inner.send(message))).await
+                                    .map_err(WsSendError::Admission)
+                                    .and_then(|result| result.map_err(WsSendError::Socket));
+                                let should_break = matches!(&result, Err(WsSendError::Socket(_)));
                                 let _ = tx_result.send(result);
                                 if should_break {
                                     break;
@@ -322,6 +332,7 @@ impl WsStream {
     }
 
     async fn send(&self, message: Message, idle_timeout: Duration) -> Result<(), ApiError> {
+        let dispatch_guard = codex_http_client::bind_dispatch_guard(None);
         let deadline = Instant::now() + idle_timeout;
         // Reserve before transferring the non-idempotent command. Failure here
         // proves no dispatch; after transfer, even a lost acknowledgement is unknown.
@@ -336,10 +347,11 @@ impl WsStream {
                 delay: None,
             })?;
         let (tx_result, rx_result) = oneshot::channel();
-        permit.send(WsCommand::Send { message, tx_result });
+        permit.send(WsCommand::Send { message, dispatch_guard, tx_result });
         let reason = match tokio::time::timeout_at(deadline, rx_result).await {
             Ok(Ok(Ok(()))) => return Ok(()),
-            Ok(Ok(Err(error))) => format!("failed to send websocket request: {error}"),
+            Ok(Ok(Err(WsSendError::Admission(error)))) => return Err(ApiError::Transport(TransportError::Build(error))),
+            Ok(Ok(Err(WsSendError::Socket(error)))) => format!("failed to send websocket request: {error}"),
             Ok(Err(_)) => "websocket send acknowledgement was lost".into(),
             Err(_) => format!(
                 "idle timeout sending websocket request after {}ms",
@@ -450,6 +462,13 @@ impl ResponsesWebsocketConnection {
 
     pub async fn is_closed(&self) -> bool {
         self.retired.load(Ordering::Acquire) || self.pump_handle.is_finished()
+    }
+
+    /// Handoff must exclude an active response that may still retire the socket
+    /// when its consumer is dropped. Inspect the existing exclusive owner without
+    /// waiting; connection health remains a separate check at reuse time.
+    pub fn has_active_response(&self) -> bool {
+        self.stream.try_lock().is_err()
     }
 
     pub async fn stream_request(
@@ -630,9 +649,9 @@ impl ResponsesWebsocketConnection {
                     let Some(ws_stream) = guard.as_mut() else {
                         let _ = tx_send_complete.send(());
                         let _ = tx_event
-                            .send(Err(ApiError::Stream(
-                                "websocket connection is closed".to_string(),
-                            )))
+                            .send(Err(ApiError::Transport(TransportError::PreDispatch(
+                                "websocket connection retired before dispatch".to_string(),
+                            ))))
                             .await;
                         return;
                     };
@@ -1233,6 +1252,9 @@ fn websocket_read_error(err: WsError) -> ApiError {
         WsError::Protocol(ProtocolError::ResetWithoutClosingHandshake) => {
             "websocket closed before response.completed".to_string()
         }
+        WsError::Protocol(_) => return ApiError::invalid_response("invalid websocket protocol frame"),
+        WsError::Capacity(_) => return ApiError::invalid_response("websocket frame exceeds capacity"),
+        WsError::Utf8(_) => return ApiError::invalid_response("invalid websocket UTF-8 message"),
         err => err.to_string(),
     };
     ApiError::Stream(message)
@@ -1803,6 +1825,73 @@ mod tests {
         }
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn queued_websocket_send_rechecks_authority_in_the_real_pump() {
+        struct Guard(Arc<std::sync::atomic::AtomicBool>);
+        impl codex_http_client::RequestDispatchGuard for Guard {
+            fn admit(&self, dispatch: &mut dyn FnMut()) -> Result<(), String> {
+                if !self.0.load(Ordering::SeqCst) { return Err("authority revoked".into()); }
+                dispatch();
+                Ok(())
+            }
+        }
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (done, wait_done) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut websocket = tokio_tungstenite::accept_async_with_config(
+                socket, Some(websocket_config()),
+            ).await.unwrap();
+            let received = tokio::time::timeout(Duration::from_millis(100), websocket.next()).await;
+            assert!(received.is_err(), "revoked command must not reach the socket: {received:?}");
+            let _ = wait_done.await;
+        });
+        let factory = HttpClientFactory::new(codex_http_client::OutboundProxyPolicy::ReqwestDefault);
+        let connected = connect_websocket(Url::parse(&format!("ws://{address}/responses")).unwrap(), HeaderMap::new(), &factory, None).await.unwrap();
+        let allowed = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let send = codex_http_client::with_dispatch_guard(Some(Arc::new(Guard(allowed.clone()))),
+            codex_http_client::admit_dispatch(connected.stream.send(Message::Text("must not send".into()), Duration::from_secs(1))));
+        tokio::pin!(send);
+        assert!(futures::poll!(&mut send).is_pending());
+        // The caller's initial admission succeeded, but its queued command has
+        // not been polled by the separately spawned physical-send owner yet.
+        allowed.store(false, Ordering::SeqCst);
+        let error = send.await.unwrap().unwrap_err();
+        assert!(!crate::api_bridge::map_api_error(error).is_retryable());
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        let _ = done.send(());
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn permanent_websocket_decode_errors_retire_the_real_receive_path() {
+        for frame in [vec![0x81, 1, 0xff], vec![0x83, 0],
+            vec![0x82, 0x7f, 0x7f, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff]] {
+            use tokio::io::AsyncWriteExt;
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let (socket, _) = listener.accept().await.unwrap();
+                let mut websocket = tokio_tungstenite::accept_async_with_config(
+                    socket, Some(websocket_config()),
+                ).await.unwrap();
+                assert!(matches!(websocket.next().await, Some(Ok(Message::Text(_)))));
+                websocket.get_mut().write_all(&frame).await.unwrap();
+                websocket.get_mut().flush().await.unwrap();
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            });
+            let factory = HttpClientFactory::new(codex_http_client::OutboundProxyPolicy::ReqwestDefault);
+            let connected = connect_websocket(Url::parse(&format!("ws://{address}/responses")).unwrap(), HeaderMap::new(), &factory, None).await.unwrap();
+            let connection = ResponsesWebsocketConnection::new(connected.stream, Duration::from_secs(1), connected.metadata, None);
+            let mut response = connection.stream_request(test_response_request("test"), false, None).await.unwrap();
+            let error = response.next().await.unwrap().unwrap_err();
+            assert!(!crate::api_bridge::map_api_error(error).is_retryable());
+            assert!(response.next().await.is_none());
+            server.await.unwrap();
+        }
+    }
+
     #[tokio::test]
     async fn connection_reports_closed_after_websocket_pump_exits() {
         let (tx_command, rx_command) = mpsc::channel::<WsCommand>(1);
@@ -2162,10 +2251,62 @@ mod tests {
             .expect("closed connection error")
             .expect_err("must reject reuse");
         assert!(
-            matches!(error, ApiError::Stream(message) if message == "websocket connection is closed")
+            matches!(error, ApiError::Transport(TransportError::PreDispatch(message))
+                if message == "websocket connection retired before dispatch")
         );
         assert!(second.next().await.is_none());
         assert_eq!(dispatches.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    #[expect(
+        clippy::await_holding_invalid_type,
+        reason = "Hold the active response lock until a queued caller observes retirement"
+    )]
+    async fn retirement_while_queued_is_predispatch_and_never_sends() {
+        let (tx_command, _rx_command) = mpsc::channel::<WsCommand>(1);
+        let (_tx_message, rx_message) = ws_ingress_channel(1, 1024);
+        let connection = ResponsesWebsocketConnection::new(
+            WsStream {
+                tx_command,
+                rx_message,
+                rx_failure: None,
+                pending_failure: None,
+                response_history: Default::default(),
+                pump_task: tokio::spawn(std::future::pending()),
+            },
+            Duration::from_secs(60),
+            ResponsesStreamMetadata::default(),
+            None,
+        );
+        assert!(!connection.has_active_response());
+        let mut guard = connection.stream.lock().await;
+        assert!(connection.has_active_response());
+        assert!(!connection.is_closed().await);
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let observed_attempts = Arc::clone(&attempts);
+        let request = test_response_request("never-dispatched");
+        let mut queued = Box::pin(connection.stream_request_with_transport_attempt(
+            &request, true, None, None, || {}, |_| {}, || {},
+            Some(Arc::new(move || {
+                observed_attempts.fetch_add(1, Ordering::SeqCst);
+            })),
+        ));
+        assert!(futures::poll!(&mut queued).is_pending());
+        // The previous response retires the socket after the healthy check but
+        // before this queued request acquires ownership. It must not count as a send.
+        connection.retired.store(true, Ordering::Release);
+        drop(guard.take());
+        drop(guard);
+        let mut response = queued.await.unwrap();
+        let error = response.next().await.unwrap().unwrap_err();
+        assert!(matches!(&error, ApiError::Transport(TransportError::PreDispatch(message))
+            if message == "websocket connection retired before dispatch"));
+        assert!(!crate::api_bridge::map_api_error(error).is_retryable());
+        assert!(response.next().await.is_none());
+        assert_eq!(attempts.load(Ordering::SeqCst), 0);
+        assert!(!connection.has_active_response());
+        assert!(connection.is_closed().await);
     }
 
     #[tokio::test(start_paused = true)]
@@ -2181,7 +2322,7 @@ mod tests {
             let dispatches = Arc::new(AtomicUsize::new(0));
             let observed_dispatches = Arc::clone(&dispatches);
             let pump_task = tokio::spawn(async move {
-                while let Some(WsCommand::Send { message, tx_result }) = rx_command.recv().await {
+                while let Some(WsCommand::Send { message, tx_result, .. }) = rx_command.recv().await {
                     observed_dispatches.fetch_add(1, Ordering::SeqCst);
                     assert_eq!(
                         serde_json::from_str::<Value>(message.to_text().unwrap()).unwrap()["model"],
@@ -3060,7 +3201,7 @@ mod tests {
                     count.fetch_add(1, Ordering::SeqCst);
                     match outcome {
                         "error" => {
-                            let _ = tx_result.send(Err(WsError::ConnectionClosed));
+                            let _ = tx_result.send(Err(WsSendError::Socket(WsError::ConnectionClosed)));
                         }
                         "lost" => drop(tx_result),
                         _ => {

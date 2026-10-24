@@ -256,29 +256,11 @@ fn root_search_reaches_exec_and_approval_is_rejected() {
 }
 
 #[test]
-fn debug_app_server_retains_ordered_model_and_effort_overrides() {
-    let cli = parse(&[
-        "codex",
-        "-c",
-        "model=chosen",
-        "debug",
-        "app-server",
-        "send-message-v2",
-        "probe",
-        "-c",
-        "model_reasoning_effort=high",
-    ])
-    .unwrap();
-    assert_eq!(
-        cli.config_overrides.raw_overrides,
-        ["model=chosen", "model_reasoning_effort=high"]
+fn debug_app_server_test_client_is_not_shipped() {
+    assert!(
+        parse(&["codex", "debug", "app-server", "send-message-v2", "probe"]).is_err(),
+        "the removed test-client command must not be available"
     );
-    assert!(matches!(
-        cli.subcommand,
-        Some(Subcommand::Debug(DebugCommand {
-            subcommand: DebugSubcommand::AppServer(_),
-        }))
-    ));
 }
 
 #[test]

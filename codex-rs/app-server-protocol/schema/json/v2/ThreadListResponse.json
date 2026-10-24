@@ -2044,6 +2044,7 @@
         },
         {
           "properties": {
+            "error": true,
             "id": {
               "type": "string"
             },
@@ -2059,7 +2060,10 @@
               "description": "Separate image-model receipt; never add these tokens to text inference."
             },
             "result": {
-              "type": "string"
+              "type": [
+                "string",
+                "null"
+              ]
             },
             "revisedPrompt": {
               "type": [
@@ -2090,7 +2094,6 @@
           },
           "required": [
             "id",
-            "result",
             "status",
             "type"
           ],
@@ -2912,7 +2915,7 @@
         },
         "mutation_revision": {
           "format": "uint64",
-          "minimum": 0,
+          "minimum": 0.0,
           "type": "integer"
         },
         "plan_revision": {
@@ -2926,7 +2929,7 @@
         },
         "schema_version": {
           "format": "uint32",
-          "minimum": 0,
+          "minimum": 0.0,
           "type": "integer"
         },
         "terminal_action": {
@@ -3614,13 +3617,6 @@
         "suppressedDeterministicContinuationCount": {
           "default": 0,
           "description": "Authoritative number of model boundaries suppressed by accepted deterministic-continuation receipts. A receipt whose `suppressed_continuation_count` is N contributes N, not one. Invalid, rejected, and zero-count receipts contribute nothing. This counter is independent of `generations_by_disposition`.",
-          "format": "uint32",
-          "minimum": 0.0,
-          "type": "integer"
-        },
-        "suppressedValidationOutputCount": {
-          "default": 0,
-          "description": "Validation tool outputs intentionally suppressed by admission policy.",
           "format": "uint32",
           "minimum": 0.0,
           "type": "integer"

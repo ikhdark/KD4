@@ -73,6 +73,15 @@ impl TimerScheduler {
     }
 
     fn schedule(&mut self, id: u64, delay: Duration) -> Result<(), String> {
+        self.schedule_with_spawn(id, delay, |worker| thread::Builder::new().spawn(worker))
+    }
+
+    fn schedule_with_spawn(
+        &mut self,
+        id: u64,
+        delay: Duration,
+        spawn: impl FnOnce(Box<dyn FnOnce() + Send>) -> std::io::Result<thread::JoinHandle<()>>,
+    ) -> Result<(), String> {
         let now = Instant::now();
         let deadline = now
             .checked_add(delay)
@@ -82,13 +91,13 @@ impl TimerScheduler {
             let command_tx = self.runtime_command_tx.clone();
             #[cfg(test)]
             let barrier = self.barrier.clone();
-            self.worker = Some(thread::spawn(move || {
+            self.worker = Some(spawn(Box::new(move || {
                 #[cfg(test)]
                 if let Some(barrier) = barrier {
                     barrier.wait();
                 }
                 run_scheduler(shared, command_tx);
-            }));
+            })).map_err(|error| format!("failed to start code mode timer worker: {error}"))?);
         }
         let (work, wake) = &*self.shared;
         let mut work = work
@@ -300,6 +309,26 @@ mod tests {
     use std::time::Instant;
 
     use super::TimerScheduler;
+
+    #[test]
+    fn worker_spawn_failure_is_recoverable_and_does_not_register_work() {
+        let (tx, rx) = std_mpsc::channel();
+        let mut scheduler = TimerScheduler::new(tx);
+        let error = scheduler.schedule_with_spawn(1, Duration::from_secs(60), |_| {
+            Err(std::io::Error::other("injected spawn failure"))
+        }).unwrap_err();
+        assert!(error.contains("injected spawn failure"));
+        assert!(scheduler.worker.is_none());
+        assert!(scheduler.shared.0.lock().unwrap().scheduled.is_empty());
+        assert!(scheduler.take_fired().is_empty());
+        assert!(rx.try_recv().is_err());
+        scheduler.schedule(2, Duration::ZERO).unwrap();
+        rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert_eq!(scheduler.take_fired(), vec![2]);
+        scheduler.schedule(3, Duration::from_secs(60)).unwrap();
+        assert!(scheduler.worker.is_some());
+        scheduler.cancel(3);
+    }
 
     #[test]
     #[ignore = "narrow timing probe"]

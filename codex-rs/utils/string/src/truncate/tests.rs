@@ -2,6 +2,7 @@ use super::approx_token_count;
 use super::approx_token_count_exceeds;
 use super::split_string;
 use super::truncate_middle_chars;
+use super::truncate_middle_chars_from_parts;
 use super::truncate_middle_with_token_budget;
 use pretty_assertions::assert_eq;
 
@@ -198,4 +199,33 @@ fn truncate_middle_bytes_handles_utf8_content() {
     let s = "😀😀😀😀😀😀😀😀😀😀\nsecond line with text\n";
     let out = truncate_middle_chars(s, /*max_bytes*/ 20);
     assert_eq!(out, "😀😀…21 chars truncated…with text\n");
+}
+
+#[test]
+fn multipart_truncation_preserves_joined_head_tail_and_character_counts() {
+    for parts in [
+        vec![],
+        vec![""],
+        vec!["ab", "\n", "é雪😀tail"],
+        vec!["😀", "", "中", "more text", "é"],
+    ] {
+        let joined = parts.concat();
+        for budget in 0..=joined.len() + 1 {
+            assert_eq!(
+                truncate_middle_chars_from_parts(&parts, budget),
+                truncate_middle_chars(&joined, budget),
+                "parts={parts:?}, budget={budget}"
+            );
+        }
+    }
+}
+
+#[test]
+fn multipart_truncation_does_not_duplicate_large_input_storage() {
+    let input = "é".repeat(1024 * 1024);
+    let result = truncate_middle_chars_from_parts(&[&input, "\n", &input], 2048);
+    assert!(result.len() < 2100);
+    assert!(result.capacity() < 4200);
+    assert!(result.starts_with('é'));
+    assert!(result.ends_with('é'));
 }

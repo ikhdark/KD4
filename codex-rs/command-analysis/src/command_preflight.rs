@@ -1,12 +1,11 @@
 use std::borrow::Cow;
-use std::path::Component;
 use std::path::Path;
 
 #[path = "full_suite.rs"]
 mod full_suite;
 pub use full_suite::FullSuiteBudget;
-pub use full_suite::check_full_suite_command;
-pub use full_suite::owned_suite_nonexecution;
+pub use full_suite::FullSuitePermit;
+pub use full_suite::ValidationPolicySnapshot;
 
 #[path = "managed_cargo_lane.rs"]
 mod managed_cargo_lane;
@@ -17,12 +16,6 @@ use super::command_search::rg_search_path_operands;
 use crate::command_shape::CommandInvocation;
 use codex_shell_command::shell_detect::ShellType;
 
-#[cfg(test)]
-use super::command_search::RgSearchBreadth;
-#[cfg(test)]
-use super::command_search::classify_rg_search_narrowing;
-#[cfg(test)]
-use super::command_search::classify_rg_search_narrowing_without_native_scope;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CommandPreflightIssueCode {
@@ -337,21 +330,7 @@ pub async fn preflight_invocation_for_kd4_runtime(
                 None => notice.to_string(),
             });
         }
-        let cwd = cwd.to_path_buf();
-        let (command, shell_type) = match outcome.invocation.to_direct_argv() {
-            Some(argv) => (argv, None),
-            None => (command.to_vec(), shell_type),
-        };
-        if let Ok(Some(notice)) = crate::run_blocking_command_analysis(move || {
-            missing_rg_path_advisory(&command, shell_type, &cwd)
-        })
-        .await
-        {
-            outcome.advisory = Some(match outcome.advisory {
-                Some(existing) => format!("{existing}\n{notice}"),
-                None => notice,
-            });
-        }
+
     }
     Ok(outcome)
 }
@@ -548,90 +527,6 @@ fn source_paging_advisory(
     (reads > 0 && paged).then_some(
         "Source-read advisory: this paged shell read runs unchanged. For subsequent UTF-8 source inspection, prefer read_file with batched line selectors (1-based, inclusive); PowerShell -Skip N starts at line N+1. Check every result and file_complete; recover omitted bytes from the returned snapshot instead of rereading pages. Keep shell reads when their encoding, streaming, or transformation semantics are required. Do not reread already delivered evidence solely to change tools.",
     )
-}
-
-fn missing_rg_path_advisory(
-    command: &[String],
-    shell_type: Option<ShellType>,
-    cwd: &Path,
-) -> Option<String> {
-    let commands = argv_commands(
-        command,
-        shell_type.or_else(|| infer_direct_shell_type(command)),
-    )?;
-    // A preceding cd, assignment, helper or mutating command can change what
-    // these operands mean. Do not guess shell state or run a repository scan.
-    if commands.is_empty()
-        || commands.iter().any(|argv| {
-            !argv.first().is_some_and(|program| is_rg_program(program))
-                || !codex_shell_command::is_safe_command::is_known_safe_direct_argv(argv)
-        })
-    {
-        return None;
-    }
-    let operands = rg_search_path_operands(&commands)?;
-    let mut notices = Vec::new();
-    for operand in operands.into_iter().take(8) {
-        if operand == "-" || operand.contains(['*', '?', '[', ']', '$', '%', '~', '`']) {
-            continue;
-        }
-        let path = cwd.join(&operand);
-        // Suggestions are local to the declared working directory, not an
-        // excuse to enumerate its ancestors or unrelated absolute paths.
-        if !path.starts_with(cwd)
-            || path.components().any(|part| part == Component::ParentDir)
-            || !matches!(std::fs::symlink_metadata(&path),
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound)
-        {
-            continue;
-        }
-        let mut nearest = path.as_path();
-        let parent = loop {
-            let parent = nearest.parent()?;
-            if !parent.starts_with(cwd) {
-                break None;
-            }
-            match std::fs::symlink_metadata(parent) {
-                Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {
-                    break Some(parent);
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => nearest = parent,
-                _ => break None,
-            }
-        };
-        let Some(parent) = parent else { continue };
-        // Do not traverse directory symlinks/junctions outside the workdir.
-        let (Ok(root), Ok(resolved_parent)) = (cwd.canonicalize(), parent.canonicalize()) else {
-            continue;
-        };
-        if !resolved_parent.starts_with(root) {
-            continue;
-        }
-        // Same cwd-relative spelling as the operand, so a suggestion can be
-        // pasted back and the notice does not repeat the absolute workdir.
-        let candidates = super::command_search::nearest_existing_paths(&path, cwd)
-            .into_iter()
-            .map(|path| json_string(&super::command_search::display_suggestion(&path, cwd)))
-            .collect::<Vec<_>>();
-        let guidance = if candidates.is_empty() {
-            let parent = if parent == cwd {
-                "./".to_string()
-            } else {
-                super::command_search::display_suggestion(parent, cwd)
-            };
-            format!("Nearest existing directory: {}.", json_string(&parent))
-        } else {
-            format!(
-                "Possible existing paths (not verified replacements): {}.",
-                candidates.join(", ")
-            )
-        };
-        notices.push(format!(
-            "Command preflight advisory (rg_missing_path): {} was not found relative to the command's working directory at preflight time. {guidance} The command is unchanged; a path error is not evidence of no matches.",
-            json_string(&operand),
-        ));
-    }
-    (!notices.is_empty()).then(|| notices.join("\n"))
 }
 
 pub async fn preflight_invocation_for_runtime(

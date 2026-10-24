@@ -544,6 +544,14 @@ pub fn extract_tool_mentions(text: &str) -> ToolMentions<'_> {
 
 pub fn extract_tool_mentions_with_sigil(text: &str, sigil: char) -> ToolMentions<'_> {
     let text_bytes = text.as_bytes();
+    if !text_bytes.contains(&(sigil as u8)) {
+        return ToolMentions {
+            names: HashSet::new(),
+            paths: HashSet::new(),
+            plain_names: HashSet::new(),
+            linked_paths: HashMap::new(),
+        };
+    }
     let literal_ranges = markdown_literal_ranges(text);
     let mut literals = literal_ranges.iter().peekable();
     let mut mentioned_names: HashSet<&str> = HashSet::new();

@@ -67,6 +67,7 @@ pub(super) fn resolve_tool_response(
     scope: &mut v8::PinScope<'_, '_>,
     id: &str,
     response: Result<JsonValue, String>,
+    completed_result: Option<JsonValue>,
 ) -> Result<(), String> {
     let (resolver, tool_name) = {
         let state = scope
@@ -88,25 +89,27 @@ pub(super) fn resolve_tool_response(
     let resolver = v8::Local::new(&tc, &resolver);
     match response {
         Ok(result) => {
-            let value = json_to_v8(&mut tc, &result)
-                .ok_or_else(|| "failed to serialize tool response".to_string())?;
-            if let Some(projected) =
-                codex_code_mode_protocol::model_visible_tool_result(&tool_name, &result)
-            {
-                let source_fragments = tool_name.namespace.is_none()
-                    && matches!(tool_name.name.as_str(), "read_file" | "read_tool_output");
-                super::output_projection::register(
-                    &mut tc,
-                    value,
-                    &result,
-                    &projected,
-                    source_fragments,
-                )?;
-            }
+            let value = super::output_projection::tool_result_to_v8(&mut tc, &result, &tool_name)?;
             resolver.resolve(&tc, value);
         }
         Err(error_text) => {
             let value = super::value::error_value(&mut tc, &error_text);
+            if let Some(result) = completed_result {
+                // A late receipt is not evidence of rollback. Keep exact
+                // completed evidence on the same canonical Error.results path
+                // used by graph recovery, without reporting timely success.
+                let results = serde_json::json!({"completed": {
+                    "status": "rejected", "value": result,
+                    "reason": "completed after the nested deadline", "retry_safe": false
+                }});
+                let results = json_to_v8(&mut tc, &results)
+                    .ok_or_else(|| "failed to serialize late tool evidence".to_string())?;
+                let key = v8::String::new(&mut tc, "results")
+                    .ok_or_else(|| "failed to allocate late evidence key".to_string())?;
+                let object = value.to_object(&mut tc)
+                    .ok_or_else(|| "failed to construct late tool error".to_string())?;
+                object.set(&tc, key.into(), results);
+            }
             resolver.reject(&tc, value);
         }
     }

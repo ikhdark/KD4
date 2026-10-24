@@ -39,7 +39,16 @@ impl AgentControl {
         let state = self.upgrade()?;
         // A missing observation authorizes no retirement: a cold loader may already
         // own this identity, or publish a replacement immediately after the lookup.
-        let thread = state.get_thread(agent_id).await?;
+        let thread = match state.get_thread(agent_id).await {
+            Ok(thread) => thread,
+            Err(CodexErr::ThreadNotFound(_)) => {
+                if self.retire_cold_v2_agent(&state, agent_id).await {
+                    return Ok(String::new());
+                }
+                state.get_thread(agent_id).await?
+            }
+            Err(error) => return Err(error),
+        };
 
         thread.codex.session.ensure_rollout_materialized().await;
         let flush_error: Option<CodexErr> = thread

@@ -1,5 +1,5 @@
 //! Shell command analysis for codex-core's command tools: invocation shapes,
-//! rg search narrowing, preflight checks, validation and mutation
+//! rg exit classification, preflight checks, validation and mutation
 //! classification, and model-facing output summaries.
 
 pub mod command_mutation;

@@ -164,6 +164,7 @@ enum RemoteControlEnrollmentSelection {
 struct RemoteControlEnrollmentState {
     enrollment: StdMutex<Option<RemoteControlEnrollment>>,
     lock: Semaphore,
+    lifecycle: StdMutex<CancellationToken>,
 }
 
 impl RemoteControlEnrollmentState {
@@ -171,6 +172,7 @@ impl RemoteControlEnrollmentState {
         Self {
             enrollment: StdMutex::new(enrollment),
             lock: Semaphore::new(1),
+            lifecycle: StdMutex::new(CancellationToken::new()),
         }
     }
 
@@ -182,6 +184,7 @@ impl RemoteControlEnrollmentState {
         RemoteControlEnrollmentLease {
             state: self,
             enrollment: self.snapshot(),
+            dirty: false,
             _permit: permit,
         }
     }
@@ -192,11 +195,22 @@ impl RemoteControlEnrollmentState {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()
     }
+
+    fn lifecycle(&self) -> CancellationToken {
+        self.lifecycle.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone()
+    }
+
+    fn retire_lifecycle(&self) {
+        let mut lifecycle = self.lifecycle.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        lifecycle.cancel();
+        *lifecycle = CancellationToken::new();
+    }
 }
 
 struct RemoteControlEnrollmentLease<'a> {
     state: &'a RemoteControlEnrollmentState,
     enrollment: Option<RemoteControlEnrollment>,
+    dirty: bool,
     _permit: SemaphorePermit<'a>,
 }
 
@@ -210,12 +224,16 @@ impl Deref for RemoteControlEnrollmentLease<'_> {
 
 impl DerefMut for RemoteControlEnrollmentLease<'_> {
     fn deref_mut(&mut self) -> &mut Self::Target {
+        self.dirty = true;
         &mut self.enrollment
     }
 }
 
 impl Drop for RemoteControlEnrollmentLease<'_> {
     fn drop(&mut self) {
+        if !self.dirty {
+            return;
+        }
         *self
             .state
             .enrollment
@@ -296,6 +314,23 @@ fn policy_admits_current_identity(
 }
 
 impl RemoteControlHandle {
+    async fn run_with_lifecycle<T>(
+        &self,
+        lifecycle: &CancellationToken,
+        operation: impl std::future::Future<Output = io::Result<T>>,
+    ) -> io::Result<T> {
+        tokio::select! {
+            biased;
+            _ = lifecycle.cancelled() => Err(io::Error::new(io::ErrorKind::Interrupted, "remote control operation retired by disable")),
+            result = operation => {
+                if lifecycle.is_cancelled() {
+                    return Err(io::Error::new(io::ErrorKind::Interrupted, "remote control operation retired by disable"));
+                }
+                result
+            }
+        }
+    }
+
     pub fn ensure_remote_control_allowed(&self) -> Result<(), RemoteControlDisabledByRequirements> {
         let admitted = self
             .auth_manager
@@ -468,6 +503,7 @@ impl RemoteControlHandle {
         app_server_client_name: Option<&str>,
     ) -> io::Result<RemoteControlStatusChangedNotification> {
         self.ensure_remote_control_allowed_io()?;
+        self.current_enrollment.retire_lifecycle();
         let _transition = self
             .desired_state_rpc_lock
             .acquire()
@@ -479,20 +515,26 @@ impl RemoteControlHandle {
             /*remote_control_enabled*/ false,
         )
         .await?;
-        Ok(self.transition_disabled())
+        Ok(self.publish_disabled())
     }
 
     pub async fn disable_ephemeral(&self) -> RemoteControlStatusChangedNotification {
+        self.current_enrollment.retire_lifecycle();
         let _transition = self
             .desired_state_rpc_lock
             .acquire()
             .await
             .unwrap_or_else(|_| unreachable!());
         let _persistence = acquire_persistence_lock(&self.desired_state_persistence_lock).await;
-        self.transition_disabled()
+        self.publish_disabled()
     }
 
     fn transition_disabled(&self) -> RemoteControlStatusChangedNotification {
+        self.current_enrollment.retire_lifecycle();
+        self.publish_disabled()
+    }
+
+    fn publish_disabled(&self) -> RemoteControlStatusChangedNotification {
         let desired_state_changed = self.desired_state_tx.send_if_modified(|state| {
             let changed = *state != RemoteControlDesiredState::Disabled;
             *state = RemoteControlDesiredState::Disabled;
@@ -583,6 +625,16 @@ impl RemoteControlHandle {
         params: RemoteControlPairingStartParams,
         app_server_client_name: Option<&str>,
     ) -> io::Result<RemoteControlPairingStartResponse> {
+        let lifecycle = self.current_enrollment.lifecycle();
+        self.run_with_lifecycle(&lifecycle, self.start_pairing_inner(http_clients, params, app_server_client_name)).await
+    }
+
+    async fn start_pairing_inner(
+        &self,
+        http_clients: RemoteControlHttpClientSource<'_>,
+        params: RemoteControlPairingStartParams,
+        app_server_client_name: Option<&str>,
+    ) -> io::Result<RemoteControlPairingStartResponse> {
         let mut auth = load_remote_control_auth(&self.auth_manager)
             .await
             .map_err(|_| pairing_unavailable_error())?;
@@ -634,10 +686,22 @@ impl RemoteControlHandle {
         let pairing_request = || protocol::StartRemoteControlPairingRequest {
             manual_code: params.manual_code,
         };
+        // Ordinary pairing HTTP neither creates nor mutates enrollment. Release
+        // ownership and validate the exact identity/token when admitting its result.
+        drop(current_enrollment);
+        let response = start_pairing_request(http_clients, &enrollment, pairing_request()).await;
+        let mut current_enrollment = self.current_enrollment.lock().await;
+        let current = current_enrollment.as_ref()
+            .filter(|current| same_remote_control_enrollment(current, &enrollment))
+            .ok_or_else(pairing_unavailable_error)?;
+        let mut token_changed = current.remote_control_token != enrollment.remote_control_token;
+        enrollment = current.clone();
         let pairing_response =
-            match start_pairing_request(http_clients, &enrollment, pairing_request()).await {
+            match response {
                 Err(err) if err.kind() == io::ErrorKind::PermissionDenied => {
-                    clear_pairing_server_token(&mut current_enrollment, &mut enrollment)?;
+                    if !token_changed {
+                        clear_pairing_server_token(&mut current_enrollment, &mut enrollment)?;
+                    }
                     refresh_pairing_enrollment(
                         http_clients,
                         &mut current_enrollment,
@@ -647,10 +711,17 @@ impl RemoteControlHandle {
                         &mut enrollment,
                     )
                     .await?;
-                    start_pairing_request(http_clients, &enrollment, pairing_request()).await
+                    let expected = enrollment.clone();
+                    drop(current_enrollment);
+                    let response = start_pairing_request(http_clients, &enrollment, pairing_request()).await;
+                    (current_enrollment, enrollment, token_changed) = self.pairing_response_enrollment(&expected).await?;
+                    response
                 }
                 Err(err) if err.kind() == io::ErrorKind::NotFound => {
-                    enrollment = self
+                    // A delayed response for an older bearer cannot invalidate
+                    // a newer generation installed while HTTP ran without the lease.
+                    if !token_changed {
+                        enrollment = self
                         .load_or_enroll_pairing_server(
                             http_clients,
                             &mut current_enrollment,
@@ -661,7 +732,12 @@ impl RemoteControlHandle {
                             RemoteControlEnrollmentSelection::ReplaceExisting,
                         )
                         .await?;
-                    start_pairing_request(http_clients, &enrollment, pairing_request()).await
+                    }
+                    let expected = enrollment.clone();
+                    drop(current_enrollment);
+                    let response = start_pairing_request(http_clients, &enrollment, pairing_request()).await;
+                    (current_enrollment, enrollment, token_changed) = self.pairing_response_enrollment(&expected).await?;
+                    response
                 }
                 pairing_response => pairing_response,
             };
@@ -671,7 +747,9 @@ impl RemoteControlHandle {
                     return Err(pairing_unavailable_error());
                 }
                 io::ErrorKind::PermissionDenied => {
-                    clear_pairing_server_token(&mut current_enrollment, &mut enrollment)?;
+                    if !token_changed {
+                        clear_pairing_server_token(&mut current_enrollment, &mut enrollment)?;
+                    }
                     return Err(pairing_unavailable_error());
                 }
                 _ => {}
@@ -834,6 +912,15 @@ impl RemoteControlHandle {
         http_clients: RemoteControlHttpClientSource<'_>,
         params: RemoteControlPairingStatusParams,
     ) -> io::Result<RemoteControlPairingStatusResponse> {
+        let lifecycle = self.current_enrollment.lifecycle();
+        self.run_with_lifecycle(&lifecycle, self.pairing_status_inner(http_clients, params)).await
+    }
+
+    async fn pairing_status_inner(
+        &self,
+        http_clients: RemoteControlHttpClientSource<'_>,
+        params: RemoteControlPairingStatusParams,
+    ) -> io::Result<RemoteControlPairingStatusResponse> {
         let status_code = remote_control_pairing_status_code(&params)?;
         let mut auth = load_remote_control_auth(&self.auth_manager)
             .await
@@ -879,15 +966,24 @@ impl RemoteControlHandle {
         }
         let pairing_status_request =
             || protocol::RemoteControlPairingStatusRequest::from(status_code.clone());
-        let pairing_status_response = match pairing_status_request_with_source(
+        drop(current_enrollment);
+        let response = pairing_status_request_with_source(
             http_clients,
             &enrollment,
             pairing_status_request(),
         )
-        .await
-        {
+        .await;
+        let mut current_enrollment = self.current_enrollment.lock().await;
+        let current = current_enrollment.as_ref()
+            .filter(|current| same_remote_control_enrollment(current, &enrollment))
+            .ok_or_else(pairing_unavailable_error)?;
+        let mut token_changed = current.remote_control_token != enrollment.remote_control_token;
+        enrollment = current.clone();
+        let pairing_status_response = match response {
             Err(err) if err.kind() == io::ErrorKind::PermissionDenied => {
-                clear_pairing_server_token(&mut current_enrollment, &mut enrollment)?;
+                if !token_changed {
+                    clear_pairing_server_token(&mut current_enrollment, &mut enrollment)?;
+                }
                 refresh_pairing_enrollment(
                     http_clients,
                     &mut current_enrollment,
@@ -897,18 +993,23 @@ impl RemoteControlHandle {
                     &mut enrollment,
                 )
                 .await?;
-                pairing_status_request_with_source(
+                let expected = enrollment.clone();
+                drop(current_enrollment);
+                let response = pairing_status_request_with_source(
                     http_clients,
                     &enrollment,
                     pairing_status_request(),
                 )
-                .await
+                .await;
+                (current_enrollment, enrollment, token_changed) = self.pairing_response_enrollment(&expected).await?;
+                response
             }
             pairing_status_response => pairing_status_response,
         };
         if let Err(err) = &pairing_status_response {
             match err.kind() {
                 io::ErrorKind::NotFound => {
+                    if token_changed { return Err(pairing_unavailable_error()); }
                     self.load_or_enroll_pairing_server(
                         http_clients,
                         &mut current_enrollment,
@@ -922,7 +1023,9 @@ impl RemoteControlHandle {
                     return Err(pairing_unavailable_error());
                 }
                 io::ErrorKind::PermissionDenied => {
-                    clear_pairing_server_token(&mut current_enrollment, &mut enrollment)?;
+                    if !token_changed {
+                        clear_pairing_server_token(&mut current_enrollment, &mut enrollment)?;
+                    }
                     return Err(pairing_unavailable_error());
                 }
                 _ => {}
@@ -938,6 +1041,19 @@ impl RemoteControlHandle {
             return Err(pairing_unavailable_error());
         }
         pairing_status_response
+    }
+
+    async fn pairing_response_enrollment(
+        &self,
+        expected: &RemoteControlEnrollment,
+    ) -> io::Result<(RemoteControlEnrollmentLease<'_>, RemoteControlEnrollment, bool)> {
+        let lease = self.current_enrollment.lock().await;
+        let current = lease.as_ref()
+            .filter(|current| same_remote_control_enrollment(current, expected))
+            .ok_or_else(pairing_unavailable_error)?;
+        let token_changed = current.remote_control_token != expected.remote_control_token;
+        let enrollment = current.clone();
+        Ok((lease, enrollment, token_changed))
     }
 
     pub async fn list_clients(

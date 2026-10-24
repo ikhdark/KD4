@@ -11,24 +11,6 @@ use std::pin::Pin;
 pub type ToolExecutorFuture<'a> =
     Pin<Box<dyn Future<Output = Result<Box<dyn ToolOutput>, FunctionCallError>> + Send + 'a>>;
 
-pub trait TaskAcceptance: Send + Sync {
-    /// Re-evaluate after sibling effects settle, before acquiring the extension
-    /// state permit. No model-provided receipt can implement this check.
-    fn check(&self) -> Pin<Box<dyn Future<Output = Result<(), FunctionCallError>> + Send + '_>>;
-    /// Nonblocking fence recheck immediately before persistence, after the
-    /// extension acquires its own permit. No cross-owner async call is allowed
-    /// while holding that permit. Missing implementations fail closed.
-    fn is_current(&self) -> bool {
-        false
-    }
-    /// A blocked intent may retain explicitly blocked requirements, but must
-    /// not hide independent obtainable work or a live required execution.
-    fn check_blocked(
-        &self,
-    ) -> Pin<Box<dyn Future<Output = Result<(), FunctionCallError>> + Send + '_>> {
-        self.check()
-    }
-}
 
 /// Conversation history an extension needs for one tool invocation.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -107,19 +89,7 @@ pub trait ToolExecutor<Invocation>: Send + Sync {
         false
     }
 
-    /// A terminal-success operation consumes the host's current scoped task
-    /// decision before invoking the extension. Default preserves old runtimes.
-    fn requires_task_acceptance(&self, _payload: &ToolPayload) -> bool {
-        false
-    }
 
-    fn handle_with_task_acceptance(
-        &self,
-        invocation: Invocation,
-        _acceptance: std::sync::Arc<dyn TaskAcceptance>,
-    ) -> ToolExecutorFuture<'_> {
-        self.handle(invocation)
-    }
 
     /// Returns the history needed for this payload before the invocation is built.
     fn conversation_history_requirement(

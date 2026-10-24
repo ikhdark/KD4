@@ -329,8 +329,7 @@ pub(crate) struct AgentControl {
     agent_execution_limiter: Arc<AgentExecutionLimiter>,
     /// Durable typed-task state shared by the root thread and all of its sub-agents.
     task_coordinator: AgentTaskCoordinator,
-    /// Captured before child startup can suspend; never follows a later parent grant.
-    pub(crate) inherited_validation_task_scope: Option<(String, String)>,
+    pub(crate) inherited_validation_context: Option<super::task_coordinator::ValidationTurnContext>,
     #[cfg(test)]
     test_hooks: Arc<AgentControlTestHooks>,
 }
@@ -368,6 +367,42 @@ impl AgentControl {
 
     pub(crate) fn task_coordinator(&self) -> &AgentTaskCoordinator {
         &self.task_coordinator
+    }
+
+    /// Mirror child admission facts into the owning root rollout. The caller
+    /// holds the shared budget's checkpoint guard through local and root writes.
+    /// Root callers persist their own context and need no second checkpoint.
+    pub(crate) async fn persist_root_validation_checkpoint(
+        &self,
+        turn: &crate::session::turn_context::TurnContext,
+    ) -> Result<(), String> {
+        if !turn.session_source.is_non_root_agent() {
+            return Ok(());
+        }
+        let root_id = ThreadId::from_string(&turn.validation_root_turn.0)
+            .map_err(|error| format!("invalid validation root thread: {error}"))?;
+        let manager = self.upgrade().map_err(|error| error.to_string())?;
+        let root = manager.get_thread(root_id).await
+            .map_err(|error| format!("validation root is unavailable: {error}"))?;
+        let session = &root.codex.session;
+        // Serialize with turn installation, but never hold active_turn across
+        // storage I/O: interruption and terminal cleanup must remain available.
+        let _start_guard = session.task_start_gate.acquire().await
+            .map_err(|_| "validation root turn admission is closed".to_string())?;
+        let item = {
+            let active = session.active_turn.lock().await;
+            let root_turn = active.as_ref().and_then(|active| active.task.as_ref())
+                .map(|task| &task.turn_context)
+                .ok_or_else(|| "validation root turn is no longer active".to_string())?;
+            if root_turn.validation_root_turn != turn.validation_root_turn
+                || !Arc::ptr_eq(&root_turn.full_suite_budget, &turn.full_suite_budget)
+            {
+                return Err("validation belongs to a different root turn".to_string());
+            }
+            root_turn.to_turn_context_item()
+        };
+        session.persist_rollout_items_durable(&[RolloutItem::TurnContext(item)]).await
+            .map_err(|error| format!("failed to checkpoint root validation admissions: {error}"))
     }
 
     /// Whether this tree has ever had a live sub-agent.
@@ -479,7 +514,7 @@ impl AgentControl {
             };
             match self
                 .task_coordinator()
-                .heartbeat_typed_actor_binding(&binding, progress)
+                .heartbeat_typed_actor_binding_if_due(&binding, progress)
                 .await
             {
                 Ok(true) => {}
@@ -606,6 +641,17 @@ impl AgentControl {
         communication: InterAgentCommunication,
         agent_communication_context: AgentCommunicationContext,
     ) -> CodexResult<String> {
+        // Only the host's terminal publication may report up the agent tree.
+        // Queue-only progress still interrupts an active parent's sampling;
+        // reject it before loading a target, reserving capacity, or enqueuing.
+        let reports_to_ancestor = communication.author.as_str()
+            .strip_prefix(communication.recipient.as_str())
+            .is_some_and(|suffix| suffix.starts_with('/'));
+        if reports_to_ancestor && !agent_communication_context.is_terminal_result() {
+            return Err(CodexErr::InvalidRequest(
+                "Sub-agents report to ancestors only at the end. Finish with one final answer, including any blockers; the host delivers the terminal result automatically. This progress message was not queued.".into(),
+            ));
+        }
         let state = self.upgrade()?;
         let execution_guard = self
             .reserve_execution_capacity_for_turn_start(agent_id, communication.trigger_turn)
@@ -1005,6 +1051,26 @@ impl AgentControl {
                         "repeated cold agent edge to {child}"
                     )));
                 }
+                // A just-published live child's rollout may not yet be flushed.
+                // Its registered runtime is authoritative; do not read it back as cold.
+                if let Ok(thread) = state.get_thread(child).await
+                    && let Some(metadata) = self.get_agent_metadata(child)
+                    && let Some(path) = metadata.agent_path
+                {
+                    let snapshot = thread.config_snapshot().await;
+                    if snapshot.parent_thread_id != Some(parent)
+                        || snapshot.session_source.parent_thread_id() != Some(parent)
+                        || path.as_str().rsplit_once('/').map(|(prefix, _)| prefix)
+                            != Some(parent_path.as_str())
+                    {
+                        return Err(CodexErr::InvalidRequest(format!(
+                            "live agent `{path}` has inconsistent lineage"
+                        )));
+                    }
+                    self.task_coordinator().record_unavailable_descendant(child, false);
+                    queue.push_back((child, path));
+                    continue;
+                }
                 let stored = match state
                     .read_stored_thread(ReadThreadParams {
                         thread_id: child,
@@ -1213,7 +1279,17 @@ impl AgentControl {
         current_session_source: &SessionSource,
         path_prefix: Option<&str>,
     ) -> CodexResult<Vec<ListedAgent>> {
+        self.list_agents_with_task_snapshots(current_session_source, path_prefix)
+            .await.map(|(agents, _)| agents)
+    }
+
+    pub(crate) async fn list_agents_with_task_snapshots(
+        &self,
+        current_session_source: &SessionSource,
+        path_prefix: Option<&str>,
+    ) -> CodexResult<(Vec<ListedAgent>, HashMap<codex_agent_task_store::AssignmentId, codex_agent_task_store::AgentTask>)> {
         let state = self.upgrade()?;
+        let mut task_snapshots = HashMap::new();
         let resolved_prefix = path_prefix
             .map(|prefix| {
                 current_session_source
@@ -1293,8 +1369,25 @@ impl AgentControl {
                 continue;
             }
 
-            let status = self.get_status(thread_id).await;
-            let runtime_loaded = state.get_thread(thread_id).await.is_ok();
+            let runtime = state.get_thread(thread_id).await.ok();
+            let runtime_loaded = runtime.is_some();
+            let status = if let Some(thread) = runtime {
+                thread.agent_status().await
+            } else if let Some(binding) = metadata.agent_path.as_ref()
+                .and_then(|path| self.task_coordinator().binding_for_agent_path(path))
+                .filter(|binding| binding.thread_id.as_deref() == Some(thread_id.to_string().as_str()))
+            {
+                match self.task_coordinator().get_agent_task(binding.assignment_id, Some(0)).await {
+                    Ok(task) if task.current_attempt.attempt_id == binding.attempt_id => {
+                        let status = agent_status_from_task(&task, None).unwrap_or(AgentStatus::NotFound);
+                        task_snapshots.insert(binding.assignment_id, task);
+                        status
+                    }
+                    _ => AgentStatus::NotFound,
+                }
+            } else {
+                AgentStatus::NotFound
+            };
             let agent_name = metadata
                 .agent_path
                 .as_ref()
@@ -1309,7 +1402,7 @@ impl AgentControl {
             });
         }
 
-        Ok(agents)
+        Ok((agents, task_snapshots))
     }
 
     /// Starts a detached watcher for sub-agents spawned from another thread.

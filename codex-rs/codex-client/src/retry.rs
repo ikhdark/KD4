@@ -68,18 +68,26 @@ pub fn capped_backoff(base: Duration, retry_number: u64, maximum: Duration) -> D
     if retry_number == 0 {
         return base.min(maximum);
     }
-    let raw = Duration::from_millis(exponential_backoff_millis(base, retry_number));
+    let raw = exponential_backoff(base, retry_number);
     let bounded = raw.min(maximum);
     let upper = if raw >= maximum { 1.0 } else { 1.1 };
     let jitter: f64 = rand::rng().random_range(0.9..upper);
     bounded.mul_f64(jitter).min(maximum)
 }
 
-fn exponential_backoff_millis(base: Duration, retry_number: u64) -> u64 {
+fn exponential_backoff(base: Duration, retry_number: u64) -> Duration {
+    if base.is_zero() {
+        return Duration::ZERO;
+    }
     let exponent = u32::try_from(retry_number.saturating_sub(1)).unwrap_or(u32::MAX);
-    let exp = 2u64.saturating_pow(exponent);
-    let millis = u64::try_from(base.as_millis()).unwrap_or(u64::MAX);
-    millis.saturating_mul(exp)
+    let nanos = 2u128
+        .checked_pow(exponent)
+        .and_then(|factor| base.as_nanos().checked_mul(factor))
+        .unwrap_or(u128::MAX);
+    match u64::try_from(nanos / 1_000_000_000) {
+        Ok(seconds) => Duration::new(seconds, (nanos % 1_000_000_000) as u32),
+        Err(_) => Duration::MAX,
+    }
 }
 
 /// Runs an operation once and retries it up to `policy.max_retries` times.

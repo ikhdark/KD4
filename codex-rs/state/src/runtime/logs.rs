@@ -398,6 +398,9 @@ impl StateRuntime {
             &commit_result,
         );
         commit_result?;
+        // Reclamation acquires its own connection. Release the committed
+        // writer first so it cannot wait for its own last available pool slot.
+        drop(connection);
         if reconcile_all {
             self.reclaim_free_log_pages().await;
         }
@@ -896,16 +899,15 @@ fn push_log_filters(builder: &mut QueryBuilder<Sqlite>, query: &LogQuery) {
     let has_thread_filter = !query.thread_ids.is_empty() || query.include_threadless;
     if has_thread_filter {
         builder.push(" AND (");
-        let mut needs_or = false;
-        for thread_id in &query.thread_ids {
-            if needs_or {
-                builder.push(" OR ");
-            }
-            builder.push("thread_id = ").push_bind(thread_id.as_str());
-            needs_or = true;
+        if !query.thread_ids.is_empty() {
+            // IN is flat: an OR per thread reaches SQLite's expression-depth
+            // limit well before its supported bind-parameter limit.
+            builder.push("thread_id IN (SELECT value FROM json_each(");
+            builder.push_bind(sqlx::types::Json(query.thread_ids.clone()));
+            builder.push("))");
         }
         if query.include_threadless {
-            if needs_or {
+            if !query.thread_ids.is_empty() {
                 builder.push(" OR ");
             }
             builder.push("thread_id IS NULL");

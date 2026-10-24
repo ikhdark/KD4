@@ -48,6 +48,53 @@ fn lock_path_is_stable_for_all_writers() {
 }
 
 #[test]
+fn patch_capture_admission_needs_only_read_access_to_initialized_lock() {
+    use std::os::windows::fs::OpenOptionsExt;
+    use windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ;
+
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("source.txt");
+    let lock_path = codex_file_system::prepare_patch_capture(&path).unwrap();
+    // Forbid write opens independently of the caller's token. Both shared and
+    // exclusive byte-range locks work on a handle opened with read access.
+    let read_only = std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_READ)
+        .open(&lock_path)
+        .unwrap();
+    let first = codex_file_system::guard_patch_read(&path).unwrap().unwrap();
+    let second = codex_file_system::guard_patch_read(&path).unwrap().unwrap();
+    let started = std::time::Instant::now();
+    assert_eq!(
+        codex_file_system::try_acquire_patch_capture(&path)
+            .unwrap_err()
+            .kind(),
+        std::io::ErrorKind::WouldBlock,
+    );
+    assert!(started.elapsed() < std::time::Duration::from_secs(2));
+    drop((first, second));
+    let writer = codex_file_system::try_acquire_patch_capture(&path).unwrap();
+    assert_eq!(
+        codex_file_system::guard_patch_read(&path)
+            .unwrap_err()
+            .kind(),
+        std::io::ErrorKind::WouldBlock,
+    );
+    drop(writer);
+    assert!(
+        codex_file_system::guard_patch_read(&path)
+            .unwrap()
+            .is_some()
+    );
+    drop(read_only);
+    assert!(
+        !path.exists(),
+        "read admission must not create source files"
+    );
+    assert_eq!(std::fs::read_dir(temp.path()).unwrap().count(), 0);
+}
+
+#[test]
 fn resolved_config_aliases_hold_the_same_target_lock() {
     let temp = tempfile::tempdir().unwrap();
     let target = temp.path().join("settings.toml");

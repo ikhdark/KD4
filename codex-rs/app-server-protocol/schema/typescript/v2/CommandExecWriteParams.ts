@@ -17,8 +17,8 @@ processId: string,
  */
 deltaBase64?: string | null,
 /**
- * Close input after queued bytes. Unix PTYs send canonical VEOF (including
- * flushing a partial line); raw/disabled-VEOF terminals return an error.
- * Terminal EOF is not a permanent pipe half-close.
+ * Close input after queued bytes. Unix PTYs drain accepted input and return
+ * an error because terminal input cannot be half-closed reliably. No
+ * terminal-control bytes are synthesized; use pipe stdin for EOF.
  */
 closeStdin?: boolean, };

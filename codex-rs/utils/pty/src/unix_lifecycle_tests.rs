@@ -24,44 +24,70 @@ async fn ready(output: &mut mpsc::Receiver<Vec<u8>>) {
     .unwrap();
 }
 
+#[cfg(target_os = "linux")]
 #[tokio::test]
-async fn ordered_terminal_eof_uses_custom_veof_after_a_partial_line() {
-    let SpawnedProcess {
-        session,
-        mut stdout_rx,
-        exit_rx,
-        ..
-    } = shell("stty -echo eof '^A'; printf READY; cat").await;
-    ready(&mut stdout_rx).await;
-    session
-        .writer_sender()
-        .send(b"partial-nonce".to_vec())
+async fn ordered_terminal_close_drains_input_without_synthesizing_control_bytes() {
+    for (settings, payload) in [
+        ("-echo -opost icanon eof '^A'", &b"accepted\n"[..]),
+        (
+            "-echo -opost icanon iexten lnext '^V' eof '^D'",
+            &b"accepted\n\x16"[..],
+        ),
+        (
+            "-echo -opost icanon isig intr '^C' eof '^C'",
+            &b"accepted\n"[..],
+        ),
+        ("raw -echo -opost", &b"accepted\n"[..]),
+    ] {
+        let SpawnedProcess {
+            session,
+            mut stdout_rx,
+            mut exit_rx,
+            ..
+        } = shell(&format!("stty {settings}; printf READY; cat")).await;
+        ready(&mut stdout_rx).await;
+        session
+            .writer_sender()
+            .send(payload.to_vec())
+            .await
+            .unwrap();
+        let first = tokio::time::timeout(Duration::from_secs(5), session.close_stdin_ordered())
+            .await
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(first.kind(), ErrorKind::Unsupported, "{settings}");
+        let second = session.close_stdin_ordered().await.unwrap_err();
+        assert_eq!(
+            (second.kind(), second.to_string()),
+            (first.kind(), first.to_string())
+        );
+        let output = tokio::time::timeout(Duration::from_secs(5), async {
+            let mut output = Vec::new();
+            while output.len() < b"accepted\n".len() {
+                output.extend(stdout_rx.recv().await.expect("accepted output"));
+            }
+            output
+        })
         .await
         .unwrap();
-    tokio::time::timeout(Duration::from_secs(5), session.close_stdin_ordered())
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(
+        assert_eq!(output, b"accepted\n", "{settings}");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), stdout_rx.recv())
+                .await
+                .is_err()
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut exit_rx)
+                .await
+                .is_err()
+        );
+        session.request_terminate().unwrap();
         tokio::time::timeout(Duration::from_secs(5), exit_rx)
             .await
             .unwrap()
-            .unwrap(),
-        0
-    );
-    let output = tokio::time::timeout(Duration::from_secs(5), async {
-        let mut bytes = Vec::new();
-        while let Some(chunk) = stdout_rx.recv().await {
-            bytes.extend(chunk);
-        }
-        bytes
-    })
-    .await
-    .unwrap();
-    assert_eq!(output, b"partial-nonce");
-    assert!(session.output_capture().stdout_complete());
-    // An acknowledged close is idempotent and cannot inject more input.
-    session.close_stdin_ordered().await.unwrap();
+            .unwrap();
+        session.finish();
+    }
 }
 
 #[tokio::test]

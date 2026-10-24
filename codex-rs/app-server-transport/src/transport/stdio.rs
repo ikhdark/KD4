@@ -358,10 +358,18 @@ where
                 break;
             };
             batch.clear();
+            let mut byte_credits = Vec::new();
             let mut write_complete_tx = None;
             for index in 0..MAX_STDOUT_BATCH_MESSAGES {
                 let frame_start = batch.len();
-                match serde_json::to_writer(&mut batch, &queued_message.message) {
+                let encoded = if let Some(mut encoded) = queued_message.encoded_json.take() {
+                    batch.extend_from_slice(&encoded.bytes);
+                    byte_credits.extend(encoded.delivery_credit.take());
+                    Ok(())
+                } else {
+                    serde_json::to_writer(&mut batch, &queued_message.message)
+                };
+                match encoded {
                     Ok(()) => {
                         batch.push(b'\n');
                         write_complete_tx = queued_message.write_complete_tx;
@@ -405,6 +413,7 @@ where
                     break;
                 }
             }
+            drop(byte_credits);
             if let Some(write_complete_tx) = write_complete_tx {
                 let _ = write_complete_tx.send(std::time::Instant::now());
             }
@@ -532,15 +541,20 @@ mod tests {
                 (3, Some(first_tx)),
                 (4, Some(second_tx)),
             ] {
-                writer
-                    .try_send(QueuedOutgoingMessage {
+                let mut queued = QueuedOutgoingMessage {
                         message: OutgoingMessage::Response(OutgoingResponse {
                             id: RequestId::Integer(id),
                             result: json!({"text": "line one\nline two"}),
                         }),
+                        encoded_json: None,
                         write_complete_tx: receipt,
-                    })
-                    .unwrap();
+                    };
+                // Exercise retained encodings and the ordinary fallback in the
+                // real writer, including receipt-bearing flush boundaries.
+                if id % 2 == 0 {
+                    queued.encode_json(16 * 1024 * 1024).unwrap();
+                }
+                writer.try_send(queued).unwrap();
             }
             assert_eq!(
                 timeout(Duration::from_secs(2), first_rx)
@@ -780,6 +794,7 @@ mod tests {
                                         id: request.id,
                                         result: json!({"payload": "x".repeat(2 * 1024 * 1024)}),
                                     }),
+                                    encoded_json: None,
                                     write_complete_tx: Some(write_complete_tx),
                                 })
                                 .await

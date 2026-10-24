@@ -25,6 +25,36 @@ use tokio_util::sync::CancellationToken;
 use super::HostPeer;
 
 #[tokio::test]
+async fn mandatory_control_failure_disconnects_instead_of_losing_an_event() {
+    let (tx, _rx) = mpsc::channel(4);
+    let mut peer = HostPeer::new(tx);
+    peer.control_bytes = Arc::new(Semaphore::new(0));
+    let reservation = Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap();
+    peer.send_mandatory_control(HostToClient::CellClosed {
+        session_id: session_id("s"), cell_id: CellId::new("c".into()).into(),
+    }, reservation);
+    assert!(peer.is_disconnected());
+}
+
+#[tokio::test]
+async fn queued_controls_keep_admission_reserved_until_the_writer_releases_them() {
+    let (tx, mut rx) = mpsc::channel(8);
+    let peer = HostPeer::new(tx);
+    let reservations = Arc::new(Semaphore::new(2));
+    for id in 0..2 {
+        peer.send_mandatory_control(HostToClient::CancelDelegateRequest {
+            id: codex_code_mode_protocol::host::DelegateRequestId::new(id), cause: None,
+        }, Arc::clone(&reservations).try_acquire_owned().unwrap());
+    }
+    assert_eq!(reservations.available_permits(), 0);
+    let frame = rx.recv().await.unwrap();
+    assert_eq!(reservations.available_permits(), 0);
+    drop(frame);
+    assert_eq!(reservations.available_permits(), 1);
+    assert!(!peer.is_disconnected());
+}
+
+#[tokio::test]
 async fn outgoing_bytes_remain_charged_until_delivery_with_reserved_control() {
     let (tx, mut rx) = mpsc::channel(super::super::OUTGOING_FRAME_CAPACITY);
     let mut peer = HostPeer::new(tx);
@@ -725,7 +755,7 @@ async fn dropped_dispatched_delegate_call_sends_cancellation_immediately() {
         .expect("immediate cancellation frame");
     assert_eq!(
         peer.delegate_permits.available_permits(),
-        MAX_PENDING_DELEGATE_REQUESTS
+        MAX_PENDING_DELEGATE_REQUESTS - 1
     );
     let mut bytes = Vec::new();
     let mut writer = FramedWriter::new(&mut bytes);
@@ -750,6 +780,8 @@ async fn dropped_dispatched_delegate_call_sends_cancellation_immediately() {
             .expect("cancellation decoding"),
         Some(HostToClient::CancelDelegateRequest { id, cause: None })
     );
+    drop(cancellation_frame);
+    assert_eq!(peer.delegate_permits.available_permits(), MAX_PENDING_DELEGATE_REQUESTS);
     assert!(matches!(
         outgoing_rx.try_recv(),
         Err(mpsc::error::TryRecvError::Empty)

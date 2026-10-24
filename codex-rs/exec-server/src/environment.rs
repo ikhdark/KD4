@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use indexmap::IndexMap;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::RwLock;
@@ -55,7 +55,7 @@ pub const CODEX_EXEC_SERVER_NOISE_CHATGPT_ACCOUNT_ID_ENV_VAR: &str =
 #[derive(Debug)]
 pub struct EnvironmentManager {
     default_environment: Option<String>,
-    pub(super) environments: RwLock<HashMap<String, Arc<Environment>>>,
+    pub(super) environments: RwLock<IndexMap<String, Arc<Environment>>>,
     local_environment: Option<Arc<Environment>>,
     local_runtime_paths: Option<ExecServerRuntimePaths>,
 }
@@ -75,7 +75,7 @@ impl EnvironmentManager {
     pub fn default_for_tests_with_local_environment(local_environment: Arc<Environment>) -> Self {
         Self {
             default_environment: Some(LOCAL_ENVIRONMENT_ID.to_string()),
-            environments: RwLock::new(HashMap::from([(
+            environments: RwLock::new(IndexMap::from([(
                 LOCAL_ENVIRONMENT_ID.to_string(),
                 Arc::clone(&local_environment),
             )])),
@@ -88,7 +88,7 @@ impl EnvironmentManager {
     pub fn without_environments() -> Self {
         Self {
             default_environment: None,
-            environments: RwLock::new(HashMap::new()),
+            environments: RwLock::new(IndexMap::new()),
             local_environment: None,
             local_runtime_paths: None,
         }
@@ -156,7 +156,7 @@ impl EnvironmentManager {
     ) -> Result<Self, ExecServerError> {
         let manager = Self {
             default_environment: Some(REMOTE_ENVIRONMENT_ID.to_string()),
-            environments: RwLock::new(HashMap::new()),
+            environments: RwLock::new(IndexMap::new()),
             local_environment: None,
             local_runtime_paths,
         };
@@ -191,7 +191,7 @@ impl EnvironmentManager {
             include_local,
         } = snapshot;
         let mut environment_map =
-            HashMap::with_capacity(environments.len() + usize::from(include_local));
+            IndexMap::with_capacity(environments.len() + usize::from(include_local));
         let local_environment = if include_local {
             let local_runtime_paths = local_runtime_paths.clone().ok_or_else(|| {
                 ExecServerError::Protocol(
@@ -819,6 +819,19 @@ mod tests {
     fn test_runtime_paths() -> ExecServerRuntimePaths {
         ExecServerRuntimePaths::new(std::env::current_exe().expect("current exe"))
             .expect("runtime paths")
+    }
+
+    #[tokio::test]
+    async fn configured_environment_order_survives_default_promotion_and_replacement() {
+        let snapshot = EnvironmentProviderSnapshot {
+            environments: ["first", "middle", "third"].into_iter().map(|id| (id.into(), Environment::default_for_tests())).collect(),
+            default: EnvironmentDefault::EnvironmentId("middle".into()), include_local: false,
+        };
+        let manager = EnvironmentManager::from_snapshot(snapshot, None).unwrap();
+        assert_eq!(manager.default_environment_ids(), ["middle", "first", "third"]);
+        manager.upsert_environment("first".into(), "ws://127.0.0.1:9".into(), Some(Duration::from_millis(10))).unwrap();
+        manager.upsert_environment("fourth".into(), "ws://127.0.0.1:9".into(), Some(Duration::from_millis(10))).unwrap();
+        assert_eq!(manager.default_environment_ids(), ["middle", "first", "third", "fourth"]);
     }
 
     #[test]

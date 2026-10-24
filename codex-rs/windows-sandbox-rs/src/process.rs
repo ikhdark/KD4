@@ -51,14 +51,22 @@ pub enum ConsoleMode {
     NoWindow,
 }
 
-pub fn make_env_block(env: &HashMap<String, String>) -> Vec<u16> {
+pub fn make_env_block(env: &HashMap<String, String>) -> Result<Vec<u16>> {
+    let mut env = env.clone();
+    crate::env::normalize_environment(&mut env)?;
     let mut items: Vec<(String, String)> =
         env.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+    let mut comparison_failed = false;
     items.sort_by(|a, b| {
-        a.0.to_uppercase()
-            .cmp(&b.0.to_uppercase())
-            .then(a.0.cmp(&b.0))
+        let left = a.0.encode_utf16().collect::<Vec<_>>();
+        let right = b.0.encode_utf16().collect::<Vec<_>>();
+        // normalize_environment checked nonempty names and counted lengths.
+        let order = unsafe { windows_sys::Win32::Globalization::CompareStringOrdinal(
+            left.as_ptr(), left.len() as i32, right.as_ptr(), right.len() as i32, 1,
+        ) };
+        if order == 0 { comparison_failed = true; a.0.cmp(&b.0) } else { order.cmp(&2) }
     });
+    anyhow::ensure!(!comparison_failed, "failed to order Windows environment names");
     let mut w: Vec<u16> = Vec::new();
     for (k, v) in items {
         let mut s = to_wide(format!("{k}={v}"));
@@ -67,7 +75,8 @@ pub fn make_env_block(env: &HashMap<String, String>) -> Vec<u16> {
         w.push(0);
     }
     w.push(0);
-    w
+    if w.len() == 1 { w.push(0); }
+    Ok(w)
 }
 
 unsafe fn ensure_inheritable_stdio(si: &mut STARTUPINFOW) -> Result<()> {
@@ -104,7 +113,7 @@ pub unsafe fn create_process_as_user(
 ) -> Result<CreatedProcess> {
     let cmdline_str = argv_to_command_line(argv);
     let mut cmdline: Vec<u16> = to_wide(&cmdline_str);
-    let env_block = make_env_block(env_map);
+    let env_block = make_env_block(env_map)?;
     let desktop = LaunchDesktop::prepare(use_private_desktop, logs_base_dir)?;
     let job = Arc::new(JobObject::create().context("create process job")?);
     let mut pi: PROCESS_INFORMATION = std::mem::zeroed();
@@ -116,8 +125,7 @@ pub unsafe fn create_process_as_user(
         | (None, ConsoleMode::Inherit)
         | (None, ConsoleMode::NoWindow) => 0,
     };
-    let attr_count = if stdio.is_some() { 2 } else { 1 };
-    let mut attrs = ProcThreadAttributeList::new(attr_count)?;
+    let mut attrs = ProcThreadAttributeList::new(2)?;
     attrs.set_job(job.as_raw_handle() as HANDLE)?;
 
     let mut si: STARTUPINFOEXW = std::mem::zeroed();
@@ -148,6 +156,10 @@ pub unsafe fn create_process_as_user(
         }
         None => {
             ensure_inheritable_stdio(&mut si.StartupInfo)?;
+            let mut handles = vec![si.StartupInfo.hStdInput, si.StartupInfo.hStdOutput, si.StartupInfo.hStdError];
+            handles.sort_unstable();
+            handles.dedup();
+            attrs.set_handle_list(handles)?;
         }
     }
     si.lpAttributeList = attrs.as_mut_ptr();

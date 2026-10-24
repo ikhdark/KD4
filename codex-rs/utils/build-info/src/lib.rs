@@ -94,20 +94,65 @@ pub fn file_sha256(path: &Path) -> io::Result<String> {
 /// SHA-256 of the running executable, hashed once per process. Commit, dirty
 /// flag, and the reproducible build timestamp cannot tell two dirty builds of
 /// one commit apart; this can. Hashing blocks, so call it off async workers.
+/// Linux opens the pinned running image. Other platforms use a best-effort
+/// current-executable pathname snapshot.
 pub fn executable_sha256() -> Option<&'static str> {
     static HASH: OnceLock<Option<String>> = OnceLock::new();
-    HASH.get_or_init(|| {
-        std::env::current_exe()
-            .and_then(|path| file_sha256(&path))
-            .ok()
-    })
-    .as_deref()
+    HASH.get_or_init(|| running_executable_sha256().ok())
+        .as_deref()
+}
+
+#[cfg(target_os = "linux")]
+fn running_executable_sha256() -> io::Result<String> {
+    file_sha256(Path::new("/proc/self/exe"))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn running_executable_sha256() -> io::Result<String> {
+    file_sha256(&std::env::current_exe()?)
 }
 
 #[cfg(test)]
 mod tests {
     use super::BuildInfo;
     use super::CODEX_VERSION;
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn executable_hash_survives_path_replacement() -> std::io::Result<()> {
+        const EXPECTED: &str = "KD4_TEST_EXPECTED_IMAGE_HASH";
+        if let Some(expected) = std::env::var_os(EXPECTED) {
+            let expected = expected.to_str().unwrap();
+            assert_eq!(super::running_executable_sha256()?, expected);
+            let executable = std::env::current_exe()?;
+            let replacement = executable.with_extension("replacement");
+            std::fs::write(&replacement, "not the running executable")?;
+            assert_ne!(super::file_sha256(&replacement)?, expected);
+            std::fs::rename(&replacement, &executable)?;
+            assert_eq!(super::executable_sha256(), Some(expected));
+            assert_eq!(super::executable_sha256(), Some(expected));
+            return Ok(());
+        }
+        let dir = tempfile::tempdir()?;
+        let executable = dir.path().join("running-build-info-test");
+        std::fs::copy(std::env::current_exe()?, &executable)?;
+        let expected = super::file_sha256(&executable)?;
+        let output = std::process::Command::new(&executable)
+            .args([
+                "--exact",
+                "tests::executable_hash_survives_path_replacement",
+                "--nocapture",
+            ])
+            .env(EXPECTED, expected)
+            .output()?;
+        assert!(
+            output.status.success(),
+            "{} {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        Ok(())
+    }
 
     #[test]
     fn current_reports_embedded_metadata() {

@@ -65,6 +65,7 @@ pub(super) struct CodeModeDispatchBroker {
     dispatch_tx: async_channel::Sender<DispatchMessage>,
     dispatch_rx: async_channel::Receiver<DispatchMessage>,
     cells: CellDispatchStates,
+    closed_cells: Mutex<Vec<CellId>>,
     dequeue_owner: Arc<Mutex<Option<Arc<()>>>>,
 }
 
@@ -75,12 +76,17 @@ impl CodeModeDispatchBroker {
             dispatch_tx,
             dispatch_rx,
             cells: Arc::new(Mutex::new(HashMap::new())),
+            closed_cells: Mutex::new(Vec::new()),
             dequeue_owner: Arc::new(Mutex::new(None)),
         }
     }
 
     pub(super) fn mark_cell_ready_for_dispatch(&self, cell_id: &CellId) {
         dispatch_gate(&self.cells, cell_id).send_replace(true);
+    }
+
+    pub(super) fn take_closed_cells(&self) -> Vec<CellId> {
+        std::mem::take(&mut *self.closed_cells.lock().unwrap_or_else(std::sync::PoisonError::into_inner))
     }
 
     pub(super) fn bind_cell_environments(
@@ -505,6 +511,7 @@ fn close_cell(cells: &Mutex<HashMap<CellId, CellDispatchState>>, cell_id: &CellI
     };
     let remove = cells.get_mut(cell_id).is_some_and(|cell| {
         cell.terminal = true;
+        cell.ready.send_replace(false);
         cell.pending_continuations.is_empty()
     });
     if remove {
@@ -516,7 +523,9 @@ fn cleanup_terminal_cells(cells: &Mutex<HashMap<CellId, CellDispatchState>>) {
     cells
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .retain(|_, cell| !cell.terminal);
+        // A sampling-worker boundary is not an acknowledgment. Retire only
+        // execution readiness; exact pages stay until their normal merge/ack.
+        .retain(|_, cell| !cell.terminal || !cell.pending_continuations.is_empty());
 }
 
 fn duration_ms(duration: std::time::Duration) -> u64 {
@@ -560,6 +569,10 @@ async fn wait_until_cell_ready_for_dispatch(
     }
     let mut ready_rx = dispatch_gate(cells, cell_id).subscribe();
     loop {
+        if cells.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(cell_id).is_some_and(|cell| cell.terminal) {
+            return false;
+        }
         if *ready_rx.borrow_and_update() {
             return true;
         }
@@ -643,6 +656,7 @@ impl CodeModeSessionDelegate for CodeModeDispatchBroker {
 
     fn cell_closed(&self, cell_id: &CellId) {
         self.close_cell(cell_id);
+        self.closed_cells.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(cell_id.clone());
     }
 }
 
@@ -1069,8 +1083,8 @@ mod tests {
         assert_eq!(snapshot[0].preserved_content, vec![json!({"ordinal": 0})]);
     }
 
-    #[test]
-    fn worker_cleanup_removes_terminal_cells_and_preserves_live_cells() {
+    #[tokio::test]
+    async fn worker_cleanup_preserves_unacknowledged_terminal_and_live_cells() {
         let broker = CodeModeDispatchBroker::new();
         let cell_id = CellId::new("cell-d".to_string());
         broker.mark_cell_ready_for_dispatch(&cell_id);
@@ -1086,15 +1100,21 @@ mod tests {
 
         cleanup_terminal_cells(&broker.cells);
 
-        assert!(broker.continuation_snapshot(&cell_id).is_empty());
+        assert_eq!(broker.continuation_snapshot(&cell_id).len(), 1);
         let cells = broker.cells.lock().unwrap();
-        assert!(!cells.contains_key(&cell_id));
+        assert!(cells.contains_key(&cell_id));
         assert!(cells.contains_key(&first));
         assert!(cells.contains_key(&second));
         drop(cells);
         assert!(broker.has_waitable_cells());
         assert!(broker.continuation_snapshot(&first).is_empty());
         assert_eq!(broker.continuation_snapshot(&second).len(), 1);
+        assert!(!wait_until_cell_ready_for_dispatch(&broker.cells,&cell_id,&CancellationToken::new()).await,
+            "a retained terminal page cannot authorize a new action");
+        let receipts=broker.continuation_snapshot(&cell_id).into_iter().map(|page|page.receipt).collect::<Vec<_>>();
+        broker.acknowledge_continuations(&cell_id,&receipts);
+        cleanup_terminal_cells(&broker.cells);
+        assert!(!broker.cells.lock().unwrap().contains_key(&cell_id));
     }
 
     #[tokio::test]

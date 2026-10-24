@@ -3,7 +3,6 @@ use crate::config_requirements::ConfigRequirementsToml;
 
 use super::fingerprint::record_origins;
 use super::fingerprint::version_for_toml;
-use super::key_aliases::normalized_with_key_aliases;
 use super::merge::merge_toml_values;
 use crate::CloudConfigBundleLoader;
 use crate::ConfigLayer;
@@ -652,6 +651,7 @@ impl ConfigLayerStack {
 
     /// Returns field origins for the merged config-layer view.
     ///
+    /// Map paths use `config_origin_key`; array indices use `[index]` components.
     /// Requirement sources are tracked separately and are not included here.
     pub fn origins(&self) -> HashMap<String, ConfigLayerMetadata> {
         let mut origins = HashMap::new();
@@ -661,9 +661,8 @@ impl ConfigLayerStack {
             ConfigLayerStackOrdering::LowestPrecedenceFirst,
             /*include_disabled*/ false,
         ) {
-            let config = normalized_with_key_aliases(&layer.config, &[]);
             let metadata = layer.metadata();
-            record_origins(&config, &metadata, &mut path, &mut origins);
+            record_origins(&layer.config, &metadata, &mut path, &mut origins);
         }
 
         // Arrays and type-changing overlays replace whole subtrees, unlike

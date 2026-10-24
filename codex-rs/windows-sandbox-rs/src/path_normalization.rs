@@ -12,6 +12,14 @@ pub fn canonical_path_key(path: &Path) -> String {
         .to_ascii_lowercase()
 }
 
+/// Lossless grant identity. Never reuse ambiguous legacy case-folded entries.
+pub(crate) fn security_path_key(path: &Path) -> String {
+    use std::os::windows::ffi::OsStrExt;
+    let units = canonicalize_path(path).as_os_str().encode_wide()
+        .map(|unit| format!("{unit:04x}")).collect::<String>();
+    format!("v2:utf16:{units}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::canonical_path_key;

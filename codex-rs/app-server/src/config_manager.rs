@@ -17,10 +17,12 @@ use codex_utils_absolute_path::AbsolutePathBuf;
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::collections::HashMap;
+use std::collections::VecDeque;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::RwLock;
+use std::sync::Weak;
 use std::sync::atomic::AtomicU64;
 #[cfg(test)]
 use std::sync::atomic::AtomicUsize;
@@ -34,6 +36,8 @@ use tracing::warn;
 /// Coalesce the clusters of identical config reads made by one app-server RPC
 /// without turning the manager into a long-lived authority over config files.
 const CONFIG_LOAD_CACHE_TTL: Duration = Duration::from_millis(250);
+const CONFIG_LOAD_CACHE_ENTRIES: usize = 8;
+const CONFIG_LOAD_TRACKED_FLIGHTS: usize = 32;
 
 #[derive(Debug, Clone, PartialEq)]
 struct ConfigLoadCacheKey {
@@ -50,6 +54,44 @@ struct ConfigLoadCacheEntry {
     config: Config,
 }
 
+#[derive(Default)]
+struct ConfigLoadCache {
+    ready: VecDeque<ConfigLoadCacheEntry>,
+    // A canceled builder releases its gate. A waiting caller can then retry;
+    // there is no detached producer or failed result retained indefinitely.
+    flights: Vec<(ConfigLoadCacheKey, u64, Weak<tokio::sync::Mutex<()>>)>,
+}
+
+#[derive(Default)]
+struct OverridePathNode {
+    children: BTreeMap<String, OverridePathNode>,
+    terminal: Option<usize>,
+    first: Option<usize>,
+}
+
+impl OverridePathNode {
+    fn insert(&mut self, path: &[String], index: usize) -> Option<usize> {
+        if let Some(previous) = self.terminal {
+            return Some(previous);
+        }
+        if path.is_empty() {
+            if let Some(previous) = self.first {
+                return Some(previous);
+            }
+            self.terminal = Some(index);
+        } else if let Some(previous) = self
+            .children
+            .entry(path[0].clone())
+            .or_default()
+            .insert(&path[1..], index)
+        {
+            return Some(previous);
+        }
+        self.first.get_or_insert(index);
+        None
+    }
+}
+
 /// Shared app-server entry point for loading effective Codex configuration.
 #[derive(Clone)]
 pub(crate) struct ConfigManager {
@@ -64,7 +106,7 @@ pub(crate) struct ConfigManager {
     cloud_config_bundle: Arc<RwLock<CloudConfigBundleLoader>>,
     arg0_paths: Arg0DispatchPaths,
     thread_config_loader: Arc<RwLock<Arc<dyn ThreadConfigLoader>>>,
-    load_cache: Arc<RwLock<Option<ConfigLoadCacheEntry>>>,
+    load_cache: Arc<RwLock<ConfigLoadCache>>,
     load_generation: Arc<AtomicU64>,
     remote_control_handle: Arc<RwLock<Option<crate::transport::RemoteControlHandle>>>,
     #[cfg(test)]
@@ -90,7 +132,7 @@ impl ConfigManager {
             cloud_config_bundle: Arc::new(RwLock::new(cloud_config_bundle)),
             arg0_paths,
             thread_config_loader: Arc::new(RwLock::new(thread_config_loader)),
-            load_cache: Arc::new(RwLock::new(None)),
+            load_cache: Arc::new(RwLock::new(ConfigLoadCache::default())),
             load_generation: Arc::new(AtomicU64::new(0)),
             remote_control_handle: Arc::new(RwLock::new(None)),
             #[cfg(test)]
@@ -131,6 +173,9 @@ impl ConfigManager {
         // Keep the published value complete even if staging allocation unwinds.
         let mut next = runtime_feature_enablement.clone();
         next.extend(enablement);
+        if next == *runtime_feature_enablement {
+            return Ok(());
+        }
         *runtime_feature_enablement = next;
         drop(runtime_feature_enablement);
         self.invalidate_load_cache();
@@ -412,16 +457,16 @@ impl ConfigManager {
             .map(|key| Ok((key, codex_config::parse_override_key(key)?)))
             .collect::<std::io::Result<Vec<_>>>()?;
         keys.sort_by_key(|(key, _)| *key);
+        let mut paths = OverridePathNode::default();
         for (index, (key, path)) in keys.iter().enumerate() {
-            for (ancestor, ancestor_path) in &keys[..index] {
-                if path.starts_with(ancestor_path) || ancestor_path.starts_with(path) {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::InvalidInput,
-                        format!(
-                            "ambiguous configuration overrides `{ancestor}` and `{key}`: use a single nested value or non-overlapping dotted paths"
-                        ),
-                    ));
-                }
+            if let Some(previous) = paths.insert(path, index) {
+                let ancestor = keys[previous].0;
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!(
+                        "ambiguous configuration overrides `{ancestor}` and `{key}`: use a single nested value or non-overlapping dotted paths"
+                    ),
+                ));
             }
         }
         if let Some(value) = request_overrides.remove("bypass_hook_trust") {
@@ -451,17 +496,35 @@ impl ConfigManager {
         };
         let generation = self.load_generation.load(Ordering::Acquire);
         self.validate_policy_generation(generation)?;
-        let cached_config = if let Ok(cache) = self.load_cache.read()
-            && let Some(entry) = cache.as_ref()
-            && entry.generation == generation
-            && entry.key == cache_key
-            && entry.loaded_at.elapsed() <= CONFIG_LOAD_CACHE_TTL
-        {
-            Some(entry.config.clone())
-        } else {
-            None
+        if let Some(config) = self.cached_config(&cache_key, generation) {
+            return self.with_current_policy(generation, || config);
+        }
+
+        let flight = {
+            let mut cache = self
+                .load_cache
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            cache.flights.retain(|(_, entry_generation, gate)| {
+                *entry_generation == generation && gate.strong_count() > 0
+            });
+            if let Some(gate) = cache.flights.iter().find_map(|(key, entry_generation, gate)| {
+                (key == &cache_key && *entry_generation == generation)
+                    .then(|| gate.upgrade())
+                    .flatten()
+            }) {
+                gate
+            } else {
+                let gate = Arc::new(tokio::sync::Mutex::new(()));
+                if cache.flights.len() < CONFIG_LOAD_TRACKED_FLIGHTS {
+                    cache.flights.push((cache_key.clone(), generation, Arc::downgrade(&gate)));
+                }
+                gate
+            }
         };
-        if let Some(config) = cached_config {
+        let _flight = flight.lock().await;
+        self.validate_policy_generation(generation)?;
+        if let Some(config) = self.cached_config(&cache_key, generation) {
             return self.with_current_policy(generation, || config);
         }
 
@@ -482,14 +545,31 @@ impl ConfigManager {
         self.apply_arg0_paths(&mut config);
         self.with_current_policy(generation, || {
             if let Ok(mut cache) = self.load_cache.write() {
-                *cache = Some(ConfigLoadCacheEntry {
+                cache.ready.retain(|entry| {
+                    entry.generation == generation
+                        && entry.loaded_at.elapsed() <= CONFIG_LOAD_CACHE_TTL
+                        && entry.key != cache_key
+                });
+                cache.ready.push_back(ConfigLoadCacheEntry {
                     key: cache_key,
                     generation,
                     loaded_at: Instant::now(),
                     config: config.clone(),
                 });
+                while cache.ready.len() > CONFIG_LOAD_CACHE_ENTRIES {
+                    cache.ready.pop_front();
+                }
             }
             config
+        })
+    }
+
+    fn cached_config(&self, key: &ConfigLoadCacheKey, generation: u64) -> Option<Config> {
+        self.load_cache.read().ok()?.ready.iter().find_map(|entry| {
+            (entry.generation == generation
+                && &entry.key == key
+                && entry.loaded_at.elapsed() <= CONFIG_LOAD_CACHE_TTL)
+                .then(|| entry.config.clone())
         })
     }
 
@@ -507,8 +587,7 @@ impl ConfigManager {
         let thread_config_loader = self.current_thread_config_loader();
         let generation = self.policy_generation();
         self.validate_policy_generation(generation)?;
-        let loader = self.current_cloud_config_bundle();
-        let candidate_generation = loader.candidate_generation();
+        let loader = self.current_cloud_config_bundle().for_load();
         let layers = load_config_layers_state(
             LOCAL_FS.as_ref(),
             &self.codex_home,
@@ -525,7 +604,7 @@ impl ConfigManager {
         match layers {
             Ok(layers) => self.with_current_policy(generation, || layers),
             Err(err) => {
-                loader.reject_candidate(candidate_generation);
+                loader.reject_loaded_candidate();
                 Err(err)
             }
         }
@@ -561,7 +640,8 @@ impl ConfigManager {
     pub(crate) fn invalidate_load_cache(&self) {
         self.load_generation.fetch_add(1, Ordering::AcqRel);
         if let Ok(mut cache) = self.load_cache.write() {
-            *cache = None;
+            cache.ready.clear();
+            cache.flights.clear();
         }
     }
 
@@ -662,6 +742,170 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
+    struct BlockedThreadConfigLoader {
+        entered: tokio::sync::Notify,
+        release: tokio::sync::Semaphore,
+        attempts: AtomicUsize,
+    }
+
+    impl ThreadConfigLoader for BlockedThreadConfigLoader {
+        fn load(
+            &self,
+            _context: codex_config::ThreadConfigContext,
+        ) -> codex_config::ThreadConfigLoaderFuture<'_, Vec<codex_config::ThreadConfigSource>> {
+            Box::pin(async move {
+                self.attempts.fetch_add(1, Ordering::Relaxed);
+                self.entered.notify_one();
+                self.release.acquire().await.expect("test release").forget();
+                Ok(Vec::new())
+            })
+        }
+    }
+
+    fn blocked_loader() -> Arc<BlockedThreadConfigLoader> {
+        Arc::new(BlockedThreadConfigLoader {
+            entered: tokio::sync::Notify::new(),
+            release: tokio::sync::Semaphore::new(0),
+            attempts: AtomicUsize::new(0),
+        })
+    }
+
+    #[tokio::test]
+    async fn concurrent_equal_config_loads_share_one_build() -> std::io::Result<()> {
+        let home = TempDir::new()?;
+        let manager = ConfigManager::without_managed_config_for_tests(home.path().to_path_buf());
+        let loader = blocked_loader();
+        manager.replace_thread_config_loader(loader.clone());
+        let mut loads = Box::pin(futures::future::join_all(
+            (0..16).map(|_| manager.load_latest_config(Some(home.path().to_path_buf()))),
+        ));
+        tokio::select! {
+            _ = &mut loads => panic!("build must wait for release"),
+            _ = loader.entered.notified() => {}
+        }
+        assert_eq!(manager.config_build_count(), 1);
+        loader.release.add_permits(16);
+        for config in loads.await {
+            config?;
+        }
+        assert_eq!(loader.attempts.load(Ordering::Relaxed), 1);
+        assert_eq!(manager.config_build_count(), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn canceled_config_builder_releases_followers_and_distinct_keys() -> std::io::Result<()> {
+        let home = TempDir::new()?;
+        let manager = ConfigManager::without_managed_config_for_tests(home.path().to_path_buf());
+        let loader = blocked_loader();
+        manager.replace_thread_config_loader(loader.clone());
+        let task_manager = manager.clone();
+        let cwd = home.path().to_path_buf();
+        let first = tokio::spawn(async move { task_manager.load_latest_config(Some(cwd)).await });
+        loader.entered.notified().await;
+        let mut follower = Box::pin(manager.load_latest_config(Some(home.path().to_path_buf())));
+        assert!(futures::poll!(&mut follower).is_pending());
+        let mut distinct = Box::pin(manager.load_with_overrides(
+            Some(HashMap::from([("model".into(), serde_json::json!("different"))])),
+            ConfigOverrides { cwd: Some(home.path().to_path_buf()), ..Default::default() },
+        ));
+        tokio::select! {
+            _ = &mut distinct => panic!("distinct build must wait for release"),
+            _ = loader.entered.notified() => {}
+        }
+        assert_eq!(manager.config_build_count(), 2, "different keys must not share a gate");
+        first.abort();
+        assert!(first.await.unwrap_err().is_cancelled());
+        loader.release.add_permits(2);
+        follower.await?;
+        assert_eq!(distinct.await?.model.as_deref(), Some("different"));
+        assert_eq!(loader.attempts.load(Ordering::Relaxed), 3);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn config_cache_retains_distinct_keys_and_enforces_capacity_and_expiry() -> std::io::Result<()> {
+        let home = TempDir::new()?;
+        let manager = ConfigManager::without_managed_config_for_tests(home.path().to_path_buf());
+        let load = |model: &str| manager.load_with_overrides(
+            Some(HashMap::from([("model".into(), serde_json::json!(model))])),
+            ConfigOverrides { cwd: Some(home.path().to_path_buf()), ..Default::default() },
+        );
+        load("A").await?;
+        load("B").await?;
+        // Control freshness independently of filesystem speed on the test host.
+        for entry in &mut manager.load_cache.write().unwrap().ready {
+            entry.loaded_at = Instant::now();
+        }
+        load("A").await?;
+        load("B").await?;
+        assert_eq!(manager.config_build_count(), 2);
+        for i in 0..CONFIG_LOAD_CACHE_ENTRIES + 1 {
+            load(&format!("model-{i}")).await?;
+        }
+        assert!(manager.load_cache.read().unwrap().ready.len() <= CONFIG_LOAD_CACHE_ENTRIES);
+        for entry in &mut manager.load_cache.write().unwrap().ready {
+            entry.loaded_at = Instant::now() - CONFIG_LOAD_CACHE_TTL - Duration::from_secs(1);
+        }
+        let before = manager.config_build_count();
+        load("model-8").await?;
+        assert_eq!(manager.config_build_count(), before + 1);
+        manager.invalidate_load_cache();
+        assert!(manager.load_cache.read().unwrap().ready.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn equal_runtime_feature_updates_preserve_warm_and_inflight_configs() -> std::io::Result<()> {
+        let home = TempDir::new()?;
+        let manager = ConfigManager::without_managed_config_for_tests(home.path().to_path_buf());
+        manager.extend_runtime_feature_enablement([("auth_elicitation".into(), false)]).unwrap();
+        manager.load_latest_config(Some(home.path().to_path_buf())).await?;
+        let generation = manager.policy_generation();
+        manager.extend_runtime_feature_enablement([]).unwrap();
+        manager.extend_runtime_feature_enablement([("auth_elicitation".into(), false)]).unwrap();
+        manager.load_latest_config(Some(home.path().to_path_buf())).await?;
+        assert_eq!(manager.policy_generation(), generation);
+        assert_eq!(manager.config_build_count(), 1);
+        let loader = blocked_loader();
+        manager.replace_thread_config_loader(loader.clone());
+        let generation = manager.policy_generation();
+        let mut load = Box::pin(manager.load_latest_config(Some(home.path().to_path_buf())));
+        tokio::select! {
+            _ = &mut load => panic!("build must wait for release"),
+            _ = loader.entered.notified() => {}
+        }
+        manager.extend_runtime_feature_enablement([]).unwrap();
+        assert_eq!(manager.policy_generation(), generation);
+        loader.release.add_permits(1);
+        load.await?;
+        manager.extend_runtime_feature_enablement([("auth_elicitation".into(), true)]).unwrap();
+        assert_ne!(manager.policy_generation(), generation);
+        assert!(manager.load_cache.read().unwrap().ready.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn override_path_trie_matches_original_conflict_selection() {
+        let spellings = ["'a'.b", "a", "a.b", "a.b.c", "a.c", "'a.b'", "'a.b'.c", "z"];
+        for mask in 0usize..(1 << spellings.len()) {
+            let mut keys = spellings.iter().enumerate()
+                .filter(|(index, _)| mask & (1 << index) != 0)
+                .map(|(_, key)| (*key, codex_config::parse_override_key(key).unwrap()))
+                .collect::<Vec<_>>();
+            keys.sort_by_key(|(key, _)| *key);
+            let original = keys.iter().enumerate().find_map(|(index, (_, path))| {
+                keys[..index].iter().position(|(_, previous)| path.starts_with(previous) || previous.starts_with(path))
+                    .map(|previous| (previous, index))
+            });
+            let mut trie = OverridePathNode::default();
+            let actual = keys.iter().enumerate().find_map(|(index, (_, path))| {
+                trie.insert(path, index).map(|previous| (previous, index))
+            });
+            assert_eq!(actual, original, "subset {mask}");
+        }
+    }
+
     #[tokio::test]
     async fn equivalent_rpc_maps_share_a_cache_entry() -> std::io::Result<()> {
         let codex_home = TempDir::new()?;
@@ -732,7 +976,7 @@ mod tests {
             before.permissions.shell_environment_policy.inherit,
             codex_protocol::config_types::ShellEnvironmentPolicyInherit::Core
         );
-        let cache_before = manager.load_cache.read().expect("cache readable").clone();
+        let cache_before = manager.load_cache.read().expect("cache readable").ready.clone();
         let builds_before = manager.config_build_count();
         let generation_before = manager.load_generation.load(Ordering::Acquire);
         for reverse in [false, true] {
@@ -765,8 +1009,8 @@ mod tests {
                 generation_before
             );
             let cache = manager.load_cache.read().expect("cache readable");
-            let cache = cache.as_ref().expect("previous successful cache remains");
-            let previous = cache_before.as_ref().expect("warm cache");
+            let cache = cache.ready.front().expect("previous successful cache remains");
+            let previous = cache_before.front().expect("warm cache");
             assert_eq!(cache.key, previous.key);
             assert_eq!(cache.loaded_at, previous.loaded_at);
             assert_eq!(cache.config.model.as_deref(), Some("baseline-model"));

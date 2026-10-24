@@ -1,5 +1,6 @@
 use crate::events::AppServerRpcTransport;
 use crate::events::CodexRuntimeMetadata;
+#[cfg(test)]
 use codex_app_server_protocol::ClientRequest;
 use codex_app_server_protocol::ClientResponsePayload;
 use codex_app_server_protocol::InitializeParams;
@@ -455,29 +456,19 @@ pub struct CodexCompactionEvent {
     pub duration_ms: Option<u64>,
 }
 
-#[derive(Clone, Copy, Debug, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum GoalEventKind {
-    Created,
-    UsageAccounted,
-    StatusChanged,
-    Cleared,
-}
 
-#[derive(Clone)]
-pub struct CodexGoalEvent {
-    pub thread_id: String,
-    pub turn_id: Option<String>,
-    pub goal_id: String,
-    pub event_kind: GoalEventKind,
-    pub goal_status: codex_state::ThreadGoalStatus,
-    pub has_token_budget: bool,
-    pub cumulative_tokens_accounted: Option<i64>,
-    pub cumulative_time_accounted_seconds: Option<i64>,
+
+
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum TurnRequestFact {
+    Start { thread_id: String, num_input_images: usize },
+    Steer { thread_id: String, expected_turn_id: String, num_input_images: usize },
 }
 
 #[allow(dead_code)]
 pub(crate) enum AnalyticsFact {
+    AuthBound { epoch: u64, fact: Box<AnalyticsFact> },
     ConnectionClosed {
         connection_id: u64,
     },
@@ -488,10 +479,16 @@ pub(crate) enum AnalyticsFact {
         runtime: CodexRuntimeMetadata,
         rpc_transport: AppServerRpcTransport,
     },
+    #[cfg(test)]
     ClientRequest {
         connection_id: u64,
         request_id: RequestId,
         request: Box<ClientRequest>,
+    },
+    TurnRequest {
+        connection_id: u64,
+        request_id: RequestId,
+        request: TurnRequestFact,
     },
     ClientResponse {
         connection_id: u64,
@@ -530,7 +527,7 @@ pub(crate) enum AnalyticsFact {
 pub(crate) enum CustomAnalyticsFact {
     SubAgentThreadStarted(SubAgentThreadStartedInput),
     Compaction(Box<CodexCompactionEvent>),
-    Goal(Box<CodexGoalEvent>),
+
     TurnResolvedConfig(Box<TurnResolvedConfigFact>),
     TurnTokenUsage(Box<TurnTokenUsageFact>),
     TurnProfile(Box<TurnProfileFact>),
@@ -544,8 +541,6 @@ pub(crate) enum CustomAnalyticsFact {
     PluginInstallRequested(PluginInstallRequestedInput),
     PluginStateChanged(PluginStateChangedInput),
     PluginInstallFailed(PluginInstallFailedInput),
-    ExternalAgentConfigImportCompleted(ExternalAgentConfigImportCompletedInput),
-    ExternalAgentConfigImportFailure(ExternalAgentConfigImportFailureInput),
 }
 
 pub(crate) struct SkillInvokedInput {
@@ -615,7 +610,6 @@ pub(crate) struct PluginStateChangedInput {
 #[serde(rename_all = "snake_case")]
 pub enum PluginInstallSource {
     Manual,
-    ExternalAgentMigration,
 }
 
 pub(crate) struct PluginInstallFailedInput {
@@ -624,21 +618,7 @@ pub(crate) struct PluginInstallFailedInput {
     pub error_type: String,
 }
 
-pub struct ExternalAgentConfigImportCompletedInput {
-    pub import_id: String,
-    pub source: String,
-    pub item_type: String,
-    pub success_count: usize,
-    pub failed_count: usize,
-}
 
-pub struct ExternalAgentConfigImportFailureInput {
-    pub import_id: String,
-    pub source: String,
-    pub item_type: String,
-    pub failure_stage: String,
-    pub error_type: String,
-}
 
 #[derive(Clone, Copy)]
 pub(crate) enum PluginState {

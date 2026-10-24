@@ -437,254 +437,6 @@ async fn registered_process_drop_outside_runtime_is_awaited_by_session_shutdown(
     assert_eq!(control.calls.load(Ordering::Acquire), 1);
 }
 
-#[cfg(windows)]
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn registered_network_denial_cleanup_is_awaited_without_tracking_idle_watchers()
--> anyhow::Result<()> {
-    use std::os::windows::io::AsRawHandle;
-    use std::os::windows::io::FromRawHandle;
-    use std::os::windows::io::OwnedHandle;
-    use windows_sys::Win32::Foundation::WAIT_OBJECT_0;
-    use windows_sys::Win32::System::Threading::OpenProcess;
-    use windows_sys::Win32::System::Threading::PROCESS_SYNCHRONIZE;
-    use windows_sys::Win32::System::Threading::PROCESS_TERMINATE;
-    use windows_sys::Win32::System::Threading::TerminateProcess;
-    use windows_sys::Win32::System::Threading::WaitForSingleObject;
-    struct ChildGuard(OwnedHandle);
-    impl ChildGuard {
-        fn exited(&self) -> bool {
-            unsafe { WaitForSingleObject(self.0.as_raw_handle(), 0) == WAIT_OBJECT_0 }
-        }
-    }
-    impl Drop for ChildGuard {
-        fn drop(&mut self) {
-            if !self.exited() {
-                unsafe {
-                    TerminateProcess(self.0.as_raw_handle(), 1);
-                    WaitForSingleObject(self.0.as_raw_handle(), 5_000);
-                }
-            }
-        }
-    }
-    for denied in [false, true] {
-        let fixture = tempfile::tempdir()?;
-        let marker = fixture.path().join("network-child-pid.txt");
-        let (session, mut turn) = make_session_and_context().await;
-        turn.permission_profile = codex_protocol::models::PermissionProfile::Disabled;
-        turn.windows_sandbox_level = codex_protocol::config_types::WindowsSandboxLevel::Disabled;
-        turn.approval_policy
-            .set(codex_protocol::protocol::AskForApproval::Never)?;
-        let proxy_spec = crate::config::NetworkProxySpec::from_config_and_constraints(
-            codex_network_proxy::NetworkProxyConfig {
-                enabled: true,
-                proxy_url: "http://127.0.0.1:0".to_string(),
-                enable_socks5: false,
-                allow_local_binding: true,
-                allow_upstream_proxy: false,
-                ..Default::default()
-            },
-            None,
-            &turn.permission_profile(),
-        )?;
-        let proxy_owner = proxy_spec
-            .start_proxy(
-                turn.config.codex_home.as_path(),
-                &turn.permission_profile(),
-                None,
-                None,
-                true,
-                codex_network_proxy::NetworkProxyAuditMetadata::default(),
-            )
-            .await?;
-        turn.network = Some(proxy_owner.proxy().clone());
-        let program = which::which("powershell.exe")?
-            .to_string_lossy()
-            .into_owned();
-        let args = vec![
-            "-NoLogo".to_string(),
-            "-NoProfile".to_string(),
-            "-NonInteractive".to_string(),
-            "-Command".to_string(),
-            format!(
-                "[System.IO.File]::WriteAllText('{}', [string]$PID); Start-Sleep -Seconds 60",
-                marker.to_string_lossy().replace('\'', "''")
-            ),
-        ];
-        let mut allowed = vec![program.clone()];
-        allowed.extend(args.clone());
-        tokio::fs::create_dir_all(&turn.config.codex_home).await?;
-        session
-            .services
-            .exec_policy
-            .append_amendment_and_update(
-                &turn.config.codex_home,
-                &codex_protocol::protocol::ExecPolicyAmendment::new(allowed),
-            )
-            .await?;
-        let session = Arc::new(session);
-        let turn = Arc::new(turn);
-        let router = Arc::new(crate::tools::router::ToolRouter::from_parts(
-            crate::tools::registry::ToolRegistry::from_tools([Arc::new(
-                crate::tools::handlers::ExecCommandHandler::default(),
-            )
-                as Arc<dyn CoreToolRuntime>]),
-            Vec::new(),
-        ));
-        let runtime = crate::tools::parallel::ToolCallRuntime::new(
-            Arc::clone(&session),
-            StepContext::for_test(Arc::clone(&turn)).with_tool_router_for_test(router),
-            Arc::new(Mutex::new(TurnDiffTracker::new())),
-        );
-        runtime
-            .clone()
-            .handle_tool_call(
-                crate::tools::router::ToolCall {
-                    tool_name: codex_tools::ToolName::plain("exec_command"),
-                    call_id: "network-cleanup-owner".to_string(),
-                    payload: ToolPayload::Function {
-                        arguments: serde_json::json!({
-                            "program": program, "args": args,
-                            "tty": false, "yield_time_ms": 1000,
-                        })
-                        .to_string(),
-                    },
-                },
-                CancellationToken::new(),
-            )
-            .await?;
-        runtime.flush_workspace_evidence_generation().await?;
-        drop(runtime);
-        let manager = &session.services.unified_exec_manager;
-        let (process_id, process, deferred) = {
-            let store = manager.process_store.lock().await;
-            assert_eq!(
-                store.processes.len(),
-                1,
-                "registered call must retain its live child"
-            );
-            let (id, entry) = store.processes.iter().next().unwrap();
-            assert_eq!(entry.call_id, "network-cleanup-owner");
-            (
-                *id,
-                Arc::clone(&entry.process),
-                entry
-                    .network_approval
-                    .clone()
-                    .expect("normal runtime must register a deferred approval"),
-            )
-        };
-        let pid = tokio::time::timeout(Duration::from_secs(10), async {
-            loop {
-                if let Ok(text) = tokio::fs::read_to_string(&marker).await
-                    && let Ok(pid) = text.parse::<u32>()
-                {
-                    break pid;
-                }
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .expect("real native child must publish its identity");
-        let raw = unsafe { OpenProcess(PROCESS_SYNCHRONIZE | PROCESS_TERMINATE, 0, pid) };
-        assert!(
-            !raw.is_null(),
-            "native handle: {}",
-            std::io::Error::last_os_error()
-        );
-        let child = ChildGuard(unsafe { OwnedHandle::from_raw_handle(raw) });
-        assert!(!child.exited());
-        // Drain finite work from tool dispatch while leaving the live child's
-        // network watcher installed. An idle watcher must own no tracker slot.
-        tokio::time::timeout(Duration::from_secs(3), async {
-            while !session.terminal_tasks.is_empty() {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("an idle network watcher must not join the shutdown barrier");
-        if denied {
-            let held_termination = process.hold_termination_for_test();
-            let mut blocked =
-                codex_network_proxy::BlockedRequest::new(codex_network_proxy::BlockedRequestArgs {
-                    host: "denied.example".to_string(),
-                    reason: "not_allowed".to_string(),
-                    client: None,
-                    method: None,
-                    mode: None,
-                    protocol: "http".to_string(),
-                    decision: Some("deny".to_string()),
-                    source: Some("decider".to_string()),
-                    port: Some(80),
-                });
-            blocked.execution_id = Some(deferred.registration_id().to_string());
-            session
-                .services
-                .network_approval
-                .record_blocked_request(blocked)
-                .await;
-            tokio::time::timeout(Duration::from_secs(3), async {
-                while !process.termination_was_requested() {
-                    tokio::task::yield_now().await;
-                }
-            })
-            .await
-            .expect("the registered denial watcher must request termination");
-            assert!(deferred.is_cancelled());
-            assert!(
-                !session.terminal_tasks.is_empty(),
-                "accepted denial cleanup must acquire Session shutdown custody"
-            );
-            assert!(!child.exited());
-            assert!(
-                process
-                    .failure_message()
-                    .is_some_and(|message| message.contains("denied.example"))
-            );
-            let shutdown = session.shutdown_runtime_for_test();
-            tokio::pin!(shutdown);
-            assert!(
-                tokio::time::timeout(Duration::from_millis(50), &mut shutdown)
-                    .await
-                    .is_err()
-            );
-            assert!(session.terminal_tasks.is_closed());
-            assert!(
-                !child.exited(),
-                "shutdown cannot forge native termination while cleanup is blocked"
-            );
-            assert!(
-                manager
-                    .process_store
-                    .lock()
-                    .await
-                    .processes
-                    .contains_key(&process_id)
-            );
-            drop(held_termination);
-            assert!(
-                tokio::time::timeout(Duration::from_secs(5), shutdown)
-                    .await
-                    .expect("accepted denial cleanup must finish before shutdown")
-            );
-        } else {
-            assert!(!deferred.is_cancelled());
-            assert!(!process.termination_was_requested());
-            assert!(
-                tokio::time::timeout(Duration::from_secs(5), session.shutdown_runtime_for_test())
-                    .await
-                    .expect("idle watcher must not delay shutdown behind the live child")
-            );
-        }
-        assert!(
-            child.exited(),
-            "shutdown must reap the actual native process"
-        );
-        assert!(manager.process_store.lock().await.processes.is_empty());
-        assert!(session.list_background_terminals().await.is_empty());
-        drop(proxy_owner);
-    }
-    Ok(())
-}
 
 pub(super) async fn store_process_for_test(
     manager: &UnifiedExecProcessManager,
@@ -713,7 +465,6 @@ pub(super) async fn store_process_for_test(
             hook_command: format!("test-command-{process_id}"),
             tty: true,
             validation_launch: false,
-            network_approval: None,
             session: Arc::downgrade(session),
             last_used: Instant::now(),
         },
@@ -2113,7 +1864,6 @@ async fn cancelled_startup_keeps_store_and_ledger_until_termination_is_confirmed
             hook_command: "blocking-test".to_string(),
             tty: false,
             validation_launch: false,
-            network_approval: None,
             session: Arc::downgrade(&session),
             last_used: Instant::now(),
         },
@@ -2144,7 +1894,7 @@ async fn cancelled_startup_keeps_store_and_ledger_until_termination_is_confirmed
         attempt_key,
         process_id,
     );
-    registration.attach_process(Arc::clone(&process), None);
+    registration.attach_process(Arc::clone(&process));
     registration.set_initial_exec_command_active(Arc::clone(&active));
 
     let pending_control = Arc::new(TerminationControl::new());
@@ -2511,6 +2261,7 @@ async fn local_output_is_published_while_artifact_state_is_busy() {
     let artifact = Arc::new(Mutex::new(
         create_raw_output_artifact(temp.path(), "nonblocking-artifact", b"").await,
     ));
+    let initial_artifact = artifact.lock().await.clone();
     let (artifact_release, artifact_lock_thread) = hold_artifact_lock(Arc::clone(&artifact));
     let output_closed = Arc::new(AtomicBool::new(false));
     let output_handles = OutputHandles {
@@ -2535,6 +2286,7 @@ async fn local_output_is_published_while_artifact_state_is_busy() {
         output_tx,
         Some(Arc::clone(&artifact)),
         CancellationToken::new(),
+        Some(initial_artifact),
     );
     stdout_tx
         .send(b"live-output".to_vec())
@@ -2571,7 +2323,7 @@ async fn local_output_is_published_while_artifact_state_is_busy() {
         tokio::fs::read(path)
             .await
             .expect("read finalized artifact"),
-        b"live-output\n[output gap: producer output is missing or unverified; capture is incomplete]\n"
+        b"live-output"
     );
 }
 
@@ -2581,6 +2333,7 @@ async fn local_output_artifact_is_flushed_and_unlocked_after_worker_finishes() {
     let artifact = Arc::new(Mutex::new(
         create_raw_output_artifact(temp.path(), "completion-barrier", b"").await,
     ));
+    let initial_artifact = artifact.lock().await.clone();
     let output_buffer = Arc::new(Mutex::new(HeadTailBuffer::default()));
     let output_notify = Arc::new(Notify::new());
     let output_closed = Arc::new(AtomicBool::new(false));
@@ -2610,6 +2363,7 @@ async fn local_output_artifact_is_flushed_and_unlocked_after_worker_finishes() {
         output_tx,
         Some(Arc::clone(&artifact)),
         CancellationToken::new(),
+        Some(initial_artifact),
     );
     stdout_tx
         .send(b"artifact-tail".to_vec())
@@ -2647,23 +2401,22 @@ async fn local_output_artifact_is_flushed_and_unlocked_after_worker_finishes() {
         tokio::fs::read(&path)
             .await
             .expect("read finalized artifact"),
-        b"artifact-tailerror-tail\n[output gap: producer output is missing or unverified; capture is incomplete]\n"
+        b"artifact-tailerror-tail"
     );
     handle.try_lock().expect("artifact should be unlocked");
     handle.unlock().expect("release test artifact lock");
     let artifact_id = path.file_stem().unwrap().to_str().unwrap();
-    let recovered = crate::tools::command_output_artifact::read_tool_output_selectors(
+    let recovered = crate::tools::command_output_artifact::capture::read_command_log(
         temp.path(),
         "completion-barrier",
         artifact_id,
-        vec![
-            crate::tools::command_output_artifact::ToolOutputSelector::Bytes { start: 0, end: 23 },
-        ],
+        &[crate::tools::command_output_artifact::ToolOutputSelector::Lines { start: 1, end: 200 }],
+        16 * 1024,
     )
     .await
-    .unwrap();
+    .unwrap().unwrap();
     assert!(
-        !recovered.capture_complete,
+        recovered["retained_artifact_complete"] == false,
         "known prefix is not a complete producer transcript"
     );
 }
@@ -2674,6 +2427,7 @@ async fn local_output_closes_while_artifact_finalization_stalls() {
     let artifact = Arc::new(Mutex::new(
         create_raw_output_artifact(temp.path(), "stalled-finalization", b"").await,
     ));
+    let initial_artifact = artifact.lock().await.clone();
     let (artifact_release, artifact_lock_thread) = hold_artifact_lock(Arc::clone(&artifact));
     let output_closed = Arc::new(AtomicBool::new(false));
     let output_closed_notify = Arc::new(Notify::new());
@@ -2702,6 +2456,7 @@ async fn local_output_closes_while_artifact_finalization_stalls() {
         output_tx,
         Some(Arc::clone(&artifact)),
         CancellationToken::new(),
+        Some(initial_artifact),
     );
     drop(stdout_tx);
     drop(stderr_tx);
@@ -2728,8 +2483,7 @@ async fn local_output_closes_while_artifact_finalization_stalls() {
     output_task.await.expect("local output task should finish");
     assert!(matches!(
         &*artifact.lock().await,
-        RawOutputArtifact::Failed { message, .. }
-            if message == "raw output artifact finalization timed out"
+        RawOutputArtifact::Stored { truncated: true, finalized: true, .. }
     ));
 }
 
@@ -2737,7 +2491,7 @@ async fn local_output_closes_while_artifact_finalization_stalls() {
 #[serial_test::serial(command_output_artifact)]
 async fn remote_output_shutdown_does_not_certify_complete_artifact() {
     use crate::tools::command_output_artifact::ToolOutputSelector;
-    use crate::tools::command_output_artifact::read_tool_output_selectors;
+    use crate::tools::command_output_artifact::capture::read_command_log;
 
     // This prefix was captured before the reader stopped. It is not a complete
     // compiler diagnostic: absence from the retained bytes cannot prove that
@@ -2747,6 +2501,7 @@ async fn remote_output_shutdown_does_not_certify_complete_artifact() {
     let artifact = Arc::new(Mutex::new(
         create_raw_output_artifact(temp.path(), "remote-reader-shutdown", PREFIX).await,
     ));
+    let initial_artifact = artifact.lock().await.clone();
     let output_closed = Arc::new(AtomicBool::new(false));
     let output_handles = OutputHandles {
         output_buffer: Arc::new(Mutex::new(HeadTailBuffer::default())),
@@ -2784,6 +2539,7 @@ async fn remote_output_shutdown_does_not_certify_complete_artifact() {
         state_tx,
         Some(Arc::clone(&artifact)),
         CancellationToken::new(),
+        Some(initial_artifact),
         output_shutdown,
     );
     tokio::time::timeout(Duration::from_secs(5), output_task)
@@ -2804,34 +2560,23 @@ async fn remote_output_shutdown_does_not_certify_complete_artifact() {
     };
     let bytes = tokio::fs::read(path).await.expect("read retained prefix");
     assert!(bytes.starts_with(PREFIX));
-    let recovered = read_tool_output_selectors(
+    let recovered = read_command_log(
         temp.path(),
         "remote-reader-shutdown",
         &id,
-        vec![ToolOutputSelector::Search {
-            query: "MutexGuard".into(),
-            case_insensitive: false,
-            start_byte: 0,
-            max_results: 20,
-            context_lines: 0,
-            enclosing: false,
-        }],
+        &[crate::tools::command_output_artifact::ToolOutputSelector::Lines { start: 1, end: 200 }],
+        16 * 1024,
     )
     .await
-    .expect("recover retained diagnostic prefix");
+    .unwrap().unwrap();
     assert!(
-        recovered.complete,
+        recovered["complete"] == true,
         "retained search page itself was delivered"
     );
-    let search = recovered.results[0].value.as_ref().expect("search result");
-    assert_eq!(search["total_matches"], 0);
+    assert_eq!(recovered["results"][0]["text"], String::from_utf8_lossy(PREFIX).as_ref());
     assert!(
-        !recovered.capture_complete,
+        recovered["retained_artifact_complete"] == false,
         "reader shutdown before authoritative closure cannot certify producer capture"
-    );
-    assert_eq!(
-        search["coverage_complete"], false,
-        "negative retained search is not absence proof for the interrupted producer"
     );
     assert!(
         !String::from_utf8_lossy(&bytes).contains("evicted"),
@@ -2844,12 +2589,13 @@ async fn remote_output_shutdown_does_not_certify_complete_artifact() {
 #[serial_test::serial(command_output_artifact)]
 async fn exec_server_authoritative_close_preserves_complete_artifact() {
     use crate::tools::command_output_artifact::ToolOutputSelector;
-    use crate::tools::command_output_artifact::read_tool_output_selectors;
+    use crate::tools::command_output_artifact::capture::read_command_log;
 
     let temp = tempfile::tempdir().unwrap();
     let artifact = Arc::new(Mutex::new(
         create_raw_output_artifact(temp.path(), "normal-close", b"").await,
     ));
+    let initial_artifact = artifact.lock().await.clone();
     let environment = codex_exec_server::Environment::default_for_tests();
     let started = environment
         .get_exec_backend()
@@ -2891,6 +2637,7 @@ async fn exec_server_authoritative_close_preserves_complete_artifact() {
         state_tx,
         Some(Arc::clone(&artifact)),
         CancellationToken::new(),
+        Some(initial_artifact),
         CancellationToken::new(),
     );
     match tokio::time::timeout(Duration::from_secs(10), &mut output_task).await {
@@ -2918,26 +2665,17 @@ async fn exec_server_authoritative_close_preserves_complete_artifact() {
         (path.clone(), artifact.artifact_id().unwrap().to_string())
     };
     assert_eq!(tokio::fs::read(path).await.unwrap(), b"compiler-output\r\n");
-    let recovered = read_tool_output_selectors(
+    let recovered = read_command_log(
         temp.path(),
         "normal-close",
         &id,
-        vec![ToolOutputSelector::Search {
-            query: "absent".into(),
-            case_insensitive: false,
-            start_byte: 0,
-            max_results: 20,
-            context_lines: 0,
-            enclosing: false,
-        }],
+        &[crate::tools::command_output_artifact::ToolOutputSelector::Lines { start: 1, end: 200 }],
+        16 * 1024,
     )
     .await
-    .unwrap();
-    assert!(recovered.capture_complete);
-    assert_eq!(
-        recovered.results[0].value.as_ref().unwrap()["coverage_complete"],
-        true
-    );
+    .unwrap().unwrap();
+    assert_eq!(recovered["retained_artifact_complete"], true);
+    assert_eq!(recovered["results"][0]["text"], "compiler-output\r\n");
 }
 
 #[tokio::test]

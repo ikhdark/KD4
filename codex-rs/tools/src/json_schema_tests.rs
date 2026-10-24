@@ -6,6 +6,37 @@ use super::parse_tool_input_schema;
 use super::parse_tool_input_schema_without_compaction;
 
 #[test]
+fn mcp_projection_widens_tuple_tails_and_relocated_references() {
+    use serde_json::json;
+    for items in [json!(false), json!(true), json!({"type":"string"})] {
+        let input = json!({"type":"object", "properties": {
+            "tuple":{"type":"array", "prefixItems":[{"type":"integer"}], "items":items},
+            "entry":{"$ref":"#/$defs/V/oneOf/0"}
+        }, "$defs":{"V":{"oneOf":[{"type":"string"},{"type":"integer"}]}}});
+        let tool = rmcp::model::Tool::new(
+            "projection",
+            "projection",
+            std::sync::Arc::new(rmcp::model::object(input)),
+        );
+        let projected =
+            serde_json::to_value(crate::parse_mcp_tool(&tool).unwrap().input_schema).unwrap();
+        assert_eq!(projected["properties"]["tuple"]["items"], json!({}));
+        assert!(projected["properties"]["entry"].get("$ref").is_none());
+    }
+}
+
+#[test]
+fn pruning_retains_definitions_referenced_by_embedded_resource_id() {
+    use serde_json::json;
+    for table in ["$defs", "definitions"] {
+        let input = json!({"type":"object", "properties":{"entry":{"$ref":"urn:example:Entry"}},
+            (table):{"Entry":{"$id":"urn:example:Entry", "type":"string"}, "Unused":{"type":"boolean"}}});
+        let parsed = serde_json::to_value(parse_tool_input_schema(&input).unwrap()).unwrap();
+        assert!(parsed[table].get("Entry").is_some());
+    }
+}
+
+#[test]
 fn schema_guidance_preserves_utf8_and_escapes() {
     let guidance = format!(
         "{}Use milliseconds, not seconds. 界\n\t\\",
@@ -1827,7 +1858,7 @@ fn parse_tool_input_schema_preserves_unresolved_and_external_refs() {
     //
     // Expected normalization behavior:
     // - Unresolved local refs and external refs are preserved.
-    // - Unreachable local definitions are still pruned.
+    // - URI targets cannot be proven external; retain definitions conservatively.
     // - Preserves the references; downstream API acceptance is outside this test.
     let schema = parse_tool_input_schema(&serde_json::json!({
         "type": "object",
@@ -1861,6 +1892,10 @@ fn parse_tool_input_schema_preserves_unresolved_and_external_refs() {
                     },
                 ),
             ])),
+            defs: Some(BTreeMap::from([(
+                "Unused".into(),
+                JsonSchema::string(None)
+            )])),
             ..Default::default()
         }
     );

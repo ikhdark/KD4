@@ -383,9 +383,15 @@ struct AvailableModelPresets {
 }
 
 impl AvailableModelPresets {
+    #[cfg(test)]
     fn new(remote_models: &[ModelInfo]) -> Self {
         let normalized = normalize_model_catalog(remote_models.to_vec());
-        let mut sorted_models: Vec<&ModelInfo> = normalized.iter().collect();
+        Self::from_normalized(&normalized)
+    }
+
+    /// Project a manager snapshot whose capabilities and slug conflicts were checked at publication.
+    fn from_normalized(remote_models: &[ModelInfo]) -> Self {
+        let mut sorted_models: Vec<&ModelInfo> = remote_models.iter().collect();
         sorted_models.sort_by(|a, b| {
             a.priority
                 .cmp(&b.priority)
@@ -458,7 +464,7 @@ impl ModelState {
     ) -> Self {
         let normalized = normalize_model_catalog_with_rejections(remote_models);
         let remote_models = normalized.models;
-        let available_models = AvailableModelPresets::new(&remote_models);
+        let available_models = AvailableModelPresets::from_normalized(&remote_models);
         Self {
             remote_models,
             rejected_slugs: normalized.rejected_slugs,
@@ -479,7 +485,7 @@ impl ModelState {
         if self.remote_models == remote_models {
             return;
         }
-        self.available_models = AvailableModelPresets::new(&remote_models);
+        self.available_models = AvailableModelPresets::from_normalized(&remote_models);
         self.remote_models = remote_models;
     }
 
@@ -603,7 +609,7 @@ impl StaticModelsManager {
                 crate::prompt_resolver::apply_prompt_policy(std::slice::from_mut(model));
             }
         }
-        let available_models = AvailableModelPresets::new(&remote_models);
+        let available_models = AvailableModelPresets::from_normalized(&remote_models);
         Self {
             remote_models,
             available_models,
@@ -857,24 +863,23 @@ impl OpenAiModelsManager {
 
             let _refresh = self.refresh_gate.lock().await;
             let refresh_identity = self.ensure_current_cache_identity().await;
-            let write_basis = match self
-                .cache_manager
-                .write_basis_for_identity(&refresh_identity)
-                .await
-            {
-                Ok(basis) => Some(basis),
-                Err(err) => {
-                    error!("failed to capture models cache revision before refresh: {err}");
-                    None
-                }
-            };
-
+            let current_etag = self.get_etag().await;
             // Inference hints carry no frozen request authority. Equal opaque
             // validators cannot confirm current-scope freshness after an auth switch.
-            if self.get_etag().await.as_deref() == Some(notice.etag.as_str()) {
+            if current_etag.as_deref() == Some(notice.etag.as_str()) {
                 // Keep the existing expiry; only scoped /models responses renew it.
             } else {
-                let current_etag = self.get_etag().await;
+                let write_basis = match self
+                    .cache_manager
+                    .write_basis_for_identity(&refresh_identity)
+                    .await
+                {
+                    Ok(basis) => Some(basis),
+                    Err(err) => {
+                        error!("failed to capture models cache revision before refresh: {err}");
+                        None
+                    }
+                };
                 match self
                     .fetch_models(
                         &notice.http_client_factory,
@@ -992,6 +997,21 @@ impl OpenAiModelsManager {
         self.ensure_current_cache_identity().await;
         if refresh_strategy != RefreshStrategy::Online && self.memory_is_fresh().await {
             return Ok(());
+        }
+        if refresh_strategy == RefreshStrategy::OnlineIfUncached
+            && !self.endpoint_client.has_authoritative_catalog()
+            && !self.endpoint_client.has_command_auth()
+        {
+            // A fresh disk snapshot needs no request authentication. Probe only
+            // when the transaction is free: an ineligible consumer must never
+            // queue behind a network refresh. Release before resolving auth on a miss.
+            if let Ok(_refresh) = self.refresh_gate.try_lock() {
+                match self.try_load_cache_locked().await {
+                    Ok(true) => return Ok(()),
+                    Ok(false) => {}
+                    Err(err) => error!("models cache unavailable before auth eligibility: {err}"),
+                }
+            }
         }
         if refresh_strategy == RefreshStrategy::Offline || !self.should_refresh_models().await {
             if refresh_strategy != RefreshStrategy::Online {
@@ -1222,8 +1242,8 @@ impl OpenAiModelsManager {
 
     async fn should_refresh_models(&self) -> bool {
         self.endpoint_client.has_authoritative_catalog()
-            || self.endpoint_client.uses_codex_backend().await
             || self.endpoint_client.has_command_auth()
+            || self.endpoint_client.uses_codex_backend().await
     }
 
     async fn get_etag(&self) -> Option<String> {
@@ -1634,9 +1654,9 @@ fn construct_model_info_with_rejections(
             || suffix.is_some_and(|suffix| model_info::matches_model_slug(suffix, slug))
     }) {
         tracing::warn!(%model, "using explicit fallback for quarantined model metadata");
-        return construct_model_info_from_candidates(model, &[], config);
+        return construct_model_info_from_normalized(model, &[], config);
     }
-    construct_model_info_from_candidates(model, candidates, config)
+    construct_model_info_from_normalized(model, candidates, config)
 }
 
 fn load_bundled_models() -> Result<Vec<ModelInfo>, std::io::Error> {
@@ -1671,27 +1691,20 @@ fn requested_model_is_available(
     })
 }
 
+#[cfg(test)]
 fn find_model_by_longest_prefix(model: &str, candidates: &[ModelInfo]) -> Option<ModelInfo> {
     let candidates = normalize_model_catalog(candidates.to_vec());
-    let mut best: Option<ModelInfo> = None;
-    for candidate in &candidates {
-        if !model_info::matches_model_slug(model, &candidate.slug) {
-            continue;
-        }
-        let is_better_match = if let Some(current) = best.as_ref() {
-            candidate.slug.len() > current.slug.len()
-        } else {
-            true
-        };
-        if is_better_match {
-            best = Some(candidate.clone());
-        }
-    }
-    best
+    find_normalized_model_by_longest_prefix(model, &candidates).cloned()
 }
 
-fn find_model_by_namespaced_suffix(model: &str, candidates: &[ModelInfo]) -> Option<ModelInfo> {
-    find_model_by_longest_prefix(model_info::namespaced_model_suffix(model)?, candidates)
+fn find_normalized_model_by_longest_prefix<'a>(
+    model: &str,
+    candidates: &'a [ModelInfo],
+) -> Option<&'a ModelInfo> {
+    candidates
+        .iter()
+        .filter(|candidate| model_info::matches_model_slug(model, &candidate.slug))
+        .max_by_key(|candidate| candidate.slug.len())
 }
 
 pub(crate) fn construct_model_info_from_candidates(
@@ -1699,15 +1712,29 @@ pub(crate) fn construct_model_info_from_candidates(
     candidates: &[ModelInfo],
     config: &ModelsManagerConfig,
 ) -> ModelInfo {
+    let normalized = normalize_model_catalog(candidates.to_vec());
+    construct_model_info_from_normalized(model, &normalized, config)
+}
+
+/// Borrow an already validated manager snapshot and copy only the selected record.
+fn construct_model_info_from_normalized(
+    model: &str,
+    candidates: &[ModelInfo],
+    config: &ModelsManagerConfig,
+) -> ModelInfo {
     // First use the normal longest-prefix match. If that misses, allow a narrowly scoped
     // retry for namespaced slugs like `custom/gpt-5.3-codex`.
-    let remote = find_model_by_longest_prefix(model, candidates)
-        .or_else(|| find_model_by_namespaced_suffix(model, candidates));
+    let remote = find_normalized_model_by_longest_prefix(model, candidates).or_else(|| {
+        find_normalized_model_by_longest_prefix(
+            model_info::namespaced_model_suffix(model)?,
+            candidates,
+        )
+    });
     let mut model_info = if let Some(remote) = remote {
         ModelInfo {
             slug: model.to_string(),
             used_fallback_model_metadata: false,
-            ..remote
+            ..remote.clone()
         }
     } else {
         model_info::model_info_from_slug(model)

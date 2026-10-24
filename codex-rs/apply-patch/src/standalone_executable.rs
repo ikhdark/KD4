@@ -215,12 +215,23 @@ mod tests {
     }
 
     #[test]
+    #[cfg(windows)]
     fn patch_arg_rejects_non_utf8_argument() {
         use std::os::windows::ffi::OsStringExt;
 
         let err = patch_from_args_or_reader([OsString::from_wide(&[0xD800])], "ignored".as_bytes())
             .expect_err("non-UTF-8 patch argument should be rejected");
 
+        assert!(matches!(err, PatchInputError::NonUtf8Argument));
+        assert_eq!(err.exit_code(), 1);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn patch_arg_rejects_non_utf8_argument() {
+        use std::os::unix::ffi::OsStringExt;
+        let err = patch_from_args_or_reader([OsString::from_vec(vec![0xff])], "ignored".as_bytes())
+            .expect_err("non-UTF-8 patch argument should be rejected");
         assert!(matches!(err, PatchInputError::NonUtf8Argument));
         assert_eq!(err.exit_code(), 1);
     }

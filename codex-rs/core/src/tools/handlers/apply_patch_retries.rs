@@ -780,5 +780,5 @@ mod tests {
 }
 
 #[cfg(test)]
-#[path = "apply_patch_retries_audit147_tests.rs"]
-mod audit147_tests;
+#[path = "apply_patch_retries_residue_tests.rs"]
+mod residue_tests;

@@ -285,30 +285,14 @@ pub async fn format_config_error_with_source(error: &ConfigError) -> String {
 }
 
 fn position_for_offset(contents: &str, index: usize) -> TextPosition {
-    let bytes = contents.as_bytes();
-    if bytes.is_empty() {
-        return TextPosition { line: 1, column: 1 };
+    let mut index = index.min(contents.len());
+    // An offset inside a UTF-8 scalar points at that scalar's start.
+    while !contents.is_char_boundary(index) {
+        index -= 1;
     }
-
-    let safe_index = index.min(bytes.len().saturating_sub(1));
-    let column_offset = index.saturating_sub(safe_index);
-    let index = safe_index;
-
-    let line_start = bytes[..index]
-        .iter()
-        .rposition(|byte| *byte == b'\n')
-        .map(|pos| pos + 1)
-        .unwrap_or(0);
-    let line = bytes[..line_start]
-        .iter()
-        .filter(|byte| **byte == b'\n')
-        .count();
-
-    let column = std::str::from_utf8(&bytes[line_start..=index])
-        .map(|slice| slice.chars().count().saturating_sub(1))
-        .unwrap_or_else(|_| index - line_start);
-    let column = column + column_offset;
-
+    let prefix = &contents[..index];
+    let line = prefix.bytes().filter(|byte| *byte == b'\n').count();
+    let column = prefix.rsplit('\n').next().unwrap_or_default().chars().count();
     TextPosition {
         line: line + 1,
         column: column + 1,
@@ -320,6 +304,20 @@ pub(crate) fn default_range() -> TextRange {
     TextRange {
         start: position,
         end: position,
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn diagnostic_positions_cover_eof_and_utf8_boundaries() {
+    for (contents, offset, line, column) in [
+        ("a = [\n", 6, 2, 1), ("abc", 3, 1, 4), ("", 0, 1, 1),
+        ("éé", 0, 1, 1), ("éé", 1, 1, 1), ("éé", 2, 1, 2), ("éé", 4, 1, 3),
+    ] {
+        let expected = TextPosition { line, column };
+        let range = text_range_from_span(contents, offset..offset);
+        assert_eq!(range.start, expected);
+        assert_eq!(range.end, expected);
     }
 }
 

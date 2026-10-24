@@ -442,12 +442,22 @@ struct LoadedPluginsCacheEntry {
     resolved_auth_mode: Option<AuthMode>,
     resolved_outcome: PluginLoadOutcome,
     plugin_skill_snapshots: PluginSkillSnapshots,
+    retry_after: Option<std::time::Instant>,
 }
 
 #[derive(Default)]
 struct LoadedPluginsCache {
     generation: u64,
-    entry: Option<LoadedPluginsCacheEntry>,
+    entries: Vec<LoadedPluginsCacheEntry>,
+    skill_roots: Vec<CachedPluginSkillRoots>,
+}
+
+struct CachedPluginSkillRoots {
+    key: PluginLoadCacheKey,
+    auth_mode: Option<AuthMode>,
+    snapshot_generation: u64,
+    roots: Vec<PluginSkillRoot>,
+    snapshots: PluginSkillSnapshots,
 }
 
 #[derive(Clone, Debug)]
@@ -637,9 +647,10 @@ impl PluginsManager {
         self.loaded_plugins_cache
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .entry
-            .as_ref()
-            .filter(|cached| cached.key == key)
+            .entries
+            .iter()
+            .find(|cached| cached.key == key
+                && cached.retry_after.is_none_or(|deadline| std::time::Instant::now() < deadline))
             .map(|cached| cached.plugin_skill_snapshots.clone())
     }
 
@@ -762,7 +773,8 @@ impl PluginsManager {
             Err(err) => err.into_inner(),
         };
         cache.generation = cache.generation.wrapping_add(1);
-        cache.entry = None;
+        cache.entries.clear();
+        cache.skill_roots.clear();
     }
 
     fn clear_caches_after_marketplace_source_refresh(
@@ -795,6 +807,16 @@ impl PluginsManager {
         config_layer_stack: &ConfigLayerStack,
         config: &PluginsConfigInput,
     ) -> PluginLoadOutcome {
+        self.plugins_for_layer_stack_with_skill_snapshots(config_layer_stack, config, None)
+            .await
+    }
+
+    async fn plugins_for_layer_stack_with_skill_snapshots(
+        &self,
+        config_layer_stack: &ConfigLayerStack,
+        config: &PluginsConfigInput,
+        plugin_skill_snapshots: Option<&PluginSkillSnapshots>,
+    ) -> PluginLoadOutcome {
         if !config.plugins_enabled {
             return PluginLoadOutcome::default();
         }
@@ -802,7 +824,7 @@ impl PluginsManager {
             config_layer_stack,
             self.remote_installed_plugin_configs(),
             &self.store,
-            /*plugin_skill_snapshots*/ None,
+            plugin_skill_snapshots,
             self.restriction_product,
             self.remote_global_catalog_active(config),
         )
@@ -842,14 +864,88 @@ impl PluginsManager {
             .effective_plugin_skill_roots()
     }
 
+    /// Reuse discovery only within the caller's observed skills generation.
+    /// Keep per-cwd roots separate from the main config's capability cache.
+    pub async fn effective_skill_roots_with_snapshots_for_layer_stack(
+        &self,
+        config_layer_stack: &ConfigLayerStack,
+        config: &PluginsConfigInput,
+        snapshot_generation: Option<u64>,
+    ) -> (Vec<PluginSkillRoot>, Option<PluginSkillSnapshots>) {
+        if !config.plugins_enabled {
+            return (Vec::new(), None);
+        }
+        let remote_global_catalog_active = self.remote_global_catalog_active(config);
+        let key = PluginLoadCacheKey {
+            config_layer_stack: ConfigLayerStackIdentity(Arc::new(config_layer_stack.clone())),
+            remote_global_catalog_active,
+        };
+        if let Some(cached) = self.cached_skill_roots(&key, snapshot_generation) {
+            return cached;
+        }
+        let Ok(_permit) = self.loaded_plugins_load_semaphore.acquire().await else {
+            warn!("plugin load semaphore closed");
+            return (Vec::new(), None);
+        };
+        if let Some(cached) = self.cached_skill_roots(&key, snapshot_generation) {
+            return cached;
+        }
+        let generation = self.loaded_plugins_cache_generation();
+        let snapshots = PluginSkillSnapshots::for_plugin_load();
+        let plugins = match load_plugins_from_layer_stack(
+            config_layer_stack,
+            self.remote_installed_plugin_configs(),
+            &self.store,
+            Some(&snapshots),
+            self.restriction_product,
+            remote_global_catalog_active,
+        ).await {
+            Ok(plugins) => plugins,
+            Err(_) => return (Vec::new(), Some(snapshots)),
+        };
+        let auth_mode = self.auth_mode();
+        let roots = resolve_loaded_plugins_for_auth_mode(plugins, auth_mode)
+            .effective_plugin_skill_roots();
+        if let Some(snapshot_generation) = snapshot_generation {
+            let mut cache = self.loaded_plugins_cache.write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if cache.generation == generation {
+                cache.skill_roots.retain(|entry| entry.key != key);
+                // A multi-cwd client must not grow discovery state indefinitely.
+                if cache.skill_roots.len() >= 16 {
+                    cache.skill_roots.remove(0);
+                }
+                cache.skill_roots.push(CachedPluginSkillRoots {
+                    key, auth_mode, snapshot_generation,
+                    roots: roots.clone(), snapshots: snapshots.clone(),
+                });
+            }
+        }
+        (roots, Some(snapshots))
+    }
+
+    fn cached_skill_roots(
+        &self,
+        key: &PluginLoadCacheKey,
+        snapshot_generation: Option<u64>,
+    ) -> Option<(Vec<PluginSkillRoot>, Option<PluginSkillSnapshots>)> {
+        let snapshot_generation = snapshot_generation?;
+        let auth_mode = self.auth_mode();
+        let cache = self.loaded_plugins_cache.read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        cache.skill_roots.iter().find(|entry| entry.key == *key
+            && entry.snapshot_generation == snapshot_generation && entry.auth_mode == auth_mode)
+            .map(|entry| (entry.roots.clone(), Some(entry.snapshots.clone())))
+    }
+
     #[cfg(test)]
     fn cached_loaded_plugins(&self, key: &PluginLoadCacheKey) -> Option<Vec<LoadedPlugin>> {
         self.loaded_plugins_cache
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .entry
-            .as_ref()
-            .filter(|cached| cached.key == *key)
+            .entries
+            .iter()
+            .find(|cached| cached.key == *key)
             .map(|cached| cached.plugins.clone())
     }
 
@@ -860,7 +956,8 @@ impl PluginsManager {
                 .loaded_plugins_cache
                 .read()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let cached = cache.entry.as_ref().filter(|cached| cached.key == *key)?;
+            let cached = cache.entries.iter().find(|cached| cached.key == *key
+                && cached.retry_after.is_none_or(|deadline| std::time::Instant::now() < deadline))?;
             if cached.resolved_auth_mode == auth_mode {
                 return Some(cached.resolved_outcome.clone());
             }
@@ -869,7 +966,8 @@ impl PluginsManager {
             .loaded_plugins_cache
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let cached = cache.entry.as_mut().filter(|cached| cached.key == *key)?;
+        let cached = cache.entries.iter_mut().find(|cached| cached.key == *key
+            && cached.retry_after.is_none_or(|deadline| std::time::Instant::now() < deadline))?;
         if cached.resolved_auth_mode != auth_mode {
             cached.resolved_outcome =
                 resolve_loaded_plugins_for_auth_mode(cached.plugins.clone(), auth_mode);
@@ -899,12 +997,19 @@ impl PluginsManager {
             Err(err) => err.into_inner(),
         };
         if cache.generation == generation {
-            cache.entry = Some(LoadedPluginsCacheEntry {
+            let retry_after = plugins.iter().any(|plugin| plugin.error.is_some())
+                .then(|| std::time::Instant::now() + std::time::Duration::from_secs(30));
+            cache.entries.retain(|cached| cached.key != key);
+            if cache.entries.len() >= 4 {
+                cache.entries.remove(0);
+            }
+            cache.entries.push(LoadedPluginsCacheEntry {
                 key,
                 plugins,
                 resolved_auth_mode,
                 resolved_outcome,
                 plugin_skill_snapshots,
+                retry_after,
             });
         }
     }

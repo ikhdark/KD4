@@ -117,18 +117,18 @@ async fn immutable_catalog_references_preserve_revision_revocation() {
     };
     submit(1, 1, true);
     let _ = rx.recv().await.unwrap();
-    let first = Arc::clone(&state.catalogs.lock().unwrap()[&session].1);
+    let first = Arc::clone(&state.catalogs.lock().unwrap()[&session].as_ref().unwrap().1);
     submit(2, 1, false);
     let _ = rx.recv().await.unwrap();
     assert!(Arc::ptr_eq(
         &first,
-        &state.catalogs.lock().unwrap()[&session].1
+        &state.catalogs.lock().unwrap()[&session].as_ref().unwrap().1
     ));
     submit(3, 2, true);
     let _ = rx.recv().await.unwrap();
     assert!(!Arc::ptr_eq(
         &first,
-        &state.catalogs.lock().unwrap()[&session].1
+        &state.catalogs.lock().unwrap()[&session].as_ref().unwrap().1
     ));
     submit(4, 1, false);
     let error = decode_frame(rx.recv().await.unwrap()).await;
@@ -140,7 +140,12 @@ async fn immutable_catalog_references_preserve_revision_revocation() {
     assert!(
         matches!(error, HostToClient::Response { result: WireResult::Err { message }, .. } if message.contains("stale"))
     );
-    assert_eq!(state.catalogs.lock().unwrap()[&session].0, 2);
+    assert_eq!(state.catalogs.lock().unwrap()[&session].as_ref().unwrap().0, 2);
+    state.catalogs.lock().unwrap().insert(session.clone(), None);
+    submit(6, 3, true);
+    let error = decode_frame(rx.recv().await.unwrap()).await;
+    assert!(matches!(error, HostToClient::Response { result: WireResult::Err { message }, .. } if message.contains("closing")));
+    assert!(state.catalogs.lock().unwrap()[&session].is_none());
     state.disconnect().await;
 }
 

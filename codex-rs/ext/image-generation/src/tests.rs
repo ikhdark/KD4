@@ -157,7 +157,7 @@ async fn image_completion_requires_valid_bytes_regardless_of_save_configuration(
                 Some(usage),
                 "receipt survives decode and save failures"
             );
-            assert_eq!(item.result.is_empty(), !valid);
+            assert_eq!(item.result.is_none(), !valid);
             if let Ok(output) = output {
                 assert_eq!(
                     output.code_mode_result(&function_payload())["image_url"],
@@ -418,7 +418,8 @@ async fn recent_image_fallback_selects_newest_images_in_chronological_order() {
             id: Some(ResponseItemId::with_suffix("ig", "generated-call")),
             status: "completed".to_string(),
             revised_prompt: None,
-            result: "generated".to_string(),
+            result: Some("generated".to_string()),
+            error: None,
             internal_chat_message_metadata_passthrough: None,
         },
         ResponseItem::FunctionCallOutput {
@@ -493,6 +494,33 @@ async fn too_many_referenced_image_paths_return_tool_error() {
         error.to_string(),
         "`referenced_image_paths` must contain at most 5 paths"
     );
+}
+
+#[tokio::test]
+async fn unavailable_hosted_image_results_are_not_edit_inputs() {
+    for status in ["in_progress", "generating", "failed"] {
+        let history = [serde_json::from_value::<ResponseItem>(serde_json::json!({
+            "type":"image_generation_call", "id":"ig_unavailable", "status":status,
+            "result":null, "error":{"message":"no image available"},
+        }))
+        .unwrap()];
+        let error = request_for_call_args(
+            &ImagegenArgs {
+                prompt: "edit".to_string(),
+                referenced_image_paths: None,
+                num_last_images_to_include: Some(1),
+            },
+            &history,
+            None,
+            &[],
+        )
+        .await
+        .expect_err("unavailable results must not become image URLs");
+        assert_eq!(
+            error.to_string(),
+            "requested the last 1 conversation images, but only 0 were available"
+        );
+    }
 }
 
 #[tokio::test]

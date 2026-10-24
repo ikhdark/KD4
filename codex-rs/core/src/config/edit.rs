@@ -1,7 +1,7 @@
 use anyhow::Context;
 use codex_config::CONFIG_TOML_FILE;
 use codex_config::serialize_mcp_server;
-use codex_config::serialize_mcp_server_inline;
+use codex_config::serialize_mcp_server_for_edit;
 use codex_config::types::McpServerConfig;
 use codex_config::types::SessionPickerViewMode;
 use codex_config::types::ToolSuggestDisabledTool;
@@ -365,13 +365,13 @@ impl ConfigDocument {
 
         for (name, config) in servers {
             if let Some(existing) = table.get_mut(name.as_str()) {
-                if let TomlItem::Value(value) = existing
-                    && let Some(inline) = value.as_inline_table_mut()
+                let replacement = serialize_mcp_server_for_edit(config, Some(existing));
+                if let Some(inline) = existing.as_inline_table_mut()
+                    && let Some(replacement) = replacement.as_inline_table()
                 {
-                    let replacement = serialize_mcp_server_inline(config);
-                    document_helpers::merge_inline_table(inline, replacement);
+                    document_helpers::merge_inline_table(inline, replacement.clone());
                 } else {
-                    *existing = serialize_mcp_server(config);
+                    *existing = replacement;
                 }
             } else {
                 table.insert(name, serialize_mcp_server(config));

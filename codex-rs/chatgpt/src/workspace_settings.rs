@@ -1,8 +1,9 @@
 use std::collections::HashMap;
 use std::fmt::Write as _;
+use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::RwLock;
-use std::sync::atomic::AtomicU64;
-use std::sync::atomic::Ordering;
+use std::sync::Weak;
 use std::time::Duration;
 use std::time::Instant;
 
@@ -16,6 +17,7 @@ use crate::chatgpt_client::chatgpt_http_clients;
 const WORKSPACE_SETTINGS_TIMEOUT: Duration = Duration::from_secs(10);
 const WORKSPACE_SETTINGS_CACHE_TTL: Duration = Duration::from_secs(15 * 60);
 const CODEX_PLUGINS_BETA_SETTING: &str = "enable_plugins";
+const MAX_ACTIVE_REFRESH_KEYS: usize = 128;
 
 #[derive(Debug, Deserialize)]
 struct WorkspaceSettingsResponse {
@@ -26,19 +28,12 @@ struct WorkspaceSettingsResponse {
 #[derive(Debug, Default)]
 pub struct WorkspaceSettingsCache {
     entry: RwLock<Option<CachedWorkspaceSettings>>,
-    /// Serializes refreshes and holds the latest attempt's failure, if any.
-    refresh: tokio::sync::Mutex<Option<FailedRefresh>>,
-    /// Finished refresh attempts, read before waiting on `refresh`.
-    refresh_attempts: AtomicU64,
+    /// Only active callers own refresh outcomes. A different key cannot erase
+    /// the outcome shared by existing waiters; later calls can retry failures.
+    refreshes: Mutex<HashMap<WorkspaceSettingsCacheKey, Weak<WorkspaceRefresh>>>,
 }
 
-/// A failure shared only with callers that were waiting when it happened;
-/// later callers fetch again rather than reuse the fail-open result.
-#[derive(Debug)]
-struct FailedRefresh {
-    key: WorkspaceSettingsCacheKey,
-    error: String,
-}
+type WorkspaceRefresh = tokio::sync::Mutex<Option<Result<bool, String>>>;
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct WorkspaceSettingsCacheKey {
@@ -54,6 +49,20 @@ struct CachedWorkspaceSettings {
 }
 
 impl WorkspaceSettingsCache {
+    fn active_refresh(&self, key: &WorkspaceSettingsCacheKey) -> Option<Arc<WorkspaceRefresh>> {
+        let mut refreshes = self.refreshes.lock().unwrap_or_else(|error| error.into_inner());
+        refreshes.retain(|_, refresh| refresh.strong_count() != 0);
+        if let Some(refresh) = refreshes.get(key).and_then(Weak::upgrade) {
+            return Some(refresh);
+        }
+        if refreshes.len() >= MAX_ACTIVE_REFRESH_KEYS {
+            return None;
+        }
+        let refresh = Arc::new(tokio::sync::Mutex::new(None));
+        refreshes.insert(key.clone(), Arc::downgrade(&refresh));
+        Some(refresh)
+    }
+
     fn get_codex_plugins_enabled(&self, key: &WorkspaceSettingsCacheKey) -> Option<bool> {
         let entry = match self.entry.read() {
             Ok(entry) => entry,
@@ -100,6 +109,7 @@ pub async fn codex_plugins_enabled_for_workspace(
     let Some(account_id) = auth.get_account_id().filter(|id| !id.is_empty()) else {
         return Ok(true);
     };
+    anyhow::ensure!(!matches!(account_id.as_str(), "." | ".."), "invalid workspace account ID");
 
     let cache_key = WorkspaceSettingsCacheKey {
         chatgpt_base_url: config.chatgpt_base_url.clone(),
@@ -112,32 +122,22 @@ pub async fn codex_plugins_enabled_for_workspace(
         return Ok(enabled);
     }
 
-    // Catalog operations can request this setting concurrently. Serialize
-    // refreshes and reuse the outcome of one that finished while waiting, so
-    // an unavailable backend costs one timeout rather than one per waiter.
-    let attempts_before_wait = cache.refresh_attempts.load(Ordering::Acquire);
-    let mut refresh = cache.refresh.lock().await;
+    let Some(shared_refresh) = cache.active_refresh(&cache_key) else {
+        return fetch_codex_plugins_enabled(config, auth, &account_id).await;
+    };
+    let mut refresh = shared_refresh.lock().await;
     if let Some(enabled) = cache.get_codex_plugins_enabled(&cache_key) {
         return Ok(enabled);
     }
-    if cache.refresh_attempts.load(Ordering::Acquire) != attempts_before_wait
-        && let Some(failed) = refresh.as_ref().filter(|failed| failed.key == cache_key)
-    {
-        anyhow::bail!("{}", failed.error);
+    if let Some(result) = refresh.as_ref() {
+        return result.clone().map_err(anyhow::Error::msg);
     }
 
     let result = fetch_codex_plugins_enabled(config, auth, &account_id).await;
-    *refresh = match &result {
-        Ok(enabled) => {
-            cache.set_codex_plugins_enabled(cache_key, *enabled);
-            None
-        }
-        Err(error) => Some(FailedRefresh {
-            key: cache_key,
-            error: format!("{error:#}"),
-        }),
-    };
-    cache.refresh_attempts.fetch_add(1, Ordering::Release);
+    if let Ok(enabled) = &result {
+        cache.set_codex_plugins_enabled(cache_key, *enabled);
+    }
+    *refresh = Some(result.as_ref().map(|value| *value).map_err(|error| format!("{error:#}")));
     result
 }
 

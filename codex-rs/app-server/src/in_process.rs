@@ -165,37 +165,33 @@ fn forward_server_request(
     skipped_events: &mut usize,
     request: ServerRequest,
 ) -> std::result::Result<(), ServerRequestDeliveryError> {
+    // Reserve the actionable request's slot before attempting advisory lag
+    // delivery. Capacity one is supported: keep the lag count for a later
+    // event rather than letting the marker manufacture a request rejection.
+    let permit = match event_tx.try_reserve() {
+        Ok(permit) => permit,
+        Err(mpsc::error::TrySendError::Full(_)) => {
+            *skipped_events = skipped_events.saturating_add(1);
+            return Err(ServerRequestDeliveryError::Full(Box::new(request)));
+        }
+        Err(mpsc::error::TrySendError::Closed(_)) => {
+            return Err(ServerRequestDeliveryError::Closed(Box::new(request)));
+        }
+    };
     if *skipped_events > 0 {
         match event_tx.try_send(InProcessServerEvent::Lagged {
             skipped: *skipped_events,
         }) {
             Ok(()) => *skipped_events = 0,
-            Err(mpsc::error::TrySendError::Full(_)) => {
-                *skipped_events = skipped_events.saturating_add(1);
-                return Err(ServerRequestDeliveryError::Full(Box::new(request)));
-            }
+            Err(mpsc::error::TrySendError::Full(_)) => {}
             Err(mpsc::error::TrySendError::Closed(_)) => {
                 return Err(ServerRequestDeliveryError::Closed(Box::new(request)));
             }
         }
     }
 
-    match event_tx.try_send(InProcessServerEvent::ServerRequest(request)) {
-        Ok(()) => Ok(()),
-        Err(mpsc::error::TrySendError::Full(event)) => {
-            *skipped_events = skipped_events.saturating_add(1);
-            let InProcessServerEvent::ServerRequest(request) = event else {
-                unreachable!("forwarded event should remain a server request");
-            };
-            Err(ServerRequestDeliveryError::Full(Box::new(request)))
-        }
-        Err(mpsc::error::TrySendError::Closed(event)) => {
-            let InProcessServerEvent::ServerRequest(request) = event else {
-                unreachable!("forwarded event should remain a server request");
-            };
-            Err(ServerRequestDeliveryError::Closed(Box::new(request)))
-        }
-    }
+    permit.send(InProcessServerEvent::ServerRequest(request));
+    Ok(())
 }
 
 /// Input needed to start an in-process app-server runtime.
@@ -371,7 +367,8 @@ impl InProcessClientSender {
         let control = match &message {
             InProcessClientMessage::Request { request, .. } => {
                 request.is_control()
-                    && serde_json::to_vec(request).is_ok_and(|bytes| bytes.len() <= 64 * 1024)
+                    && codex_app_server_transport::serialized_request_bytes_up_to(request, 64 * 1024)
+                        <= 64 * 1024
             }
             // Client replies and lifecycle messages also need ingress progress.
             _ => true,
@@ -446,31 +443,11 @@ impl InProcessClientHandle {
         let (done_tx, done_rx) = oneshot::channel();
         let deadline = tokio::time::Instant::now() + SHUTDOWN_TIMEOUT;
 
-        let _acknowledgement = if matches!(
-            tokio::time::timeout_at(
-                deadline,
-                self.client
-                    .client_tx
-                    .send(InProcessClientMessage::Shutdown { done_tx }),
-            )
-            .await,
-            Ok(Ok(()))
-        ) {
-            match tokio::time::timeout_at(deadline, done_rx).await {
-                Ok(Ok(result)) => result,
-                Ok(Err(_)) => Err(IoError::other(
-                    "session persistence shutdown acknowledgement lost",
-                )),
-                Err(_) => Err(IoError::new(
-                    ErrorKind::TimedOut,
-                    "session persistence shutdown unconfirmed",
-                )),
-            }
-        } else {
-            Err(IoError::other(
-                "session persistence shutdown channel closed",
-            ))
-        };
+        // The public observer is bounded, but the retained owner must never
+        // cancel Shutdown admission: sender clones can outlive that deadline.
+        if self.client.client_tx.send(InProcessClientMessage::Shutdown { done_tx }).await.is_ok() {
+            let _ = done_rx.await;
+        }
 
         // A completed join can contain a panic; timeout success is not task success.
         let runtime_result =
@@ -691,6 +668,7 @@ async fn start_uninitialized(args: InProcessStartArgs) -> IoResult<InProcessClie
             let mut thread_created_rx = processor.thread_manager.subscribe_thread_created();
             let session = Arc::new(ConnectionSessionState::new());
             let mut listen_for_threads = true;
+            let mut thread_attachment_tasks = tokio::task::JoinSet::new();
 
             loop {
                 tokio::select! {
@@ -740,21 +718,30 @@ async fn start_uninitialized(args: InProcessStartArgs) -> IoResult<InProcessClie
                             }
                         }
                     }
-                    created = thread_created_rx.recv(), if listen_for_threads => {
+                    result = thread_attachment_tasks.join_next(), if !thread_attachment_tasks.is_empty() => {
+                        match result {
+                            Some(Ok(keep_listening)) => listen_for_threads = keep_listening,
+                            Some(Err(error)) => warn!(%error, "thread listener attachment worker failed"),
+                            None => {}
+                        }
+                    }
+                    created = thread_created_rx.recv(), if listen_for_threads && thread_attachment_tasks.is_empty() => {
                         let connection_ids = if session.initialized() {
                             vec![IN_PROCESS_CONNECTION_ID]
                         } else {
                             Vec::<ConnectionId>::new()
                         };
-                        listen_for_threads = processor
-                            .thread_processor
-                            .handle_thread_created_event(created, connection_ids)
-                            .await;
+                        let processor = Arc::clone(&processor);
+                        thread_attachment_tasks.spawn(async move {
+                            processor.thread_processor
+                                .handle_thread_created_event(created, connection_ids).await
+                        });
                     }
                 }
             }
 
             processor.clear_runtime_references();
+            thread_attachment_tasks.shutdown().await;
             processor.account_processor.cancel_active_login().await;
             processor
                 .connection_closed(IN_PROCESS_CONNECTION_ID, &session)
@@ -1089,6 +1076,50 @@ mod tests {
     use std::path::Path;
     use tempfile::TempDir;
     use tokio::time::timeout;
+
+    #[tokio::test]
+    async fn server_request_recovers_after_capacity_one_overload_with_lag_pending() {
+        let request = |id| ServerRequest::ToolRequestUserInput {
+            request_id: RequestId::Integer(id),
+            params: codex_app_server_protocol::ToolRequestUserInputParams {
+                thread_id: "thread".into(),
+                turn_id: "turn".into(),
+                item_id: "item".into(),
+                questions: Vec::new(),
+                auto_resolution_ms: None,
+            },
+        };
+        let (event_tx, mut event_rx) = mpsc::channel(1);
+        let mut skipped = 0;
+        assert!(forward_server_request(&event_tx, &mut skipped, request(1)).is_ok());
+        assert!(matches!(
+            forward_server_request(&event_tx, &mut skipped, request(2)),
+            Err(ServerRequestDeliveryError::Full(_))
+        ));
+        assert_eq!(skipped, 1);
+        assert!(matches!(event_rx.try_recv(), Ok(InProcessServerEvent::ServerRequest(_))));
+        assert!(forward_server_request(&event_tx, &mut skipped, request(3)).is_ok());
+        assert!(matches!(
+            event_rx.try_recv(),
+            Ok(InProcessServerEvent::ServerRequest(request)) if request.id() == &RequestId::Integer(3)
+        ));
+        assert_eq!(skipped, 1, "deferred lag accounting is not lost");
+        let notification = ServerNotification::AgentMessageDelta(AgentMessageDeltaNotification {
+            thread_id: "thread".into(), turn_id: "turn".into(),
+            item_id: "item".into(), delta: "text".into(),
+        });
+        let mut delivery = Box::pin(forward_server_notification(&event_tx, &mut skipped, notification));
+        assert!(futures::poll!(&mut delivery).is_pending());
+        assert!(matches!(event_rx.try_recv(), Ok(InProcessServerEvent::Lagged { skipped: 1 })));
+        assert!(delivery.await);
+        assert!(matches!(event_rx.try_recv(), Ok(InProcessServerEvent::ServerNotification(_))));
+        assert_eq!(skipped, 0);
+        drop(event_rx);
+        assert!(matches!(
+            forward_server_request(&event_tx, &mut skipped, request(4)),
+            Err(ServerRequestDeliveryError::Closed(_))
+        ));
+    }
 
     #[tokio::test]
     async fn audit_observability_caller_trace_reaches_runtime_mailbox() {
@@ -1734,6 +1765,41 @@ mod tests {
             error.to_string().contains("processor owner sentinel"),
             "{error}"
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_admission_survives_observer_timeout_with_retained_sender() {
+        let (client_tx, mut client_rx) = mpsc::channel(1);
+        client_tx.try_send(InProcessClientMessage::Notification {
+            notification: ClientNotification::Initialized,
+        }).unwrap_or_else(|_| panic!("fill the real shutdown admission channel"));
+        let retained_sender = InProcessClientSender { client_tx: client_tx.clone() };
+        let (_event_tx, event_rx) = mpsc::channel(1);
+        let (release_tx, release_rx) = oneshot::channel();
+        let runtime_handle = tokio::spawn(async move {
+            release_rx.await.unwrap();
+            assert!(matches!(client_rx.recv().await, Some(InProcessClientMessage::Notification { .. })));
+            let Some(InProcessClientMessage::Shutdown { done_tx }) = client_rx.recv().await
+            else { panic!("shutdown intent must survive timeout and retained senders"); };
+            let _ = done_tx.send(Ok(()));
+            Ok(())
+        });
+        let runtime = runtime_handle.abort_handle();
+        let client = InProcessClientHandle {
+            client: InProcessClientSender { client_tx }, event_rx, runtime_handle,
+            initialize_response: None, _test_outgoing: std::sync::Weak::new(),
+            _test_codex_home: None,
+        };
+        let mut shutdown = Box::pin(client.shutdown());
+        assert!(futures::poll!(&mut shutdown).is_pending());
+        tokio::task::yield_now().await;
+        tokio::time::advance(SHUTDOWN_TIMEOUT).await;
+        assert_eq!(shutdown.await.unwrap_err().kind(), ErrorKind::TimedOut);
+        assert!(!runtime.is_finished(), "observer timeout cannot abort committed cleanup");
+        release_tx.send(()).unwrap();
+        timeout(Duration::from_secs(1), retained_sender.client_tx.closed()).await
+            .expect("shutdown must retire the runtime while a sender remains alive");
+        assert!(runtime.is_finished());
     }
 
     #[tokio::test]

@@ -1163,7 +1163,11 @@ fn has_pending_required_gates(task: &AgentTask) -> bool {
     matches!(
         task.assignment.admission_origin,
         AssignmentAdmissionOrigin::Typed
-    ) && !task.workspace_status.pending_gates.is_empty()
+    ) && task
+        .workspace_status
+        .pending_gates
+        .iter()
+        .any(|gate| !gate.is_waivable())
 }
 
 enum BacklogPageRead {
@@ -1296,7 +1300,7 @@ mod tests {
         // Host-authored prose is not provider ciphertext. The recipient must
         // receive readable instructions, not an EncryptedContent item.
         assert_eq!(content, vec![AgentMessageInputContent::InputText {
-            text: "Coordination nudge: no durable progress has been observed. Report current progress or the concrete blocker; do not restart a stale validation loop.".to_string(),
+            text: "Coordination nudge: no durable progress has been observed. Continue the assigned work if possible; if blocked, finish with one final report naming the blocker. Do not send progress messages or restart a stale validation loop.".to_string(),
         }]);
     }
 
@@ -3116,7 +3120,7 @@ fn stalled_assignment_nudge(author: AgentPath, recipient: AgentPath) -> InterAge
     communication_from_plaintext_message(
         author,
         recipient,
-        "Coordination nudge: no durable progress has been observed. Report current progress or the concrete blocker; do not restart a stale validation loop."
+        "Coordination nudge: no durable progress has been observed. Continue the assigned work if possible; if blocked, finish with one final report naming the blocker. Do not send progress messages or restart a stale validation loop."
             .to_string(),
     )
 }
@@ -3300,6 +3304,8 @@ mod multi_agent_regressions {
         let pool = sqlx::sqlite::SqlitePoolOptions::new().max_connections(1).connect_with(
             sqlx::sqlite::SqliteConnectOptions::new().filename(state_home.join("agent-task-coordination/agent_tasks.sqlite"))
         ).await?;
+        // Simulate persisted damage below the normal immutable-write boundary.
+        sqlx::query("DROP TRIGGER assignments_immutable_update").execute(&pool).await?;
         sqlx::query("UPDATE assignments SET body_json = '{' WHERE assignment_id = ?").bind(bad.assignment_id.to_string()).execute(&pool).await?;
         let ids = BTreeSet::from([bad.assignment_id, good.assignment_id]);
         let hydrated = hydrate_assignments(coordinator, &ids).await.map_err(anyhow::Error::msg)?;

@@ -255,6 +255,17 @@ fn append_description(description: &str, parts: &mut String, activation: bool) {
 /// a general natural-language classifier: preserve preceding positive clauses
 /// and constructions such as "not only", and resume at the next sentence/clause.
 fn append_activation_description(description: &str, parts: &mut String) {
+    // Soft line wraps retain one clause, but blank-line paragraphs establish a
+    // fresh capability statement rather than inheriting a preceding negation.
+    for paragraph in description
+        .split("\n\n")
+        .flat_map(|part| part.split("\r\n\r\n"))
+    {
+        append_activation_description_paragraph(paragraph, parts);
+    }
+}
+
+fn append_activation_description_paragraph(description: &str, parts: &mut String) {
     // Most descriptions contain no exclusion/routing cue. Check byte prefixes
     // without allocating, lowercasing Unicode, or splitting those descriptions.
     if !description
@@ -271,14 +282,14 @@ fn append_activation_description(description: &str, parts: &mut String) {
         push_search_part(parts, description);
         return;
     }
-    for clause in description.split_inclusive(['.', ';', '\n']) {
+    for clause in description.split_inclusive(['.', ';']) {
         let mut offset = 0;
         let mut previous = ("", 0);
         let mut positive_start = 0;
         let mut cutoff = clause.len();
         let mut first = "";
         for piece in clause.split_inclusive(char::is_whitespace) {
-            let word = piece.trim();
+            let word = piece.trim().trim_matches(['*', '_', '`']);
             if !word.is_empty() {
                 if cutoff < clause.len() && word.eq_ignore_ascii_case("but") {
                     push_search_part(parts, &clause[positive_start..cutoff]);
@@ -294,10 +305,15 @@ fn append_activation_description(description: &str, parts: &mut String) {
                 }
                 let negative = match word.as_bytes()[0].to_ascii_lowercase() {
                     b'c' => {
-                        word.eq_ignore_ascii_case("cannot") || word.eq_ignore_ascii_case("can't")
+                        word.eq_ignore_ascii_case("cannot")
+                            || word.eq_ignore_ascii_case("can't")
+                            || word.eq_ignore_ascii_case("can’t")
                     }
                     b'd' => {
-                        word.eq_ignore_ascii_case("doesn't") || word.eq_ignore_ascii_case("don't")
+                        word.eq_ignore_ascii_case("doesn't")
+                            || word.eq_ignore_ascii_case("don't")
+                            || word.eq_ignore_ascii_case("doesn’t")
+                            || word.eq_ignore_ascii_case("don’t")
                     }
                     b'n' => word.eq_ignore_ascii_case("never"),
                     _ => false,
@@ -309,11 +325,16 @@ fn append_activation_description(description: &str, parts: &mut String) {
                 // the capability; they do not prohibit it.
                 let not_only = (pair
                     || word.eq_ignore_ascii_case("doesn't")
-                    || word.eq_ignore_ascii_case("don't"))
+                    || word.eq_ignore_ascii_case("don't")
+                    || word.eq_ignore_ascii_case("doesn’t")
+                    || word.eq_ignore_ascii_case("don’t"))
                     && clause[offset + piece.len()..]
                         .split_whitespace()
                         .next()
-                        .is_some_and(|next| next.eq_ignore_ascii_case("only"));
+                        .is_some_and(|next| {
+                            next.trim_matches(['*', '_', '`'])
+                                .eq_ignore_ascii_case("only")
+                        });
                 if cutoff == clause.len() && (negative || pair) && !not_only {
                     cutoff = if pair { previous.1 } else { offset };
                 }

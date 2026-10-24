@@ -53,18 +53,20 @@ async fn oauth_client_fixture()
             let body: Value = request.body_json().expect("valid JSON-RPC request");
             let id = body.get("id").cloned().unwrap_or(Value::Null);
             match body.get("method").and_then(Value::as_str) {
-                Some("initialize") => ResponseTemplate::new(200).set_body_json(json!({
-                    "jsonrpc": "2.0",
-                    "id": id,
-                    "result": {
-                        "protocolVersion": body
-                            .pointer("/params/protocolVersion")
-                            .cloned()
-                            .unwrap_or_else(|| json!("2025-06-18")),
-                        "capabilities": { "tools": {} },
-                        "serverInfo": { "name": "oauth-refresh-test", "version": "0.0.0-test" },
-                    },
-                })),
+                Some("initialize") => ResponseTemplate::new(200)
+                    .insert_header("mcp-session-id", "refresh-session")
+                    .set_body_json(json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "result": {
+                            "protocolVersion": body
+                                .pointer("/params/protocolVersion")
+                                .cloned()
+                                .unwrap_or_else(|| json!("2025-06-18")),
+                            "capabilities": { "tools": {} },
+                            "serverInfo": { "name": "oauth-refresh-test", "version": "0.0.0-test" },
+                        },
+                    })),
                 Some("notifications/initialized") => ResponseTemplate::new(202),
                 Some("tools/list") => ResponseTemplate::new(200).set_body_json(json!({
                     "jsonrpc": "2.0",
@@ -115,6 +117,11 @@ async fn oauth_client_fixture()
         /*auth_provider*/ None,
     )
     .await?;
+    Mock::given(method("GET"))
+        .and(path("/mcp"))
+        .respond_with(ResponseTemplate::new(405))
+        .mount(&server)
+        .await;
     client
         .initialize(
             rmcp::model::InitializeRequestParams::new(
@@ -148,6 +155,57 @@ async fn oauth_client_fixture()
         oauth.clone()
     };
     Ok((server, codex_home, Arc::new(client), oauth))
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rotated_refresh_survives_session_expiry_before_operation_persistence() -> anyhow::Result<()>
+{
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let (server, home, client, oauth) = oauth_client_fixture().await?;
+    let refreshes = Arc::new(AtomicUsize::new(0));
+    let count = refreshes.clone();
+    Mock::given(method("POST")).and(path("/oauth/token")).respond_with(move |request:&Request| {
+        let valid=String::from_utf8_lossy(&request.body).contains(&format!("refresh_token={REFRESH_TOKEN}"));
+        if !valid || count.fetch_add(1,Ordering::SeqCst)!=0 { return ResponseTemplate::new(400).set_body_json(json!({"error":"invalid_grant"})); }
+        ResponseTemplate::new(200).set_body_json(json!({"access_token":REFRESHED_ACCESS_TOKEN,"token_type":"Bearer","expires_in":7200,"refresh_token":"rotated-refresh-1"}))
+    }).with_priority(0).mount(&server).await;
+    let tools = Arc::new(AtomicUsize::new(0));
+    let count = tools.clone();
+    Mock::given(method("POST")).and(path("/mcp")).respond_with(move |request:&Request| {
+        let body:Value=request.body_json().unwrap();
+        let expected=format!("Bearer {REFRESHED_ACCESS_TOKEN}");
+        if request.headers.get("authorization").and_then(|value|value.to_str().ok())!=Some(expected.as_str()) {
+            return ResponseTemplate::new(401).insert_header("www-authenticate","Bearer error=\"invalid_token\"");
+        }
+        let result=match body["method"].as_str().unwrap_or("") {
+            "initialize"=>json!({"protocolVersion":body["params"]["protocolVersion"],"capabilities":{"tools":{}},"serverInfo":{"name":"recovery","version":"1"}}),
+            "notifications/initialized"=>return ResponseTemplate::new(202),
+            "tools/list"=>{ if count.fetch_add(1,Ordering::SeqCst)==0 { return ResponseTemplate::new(404); } json!({"tools":[]}) },
+            _=>return ResponseTemplate::new(400),
+        };
+        ResponseTemplate::new(200).insert_header("mcp-session-id","recovered-session").set_body_json(json!({"jsonrpc":"2.0","id":body["id"],"result":result}))
+    }).with_priority(0).mount(&server).await;
+    oauth
+        .set_remaining_lifetime_for_test(Duration::from_secs(29))
+        .await?;
+    client
+        .list_tools(None, Some(Duration::from_secs(5)))
+        .await?;
+    assert_eq!(refreshes.load(Ordering::SeqCst), 1);
+    assert_eq!(tools.load(Ordering::SeqCst), 2);
+    let stored = crate::load_oauth_tokens(
+        home.path(),
+        SERVER_NAME,
+        &format!("{}/mcp", server.uri()),
+        OAuthCredentialsStoreMode::File,
+        AuthKeyringBackendKind::default(),
+    )?
+    .unwrap();
+    assert_eq!(
+        stored.token_response.0.refresh_token().unwrap().secret(),
+        "rotated-refresh-1"
+    );
+    Ok(())
 }
 
 /// Concurrent operations inside the refresh window share one token-endpoint call.

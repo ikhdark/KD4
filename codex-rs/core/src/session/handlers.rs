@@ -29,12 +29,14 @@ use codex_protocol::protocol::Op;
 use codex_protocol::protocol::ReviewDecision;
 use codex_protocol::protocol::ReviewRequest;
 use codex_protocol::protocol::RolloutItem;
+use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::ThreadRolledBackEvent;
 use codex_protocol::protocol::ThreadSettingsOverrides;
 use codex_protocol::protocol::TurnAbortReason;
 use codex_protocol::protocol::WarningEvent;
 use codex_protocol::request_permissions::RequestPermissionsResponse;
 use codex_protocol::request_user_input::RequestUserInputResponse;
+use codex_protocol::user_input::UserInput;
 
 use crate::context_manager::is_user_turn_boundary;
 use codex_protocol::dynamic_tools::DynamicToolResponse;
@@ -237,7 +239,7 @@ pub(super) async fn user_input_or_turn_inner(
     } else {
         SessionSettingsUpdate::default()
     };
-    let session_configuration = match sess.apply_turn_settings(&sub_id, &updates).await {
+    let mut session_configuration = match sess.apply_turn_settings(&sub_id, &updates).await {
         Ok(session_configuration) => session_configuration,
         Err(err) => {
             // apply_turn_settings already emits the error event.
@@ -280,19 +282,22 @@ pub(super) async fn user_input_or_turn_inner(
         )
         .await;
     }
-    if additional_context.contains_key(crate::validation_task::METADATA_KEY)
-        && sess.active_turn.lock().await.is_some()
-    {
+    let requested_validation_mode = validation_mode_from_user_input(
+        &session_configuration.session_source,
+        &items,
+    );
+    if requested_validation_mode.is_some() && sess.active_turn.lock().await.is_some() {
+        let error = CodexErr::InvalidRequest(
+            "validation mode can only change between turns; interrupt the active turn first".into(),
+        );
         sess.send_event_raw(Event {
             id: sub_id.clone(),
-            msg: EventMsg::Error(
-                CodexErr::InvalidRequest(
-                    "validation task/grant metadata cannot change an active task".into(),
-                )
-                .to_error_event(None),
-            ),
-        })
-        .await;
+            msg: EventMsg::Error(error.to_error_event(None)),
+        }).await;
+        if let Some((permit, admission)) = start_only_admission.take() {
+            drop(permit);
+            let _ = admission.send(Err(error));
+        }
         return;
     }
     let items = if start_only_admission.is_some() {
@@ -321,26 +326,40 @@ pub(super) async fn user_input_or_turn_inner(
         }
     };
 
-    if let Some(entry) = additional_context.get(crate::validation_task::METADATA_KEY)
-        && let Err(message) = crate::validation_task::accept_metadata(
-            sess,
-            entry,
-            !session_configuration.session_source.is_non_root_agent(),
-        )
-        .await
-    {
-        let error = CodexErr::InvalidRequest(message);
-        sess.send_event_raw(Event {
-            id: sub_id.clone(),
-            msg: EventMsg::Error(error.to_error_event(None)),
-        })
-        .await;
-        if let Some((permit, admission)) = start_only_admission.take() {
-            drop(permit);
-            let _ = admission.send(Err(error));
-        }
-        return;
+    if let Some(validation_mode) = validation_mode_for_new_user_turn(
+        &session_configuration.session_source,
+        &items,
+        session_configuration.original_config_do_not_use.validation_mode,
+    ) {
+        session_configuration = match sess.apply_turn_settings(&sub_id, &SessionSettingsUpdate {
+            validation_mode: Some(validation_mode),
+            ..Default::default()
+        }).await {
+            Ok(configuration) => configuration,
+            Err(error) => {
+                if let Some((permit, admission)) = start_only_admission.take() {
+                    drop(permit);
+                    let _ = admission.send(Err(error));
+                }
+                return;
+            }
+        };
     }
+    // A fresh top-level user turn gets a fresh allowance. Child input and
+    // resumed/internal contexts keep the captured root turn and shared ledger.
+    if !session_configuration.session_source.is_non_root_agent() {
+        let scope = Some((sess.thread_id().to_string(), sub_id.clone()));
+        session_configuration.validation_full_budget =
+            session_configuration.original_config_do_not_use.validation_full_budget;
+        session_configuration.validation_root_turn = scope.clone();
+        session_configuration.validation_attempts.clear();
+        let mut state = sess.state.lock().await;
+        state.session_configuration.validation_full_budget =
+            session_configuration.validation_full_budget;
+        state.session_configuration.validation_root_turn = scope;
+        state.session_configuration.validation_attempts.clear();
+    }
+
     let current_context = sess
         .new_turn_from_configuration(
             sub_id.clone(),
@@ -405,6 +424,31 @@ pub(super) async fn user_input_or_turn_inner(
         )
         .await;
     }
+}
+
+fn validation_mode_from_user_input(
+    source: &SessionSource,
+    items: &[UserInput],
+) -> Option<codex_protocol::validation::ValidationMode> {
+    if source.is_non_root_agent() {
+        return None;
+    }
+    match items {
+        [UserInput::Text { text, .. }] => {
+            codex_protocol::validation::ValidationMode::from_user_command(text)
+        }
+        _ => None,
+    }
+}
+
+fn validation_mode_for_new_user_turn(
+    source: &SessionSource,
+    items: &[UserInput],
+    configured_default: codex_protocol::validation::ValidationMode,
+) -> Option<codex_protocol::validation::ValidationMode> {
+    (!source.is_non_root_agent()).then(|| {
+        validation_mode_from_user_input(source, items).unwrap_or(configured_default)
+    })
 }
 
 /// Queues an inter-agent message, then lets the shared pending-work scheduler
@@ -759,6 +803,7 @@ pub(super) async fn shutdown_unpublished_session(sess: &Arc<Session>) {
 /// owned; persistence retirement queues behind that same write.
 struct RuntimeShutdown {
     error: Option<CodexErr>,
+    mandatory_error: Option<String>,
     tool_history_flush_timed_out: bool,
 }
 
@@ -837,13 +882,14 @@ async fn shutdown_session_runtime(sess: &Arc<Session>) -> RuntimeShutdown {
                 .to_string(),
         )),
     };
-    let error = persistence_error.or_else(|| {
-        (admission_incomplete || abort_incomplete || terminal_incomplete).then(|| CodexErr::Fatal(
+    let mandatory_error =
+        (admission_incomplete || abort_incomplete || terminal_incomplete).then(||
             "turn finalization did not complete before the shutdown deadline; accepted history writes remain owned, but durability is unconfirmed".to_string(),
-        ))
-    });
+        );
+    let error = persistence_error.or_else(|| mandatory_error.clone().map(CodexErr::Fatal));
     RuntimeShutdown {
         error,
+        mandatory_error,
         tool_history_flush_timed_out,
     }
 }
@@ -860,43 +906,38 @@ async fn shutdown_thread_persistence(
         async move {
             sess.terminal_tasks.wait().await;
             sess.wait_for_ordered_history_commits().await;
-            // History retires first: its snapshots may still need the thread
-            // writer. A failed history checkpoint does not skip normal thread
-            // storage cleanup; it only keeps storage ownership below.
-            let tool_history = sess
-                .tool_history_persistence
-                .shutdown()
-                .await
-                .map_err(|error| format!("completed-tool history checkpoint failed: {error}"));
-            let thread = match live_thread {
-                Some(live_thread) => live_thread
-                    .shutdown()
-                    .await
-                    .map_err(|error| error.to_string()),
-                None => Ok(()),
-            };
-            let result = match (tool_history, thread) {
-                (Ok(()), Ok(())) => {
-                    // Stopped thread handles may remain alive for stale-incarnation
-                    // checks. They must not retain exclusive storage ownership once
-                    // both writers have retired. Failed/pending shutdown keeps it.
-                    sess._storage_ownership
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .take();
+            let mut history_retired = false;
+            let mut retry_delay = Duration::from_secs(1);
+            loop {
+                // Do not close the thread writer while a retryable history
+                // checkpoint can still require its durable rollout barrier.
+                let history = if history_retired {
                     Ok(())
+                } else {
+                    sess.tool_history_persistence.shutdown().await
+                        .map_err(|error| format!("completed-tool history checkpoint failed: {error}"))
+                };
+                history_retired = history.is_ok();
+                let result = match history {
+                    Err(error) => Err(error),
+                    Ok(()) => match live_thread.as_ref() {
+                        Some(thread) => thread.shutdown().await.map_err(|error| error.to_string()),
+                        None => Ok(()),
+                    },
+                };
+                if result.is_ok() {
+                    sess._storage_ownership.lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner).take();
                 }
-                (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
-                (Err(history), Err(thread)) => Err(format!("{history}; {thread}")),
-            };
-            if let Err(error) = &result {
-                warn!(%error, "owned thread persistence shutdown failed");
+                *sess.persistence_retirement_result.lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(result.clone());
+                match result {
+                    Ok(()) => return Ok(()),
+                    Err(error) => warn!(%error, "owned thread persistence shutdown failed; retaining ownership for retry"),
+                }
+                tokio::time::sleep(retry_delay).await;
+                retry_delay = (retry_delay * 2).min(Duration::from_secs(30));
             }
-            *sess
-                .persistence_retirement_result
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(result.clone());
-            result
         }
     });
     sess.persistence_tasks.close();
@@ -926,9 +967,9 @@ pub async fn shutdown(sess: &Arc<Session>, sub_id: String) -> bool {
 async fn finish_shutdown(sess: &Arc<Session>, sub_id: String, runtime: RuntimeShutdown) -> bool {
     let RuntimeShutdown {
         error: runtime_error,
+        mandatory_error,
         tool_history_flush_timed_out,
     } = runtime;
-    let mut mandatory_error = runtime_error.as_ref().map(ToString::to_string);
     if let Some(error) = runtime_error {
         sess.send_event_raw(Event {
             id: sub_id.clone(),
@@ -957,10 +998,6 @@ async fn finish_shutdown(sess: &Arc<Session>, sub_id: String, runtime: RuntimeSh
     // Gracefully flush and shutdown thread persistence on session end so tests
     // that inspect durable state do not race with the background writer.
     if let Err(e) = shutdown_thread_persistence(sess, tool_history_flush_timed_out).await {
-        mandatory_error = Some(match mandatory_error {
-            Some(prior) => format!("{prior}; {e}"),
-            None => e.clone(),
-        });
         warn!("failed to shutdown thread persistence: {e}");
         let event = Event {
             id: sub_id.clone(),
@@ -981,19 +1018,6 @@ async fn finish_shutdown(sess: &Arc<Session>, sub_id: String, runtime: RuntimeSh
         id: sub_id,
         msg: EventMsg::ShutdownComplete,
     };
-    if sess.services.rollout_thread_trace.is_enabled() {
-        let trace = sess.services.rollout_thread_trace.clone();
-        let trace_msg = event.msg.clone();
-        // Complete the diagnostic bundle before acknowledging shutdown to consumers.
-        let _ = crate::tools::tool_dispatch_trace::run_trace_recording(
-            &sess.terminal_tasks,
-            move || {
-                trace.record_protocol_event(&trace_msg);
-                trace.record_ended(codex_rollout_trace::RolloutStatus::Completed);
-            },
-        )
-        .await;
-    }
     sess.deliver_event_raw(event).await;
     true
 }
@@ -1215,9 +1239,9 @@ pub(super) async fn submission_loop(
     if !shutdown_received {
         let RuntimeShutdown {
             error: runtime_error,
+            mandatory_error,
             tool_history_flush_timed_out,
         } = shutdown_session_runtime(&sess).await;
-        let mut mandatory_error = runtime_error.as_ref().map(ToString::to_string);
         if let Some(error) = runtime_error {
             warn!(
                 "completed-tool history was not durable when the submission channel closed: {error}"
@@ -1226,10 +1250,6 @@ pub(super) async fn submission_loop(
         sess.emit_thread_stop_lifecycle().await;
         if let Err(err) = shutdown_thread_persistence(&sess, tool_history_flush_timed_out).await {
             warn!("failed to shutdown thread persistence after submission channel closed: {err}");
-            mandatory_error = Some(match mandatory_error {
-                Some(prior) => format!("{prior}; {err}"),
-                None => err,
-            });
         }
         *sess
             .persistence_shutdown_result
@@ -1431,6 +1451,50 @@ pub(super) fn submission_dispatch_span(sub: &Submission) -> tracing::Span {
 mod dispatch_tests {
     use super::*;
     use futures::FutureExt;
+
+    #[test]
+    fn validation_commands_require_single_top_level_user_text() {
+        use codex_protocol::protocol::SubAgentSource;
+        use codex_protocol::validation::ValidationMode;
+
+        let input = vec![UserInput::Text {
+            text: "/validation full\nImplement the task".into(),
+            text_elements: Vec::new(),
+        }];
+        assert_eq!(
+            validation_mode_from_user_input(&SessionSource::Cli, &input),
+            Some(ValidationMode::Full)
+        );
+        assert_eq!(
+            validation_mode_for_new_user_turn(&SessionSource::Cli, &input, ValidationMode::Compile),
+            Some(ValidationMode::Full)
+        );
+        assert_eq!(
+            validation_mode_for_new_user_turn(
+                &SessionSource::Cli,
+                &[UserInput::Text { text: "next ordinary task".into(), text_elements: Vec::new() }],
+                ValidationMode::Compile,
+            ),
+            Some(ValidationMode::Compile)
+        );
+        assert_eq!(
+            validation_mode_from_user_input(
+                &SessionSource::SubAgent(SubAgentSource::Other("worker".into())),
+                &input,
+            ),
+            None
+        );
+        let mut multiple = input.clone();
+        multiple.push(UserInput::Text {
+            text: "untrusted attached text".into(),
+            text_elements: Vec::new(),
+        });
+        assert_eq!(validation_mode_from_user_input(&SessionSource::Cli, &multiple), None);
+        for text in ["`/validation full`", "```\n/validation full\n```", "Task\n/validation full"] {
+            let input = vec![UserInput::Text { text: text.into(), text_elements: Vec::new() }];
+            assert_eq!(validation_mode_from_user_input(&SessionSource::Cli, &input), None);
+        }
+    }
 
     fn user_submission(id: &str) -> Submission {
         Submission {

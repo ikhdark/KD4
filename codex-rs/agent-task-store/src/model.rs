@@ -123,7 +123,7 @@ impl AcceptanceCriterion {
         if policy.kind == CriterionEvidenceRequirement::ReportOnly {
             if policy.required_evidence.is_some() {
                 return Err(StoreError::InvalidAssignment(
-                    "report_only cannot claim an execution requirement".into(),
+                    "report_only cannot bind a required_evidence entry".into(),
                 ));
             }
             return Ok(());
@@ -132,35 +132,58 @@ impl AcceptanceCriterion {
             && policy.freshness == EvidenceFreshness::Current
         {
             return Err(StoreError::InvalidAssignment(
-                "current validation_execution requires trusted execution input binding, which is unavailable; another run cannot satisfy it. Declare historical only when the requirement actually concerns a recorded execution, or use current source_inspection for source acquisition".into(),
+                "current validation_execution requires trusted execution input binding, which is unavailable; another run cannot satisfy it. Historical is valid only for an explicitly historical execution requirement".into(),
             ));
         }
         let requirement = policy
             .required_evidence
             .as_deref()
             .filter(|value| !value.trim().is_empty())
-            .ok_or_else(|| {
-                StoreError::InvalidAssignment(
-                    "proof policies require an exact required_evidence binding".into(),
-                )
-            })?;
-        if policy.kind == CriterionEvidenceRequirement::SourceInspection
-            && !requirement.strip_prefix("inspect:").is_some_and(|path| {
-                !path.is_empty()
-                    && !path.contains('\\')
-                    && !path.contains(':')
-                    && !path.starts_with('/')
-                    && path.split('/').all(|part| !matches!(part, "" | "." | ".."))
-            })
+            .ok_or_else(|| StoreError::InvalidAssignment(
+                "evidence policies require an exact required_evidence binding".into(),
+            ))?;
+        match policy.kind {
+            CriterionEvidenceRequirement::SourceInspection => {
+                if !requirement.strip_prefix("inspect:").is_some_and(|path| {
+                    !path.is_empty()
+                        && path.trim() == path
+                        && !path.contains(['\0', '\\', ':'])
+                        && !path.starts_with(['/', '~'])
+                        && path.split('/').all(|part| !matches!(part, "" | "." | ".."))
+                }) {
+                    return Err(StoreError::InvalidAssignment(
+                        "source_inspection requires inspect:<normalized repository-relative file>".into(),
+                    ));
+                }
+            }
+            CriterionEvidenceRequirement::ValidationExecution => {
+                if requirement.starts_with("inspect:")
+                    || required_command_argv(requirement).is_none()
+                {
+                    return Err(StoreError::InvalidAssignment(
+                        "validation_execution requires exact command argv".into(),
+                    ));
+                }
+            }
+            CriterionEvidenceRequirement::ReportOnly => unreachable!(),
+        }
+        Ok(())
+    }
+
+    fn validate_evidence_binding(&self, required_evidence: &[String]) -> StoreResult<()> {
+        self.validate_evidence_policy()?;
+        if let Some(requirement) = self.evidence_policy.as_ref()
+            .and_then(|policy| policy.required_evidence.as_ref())
+            && !required_evidence.contains(requirement)
         {
             return Err(StoreError::InvalidAssignment(
-                "source_inspection policies require inspect:<normalized repository-relative file>"
-                    .into(),
+                "criterion policy must bind an assignment required_evidence entry".into(),
             ));
         }
         Ok(())
     }
 }
+
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -281,7 +304,6 @@ pub enum AdmissionRejectionReason {
     /// Seal-time fingerprints cannot certify the inputs a producer observed.
     ReusableSealedInvestigation,
     IsolatedIntegratorUnavailable,
-    ExternalWorkspaceWriter,
 }
 
 impl std::fmt::Display for AdmissionRejectionReason {
@@ -290,7 +312,6 @@ impl std::fmt::Display for AdmissionRejectionReason {
             Self::DuplicateExplorerInvestigation => "duplicate_explorer_investigation",
             Self::ReusableSealedInvestigation => "reusable_sealed_investigation",
             Self::IsolatedIntegratorUnavailable => "isolated_integrator_unavailable",
-            Self::ExternalWorkspaceWriter => "external_workspace_writer",
         };
         formatter.write_str(value)
     }
@@ -342,7 +363,7 @@ impl AssignmentDraft {
         for criterion in &self.acceptance_criteria {
             validate_nonempty("criterion id", &criterion.id)?;
             validate_nonempty("criterion text", &criterion.text)?;
-            criterion.validate_evidence_policy()?;
+            criterion.validate_evidence_binding(&self.required_evidence)?;
             if !criterion_ids.insert(criterion.id.as_str()) {
                 return Err(StoreError::InvalidAssignment(format!(
                     "duplicate acceptance criterion id {}",
@@ -350,7 +371,6 @@ impl AssignmentDraft {
                 )));
             }
         }
-        validate_criterion_bindings(&self.acceptance_criteria, &self.required_evidence)?;
         let mut dependency_ids = HashSet::new();
         for dependency in &self.dependencies {
             if !dependency_ids.insert(*dependency) {
@@ -529,51 +549,18 @@ impl Assignment {
                 if self.read_scope.is_empty() {
                     return invalid("architects require a non-empty read_scope");
                 }
-                if !self.required_evidence.is_empty() {
-                    return invalid("architects require an empty required_evidence");
-                }
             }
             AgentRole::Explorer => {
                 if self.read_scope.is_empty() {
                     return invalid("explorers require a non-empty read_scope");
-                }
-                if !self.required_evidence.is_empty() {
-                    return invalid("explorers require an empty required_evidence");
                 }
             }
             AgentRole::Worker => {
                 if self.write_scope.is_empty() {
                     return invalid("workers require a non-empty write_scope");
                 }
-                if self.admission_origin == AssignmentAdmissionOrigin::Typed
-                    && self.required_evidence.is_empty()
-                {
-                    return invalid(
-                        "workers require at least one proof obligation in required_evidence",
-                    );
-                }
             }
-            AgentRole::Reviewer => {
-                if !self.required_evidence.is_empty() {
-                    return invalid(
-                        "reviewers report diff/findings/gate evidence and require an empty required_evidence",
-                    );
-                }
-            }
-            AgentRole::Verifier => {
-                if self.required_evidence.is_empty() {
-                    return invalid(
-                        "verifiers require at least one focused proof obligation in required_evidence",
-                    );
-                }
-            }
-            AgentRole::Integrator => {
-                if self.required_evidence.is_empty() {
-                    return invalid(
-                        "integrators require at least one integration proof obligation in required_evidence",
-                    );
-                }
-            }
+            AgentRole::Reviewer | AgentRole::Verifier | AgentRole::Integrator => {}
         }
         Ok(())
     }
@@ -654,51 +641,6 @@ pub struct AttemptAmendment {
     pub stop_condition: Option<String>,
 }
 
-/// Admission and correction must describe proof the owner can actually acquire.
-pub(crate) fn validate_criterion_bindings(
-    criteria: &[AcceptanceCriterion],
-    required_evidence: &[String],
-) -> StoreResult<()> {
-    let mut authored = HashSet::new();
-    let mut commands = HashSet::new();
-    for requirement in required_evidence {
-        validate_nonempty("required evidence", requirement)?;
-        if !authored.insert(requirement) {
-            return Err(StoreError::InvalidAssignment(format!("duplicate required evidence {requirement}")));
-        }
-        if let Some(argv) = required_command_argv(requirement)
-            && !commands.insert(argv)
-        {
-            return Err(StoreError::InvalidAssignment(format!(
-                "equivalent required command {requirement}; use one authored required_evidence entry for each exact argv"
-            )));
-        }
-    }
-    let mut current_paths = HashSet::new();
-    for criterion in criteria {
-        let Some(policy) = &criterion.evidence_policy else {
-            continue;
-        };
-        if let Some(required) = &policy.required_evidence {
-            if !required_evidence.contains(required) {
-                return Err(StoreError::InvalidAssignment(
-                    "criterion policy must bind an assignment required_evidence entry".into(),
-                ));
-            }
-            if policy.kind == CriterionEvidenceRequirement::SourceInspection
-                && policy.freshness == EvidenceFreshness::Current
-            {
-                current_paths.insert(required);
-            }
-        }
-    }
-    if current_paths.len() > 64 {
-        return Err(StoreError::InvalidAssignment(
-            "at most 64 distinct Current source inspection paths are supported; split the assignment".into(),
-        ));
-    }
-    Ok(())
-}
 
 /// Current specification, distinct from the immutable original assignment.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -763,6 +705,15 @@ impl AttemptAmendment {
                     )));
                 }
             }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn validate_for_assignment(&self, assignment: &Assignment) -> StoreResult<()> {
+        self.validate()?;
+        // Include inherited policies from assignments admitted by older runtimes.
+        for criterion in assignment.effective_criteria(Some(self)) {
+            criterion.validate_evidence_binding(&assignment.required_evidence)?;
         }
         Ok(())
     }
@@ -1118,12 +1069,6 @@ pub struct ReceiptDraft {
     pub architecture_contract: Option<ArchitectureContractV1>,
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub struct MissingEvidenceObligation {
-    /// Stable within the immutable assignment and persisted requirement ordinal.
-    pub id: String,
-    pub requirement: String,
-}
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct AgentReceipt {
@@ -1405,76 +1350,19 @@ pub struct AgentTask {
 }
 
 impl AgentTask {
+    /// Explicit source policies use the host's acquisition applicability at
+    /// this read. Other criteria retain their existing reported-result meaning.
     pub fn criterion_is_satisfied(&self, id: &str) -> bool {
-        self.criterion_assessments
-            .iter()
-            .any(|assessment| assessment.criterion_id == id && assessment.satisfied)
-    }
-    /// Projects already loaded receipt/call state; never performs IO or upgrades prose.
-    pub fn completion_evidence_summary(&self) -> String {
-        let Some(receipt) = &self.receipt else {
-            return "No sealed completion receipt; behavior unverified.".to_string();
-        };
-        let calls: std::collections::HashMap<_, _> = self
-            .validation_calls
-            .iter()
-            .map(|call| (call.call_id.as_str(), call))
-            .collect();
-        let mut summary = format!(
-            "Recorded task status: {:?}. Changes recorded: {}.\n",
-            receipt.status,
-            receipt.declared_changes.len()
-        );
-        for result in receipt.criterion_results.iter().take(4) {
-            let evidence = result.evidence_ref.as_ref().filter(|reference| {
-                reference.workspace_id == self.assignment.workspace_id
-                    && receipt.validation_call_ids.contains(&reference.call_id)
-                    && calls.get(reference.call_id.as_str()).is_some_and(|call| {
-                        call.attempt_id == receipt.attempt_id
-                            && call.status == ValidationCallStatus::Succeeded
-                            && call.evidence.start_epoch == reference.evidence_epoch
-                            && call.evidence.end_epoch == Some(reference.evidence_epoch)
-                            && call.verified_evidence_kind() == Some(reference.kind)
-                    })
-            });
-            let status = match (result.status, evidence) {
-                (CriterionStatus::NotRun, _) => "not run",
-                (CriterionStatus::Failed, _) => "reported failed",
-                (CriterionStatus::Passed, Some(reference)) => match reference.kind {
-                    CriterionEvidenceKind::ValidationExecution => {
-                        "supported by a successful validation execution (test coverage not established; freshness unverified)"
-                    }
-                    CriterionEvidenceKind::SourceInspection => {
-                        "supported by complete source acquisition (semantic inspection and correctness not established; freshness unverified)"
-                    }
-                },
-                (CriterionStatus::Passed, None) => "reported complete; behavior unverified",
-            };
-            // IDs are exact when shown. Oversized IDs remain available in the receipt.
-            let id = if result.criterion_id.len() <= 128 {
-                &result.criterion_id
-            } else {
-                "[criterion ID omitted]"
-            };
-            let _ = writeln!(summary, "{id}: {status}.");
+        if self.assignment.effective_criteria(self.current_attempt.amendment.as_ref()).iter()
+            .find(|criterion| criterion.id == id)
+            .and_then(|criterion| criterion.evidence_policy.as_ref())
+            .is_some_and(|policy| policy.kind == CriterionEvidenceRequirement::SourceInspection)
+        {
+            return self.criterion_assessments.iter()
+                .any(|assessment| assessment.criterion_id == id && assessment.satisfied);
         }
-        if receipt.criterion_results.len() > 4 {
-            let _ = writeln!(
-                summary,
-                "{} more criterion results in the receipt.",
-                receipt.criterion_results.len() - 4
-            );
-        }
-        if receipt.criterion_results.is_empty() {
-            summary.push_str("No criterion evidence recorded; behavior unverified.\n");
-        }
-        let _ = write!(
-            summary,
-            "Blockers: {}. Risks: {}. Running Desktop build: not established by this receipt.",
-            receipt.blockers.len(),
-            receipt.risks.len()
-        );
-        summary
+        self.receipt.as_ref().is_some_and(|receipt| receipt.criterion_results.iter()
+            .any(|result| result.criterion_id == id && result.status == CriterionStatus::Passed))
     }
 }
 

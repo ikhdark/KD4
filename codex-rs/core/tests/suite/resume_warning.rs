@@ -77,6 +77,10 @@ fn resume_history(
         multi_agent_version: None,
         multi_agent_mode: None,
         effort: config.model_reasoning_effort.clone(),
+        validation_mode: None,
+        validation_full_budget: None,
+        validation_root_turn: None,
+        validation_attempts: Vec::new(),
         context_provenance: None,
     };
 

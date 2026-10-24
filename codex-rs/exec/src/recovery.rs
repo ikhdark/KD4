@@ -46,24 +46,14 @@ impl ExecRecoveryState {
                 }
                 if matches!(
                     &event.item,
-                    ThreadItem::CommandExecution {
-                        status: codex_app_server_protocol::CommandExecutionStatus::InProgress,
-                        ..
-                    } | ThreadItem::McpToolCall {
-                        status: codex_app_server_protocol::McpToolCallStatus::InProgress,
-                        ..
-                    } | ThreadItem::FileChange {
-                        status: codex_app_server_protocol::PatchApplyStatus::InProgress,
-                        ..
-                    } | ThreadItem::DynamicToolCall {
-                        status: codex_app_server_protocol::DynamicToolCallStatus::InProgress,
-                        ..
-                    } | ThreadItem::CollabAgentToolCall {
-                        status: codex_app_server_protocol::CollabAgentToolCallStatus::InProgress,
-                        ..
-                    }
-                ) {
+                    ThreadItem::AgentMessage { .. } | ThreadItem::Plan { .. }
+                ) && self.completed.contains(event.item.id())
+                {
+                    return; // immutable text replay cannot replace a newer final
+                }
+                if crate::event_processor::item_is_in_progress(&event.item) {
                     self.mark_gap();
+                    return; // only terminal evidence closes a started identity
                 }
                 self.pending.remove(event.item.id());
                 if self.completed.len() >= MAX_ITEMS {

@@ -1,31 +1,30 @@
+use std::fs::{File, OpenOptions};
+use std::io::{BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::Mutex;
-use tokio::sync::mpsc;
-use tokio::task::JoinHandle;
-use tokio::time::Duration;
 use tokio_util::sync::CancellationToken;
+use sha2::{Digest, Sha256};
+use base64::Engine as _;
+use super::{RawOutputArtifact, ToolOutputArtifactId, ToolOutputSelector};
 
-use super::MAX_RAW_OUTPUT_ARTIFACT_BYTES;
-use super::RawOutputArtifact;
-use super::RawOutputArtifactWriter;
-use super::STREAMING_ARTIFACT_BUFFER_BYTES;
-
-const RAW_OUTPUT_ARTIFACT_FINALIZATION_TIMEOUT: Duration = Duration::from_secs(10);
-
-/// Persists the retained raw-output prefix without putting filesystem I/O on
-/// the process reader's live-output path. The producer accepts at most one byte
-/// beyond the artifact cap so the writer can preserve its truncation marker
-/// while the in-memory queue remains bounded. Coalescing before enqueueing also
-/// bounds message/allocator overhead when the producer emits tiny chunks and
-/// storage stalls; no filesystem wait is added to the process reader.
+/// Plain command logs are separate from indexed source snapshots. Writes apply
+/// disk backpressure instead of retaining an unbounded queue or dropping a prefix.
+/// Disk exhaustion fails capture explicitly; it never turns a partial log complete.
 #[derive(Debug)]
 pub(crate) struct RawOutputArtifactTask {
-    sender: Option<mpsc::UnboundedSender<Option<Vec<u8>>>>,
-    task: JoinHandle<()>,
     state: Arc<Mutex<RawOutputArtifact>>,
-    accepted_bytes: usize,
-    pending_output: Vec<u8>,
-    gap_recorded: bool,
+    ready: CancellationToken,
+    writer: Option<BufWriter<File>>,
+    handle: Option<Arc<File>>,
+    _residency: Option<File>,
+    id: ToolOutputArtifactId,
+    path: PathBuf,
+    bytes: u64,
+    digest: Sha256,
+    incomplete: bool,
+    failure: Option<String>,
+    finished: bool,
 }
 
 /// Only original producer chunks enter this sink. Display decoding, cap markers
@@ -33,8 +32,7 @@ pub(crate) struct RawOutputArtifactTask {
 #[derive(Debug)]
 pub(crate) struct LegacyRawCapture {
     task: Option<RawOutputArtifactTask>,
-    inline: Option<Vec<u8>>,
-    gap: bool,
+
     attached: bool,
 }
 
@@ -58,22 +56,14 @@ pub(crate) fn current_legacy_capture() -> Option<SharedLegacyRawCapture> {
 
 impl LegacyRawCapture {
     pub(crate) fn write_chunk(&mut self, bytes: &[u8]) {
-        if let Some(inline) = &mut self.inline {
-            if inline.len().saturating_add(bytes.len())
-                <= super::LAZY_RAW_OUTPUT_ARTIFACT_THRESHOLD_BYTES
-            {
-                inline.extend_from_slice(bytes);
-            } else {
-                self.inline = None;
-            }
-        }
+
         if let Some(task) = &mut self.task {
             task.write_chunk(bytes);
         }
     }
 
     pub(crate) fn mark_output_gap(&mut self) {
-        self.gap = true;
+
         if let Some(task) = &mut self.task {
             task.mark_output_gap();
         }
@@ -94,356 +84,395 @@ pub(crate) async fn capture_legacy_output<F: std::future::Future>(
     let state = Arc::new(Mutex::new(RawOutputArtifact::pending(home, thread_id)));
     let capture = Arc::new(std::sync::Mutex::new(LegacyRawCapture {
         task: RawOutputArtifactTask::spawn(Some(Arc::clone(&state)), CancellationToken::new()),
-        inline: Some(Vec::new()),
-        gap: false,
+
         attached: false,
     }));
     let output = LEGACY_RAW_CAPTURE.scope(Arc::clone(&capture), future).await;
     // Never hold the reader's synchronous lock while waiting for storage.
-    let (task, inline, gap, attached) = {
-        let mut capture = capture
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        (
-            capture.task.take(),
-            capture.inline.take(),
-            capture.gap,
-            capture.attached,
-        )
+    let (task, attached) = {
+        let mut capture = capture.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        (capture.task.take(), capture.attached)
     };
+    if !attached {
+        drop(task);
+        return (output, CapturedShellOutput {
+            artifact: RawOutputArtifact::pending(home, thread_id),
+            canonical: None,
+        });
+    }
     if let Some(task) = task {
         task.finish().await;
     }
     let artifact = state.lock().await.clone();
-    let canonical = match &artifact {
-        RawOutputArtifact::Pending { .. } if attached => inline.map(|bytes| {
-            let mut canonical = codex_tools::CanonicalToolResult::bytes(bytes);
-            canonical.complete = !gap;
-            canonical
-        }),
-        RawOutputArtifact::Stored { id, .. } => {
-            super::load_tool_output_snapshot(home, thread_id, &id.to_string())
-                .await
-                .ok()
-                .map(|snapshot| snapshot.canonical_result())
-        }
-        RawOutputArtifact::Pending { .. } | RawOutputArtifact::Failed { .. } => None,
-    };
+
     (
         output,
         CapturedShellOutput {
             artifact,
-            canonical,
+            canonical: None,
         },
     )
 }
 
+
+
 impl RawOutputArtifactTask {
-    pub(crate) fn spawn(
+    pub(crate) fn spawn(state: Option<Arc<Mutex<RawOutputArtifact>>>, ready: CancellationToken) -> Option<Self> {
+        let state = state?;
+        let target = match state.try_lock() {
+            Ok(state) => state.clone(),
+            Err(_) => {
+                ready.cancel();
+                return None;
+            }
+        };
+        Self::spawn_with_target(Some(state), ready, Some(target))
+    }
+
+    pub(crate) fn spawn_with_target(
         state: Option<Arc<Mutex<RawOutputArtifact>>>,
         ready: CancellationToken,
+        target: Option<RawOutputArtifact>,
     ) -> Option<Self> {
-        let state = state?;
-        let (sender, mut receiver) = mpsc::unbounded_channel::<Option<Vec<u8>>>();
-        let task_state = Arc::clone(&state);
-        let task = tokio::spawn(async move {
-            let ready_on_exit = ready.clone().drop_guard();
-            let mut writer = RawOutputArtifactWriter::open(Some(&task_state)).await;
-            while let Some(output) = receiver.recv().await {
-                if let Some(writer) = writer.as_mut() {
-                    if let Some(output) = output {
-                        writer.write_chunk(Some(&task_state), &output).await;
-                    } else {
-                        writer.mark_output_gap(Some(&task_state)).await;
+        let Some(state) = state else { ready.cancel(); return None; };
+        let (codex_home, thread_id, previous) = match target {
+            Some(RawOutputArtifact::Pending { codex_home, thread_id }) => (codex_home, thread_id, None),
+            Some(RawOutputArtifact::Stored { path, truncated, .. }) => {
+                let thread = path.parent()?;
+                let store = thread.parent()?;
+                if !matches!(store.file_name().and_then(|s| s.to_str()), Some("tool-output" | "command-output")) {
+                    ready.cancel();
+                    return None;
+                }
+                (store.parent()?.to_path_buf(), thread.file_name()?.to_string_lossy().into_owned(), Some((path, truncated)))
+            }
+            _ => { ready.cancel(); return None; }
+        };
+        let id = ToolOutputArtifactId::new();
+        let path = codex_home.join("command-output").join(&thread_id).join(format!("{id}.log"));
+        let opened = (|| {
+            let residency = super::command_output_artifact::artifact_residency_file(&codex_home, &thread_id, false)?;
+            std::fs::create_dir_all(path.parent().ok_or_else(|| std::io::Error::other("missing log parent"))?)?;
+            let file = OpenOptions::new().create_new(true).read(true).write(true).open(&path)?;
+            Ok::<_, std::io::Error>((file, residency))
+        })();
+        let (writer, handle, residency, failure) = match opened.and_then(|(file, residency)| {
+            let handle = Arc::new(file.try_clone()?);
+            Ok((BufWriter::with_capacity(64 * 1024, file), handle, residency))
+        }) {
+            Ok((writer, handle, residency)) => (Some(writer), Some(handle), Some(residency), None),
+            Err(error) => (None, None, None, Some(error.to_string())),
+        };
+        let mut capture = Self { state, ready, writer, handle, _residency: residency, id, path, bytes: 0, digest: Sha256::new(),
+            incomplete: false, failure, finished: false };
+        if let Some((previous, incomplete)) = previous {
+            capture.incomplete = incomplete;
+            match File::open(previous) {
+                Ok(mut file) => {
+                    let mut buffer = [0u8; 64 * 1024];
+                    loop {
+                        match file.read(&mut buffer) {
+                            Ok(0) => break,
+                            Ok(length) => capture.write_chunk(&buffer[..length]),
+                            Err(error) => {
+                                capture.failure = Some(error.to_string());
+                                capture.writer.take();
+                                capture.incomplete = true;
+                                break;
+                            }
+                        }
                     }
                 }
+                Err(error) => {
+                    capture.failure = Some(error.to_string());
+                    capture.writer.take();
+                    capture.incomplete = true;
+                }
             }
-            if let Some(writer) = writer.as_mut() {
-                writer.flush_pending(Some(&task_state)).await;
-            }
-            // Readiness means finalized: consumers snapshot the state right
-            // after it and report capture completeness from `finalized`, and
-            // readers stay locked out until finish. Finish adds no data sync,
-            // and the abort drop guard still releases waiters.
-            if let Some(writer) = writer.as_mut() {
-                writer.finish(Some(&task_state)).await;
-            }
-            ready.cancel();
-            drop(ready_on_exit);
-        });
-        Some(Self {
-            sender: Some(sender),
-            task,
-            state,
-            accepted_bytes: 0,
-            pending_output: Vec::new(),
-            gap_recorded: false,
-        })
+        }
+        capture.publish_live();
+        Some(capture)
     }
 
     pub(crate) fn write_chunk(&mut self, output: &[u8]) {
-        if output.is_empty() {
+        let Some(writer) = self.writer.as_mut() else { return; };
+        if let Err(error) = writer.write_all(output) {
+            self.failure = Some(error.to_string());
+            self.writer.take();
+            self.incomplete = true;
             return;
         }
-        let queue_limit = MAX_RAW_OUTPUT_ARTIFACT_BYTES.saturating_add(1);
-        let remaining = queue_limit.saturating_sub(self.accepted_bytes);
-        if remaining == 0 {
-            return;
-        }
-        if self.sender.is_none() {
-            return;
-        }
-        let mut retained = &output[..output.len().min(remaining)];
-        while !retained.is_empty() {
-            let count = retained
-                .len()
-                .min(STREAMING_ARTIFACT_BUFFER_BYTES - self.pending_output.len());
-            self.pending_output.extend_from_slice(&retained[..count]);
-            self.accepted_bytes += count;
-            retained = &retained[count..];
-            if self.pending_output.len() == STREAMING_ARTIFACT_BUFFER_BYTES {
-                self.flush_pending_output();
-                if self.sender.is_none() {
-                    break;
-                }
-            }
-        }
+        self.bytes = self.bytes.saturating_add(output.len() as u64);
+        self.digest.update(output);
+        self.publish_live();
     }
 
-    fn flush_pending_output(&mut self) {
-        if self.pending_output.is_empty() {
-            return;
+    fn publish_live(&self) {
+        let Some(handle) = &self.handle else { return; };
+        if let Ok(mut state) = self.state.try_lock() {
+            *state = RawOutputArtifact::Stored {
+                id: self.id, path: self.path.clone(), bytes: self.bytes,
+                truncated: self.incomplete, handle: Arc::clone(handle),
+                digest: self.digest.clone(), finalized: false,
+            };
         }
-        let output = std::mem::take(&mut self.pending_output);
-        if self
-            .sender
-            .as_ref()
-            .is_some_and(|sender| sender.send(Some(output)).is_err())
-        {
-            self.sender = None;
-        }
-    }
-
-    pub(crate) async fn finish(mut self) {
-        self.flush_pending_output();
-        self.sender.take();
-        if matches!(
-            tokio::time::timeout(RAW_OUTPUT_ARTIFACT_FINALIZATION_TIMEOUT, &mut self.task).await,
-            Ok(Ok(()))
-        ) {
-            return;
-        }
-
-        self.task.abort();
-        let mut artifact = self.state.lock().await;
-        let failed = match &*artifact {
-            RawOutputArtifact::Pending { .. } => {
-                RawOutputArtifact::unavailable("raw output artifact finalization timed out")
-            }
-            RawOutputArtifact::Stored {
-                id, path, bytes, ..
-            } => RawOutputArtifact::Failed {
-                id: Some(*id),
-                message: "raw output artifact finalization timed out".to_string(),
-                owned_path: Some(path.clone()),
-                bytes: *bytes,
-            },
-            RawOutputArtifact::Failed { .. } => return,
-        };
-        *artifact = failed;
     }
 
     pub(crate) fn mark_output_gap(&mut self) {
-        if self.gap_recorded {
-            return;
-        }
-        self.gap_recorded = true;
-        // Keep the producer gap between its preceding and following bytes.
-        self.flush_pending_output();
-        if let Some(sender) = &self.sender {
-            let _ = sender.send(None);
-        }
+        self.incomplete = true;
+        self.publish_live();
+    }
+
+    pub(crate) async fn finish(mut self) {
+        let artifact = if let Some(mut writer) = self.writer.take() {
+            let result = (|| {
+                writer.flush()?;
+                writer.get_ref().sync_all()?;
+                let handle = Arc::clone(self.handle.as_ref().ok_or_else(|| std::io::Error::other("command log handle unavailable"))?);
+                let status = serde_json::json!({
+                    "complete": !self.incomplete,
+                    "bytes": self.bytes,
+                    "sha256": hex::encode(self.digest.clone().finalize()),
+                });
+                codex_file_system::write_bytes_atomically(
+                    &self.path.with_extension("status"), &serde_json::to_vec(&status)?,
+                )?;
+                Ok::<_, std::io::Error>(handle)
+            })();
+            match result {
+                Ok(handle) => RawOutputArtifact::Stored {
+                    id: self.id, path: self.path.clone(), bytes: self.bytes,
+                    truncated: self.incomplete, handle, digest: self.digest.clone(), finalized: true,
+                },
+                Err(error) => self.failed(error.to_string()),
+            }
+        } else {
+            self.failed(self.failure.clone().unwrap_or_else(|| "command log unavailable".into()))
+        };
+        *self.state.lock().await = artifact;
+        self.finished = true;
+        self.ready.cancel();
+    }
+
+    fn failed(&self, message: String) -> RawOutputArtifact {
+        RawOutputArtifact::Failed { id: Some(self.id), message, owned_path: Some(self.path.clone()), bytes: self.bytes }
     }
 }
 
 impl Drop for RawOutputArtifactTask {
     fn drop(&mut self) {
-        if !self.pending_output.is_empty() {
-            // Cancellation/unwinding must not discard coalesced bytes while the
-            // detached writer certifies the already-queued prefix as complete.
-            // This only queues data and a gap marker; Drop never waits on disk.
-            self.mark_output_gap();
-            self.flush_pending_output();
+        if !self.finished {
+            // Preserve an explicitly incomplete prefix even when the owner is
+            // cancelled. No cancellation path publishes a complete transcript.
+            if let Some(writer) = self.writer.as_mut() { let _ = writer.flush(); }
+            let status = serde_json::json!({
+                "complete": false, "bytes": self.bytes,
+                "sha256": hex::encode(self.digest.clone().finalize()),
+            });
+            if let Ok(bytes) = serde_json::to_vec(&status) {
+                let _ = codex_file_system::write_bytes_atomically(&self.path.with_extension("status"), &bytes);
+            }
+            if let Ok(mut state) = self.state.try_lock() {
+                *state = self.failed("command output capture ended before finalization".into());
+            }
+            self.ready.cancel();
         }
     }
 }
 
-#[cfg(test)]
-mod raw_artifact_queue_tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn dropping_capture_flushes_the_buffered_tail_as_incomplete() {
-        let (sender, mut receiver) = mpsc::unbounded_channel();
-        let mut artifact = RawOutputArtifactTask {
-            sender: Some(sender),
-            task: tokio::spawn(async {}),
-            state: Arc::new(Mutex::new(RawOutputArtifact::unavailable("stalled sink"))),
-            accepted_bytes: 0,
-            pending_output: Vec::new(),
-            gap_recorded: false,
+/// Return None for an old/indexed artifact so its existing recovery owner handles it.
+/// Reads are thread-confined, line-only, bounded-memory and never mutate saved logs.
+pub(crate) async fn read_command_log(
+    home: &Path, thread_id: &str, artifact_id: &str,
+    selectors: &[ToolOutputSelector], max_bytes: usize,
+) -> Result<Option<serde_json::Value>, super::ReadToolOutputError> {
+    let id = artifact_id.parse::<ToolOutputArtifactId>()
+        .map_err(|_| super::ReadToolOutputError::InvalidArtifactId)?;
+    if id.to_string() != artifact_id { return Err(super::ReadToolOutputError::InvalidArtifactId); }
+    let path = home.join("command-output").join(thread_id).join(format!("{id}.log"));
+    let selectors = selectors.to_vec();
+    let artifact_id = artifact_id.to_owned();
+    tokio::task::spawn_blocking(move || {
+        let metadata = match std::fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(super::ReadToolOutputError::Io(error.to_string())),
         };
-        artifact.write_chunk(b"buffered tail");
-        drop(artifact);
-        assert_eq!(
-            receiver.try_recv().unwrap(),
-            Some(b"buffered tail".to_vec())
-        );
-        assert_eq!(receiver.try_recv().unwrap(), None);
-        assert!(matches!(
-            receiver.try_recv(),
-            Err(mpsc::error::TryRecvError::Disconnected)
-        ));
-    }
-
-    #[tokio::test]
-    async fn coalesced_capture_recovers_unicode_crlf_binary_and_the_partial_tail() {
-        let home = tempfile::tempdir().unwrap();
-        let state = Arc::new(Mutex::new(RawOutputArtifact::pending(
-            home.path(),
-            "coalesced",
-        )));
-        let ready = CancellationToken::new();
-        let mut task =
-            RawOutputArtifactTask::spawn(Some(Arc::clone(&state)), ready.clone()).unwrap();
-        let mut bytes = "é😀\r\n".repeat(9_000).into_bytes();
-        bytes.push(0xff);
-        for chunk in bytes.chunks(3) {
-            task.write_chunk(chunk);
+        if !metadata.is_file() || metadata.file_type().is_symlink() {
+            return Err(super::ReadToolOutputError::Io("command log is not a regular file".into()));
         }
+        let status = std::fs::read(path.with_extension("status"))
+            .map_err(|error| if error.kind() == std::io::ErrorKind::NotFound {
+                super::ReadToolOutputError::StillWriting
+            } else { super::ReadToolOutputError::Io(error.to_string()) })?;
+        let status: serde_json::Value = serde_json::from_slice(&status)
+            .map_err(|error| super::ReadToolOutputError::Io(error.to_string()))?;
+        let mut remaining = max_bytes;
+        let mut results = Vec::new();
+        let mut offsets = std::collections::BTreeMap::new();
+        for selector in &selectors {
+            let ToolOutputSelector::Lines { start, end } = selector else {
+                return Err(super::ReadToolOutputError::InvalidRange(
+                    "Command logs support line ranges only; use selectors:[{kind:lines,start:1,end:200}]. Source snapshots retain advanced selectors.".into()));
+            };
+            if *start == 0 || end < start {
+                return Err(super::ReadToolOutputError::InvalidRange("expected 1-based start <= end".into()));
+            }
+            offsets.insert(*start, None);
+        }
+        let io_error = |error: std::io::Error| super::ReadToolOutputError::Io(error.to_string());
+        let mut reader = BufReader::new(File::open(&path).map_err(io_error)?);
+        let mut scanned_line = 1usize;
+        let mut offset = 0u64;
+        // Index only requested starts, in one bounded-memory prefix scan.
+        // Delivery remains in caller order, including its shared byte budget.
+        for (start, position) in &mut offsets {
+            while scanned_line < *start {
+                let available = reader.fill_buf().map_err(io_error)?;
+                if available.is_empty() { break; }
+                let newline = available.iter().position(|byte| *byte == b'\n');
+                let count = newline.map_or(available.len(), |index| index + 1);
+                reader.consume(count);
+                offset += count as u64;
+                if newline.is_some() { scanned_line += 1; }
+            }
+            if scanned_line == *start { *position = Some(offset); }
+        }
+        for selector in selectors {
+            let ToolOutputSelector::Lines { start, end } = selector else {
+                return Err(super::ReadToolOutputError::InvalidRange(
+                    "Command logs support line ranges only; use selectors:[{kind:lines,start:1,end:200}]. Source snapshots retain advanced selectors.".into()));
+            };
+            if start == 0 || end < start { return Err(super::ReadToolOutputError::InvalidRange("expected 1-based start <= end".into())); }
+            let position = offsets.get(&start).copied().flatten();
+            if let Some(position) = position {
+                reader.seek(SeekFrom::Start(position)).map_err(io_error)?;
+            }
+            let mut line = start;
+            let mut selection = Vec::new();
+            let mut complete = true;
+            let mut next_line = None;
+            let mut error = None;
+            while position.is_some() && line <= end {
+                let mut bytes = Vec::new();
+                let count = Read::by_ref(&mut reader).take(remaining.saturating_add(1) as u64)
+                    .read_until(b'\n', &mut bytes)
+                    .map_err(|error| super::ReadToolOutputError::Io(error.to_string()))?;
+                if count == 0 { break; }
+                if count > remaining {
+                    if selection.is_empty() && remaining == max_bytes {
+                        error = Some(format!(
+                            "Line {line} exceeds this response budget. Request a larger max_bytes in Code Mode, or read the saved log directly: {}", path.display()
+                        ));
+                    } else {
+                        next_line = Some(line);
+                    }
+                    complete = false;
+                    break;
+                }
+                remaining -= count;
+                selection.extend_from_slice(&bytes);
+                line += 1;
+            }
+            let mut item = serde_json::json!({
+                "selector":{"kind":"lines","start":start,"end":end},
+                "status":if error.is_some() { "invalid" } else { "ok" }, "complete":complete,
+            });
+            if let Some(error) = error { item["message"] = error.into(); }
+            match String::from_utf8(selection) {
+                Ok(text) => item["text"] = text.into(),
+                Err(error) => item["data_base64"] =
+                    base64::engine::general_purpose::STANDARD.encode(error.into_bytes()).into(),
+            }
+            if let Some(start) = next_line {
+                item["continuation"] = serde_json::json!({"kind":"lines","start":start,"end":end});
+            }
+            results.push(item);
+        }
+        Ok(Some(serde_json::json!({
+            "artifact_id":artifact_id,
+            "canonical_sha256":status["sha256"],
+            "canonical_bytes":metadata.len(),
+            "historical_authenticity":"unverified",
+            "complete":results.iter().all(|r| r["complete"] == true),
+            "delivered_selection_complete":results.iter().all(|r| r["complete"] == true),
+            "retained_bytes":metadata.len(),
+            "retained_artifact_complete":status["complete"] == true && status["bytes"].as_u64() == Some(metadata.len()),
+            "results":results,
+        })))
+    }).await.map_err(|error| super::ReadToolOutputError::Io(error.to_string()))?
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[tokio::test]
+    async fn command_lines_preserve_batch_progress_and_skip_large_preceding_lines() {
+        let home = tempfile::tempdir().unwrap();
+        let state = Arc::new(Mutex::new(RawOutputArtifact::pending(home.path(), "lines")));
+        let mut task = RawOutputArtifactTask::spawn(Some(state.clone()), CancellationToken::new()).unwrap();
+        task.write_chunk(&vec![b'x'; 32 * 1024]);
+        task.write_chunk(b"\nfirst\nsecond\n");
+        task.finish().await;
+        let id = state.lock().await.artifact_id().unwrap().to_string();
+        let selected = read_command_log(home.path(), "lines", &id,
+            &[ToolOutputSelector::Lines { start:2, end:3 }], 6).await.unwrap().unwrap();
+        assert_eq!(selected["results"][0]["text"], "first\n");
+        assert_eq!(selected["results"][0]["continuation"]["start"], 3);
+        assert_eq!(selected["complete"], false);
+        let batch = read_command_log(home.path(), "lines", &id,
+            &[ToolOutputSelector::Lines { start:1, end:1 }, ToolOutputSelector::Lines { start:2, end:2 }],
+            8).await.unwrap().unwrap();
+        assert_eq!(batch["results"][0]["status"], "invalid");
+        assert_eq!(batch["results"][1]["text"], "first\n");
+        assert_eq!(batch["retained_artifact_complete"], true);
+        assert_eq!(batch["canonical_bytes"], 32 * 1024 + 14);
+    }
+    #[tokio::test]
+    async fn full_log_exceeds_old_cap_and_remains_line_readable() {
+        let home = tempfile::tempdir().unwrap();
+        let state = Arc::new(Mutex::new(RawOutputArtifact::pending(home.path(), "full")));
+        let ready = CancellationToken::new();
+        let mut task = RawOutputArtifactTask::spawn(Some(state.clone()), ready.clone()).unwrap();
+        let line = vec![b'x'; 1023].into_iter().chain([b'\n']).collect::<Vec<_>>();
+        for _ in 0..17_000 { task.write_chunk(&line); }
+        task.write_chunk("final é\r\n".as_bytes());
         task.finish().await;
         assert!(ready.is_cancelled());
         let artifact = state.lock().await.clone();
         assert!(artifact.capture_finalized_complete());
-        let id = artifact.artifact_id().unwrap().to_string();
-        let snapshot = super::super::load_tool_output_snapshot(home.path(), "coalesced", &id)
-            .await
-            .unwrap();
-        assert_eq!(snapshot.historical_authenticity(), "authenticated");
-        assert_eq!(snapshot.canonical_result().bytes, bytes);
+        assert_eq!(artifact.retained_bytes(), Some(17_000 * 1024 + "final é\r\n".len() as u64));
+        let value = read_command_log(home.path(), "full", &artifact.artifact_id().unwrap().to_string(),
+            &[ToolOutputSelector::Lines { start:17_001, end:17_001 }], 4096).await.unwrap().unwrap();
+        assert_eq!(value["results"][0]["text"], "final é\r\n");
+        assert_eq!(value["retained_artifact_complete"], true);
     }
-
     #[tokio::test]
-    async fn tiny_artifact_chunks_bound_queue_overhead_with_a_stalled_sink() {
-        let (sender, mut receiver) = mpsc::unbounded_channel();
-        let mut artifact = RawOutputArtifactTask {
-            sender: Some(sender),
-            task: tokio::spawn(async {}),
-            state: Arc::new(Mutex::new(RawOutputArtifact::unavailable("stalled sink"))),
-            accepted_bytes: 0,
-            pending_output: Vec::new(),
-            gap_recorded: false,
-        };
-        let bytes = 2 * super::super::STREAMING_ARTIFACT_BUFFER_BYTES + 3;
-        for _ in 0..bytes {
-            artifact.write_chunk(b"x");
-        }
-        assert!(
-            receiver.len() <= 2,
-            "tiny chunks must not allocate one queued message each"
-        );
-        artifact.finish().await;
-        let mut recovered = Vec::new();
-        let mut messages = 0;
-        while let Ok(chunk) = receiver.try_recv() {
-            recovered.extend(chunk.expect("no producer gap"));
-            messages += 1;
-        }
-        assert_eq!(messages, 3);
-        assert_eq!(recovered, vec![b'x'; bytes]);
-    }
-
-    #[tokio::test]
-    async fn coalesced_capture_keeps_gap_order_and_flushes_the_final_tail() {
-        let (sender, mut receiver) = mpsc::unbounded_channel();
-        let mut artifact = RawOutputArtifactTask {
-            sender: Some(sender),
-            task: tokio::spawn(async {}),
-            state: Arc::new(Mutex::new(RawOutputArtifact::unavailable("stalled sink"))),
-            accepted_bytes: 0,
-            pending_output: Vec::new(),
-            gap_recorded: false,
-        };
-        artifact.write_chunk(b"before");
-        artifact.mark_output_gap();
-        artifact.mark_output_gap();
-        artifact.write_chunk(b"after");
-        artifact.finish().await;
-        assert_eq!(receiver.try_recv().unwrap(), Some(b"before".to_vec()));
-        assert_eq!(receiver.try_recv().unwrap(), None);
-        assert_eq!(receiver.try_recv().unwrap(), Some(b"after".to_vec()));
-        assert!(matches!(
-            receiver.try_recv(),
-            Err(mpsc::error::TryRecvError::Disconnected)
-        ));
-    }
-
-    #[tokio::test]
-    async fn empty_artifact_chunks_do_not_queue_messages_or_consume_byte_capacity() {
-        let (sender, mut receiver) = mpsc::unbounded_channel();
-        let mut artifact = RawOutputArtifactTask {
-            sender: Some(sender),
-            task: tokio::spawn(async {}),
-            state: Arc::new(Mutex::new(RawOutputArtifact::unavailable("test sink"))),
-            accepted_bytes: 0,
-            pending_output: Vec::new(),
-            gap_recorded: false,
-        };
-        for _ in 0..100 {
-            artifact.write_chunk(b"");
-        }
-        assert!(matches!(
-            receiver.try_recv(),
-            Err(mpsc::error::TryRecvError::Empty)
-        ));
-        assert_eq!(artifact.accepted_bytes, 0);
-        artifact.write_chunk(b"retained output");
-        assert_eq!(artifact.accepted_bytes, 15);
-        artifact.finish().await;
-        assert_eq!(
-            receiver.try_recv().expect("nonempty output queued"),
-            Some(b"retained output".to_vec())
-        );
-        assert!(matches!(
-            receiver.try_recv(),
-            Err(mpsc::error::TryRecvError::Disconnected)
-        ));
-    }
-
-    /// Audit 145 (A145-07): `raw_output_artifact()` snapshots the shared state
-    /// as soon as readiness fires, so readiness must follow finalization. A gap
-    /// still releases the waiter, but its capture is never complete.
-    #[tokio::test]
-    async fn audit145_claude_readiness_follows_capture_finalization() {
+    async fn gaps_and_abandonment_never_claim_complete_capture() {
         let home = tempfile::tempdir().unwrap();
-        for gap in [false, true] {
-            let state = Arc::new(Mutex::new(RawOutputArtifact::pending(home.path(), "ready")));
-            let ready = CancellationToken::new();
-            let mut task =
-                RawOutputArtifactTask::spawn(Some(Arc::clone(&state)), ready.clone()).unwrap();
-            task.write_chunk(&vec![
-                b'x';
-                super::super::LAZY_RAW_OUTPUT_ARTIFACT_THRESHOLD_BYTES + 1
-            ]);
-            if gap {
-                task.mark_output_gap();
-            }
-            let finishing = tokio::spawn(task.finish());
-            ready.cancelled().await;
-            let snapshot = state.lock().await.clone();
-            assert!(snapshot.artifact_id().is_some(), "gap={gap}");
-            assert_eq!(snapshot.capture_finalized_complete(), !gap, "gap={gap}");
-            finishing.await.unwrap();
-        }
+        let state = Arc::new(Mutex::new(RawOutputArtifact::pending(home.path(), "gap")));
+        let mut task = RawOutputArtifactTask::spawn(Some(state.clone()), CancellationToken::new()).unwrap();
+        task.write_chunk(b"before\n");
+        task.mark_output_gap();
+        task.write_chunk(b"after\n");
+        task.finish().await;
+        let artifact = state.lock().await.clone();
+        assert!(!artifact.capture_finalized_complete());
+        let value = read_command_log(home.path(), "gap", &artifact.artifact_id().unwrap().to_string(),
+            &[ToolOutputSelector::Lines { start:1, end:2 }], 4096).await.unwrap().unwrap();
+        assert_eq!(value["results"][0]["text"], "before\nafter\n");
+        assert_eq!(value["retained_artifact_complete"], false);
+        let second = Arc::new(Mutex::new(RawOutputArtifact::pending(home.path(), "drop")));
+        let ready = CancellationToken::new();
+        let mut abandoned = RawOutputArtifactTask::spawn(Some(second.clone()), ready.clone()).unwrap();
+        abandoned.write_chunk(b"retained prefix\n");
+        let live_id = second.lock().await.artifact_id().unwrap().to_string();
+        drop(abandoned);
+        assert!(ready.is_cancelled());
+        assert!(matches!(*second.lock().await, RawOutputArtifact::Failed { .. }));
+        let prefix = read_command_log(home.path(), "drop", &live_id,
+            &[ToolOutputSelector::Lines { start:1, end:1 }], 4096).await.unwrap().unwrap();
+        assert_eq!(prefix["results"][0]["text"], "retained prefix\n");
+        assert_eq!(prefix["retained_artifact_complete"], false);
     }
 }

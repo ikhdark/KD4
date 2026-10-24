@@ -50,6 +50,7 @@ pub(super) struct LocalThreadProjectionEntry {
     payload_versions: Mutex<Vec<codex_rollout::PayloadDependencyVersion>>,
     /// Source version whose last unloaded read had reconstruction gaps.
     gap_source_version: Mutex<Option<(PathBuf, u64, Option<SystemTime>)>>,
+    gap_retry_after: Mutex<Option<Instant>>,
     last_unloaded_read: StdMutex<Option<Instant>>,
 }
 
@@ -504,6 +505,7 @@ impl LocalThreadProjectionEntry {
             source_version: Mutex::new(None),
             payload_versions: Mutex::new(Vec::new()),
             gap_source_version: Mutex::new(None),
+            gap_retry_after: Mutex::new(None),
             last_unloaded_read: StdMutex::new(None),
         }
     }
@@ -602,6 +604,7 @@ pub(super) async fn initialize_from_store(
         let dependencies = projection.payload_versions.lock().await.clone();
         let source_changed = source_version.is_none()
             || *projection.source_version.lock().await != source_version
+            || projection.gap_retry_after.lock().await.is_some_and(|deadline| Instant::now() >= deadline)
             || !codex_rollout::payload_versions_match(&dependencies).await;
         if source_changed {
             // Stamped before the read, so a payload that appears during or after it is
@@ -631,9 +634,10 @@ pub(super) async fn initialize_from_store(
                 }
                 _ => false,
             });
-            // A gap read again at one source version is a deterministic view of that
-            // source and its payload stamps: reuse it while its missing payloads stay
-            // missing. A first gap may be a transient payload read failure.
+            // Metadata stamps cannot prove content readability. Even confirmed
+            // gaps must retry periodically after transient sharing/I/O failures.
+            *projection.gap_retry_after.lock().await = degraded.then(||
+                Instant::now() + std::time::Duration::from_secs(30));
             let confirmed_gap = {
                 let mut gap_source_version = projection.gap_source_version.lock().await;
                 let confirmed = degraded

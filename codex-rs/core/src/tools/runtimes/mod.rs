@@ -16,11 +16,7 @@ use crate::shell_snapshot::ShellSnapshotFile;
 use crate::shell_snapshot::parse_cmd_snapshot_environment;
 use crate::tools::sandboxing::ToolError;
 
-use codex_network_proxy::CUSTOM_CA_ENV_KEYS;
-use codex_network_proxy::PROXY_ACTIVE_ENV_KEY;
-use codex_network_proxy::PROXY_ENV_KEYS;
 
-use codex_network_proxy::is_managed_mitm_ca_trust_bundle_path;
 use codex_otel::MetricsClient;
 use codex_protocol::config_types::WindowsSandboxLevel;
 use codex_protocol::models::AdditionalPermissionProfile;
@@ -39,6 +35,53 @@ use std::collections::HashMap;
 use std::path::Path;
 
 const SHELL_SNAPSHOT_REPLAY_METRIC: &str = "codex.shell_snapshot_replay";
+
+// These are ordinary user transport settings, not the removed managed proxy.
+// A shell snapshot must not overwrite the current proxy or TLS trust configuration.
+const SHELL_TRANSPORT_ENV_KEYS: &[&str] = &[
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "http_proxy",
+    "https_proxy",
+    "YARN_HTTP_PROXY",
+    "YARN_HTTPS_PROXY",
+    "npm_config_http_proxy",
+    "npm_config_https_proxy",
+    "npm_config_proxy",
+    "NPM_CONFIG_HTTP_PROXY",
+    "NPM_CONFIG_HTTPS_PROXY",
+    "NPM_CONFIG_PROXY",
+    "BUNDLE_HTTP_PROXY",
+    "BUNDLE_HTTPS_PROXY",
+    "PIP_PROXY",
+    "WS_PROXY",
+    "WSS_PROXY",
+    "ws_proxy",
+    "wss_proxy",
+    "NO_PROXY",
+    "no_proxy",
+    "npm_config_noproxy",
+    "NPM_CONFIG_NOPROXY",
+    "YARN_NO_PROXY",
+    "BUNDLE_NO_PROXY",
+    "ALL_PROXY",
+    "all_proxy",
+    "FTP_PROXY",
+    "ftp_proxy",
+    "CODEX_CA_CERTIFICATE",
+    "SSL_CERT_FILE",
+    "REQUESTS_CA_BUNDLE",
+    "CURL_CA_BUNDLE",
+    "NODE_EXTRA_CA_CERTS",
+    "GIT_SSL_CAINFO",
+    "CARGO_HTTP_CAINFO",
+    "PIP_CERT",
+    "BUNDLE_SSL_CA_CERT",
+    "npm_config_cafile",
+    "NPM_CONFIG_CAFILE",
+    "ELECTRON_GET_USE_PROXY",
+    "NODE_USE_ENV_PROXY",
+];
 
 pub(crate) mod apply_patch;
 pub(crate) mod shell;
@@ -144,7 +187,6 @@ pub(crate) fn build_sandbox_command(
         args: args.to_vec(),
         cwd,
         env: env.clone(),
-        managed_network: None,
         additional_permissions,
     })
 }
@@ -166,33 +208,8 @@ pub(crate) fn shell_snapshot_additional_read_roots(
         .collect()
 }
 
-pub(crate) fn exec_env_for_sandbox_permissions(
-    env: &HashMap<String, String>,
-    sandbox_permissions: SandboxPermissions,
-) -> HashMap<String, String> {
-    let mut env = env.clone();
-    if sandbox_permissions.requires_escalated_permissions()
-        && env.contains_key(PROXY_ACTIVE_ENV_KEY)
-    {
-        strip_managed_proxy_env(&mut env);
-    }
-    env
-}
 
-pub(crate) fn is_managed_proxy_env_var(key: &str, value: &str) -> bool {
-    if PROXY_ENV_KEYS.contains(&key) {
-        return true;
-    }
-    if CUSTOM_CA_ENV_KEYS.contains(&key) {
-        return is_managed_mitm_ca_trust_bundle_path(value);
-    }
 
-    false
-}
-
-pub(crate) fn strip_managed_proxy_env(env: &mut HashMap<String, String>) {
-    env.retain(|key, value| !is_managed_proxy_env_var(key, value));
-}
 
 pub(crate) fn disable_powershell_profile_for_elevated_windows_sandbox(
     command: &[String],
@@ -379,32 +396,16 @@ fn maybe_wrap_powershell_with_snapshot(
             override_keys.push(key);
         }
     }
+    override_keys.extend(SHELL_TRANSPORT_ENV_KEYS.iter().copied());
     override_keys.sort_unstable_by_key(|key| key.to_ascii_lowercase());
     override_keys.dedup_by(|left, right| left.eq_ignore_ascii_case(right));
     let override_restores = build_powershell_env_restores(&override_keys, env);
-
-    let mut proxy_keys = PROXY_ENV_KEYS
-        .iter()
-        .copied()
-        .chain(CUSTOM_CA_ENV_KEYS)
-        .filter(|key| is_valid_powershell_env_name(key))
-        .collect::<Vec<_>>();
-    proxy_keys.sort_unstable_by_key(|key| key.to_ascii_lowercase());
-    proxy_keys.dedup_by(|left, right| left.eq_ignore_ascii_case(right));
-    let proxy_restores = build_powershell_env_restores(&proxy_keys, env);
-    let live_proxy_active = powershell_env_value(env, PROXY_ACTIVE_ENV_KEY).is_some();
-    let proxy_restore = format!(
-        "if ({} -or (Microsoft.PowerShell.Management\\Test-Path -LiteralPath 'Env:{}')) {{\n{}\n}}",
-        if live_proxy_active { "$true" } else { "$false" },
-        powershell_single_quote(PROXY_ACTIVE_ENV_KEY),
-        proxy_restores
-    );
 
     let snapshot_path = powershell_single_quote(snapshot_path);
     // Keep the command at script scope so PowerShell propagates its final native
     // exit status; invoking a script block can turn a failed pipeline into success.
     let rewritten_script = format!(
-        "try {{ . '{snapshot_path}' *> $null }} catch {{ [Console]::Error.WriteLine('codex: shell snapshot replay failed: ' + $_.Exception.Message) }}\n{override_restores}\n{proxy_restore}\n{original_script}"
+        "try {{ . '{snapshot_path}' *> $null }} catch {{ [Console]::Error.WriteLine('codex: shell snapshot replay failed: ' + $_.Exception.Message) }}\n{override_restores}\n{original_script}"
     );
 
     let rewritten = vec![
@@ -449,8 +450,7 @@ fn maybe_wrap_cmd_with_snapshot(
         .filter(|key| is_valid_cmd_environment_name(key))
         .collect::<Vec<_>>();
     restore_keys.extend([CODEX_THREAD_ID_ENV_VAR, CODEX_PERMISSION_PROFILE_ENV_VAR]);
-    restore_keys.extend(PROXY_ENV_KEYS.iter().copied());
-    restore_keys.extend(CUSTOM_CA_ENV_KEYS);
+    restore_keys.extend(SHELL_TRANSPORT_ENV_KEYS.iter().copied());
     restore_keys.sort_unstable_by_key(|key| key.to_ascii_lowercase());
     restore_keys.dedup_by(|left, right| left.eq_ignore_ascii_case(right));
 
@@ -708,14 +708,17 @@ mod shell_snapshot_replay_tests {
             "echo ready".to_string(),
         ];
         let remote_path = "C:\\remote workspace\\snapshot.cmd";
-        let mut env = HashMap::new();
+        let mut env = HashMap::from([
+            ("HTTP_PROXY".to_string(), "http://current.invalid:8080".to_string()),
+            ("SSL_CERT_FILE".to_string(), "C:\\current-ca.pem".to_string()),
+        ]);
 
         let rewritten = maybe_wrap_cmd_with_snapshot(
             &command,
             &shell,
             remote_path,
             &format!(
-                "@rem Snapshot file\r\n{CMD_SNAPSHOT_FORMAT_HEADER}\r\n@set CODEX_CMD_VALUE=100%%^^^&! %%PATH%%\r\n"
+                "@rem Snapshot file\r\n{CMD_SNAPSHOT_FORMAT_HEADER}\r\n@set CODEX_CMD_VALUE=100%%^^^&! %%PATH%%\r\n@set HTTP_PROXY=http://stale.invalid:8080\r\n@set SSL_CERT_FILE=C:\\stale-ca.pem\r\n@set HTTPS_PROXY=http://unrequested.invalid:8080\r\n"
             ),
             &HashMap::new(),
             &mut env,
@@ -727,6 +730,9 @@ mod shell_snapshot_replay_tests {
             Some("100%^&! %PATH%")
         );
         assert!(!env.contains_key("__CODEX_SNAPSHOT_FILE"));
+        assert_eq!(env["HTTP_PROXY"], "http://current.invalid:8080");
+        assert_eq!(env["SSL_CERT_FILE"], "C:\\current-ca.pem");
+        assert!(!env.contains_key("HTTPS_PROXY"));
     }
 
     #[test]
@@ -795,7 +801,10 @@ mod shell_snapshot_replay_tests {
                 "# Snapshot file\n{POWERSHELL_SNAPSHOT_FORMAT_HEADER}\n\
                  function Invoke-CodexSnapshotFunction {{ 'from-snapshot' }}\n\
                  Microsoft.PowerShell.Management\\Set-Item -LiteralPath 'Env:CODEX_TEST_OVERRIDE' -Value 'stale'\n\
-                 Microsoft.PowerShell.Management\\Set-Item -LiteralPath 'Env:{CODEX_PERMISSION_PROFILE_ENV_VAR}' -Value 'stale-profile'\n"
+                 Microsoft.PowerShell.Management\\Set-Item -LiteralPath 'Env:{CODEX_PERMISSION_PROFILE_ENV_VAR}' -Value 'stale-profile'\n\
+                 Microsoft.PowerShell.Management\\Set-Item -LiteralPath 'Env:HTTP_PROXY' -Value 'http://stale.invalid:8080'\n\
+                 Microsoft.PowerShell.Management\\Set-Item -LiteralPath 'Env:SSL_CERT_FILE' -Value 'C:\\stale-ca.pem'\n\
+                 Microsoft.PowerShell.Management\\Set-Item -LiteralPath 'Env:NODE_EXTRA_CA_CERTS' -Value 'C:\\unrequested-ca.pem'\n"
             ),
         )
         .expect("write PowerShell snapshot");
@@ -803,7 +812,7 @@ mod shell_snapshot_replay_tests {
             .expect("PowerShell is required on Windows");
         let original = shell.derive_exec_args(
             &format!(
-                "Microsoft.PowerShell.Utility\\Write-Output ((Invoke-CodexSnapshotFunction) + '|' + $env:CODEX_TEST_OVERRIDE + '|' + (Microsoft.PowerShell.Management\\Test-Path -LiteralPath 'Env:{CODEX_PERMISSION_PROFILE_ENV_VAR}'))"
+                "Microsoft.PowerShell.Utility\\Write-Output ((Invoke-CodexSnapshotFunction) + '|' + $env:CODEX_TEST_OVERRIDE + '|' + (Microsoft.PowerShell.Management\\Test-Path -LiteralPath 'Env:{CODEX_PERMISSION_PROFILE_ENV_VAR}') + '|' + $env:HTTP_PROXY + '|' + $env:SSL_CERT_FILE + '|' + (Microsoft.PowerShell.Management\\Test-Path -LiteralPath 'Env:NODE_EXTRA_CA_CERTS'))"
             ),
             /*use_login_shell*/ true,
         )
@@ -812,7 +821,18 @@ mod shell_snapshot_replay_tests {
             HashMap::from([("CODEX_TEST_OVERRIDE".to_string(), "current".to_string())]);
         let mut env = std::env::vars().collect::<HashMap<_, _>>();
         env.insert("CODEX_TEST_OVERRIDE".to_string(), "current".to_string());
-        env.retain(|key, _| !key.eq_ignore_ascii_case(CODEX_PERMISSION_PROFILE_ENV_VAR));
+        env.retain(|key, _| {
+            ![
+                CODEX_PERMISSION_PROFILE_ENV_VAR,
+                "HTTP_PROXY",
+                "SSL_CERT_FILE",
+                "NODE_EXTRA_CA_CERTS",
+            ]
+            .iter()
+            .any(|protected| key.eq_ignore_ascii_case(protected))
+        });
+        env.insert("HTTP_PROXY".to_string(), "http://current.invalid:8080".to_string());
+        env.insert("SSL_CERT_FILE".to_string(), "C:\\current-ca.pem".to_string());
 
         let rewritten = maybe_wrap_shell_lc_with_snapshot_source(
             &original,
@@ -835,7 +855,7 @@ mod shell_snapshot_replay_tests {
         assert!(output.status.success(), "command failed: {output:?}");
         assert_eq!(
             String::from_utf8_lossy(&output.stdout).trim(),
-            "from-snapshot|current|False"
+            "from-snapshot|current|False|http://current.invalid:8080|C:\\current-ca.pem|False"
         );
     }
 

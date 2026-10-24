@@ -386,7 +386,7 @@ mod tests {
             "Get-Content foo.rs | Select-Object -Skip 200".to_string()
         ]));
 
-        assert!(is_safe_command_windows(&[
+        assert!(!is_safe_command_windows(&[
             pwsh.clone(),
             "-NoProfile".to_string(),
             "-Command".to_string(),

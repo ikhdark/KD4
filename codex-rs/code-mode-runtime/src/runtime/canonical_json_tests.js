@@ -20,7 +20,7 @@
     ++stringConversions; return "converted";
   };
   const positive = {
-    text: "λ😀\n\\\"\ud800",
+    text: "λ😀\n\\\"\ud800\udc00",
     number, string, boolean: new Boolean(false),
     omitted: undefined,
     array: [undefined, , NaN, Infinity, -0, false],
@@ -41,5 +41,15 @@
     conversions === 1 && numberConversions === 1 && stringConversions === 1,
     "bounded serialization changed valid JSON or repeated user code");
   deleteStored("valid");
+  // The persisted serde_json representation contains Unicode scalar strings,
+  // not lone UTF-16 surrogates. Invalid strings must fail atomically, while the
+  // paired-surrogate case above must round-trip without loss.
+  for (const text of ["\ud800", "\udc00", "prefix\ud800tail"]) {
+    let invalidRejected = false;
+    try { store("invalid-surrogate", {text}); }
+    catch { invalidRejected = true; }
+    check(invalidRejected && load("invalid-surrogate") === undefined,
+      "an invalid Unicode string was silently replaced or persisted");
+  }
 }
 text("bounded canonical JSON scenarios passed");

@@ -33,7 +33,7 @@ async fn sandboxed_file_system_rejects_non_native_uri_as_invalid_input() {
 }
 
 fn non_native_uri() -> PathUri {
-    let uri = "file:///usr/local/file.txt";
+    let uri = if cfg!(windows) { "file:///usr/local/file.txt" } else { "file:///C:/non-native/file.txt" };
 
     match PathUri::parse(uri) {
         Ok(uri) => uri,

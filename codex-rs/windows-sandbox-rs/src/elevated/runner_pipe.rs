@@ -30,7 +30,7 @@ use windows_sys::Win32::System::Pipes::CreateNamedPipeW;
 use windows_sys::Win32::System::Pipes::GetNamedPipeClientProcessId;
 use windows_sys::Win32::System::Pipes::PIPE_READMODE_BYTE;
 use windows_sys::Win32::System::Pipes::PIPE_TYPE_BYTE;
-use windows_sys::Win32::System::Pipes::PIPE_WAIT;
+use windows_sys::Win32::System::Pipes::PIPE_NOWAIT;
 
 /// PIPE_ACCESS_INBOUND (win32 constant), not exposed in windows-sys 0.52.
 pub const PIPE_ACCESS_INBOUND: u32 = 0x0000_0001;
@@ -39,7 +39,7 @@ pub const PIPE_ACCESS_OUTBOUND: u32 = 0x0000_0002;
 
 /// Resolves the elevated command runner path, preferring the copied helper under
 /// `.sandbox-bin` and falling back to the legacy sibling lookup when needed.
-pub fn find_runner_exe(codex_home: &Path, log_dir: Option<&Path>) -> PathBuf {
+pub fn find_runner_exe(codex_home: &Path, log_dir: Option<&Path>) -> anyhow::Result<PathBuf> {
     resolve_helper_for_launch(HelperExecutable::CommandRunner, codex_home, log_dir)
 }
 
@@ -88,7 +88,7 @@ pub fn create_named_pipe(name: &str, access: u32, sandbox_username: &str) -> io:
         CreateNamedPipeW(
             wide.as_ptr(),
             access,
-            PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
+            PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_NOWAIT,
             1,
             65536,
             65536,

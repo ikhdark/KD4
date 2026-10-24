@@ -1158,7 +1158,12 @@ impl FileSystemSandboxPolicy {
             .filter(|entry| entry.access == FileSystemAccessMode::Deny)
             .filter_map(|entry| match &entry.path {
                 FileSystemPath::GlobPattern { pattern } => {
-                    Some(AbsolutePathBuf::resolve_path_against_base(pattern, cwd))
+                    // Only the supplied pattern is glob syntax; cwd is a literal path.
+                    let literal_cwd = globset::escape(&cwd.to_string_lossy());
+                    Some(AbsolutePathBuf::resolve_path_against_base(
+                        pattern,
+                        literal_cwd,
+                    ))
                 }
                 FileSystemPath::Path { .. } | FileSystemPath::Special { .. } => None,
             })
@@ -1783,7 +1788,9 @@ fn metadata_child_of_writable_root(
             let metadata_name = metadata_path_name(first_component.as_os_str())?;
             Some((entry.path.join(metadata_name), metadata_name))
         })
-        .next()
+        // A nested writable root introduces its own metadata boundary. An
+        // exception for an outer boundary must not bypass that deeper one.
+        .max_by_key(|(path, _)| path.as_path().components().count())
 }
 
 fn protected_metadata_names_for_writable_root(
@@ -2859,6 +2866,85 @@ mod tests {
         ]);
         expected.glob_scan_max_depth = Some(2);
         assert_eq!(replacement, expected);
+    }
+
+    #[test]
+    fn nested_metadata_boundaries_are_order_independent() {
+        let temp = TempDir::new().expect("tempdir");
+        let outer = AbsolutePathBuf::from_absolute_path(temp.path()).expect("absolute root");
+        let nested = outer.join(".codex/subproject");
+        let metadata = nested.join(".git");
+        let target = metadata.join("config");
+
+        for explicit_metadata_grant in [false, true] {
+            let mut roots = vec![outer.clone(), nested.clone()];
+            if explicit_metadata_grant {
+                roots.push(metadata.clone());
+            }
+            for reverse in [false, true] {
+                let mut entries = roots
+                    .iter()
+                    .map(|path| FileSystemSandboxEntry {
+                        path: FileSystemPath::Path { path: path.clone() },
+                        access: FileSystemAccessMode::Write,
+                    })
+                    .collect::<Vec<_>>();
+                if reverse {
+                    entries.reverse();
+                }
+                let policy = FileSystemSandboxPolicy::restricted(entries);
+                assert_eq!(
+                    policy.can_write_path_with_cwd(target.as_path(), temp.path()),
+                    explicit_metadata_grant,
+                );
+                assert_eq!(
+                    forbidden_agent_metadata_write(target.as_path(), temp.path(), &policy),
+                    if explicit_metadata_grant {
+                        None
+                    } else {
+                        Some(".git")
+                    },
+                );
+                assert_eq!(
+                    policy
+                        .get_writable_roots_with_cwd(temp.path())
+                        .iter()
+                        .any(|root| root.is_path_writable(target.as_path())),
+                    explicit_metadata_grant,
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn relative_deny_globs_escape_literal_working_directories() {
+        let temp = TempDir::new().expect("tempdir");
+        for (directory, sibling) in [
+            ("workspace[1]", "workspace1"),
+            ("workspace{a,b}", "workspacea"),
+        ] {
+            let cwd = temp.path().join(directory);
+            std::fs::create_dir(&cwd).expect("create cwd");
+            let policy = default_policy_with_unreadable_glob("**/*.env".to_string());
+            let matcher = ReadDenyMatcher::try_new(&policy, &cwd)
+                .expect("valid glob")
+                .expect("deny matcher");
+            assert!(matcher.is_read_denied(&cwd.join("secret.env")));
+            assert!(matcher.is_read_denied(&cwd.join("nested/secret.env")));
+            assert!(!matcher.is_read_denied(&temp.path().join(sibling).join("secret.env")));
+            assert!(!matcher.is_read_denied(&cwd.join("notes.txt")));
+
+            // Absolute caller-supplied glob syntax is not escaped with the cwd.
+            let absolute_policy = default_policy_with_unreadable_glob(format!(
+                "{}/absolute/*.env",
+                temp.path().display(),
+            ));
+            let absolute_matcher = ReadDenyMatcher::try_new(&absolute_policy, &cwd)
+                .expect("valid absolute glob")
+                .expect("absolute deny matcher");
+            assert!(absolute_matcher.is_read_denied(&temp.path().join("absolute/secret.env")));
+            assert!(!absolute_matcher.is_read_denied(&cwd.join("secret.env")));
+        }
     }
 
     fn deny_policy(path: &Path) -> FileSystemSandboxPolicy {

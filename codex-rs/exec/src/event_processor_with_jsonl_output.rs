@@ -23,7 +23,6 @@ use codex_protocol::protocol::SessionConfiguredEvent;
 
 pub use crate::event_processor::CodexStatus;
 use crate::event_processor::EventProcessor;
-use crate::event_processor::final_message_from_turn;
 use crate::event_processor::handle_last_message;
 use crate::exec_events::AgentMessageItem;
 use crate::exec_events::CodeModeCellItem;
@@ -429,6 +428,10 @@ impl EventProcessorWithJsonOutput {
     }
 
     fn map_completed_item_mut(&mut self, item: ThreadItem) -> Option<ExecThreadItem> {
+        if crate::event_processor::item_is_in_progress(&item) {
+            let raw_id = item.id().to_string();
+            return Self::map_item_with_id(item, || self.started_item_id(&raw_id));
+        }
         match &item {
             ThreadItem::AgentMessage { .. } | ThreadItem::Reasoning { .. } => {
                 Self::map_item_with_id(item, || self.next_item_id())
@@ -452,26 +455,8 @@ impl EventProcessorWithJsonOutput {
             .filter_map(|item| {
                 let raw_id = item.id().to_string();
                 let exec_id = self.raw_to_exec_item_id.get(&raw_id)?.clone();
+                let in_progress = crate::event_processor::item_is_in_progress(item);
                 let item = Self::map_item_with_id(item.clone(), || exec_id)?;
-                let in_progress = matches!(
-                    &item.details,
-                    ThreadItemDetails::CodeModeCell(CodeModeCellItem {
-                        status: CodeModeCellStatus::InProgress | CodeModeCellStatus::Yielded,
-                        ..
-                    }) | ThreadItemDetails::CommandExecution(CommandExecutionItem {
-                        status: ExecCommandExecutionStatus::InProgress,
-                        ..
-                    }) | ThreadItemDetails::FileChange(FileChangeItem {
-                        status: ExecPatchApplyStatus::InProgress,
-                        ..
-                    }) | ThreadItemDetails::McpToolCall(McpToolCallItem {
-                        status: ExecMcpToolCallStatus::InProgress,
-                        ..
-                    }) | ThreadItemDetails::CollabToolCall(CollabToolCallItem {
-                        status: CollabToolCallStatus::InProgress,
-                        ..
-                    })
-                );
                 if in_progress {
                     // A terminal turn does not prove its background work has finished.
                     Some(ThreadEvent::ItemUpdated(ItemUpdatedEvent { item }))
@@ -625,6 +610,7 @@ impl EventProcessorWithJsonOutput {
                     };
                 }
                 self.streamed_final_message.observe(&notification.item);
+                let in_progress = crate::event_processor::item_is_in_progress(&notification.item);
                 if let Some(item) = self.map_completed_item_mut(notification.item) {
                     if matches!(
                         &item.details,
@@ -632,7 +618,11 @@ impl EventProcessorWithJsonOutput {
                     ) {
                         self.final_message = self.streamed_final_message.message();
                     }
-                    events.push(ThreadEvent::ItemCompleted(ItemCompletedEvent { item }));
+                    if in_progress {
+                        events.push(ThreadEvent::ItemUpdated(ItemUpdatedEvent { item }));
+                    } else {
+                        events.push(ThreadEvent::ItemCompleted(ItemCompletedEvent { item }));
+                    }
                 }
                 CodexStatus::Running
             }
@@ -712,30 +702,22 @@ impl EventProcessorWithJsonOutput {
                 if notification.turn.status != TurnStatus::InProgress {
                     self.terminal_emitted = true;
                 }
+                let authoritative =
+                    crate::event_processor::authoritative_final_message(&notification)
+                        .map(|message| message.map(str::to_string));
                 let timing = notification.timing.or(notification.turn.timing);
                 match notification.turn.status {
                     TurnStatus::Completed => {
-                        if let Some(surfaced_result) = notification
-                            .surfaced_result
-                            .as_ref()
-                            .or(notification.turn.surfaced_result.as_ref())
+                        if notification.surfaced_result.is_some()
+                            || notification.turn.surfaced_result.is_some()
                         {
-                            self.final_message = surfaced_result.canonical_message.clone();
+                            self.final_message = authoritative.flatten();
                         } else {
                             for item in &notification.turn.items {
                                 self.streamed_final_message.observe(item);
                             }
-                            self.final_message = if timing
-                                .as_ref()
-                                .is_some_and(|timing| timing.final_answer.is_some())
-                            {
-                                final_message_from_turn(
-                                    notification.turn.items.as_slice(),
-                                    timing.as_ref(),
-                                )
-                            } else {
-                                self.streamed_final_message.message()
-                            };
+                            self.final_message = authoritative
+                                .unwrap_or_else(|| self.streamed_final_message.message());
                             if let Some(item) = notification
                                 .turn
                                 .items

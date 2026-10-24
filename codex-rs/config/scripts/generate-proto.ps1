@@ -129,7 +129,7 @@ function Resolve-ProtocPath {
     }
 
     foreach ($candidate in $candidates) {
-        $resolved = [System.IO.Path]::GetFullPath($candidate)
+        $resolved = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($candidate)
         if ([System.IO.File]::Exists($resolved)) {
             return $resolved
         }

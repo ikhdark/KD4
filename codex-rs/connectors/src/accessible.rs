@@ -104,7 +104,7 @@ mod tests {
             connector_description: description.map(str::to_string),
             plugin_display_names: vec!["Plugin".to_string()],
         });
-        let mut expected = crate::merge::plugin_connector_to_app_info("calendar".to_string());
+        let mut expected = crate::merge::plugin_connector_to_app_info("calendar".to_string()).unwrap();
         expected.name = "Calendar".to_string();
         expected.description = Some("Plan events".to_string());
         expected.install_url = Some("https://chatgpt.com/apps/calendar/calendar".to_string());

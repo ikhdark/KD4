@@ -59,7 +59,7 @@ pub(crate) async fn notify_tool_start(
 }
 
 pub(crate) async fn notify_tool_finish(invocation: &ToolInvocation, outcome: ToolCallOutcome) {
-    notify_tool_finish_parts(
+    let _ = notify_tool_finish_parts(
         invocation.session.as_ref(),
         invocation.step_context.turn.as_ref(),
         invocation.call_id.as_str(),
@@ -74,7 +74,7 @@ pub(crate) async fn notify_tool_finish(invocation: &ToolInvocation, outcome: Too
 pub(crate) async fn notify_required_tool_finish(
     invocation: &ToolInvocation,
     outcome: ToolCallOutcome,
-) {
+) -> Result<(), crate::FunctionCallError> {
     notify_tool_finish_parts(
         invocation.session.as_ref(),
         invocation.step_context.turn.as_ref(),
@@ -84,7 +84,7 @@ pub(crate) async fn notify_required_tool_finish(
         outcome,
         true,
     )
-    .await;
+    .await
 }
 
 pub(crate) async fn notify_tool_aborted(
@@ -97,7 +97,7 @@ pub(crate) async fn notify_tool_aborted(
     // Cancellation cannot claim successful accounting when its dependency is
     // stalled. Bound this observation too and retain an explicit diagnostic;
     // ordinary terminal success still waits for required accounting above.
-    if tokio::time::timeout(
+    match tokio::time::timeout(
         std::time::Duration::from_secs(1),
         notify_tool_finish_parts(
             session,
@@ -110,14 +110,18 @@ pub(crate) async fn notify_tool_aborted(
         ),
     )
     .await
-    .is_err()
     {
-        tracing::warn!(
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => tracing::warn!(
+            call_id, %error,
+            "cancelled tool required finish accounting is unconfirmed after callback failure"
+        ),
+        Err(_) => tracing::warn!(
             call_id,
             "cancelled tool required finish accounting is unconfirmed after its deadline"
-        );
+        ),
     }
-    notify_tool_finish_parts(
+    let _ = notify_tool_finish_parts(
         session,
         turn,
         call_id,
@@ -137,9 +141,10 @@ async fn notify_tool_finish_parts(
     source: ToolCallSource,
     outcome: ToolCallOutcome,
     required: bool,
-) {
+) -> Result<(), crate::FunctionCallError> {
     // One absolute observation budget, not a fresh timeout per contributor.
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(1);
+    let mut required_panicked = false;
     for contributor in session.services.extensions.tool_lifecycle_contributors() {
         if contributor.requires_finish_before_completion() != required {
             continue;
@@ -175,7 +180,15 @@ async fn notify_tool_finish_parts(
         };
         if result.is_err() {
             tracing::warn!(call_id, required, "tool lifecycle finish callback panicked");
+            required_panicked |= required;
         }
+    }
+    if required_panicked {
+        Err(crate::FunctionCallError::RespondToModel(
+            "Required tool finish accounting is unconfirmed because a lifecycle callback panicked. Tool effects have not been rolled back; inspect retained results and accounting state, and do not repeat the tool automatically.".into(),
+        ))
+    } else {
+        Ok(())
     }
 }
 

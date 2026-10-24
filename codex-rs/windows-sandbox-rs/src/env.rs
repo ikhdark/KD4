@@ -8,6 +8,35 @@ use std::io::Write;
 use std::path::Path;
 use std::path::PathBuf;
 
+/// Windows variable names use ordinal, case-insensitive identity. Normalize
+/// before policy/default insertion, rejecting ambiguous caller overrides.
+pub(crate) fn normalize_environment(env_map: &mut HashMap<String, String>) -> Result<()> {
+    use windows_sys::Win32::Globalization::CompareStringOrdinal;
+    let mut entries = env_map.iter().collect::<Vec<_>>();
+    entries.sort_by(|a, b| a.0.cmp(b.0));
+    let mut normalized = HashMap::new();
+    let mut names: Vec<(Vec<u16>, &String)> = Vec::new();
+    for (key, value) in entries {
+        let drive_directory = key.len() == 3 && key.starts_with('=') && key.as_bytes()[1].is_ascii_alphabetic() && key.ends_with(':');
+        anyhow::ensure!(!key.is_empty() && !key.contains('\0') && (!key.contains('=') || drive_directory) && !value.contains('\0'), "invalid Windows environment record");
+        let wide: Vec<u16> = key.encode_utf16().collect();
+        anyhow::ensure!(wide.len() <= 32767, "Windows environment name is too long");
+        let duplicate = names.iter().find(|(name, _)| {
+            // SAFETY: Both counted UTF-16 slices remain live for the call;
+            // lengths were checked and no NUL-terminated access is requested.
+            unsafe { CompareStringOrdinal(name.as_ptr(), name.len() as i32, wide.as_ptr(), wide.len() as i32, 1) == 2 }
+        });
+        if let Some((_, previous)) = duplicate {
+            anyhow::ensure!(*previous == value, "conflicting case-equivalent Windows environment names");
+            continue;
+        }
+        names.push((wide, value));
+        normalized.insert(key.to_ascii_uppercase(), value.clone());
+    }
+    *env_map = normalized;
+    Ok(())
+}
+
 pub fn normalize_null_device_env(env_map: &mut HashMap<String, String>) {
     let keys: Vec<String> = env_map.keys().cloned().collect();
     for k in keys {
@@ -136,6 +165,7 @@ fn ensure_denybin_with_home(
 }
 
 pub fn apply_no_network_to_env(env_map: &mut HashMap<String, String>) -> Result<()> {
+    normalize_environment(env_map)?;
     env_map.insert("SBX_NONET_ACTIVE".into(), "1".into());
     env_map
         .entry("HTTP_PROXY".into())
@@ -170,9 +200,7 @@ pub fn apply_no_network_to_env(env_map: &mut HashMap<String, String>) -> Result<
     env_map
         .entry("GIT_SSH_COMMAND".into())
         .or_insert_with(|| "cmd /c exit 1".into());
-    env_map
-        .entry("GIT_ALLOW_PROTOCOLS".into())
-        .or_insert_with(|| "".into());
+    env_map.insert("GIT_ALLOW_PROTOCOL".into(), String::new());
 
     let base = ensure_denybin(&["ssh", "scp"], /*denybin_dir*/ None)?;
     for tool in ["curl", "wget"] {

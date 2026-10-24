@@ -1111,7 +1111,7 @@ async fn dropped_initial_response_leaves_the_running_cell_owned_by_the_session()
         .execute(ExecuteRequest {
             enabled_tools: vec![blocking_tool()].into(),
             yield_time_ms: Some(60_000),
-            ..execute_request("await tools.block({});")
+            ..execute_request("text('before abandoned yield'); await tools.block({});")
         })
         .await
         .expect("start cell");
@@ -1123,6 +1123,20 @@ async fn dropped_initial_response_leaves_the_running_cell_owned_by_the_session()
     ));
     assert_eq!(next_event(&mut events_rx).await, DelegateEvent::ToolStarted);
     drop(initial_response);
+
+    assert_eq!(service.wait(WaitRequest {
+        recovery: None, cell_id: cell_id.clone(), yield_time_ms: 0,
+    }).await.unwrap(), WaitOutcome::LiveCell(RuntimeResponse::Yielded {
+        cell_id: cell_id.clone(), content_items: vec![FunctionCallOutputContentItem::InputText {
+            text: "before abandoned yield".into(),
+        }],
+    }), "dropping the initial response must release its observer immediately");
+
+    assert_eq!(service.wait(WaitRequest {
+        recovery: None, cell_id: cell_id.clone(), yield_time_ms: 0,
+    }).await.unwrap(), WaitOutcome::LiveCell(RuntimeResponse::Yielded {
+        cell_id: cell_id.clone(), content_items: Vec::new(),
+    }), "abandoned initial output must be received exactly once");
 
     // Termination must still find and clean up this admitted cell after its
     // response receiver has gone away.

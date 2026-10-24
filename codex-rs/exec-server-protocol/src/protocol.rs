@@ -4,7 +4,6 @@ use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use codex_file_system::FileSystemSandboxContext;
 pub use codex_file_system::WalkOptions;
 pub use codex_file_system::WalkOutcome;
-use codex_network_proxy::ManagedNetworkSandboxContext;
 use codex_protocol::config_types::ShellEnvironmentPolicyInherit;
 use codex_shell_command::shell_detect::DetectedShell;
 use codex_utils_path_uri::PathUri;
@@ -172,12 +171,9 @@ pub struct ExecParams {
     /// Whether the eventual executor-side sandbox must enforce managed networking.
     #[serde(default)]
     pub enforce_managed_network: bool,
-    /// Optional details for enforcing managed networking without a live proxy object.
-    ///
-    /// When `enforce_managed_network` is true and these details are absent, the executor must
-    /// continue to fail closed. This preserves compatibility with older clients.
+    /// Legacy input recognized only to reject unsupported managed proxy requests.
     #[serde(default)]
-    pub managed_network: Option<ManagedNetworkSandboxContext>,
+    pub managed_network: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -742,7 +738,6 @@ mod tests {
     use super::ProcessId;
     use super::ShellInfo;
     use codex_file_system::FileSystemSandboxContext;
-    use codex_network_proxy::ManagedNetworkSandboxContext;
     use codex_protocol::models::PermissionProfile;
     use codex_utils_path_uri::PathUri;
     use pretty_assertions::assert_eq;
@@ -764,10 +759,10 @@ mod tests {
             arg0: None,
             sandbox: None,
             enforce_managed_network: true,
-            managed_network: Some(ManagedNetworkSandboxContext {
-                loopback_ports: vec![43123, 48081],
-                allow_local_binding: false,
-            }),
+            managed_network: Some(serde_json::json!({
+                "loopbackPorts": [43123, 48081],
+                "allowLocalBinding": false,
+            })),
         };
 
         let mut serialized = serde_json::to_value(&params).expect("serialize exec params");

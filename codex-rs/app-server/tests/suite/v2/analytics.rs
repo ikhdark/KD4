@@ -158,19 +158,6 @@ pub(crate) async fn wait_for_analytics_event(
     .await
 }
 
-pub(crate) async fn wait_for_goal_event(
-    server: &AnalyticsCapture,
-    read_timeout: Duration,
-    event_kind: &str,
-    goal_status: &str,
-) -> Result<Value> {
-    wait_for_matching_analytics_event(server, read_timeout, |event| {
-        event["event_type"] == "codex_goal_event"
-            && event["event_params"]["event_kind"] == event_kind
-            && event["event_params"]["goal_status"] == goal_status
-    })
-    .await
-}
 
 pub(crate) async fn wait_for_matching_analytics_event(
     server: &AnalyticsCapture,

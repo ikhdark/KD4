@@ -67,14 +67,20 @@ struct InitializedTaskStore {
     state_runtime: Arc<StateRuntime>,
 }
 
-/// Full-suite validation budgets keyed by validation task scope.
+/// Per-call full-suite launch ownership shared within a validation task scope.
 type SuiteBudgets =
     HashMap<(String, String), Arc<codex_command_analysis::command_preflight::FullSuiteBudget>>;
 
-type NativeValidationDeliveries = HashMap<
-    String,
-    Arc<tokio::sync::Mutex<crate::tools::typed_validation::DeliveryState>>,
->;
+/// Trusted validation policy captured from the current root turn before child startup.
+#[derive(Clone, Debug)]
+pub(crate) struct ValidationTurnContext {
+    pub(crate) scope: (String, String),
+    pub(crate) mode: codex_protocol::validation::ValidationMode,
+    pub(crate) full_budget: usize,
+    /// Retains the allowance while child initialization can suspend after its
+    /// parent turn has stopped. This is the same ledger, not a child allowance.
+    pub(crate) budget: Arc<codex_command_analysis::command_preflight::FullSuiteBudget>,
+}
 
 /// Shared typed-task persistence and identity index for one root agent tree.
 ///
@@ -89,14 +95,33 @@ pub(crate) struct AgentTaskCoordinator {
     metrics: Arc<Mutex<TaskMetricIndex>>,
     suite_budgets: Arc<Mutex<SuiteBudgets>>,
     unavailable_descendants: Arc<RwLock<HashMap<String, String>>>,
-    pub(crate) native_validation_deliveries: Arc<Mutex<NativeValidationDeliveries>>,
     /// Retained terminal outcomes this process already reconciled. The rows stay
     /// pending for their delivery owner; another pass would only rewrite the
     /// same idempotent evidence and bump the task revision.
     reconciled_terminal_outcomes: Arc<Mutex<HashSet<(AttemptId, String)>>>,
+    heartbeat_receipts: Arc<Mutex<HashMap<AssignmentId, Arc<tokio::sync::Mutex<Option<TypedActorHeartbeatReceipt>>>>>>,
+}
+
+struct TypedActorHeartbeatReceipt {
+    attempt_id: AttemptId,
+    thread_id: Option<String>,
+    renewed_at: tokio::time::Instant,
+    progress: bool,
 }
 
 impl AgentTaskCoordinator {
+    pub(crate) fn validation_budget_for_turn(
+        &self,
+        scope: &(String, String),
+    ) -> Arc<codex_command_analysis::command_preflight::FullSuiteBudget> {
+        let mut budgets = self.suite_budgets
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Keep live root/child contexts, not every historical turn in a long session.
+        budgets.retain(|key, budget| key == scope || Arc::strong_count(budget) > 1);
+        Arc::clone(budgets.entry(scope.clone()).or_default())
+    }
+
     pub(crate) fn record_unavailable_descendant(&self, thread: ThreadId, unavailable: bool) {
         let mut records = self.unavailable_descendants.write().unwrap_or_else(std::sync::PoisonError::into_inner);
         if unavailable {
@@ -111,35 +136,6 @@ impl AgentTaskCoordinator {
             .iter().map(|(id, reason)| (id.clone(), reason.clone())).collect::<Vec<_>>();
         records.sort();
         records
-    }
-
-    pub(crate) async fn validation_budget(
-        &self,
-        thread: ThreadId,
-    ) -> Arc<codex_command_analysis::command_preflight::FullSuiteBudget> {
-        use codex_command_analysis::command_preflight::FullSuiteBudget;
-        let scope = match self.store() {
-            Some(store) => store
-                .validation_task_scope(&thread.to_string())
-                .await
-                .ok()
-                .flatten(),
-            None => None,
-        };
-        let mut budgets = self
-            .suite_budgets
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let key = scope
-            .clone()
-            .unwrap_or_else(|| (format!("unbound:{thread}"), "uncertain".into()));
-        Arc::clone(budgets.entry(key.clone()).or_insert_with(|| {
-            let budget = Arc::new(FullSuiteBudget::for_task(key.0, key.1));
-            if scope.is_none() {
-                let _ = budget.admit(true);
-            }
-            budget
-        }))
     }
 
     pub(crate) fn has_bindings(&self) -> bool {
@@ -417,9 +413,7 @@ impl AgentTaskCoordinator {
                         "Host terminal boundary for turn {}: turn aborted; partial effects may remain.", pending.turn_id),
                     _ => return Err(StoreError::CorruptData("pending terminal event is not terminal".into())),
                 };
-                self.record_host_completion_observation(&binding, thread, &pending.turn_id, summary, Some(&status)).await?;
-                self.seal_missing_receipt_for_attempt(&path, thread, &status, binding.attempt_id)
-                    .await?;
+                self.record_host_completion_and_seal(&binding, &path, thread, &pending.turn_id, summary, &status).await?;
                 self.record_host_completion_observation(&binding, thread,
                     &format!("{}:parent-delivery", pending.turn_id),
                     format!("Completion retained across recovery; parent delivery is unacknowledged. Read get_agent_task for assignment {} attempt {}; do not replay the child.", binding.assignment_id, binding.attempt_id), None).await?;
@@ -568,9 +562,44 @@ impl AgentTaskCoordinator {
         binding: &AgentTaskBinding,
         progress: bool,
     ) -> StoreResult<bool> {
-        self.required_store()?
-            .heartbeat_typed_workspace_actor(binding.clone(), progress)
-            .await
+        self.heartbeat_typed_actor_binding_inner(binding, progress, true).await
+    }
+
+    pub(crate) async fn heartbeat_typed_actor_binding_if_due(
+        &self,
+        binding: &AgentTaskBinding,
+        progress: bool,
+    ) -> StoreResult<bool> {
+        self.heartbeat_typed_actor_binding_inner(binding, progress, false).await
+    }
+
+    async fn heartbeat_typed_actor_binding_inner(
+        &self,
+        binding: &AgentTaskBinding,
+        progress: bool,
+        force: bool,
+    ) -> StoreResult<bool> {
+        let slot = Arc::clone(self.heartbeat_receipts.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entry(binding.assignment_id).or_default());
+        // Share successful renewals per exact actor, not a root-wide I/O lock.
+        let mut receipt = slot.lock().await;
+        if !force && receipt.as_ref().is_some_and(|prior|
+            prior.attempt_id == binding.attempt_id && prior.thread_id == binding.thread_id
+                && (!progress || prior.progress)
+                && prior.renewed_at.elapsed() < std::time::Duration::from_secs(30))
+        {
+            return Ok(true);
+        }
+        let result = self.required_store()?
+            .heartbeat_typed_workspace_actor(binding.clone(), progress).await;
+        *receipt = matches!(&result, Ok(true)).then(|| TypedActorHeartbeatReceipt {
+            attempt_id: binding.attempt_id,
+            thread_id: binding.thread_id.clone(),
+            renewed_at: tokio::time::Instant::now(),
+            progress,
+        });
+        result
     }
 
     pub(crate) fn binding_for_agent_path(
@@ -618,6 +647,46 @@ impl AgentTaskCoordinator {
             .await?;
         self.require_root_scope(&task.assignment.root_session_id)?;
         Ok(task)
+    }
+
+    pub(crate) async fn record_host_completion_and_seal(
+        &self,
+        binding: &AgentTaskBinding,
+        agent_path: &AgentPath,
+        thread_id: ThreadId,
+        turn_id: &str,
+        summary: String,
+        status: &AgentStatus,
+    ) -> StoreResult<()> {
+        if binding.thread_id.as_deref() != Some(thread_id.to_string().as_str()) {
+            return Ok(());
+        }
+        let store = self.required_store()?;
+        if matches!(status, AgentStatus::Completed(_) | AgentStatus::CompletedWithSurface { .. }) {
+            let mut publication = store.record_host_completion_deferred(
+                binding.attempt_id, format!("{thread_id}:{turn_id}"), summary,
+            ).await?;
+            let result = self.seal_missing_receipt_with_host_completion(
+                agent_path, thread_id, status, binding.attempt_id, Some(&mut publication),
+            ).await;
+            // An existing receipt or unresolved seal still needs its actual
+            // host evidence. This is idempotent after an atomic publication.
+            let published = publication.publish().await;
+            match result {
+                Ok(_) => published,
+                Err(error) => {
+                    if let Err(publication_error) = published {
+                        warn!(%publication_error, "host completion fallback remains owned");
+                    }
+                    Err(error)
+                }
+            }
+        } else {
+            // Failures, stops and cancellation are actionable immediately.
+            self.record_host_completion_observation(binding, thread_id, turn_id, summary, Some(status)).await?;
+            self.seal_missing_receipt_for_attempt(agent_path, thread_id, status, binding.attempt_id).await?;
+            Ok(())
+        }
     }
 
     pub(crate) async fn record_host_completion_observation(
@@ -962,6 +1031,19 @@ impl AgentTaskCoordinator {
         status: &AgentStatus,
         expected_attempt_id: AttemptId,
     ) -> StoreResult<Option<AgentReceipt>> {
+        self.seal_missing_receipt_with_host_completion(
+            agent_path, expected_thread_id, status, expected_attempt_id, None,
+        ).await
+    }
+
+    async fn seal_missing_receipt_with_host_completion(
+        &self,
+        agent_path: &AgentPath,
+        expected_thread_id: ThreadId,
+        status: &AgentStatus,
+        expected_attempt_id: AttemptId,
+        mut host_completion: Option<&mut codex_agent_task_store::DeferredHostCompletionWake>,
+    ) -> StoreResult<Option<AgentReceipt>> {
         // Retain the complete identity across awaits; a reused path must never select a new child.
         let Some(binding) = self.binding_for_agent_path(agent_path).filter(|binding| {
             binding.thread_id.as_deref() == Some(expected_thread_id.to_string().as_str())
@@ -971,10 +1053,13 @@ impl AgentTaskCoordinator {
         };
         let store = self.required_store()?;
         let task = store.get_agent_task(binding.assignment_id, Some(0)).await?;
-        if task.current_attempt.attempt_id != binding.attempt_id
-            || task.receipt.is_some()
-            || task.current_attempt.state != AttemptState::Active
-        {
+        if task.current_attempt.attempt_id != binding.attempt_id {
+            return Ok(None);
+        }
+        if task.receipt.is_some() || task.current_attempt.state != AttemptState::Active {
+            if let Some(publication) = host_completion.as_mut() {
+                publication.publish().await?;
+            }
             return Ok(None);
         }
         if super::status::is_final(status)
@@ -983,6 +1068,11 @@ impl AgentTaskCoordinator {
                 .iter()
                 .any(|call| !call.status.is_terminal())
         {
+            // A running validation lease makes settlement non-immediate. Keep
+            // the host boundary actionable without implying a receipt exists.
+            if let Some(publication) = host_completion.as_mut() {
+                publication.publish().await?;
+            }
             // The terminal runtime no longer produces work. Reuse the store's
             // lease-fenced recovery: unexpired operations suspend settlement;
             // expired operations become cancelled, never successful evidence.
@@ -1039,7 +1129,7 @@ impl AgentTaskCoordinator {
                 "Agent stopped without a final response.".to_string(),
             ),
         };
-        let receipt = ReceiptDraft {
+        let mut receipt = ReceiptDraft {
             status: AgentStatusClaim::NeedsMain,
             summary: format!(
                 "typed agent {agent_path}, attempt {}, stopped with execution outcome {outcome:?} without submitting a receipt: {summary}", binding.attempt_id
@@ -1067,7 +1157,18 @@ impl AgentTaskCoordinator {
             ),
             architecture_contract: None,
         };
-        let result = if legacy_outcome {
+        let result = if let Some(publication) = host_completion {
+            if legacy_outcome {
+                receipt.status = outcome;
+                receipt.summary = summary;
+                // Match record_legacy_agent_outcome: a host final response is
+                // lifecycle evidence, not a typed validation/acceptance report.
+                receipt.validation_call_ids.clear();
+                receipt.blockers.clear();
+                receipt.next_action = None;
+            }
+            publication.seal_receipt(receipt, legacy_outcome).await
+        } else if legacy_outcome {
             store
                 .record_legacy_agent_outcome(binding.attempt_id, outcome, summary)
                 .await
@@ -1121,6 +1222,8 @@ impl AgentTaskCoordinator {
     }
 
     fn forget_binding(&self, assignment_id: AssignmentId) {
+        self.heartbeat_receipts.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner).remove(&assignment_id);
         let mut bindings = self
             .bindings
             .write()

@@ -35,6 +35,7 @@ struct ProjectRootMarkersCacheEntry {
 #[derive(Default)]
 struct AgentsMdCache {
     key: Option<AgentsMdCacheKey>,
+    complete: bool,
     loaded: Option<Arc<LoadedAgentsMd>>,
     retained_sources: Vec<crate::agents_md::RetainedProjectDoc>,
     stable_context: Option<RepositoryStableContextBundle>,
@@ -190,6 +191,11 @@ impl AgentsMdManager {
             return;
         }
         let mut cache = self.cache.lock().await;
+        // A resumed rollout is fallback evidence, not a replacement for the
+        // instructions already loaded by this session.
+        if cache.complete {
+            return;
+        }
         let mut bundle = loaded.stable_context_bundle(&key.active_cwd);
         bundle.source_snapshot = Some(value.clone());
         cache.key = Some(key);
@@ -252,7 +258,17 @@ impl AgentsMdManager {
         environments: &TurnEnvironmentSnapshot,
     ) -> AgentsMdObservation {
         let config = Arc::new(config.clone());
-        self.refresh_and_observe_shared(&config, environments).await
+        let refresh = async {
+            let _permit = self.refresh_gate.acquire().await.ok()?;
+            Some(
+                self.refresh_with_gate_held(Arc::clone(&config), environments)
+                    .await,
+            )
+        };
+        match tokio::time::timeout(REFRESH_TIMEOUT, refresh).await {
+            Ok(Some(observation)) => observation,
+            _ => self.scoped_fallback(&config, environments),
+        }
     }
 
     pub(crate) async fn refresh_and_observe_shared(
@@ -263,7 +279,7 @@ impl AgentsMdManager {
         let refresh = async {
             let _permit = self.refresh_gate.acquire().await.ok()?;
             Some(
-                self.refresh_with_gate_held(Arc::clone(config), environments)
+                self.observe_with_gate_held(Arc::clone(config), environments)
                     .await,
             )
         };
@@ -299,7 +315,7 @@ impl AgentsMdManager {
             if let Some(_permit) = permit
                 && let Ok(observation) = tokio::time::timeout_at(
                     deadline,
-                    self.refresh_with_gate_held(Arc::clone(config), &snapshot),
+                    self.observe_with_gate_held(Arc::clone(config), &snapshot),
                 )
                 .await
             {
@@ -312,6 +328,29 @@ impl AgentsMdManager {
         // the refresh gate held while waiting for preparation after instructions are ready.
         let (observation, prepared) = tokio::join!(refresh, Box::pin(prepare(snapshot.clone())));
         (snapshot, observation, prepared)
+    }
+
+    /// Instructions are session-scoped. Reload only for a new environment or
+    /// instruction configuration, or to recover an incomplete initial load.
+    async fn observe_with_gate_held(
+        &self,
+        config: Arc<Config>,
+        environments: &TurnEnvironmentSnapshot,
+    ) -> AgentsMdObservation {
+        let key = AgentsMdCacheKey::capture_with_markers(
+            &config,
+            environments,
+            &self.project_root_markers(&config),
+        );
+        {
+            let cache = self.cache.lock().await;
+            if cache.complete && cache.key.as_ref() == Some(&key) {
+                // Refreshed denotes a complete load for this scope, not a
+                // claim that files were reread for the current model request.
+                return cache.cached_observation(AgentsMdFreshness::Refreshed);
+            }
+        }
+        self.refresh_with_gate_held(config, environments).await
     }
 
     fn scoped_fallback(
@@ -362,9 +401,8 @@ impl AgentsMdManager {
             project_root_markers.as_ref(),
         )
         .await;
-        // File metadata is discovery evidence, not a content identity. Editors, sync tools, and
-        // remote filesystems can replace a file while preserving its size and modification time,
-        // so every sampling-step refresh must read the discovered instruction files again.
+        // Explicit refreshes and new scopes read the instruction bytes rather
+        // than using metadata as a content identity.
         let previous = {
             let cache = self.cache.lock().await;
             (cache.key.as_ref() == Some(&key))
@@ -387,6 +425,7 @@ impl AgentsMdManager {
         )
         .await;
         let mut cache = self.cache.lock().await;
+        cache.complete = load.complete;
         let freshness = if load.complete {
             cache.recovered_snapshot = None;
             AgentsMdFreshness::Refreshed

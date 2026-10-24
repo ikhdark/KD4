@@ -6,10 +6,9 @@ param(
     [switch]$SkipBuild,
     [switch]$AutoSkipBuild,
     [switch]$NoSccache,
-    [switch]$SkipPreflightCheck,
     [switch]$BuildOnly,
-    [switch]$TestRun,
-    [ValidateSet("debug", "release", "local-release")]
+
+    [ValidateSet("debug", "release", "local-release", "local-fast")]
     [string]$Profile = "local-release",
     [switch]$PrintBuiltCodexPath,
     [string]$RepoRoot,
@@ -20,11 +19,11 @@ param(
     [string]$SourceBundleManifest,
     [string]$InstallDir = $env:CODEX_LOCAL_PUBLISH_DIR,
     [string]$BackupDir,
-    [switch]$RunDoctor,
+
     [switch]$FastProof,
-    [switch]$DoctorOnNoop,
+
     [switch]$FailOnStaleSourceBuild,
-    [switch]$RuntimeProof,
+
     [switch]$AllowRustyV8Download,
     [string]$RustyV8Archive,
     [switch]$ConfigureDesktopLocalCli,
@@ -502,186 +501,6 @@ function Format-UtcTimestamp {
     return ([DateTime]$Value).ToString("o")
 }
 
-function Test-DoctorFailureAllowedForPublish {
-    param(
-        [object[]]$OutputLines
-    )
-
-    $doctor = ConvertFrom-DoctorOutput -OutputLines $OutputLines
-    if ($null -eq $doctor) {
-        return $false
-    }
-
-    # Use PSObject.Properties lookups: direct member access on missing JSON
-    # properties throws under Set-StrictMode -Version Latest.
-    $checksProperty = $doctor.PSObject.Properties["checks"]
-    if ($null -eq $checksProperty -or $null -eq $checksProperty.Value) {
-        return $false
-    }
-
-    $failedChecks = @(
-        $checksProperty.Value.PSObject.Properties |
-            Where-Object {
-                $null -ne $_.Value -and
-                $null -ne $_.Value.PSObject.Properties["status"] -and
-                [string]$_.Value.PSObject.Properties["status"].Value -eq "fail"
-            } |
-            ForEach-Object { $_.Name }
-    )
-
-    if ($failedChecks.Count -eq 0) {
-        return $false
-    }
-
-    foreach ($failedCheck in $failedChecks) {
-        if ($failedCheck -eq "auth.credentials") {
-            continue
-        }
-        if ($failedCheck -ne "terminal.env") {
-            return $false
-        }
-
-        $terminalCheck = $checksProperty.Value.PSObject.Properties["terminal.env"].Value
-        $terminalSummaryProperty = $terminalCheck.PSObject.Properties["summary"]
-        if (
-            $null -eq $terminalSummaryProperty -or
-            [string]$terminalSummaryProperty.Value -ne "TERM=dumb - colors and cursor control are disabled"
-        ) {
-            return $false
-        }
-
-        # Publish runs doctor through an automation pipe, so TERM=dumb describes
-        # the caller rather than the installed runtime. Only tolerate that exact
-        # caller failure after doctor has proved the local publish is ready.
-        $readinessProperty = $checksProperty.Value.PSObject.Properties["local_publish.readiness"]
-        if ($null -eq $readinessProperty -or $null -eq $readinessProperty.Value) {
-            return $false
-        }
-        $readinessStatusProperty = $readinessProperty.Value.PSObject.Properties["status"]
-        if (
-            $null -eq $readinessStatusProperty -or
-            [string]$readinessStatusProperty.Value -ne "ok"
-        ) {
-            return $false
-        }
-    }
-
-    return $true
-}
-
-function ConvertFrom-DoctorOutput {
-    param(
-        [object[]]$OutputLines
-    )
-
-    $doctorText = ($OutputLines | ForEach-Object { [string]$_ }) -join "`n"
-    if ([string]::IsNullOrWhiteSpace($doctorText)) {
-        return $null
-    }
-
-    try {
-        return $doctorText | ConvertFrom-Json -ErrorAction Stop
-    }
-    catch {
-        return $null
-    }
-}
-
-function Write-DoctorCheckProofLine {
-    param(
-        [AllowNull()]
-        [object]$Doctor,
-        [string]$CheckId,
-        [string]$Prefix
-    )
-
-    # Use PSObject.Properties lookups: direct member access on missing JSON
-    # properties throws under Set-StrictMode -Version Latest.
-    if ($null -eq $Doctor) {
-        return
-    }
-    $checksProperty = $Doctor.PSObject.Properties["checks"]
-    if ($null -eq $checksProperty -or $null -eq $checksProperty.Value) {
-        return
-    }
-
-    $property = $checksProperty.Value.PSObject.Properties[$CheckId]
-    if ($null -eq $property -or $null -eq $property.Value) {
-        return
-    }
-
-    $check = $property.Value
-    $statusProperty = $check.PSObject.Properties["status"]
-    if ($null -ne $statusProperty -and $null -ne $statusProperty.Value) {
-        Write-ProofLine "$($Prefix)Status" ([string]$statusProperty.Value)
-    }
-    $summaryProperty = $check.PSObject.Properties["summary"]
-    if ($null -ne $summaryProperty -and -not [string]::IsNullOrWhiteSpace([string]$summaryProperty.Value)) {
-        Write-ProofLine "$($Prefix)Summary" ([string]$summaryProperty.Value)
-    }
-}
-
-function Write-DoctorRuntimeProofLines {
-    param(
-        [AllowNull()]
-        [object]$Doctor
-    )
-
-    Write-DoctorCheckProofLine -Doctor $Doctor -CheckId "local_publish.readiness" -Prefix "doctorLocalPublish"
-    Write-DoctorCheckProofLine -Doctor $Doctor -CheckId "desktop.runtime_chain" -Prefix "doctorDesktopRuntime"
-    Write-DoctorCheckProofLine -Doctor $Doctor -CheckId "app_server.status" -Prefix "doctorAppServer"
-}
-
-function Invoke-DoctorForPublish {
-    param(
-        [string]$TargetPath
-    )
-
-    Write-ProofLine "doctorCommand" "`"$TargetPath`" doctor --json"
-    # Windows PowerShell 5.1 turns redirected native stderr into terminating
-    # errors while $ErrorActionPreference is "Stop"; doctor stderr must reach
-    # the allowed-failure check below instead of aborting into rollback.
-    $doctorStderrPath = [System.IO.Path]::GetTempFileName()
-    $oldErrorActionPreference = $ErrorActionPreference
-    $ErrorActionPreference = "Continue"
-    try {
-        $doctorOutput = @(& $TargetPath doctor --json 2>$doctorStderrPath)
-        $doctorExitCode = $LASTEXITCODE
-    }
-    finally {
-        $ErrorActionPreference = $oldErrorActionPreference
-    }
-    try {
-        $doctorErrorOutput = @(
-            [System.IO.File]::ReadAllLines($doctorStderrPath) |
-                Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) }
-        )
-    }
-    finally {
-        Remove-Item -LiteralPath $doctorStderrPath -Force -ErrorAction SilentlyContinue
-    }
-    foreach ($line in $doctorOutput) {
-        Write-Output $line
-    }
-    foreach ($line in $doctorErrorOutput) {
-        Write-Output $line
-    }
-
-    $doctor = ConvertFrom-DoctorOutput -OutputLines $doctorOutput
-    Write-DoctorRuntimeProofLines -Doctor $doctor
-
-    if ($doctorExitCode -eq 0) {
-        Write-ProofLine "doctorStatus" "ok"
-        return
-    }
-
-    if (Test-DoctorFailureAllowedForPublish -OutputLines $doctorOutput) {
-        Write-ProofLine "doctorStatus" "warning: allowed non-runtime doctor failure"
-        return
-    }
-
-    throw "codex doctor --json failed with exit code $doctorExitCode."
-}
 
 function Test-LocalPublishBuildRelevantPath {
     param(
@@ -3832,25 +3651,13 @@ $installParentForTransaction = Split-Path -Parent ([IO.Path]::GetFullPath($Insta
 $installLeafForTransaction = Split-Path -Leaf ([IO.Path]::GetFullPath($InstallDir))
 $publishTransactionJournalPath = Join-Path $installParentForTransaction ".$installLeafForTransaction.codex-local-publish.transaction.json"
 
-Write-ProofLine "action" $(if ($DryRun) { "DRY-RUN" } elseif ($BuildOnly) { "build-only" } elseif ($TestRun) { "test-run" } else { "publish" })
+Write-ProofLine "action" $(if ($DryRun) { "DRY-RUN" } elseif ($BuildOnly) { "build-only" } else { "publish" })
 Write-ProofLine "profile" $Profile
 Write-ProofLine "sourceBuildStalePolicy" $(if ($FailOnStaleSourceBuild) { "fail" } else { "report" })
-Write-ProofLine "runtimeProof" $(if ($RuntimeProof) { "requested" } else { "not requested" })
+
 
 if ($BuildOnly -and $SkipBuild) {
     throw "-BuildOnly cannot be combined with -SkipBuild."
-}
-if ($TestRun -and $DryRun) {
-    throw "-TestRun cannot be combined with -DryRun."
-}
-if ($TestRun -and $BuildOnly) {
-    throw "-TestRun cannot be combined with -BuildOnly."
-}
-if ($TestRun -and $SkipBuild) {
-    throw "-TestRun cannot be combined with -SkipBuild."
-}
-if ($RuntimeProof -and -not ($DryRun -and $RunDoctor)) {
-    throw "-RuntimeProof only applies to -DryRun -RunDoctor; use -RestartDesktop or -RestartDesktopIfNeeded to prove the Desktop runtime after publishing."
 }
 
 $buildLease = $null
@@ -3969,44 +3776,6 @@ if ($BuildOnly) {
     exit 0
 }
 
-if ($TestRun) {
-    Write-ProofLine "testRun" "true"
-    Write-ProofLine "sourcePath" $SourceExe
-    Write-ProofLine "sourceCodeModeHostPath" $SourceCodeModeHostExe
-    Write-ProofLine "sourceWindowsSandboxSetupPath" $SourceWindowsSandboxSetupExe
-    Write-ProofLine "sourceCommandRunnerPath" $SourceCommandRunnerExe
-    if (-not (Test-Path -LiteralPath $SourceExe -PathType Leaf)) {
-        throw "Test run built source Codex binary does not exist: $SourceExe"
-    }
-    if (-not (Test-Path -LiteralPath $SourceCodeModeHostExe -PathType Leaf)) {
-        throw "Test run built source code-mode host does not exist: $SourceCodeModeHostExe"
-    }
-    if (-not (Test-Path -LiteralPath $SourceWindowsSandboxSetupExe -PathType Leaf)) {
-        throw "Test run built Windows sandbox setup helper does not exist: $SourceWindowsSandboxSetupExe"
-    }
-    if (-not (Test-Path -LiteralPath $SourceCommandRunnerExe -PathType Leaf)) {
-        throw "Test run built command runner does not exist: $SourceCommandRunnerExe"
-    }
-    Write-ProofLine "sourceMissing" "false"
-    Write-ProofLine "sourceCodeModeHostMissing" "false"
-    Write-ProofLine "sourceCodeModeHostSha256" (Get-FileSha256 $SourceCodeModeHostExe)
-    Write-ProofLine "sourceWindowsSandboxSetupSha256" (Get-FileSha256 $SourceWindowsSandboxSetupExe)
-    Write-ProofLine "sourceCommandRunnerSha256" (Get-FileSha256 $SourceCommandRunnerExe)
-    $testVersionLines = @(Get-VersionProofLines -Path $SourceExe)
-    Write-VersionProofLinesBlock -Prefix "source" -VersionLines $testVersionLines
-    if (-not (Test-VersionProofAvailable -VersionLines $testVersionLines)) {
-        throw "Test run built Codex binary failed --version verification: $($testVersionLines[0])"
-    }
-    if ($RunDoctor) {
-        Invoke-DoctorForPublish -TargetPath $SourceExe
-    }
-    else {
-        Write-ProofLine "doctorCommand" "<skipped: -RunDoctor not set>"
-    }
-    Write-ProofLine "replace" "not run: test run"
-    Write-ProofLine "restartRequired" "false"
-    exit 0
-}
 
 Write-ProofLine "sourcePath" $SourceExe
 if (-not (Test-Path -LiteralPath $SourceExe -PathType Leaf)) {
@@ -4413,18 +4182,7 @@ if ($DryRun) {
         Write-ProofLine "replace" $(if ($binaryChanged) { "not run" } else { "not run: target already current" })
         Write-ProofLine "restartRequired" $(if ($binaryChanged -or $desktopRoutingResult.RestartRequired) { "true" } else { "false" })
     }
-    if ($RunDoctor) {
-        if ($RuntimeProof -and (Test-Path -LiteralPath $targetPath -PathType Leaf)) {
-            Invoke-DoctorForPublish -TargetPath $targetPath
-        }
-        elseif ($RuntimeProof) {
-            Write-ProofLine "doctorCommand" "`"$targetPath`" doctor --json (not run: target missing)"
-            Write-ProofLine "doctorStatus" "skipped: target missing"
-        }
-        else {
-            Write-ProofLine "doctorCommand" "`"$targetPath`" doctor --json (not run)"
-        }
-    }
+
     if ($RestartDesktop) {
         if ($ConfigureDesktopLocalCli) {
             Restart-CodexDesktop -DryRun -Force:$Force -LocalCliPath $targetPath -LocalCodexHome $LocalCodexHome -LocalCodexSqliteHome $LocalCodexSqliteHome
@@ -4490,14 +4248,7 @@ if (-not $binaryChanged) {
     Write-ProofLine "windowsSandboxSetupBackupSha256" "<none: target already current>"
     Write-ProofLine "commandRunnerBackupSha256" "<none: target already current>"
     Write-ProofLine "restartRequired" $(if ($desktopRoutingResult.RestartRequired) { "true" } else { "false" })
-    if ($RunDoctor) {
-        if ($DoctorOnNoop -or $desktopRoutingResult.Changed) {
-            Invoke-DoctorForPublish -TargetPath $targetPath
-        }
-        else {
-            Write-ProofLine "doctorCommand" "<skipped: target already current>"
-        }
-    }
+
     $publishCommitted = $true
     Write-ProofLine "publishCommitted" "true"
     if ($RestartDesktop) {
@@ -4651,9 +4402,7 @@ try {
     Write-ProofLine "restartRequired" "true"
     Write-ProofLine "restart" "Restart Codex Desktop from the Start menu or desktopAppLaunchCommand; do not launch targetPath directly."
 
-    if ($RunDoctor) {
-        Invoke-DoctorForPublish -TargetPath $targetPath
-    }
+
     Complete-CodexRuntimeBundleTransaction -Transaction $publishTransaction
 }
 catch {

@@ -11,7 +11,7 @@ if __package__ in (None, ""):
 
 
 import argparse
-from contextlib import contextmanager, nullcontext
+from contextlib import contextmanager
 from dataclasses import dataclass
 from dataclasses import field
 import errno
@@ -28,7 +28,6 @@ import stat
 import subprocess
 import sys
 import time
-import tomllib
 import uuid
 from typing import Callable
 from typing import BinaryIO
@@ -49,7 +48,6 @@ from scripts.build.rust_tool_env import cargo_package_specs, local_rust_env  # n
 from scripts.build.rust_build_status_support import (  # noqa: E402
     add_prune_arguments,
     bounded_size_workers,
-    build_doctor_report,
     bytes_from_gib,
     directory_size_bytes,
     directory_sizes_bytes,
@@ -59,7 +57,6 @@ from scripts.build.rust_build_status_support import (  # noqa: E402
     max_lane_bytes_from_args,
     max_total_lane_bytes_from_args,
     max_total_target_bytes_from_args,
-    msvc_linkers_from_cargo_config,
     non_negative_int,
     positive_float,
     positive_int,
@@ -73,7 +70,6 @@ from scripts.build.rust_build_status_support import (  # noqa: E402
 __all__ = [
     "add_prune_arguments",
     "bounded_size_workers",
-    "build_doctor_report",
     "bytes_from_gib",
     "directory_size_bytes",
     "directory_sizes_bytes",
@@ -83,7 +79,6 @@ __all__ = [
     "max_lane_bytes_from_args",
     "max_total_lane_bytes_from_args",
     "max_total_target_bytes_from_args",
-    "msvc_linkers_from_cargo_config",
     "non_negative_int",
     "positive_float",
     "positive_int",
@@ -113,10 +108,6 @@ RUST_WRAPPER_PROCESS_NAMES = (
     "just",
     "powershell",
     "pwsh",
-)
-WINDOWS_MSVC_TARGETS = (
-    "x86_64-pc-windows-msvc",
-    "aarch64-pc-windows-msvc",
 )
 BYTES_PER_KIB = 1024
 BYTES_PER_MIB = BYTES_PER_KIB * 1024
@@ -158,7 +149,6 @@ RUST_PROCESS_TOKEN_RE = re.compile(
     re.IGNORECASE,
 )
 RUST_MIN_STACK_BYTES = "8388608"
-RUST_ADMISSION_BUSY_EXIT_CODE = 75
 LANE_COORDINATION_GRACE_SECONDS = 1.0
 # Lanes of one family (`core-tests`, `core-tests-2`, ...) that may build at
 # once when cold overflow is allowed. Each lane holds a whole Cargo target, so
@@ -175,130 +165,9 @@ def max_active_lanes_per_base(env: Mapping[str, str] = os.environ) -> int:
     return max(1, value)
 
 
-class RustAdmissionBusy(RuntimeError):
-    """Admission did not execute the requested work; obligations remain pending."""
-
-    def __init__(
-        self,
-        message: str,
-        *,
-        resource: Path,
-        wait_option: str,
-        blocking_resources: Sequence[Path] = (),
-    ):
-
-        super().__init__(message)
-
-        self.blocking_resources = tuple(dict.fromkeys(blocking_resources))
-
-        requested_resource = resource
-
-        if self.blocking_resources:
-            resource = self.blocking_resources[0]
-
-        self.status = {
-            "kind": "codex_rust_admission_v1",
-            "status": "busy",
-            "exit_code": RUST_ADMISSION_BUSY_EXIT_CODE,
-            "resource": str(resource.resolve()),
-            "validation_status": "pending",
-            "executed": False,
-            "queued": False,
-            "automatic_retry": False,
-            "working_directory": str(Path.cwd().resolve()),
-            "automatic_resume": False,
-            "wait_option": wait_option,
-            "next_action": (
-                "Keep required validation pending. Do not poll by relaunching, switch lanes, "
-                "or start duplicate checks. Resume any already-live validation operation; "
-                "Otherwise leave validation pending for a later explicit invocation; "
-                "a short bounded wait is opt-in, not required. "
-                "If that wait expires, report blocked validation rather than retrying or completing."
-            ),
-        }
-
-        if self.blocking_resources:
-            self.status["requested_resource"] = str(requested_resource.resolve())
-
-    def report(self) -> dict[str, object]:
-        """Status plus the holder, read after the locks admission raised under."""
-
-        blocking = [
-            {"resource": str(path.resolve()), "target_dir": str(path.resolve()), "holder": lane_runner_holder(path)}
-            for path in self.blocking_resources
-        ]
-
-        report = {
-            **self.status,
-            "holder": blocking[0]["holder"]
-            if blocking
-            else lane_runner_holder(Path(str(self.status["resource"]))),
-        }
-
-        if blocking:
-            report["resource_kind"] = "lane_family"
-            for entry in blocking:
-                entry["owner_kind"] = "test_runner" if entry["holder"] is not None else "unknown"
-            report["blocking_lanes"] = blocking
-
-        return report
 
 
-def lane_runner_holder(target_dir: Path) -> dict[str, object] | None:
-    """Read the current target owner's binding, never guess from ledger history."""
-    lock_path = target_dir / ".rust-test-runner.lock"
-    try:
-        if not _binary_file_lock_is_busy(lock_path):
-            return None
-        # Byte zero is locked on Windows; the bounded descriptor follows it.
-        with lock_path.open("rb") as source:
-            source.seek(1)
-            descriptor = source.read(4097)
-        if len(descriptor) > 4096:
-            return None
-        binding = json.loads(descriptor)
-        if not isinstance(binding, dict) or binding.get("version") != 1:
-            return None
-        path = Path(binding["ledger"])
-        if (
-            path.parent.resolve() != (target_dir / "test-runner-logs").resolve()
-            or path.name != "validation-" + binding["run_id"] + ".json"
-            or path.is_symlink()
-        ):
-            return None
-        record = json.loads(path.read_text(encoding="utf-8"))
-        owner_path = path.with_suffix(".owner.lock")
-        if (
-            not isinstance(record, dict)
-            or record.get("run_id") != binding["run_id"]
-            or record.get("owner_lock_version") != 1
-            or record.get("outcome") != "running"
-            or not owner_path.is_file()
-            or owner_path.is_symlink()
-        ):
-            return None
-        owner = _try_acquire_binary_file_lock(owner_path)
-        if owner is not None:
-            owner.close()
-            return None
-        # A release/new acquisition during inspection invalidates this binding.
-        with lock_path.open("rb") as source:
-            source.seek(1)
-            if source.read(4097) != descriptor:
-                return None
-        if not _binary_file_lock_is_busy(lock_path) or not isinstance(
-            record.get("argv"), list
-        ):
-            return None
-        return {
-            "argv": [str(arg) for arg in record["argv"]],
-            "working_directory": record.get("working_directory"),
-            "started_at": record.get("started_at"),
-            "ledger": str(path),
-        }
-    except (OSError, ValueError, KeyError, TypeError):
-        return None
-    return None
+
 
 
 class CargoLanesRootValidationError(ValueError):
@@ -690,7 +559,7 @@ def _classify_rust_process(process: RustProcess) -> RustProcessClassification:
         tokens = [token.strip('"') for token in shlex.split(process.command_line, posix=False)]
     except ValueError:
         tokens = []
-    scripts = {"cargo-lane.ps1", "rust_test_runner.py", "rust_build_status.py"}
+    scripts = {"cargo-lane.ps1", "rust_build_status.py"}
     script = None
     if executable in {"python", "python3", "pythonw", "powershell", "pwsh"}:
         for token in tokens[1:]:
@@ -1038,155 +907,7 @@ def _binary_file_lock_is_busy(path: Path) -> bool:
         return True
 
 
-@contextmanager
-def reserve_rust_test_target(
-    target_dir: Path,
-    *,
-    timeout_seconds: float = 0.0,
-    cargo_profile: str | None = None,
-    holder: Mapping[str, object] | None = None,
-) -> Iterator[dict[str, object]]:
-    """Coordinate whole runner invocations, not cached results.
 
-    A separate lease avoids re-acquiring a parent run-lane reservation. Managed
-    lanes use the existing short creation/prune lock; never hold it while waiting
-    or executing. Different exact targets remain independent. Observe existing
-    raw Cargo locks too, without claiming to prevent uncooperative future starts.
-    CODEX_CARGO_LANE_TARGET_DIR is the wrappers' inherited reservation contract,
-    not an authorization boundary; it exempts only that exact parent lane, never
-    another runner or Cargo process using the selected build profile. An unknown
-    profile keeps the conservative whole-target Cargo probe. Busy targets fail
-    promptly by default; the short coordination lock has a one-second grace,
-    independent of the build wait. A positive timeout opts into waiting. Under
-    an inherited reservation the short creation/prune lock is a handoff, not
-    another job, and keeps its own bounded wait.
-    """
-    if not math.isfinite(timeout_seconds) or timeout_seconds < 0:
-        raise ValueError("admission timeout must be a finite nonnegative number")
-    if (
-        cargo_profile is not None
-        and re.fullmatch(r"[A-Za-z0-9_-]+", cargo_profile) is None
-    ):
-        raise ValueError("Cargo profile must be a profile name, not a filesystem path")
-    profile_dir = {"dev": "debug", "test": "debug", "bench": "release"}.get(
-        cargo_profile, cargo_profile
-    )
-    target_dir = target_dir.resolve()
-    inherited_target = os.environ.get("CODEX_CARGO_LANE_TARGET_DIR")
-    parent_reserved = bool(
-        inherited_target and Path(inherited_target).resolve() == target_dir
-    )
-    started = time.monotonic()
-    deadline = started + timeout_seconds
-    coordination_deadline = started + max(
-        timeout_seconds,
-        30.0 if parent_reserved else LANE_COORDINATION_GRACE_SECONDS,
-    )
-    handle = None
-    announced = False
-    try:
-        while handle is None:
-            remaining = deadline - time.monotonic()
-            if timeout_seconds > 0 and remaining <= 0:
-                raise TimeoutError(
-                    f"timed out waiting for Rust test target {target_dir}"
-                )
-            managed = (target_dir.parent / CARGO_LANES_ROOT_MARKER).is_file()
-            coordination = (
-                cargo_lane_coordination_lock(
-                    target_dir.parent,
-                    # The parent already won this lane; a zero budget here
-                    # would drop it whenever another launch is mid-probe.
-                    timeout_seconds=max(
-                        0.0, min(30.0, coordination_deadline - time.monotonic())
-                    ),
-                )
-                if managed and os.name == "nt"
-                else nullcontext()
-            )
-            with coordination:
-                target_dir.mkdir(parents=True, exist_ok=True)
-                if (target_dir / ".lane-cleanup-unconfirmed").exists():
-                    raise RuntimeError(f"Rust test target is quarantined: {target_dir}")
-                lane_busy = not parent_reserved and _binary_file_lock_is_busy(
-                    target_dir / ".lane-active.lock"
-                )
-                if not lane_busy:
-                    # Acquire once rather than opening, probing and releasing
-                    # this same lease before reacquiring it. Raw Cargo probes
-                    # are nonblocking; never retain our lease while waiting.
-                    candidate = _try_acquire_binary_file_lock(
-                        target_dir / ".rust-test-runner.lock"
-                    )
-                    if candidate is not None:
-                        try:
-                            # Retire the previous owner's descriptor immediately,
-                            # including during this owner's pre-checkpoint interval.
-                            candidate.truncate(1)
-                            candidate.flush()
-                            if not _cargo_profile_locks_are_busy(
-                                target_dir, profile=profile_dir
-                            ):
-                                handle = candidate
-                        finally:
-                            if handle is None:
-                                try:
-                                    _release_binary_file_lock(candidate)
-                                finally:
-                                    candidate.close()
-            if handle is None:
-                if timeout_seconds == 0:
-                    raise RustAdmissionBusy(
-                        f"Rust test target is busy: {target_dir}. No validation was run. "
-                        "Required validation remains pending.",
-                        resource=target_dir,
-                        wait_option="--admission-timeout-seconds",
-                    )
-                if not announced:
-                    print(
-                        f"Rust admission: waiting for target {target_dir}",
-                        file=sys.stderr,
-                    )
-                    announced = True
-                time.sleep(min(0.1, max(0.0, deadline - time.monotonic())))
-        if holder is not None:
-            descriptor = json.dumps({"version": 1, **holder}).encode("utf-8")
-            if len(descriptor) <= 4096:
-                handle.write(descriptor)
-                handle.flush()
-        try:
-            yield {
-                "target_dir": str(target_dir),
-                "wait_seconds": time.monotonic() - started,
-                "scope": "cooperating_rust_test_runner_invocations",
-                "inherited_lane_reservation": parent_reserved,
-                "observed_external_locks": ["lane_reservation", "cargo_profile"],
-                "cargo_profile_directory": profile_dir,
-            }
-        except BaseException as error:
-            if (
-                isinstance(error, CleanupFailed)
-                or getattr(error, "outcome", None) == "cleanup_failed"
-            ):
-                (target_dir / ".lane-cleanup-unconfirmed").write_text(
-                    "Runner process cleanup was not confirmed; inspect descendants before removing this quarantine.\n",
-                    encoding="utf-8",
-                )
-            raise
-    finally:
-        if handle is not None:
-            try:
-                try:
-                    handle.truncate(1)
-                    handle.flush()
-                except OSError:
-                    # A leftover descriptor is not live without both leases.
-                    # Retention failure must not replace the command outcome.
-                    pass
-                finally:
-                    _release_binary_file_lock(handle)
-            finally:
-                handle.close()
 
 
 def _safe_lane_name(value: str) -> str:
@@ -1206,16 +927,9 @@ def _cargo_profile_options(command: Sequence[str]) -> list[str]:
         cargo_index = 4 if command[2] == "--install" else 3
         if cargo_index < len(command) and Path(command[cargo_index]).stem.lower() == "cargo":
             return _cargo_profile_options(command[cargo_index:])
-    recipe = command[1] if len(command) > 1 else None
-    if recipe == "_core-test-small-reserved":
-        return ["--profile", "dev-small"]
     cargo_index = _cargo_subcommand_index(command) if command and Path(command[0]).stem.lower() == "cargo" else None
     subcommand = command[cargo_index] if cargo_index is not None else None
-    nextest = (
-        subcommand == "nextest"
-        or _is_named_runner_command(command, allow_interpreter_flags=True)
-        or recipe in {"_core-test-reserved", "_core-gate-reserved"}
-    )
+    nextest = subcommand == "nextest"
     profile: list[str] = []
     tokens = iter(command[(cargo_index + 1) if cargo_index is not None else 1:])
     for token in tokens:
@@ -1537,23 +1251,11 @@ def reserve_cargo_lane(
     target_dir: Path | None = None
     resolved_lane: str | None = None
     deadline = time.monotonic() + max(0.0, warm_wait_seconds)
-    coordination_deadline = time.monotonic() + max(
-        warm_wait_seconds, lock_timeout_seconds
-    )
     announced_wait = False
     retry_delay = 0.01
     while active_handle is None:
         busy_reusable = False
-        deferred_cold = False
-        # A transient probe of an unrelated lane is not a busy build. Give the
-        # creation/prune lock its own bounded grace, without resetting its
-        # deadline on each attempt or opting into waiting for a busy lane.
-        with cargo_lane_coordination_lock(
-            root,
-            timeout_seconds=max(
-                0.0, min(lock_timeout_seconds, coordination_deadline - time.monotonic())
-            ),
-        ):
+        with cargo_lane_coordination_lock(root, timeout_seconds=float("inf")):
             candidates = _lane_reservation_candidates(root, base_lane, prefer_warm=True)
             # Profile names are configurable. Inspect only immediate, direct
             # profile directories; their names alone do not prove reusable work.
@@ -1588,21 +1290,11 @@ def reserve_cargo_lane(
                 )
             )
             # Bound how many lanes of this family build at once, warm or cold:
-            # at the bound, wait for one to finish or report busy.
+            # at the bound, wait for one to finish.
             at_capacity = (
                 max_active_lanes is not None
                 and _lanes_in_use(candidates) >= max_active_lanes
             )
-            if at_capacity:
-                if time.monotonic() >= deadline:
-                    raise RustAdmissionBusy(
-                        f"all {max_active_lanes} allowed Cargo lanes for "
-                        f"{base_lane!r} are busy; validation remains pending",
-                        resource=root / base_lane,
-                        wait_option="--warm-wait-seconds",
-                        blocking_resources=_busy_lane_paths(candidates),
-                    )
-                deferred_cold = True
             for candidate in () if at_capacity else candidates:
                 candidate_name = _safe_lane_name(candidate.name)
                 candidate_dir = candidate.path
@@ -1616,17 +1308,8 @@ def reserve_cargo_lane(
                 warm = candidate_dir in warm_paths
                 compatible = candidate_dir in compatible_paths
                 if busy_reusable and not compatible and (compatible_paths or not warm):
-                    if time.monotonic() < deadline:
-                        deferred_cold = True
+                    if not allow_cold_overflow or time.monotonic() < deadline:
                         break
-                    if not allow_cold_overflow:
-                        raise RustAdmissionBusy(
-                            f"Cargo lane {base_lane!r} is busy; no cold overflow was started. "
-                            "Required validation remains pending.",
-                            resource=root / base_lane,
-                            wait_option="--warm-wait-seconds",
-                            blocking_resources=_busy_lane_paths(candidates),
-                        )
                 candidate_dir.mkdir(exist_ok=True)
                 if cargo_lock_is_busy(candidate_dir):
                     busy_reusable |= compatible or not compatible_paths
@@ -1639,25 +1322,19 @@ def reserve_cargo_lane(
                     resolved_lane = candidate_name
                     break
                 busy_reusable |= compatible or not compatible_paths
-        if active_handle is not None or not deferred_cold:
+        if active_handle is not None:
             break
         if not announced_wait:
             print(
-                f"waiting up to {warm_wait_seconds:g}s for a reusable Cargo lane for {base_lane!r}",
+                f"waiting for a reusable Cargo lane for {base_lane!r}",
                 file=sys.stderr,
             )
             announced_wait = True
         # Release the coordination lock while waiting so owners can finish and
         # other work can reserve unrelated lanes.
-        time.sleep(min(retry_delay, max(0.0, deadline - time.monotonic())))
+        time.sleep(retry_delay)
         retry_delay = min(0.05, retry_delay * 1.5)
-    if active_handle is None or target_dir is None or resolved_lane is None:
-        raise RustAdmissionBusy(
-            f"unable to reserve an idle Cargo lane for {base_lane!r}; validation remains pending",
-            resource=root / base_lane,
-            wait_option="--warm-wait-seconds",
-            blocking_resources=_busy_lane_paths(candidates),
-        )
+    assert active_handle is not None and target_dir is not None and resolved_lane is not None
     stamp = target_dir / LANE_LAST_USED_STAMP
     try:
         stamp.write_text(f"{time.time()}\n", encoding="utf-8")
@@ -2103,143 +1780,16 @@ def _guard_cargo_checkout_cwd(command: Sequence[str], repo_root: Path) -> None:
     )
 
 
-def _is_named_runner_command(
-    command: Sequence[str], *, allow_interpreter_flags: bool = False
-) -> bool:
-    script_index = 1
-    if allow_interpreter_flags:
-        # Recognize only non-consuming interpreter switches. Keep module/code
-        # execution, launcher selectors and options with values opaque, and do
-        # not broaden the separate admission preflight's argument contract.
-        while script_index < len(command) and command[script_index] in {"-I", "-B"}:
-            script_index += 1
-    return (
-        len(command) > script_index + 1
-        and Path(command[0]).stem.lower()
-        in {
-            "python",
-            "python3",
-            "py",
-            Path(sys.executable).stem.lower(),
-        }
-        and Path(command[script_index]).resolve()
-        == Path(__file__).with_name("rust_test_runner.py").resolve()
-    )
 
 
-def _guard_named_runner_args(command: Sequence[str]) -> None:
-    """Preflight direct calls to this checkout's runner before lane admission.
-
-    Leave wrappers, interpreter options and foreign scripts to their owners.
-    The child still performs its normal validation against current inputs.
-    """
-    if not _is_named_runner_command(command, allow_interpreter_flags=True):
-        return
-    script_index = 1
-    while command[script_index] in {"-I", "-B"}:
-        script_index += 1
-    arguments = list(command[script_index + 1:])
-    if any(argument in {"-h", "--help"} for argument in arguments):
-        return
-
-    from scripts.build import rust_test_runner
-
-    try:
-        args = rust_test_runner.build_parser().parse_args(arguments)
-        rust_test_runner._preflight_selection(args)
-    except rust_test_runner.RunnerError as exc:
-        raise ValueError(str(exc)) from exc
-    except SystemExit as exc:
-        raise ValueError(
-            "Invalid named runner arguments; no build lane was reserved."
-        ) from exc
 
 
-def _implicit_cargo_package(command: Sequence[str]) -> str | None:
-    """Name the single package Cargo selects without -p, or None if unsure.
-
-    Cargo uses the nearest manifest (or --manifest-path). A workspace root
-    selects its default members, which may include codex-core.
-    """
-    working_dir = Path.cwd()
-    manifest = None
-    tokens = iter(command)
-    for token in tokens:
-        if token == "--":
-            break
-        if token == "-C":
-            working_dir /= next(tokens, "")
-        elif token.startswith("-C"):
-            working_dir /= token[2:]
-        elif token == "--manifest-path":
-            manifest = next(tokens, "")
-        elif token.startswith("--manifest-path="):
-            manifest = token.split("=", 1)[1]
-    candidates = (
-        [working_dir / manifest]
-        if manifest is not None
-        else [
-            directory / "Cargo.toml"
-            for directory in (working_dir, *working_dir.parents)
-        ]
-    )
-    for path in candidates:
-        try:
-            data = tomllib.loads(path.read_text(encoding="utf-8"))
-        except FileNotFoundError:
-            continue
-        except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError):
-            return None
-        package = data.get("package")
-        if "workspace" in data or not isinstance(package, dict):
-            return None
-        name = package.get("name")
-        return name if isinstance(name, str) else None
-    return None
 
 
-def _guard_raw_lane_test_command(command: Sequence[str]) -> None:
-    """Apply the generic test-recipe package policy to raw lane test runs.
 
-    A persistent lane can hold helper binaries (codex-code-mode-host) older than
-    their inputs; only the named codex-core targets rebuild them before tests.
-    """
-    if not command or Path(command[0]).stem.lower() != "cargo":
-        return
-    index = _cargo_subcommand_index(command)
-    if index is None:
-        return
-    if command[index] in {"test", "t"}:
-        test_args = command[index + 1 :]
-    elif command[index] == "nextest":
-        run_index = _cargo_subcommand_index(
-            command,
-            start_index=index + 1,
-            global_options_with_values=NEXTEST_GLOBAL_OPTIONS_WITH_VALUES,
-        )
-        if run_index is None or command[run_index] not in {"run", "r"}:
-            return
-        test_args = command[run_index + 1 :]
-    else:
-        return
-    if any(arg in {"--help", "-h"} for arg in test_args):
-        return
-    selection = test_args[: test_args.index("--")] if "--" in test_args else test_args
-    if not cargo_package_specs(selection) and not any(
-        arg in {"--workspace", "--all"} for arg in selection
-    ):
-        # From a member crate's directory Cargo selects only that crate; judge
-        # it as the explicit -p the user would otherwise have to add.
-        package = _implicit_cargo_package(command)
-        if package is not None:
-            test_args = ["-p", package, *test_args]
 
-    from scripts.build.rust_test_runner import RunnerError, guard_generic_recipe_args
 
-    try:
-        guard_generic_recipe_args(test_args, recipe="raw run-lane test commands")
-    except RunnerError as exc:
-        raise ValueError(str(exc)) from exc
+
 
 
 def _direct_reserved_lane_command(
@@ -2254,37 +1804,6 @@ def _direct_reserved_lane_command(
 
     recipe = command[1]
     arguments = list(command[2:])
-    runner_arguments: list[str] | None = None
-    if recipe == "_core-test-reserved" and len(arguments) >= 2:
-        profile, target, *forwarded = arguments
-        runner_arguments = ["run-target", "--profile", profile, target, *forwarded]
-    elif recipe == "_core-test-small-reserved" and arguments:
-        profile = "fast"
-        runner_arguments = [
-            "--cargo-profile",
-            "dev-small",
-            "run-target",
-            "--profile",
-            profile,
-            *arguments,
-        ]
-    elif recipe == "_core-gate-reserved" and arguments:
-        profile = "fast"
-        runner_arguments = ["run-gate", "--profile", profile, *arguments]
-    if runner_arguments is not None:
-        child_env["RUST_MIN_STACK"] = RUST_MIN_STACK_BYTES
-        child_env["NEXTEST_PROFILE"] = profile
-        # The direct Python shortcut must preserve the same parent reservation
-        # contract as the PowerShell/just wrapper, or admission waits on itself.
-        child_env["CODEX_CARGO_LANE_TARGET_DIR"] = str(target_dir)
-        return [
-            sys.executable,
-            str(repo_root / "scripts" / "build" / "rust_test_runner.py"),
-            "--target-dir",
-            str(target_dir),
-            *runner_arguments,
-        ]
-
     profile: str | None = None
     cargo_arguments: list[str] | None = None
     if recipe == "_test-lane-local-reserved":
@@ -2300,12 +1819,6 @@ def _direct_reserved_lane_command(
     else:
         return None
 
-    from scripts.build.rust_test_runner import RunnerError, guard_generic_recipe_args
-
-    try:
-        guard_generic_recipe_args(cargo_arguments, recipe=recipe)
-    except RunnerError as exc:
-        raise ValueError(str(exc)) from exc
     child_env["RUST_MIN_STACK"] = RUST_MIN_STACK_BYTES
     child_env["NEXTEST_PROFILE"] = profile
     return ["cargo", "nextest", "run", *cargo_arguments]
@@ -2545,25 +2058,7 @@ def cargo_build_context(
         if command and Path(command[0]).stem.lower() == "cargo"
         else None
     )
-    reserved_recipe = (
-        command[1]
-        if len(command) >= 2 and Path(command[0]).stem.lower() == "just"
-        else None
-    )
-    # These entrypoints dispatch Nextest through the named runner. Its profile
-    # selects test policy, not Cargo artifacts; use the same distinction as a
-    # direct `cargo nextest` command when ranking warm lanes.
-    nextest = (
-        cargo_index is not None
-        and command[cargo_index] == "nextest"
-        or _is_named_runner_command(command, allow_interpreter_flags=True)
-        or reserved_recipe
-        in {
-            "_core-test-reserved",
-            "_core-test-small-reserved",
-            "_core-gate-reserved",
-        }
-    )
+    nextest = cargo_index is not None and command[cargo_index] == "nextest"
     options.extend(_cargo_profile_options(command))
     tokens = iter(command)
     for token in tokens:
@@ -2604,10 +2099,6 @@ def cargo_build_context(
                 configs[str(path)] = hashlib.sha256(path.read_bytes()).hexdigest()
             except OSError:
                 configs[str(path)] = None
-    # Named core targets and gates deliberately share one lane: each package
-    # graph keeps its own feature-hashed artifacts there, so a different named
-    # selection is not a different build setting and must not rank that lane
-    # below a staler sibling.
     return {
         "version": 1,
         "environment": settings,
@@ -2628,270 +2119,78 @@ def run_in_cargo_lane(
     timing_path: Path | None = None,
     warm_wait_seconds: float = 0.0,
     allow_cold_overflow: bool = False,
-    admission_invocation: Sequence[str] | None = None,
     max_active_lanes: int | None = None,
 ) -> int:
+    """Reuse a compatible warm build directory and run the command once."""
     if not command:
         raise ValueError("run-lane requires a command after --")
-    # Open exclusively before any child work: a bad path must not launch a build
-    # or overwrite an earlier measurement. Reporting never changes the child exit.
     stream = timing_path.open("x", encoding="utf-8") if timing_path else None
-    phases = dict.fromkeys(
-        ("reservation", "setup", "maintenance", "command", "release")
-    )
-    record = {
-        "schemaVersion": 1,
-        "startedUnixMs": time.time_ns() // 1_000_000,
-        "requestedLane": requested_lane,
-        "resolvedLane": None,
-        "targetDir": None,
-        "command": list(command),
-        "exitCode": None,
-        "status": "error",
-        "phaseDurationsMs": phases,
-    }
-    from scripts.build.validation_metrics import ValidationMetrics
-
-    phase = "reservation"
-    started = previous = time.perf_counter_ns()
-    # One timeline, not a second clock: the envelope starts and finishes on the
-    # phase boundaries below, so it covers every phase and equals totalMs.
-    metrics = ValidationMetrics(command, clock=lambda: previous / 1_000_000_000)
-    metrics.record.update(producer="rust_build_status", executed=False, queued=False)
-
-    def next_phase(name: str | None) -> None:
-        nonlocal phase, previous
-        now = time.perf_counter_ns()
-        if phase is not None:
-            phases[phase] = (now - previous) / 1_000_000
-        phase, previous = name, now
-
+    started = time.perf_counter()
+    record = {"command": list(command), "requestedLane": requested_lane, "exitCode": None}
     try:
-        # Refuse before reserving: a raw core test run would otherwise build and
-        # then fail on stale helpers instead of using the named runner.
-        _guard_raw_lane_test_command(command)
         _guard_cargo_checkout_cwd(command, repo_root)
-        _guard_named_runner_args(command)
         child_env = os.environ.copy()
-        child_env["CODEX_VALIDATION_PARENT_RUN_ID"] = metrics.record["run_id"]
-        updates = local_rust_env(child_env, repo_root=repo_root, which=shutil.which)
-        child_env.update(updates)
-        # Lane commands such as `cargo llvm-cov` and `cargo test` run libtest
-        # workers, which size their stacks from RUST_MIN_STACK; keep the 8 MiB
-        # default cargo-lane.ps1 applies to every lane command.
+        child_env.update(local_rust_env(child_env, repo_root=repo_root, which=shutil.which))
         child_env.setdefault("RUST_MIN_STACK", RUST_MIN_STACK_BYTES)
         build_context = cargo_build_context(repo_root, command, child_env)
-        record["buildContext"] = build_context
-        if updates:
-            print(
-                "Rust environment defaults: " + json.dumps(updates, sort_keys=True),
-                file=sys.stderr,
-            )
         with reserve_cargo_lane(
-            repo_root=repo_root,
-            requested_lane=requested_lane,
-            command=command,
-            lane_root=lane_root,
-            lock_timeout_seconds=lock_timeout_seconds,
-            warm_wait_seconds=warm_wait_seconds,
-            allow_cold_overflow=allow_cold_overflow,
-            build_context=build_context,
-            max_active_lanes=max_active_lanes,
+            repo_root=repo_root, requested_lane=requested_lane, command=command,
+            lane_root=lane_root, lock_timeout_seconds=lock_timeout_seconds,
+            warm_wait_seconds=warm_wait_seconds, allow_cold_overflow=allow_cold_overflow,
+            build_context=build_context, max_active_lanes=max_active_lanes,
         ) as (resolved_lane, target_dir):
-            next_phase("setup")
             record.update(resolvedLane=resolved_lane, targetDir=str(target_dir))
-            metrics.bind(target_dir)
-            if requested_lane != "auto" and resolved_lane != requested_lane:
-                print(
-                    f"using Cargo lane {resolved_lane!r} "
-                    f"for requested family {requested_lane!r}",
-                    file=sys.stderr,
-                )
-            previous_context = _read_lane_build_context(target_dir)
-            compatibility = (
-                "matching recorded settings"
-                if previous_context == build_context
-                else "changed settings; Cargo may rebuild"
-                if previous_context is not None
-                else "unrecorded settings; warm reuse unverified"
-            )
-            print(
-                f"Cargo lane {resolved_lane}: {target_dir} ({compatibility})",
-                file=sys.stderr,
-            )
-            # Keep the lane out of Cargo's environment so its absolute path does
-            # not fragment compiler-cache keys. Nested recipes consume CODEX's value.
+            print(f"Cargo lane {resolved_lane}: {target_dir}", file=sys.stderr)
+            # An exported target directory fragments compiler-cache keys.
             child_env.pop("CARGO_TARGET_DIR", None)
             child_env.pop("CODEX_CARGO_LANE_TARGET_DIR", None)
             child_env.pop("CODEX_CARGO_LANE_OWNER_PID", None)
-            direct_command = _direct_reserved_lane_command(
+            direct = _direct_reserved_lane_command(
                 command, child_env, repo_root=repo_root, target_dir=target_dir
             )
-            if direct_command is None:
+            if direct is None:
                 child_env["CODEX_CARGO_LANE_OWNER_PID"] = str(os.getpid())
                 child_env["CODEX_CARGO_LANE_TARGET_DIR"] = str(target_dir)
             child_command = _cargo_command_with_target_dir(
-                direct_command if direct_command is not None else command,
-                target_dir,
+                direct if direct is not None else command, target_dir
             )
             if not Path(child_command[0]).parent.name:
-                resolved_program = shutil.which(
-                    child_command[0], path=child_env.get("PATH")
-                )
-                if resolved_program is not None:
-                    child_command[0] = resolved_program
-            next_phase("maintenance")
+                program = shutil.which(child_command[0], path=child_env.get("PATH"))
+                if program is not None:
+                    child_command[0] = program
             try:
                 request_cargo_lane_maintenance(repo_root, target_dir.parent)
             except OSError as error:
-                print(
-                    f"warning: could not request Cargo maintenance: {error}",
-                    file=sys.stderr,
-                )
-            next_phase("command")
-            from scripts.build.full_suite_dispatch import record_dispatch, record_test_dispatch
-
-            # Nested runners own their children; only direct Cargo leaves get
-            # a command work row in this envelope.
-            command_metrics = None
-            launched_at = None
-            reaped_at = None
-
-            def child_started(_process):
-                nonlocal command_metrics, launched_at
-                launched_at = time.monotonic()
-                metrics.record["executed"] = True
-                record_test_dispatch(child_command, child_env)
-                if Path(child_command[0]).stem.lower() == "cargo":
-                    subcommand = child_command[1] if len(child_command) > 1 else ""
-                    phase = (
-                        "check" if subcommand in {"check", "c", "clippy"}
-                        else "compile/discover" if "--no-run" in child_command
-                        or child_command[1:3] == ["nextest", "list"]
-                        else "build/test"
-                    )
-                    command_metrics = metrics.command(child_command, phase, 1)
-
+                print(f"warning: could not request Cargo maintenance: {error}", file=sys.stderr)
             try:
+                code = run_owned(
+                    child_command, env=child_env,
+                    creationflags=getattr(subprocess, "BELOW_NORMAL_PRIORITY_CLASS", 0),
+                    prepare_sccache=True, check=False, stdout=sys.stdout, stderr=sys.stderr,
+                ).returncode
+            except CleanupFailed:
+                (target_dir / ".lane-cleanup-unconfirmed").write_text(
+                    "Process cleanup was not confirmed; inspect descendants before removing this quarantine.\n"
+                )
+                raise
+            record["exitCode"] = code
+            if code == 0:
                 try:
-                    exit_code = run_owned(
-                        child_command,
-                        env=child_env,
-                        # Keep foreground harness work ahead of lane builds;
-                        # Windows descendants inherit this priority class.
-                        creationflags=getattr(
-                            subprocess, "BELOW_NORMAL_PRIORITY_CLASS", 0
-                        ),
-                        prepare_sccache=True,
-                        on_spawn=child_started,
-                        on_spawn_error=lambda: record_dispatch("not_started", child_env),
-                        check=False,
-                        stdout=sys.stdout,
-                        stderr=sys.stderr,
-                    ).returncode
-                    reaped_at = time.monotonic()
-                except CleanupFailed:
-                    (target_dir / ".lane-cleanup-unconfirmed").write_text(
-                        "Process cleanup was not confirmed; inspect descendants before removing this quarantine.\n"
+                    (target_dir / ".lane-build-context.json").write_text(
+                        json.dumps(build_context, indent=2) + "\n", encoding="utf-8"
                     )
-                    raise
-                record.update(
-                    exitCode=exit_code,
-                    status="completed"
-                    if exit_code == 0
-                    else (
-                        "busy"
-                        if exit_code == RUST_ADMISSION_BUSY_EXIT_CODE
-                        and _is_named_runner_command(child_command, allow_interpreter_flags=True)
-                        else "failed"
-                    ),
-                )
-                if record["status"] == "busy":
-                    metrics.record["executed"] = False
-                if exit_code == 0:
-                    # Hold the lane lock until its successful context is recorded.
-                    try:
-                        (target_dir / ".lane-build-context.json").write_text(
-                            json.dumps(build_context, indent=2) + "\n", encoding="utf-8"
-                        )
-                    except OSError as error:
-                        print(
-                            f"warning: could not record lane build context: {error}",
-                            file=sys.stderr,
-                        )
-                return exit_code
-            finally:
-                if command_metrics is not None:
-                    command_metrics["wall_seconds"] = (reaped_at if reaped_at is not None else time.monotonic()) - launched_at
-                    command_metrics["exit_code"] = record["exitCode"]
-                    command_metrics["outcome"] = (
-                        "passed" if record["exitCode"] == 0 else "failed"
-                    )
-                next_phase("release")
-    except BaseException as error:
-        if isinstance(error, TimeoutError) and phase == "reservation":
-            error = RustAdmissionBusy(
-                str(error),
-                resource=lane_root
-                if lane_root is not None
-                else cargo_lanes_root(repo_root),
-                wait_option="--warm-wait-seconds",
-            )
-        if isinstance(error, RustAdmissionBusy):
-            from scripts.build.full_suite_dispatch import record_dispatch
-
-            record_dispatch("not_started")
-            record.update(
-                status="busy",
-                exitCode=RUST_ADMISSION_BUSY_EXIT_CODE,
-                admission=error.status,
-            )
-            if admission_invocation is not None:
-                # Publish before the request ledger written in `finally`, so the
-                # first JSON line is the admission record, as from the runner
-                # and cargo-lane.ps1.
-                print(f"Rust admission busy: {error}", file=sys.stderr)
-                print(
-                    json.dumps(
-                        {
-                            **error.report(),
-                            "pending_command": list(command),
-                            "invocation": list(admission_invocation),
-                        },
-                        sort_keys=True,
-                    ),
-                    file=sys.stderr,
-                )
-            raise error
-        record.update(
-            status="interrupted" if isinstance(error, KeyboardInterrupt) else "error",
-            errorType=type(error).__name__,
-        )
-        raise
+                except OSError as error:
+                    print(f"warning: could not record lane build context: {error}", file=sys.stderr)
+            return code
     finally:
-        next_phase(None)
-        record["totalMs"] = (previous - started) / 1_000_000
-        metrics.record["outer_lifecycle"] = record
-        metrics.record["phases"] = {
-            name: duration / 1000 if duration is not None else None
-            for name, duration in phases.items()
-        }
-        metrics.finish(
-            {"completed": "passed", "interrupted": "cancelled"}.get(
-                record["status"],
-                record["status"],
-            )
-        )
         if stream is not None:
+            record["totalMs"] = (time.perf_counter() - started) * 1000
             try:
                 with stream:
                     json.dump(record, stream, indent=2)
                     stream.write("\n")
             except OSError as error:
-                print(
-                    f"warning: Cargo lane timing could not be saved: {error}",
-                    file=sys.stderr,
-                )
+                print(f"warning: Cargo lane timing could not be saved: {error}", file=sys.stderr)
 
 
 def is_protected_target_dir_name(name: str) -> bool:
@@ -3533,14 +2832,6 @@ def main(argv: list[str] | None = None) -> int:
     subparsers.add_parser(
         "lane-affinity", help="Compute Cargo lane affinity from a JSON argument array on stdin."
     )
-    doctor_parser = subparsers.add_parser(
-        "doctor", help="Show local Rust build environment and contention."
-    )
-    doctor_parser.add_argument(
-        "--include-disk",
-        action="store_true",
-        help="Also scan target disk usage; omitted by default for fast readiness checks.",
-    )
     subparsers.add_parser("lanes", help="Show active/stale Cargo target lanes.")
     disk_parser = subparsers.add_parser(
         "disk", help="Show codex-rs/target disk usage and warnings."
@@ -3557,7 +2848,7 @@ def main(argv: list[str] | None = None) -> int:
         help="Emit the destructive prune plan as JSON without deleting anything.",
     )
     optimize_parser = subparsers.add_parser(
-        "optimize", help="Show doctor output, then prune inactive target lanes."
+        "optimize", help="Prune inactive lanes while retaining warm build directories."
     )
     add_prune_arguments(optimize_parser)
     optimize_parser.add_argument("--include-prune-disk-report", action="store_true")
@@ -3577,7 +2868,7 @@ def main(argv: list[str] | None = None) -> int:
         "--warm-wait-seconds",
         type=_nonnegative_wait_seconds,
         default=0.0,
-        help="Opt into waiting for a busy build lane (default: 0). Coordination has a separate bounded grace.",
+        help="Wait this long before optional cold overflow; without overflow, wait until a lane is free.",
     )
     run_lane_parser.add_argument(
         "--allow-cold-overflow",
@@ -3595,7 +2886,7 @@ def main(argv: list[str] | None = None) -> int:
     run_lane_parser.add_argument(
         "--timing-json",
         type=Path,
-        help="Write phase durations to a new JSON file (never overwrite).",
+        help="Write total wall-clock duration to a new JSON file (never overwrite).",
     )
     run_lane_parser.add_argument(
         "--lock-timeout-seconds",
@@ -3617,8 +2908,6 @@ def main(argv: list[str] | None = None) -> int:
             if not isinstance(command, list) or not all(isinstance(value, str) for value in command):
                 raise ValueError("lane-affinity requires a JSON array of strings")
             print(_auto_lane_base(command))
-        elif args.command == "doctor":
-            print(build_doctor_report(include_disk=args.include_disk))
         elif args.command == "lanes":
             print(lane_report())
         elif args.command == "disk":
@@ -3683,17 +2972,9 @@ def main(argv: list[str] | None = None) -> int:
                 allow_cold_overflow=args.allow_cold_overflow,
                 max_active_lanes=args.max_active_lanes
                 or (max_active_lanes_per_base() if args.allow_cold_overflow else None),
-                admission_invocation=[
-                    sys.executable,
-                    str(Path(__file__).resolve()),
-                    *(sys.argv[1:] if argv is None else argv),
-                ],
             )
         else:
             parser.error(f"unknown command {args.command}")
-    except RustAdmissionBusy:
-        # run_in_cargo_lane already published the pending admission record.
-        return RUST_ADMISSION_BUSY_EXIT_CODE
     except (CargoLanesRootValidationError, OSError, RuntimeError, ValueError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2

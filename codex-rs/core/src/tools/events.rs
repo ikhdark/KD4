@@ -739,20 +739,7 @@ struct ExecCommandResult {
     timed_out: bool,
 }
 
-// Safety classification can invoke the native PowerShell parser. Keep its process
-// and filesystem work off the executor for runtime admission and execution events.
-pub(crate) async fn command_mutation_for_exec(
-    command: &[String],
-    cwd: Option<&std::path::Path>,
-) -> CodexResult<crate::turn_diff_tracker::CommandMutation> {
-    let command = command.to_vec();
-    let cwd = cwd.map(std::path::Path::to_path_buf);
-    super::run_blocking_command_analysis(move || {
-        crate::turn_diff_tracker::command_mutation(&command, cwd.as_deref())
-    })
-    .await
-    .map_err(|error| CodexErr::Fatal(format!("command mutation analysis failed: {error}")))
-}
+
 
 async fn emit_exec_stage(
     ctx: ToolEventCtx<'_>,
@@ -765,19 +752,7 @@ async fn emit_exec_stage(
             .is_some_and(|metadata| metadata.failure_cause.is_some());
     match stage {
         ToolEventStage::Begin => {
-            let native_cwd = exec_input.cwd.to_abs_path().ok();
-            let mutation = command_mutation_for_exec(
-                exec_input.command,
-                native_cwd.as_ref().map(AbsolutePathBuf::as_path),
-            )
-            .await?;
-            begin_uncertain_command_baseline(
-                ctx,
-                exec_input.cwd,
-                exec_input.environment_id,
-                &mutation,
-            )
-            .await;
+
             emit_exec_command_begin(
                 ctx,
                 exec_input.command,
@@ -854,374 +829,28 @@ async fn emit_exec_stage(
     Ok(())
 }
 
-/// Records the workspace identity a potentially mutating command is compared with.
-/// The snapshot must precede the process: a write that lands while it is being
-/// captured becomes part of the baseline and the command reads as unchanged.
-/// Launchers that publish Begin after spawning call this before the spawn, and
-/// Begin then keeps that earlier snapshot.
-pub(crate) async fn begin_uncertain_command_baseline(
-    ctx: ToolEventCtx<'_>,
-    cwd: &PathUri,
-    environment_id: &str,
-    mutation: &crate::turn_diff_tracker::CommandMutation,
-) {
-    if !mutation.may_have_mutated()
-        || ctx
-            .session
-            .services
-            .command_execution
-            .has_uncertain_command_baseline(ctx.call_id)
-            .await
-    {
-        return;
-    }
-    let admitted_baseline =
-        if let (Some(tracker), Ok(local_cwd)) = (ctx.turn_diff_tracker, cwd.to_abs_path()) {
-            let (batch, revision) = {
-                let tracker = tracker.lock().await;
-                (
-                    tracker.workspace_evidence_generation_batch_for_call(ctx.call_id),
-                    tracker.current_mutation_revision(),
-                )
-            };
-            match batch {
-                Some(batch) => batch.captured_identity(local_cwd.as_path(), revision).await,
-                None => None,
-            }
-        } else {
-            None
-        };
-    let baseline = match admitted_baseline {
-        Some(identity) => identity,
-        None => {
-            let _phase = crate::tools::tool_dispatch_trace::begin_tool_phase(
-                "command_workspace_baseline_capture",
-            );
-            ctx.session
-                .services
-                .git_workspace
-                .workspace_evidence_for_uri(ctx.turn, cwd, environment_id)
-                .await
-        }
-    };
-    // `None` is a completed capture outside any Git repository. There the
-    // bounded workspace tree is the baseline for the same commands whose
-    // Git-visible equality counts in a repository (see `emit_exec_end`).
-    let non_git_tree_identity = if baseline.is_none()
-        && ctx.turn_diff_tracker.is_some()
-        && matches!(
-            mutation,
-            crate::turn_diff_tracker::CommandMutation::Uncertain
-                | crate::turn_diff_tracker::CommandMutation::KnownMutation { paths: None }
-        ) {
-        non_git_workspace_tree_identity(ctx.turn, cwd, environment_id).await
-    } else {
-        None
-    };
-    ctx.session
-        .services
-        .command_execution
-        .record_uncertain_command_baseline_with_tree(
-            ctx.call_id,
-            &ctx.turn.sub_id,
-            baseline,
-            non_git_tree_identity,
-        )
-        .await;
-}
 
-#[expect(
-    clippy::await_holding_invalid_type,
-    reason = "reconciliation and recording must exclude patches that change the tracker's expected content during filesystem reads"
-)]
 async fn emit_exec_end(
     ctx: ToolEventCtx<'_>,
     exec_input: ExecCommandInput<'_>,
     exec_result: ExecCommandResult,
 ) -> CodexResult<()> {
     let mut persistence_result = Ok(());
-    let native_cwd = exec_input.cwd.to_abs_path().ok();
-    let local_execution = ctx.turn.environments.turn_environments.iter()
-        .find(|environment| environment.environment_id == exec_input.environment_id)
-        .is_some_and(|environment| !environment.environment.is_remote());
-    let mut mutation = command_mutation_for_exec(
-        exec_input.command,
-        native_cwd.as_ref().map(AbsolutePathBuf::as_path),
-    )
-    .await?;
-    // A background command can finish after its dispatch lease was released.
-    // Do not label a scan with a later revision if another mutation races it.
-    let capture_revision = match ctx.turn_diff_tracker {
-        Some(tracker) => Some(tracker.lock().await.current_mutation_revision()),
-        None => None,
-    };
-    let mut observed_workspace_identity = None;
-    let mut captured_workspace_identity = false;
-    // The command's declared paths and every path observed changing while it ran.
-    let mut observed_changes = None;
-    // An uncertain command whose own Git-visible observation was unchanged or,
-    // outside any Git repository, whose bounded workspace tree was unchanged.
-    let mut workspace_observed_unchanged = false;
-    if mutation.may_have_mutated() {
-        let (baseline, non_git_tree_baseline) = match ctx
-            .session
-            .services
-            .command_execution
-            .take_uncertain_command_baseline(ctx.call_id)
-            .await
-        {
-            Some((identity, tree)) => (Some(identity), tree),
-            None => (None, None),
-        };
-        mutation = if exec_result.status == ExecCommandStatus::Declined {
-            crate::turn_diff_tracker::CommandMutation::ReadOnly
-        } else {
-            let current = ctx
-                .session
-                .services
-                .git_workspace
-                .workspace_evidence_for_uri(ctx.turn, exec_input.cwd, exec_input.environment_id)
-                .await;
-            captured_workspace_identity = true;
-            let workspace_changed =
-                observed_workspace_identity_changed(baseline.as_ref(), current.as_ref());
-            let changed_paths = baseline
-                .as_ref()
-                .and_then(Option::as_ref)
-                .and_then(|before| current.as_ref()?.changed_paths_since(before));
-            observed_workspace_identity = current;
-            if let Some(mut paths) = changed_paths.filter(|paths| !paths.is_empty()) {
-                // Caches drop concurrent writes too. The turn diff attributes
-                // only declared and tracked paths, below. Retain explicit
-                // effects (including ignored files).
-                observed_changes = Some((mutation.paths().cloned(), paths.clone()));
-                if let Some(declared) = mutation.paths() {
-                    paths.extend(declared.iter().cloned());
-                }
-                crate::turn_diff_tracker::CommandMutation::KnownMutation { paths: Some(paths) }
-            } else if matches!(
-                mutation,
-                crate::turn_diff_tracker::CommandMutation::Uncertain
-                    | crate::turn_diff_tracker::CommandMutation::KnownMutation { paths: None }
-            ) {
-                // Git-visible equality says nothing about ignored content, so
-                // evidence stays uncertain. For validation it is no source
-                // change unless a patched path no longer matches; two
-                // unavailable captures prove nothing.
-                workspace_observed_unchanged = workspace_changed == Some(false)
-                    && observed_workspace_identity
-                        .as_ref()
-                        .is_some_and(|identity| !identity.unavailable);
-                // Both captures completed outside any Git repository, where
-                // no Git-visible tree exists. The whole bounded tree, with
-                // nothing ignored, stands in for it. A missing tree identity
-                // proves nothing.
-                if matches!(baseline, Some(None))
-                    && observed_workspace_identity.is_none()
-                    && ctx.turn_diff_tracker.is_some()
-                    && let Some(before) = non_git_tree_baseline
-                {
-                    workspace_observed_unchanged = non_git_workspace_tree_identity(
-                        ctx.turn,
-                        exec_input.cwd,
-                        exec_input.environment_id,
-                    )
-                    .await
-                    .is_some_and(|after| after == before);
-                }
-                crate::turn_diff_tracker::resolve_uncertain_command_observation(
-                    workspace_changed.filter(|changed| *changed),
-                )
-            } else {
-                mutation
-            }
-        };
-    }
-    let possible_mutation = mutation.may_have_mutated();
-    let mutation_paths = mutation.paths();
-    let generation_batch = if local_execution && possible_mutation
-        && exec_result.status != ExecCommandStatus::Declined
-        && observed_workspace_identity.is_none()
-    {
-        match ctx.turn_diff_tracker {
-            Some(tracker) => tracker
-                .lock()
-                .await
-                .workspace_evidence_generation_batch_for_call(ctx.call_id),
-            None => None,
+    // Command outputs are not a file-change inventory. Keep caches conservative
+    // without parsing commands, taking workspace baselines, or changing patch diffs.
+    if exec_result.status != ExecCommandStatus::Declined {
+        ctx.session.services.git_workspace.note_host_workspace_mutation();
+        persistence_result = ctx.session
+            .invalidate_tool_history_source_dependencies(None, None).await;
+        if let Some(tracker) = ctx.turn_diff_tracker {
+            let revision = {
+                let mut tracker = tracker.lock().await;
+                tracker.record_command_execution();
+                tracker.current_mutation_revision()
+            };
+            ctx.session.services.command_execution
+                .invalidate_repository_revision(&ctx.turn.sub_id, revision).await;
         }
-    } else {
-        None
-    };
-    let defer_workspace_identity = generation_batch.is_some();
-    let workspace_identity_required =
-        possible_mutation && exec_result.status != ExecCommandStatus::Declined;
-    let current_workspace_identity = if !defer_workspace_identity
-        && workspace_identity_capture_required(
-            workspace_identity_required,
-            captured_workspace_identity,
-        ) {
-        captured_workspace_identity = true;
-        ctx.session
-            .services
-            .git_workspace
-            .workspace_evidence_for_uri(ctx.turn, exec_input.cwd, exec_input.environment_id)
-            .await
-    } else {
-        observed_workspace_identity
-    };
-    if local_execution && possible_mutation && exec_result.status != ExecCommandStatus::Declined {
-        if let (Some(paths), Some(cwd)) = (mutation_paths, native_cwd.as_ref()) {
-            let paths = paths
-                .iter()
-                .map(|path| path.to_string_lossy().into_owned())
-                .collect::<Vec<_>>();
-            ctx.session
-                .services
-                .git_workspace
-                .note_host_workspace_mutation_paths(
-                    cwd.as_path(),
-                    &paths,
-                )
-                .await;
-        } else {
-            ctx.session
-                .services
-                .git_workspace
-                .note_host_workspace_mutation();
-        }
-        if !defer_workspace_identity {
-            persistence_result = ctx
-                .session
-                .invalidate_tool_history_source_dependencies(
-                    mutation_paths,
-                    current_workspace_identity.as_ref(),
-                )
-                .await;
-        }
-    }
-    let observed_mutation_revision = if exec_result.status != ExecCommandStatus::Declined
-        && let Some(tracker) = ctx.turn_diff_tracker
-    {
-        let mut tracker = tracker.lock().await;
-        let revision_unchanged = capture_revision == Some(tracker.current_mutation_revision());
-        captured_workspace_identity &= revision_unchanged;
-        // Preserve declared effects even when the narrower Git observer agrees.
-        // Unknown effects are checked against the tracker's expected contents;
-        // no ignored-tree scan or attribution of unrelated writes is needed.
-        let observed_mutation = mutation.clone();
-        let tool = match exec_input.source {
-            ExecCommandSource::UnifiedExecStartup => "exec_command",
-            ExecCommandSource::UnifiedExecInteraction => "write_stdin",
-            ExecCommandSource::Agent => "shell",
-            ExecCommandSource::UserShell => "user_shell",
-        };
-        let filesystem = ctx
-            .turn
-            .environments
-            .turn_environments
-            .iter()
-            .find(|environment| {
-                environment.environment_id == exec_input.environment_id
-            })
-            .map(|environment| environment.environment.get_filesystem());
-        let observed_mutation = match observed_changes.as_ref() {
-            Some((declared, observed)) => {
-                tracker
-                    .attribute_observed_changes(
-                        exec_input.environment_id,
-                        native_cwd.as_ref().map(AbsolutePathBuf::as_path),
-                        declared.as_ref(),
-                        observed,
-                        filesystem.as_deref(),
-                    )
-                    .await
-            }
-            _ => {
-                tracker
-                    .reconcile_command_mutation(
-                        exec_input.environment_id,
-                        observed_mutation,
-                        filesystem.as_deref(),
-                    )
-                    .await
-            }
-        };
-        tracker.record_command_invalidation_cause(
-            Some(ctx.call_id),
-            tool,
-            exec_input.command,
-            &observed_mutation,
-        );
-        if workspace_observed_unchanged {
-            tracker.record_git_unchanged_command_end_at(
-                exec_input.command,
-                exec_input.environment_id,
-                native_cwd.as_ref().map(AbsolutePathBuf::as_path),
-                observed_mutation,
-            );
-        } else {
-            tracker.record_exec_command_end_with_mutation_at(
-                exec_input.command,
-                exec_result.exit_code.unwrap_or(-1),
-                exec_result.timed_out,
-                exec_input.environment_id,
-                native_cwd.as_ref().map(AbsolutePathBuf::as_path),
-                observed_mutation,
-            );
-        }
-        Some(tracker.current_mutation_revision())
-    } else {
-        None
-    };
-    if local_execution && captured_workspace_identity
-        && let (Some(tracker), Some(cwd), Some(revision)) = (
-            ctx.turn_diff_tracker,
-            native_cwd.as_ref(),
-            observed_mutation_revision,
-        )
-    {
-        let batch = tracker
-            .lock()
-            .await
-            .workspace_evidence_generation_batch_for_call(ctx.call_id);
-        if let Some(batch) = batch {
-            batch
-                .record_captured_identity(
-                    cwd.as_path(),
-                    revision,
-                    current_workspace_identity.clone(),
-                )
-                .await;
-        }
-    }
-    let mutation_deferred = generation_batch.is_some_and(|batch| {
-        batch.record_mutation(
-            ctx.call_id,
-            native_cwd.as_ref().map_or_else(
-                || ctx.turn.config.cwd.clone().to_path_buf(),
-                codex_utils_absolute_path::AbsolutePathBuf::to_path_buf,
-            ),
-            mutation_paths.cloned(),
-            /*observe_command_ledger*/ true,
-        )
-    });
-    if defer_workspace_identity && !mutation_deferred {
-        persistence_result = ctx
-            .session
-            .invalidate_tool_history_source_dependencies(mutation_paths, None)
-            .await;
-    }
-    if local_execution && !mutation_deferred && let Some(observed_mutation_revision) = observed_mutation_revision {
-        ctx.session
-            .services
-            .command_execution
-            .observe_repository_revision_with_identity(
-                &ctx.turn.sub_id,
-                observed_mutation_revision,
-                current_workspace_identity.clone(),
-            )
-            .await;
     }
     ctx.session
         .emit_turn_item_completed(
@@ -1254,79 +883,11 @@ async fn emit_exec_end(
             }),
         )
         .await;
-    // A command mutation the tracker cannot represent exactly clears the turn
-    // diff. Publish that reason next to the command that caused it rather than
-    // waiting for the end of the turn; the one-shot latch keeps the turn-end
-    // emission from repeating it.
-    let (unified_diff, invalidation_warning) = match ctx.turn_diff_tracker {
-        Some(tracker) => {
-            let mut tracker = tracker.lock().await;
-            (tracker.take_unified_diff_if_changed(), tracker.take_invalidation_warning())
-        }
-        None => (None, None),
-    };
-    if let Some(unified_diff) = unified_diff {
-        ctx.session.send_event(ctx.turn, EventMsg::TurnDiff(TurnDiffEvent { unified_diff })).await;
-    }
-    if let Some(message) = invalidation_warning {
-        // Diff-display uncertainty belongs in the UI, not in model history.
-        // Source-evidence invalidation above remains authoritative and separate.
-        ctx.session
-            .send_event(
-                ctx.turn,
-                EventMsg::Warning(codex_protocol::protocol::WarningEvent {
-                    message: message.to_string(),
-                }),
-            )
-            .await;
-    }
     // The external command already ran. Publish its terminal item and account for
     // its mutation before propagating the durability barrier failure.
     persistence_result
 }
 
-fn observed_workspace_identity_changed(
-    baseline: Option<&Option<crate::git_workspace::WorkspaceEvidenceIdentity>>,
-    current: Option<&crate::git_workspace::WorkspaceEvidenceIdentity>,
-) -> Option<bool> {
-    // Two unavailable snapshots do not prove a read-only execution.
-    Some(baseline?.as_ref()? != current?)
-}
-
-/// Bounded tree identity of the selected local environment root containing
-/// `cwd`, for a workspace outside any Git repository. Writes outside that root
-/// are unobserved, as writes outside a repository are for Git captures. `None`
-/// (remote environment, cwd outside the root, capture bounds) proves nothing.
-async fn non_git_workspace_tree_identity(
-    turn: &TurnContext,
-    cwd: &PathUri,
-    environment_id: &str,
-) -> Option<String> {
-    let environment = turn
-        .environments
-        .turn_environments
-        .iter()
-        .find(|environment| environment.environment_id == environment_id)
-        .filter(|environment| !environment.environment.is_remote())?;
-    let root = environment.cwd().to_abs_path().ok()?;
-    if !cwd
-        .to_abs_path()
-        .ok()?
-        .as_path()
-        .starts_with(root.as_path())
-    {
-        return None;
-    }
-    let _phase =
-        crate::tools::tool_dispatch_trace::begin_tool_phase("command_workspace_tree_capture");
-    crate::git_workspace::capture_non_git_tree_identity(root.as_path()).await
-}
-
-fn workspace_identity_capture_required(required: bool, already_captured: bool) -> bool {
-    // None is a completed observation too (for example outside a repository).
-    // Retrying it here adds another scan without strengthening the evidence.
-    required && !already_captured
-}
 
 fn patch_effects(update: &TurnDiffTrackerUpdate<'_>) -> codex_protocol::items::FileChangeEffects {
     use codex_apply_patch::AppliedPatchFileChange;
@@ -1565,236 +1126,68 @@ mod tests {
     use tokio::sync::Mutex;
     use tokio::time::Instant;
 
-    #[test]
-    fn execution_events_wait_for_command_analysis_without_blocking_the_executor() {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .max_blocking_threads(1)
-            .build()
-            .expect("current-thread runtime");
-        runtime.block_on(async {
-            let (session, turn, rx_event) =
-                make_session_and_context_with_dynamic_tools_and_rx(Vec::new()).await;
-            let workspace = tempdir().expect("workspace");
-            let cwd = AbsolutePathBuf::from_absolute_path(workspace.path()).expect("absolute cwd");
-            #[cfg(windows)]
-            let command = vec![
-                "powershell.exe".to_string(),
-                "-NoProfile".to_string(),
-                "-Command".to_string(),
-                "Write-Output 'classification-ok'".to_string(),
-            ];
-            #[cfg(not(windows))]
-            let command = vec!["echo".to_string(), "classification-ok".to_string()];
-            let emitter = ToolEmitter::shell(
-                command.clone(),
-                cwd.clone(),
-                ExecCommandSource::Agent,
-                codex_exec_server::LOCAL_ENVIRONMENT_ID.to_string(),
-            );
-            let tracker = Arc::new(Mutex::new(TurnDiffTracker::new()));
-            let ctx = ToolEventCtx::new(
-                session.as_ref(),
-                turn.as_ref(),
-                "analysis-call",
-                Some(&tracker),
-            );
-
-            for begin in [true, false] {
-                let (release_tx, release_rx) = std::sync::mpsc::channel();
-                let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
-                let occupied_worker = tokio::task::spawn_blocking(move || {
-                    let _ = entered_tx.send(());
-                    release_rx
-                        .recv_timeout(Duration::from_secs(5))
-                        .expect("release occupied worker");
-                });
-                entered_rx.await.expect("worker is occupied");
-                let stage = if begin {
-                    ToolEventStage::Begin
-                } else {
-                    ToolEventStage::Success {
-                        output: ExecToolCallOutput {
-                            exit_code: 0,
-                            stdout: StreamOutput::new("classification-ok\n".to_string()),
-                            stderr: StreamOutput::new(String::new()),
-                            aggregated_output: StreamOutput::new("classification-ok\n".to_string()),
-                            duration: Duration::from_millis(7),
-                            timed_out: false,
-                        },
-                        applied_patch_delta: None,
-                        formatted_output: Some("classification-ok\n".to_string()),
-                    }
-                };
-                let mut operation = Box::pin(emitter.emit(ctx, stage));
-                // The ordinary in-memory Session fixture has no rollout writer or trace
-                // worker. A read-only command has no Git evidence work. Thus the old
-                // inline classifier publishes its event here instead of waiting.
-                assert!(futures::poll!(operation.as_mut()).is_pending());
-                assert!(
-                    rx_event.try_recv().is_err(),
-                    "classification must precede publication"
-                );
-                tokio::time::sleep(Duration::from_millis(1)).await;
-                assert!(futures::poll!(operation.as_mut()).is_pending());
-                release_tx.send(()).expect("release classification worker");
-                occupied_worker.await.expect("occupied worker finished");
-                tokio::time::timeout(Duration::from_secs(15), operation)
-                    .await
-                    .expect("classification and publication complete")
-                    .expect("event emission succeeds");
-
-                let events = std::iter::from_fn(|| rx_event.try_recv().ok()).collect::<Vec<_>>();
-                let modern = events
-                    .iter()
-                    .filter_map(|event| match &event.msg {
-                        EventMsg::ItemStarted(event) if begin => Some(&event.item),
-                        EventMsg::ItemCompleted(event) if !begin => Some(&event.item),
-                        _ => None,
-                    })
-                    .collect::<Vec<_>>();
-                assert_eq!(modern.len(), 1, "one normal event for this execution stage");
-                let TurnItem::CommandExecution(item) = modern[0] else {
-                    panic!("expected command execution item");
-                };
-                assert_eq!(item.id, "analysis-call");
-                assert_eq!(item.command, command);
-                assert_eq!(
-                    item.status,
-                    if begin {
-                        CommandExecutionStatus::InProgress
-                    } else {
-                        CommandExecutionStatus::Completed
-                    }
-                );
-                if !begin {
-                    assert_eq!(item.exit_code, Some(0));
-                    assert_eq!(item.stdout.as_deref(), Some("classification-ok\n"));
-                    assert_eq!(
-                        item.formatted_output.as_deref(),
-                        Some("classification-ok\n")
-                    );
-                }
-                assert_eq!(tracker.lock().await.current_mutation_revision(), 0);
-                if begin {
-                    assert!(
-                        session
-                            .services
-                            .command_execution
-                            .take_uncertain_command_baseline("analysis-call")
-                            .await
-                            .is_none(),
-                        "read-only parsing must not fall back to uncertain Git evidence work"
-                    );
-                }
-            }
-
-            // Reject a worker integration that always returns ReadOnly: the ordinary
-            // completed mutating command must still invalidate the mutation tracker.
-            tokio::fs::write(workspace.path().join("removed.txt"), "before")
-                .await
-                .expect("fixture file");
-            let mutating = ToolEmitter::shell(
-                vec!["rm".to_string(), "removed.txt".to_string()],
-                cwd,
-                ExecCommandSource::Agent,
-                codex_exec_server::LOCAL_ENVIRONMENT_ID.to_string(),
-            );
-            let mutation_ctx = ToolEventCtx::new(
-                session.as_ref(),
-                turn.as_ref(),
-                "mutation-control",
-                Some(&tracker),
-            );
-            mutating
-                .emit(mutation_ctx, ToolEventStage::Begin)
-                .await
-                .expect("mutation begin");
-            tokio::fs::remove_file(workspace.path().join("removed.txt"))
-                .await
-                .expect("external command effect");
-            mutating
-                .emit(
-                    mutation_ctx,
-                    ToolEventStage::Success {
-                        output: ExecToolCallOutput::default(),
-                        applied_patch_delta: None,
-                        formatted_output: Some(String::new()),
-                    },
-                )
-                .await
-                .expect("mutation completion");
-            assert_eq!(tracker.lock().await.current_mutation_revision(), 1);
-            assert!(!workspace.path().join("removed.txt").exists());
-            assert!(std::iter::from_fn(|| rx_event.try_recv().ok()).any(
-                |event| matches!(event.msg,
-                EventMsg::ItemCompleted(event) if matches!(&event.item,
-                    TurnItem::CommandExecution(item) if item.id == "mutation-control"
-                        && item.status == CommandExecutionStatus::Completed))
-            ));
-        });
+    #[tokio::test]
+    async fn command_completion_preserves_patch_diff_without_attribution() {
+        let (session, turn, events) =
+            make_session_and_context_with_dynamic_tools_and_rx(Vec::new()).await;
+        let workspace = tempdir().unwrap();
+        let cwd = AbsolutePathBuf::from_absolute_path(workspace.path()).unwrap();
+        let tracker = Arc::new(Mutex::new(TurnDiffTracker::new()));
+        let delta = codex_apply_patch::apply_patch(
+            "*** Begin Patch\n*** Add File: patch.txt\n+patch-owned\n*** End Patch",
+            &PathUri::from_abs_path(&cwd), &mut Vec::new(), &mut Vec::new(),
+            LOCAL_FS.as_ref(), None,
+        ).await.unwrap();
+        tracker.lock().await.track_delta(codex_exec_server::LOCAL_ENVIRONMENT_ID, &delta);
+        let patch_diff = tracker.lock().await.get_unified_diff();
+        let emitter = ToolEmitter::shell(
+            vec!["arbitrary-command".into()],
+            cwd,
+            ExecCommandSource::Agent,
+            codex_exec_server::LOCAL_ENVIRONMENT_ID.into(),
+        );
+        let before = session.services.git_workspace.workspace_evidence_capture_sequence();
+        let ctx = ToolEventCtx::new(&session, &turn, "command", Some(&tracker));
+        emitter.begin(ctx).await.unwrap();
+        emitter.finish(ctx, Ok(ExecToolCallOutput::default()), None).await.unwrap();
+        let tracker = tracker.lock().await;
+        assert_eq!(tracker.current_mutation_revision(), 2);
+        assert_eq!(tracker.changed_paths().len(), 1);
+        assert!(!tracker.has_untracked_changes());
+        assert_eq!(tracker.get_unified_diff(), patch_diff);
+        assert_eq!(session.services.git_workspace.workspace_evidence_capture_sequence(), before);
+        let emitted = std::iter::from_fn(|| events.try_recv().ok()).collect::<Vec<_>>();
+        assert!(emitted.iter().any(|event| matches!(event.msg, EventMsg::ItemCompleted(_))));
+        assert!(!emitted.iter().any(|event| matches!(event.msg, EventMsg::Warning(_) | EventMsg::TurnDiff(_))));
     }
 
     #[tokio::test]
-    async fn command_end_does_not_recapture_an_unavailable_workspace_observation() {
-        assert!(workspace_identity_capture_required(true, false));
-        assert!(!workspace_identity_capture_required(true, true));
-        assert!(!workspace_identity_capture_required(false, false));
-        assert!(!workspace_identity_capture_required(false, true));
-        // Avoiding a second scan must not upgrade unavailable evidence.
-        assert_eq!(observed_workspace_identity_changed(Some(&None), None), None);
-        assert_eq!(observed_workspace_identity_changed(None, None), None);
-
-        // Outside a repository every capture yields no identity, so the first
-        // post-command capture cannot be told apart from "not captured" by value.
-        let temp = tempdir().expect("tempdir");
-        let (session, mut turn, _rx_event) =
-            make_session_and_context_with_dynamic_tools_and_rx(Vec::new()).await;
-        set_turn_environments(
-            &mut turn,
-            &[(codex_exec_server::LOCAL_ENVIRONMENT_ID, temp.path())],
-        );
-        let cache = &session.services.git_workspace;
-        assert!(
-            cache
-                .workspace_evidence_identity(temp.path())
-                .await
-                .is_none()
-        );
-        let emitter = ToolEmitter::shell(
-            vec!["custom-mutator".to_string()],
-            AbsolutePathBuf::from_absolute_path(temp.path()).expect("absolute cwd"),
-            ExecCommandSource::Agent,
-            codex_exec_server::LOCAL_ENVIRONMENT_ID.to_string(),
-        );
-        let tracker = Arc::new(Mutex::new(TurnDiffTracker::new()));
-        emitter
-            .begin(ToolEventCtx::new(
-                session.as_ref(),
-                turn.as_ref(),
-                "non-git-call",
-                Some(&tracker),
-            ))
-            .await
-            .expect("begin event should publish");
-        let captures_before_end = cache.workspace_evidence_capture_sequence();
-        emitter
-            .finish(
-                ToolEventCtx::new(
-                    session.as_ref(),
-                    turn.as_ref(),
-                    "non-git-call",
-                    Some(&tracker),
-                ),
-                Ok(ExecToolCallOutput::default()),
-                None,
-            )
-            .await
-            .expect("successful uncertain command");
-        assert_eq!(
-            cache.workspace_evidence_capture_sequence() - captures_before_end,
-            1
-        );
+    async fn uncertain_commands_invalidate_without_workspace_scans() {
+        for git in [false, true] {
+            let temp = tempdir().unwrap();
+            if git { initialize_git_repository(temp.path()); }
+            let (session, mut turn, _events) =
+                make_session_and_context_with_dynamic_tools_and_rx(Vec::new()).await;
+            set_turn_environments(&mut turn, &[(codex_exec_server::LOCAL_ENVIRONMENT_ID, temp.path())]);
+            let cache = &session.services.git_workspace;
+            let before = cache.workspace_evidence_capture_sequence();
+            let emitter = ToolEmitter::shell(
+                vec!["custom-mutator".into()],
+                AbsolutePathBuf::from_absolute_path(temp.path()).unwrap(),
+                ExecCommandSource::Agent,
+                codex_exec_server::LOCAL_ENVIRONMENT_ID.into(),
+            );
+            let tracker = Arc::new(Mutex::new(TurnDiffTracker::new()));
+            let ctx = ToolEventCtx::new(&session, &turn, "uncertain", Some(&tracker));
+            emitter.begin(ctx).await.unwrap();
+            std::fs::write(temp.path().join("external.txt"), "command or concurrent writer").unwrap();
+            emitter.finish(ctx, Ok(ExecToolCallOutput::default()), None).await.unwrap();
+            assert_eq!(cache.workspace_evidence_capture_sequence(), before,
+                "neither command boundary may scan Git or a non-Git tree");
+            let tracker = tracker.lock().await;
+            assert_eq!(tracker.current_mutation_revision(), 1);
+            assert!(!tracker.has_untracked_changes());
+        }
     }
 
     #[tokio::test]
@@ -2240,101 +1633,9 @@ mod tests {
         assert_eq!(item.aggregated_output.as_deref(), Some(raw_output.as_str()));
     }
 
-    #[tokio::test]
-    async fn patch_after_capture_reuses_only_the_matching_mutation_revision() {
-        check_patch_after_capture(false).await;
-        check_patch_after_capture(true).await;
-    }
 
-    async fn check_patch_after_capture(later_mutation: bool) {
-        let temp = tempdir().expect("tempdir");
-        let repo = temp.path().join("repo");
-        initialize_git_repository(&repo);
-        let (session, mut turn, _rx_event) =
-            make_session_and_context_with_dynamic_tools_and_rx(Vec::new()).await;
-        set_turn_environments(
-            &mut turn,
-            &[(codex_exec_server::LOCAL_ENVIRONMENT_ID, repo.as_path())],
-        );
-        let tracker = Arc::new(Mutex::new(TurnDiffTracker::new()));
-        let batch = Arc::new(crate::tools::parallel::WorkspaceEvidenceGenerationBatch::new());
-        assert!(batch.register_call("patch"));
-        tracker
-            .lock()
-            .await
-            .activate_workspace_evidence_generation_batch(&batch);
-        let path = repo.join("changed.txt");
-        std::fs::write(&path, "after patch").unwrap();
-        let cache = &session.services.git_workspace;
-        let pause = cache.pause_next_workspace_evidence_capture();
-        let count = cache.workspace_evidence_capture_count();
-        tokio::time::timeout(
-            Duration::from_secs(10),
-            emit_patch_end(
-                ToolEventCtx::new(&session, &turn, "patch", Some(&tracker)),
-                HashMap::from([(
-                    path.clone(),
-                    FileChange::Add {
-                        content: "after patch".into(),
-                    },
-                )]),
-                String::new(),
-                String::new(),
-                PatchApplyStatus::Completed,
-                TurnDiffTrackerUpdate::Invalidate,
-                None,
-            ),
-        )
-        .await
-        .expect("patch completion must not wait for after-capture")
-        .unwrap();
-        tokio::time::timeout(Duration::from_secs(10), pause.wait_until_started())
-            .await
-            .expect("capture starts before generation drain");
-        let revision = tracker.lock().await.current_mutation_revision();
-        assert_eq!(revision, 1);
-        tokio::time::timeout(
-            Duration::from_secs(1),
-            batch.prefetch_identity_after_mutation(&session, &turn, &repo, revision),
-        )
-        .await
-        .expect("duplicate prefetch must not wait for the pending capture");
-        if later_mutation {
-            std::fs::write(&path, "later mutation").unwrap();
-            tracker.lock().await.record_unknown_mutation();
-            cache.note_host_workspace_mutation();
-            tokio::time::timeout(
-                Duration::from_secs(1),
-                batch.prefetch_identity_after_mutation(&session, &turn, &repo, revision + 1),
-            )
-            .await
-            .expect("later completion must not queue a redundant capture");
-        }
-        let flush = batch.flush(&session, &turn, &tracker);
-        tokio::pin!(flush);
-        assert!(futures::poll!(flush.as_mut()).is_pending());
-        pause.release();
-        let flushed = tokio::time::timeout(Duration::from_secs(10), flush)
-            .await
-            .expect("flush joins after-capture")
-            .unwrap();
-        assert_eq!(
-            flushed.authoritative_capture_count,
-            usize::from(later_mutation)
-        );
-        if !later_mutation {
-            assert_eq!(cache.workspace_evidence_capture_count(), count + 1);
-            assert!(
-                batch
-                    .captured_identity(&repo, revision)
-                    .await
-                    .flatten()
-                    .is_some()
-            );
-        } else {
-            assert!(batch.captured_identity(&repo, revision + 1).await.is_none());
-        }
-    }
+
+
 
     #[tokio::test]
     async fn unknown_path_writer_with_git_equality_retains_uncertainty() {
@@ -2391,7 +1692,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn git_unchanged_uncertain_command_invalidates_evidence_but_not_validation() {
+    async fn git_unchanged_unknown_command_conservatively_invalidates_evidence() {
         let temp = tempdir().unwrap();
         let repo = temp.path().join("repo");
         initialize_git_repository(&repo);
@@ -2446,13 +1747,7 @@ mod tests {
             .finish(ctx, Ok(ExecToolCallOutput::default()), None)
             .await
             .unwrap();
-        let (mutation_revision, validation_revision) = {
-            let tracker = tracker.lock().await;
-            (
-                tracker.current_mutation_revision(),
-                tracker.current_validation_revision(),
-            )
-        };
+        let mutation_revision = tracker.lock().await.current_mutation_revision();
         // Evidence stays conservative: the turn revision, the exact-retry
         // epoch and earlier workspace evidence all see a possible change.
         assert_eq!(mutation_revision, 1);
@@ -2470,8 +1765,7 @@ mod tests {
             live["workspace_evidence"]["earlier-read"]["source_dependencies_current"],
             false
         );
-        // Git saw no source change, so validation settles at the same revision.
-        assert_eq!(validation_revision, 0);
+        // Without command scans, unchanged Git bytes do not certify validation inputs.
     }
 
     #[tokio::test]
@@ -2506,20 +1800,12 @@ mod tests {
             .await
             .unwrap();
         let tracker = tracker.lock().await;
-        assert!(
-            tracker
-                .unattributed_display_paths()
-                .iter()
-                .any(|path| path.ends_with("generated.rs")),
-            "{:?}",
-            tracker.unattributed_display_paths()
-        );
+        assert!(tracker.unattributed_display_paths().is_empty());
         assert_eq!(tracker.current_mutation_revision(), 1);
-        assert_eq!(tracker.current_validation_revision(), 1);
     }
 
     #[tokio::test]
-    async fn non_git_unchanged_uncertain_command_invalidates_evidence_but_not_validation() {
+    async fn non_git_unknown_command_conservatively_invalidates_evidence() {
         let workspace = tempdir().unwrap();
         std::fs::write(workspace.path().join("lib.py"), "VALUE = 1\n").unwrap();
         let (session, mut turn, _events) =
@@ -2580,13 +1866,7 @@ mod tests {
             .finish(ctx, Ok(ExecToolCallOutput::default()), None)
             .await
             .unwrap();
-        let (mutation_revision, validation_revision) = {
-            let tracker = tracker.lock().await;
-            (
-                tracker.current_mutation_revision(),
-                tracker.current_validation_revision(),
-            )
-        };
+        let mutation_revision = tracker.lock().await.current_mutation_revision();
         // Evidence stays conservative, as it does in a repository.
         assert_eq!(mutation_revision, 1);
         assert_eq!(
@@ -2603,9 +1883,7 @@ mod tests {
             live["workspace_evidence"]["earlier-read"]["source_dependencies_current"],
             false
         );
-        // The unchanged tree is no source change, so validation settles at
-        // the same revision.
-        assert_eq!(validation_revision, 0);
+        // No tree scan attempts to prove unchanged validation inputs.
     }
 
     #[tokio::test]
@@ -2658,357 +1936,18 @@ mod tests {
             .unwrap();
         let tracker = tracker.lock().await;
         assert_eq!(tracker.current_mutation_revision(), 1);
-        assert_eq!(tracker.current_validation_revision(), 1);
     }
 
-    /// Runs one validation command through command completion in `workspace`,
-    /// running `effect` while it is live, then settles the request the way the
-    /// turn loop does.
-    #[allow(clippy::too_many_arguments)]
-    async fn settle_validation_command(
-        control: &mut crate::session::turn_execution::TurnExecutionControl,
-        session: &Session,
-        turn: &TurnContext,
-        tracker: &SharedTurnDiffTracker,
-        workspace: &Path,
-        call_id: &str,
-        outcome: codex_tools::ToolOutputOutcome,
-        effect: impl FnOnce(),
-    ) -> crate::session::turn_execution::CompletionReadiness {
-        let admitted = tracker.lock().await.current_mutation_revision();
-        let baselines = control.baselines(admitted);
-        let collector = control.collector(&baselines);
-        let ordinal = collector
-            .register_deterministic_tool_call(
-                &codex_tools::ToolName::plain("exec_command"),
-                &codex_tools::ToolPayload::Function {
-                    arguments: serde_json::json!({"cmd": "python -m unittest -q"}).to_string(),
-                },
-                call_id,
-            )
-            .ordinal;
-        let emitter = ToolEmitter::shell(
-            vec![
-                "python".to_string(),
-                "-m".to_string(),
-                "unittest".to_string(),
-                "-q".to_string(),
-            ],
-            AbsolutePathBuf::from_absolute_path(workspace).unwrap(),
-            ExecCommandSource::Agent,
-            codex_exec_server::LOCAL_ENVIRONMENT_ID.into(),
-        );
-        let ctx = ToolEventCtx::new(session, turn, call_id, Some(tracker));
-        emitter.begin(ctx).await.unwrap();
-        effect();
-        emitter
-            .finish(ctx, Ok(ExecToolCallOutput::default()), None)
-            .await
-            .unwrap();
-        let exit_code = i32::from(outcome != codex_tools::ToolOutputOutcome::Success);
-        collector.record_response_result(
-            ordinal,
-            codex_tools::ToolOutputOutcomeContext::new(outcome),
-            Some(serde_json::json!({
-                "runner_execution_receipt": {"executed_tests": 1, "exit_code": exit_code},
-                "validation_mutation_revision": admitted,
-            })),
-            &codex_protocol::models::ResponseInputItem::FunctionCallOutput {
-                call_id: call_id.to_string(),
-                output: codex_protocol::models::FunctionCallOutputPayload::from_text(
-                    "Ran 1 test".to_string(),
-                ),
-            },
-            false,
-        );
-        let tracker = tracker.lock().await;
-        let revision = tracker.current_mutation_revision();
-        control.retain_validation_across_changes(revision, &tracker);
-        control.settle(
-            &baselines,
-            &collector,
-            &crate::session::turn_execution::SamplingRequestSettledState {
-                mutation_revision: revision,
-                attributed_mutation_revision: tracker.attributed_mutation_revision(),
-                tool_exposure_revision: 0,
-            },
-        );
-        control.completion_readiness(revision)
-    }
+
+
+
+
+
+
+
 
     #[tokio::test]
-    async fn non_git_validation_rerun_clears_failure_only_without_source_change() {
-        let workspace = tempdir().unwrap();
-        std::fs::write(workspace.path().join("lib.py"), "VALUE = 1\n").unwrap();
-        std::fs::write(workspace.path().join("test_lib.py"), "import lib\n").unwrap();
-        let (session, mut turn, _events) =
-            make_session_and_context_with_dynamic_tools_and_rx(Vec::new()).await;
-        set_turn_environments(
-            &mut turn,
-            &[(codex_exec_server::LOCAL_ENVIRONMENT_ID, workspace.path())],
-        );
-        assert!(
-            session
-                .services
-                .git_workspace
-                .workspace_evidence_identity(workspace.path())
-                .await
-                .is_none(),
-            "the fixture must be a completed capture outside any Git repository"
-        );
-        let tracker = Arc::new(Mutex::new(TurnDiffTracker::new()));
-        let mut control = crate::session::turn_execution::TurnExecutionControl::new();
-        let failed = settle_validation_command(
-            &mut control,
-            &session,
-            &turn,
-            &tracker,
-            workspace.path(),
-            "failing-run",
-            codex_tools::ToolOutputOutcome::Failure,
-            || {},
-        )
-        .await;
-        assert_eq!(
-            failed.validation_work.len(),
-            1,
-            "{:?}",
-            failed.validation_work
-        );
-        assert_eq!(tracker.lock().await.current_validation_revision(), 0);
-
-        // The fix is an exact, tracked edit.
-        let cwd = PathUri::from_host_native_path(workspace.path()).unwrap();
-        let delta = codex_apply_patch::apply_patch(
-            "*** Begin Patch\n*** Update File: lib.py\n@@\n-VALUE = 1\n+VALUE = 2\n*** End Patch",
-            &cwd,
-            &mut Vec::new(),
-            &mut Vec::new(),
-            LOCAL_FS.as_ref(),
-            /*sandbox*/ None,
-        )
-        .await
-        .unwrap();
-        ToolEmitter::ApplyPatch {
-            changes: HashMap::new(),
-            auto_approved: false,
-            environment_id: Some(codex_exec_server::LOCAL_ENVIRONMENT_ID.into()),
-            captured_environment: None,
-        }
-        .finish(
-            ToolEventCtx::new(session.as_ref(), turn.as_ref(), "fix", Some(&tracker)),
-            Ok(ExecToolCallOutput::default()),
-            Some(&delta),
-        )
-        .await
-        .unwrap();
-
-        // An edit to a file this turn never patched lands while the next
-        // passing run is live. That pass cannot show the final state, so the
-        // failure remains current work.
-        let stale = settle_validation_command(
-            &mut control,
-            &session,
-            &turn,
-            &tracker,
-            workspace.path(),
-            "stale-pass",
-            codex_tools::ToolOutputOutcome::Success,
-            || std::fs::write(workspace.path().join("helper.py"), "HELPER = 2\n").unwrap(),
-        )
-        .await;
-        assert!(
-            stale
-                .validation_work
-                .iter()
-                .any(|work| work.starts_with("Resolve current failed validation")),
-            "{:?}",
-            stale.validation_work
-        );
-
-        // A rerun that leaves the whole tree unchanged settles at the revision
-        // it tested, so it clears the failure.
-        let current = settle_validation_command(
-            &mut control,
-            &session,
-            &turn,
-            &tracker,
-            workspace.path(),
-            "current-pass",
-            codex_tools::ToolOutputOutcome::Success,
-            || {},
-        )
-        .await;
-        assert!(
-            current.validation_work.is_empty(),
-            "{:?}",
-            current.validation_work
-        );
-        let tracker = tracker.lock().await;
-        // Every run still invalidated cached evidence; only the patch and the
-        // concurrent edit are source changes.
-        assert_eq!(tracker.current_mutation_revision(), 4);
-        assert_eq!(tracker.current_validation_revision(), 2);
-    }
-
-    /// Settles a nested compile check that failed with `stderr` the way a code
-    /// cell records it, then adopts the next settlement boundary as the
-    /// completion gate does.
-    async fn settle_nested_compile_failure(
-        control: &mut crate::session::turn_execution::TurnExecutionControl,
-        tracker: &SharedTurnDiffTracker,
-        workspace: &Path,
-        stderr: &str,
-    ) {
-        let tool = codex_tools::ToolName::plain("exec_command");
-        let command = "cargo check --locked -p kda --lib --bins --tests";
-        let payload = codex_tools::ToolPayload::Function {
-            arguments: serde_json::json!({"cmd": command}).to_string(),
-        };
-        let signal = serde_json::json!({"command_validation": {
-            "validation": true, "proof": true, "tests": false,
-            "execution_context": {
-                "command": ["pwsh", "-NonInteractive", "-Command", command],
-                "cwd": workspace, "environment_id": "local", "environment_fingerprint": "kda"
-            }
-        }});
-        let result = serde_json::json!({
-            "exit_code": 101, "execution_state": "exited", "process_exited": true,
-            "streams_complete": true, "stdout": "", "stderr": stderr, "output": stderr,
-            "output_complete": true, "output_reduced": false,
-        });
-        let tracker = tracker.lock().await;
-        let revision = tracker.current_mutation_revision();
-        let baselines = control.baselines(revision);
-        let collector = control.collector(&baselines);
-        collector.record_code_mode_result_for_call(
-            Some("exec-cell/1-tool-1"),
-            crate::session::turn_execution::CodeModeToolResult {
-                cell_id: "cell/1",
-                tool_name: &tool,
-                payload: &payload,
-                source_dependencies: None,
-                outcome_context: codex_tools::ToolOutputOutcomeContext::new(
-                    codex_tools::ToolOutputOutcome::Failure,
-                ),
-                signal: Some(&signal),
-                result: &result,
-                canonical_artifact_required: false,
-            },
-        );
-        let settled = crate::session::turn_execution::SamplingRequestSettledState {
-            mutation_revision: revision,
-            attributed_mutation_revision: tracker.attributed_mutation_revision(),
-            tool_exposure_revision: 0,
-        };
-        control.retain_validation_across_changes(revision, &tracker);
-        control.settle(&baselines, &collector, &settled);
-        // The final answer's own settlement boundary precedes the gate.
-        control.retain_validation_across_changes(revision, &tracker);
-    }
-
-    /// Writer overlap locates concurrent work, not which change broke a consumer.
-    /// Even wholly foreign diagnostics must remain unresolved without a scoped
-    /// explicit blocker; a comment edit cannot excuse our removed API.
-    #[tokio::test]
-    async fn audit149_compile_failure_overlap_is_advisory_not_causal_attribution() {
-        let workspace = tempdir().unwrap();
-        let source = workspace.path().join("src");
-        std::fs::create_dir_all(&source).unwrap();
-        std::fs::write(source.join("body_ir.rs"), "fn edge() {}\n").unwrap();
-        let (session, mut turn, _events) =
-            make_session_and_context_with_dynamic_tools_and_rx(Vec::new()).await;
-        set_turn_environments(
-            &mut turn,
-            &[(codex_exec_server::LOCAL_ENVIRONMENT_ID, workspace.path())],
-        );
-        let foreign = "   Compiling kda v0.1.0\nerror[E0433]: cannot find type `EdgeKind` in this scope\n    --> src\\body_ir.rs:1181:40\n     |\n1181 |                 if matches!(edge.kind, EdgeKind::True | EdgeKind::False) {\n     |                                        ^^^^^^^^ use of undeclared type `EdgeKind`\n     |\nhelp: consider importing one of these enums\n     |\n  13 + use crate::local_cfg::EdgeKind;\n     |\n\nwarning: unused variable: `manifest_path`\n    --> src\\workspace.rs:4868:9\n     |\n4868 |         manifest_path: Option<&Path>,\n     |         ^^^^^^^^^^^^^\n\nFor more information about an error, try `rustc --explain E0433`.\nerror: could not compile `kda` (lib) due to 1 previous error; 1 warning emitted\n";
-        // This consumer error points back at the turn's own edited definition.
-        let consumer = "error[E0061]: this function takes 0 arguments but 1 argument was supplied\n    --> src\\body_ir.rs:12:5\n     |\n12   |     delete(path);\n     |     ^^^^^^ ----\nnote: function defined here\n    --> src\\atomic_write.rs:1:8\n     |\n1    | pub fn delete() {}\n     |        ^^^^^^\n\nerror: could not compile `kda` (lib) due to 1 previous error\n";
-        for (stderr, own_reference) in [(foreign, false), (consumer, true)] {
-            let home = tempdir().unwrap();
-            std::fs::write(source.join("atomic_write.rs"), "pub fn delete() {}\n").unwrap();
-            let tracker = Arc::new(Mutex::new(TurnDiffTracker::new()));
-            let mut control = crate::session::turn_execution::TurnExecutionControl::new();
-            // This turn's exact patch is its only change.
-            let cwd = PathUri::from_host_native_path(workspace.path()).unwrap();
-            let delta = codex_apply_patch::apply_patch(
-                "*** Begin Patch\n*** Update File: src/atomic_write.rs\n@@\n-pub fn delete() {}\n+pub fn delete() -> bool { true }\n*** End Patch",
-                &cwd,
-                &mut Vec::new(),
-                &mut Vec::new(),
-                LOCAL_FS.as_ref(),
-                /*sandbox*/ None,
-            )
-            .await
-            .unwrap();
-            ToolEmitter::ApplyPatch {
-                changes: HashMap::new(),
-                auto_approved: false,
-                environment_id: Some(codex_exec_server::LOCAL_ENVIRONMENT_ID.into()),
-                captured_environment: None,
-            }
-            .finish(
-                ToolEventCtx::new(session.as_ref(), turn.as_ref(), "own", Some(&tracker)),
-                Ok(ExecToolCallOutput::default()),
-                Some(&delta),
-            )
-            .await
-            .unwrap();
-            settle_nested_compile_failure(&mut control, &tracker, workspace.path(), stderr).await;
-            let revision = tracker.lock().await.current_mutation_revision();
-
-            // Without another writer, an error in an unedited file can be a
-            // consumer this turn broke: it stays repair work.
-            assert_eq!(control.has_external_validation_candidates(), !own_reference);
-            let alone = control.completion_readiness(revision);
-            assert_eq!(alone.validation_work.len(), 1, "{:?}", alone.validation_work);
-            assert!(alone.validation_work[0].starts_with("Resolve current failed validation"));
-
-            // Another live session in this checkout is editing the erroring file.
-            let mut other = crate::live_sessions::LiveSessionTurn::begin(
-                home.path(),
-                "other-session",
-                workspace.path(),
-                "Fix the CFG edges",
-            );
-            other.publish(vec![source.join("body_ir.rs")]).await;
-            let others = crate::live_sessions::others_in_checkout(
-                home.path(),
-                "this-session",
-                workspace.path(),
-            )
-            .await;
-            assert_eq!(others.len(), 1);
-            control.observe_concurrent_writers(&others, workspace.path());
-            let readiness = control.completion_readiness(revision);
-            let assessment =
-                control.completion_assessment_with_changed_paths(revision, None, false);
-            let external = assessment
-                .verification_gaps
-                .iter()
-                .any(|gap| gap.contains("external blocker") && gap.contains("body_ir.rs"));
-            let failed = assessment
-                .validation_uncertainty
-                .as_ref()
-                .unwrap()
-                .failed_checks
-                .len();
-            assert_eq!(failed, 1, "the check did fail; resume keeps that question");
-            assert_eq!(readiness.validation_work.len(), 1, "{readiness:?}");
-            assert!(!assessment.failed_checks.is_empty(), "{assessment:?}");
-            assert!(!external, "{assessment:?}");
-            assert_eq!(
-                assessment.advisories.iter().any(|note| note.contains("concurrent writer overlap")),
-                !own_reference,
-                "overlap is advisory even when the compiler does not point back at our definition"
-            );
-            drop(other);
-        }
-    }
-
-    #[tokio::test]
-    async fn ignored_patch_then_command_delete_or_overwrite_cannot_export_a_stale_exact_diff() {
+    async fn commands_do_not_rewrite_the_committed_patch_diff() {
         for remove in [true, false] {
             for declared in [true, false] {
                 let temp = tempdir().unwrap();
@@ -3090,15 +2029,15 @@ mod tests {
                     .await
                     .unwrap();
                 assert!(
-                    tracker.lock().await.exact_unified_diff().is_err(),
-                    "Git equality must not preserve the stale patch: remove={remove}, declared={declared}"
+                    tracker.lock().await.exact_unified_diff().unwrap().unwrap().contains("+after"),
+                    "command effects are outside the apply-patch diff: remove={remove}, declared={declared}"
                 );
             }
         }
     }
 
     #[tokio::test]
-    async fn duplicate_repository_reads_uncertain_command_reuses_post_command_identity() {
+    async fn command_completion_invalidates_cached_identity_without_recapturing() {
         let temp = tempdir().expect("tempdir");
         let repo = temp.path().join("repo");
         initialize_git_repository(&repo);
@@ -3195,24 +2134,25 @@ mod tests {
                 .git_workspace
                 .workspace_evidence_capture_count()
                 - capture_count_before,
-            1,
-            "one post-command capture should serve all remaining consumers"
+            0,
+            "command completion must not recapture the workspace"
         );
         let after_hash = session
             .services
             .command_execution
             .current_workspace_identity_hash(codex_exec_server::LOCAL_ENVIRONMENT_ID, &repo)
             .await
-            .expect("refreshed workspace identity");
-        assert_ne!(before_hash, after_hash);
+            ;
+        assert!(after_hash.is_none(), "the previous identity must be invalidated, not refreshed");
+        assert!(!before_hash.is_empty());
         let revision = tracker.lock().await.current_mutation_revision();
         assert!(
             batch
                 .captured_identity(&repo, revision)
                 .await
                 .flatten()
-                .is_some(),
-            "command completion must publish its capture for subsequent readers"
+                .is_none(),
+            "a new revision must not inherit the pre-command capture"
         );
     }
 
@@ -3682,17 +2622,6 @@ mod tests {
                 matches!(diff.msg, EventMsg::TurnDiff(TurnDiffEvent { unified_diff })
                 if unified_diff.contains("changed.txt") && unified_diff.contains("+after"))
             );
-        } else {
-            let warning = events.next().expect("unknown command diff warning");
-            assert!(
-                matches!(&warning.msg, EventMsg::Warning(event)
-                if (event.message.contains("The turn diff is partial")
-                    || event.message.contains("The turn diff is unavailable"))
-                    && event.message.contains("without fresh workspace verification")),
-                "{warning:?}"
-            );
-            // Published exactly once: the turn-end emission must not repeat it.
-            assert_eq!(tracker.lock().await.take_invalidation_warning(), None);
         }
         assert!(
             events.next().is_none(),
@@ -3786,5 +2715,5 @@ mod captured_patch_scope_tests {
 }
 
 #[cfg(test)]
-#[path = "events_audit147_tests.rs"]
-mod audit147_tests;
+#[path = "events_workspace_invalidation_tests.rs"]
+mod workspace_invalidation_tests;

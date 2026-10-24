@@ -3,16 +3,11 @@
   "private": true,
   "description": "Tools for repo-wide maintenance.",
   "scripts": {
-    "audit:scripts": "node scripts/maintenance/run-python.js scripts/maintenance/root_maintenance.py audit-scripts",
     "format": "node scripts/maintenance/run-python.js scripts/maintenance/format.py --check --only prettier",
     "format:fix": "node scripts/maintenance/run-python.js scripts/maintenance/format.py --write --only prettier",
     "format:python": "node scripts/maintenance/run-python.js scripts/maintenance/format.py --check --only python-scripts",
     "format:python:fix": "node scripts/maintenance/run-python.js scripts/maintenance/format.py --write --only python-scripts",
-    "lint:markdown": "markdownlint-cli2",
-    "lint:python": "node scripts/maintenance/run-python.js scripts/maintenance/root_maintenance.py lint-python",
-    "lint:python:fix": "node scripts/maintenance/run-python.js scripts/maintenance/root_maintenance.py lint-python --fix",
-    "test:scripts": "node scripts/maintenance/run-python.js scripts/maintenance/root_maintenance.py test-python",
-    "test:scripts:changed": "node scripts/maintenance/run-python.js scripts/maintenance/root_maintenance.py test-python --changed"
+    "lint:markdown": "markdownlint-cli2"
   },
   "devDependencies": {
     "markdownlint-cli2": "0.18.1",

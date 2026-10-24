@@ -218,7 +218,7 @@ pub(crate) fn is_safe_ripgrep(words: &[String]) -> bool {
 
 pub(crate) fn is_safe_git_command(command: &[String]) -> bool {
     let Some((subcommand_idx, subcommand)) =
-        find_git_subcommand(command, &["log", "diff", "show", "branch", "status"])
+        find_git_subcommand(command, &["diff", "branch", "status"])
     else {
         return false;
     };
@@ -231,7 +231,9 @@ pub(crate) fn is_safe_git_command(command: &[String]) -> bool {
     let subcommand_args = &command[subcommand_idx + 1..];
 
     match subcommand {
-        "log" | "diff" | "show" => {
+        // log/show can invoke configured signature verifiers through defaults,
+        // pretty formats, and abbreviated flags. They require normal approval.
+        "diff" => {
             let options: Vec<_> = subcommand_args
                 .iter()
                 .take_while(|arg| arg.as_str() != "--")
@@ -647,8 +649,8 @@ mod tests {
     }
 
     #[test]
-    fn git_subcommand_patch_flags_remain_safe() {
-        assert!(is_known_safe_command(&vec_str(&[
+    fn git_history_requires_approval_while_hardened_diff_remains_safe() {
+        assert!(!is_known_safe_command(&vec_str(&[
             "git",
             "-c",
             "core.fsmonitor=false",
@@ -667,7 +669,7 @@ mod tests {
             "--no-textconv",
             "-p"
         ])));
-        assert!(is_known_safe_command(&vec_str(&[
+        assert!(!is_known_safe_command(&vec_str(&[
             "git",
             "-c",
             "core.fsmonitor=false",
@@ -677,7 +679,7 @@ mod tests {
             "-p",
             "HEAD",
         ])));
-        assert!(is_known_safe_command(&vec_str(&[
+        assert!(!is_known_safe_command(&vec_str(&[
             "bash",
             "-lc",
             "git -c core.fsmonitor=false log --no-ext-diff --no-textconv -p -1",
@@ -1026,6 +1028,31 @@ mod tests {
 mod configured_git_helper_tests {
     use super::*;
 
+    #[test]
+    fn git_history_signature_verification_forms_require_approval() {
+        for subcommand in ["log", "show"] {
+            for extra in [
+                vec![],
+                vec!["--show-signature"],
+                vec!["--no-show-signature", "--format=%G?"],
+                vec!["--no-show-signature", "--pretty=format:%GS"],
+                vec!["--no-show-signature", "--format=configured-alias"],
+            ] {
+                let mut words = argv(&[
+                    "git",
+                    "-c",
+                    "core.fsmonitor=false",
+                    subcommand,
+                    "--no-ext-diff",
+                    "--no-textconv",
+                ]);
+                words.extend(extra.into_iter().map(str::to_owned));
+                assert!(!is_known_safe_direct_argv(&words));
+                assert!(!is_safe_powershell_words(&words));
+            }
+        }
+    }
+
     fn argv(args: &[&str]) -> Vec<String> {
         args.iter().map(|arg| (*arg).to_string()).collect()
     }
@@ -1070,7 +1097,10 @@ mod configured_git_helper_tests {
                 "--no-ext-diff",
                 "--no-textconv",
             ];
-            assert!(is_known_safe_direct_argv(&argv(&safe)));
+            assert_eq!(
+                is_known_safe_direct_argv(&argv(&safe)),
+                subcommand == "diff"
+            );
             for override_value in [
                 "core.fsmonitor=true",
                 "core.fsmonitor=helper",

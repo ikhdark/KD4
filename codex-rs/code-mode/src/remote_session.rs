@@ -288,7 +288,9 @@ struct SessionInner {
     lost_state: AtomicBool,
     shutdown_requested: AtomicBool,
     shutdown_result: StdMutex<Option<ShutdownResultReceiver>>,
-    retired_cleanups: StdMutex<Vec<SessionCleanup>>,
+    // Retiring a binding must not drop the last connection owner while its
+    // supervisor still drains accepted stdout responses.
+    retired_cleanups: StdMutex<Vec<(SessionCleanup, Arc<Connection>)>>,
     // Keep the receiving future, not just a successful intermediate send. A
     // steered caller can drop its observation without discarding a host yield.
     pending_waits: StdMutex<std::collections::HashMap<(u64, CellId), PendingWait>>,
@@ -339,9 +341,7 @@ impl ProcessOwnedCodeModeSession {
         if self.inner.lost_state.swap(false, Ordering::AcqRel) {
             return Err(RUNTIME_REPLACED_NOTICE.to_string());
         }
-        self.inner
-            .executed_generation
-            .store(binding.remote.generation, Ordering::Release);
+        self.inner.record_execution_generation(binding.remote.generation);
         binding.connection.execute(binding.remote, request).await
     }
 
@@ -361,7 +361,7 @@ impl ProcessOwnedCodeModeSession {
             if self.inner.shutdown_requested.load(Ordering::Acquire) {
                 return Err("code mode session is shutting down".into());
             }
-            waits.retain(|(generation, _), _| *generation == key.0);
+            prune_pending_waits(&mut waits, key.0);
             if !waits.contains_key(&key)
                 && waits.len() >= codex_code_mode_protocol::host::MAX_IN_FLIGHT_REQUESTS
             {
@@ -456,7 +456,28 @@ impl ProcessOwnedCodeModeSession {
     }
 }
 
+fn prune_pending_waits(
+    waits: &mut std::collections::HashMap<(u64, CellId), PendingWait>,
+    generation: u64,
+) {
+    waits.retain(|(entry_generation, _), pending| {
+        // An old caller is not authority to retire a replacement host's waits.
+        if *entry_generation < generation {
+            return false;
+        }
+        // A queued observer may disappear after the completing observer left an
+        // empty slot. Never block on a cell mutex while holding the map lock.
+        !(Arc::strong_count(pending) == 1
+            && pending.try_lock().is_ok_and(|receiving| receiving.is_none()))
+    });
+}
+
 impl SessionInner {
+    fn record_execution_generation(&self, generation: u64) {
+        // A caller holding an obsolete binding cannot erase a newer host's state.
+        self.executed_generation.fetch_max(generation, Ordering::AcqRel);
+    }
+
     async fn connection(self: &Arc<Self>) -> Result<SessionBinding, String> {
         self.runtime.get_or_init(tokio::runtime::Handle::current);
         loop {
@@ -492,7 +513,7 @@ impl SessionInner {
                         {
                             self.lost_state.store(true, Ordering::Release);
                         }
-                        self.retain_cleanup(binding.cleanup.clone());
+                        self.retain_cleanup(binding);
                         *state = SessionState::New;
                         continue;
                     }
@@ -659,14 +680,14 @@ impl SessionInner {
             .unwrap_or_else(std::sync::PoisonError::into_inner) = SessionState::Closed;
     }
 
-    fn retain_cleanup(&self, cleanup: SessionCleanup) {
+    fn retain_cleanup(&self, binding: &SessionBinding) {
         let mut retired = self
             .retired_cleanups
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        retired.retain(|cleanup| !cleanup.is_complete());
-        if !cleanup.is_complete() {
-            retired.push(cleanup);
+        retired.retain(|(cleanup, _)| !cleanup.is_complete());
+        if !binding.cleanup.is_complete() {
+            retired.push((binding.cleanup.clone(), Arc::clone(&binding.connection)));
         }
     }
 
@@ -677,8 +698,9 @@ impl SessionInner {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner),
         );
-        for cleanup in retired {
+        for (cleanup, connection) in retired {
             cleanup.wait().await;
+            drop(connection);
         }
     }
 }

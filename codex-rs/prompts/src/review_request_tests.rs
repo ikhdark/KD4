@@ -2,6 +2,37 @@ use super::*;
 use pretty_assertions::assert_eq;
 
 #[test]
+fn scoped_prompt_keeps_the_captured_base_when_branch_moves() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let git = |args: &[&str]| {
+        let output = std::process::Command::new(codex_git_utils::git_executable())
+            .current_dir(root).args(args).output().unwrap();
+        assert!(output.status.success(), "{args:?}: {:?}", output.stderr);
+        String::from_utf8(output.stdout).unwrap().trim().to_string()
+    };
+    git(&["init"]);
+    std::fs::write(root.join("source.rs"), "base\n").unwrap();
+    git(&["add", "."]);
+    git(&["-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "-m", "base"]);
+    let original = git(&["rev-parse", "HEAD"]);
+    git(&["branch", "review-base"]);
+    std::fs::write(root.join("source.rs"), "changed\n").unwrap();
+    git(&["add", "."]);
+    git(&["-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "-m", "change"]);
+    let cwd = AbsolutePathBuf::from_absolute_path(root).unwrap();
+    let target = ReviewTarget::BaseBranch { branch: "review-base".into() };
+    let scope = codex_git_utils::ReviewSourceScope::capture(root, &target).unwrap();
+    git(&["branch", "-f", "review-base", "HEAD"]);
+    let moved = git(&["rev-parse", "HEAD"]);
+    assert_ne!(original, moved);
+    assert_eq!(scope.comparison_revision(), Some(original.as_str()));
+    let prompt = review_prompt_for_scope(&target, &cwd, &scope).unwrap();
+    assert!(prompt.contains(&format!("git diff {original}")));
+    assert!(!prompt.contains(&moved));
+}
+
+#[test]
 fn review_prompt_template_renders_base_branch_variant() {
     assert_eq!(
         render_review_prompt(

@@ -632,7 +632,6 @@ pub(crate) fn run_turn(
         let mut pending_continuation_cause = None;
         let mut pending_generation_request: Option<GenerationRequestDisposition> = None;
         let mut missing_answer_terminal_repair_revision: Option<String> = None;
-        let mut completion_notice_key = None;
         let mut prefetched_workspace_identity: Option<
             Option<crate::git_workspace::WorkspaceEvidenceIdentity>,
         > = None;
@@ -651,41 +650,18 @@ pub(crate) fn run_turn(
             .await
             .set_environment_display_roots(display_roots);
         let kd4_runtime = turn_context.config.features.enabled(Feature::Kd4Runtime);
-        sess.state
-            .lock()
-            .await
-            .history
-            .rehydrate_read_replays(&sess.services.path_replays);
+
         let mut turn_execution =
             TurnExecutionControl::new_with_timing(Arc::clone(&turn_context.turn_timing_state))
-                .with_session_path_replays(Arc::clone(&sess.services.path_replays))
-                .with_session_validation_uncertainty(Arc::clone(
-                    &sess.services.validation_uncertainty,
-                ))
-                .for_validation_turn(&turn_context.sub_id)
+
                 .with_active_plan(if turn_context.collaboration_mode.mode == ModeKind::Plan {
                     None
                 } else {
                     sess.services.plan_store.execution_snapshot().await
                 });
+        refresh_validation_policy(&turn_context, &mut turn_execution);
         turn_execution.rehydrate_argument_failures(sess.state.lock().await.history.raw_items());
-        // A root session publishes its request and edits while this turn runs, so
-        // concurrent sessions in the checkout do not mistake them for their own.
-        let mut live_session = (!matches!(
-            turn_context.session_source,
-            SessionSource::SubAgent(_) | SessionSource::Internal(_)
-        ))
-        .then(|| turn_input_first_text(&input))
-        .flatten()
-        .map(|intent| {
-            crate::live_sessions::LiveSessionTurn::begin(
-                turn_context.config.codex_home.as_path(),
-                &sess.thread_id.to_string(),
-                turn_context.cwd().as_path(),
-                intent,
-            )
-        });
-        let mut concurrent_sessions_checked = false;
+
 
         // `ModelClientSession` is turn-scoped and caches WebSocket + sticky routing state, so we reuse
         // one instance across retries within this turn.
@@ -699,7 +675,7 @@ pub(crate) fn run_turn(
         let mut first_router = Some(first_router);
         // The turn owns its fully rendered instructions; the scaffold clones the
         // text only on a cache miss.
-        let base_instructions = Arc::clone(&turn_context.base_instructions);
+        let base_instructions = validation_mode_base_instructions(&turn_context);
         'sampling_loop: loop {
             // Metadata belongs to this attempt, while underlying evidence stays in
             // the turn execution owner across repairs and pending-input continuations.
@@ -889,49 +865,9 @@ pub(crate) fn run_turn(
                 )
                 .await;
             }
-            if kd4_runtime {
-                record_soft_convergence_directive(
-                    sess.as_ref(),
-                    turn_context.as_ref(),
-                    &mut turn_execution,
-                    has_started_generation,
-                )
-                .await?;
-            }
+
             has_started_generation = true;
-            if let Some(live_session) = live_session.as_mut() {
-                let edited = turn_diff_tracker
-                    .lock()
-                    .await
-                    .changed_paths()
-                    .into_iter()
-                    .map(|(id, path)| {
-                        let resource = turn_context.environments.turn_environments.iter()
-                            .find(|environment| environment.environment_id == id)
-                            .map_or_else(|| format!("unknown:{id}"), |environment| environment.environment.coordination_resource_id());
-                        (resource, path)
-                    })
-                    .collect();
-                // Show other sessions' work before the first edit, then what
-                // changed in it after each change to this turn's own edited files.
-                if live_session.publish_qualified(edited).await || !concurrent_sessions_checked || live_session.peer_refresh_due() {
-                    concurrent_sessions_checked = true;
-                    let others = live_session.others().await;
-                    let retained = retained_context_notices(
-                        sess.clone_history().await.raw_items(),
-                        "concurrent_sessions",
-                    );
-                    if let Some(notice) = live_session.sessions_notice(&others, &retained) {
-                        record_context_notice_if_changed(
-                            sess.as_ref(),
-                            turn_context.as_ref(),
-                            "concurrent_sessions",
-                            &notice,
-                        )
-                        .await?;
-                    }
-                }
-            }
+
             let generation_id = ModelGenerationId {
                 turn_id: turn_context.sub_id.clone(),
                 ordinal: logical_generation_ordinal,
@@ -1089,13 +1025,6 @@ pub(crate) fn run_turn(
                     } = sampling_request_output;
                     prefetched_workspace_identity = next_workspace_identity;
                     pending_workspace_prefetch = continuation_workspace_prefetch;
-                    {
-                        let tracker = turn_diff_tracker.lock().await;
-                        turn_execution.retain_validation_across_changes(
-                            settled_state.mutation_revision,
-                            &tracker,
-                        );
-                    }
                     turn_execution.refresh_plan(
                         if turn_context.collaboration_mode.mode == ModeKind::Plan {
                             None
@@ -1108,14 +1037,6 @@ pub(crate) fn run_turn(
                         &request_baselines,
                         &request_signals,
                         &settled_state,
-                    );
-                    turn_execution.capture_acceptance_sources(&step_context,
-                        &turn_context.sub_id, settled_state.mutation_revision).await;
-                    sess.services.plan_store.publish_acceptance_evidence(
-                        turn_execution.acceptance_evidence(
-                            &turn_context.sub_id,
-                            settled_state.mutation_revision,
-                        ),
                     );
                     // All owner outcomes have drained. Settle them even when a
                     // required sibling stops this generation; Drop can retain
@@ -1139,22 +1060,7 @@ pub(crate) fn run_turn(
                             defer_pending_input: false,
                         });
                     }
-                    let readiness = turn_execution.completion_readiness(settled_state.mutation_revision);
-                    let (advisory, external) = sess.services.plan_store.completion_advisory(
-                        &turn_context.sub_id, settled_state.mutation_revision,
-                    ).await;
-                    let validation_report_only = finalized_mutation_revision.is_some()
-                        || !turn_execution.changed_sources(settled_state.mutation_revision);
-                    if let Some(text) = readiness.sampling_notice_for_decision(
-                        &mut completion_notice_key, &advisory, &external, validation_report_only,
-                    ) {
-                        sess.record_conversation_items(&turn_context, &[ResponseItem::Message {
-                            id: None, role: "developer".into(),
-                            content: vec![ContentItem::InputText { text }],
-                            phase: None, internal_chat_message_metadata_passthrough: None,
-                        }]).await?;
-                    }
-                    turn_extension_data.insert(readiness);
+                    refresh_validation_policy(&turn_context, &mut turn_execution);
                     let terminal_feedback = sess
                         .settle_extension_terminal_intents(&turn_extension_data)
                         .or_cancel(&cancellation_token)
@@ -1484,67 +1390,31 @@ pub(crate) fn run_turn(
                             {
                                 output_state.missing_answer_repair_attempted = true;
                                 let repair_revision = turn_diff_tracker.lock().await.current_mutation_revision();
-                                let mut readiness = turn_execution.completion_readiness(repair_revision);
-                                if finalized_mutation_revision.is_some()
-                                    || !turn_execution.changed_sources(repair_revision)
-                                {
-                                    readiness.validation_work.clear();
-                                }
-                                let closure = if turn_context.collaboration_mode.mode == ModeKind::Plan {
-                                    None
-                                } else {
-                                    tokio::select! {
-                                        _ = cancellation_token.cancelled() => return Err(CodexErr::TurnAborted),
-                                        result = tokio::time::timeout(std::time::Duration::from_secs(5), sess.services.plan_store.task_closure(
-                                            &turn_context.sub_id, repair_revision,
-                                            sess.services.agent_control.task_coordinator(),
-                                        )) => result.ok(),
-                                    }
-                                };
-                                // Satisfied criteria account for their mapped checklist rows
-                                // here as on the ordinary final path.
-                                if let Some(decision) = &closure {
-                                    readiness.reconcile_acceptance(decision);
-                                }
-                                let delivery_only = closure.as_ref().is_some_and(|decision| {
-                                    decision.terminal_action != crate::plan_store::acceptance::TerminalAction::Continue
-                                        && readiness.remaining(
-                                            decision.request_state == crate::plan_store::acceptance::RequestState::Blocked,
-                                            &decision.unmet_obligations,
-                                        ).is_empty()
-                                }) && turn_diff_tracker.lock().await.current_mutation_revision() == repair_revision;
+                                // Missing delivery grants one tool-free answer, not a
+                                // new implementation or validation attempt.
                                 sess.record_conversation_items(
                                     &turn_context,
                                     &[ResponseItem::Message {
                                         id: None,
                                         role: "developer".to_string(),
                                         content: vec![ContentItem::InputText {
-                                            text: if delivery_only {
-                                                MISSING_ANSWER_REPAIR_DIRECTIVE.to_string()
-                                            } else {
-                                                "The prior response omitted a final answer, but authoritative work is not established complete. Continue obtainable authorized work; do not repeat completed effects or run unauthorized checks. Deliver the final answer when the existing obligations permit it.".to_string()
-                                            },
+                                            text: MISSING_ANSWER_REPAIR_DIRECTIVE.to_string(),
                                         }],
                                         phase: None,
                                         internal_chat_message_metadata_passthrough: None,
                                     }],
-                                )
-                                .await?;
-                                pending_generation_request = if delivery_only {
-                                    let fingerprint = turn_execution.baselines_with_tool_exposure_revision(
-                                        repair_revision, settled_state.tool_exposure_revision,
-                                    ).relevant_state_fingerprint();
-                                    missing_answer_terminal_repair_revision = Some(fingerprint.clone());
-                                    Some(GenerationRequestDisposition {
-                                        purpose: Some(TurnTimingGenerationPurpose::Repair),
-                                        sampling: SamplingGenerationDisposition::DecisionBearing,
-                                        relevant_state_fingerprint: fingerprint,
-                                        failure_fingerprint: None,
-                                        terminal_completion_only: false,
-                                    }.require_terminal_completion())
-                                } else {
-                                    None
-                                };
+                                ).await?;
+                                let fingerprint = turn_execution.baselines_with_tool_exposure_revision(
+                                    repair_revision, settled_state.tool_exposure_revision,
+                                ).relevant_state_fingerprint();
+                                missing_answer_terminal_repair_revision = Some(fingerprint.clone());
+                                pending_generation_request = Some(GenerationRequestDisposition {
+                                    purpose: Some(TurnTimingGenerationPurpose::Repair),
+                                    sampling: SamplingGenerationDisposition::DecisionBearing,
+                                    relevant_state_fingerprint: fingerprint,
+                                    failure_fingerprint: None,
+                                    terminal_completion_only: false,
+                                }.require_terminal_completion());
                                 pending_continuation_cause = Some(ContinuationCause::StopHook);
                                 continue 'sampling_loop;
                             }
@@ -1567,155 +1437,10 @@ pub(crate) fn run_turn(
                         // C1: the direct runtime shares this completion path. It must not skip
                         // the after-agent and completion-stop hooks, because those are the
                         // authoritative, user-configured control over whether a turn may finish.
-                        let mut initial_task_decision = None;
-                        if turn_context.collaboration_mode.mode != ModeKind::Plan {
-                            // Direct delivery and ordinary finals share this boundary.
-                            // Streamed content remains provisional; lifecycle Completed
-                            // is not a request-acceptance verdict.
-                            let closure_revision =
-                                turn_diff_tracker.lock().await.current_mutation_revision();
-                            sess.services.plan_store.publish_acceptance_evidence(
-                                turn_execution.fenced_acceptance_evidence(&step_context,
-                                    &turn_context.sub_id, closure_revision).await);
-                            let decision = tokio::select! {
-                                _ = cancellation_token.cancelled() => return Err(CodexErr::TurnAborted),
-                                result = tokio::time::timeout(std::time::Duration::from_secs(5), sess.services.plan_store.task_closure(
-                                    &turn_context.sub_id, closure_revision,
-                                    sess.services.agent_control.task_coordinator(),
-                                )) => match result {
-                                    Ok(decision) => decision,
-                                    Err(_) => {
-                                        emit_status_affecting_turn_error(sess.as_ref(), turn_context.as_ref(), "Task acceptance storage query timed out; final success remains unverified.").await;
-                                        return Ok(after_agent_abort_result(last_agent_message, surfaced_result, defer_pending_input));
-                                    }
-                                },
-                            };
-                            let decision_text = serde_json::json!(decision).to_string();
-                            completion_assessment.get_or_insert_with(Default::default)
-                                .task_disposition = Some(decision.disposition());
-                            turn_context.extension_data.insert(decision.disposition());
-                            if decision.terminal_action
-                                == crate::plan_store::acceptance::TerminalAction::Continue
-                                && budget_forced_terminal.is_none()
-                            {
-                                if turn_execution.admit_acceptance_repair(&decision)
-                                    && admit_regular_follow_up(
-                                        sess.as_ref(),
-                                        turn_context.as_ref(),
-                                        logical_generation_budget,
-                                        &mut generation_budget_error_reported,
-                                    )
-                                    .await
-                                {
-                                    sess.record_conversation_items(&turn_context, &[ResponseItem::Message {
-                                        id: None, role: "developer".into(),
-                                        content: vec![ContentItem::InputText { text: format!(
-                                            "Declared required acceptance remains open: {decision_text}. Continue independent obtainable authorized work; do not run tests without permission. A partial report does not discharge these obligations. Record concrete external blockers only where work cannot proceed.") }],
-                                        phase: None, internal_chat_message_metadata_passthrough: None,
-                                    }]).await?;
-                                    output_state.invalidate_for_repair();
-                                    pending_generation_request = None;
-                                    pending_continuation_cause = Some(ContinuationCause::StopHook);
-                                    continue 'sampling_loop;
-                                }
-                                emit_status_affecting_turn_error(sess.as_ref(), turn_context.as_ref(),
-                                    "Required declared acceptance remains open after the bounded repair; final success was not accepted.").await;
-                                return Ok(after_agent_abort_result(
-                                    last_agent_message,
-                                    surfaced_result,
-                                    defer_pending_input,
-                                ));
-                            }
-                            if turn_diff_tracker.lock().await.current_mutation_revision()
-                                != closure_revision
-                            {
-                                emit_status_affecting_turn_error(sess.as_ref(), turn_context.as_ref(),
-                                    "Workspace changed during task acceptance; final success was not accepted.").await;
-                                return Ok(after_agent_abort_result(
-                                    last_agent_message,
-                                    surfaced_result,
-                                    defer_pending_input,
-                                ));
-                            }
-                            initial_task_decision = Some(decision);
-                        }
-                        // Collect writer overlap as an advisory, never causal
-                        // proof that this turn's consumer failure is external.
-                        if turn_execution.has_external_validation_candidates()
-                            && !matches!(
-                                turn_context.session_source,
-                                SessionSource::SubAgent(_) | SessionSource::Internal(_)
-                            )
-                        {
-                            let thread_id = sess.thread_id.to_string();
-                            let others = tokio::select! {
-                                _ = cancellation_token.cancelled() => return Err(CodexErr::TurnAborted),
-                                others = crate::live_sessions::others_in_checkout(
-                                    turn_context.config.codex_home.as_path(),
-                                    &thread_id,
-                                    turn_context.cwd().as_path(),
-                                ) => others,
-                            };
-                            turn_execution
-                                .observe_concurrent_writers(&others, turn_context.cwd().as_path());
-                        }
-                        let mut readiness =
-                            turn_execution.completion_readiness(settled_state.mutation_revision);
-                        if let Some(decision) = &initial_task_decision {
-                            readiness.reconcile_acceptance(decision);
-                        }
-                        if finalized_mutation_revision.is_some()
-                            || !turn_execution.changed_sources(settled_state.mutation_revision)
-                        {
-                            // Validation work can only be reported here. After
-                            // the finalizer, its directive forbids edits that
-                            // would need another finalization. A turn that
-                            // changed no sources observed its failures against
-                            // the turn-start sources; its final reports them.
-                            // Plan and live validation work, declared acceptance
-                            // and goal completion still apply. The assessment
-                            // keeps failed checks and verification gaps.
-                            readiness.validation_work.clear();
-                        }
-                        let blocked = initial_task_decision.as_ref().is_some_and(|decision| {
-                            decision.request_state
-                                == crate::plan_store::acceptance::RequestState::Blocked
-                        });
-                        let remaining = readiness.remaining(
-                            blocked,
-                            initial_task_decision
-                                .as_ref()
-                                .map(|decision| decision.unmet_obligations.as_slice())
-                                .unwrap_or_default(),
-                        );
-                        if !remaining.is_empty() && budget_forced_terminal.is_none() {
-                            if turn_execution.admit_completion_repair(&readiness)
-                                && admit_regular_follow_up(
-                                    sess.as_ref(),
-                                    turn_context.as_ref(),
-                                    logical_generation_budget,
-                                    &mut generation_budget_error_reported,
-                                )
-                                .await
-                            {
-                                sess.record_conversation_items(&turn_context, &[ResponseItem::Message {
-                                    id: None, role: "developer".into(), content: vec![ContentItem::InputText {
-                                        text: format!("Known current work prevents final acceptance: {}. Continue only obtainable work the task already authorizes; this notice adds no authorization. When test execution is authorized, resolve a failed check by rerunning it, after any needed fix, through its runner or test command itself, not a wrapper script; otherwise record why it is blocked. Do not launch a duplicate of validation that is still running, or treat a stored process number as a capability. Reconcile legitimate blockers and user-approved scope changes with update_plan. No tool reports validation status beyond the evidence quoted here.", remaining.join(" ")),
-                                    }], phase: None, internal_chat_message_metadata_passthrough: None,
-                                }]).await?;
-                                output_state.invalidate_for_repair();
-                                pending_generation_request = None;
-                                pending_continuation_cause = Some(ContinuationCause::StopHook);
-                                continue 'sampling_loop;
-                            }
-                            emit_status_affecting_turn_error(sess.as_ref(), turn_context.as_ref(),
-                                "Known current work remains unresolved after bounded reconciliation; task success was not accepted.").await;
-                            return Ok(after_agent_abort_result(
-                                last_agent_message,
-                                surfaced_result,
-                                defer_pending_input,
-                            ));
-                        }
+                        // Ordinary chat completion is not a task-acceptance gate.
+                        // Failed checks and checklist debt remain reportable below;
+                        // they cannot manufacture another model generation. Explicit
+                        // goal terminal intents retain their separate acceptance owner.
                         let mut finalizer_ran = false;
                         let mutating_finalizer_aborted = if matches!(
                             turn_context.config.after_agent_policy,
@@ -1792,12 +1517,22 @@ pub(crate) fn run_turn(
                                 sess.record_conversation_items(&turn_context, &[ResponseItem::Message {
                                     id: None,
                                     role: "developer".to_string(),
-                                    content: vec![ContentItem::InputText { text:
-                                        "The mutating finalizer has run exactly once. Earlier validation does not cover the final workspace. Validate the affected final state before accepting an answer, or truthfully report unavailable verification. Do not replay the finalizer; further workspace edits cannot be finalized safely in this turn.".to_string() }],
+                                    content: vec![ContentItem::InputText {
+                                        text: "The mutating finalizer has run exactly once. Report the final workspace and any verification gaps without further tools. Do not replay the finalizer or start another validation attempt.".to_string(),
+                                    }],
                                     phase: None,
                                     internal_chat_message_metadata_passthrough: None,
                                 }]).await?;
-                                pending_generation_request = None;
+                                pending_generation_request = Some(GenerationRequestDisposition {
+                                    purpose: Some(TurnTimingGenerationPurpose::TerminalCompletionReasoning),
+                                    sampling: SamplingGenerationDisposition::DecisionBearing,
+                                    relevant_state_fingerprint: turn_execution.baselines_with_tool_exposure_revision(
+                                        turn_diff_tracker.lock().await.current_mutation_revision(),
+                                        settled_state.tool_exposure_revision,
+                                    ).relevant_state_fingerprint(),
+                                    failure_fingerprint: None,
+                                    terminal_completion_only: false,
+                                }.require_terminal_completion());
                                 pending_continuation_cause = Some(ContinuationCause::StopHook);
                                 output_state.invalidate_for_repair();
                                 continue 'sampling_loop;
@@ -1817,19 +1552,15 @@ pub(crate) fn run_turn(
                                 let (
                                     changed_paths,
                                     has_untracked_changes,
-                                    unattributed_paths,
                                     changed_existing,
                                     uncertain_contents,
-                                    made_attributed_edits,
                                 ) = {
                                     let tracker = turn_diff_tracker.lock().await;
                                     (
                                         Some(tracker.changed_paths()),
                                         tracker.has_untracked_changes(),
-                                        tracker.unattributed_display_paths(),
                                         tracker.changed_existing_contents(),
                                         tracker.uncertain_content_paths(),
-                                        tracker.attributed_mutation_revision() > 0,
                                     )
                                 };
                                 // Parsing is CPU work bounded by its own deadline.
@@ -1859,9 +1590,6 @@ pub(crate) fn run_turn(
                                     has_untracked_changes,
                                     &runtime_inputs,
                                 );
-                                if let Some(advisory) = unattributed_changes_advisory(&unattributed_paths, made_attributed_edits) {
-                                    assessment.advisories.push(advisory);
-                                }
                                 if let Some(advisory) = changed_tests_advisory(&changed_tests.changed) {
                                     assessment.advisories.push(advisory);
                                 }
@@ -2035,93 +1763,6 @@ pub(crate) fn run_turn(
                             ).await;
                             return Ok(after_agent_abort_result(None, None, defer_pending_input));
                         }
-                        if let Some(mut initial_decision) = initial_task_decision.clone() {
-                            let revision =
-                                turn_diff_tracker.lock().await.current_mutation_revision();
-                            sess.services.plan_store.publish_acceptance_evidence(
-                                turn_execution.fenced_acceptance_evidence(&step_context,
-                                    &turn_context.sub_id, revision).await);
-                            let decision = tokio::select! {
-                                _ = cancellation_token.cancelled() => return Err(CodexErr::TurnAborted),
-                                result = tokio::time::timeout(std::time::Duration::from_secs(5),
-                                    sess.services.plan_store.task_closure(&turn_context.sub_id, revision,
-                                        sess.services.agent_control.task_coordinator())) => match result {
-                                    Ok(decision) => decision,
-                                    Err(_) => {
-                                        emit_status_affecting_turn_error(sess.as_ref(), turn_context.as_ref(), "Task acceptance storage query timed out; final success remains unverified.").await;
-                                        return Ok(after_agent_abort_result(last_agent_message, surfaced_result, defer_pending_input));
-                                    }
-                                },
-                            };
-                            completion_assessment.get_or_insert_with(Default::default)
-                                .task_disposition = Some(decision.disposition());
-                            turn_context.extension_data.insert(decision.disposition());
-                            // Only a declared contract that remains open is a host
-                            // observation. A no-contract (unknown) or satisfied
-                            // disposition is not an advisory for the turn or its parent.
-                            if !decision.unmet_obligations.is_empty() {
-                                completion_assessment
-                                    .get_or_insert_with(Default::default)
-                                    .advisories
-                                    .push(format!(
-                                        "Task disposition: {}",
-                                        serde_json::json!(decision)
-                                    ));
-                            }
-                            if completion_stop_report
-                                .mutation_receipt
-                                .as_ref()
-                                .is_some_and(|receipt| {
-                                    receipt.covers_only_hook_effect(
-                                        initial_decision.mutation_revision,
-                                        revision,
-                                    )
-                                })
-                            {
-                                // Compare actual post-hook evidence and obligations.
-                                // Only the receipted counter difference is expected;
-                                // stale validation must still change the decision.
-                                initial_decision.mutation_revision = revision;
-                            }
-                            if decision != initial_decision
-                                || turn_diff_tracker.lock().await.current_mutation_revision()
-                                    != revision
-                            {
-                                emit_status_affecting_turn_error(sess.as_ref(), turn_context.as_ref(),
-                                    "Task, evidence or required child changed during completion hooks; final success was not accepted and effectful hooks were not replayed.").await;
-                                return Ok(after_agent_abort_result(
-                                    last_agent_message,
-                                    surfaced_result,
-                                    defer_pending_input,
-                                ));
-                            }
-                            initial_task_decision = Some(decision);
-                        }
-                        if let Some(decision) = &initial_task_decision {
-                            let owner = Arc::clone(&sess);
-                            let persistence_owner = Arc::clone(&sess);
-                            let decision = decision.clone();
-                            let result = sess.terminal_tasks.spawn(async move {
-                                owner.services.plan_store.archive_completed_scope(&decision, |item| async move {
-                                    persistence_owner.persist_rollout_items_durable(&[
-                                        codex_protocol::protocol::RolloutItem::ResponseItem(item),
-                                    ]).await
-                                }).await
-                            }).await;
-                            match result.unwrap_or_else(|error| Err(std::io::Error::other(error.to_string()))) {
-                                // Archival can complete lagging mapped rows; publish the
-                                // durable checklist after persistence, as update_plan does.
-                                Ok(Some(plan)) => {
-                                    sess.send_event(turn_context.as_ref(), EventMsg::PlanUpdate(plan)).await;
-                                }
-                                Ok(None) => {}
-                                Err(error) => {
-                                    emit_status_affecting_turn_error(sess.as_ref(), turn_context.as_ref(),
-                                        &format!("Completed task scope could not be archived: {error}; final acceptance remains uncommitted.")).await;
-                                    return Ok(after_agent_abort_result(last_agent_message, surfaced_result, defer_pending_input));
-                                }
-                            }
-                        }
                         surfaced_result = candidate;
                         if surfaced_result.is_some() {
                             turn_context.turn_timing_state.record_surfaced_final_answer();
@@ -2281,6 +1922,58 @@ pub(crate) fn run_turn(
             defer_pending_input,
         })
     })
+}
+
+fn validation_attempt_limit(turn: &TurnContext) -> usize {
+    crate::validation_task::policy_limit(turn)
+}
+
+fn refresh_validation_policy(turn: &TurnContext, execution: &mut TurnExecutionControl) {
+    let policy = turn.full_suite_budget.policy_snapshot(validation_attempt_limit(turn));
+    execution.set_validation_policy(turn.validation_mode, policy.exhausted);
+}
+
+fn validation_mode_base_instructions(turn: &TurnContext) -> Arc<BaseInstructions> {
+    let directive = match turn.validation_mode {
+        codex_protocol::validation::ValidationMode::Off =>
+            "OFF: Do not run tests, builds, checks, formatters, or validation-only continuations. Do not automatically author regression tests; test authoring requires an explicit user request. Missing validation is intentional, not a blocker or failed check. Finish independent authorized work and report unvalidated results without claiming success for unmet acceptance criteria.",
+        codex_protocol::validation::ValidationMode::Compile =>
+            "COMPILE: After the last relevant Rust source/Cargo input edit, perform one targeted cargo check of affected owners and required separate integration-test consumers through the repository's runner; documentation-only changes need no build. No test execution, formatting, or other validation. Do not automatically author regression tests; test authoring requires an explicit user request. At most two compile attempts may start. Retry only after relevant inputs change. If ownership cannot be determined safely, report that limitation; never broaden to the workspace. After exhaustion, report actual compiler errors and unverified requirements; do not continue solely for validation or describe policy refusal as busy.",
+        codex_protocol::validation::ValidationMode::Benchmark =>
+            "BENCHMARK: Scoped, non-destructive benchmarking is authorized by default for performance audits, within the requested objective, permissions, and configured attempt budget. Targeted cargo check still requires task authorization; retry compilation only after relevant inputs change. Tests, formatting, Clippy, full builds, and mixed or unclassified validation are not authorized by this mode. Do not automatically author regression tests; test authoring requires an explicit user request. Review-only workers must transfer execution to an authorized parent or verifier. Respect explicit OFF/COMPILE selections and user execution restrictions. At exhaustion, report actual errors and unverified requirements without a validation-only continuation.",
+        codex_protocol::validation::ValidationMode::Full =>
+            "FULL: Run only task-authorized validation within the configured attempt budget. Batch settled selections, preserve required consumers and exact test obligations, and distinguish busy admission from started failures. At exhaustion, report actual errors and unverified requirements without a validation-only continuation.",
+    };
+    let mut instructions = (*turn.base_instructions).clone();
+    instructions.text.push_str(&format!(
+        "\n\n<validation_mode>\n{directive}\nAttempt limit: {}. A limit is not permission to validate; explicit user restrictions still apply. Consume already-running work through its owner without launching duplicates.\n</validation_mode>",
+        validation_attempt_limit(turn),
+    ));
+    Arc::new(instructions)
+}
+
+#[cfg(test)]
+mod validation_mode_prompt_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn active_turn_validation_mode_is_injected_once_without_copying_base_prompt() {
+        let (_, mut turn) = crate::session::tests::make_session_and_context().await;
+        turn.validation_full_budget = 3;
+        for (mode, expected, limit) in [
+            (codex_protocol::validation::ValidationMode::Off, "OFF:", 0),
+            (codex_protocol::validation::ValidationMode::Compile, "COMPILE:", 2),
+            (codex_protocol::validation::ValidationMode::Benchmark, "BENCHMARK:", 3),
+            (codex_protocol::validation::ValidationMode::Full, "FULL:", 3),
+        ] {
+            turn.validation_mode = mode;
+            let instructions = validation_mode_base_instructions(&turn);
+            assert!(instructions.text.starts_with(&turn.base_instructions.text));
+            assert_eq!(instructions.text.matches("<validation_mode>").count(), 1);
+            assert!(instructions.text.contains(expected));
+            assert!(instructions.text.contains(&format!("Attempt limit: {limit}.")));
+        }
+    }
 }
 
 fn rebase_generation_request_after_compaction(
@@ -2566,23 +2259,6 @@ fn turn_input_first_text(input: &[TurnInput]) -> Option<&str> {
     })
 }
 
-/// Names observed changes the turn did not make, without counting them as its own.
-/// A turn without attributed edits is told so: its commands remain a possible
-/// cause, but the useful action is re-reading evidence gathered before the change.
-fn unattributed_changes_advisory(paths: &[String], made_attributed_edits: bool) -> Option<String> {
-    (!paths.is_empty()).then(|| {
-        let paths = crate::session::turn_execution::bounded_path_list(paths);
-        if made_attributed_edits {
-            format!(
-                "Workspace changes observed during this turn were not attributed to it (another writer, or an undeclared command effect): {paths}. Re-read these paths before relying on evidence gathered earlier."
-            )
-        } else {
-            format!(
-                "This turn made no attributed edits, but these paths changed during it (another writer, or an undeclared effect of a command it ran): {paths}. Evidence read from them earlier may be stale; re-read before relying on it."
-            )
-        }
-    })
-}
 
 /// Test files by common convention: a test directory or a test-named file.
 /// This only selects paths for the advisory below; it discovers no tests.
@@ -2689,6 +2365,14 @@ async fn record_context_notice_if_changed(
     marker: &str,
     text: &str,
 ) -> CodexResult<bool> {
+    if matches!(turn.session_source, SessionSource::SubAgent(_))
+        && matches!(
+            marker,
+            "tool_search_sources" | "mcp_catalog_availability" | "mcp_catalog_notice"
+        )
+    {
+        return Ok(false);
+    }
     let opening = format!("<{marker}>");
     let rendered = format!("{opening}\n{text}\n</{marker}>");
     let history = sess.clone_history().await;
@@ -2936,29 +2620,10 @@ fn take_convergence_observation(
         .unwrap_or_default()
 }
 
-async fn record_soft_convergence_directive(
-    sess: &Session,
-    turn_context: &TurnContext,
-    turn_execution: &mut TurnExecutionControl,
-    is_continuation: bool,
-) -> std::io::Result<()> {
-    if let Some(directive) = turn_execution.batching_advisory(is_continuation) {
-        record_turn_execution_directive(sess, turn_context, turn_execution, directive, false)
-            .await?;
-    }
-    if let Some(directive) = turn_execution.take_soft_convergence_directive(is_continuation) {
-        let mut decision = SamplingConvergenceDecision {
-            directive: Some(directive),
-            ..SamplingConvergenceDecision::default()
-        };
-        record_convergence_decision(sess, turn_context, turn_execution, Some(&mut decision))
-            .await?;
-    }
-    Ok(())
-}
+
 
 async fn record_convergence_decision(
-    sess: &Session,
+    _sess: &Session,
     turn_context: &TurnContext,
     turn_execution: &mut TurnExecutionControl,
     decision: Option<&mut SamplingConvergenceDecision>,
@@ -2968,54 +2633,13 @@ async fn record_convergence_decision(
         turn_context
             .turn_timing_state
             .record_proven_loop_activation();
-        sess.send_event(
-            turn_context,
-            EventMsg::Warning(WarningEvent {
-                message: "A repeated action/result cycle was detected. Existing results will be reused where possible; other actions remain available to complete the task.".to_string(),
-            }),
-        )
-        .await;
     }
-    let Some(directive) = directive else {
-        return Ok(());
-    };
-    record_turn_execution_directive(sess, turn_context, turn_execution, directive, true).await
-}
-
-async fn record_turn_execution_directive(
-    sess: &Session,
-    turn_context: &TurnContext,
-    turn_execution: &mut TurnExecutionControl,
-    directive: String,
-    no_progress: bool,
-) -> std::io::Result<()> {
-    if !turn_execution.admit_directive(&directive) {
-        return Ok(());
-    }
-    if no_progress {
+    // Retain loop telemetry, but do not turn it into model instructions.
+    if directive.as_deref().is_some_and(|text| turn_execution.admit_directive(text)) {
         turn_context
             .turn_timing_state
             .record_no_progress_directive();
     }
-    let directive_item = ResponseItem::Message {
-        id: Some(codex_protocol::ResponseItemId::with_suffix(
-            "msg_turn_advice",
-            &turn_context.sub_id,
-        )),
-        role: "developer".to_string(),
-        content: vec![ContentItem::InputText {
-            text: format!(
-                "Turn-local convergence advice for task {} only; expires when that task ends. It does not constrain a later task or its scope.\n{directive}",
-                turn_context.sub_id
-            ),
-        }],
-        phase: None,
-        internal_chat_message_metadata_passthrough: None,
-    };
-    // The turn-local convergence controller owns warning cadence. Session-wide
-    // text deduplication would hide the same warning in every later turn.
-    sess.record_conversation_items(turn_context, &[directive_item])
-        .await?;
     Ok(())
 }
 
@@ -3487,7 +3111,9 @@ fn task_relevant_recommended_plugins(
         .iter()
         .filter_map(|item| match item {
             ContentItem::InputText { text } => Some(text.as_str()),
-            ContentItem::InputImage { .. } | ContentItem::OutputText { .. } => None,
+            ContentItem::InputImage { .. }
+            | ContentItem::OutputText { .. }
+            | ContentItem::Refusal { .. } => None,
         })
         .collect::<Vec<_>>()
         .join("\n")
@@ -6643,14 +6269,7 @@ fn request_user_input_eligible(turn_context: &TurnContext) -> bool {
 }
 
 pub(super) fn agent_surface_stage(sess: &Session, turn_context: &TurnContext) -> AgentSurfaceStage {
-    let spawn_eligible = match turn_context.multi_agent_version {
-        MultiAgentVersion::Disabled => false,
-        MultiAgentVersion::V1 => !crate::agent::exceeds_thread_spawn_depth_limit(
-            crate::agent::next_thread_spawn_depth(&turn_context.session_source),
-            turn_context.config.agent_max_depth,
-        ),
-        MultiAgentVersion::V2 => true,
-    };
+    let spawn_eligible = turn_context.multi_agent_version != MultiAgentVersion::Disabled;
     let control = &sess.services.agent_control;
     agent_surface_stage_from_snapshot(
         spawn_eligible,
@@ -8037,19 +7656,6 @@ fn try_run_sampling_request<'a>(
             auth_mode = sess.services.auth_manager.auth_mode(),
             features = sess.features.enabled_features(),
         );
-        let inference_trace = sess.services.rollout_thread_trace.inference_trace_context(
-            turn_context.sub_id.as_str(),
-            turn_context.model_info.slug.as_str(),
-            turn_context.provider.info().name.as_str(),
-        ).with_request_metadata(|| serde_json::json!({
-            "enabled_features": sess.features.enabled_features().into_iter().map(Feature::key).collect::<Vec<_>>(),
-            "configured_reasoning_effort": turn_context.configured_reasoning_effort,
-            "resolved_reasoning_effort": request_effort,
-            "reasoning_summary": turn_context.reasoning_summary,
-            "service_tier": service_tier,
-            "collaboration_mode": turn_context.collaboration_mode,
-            "parallel_tool_calls": prompt.parallel_tool_calls,
-        }));
         let sampling_timing_guard = turn_context.turn_timing_state.begin_sampling();
         let uses_sequential_cutoff_reasoning_summaries = turn_context
             .config
@@ -8317,7 +7923,6 @@ fn try_run_sampling_request<'a>(
             turn_context.reasoning_summary,
             service_tier,
             responses_metadata,
-            &inference_trace,
             Some(attempt_prepared),
         ))
         .instrument(trace_span!("stream_request"))

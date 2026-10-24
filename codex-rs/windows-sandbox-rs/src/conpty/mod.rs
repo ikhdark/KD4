@@ -109,7 +109,7 @@ pub unsafe fn spawn_conpty_process_as_user(
         .collect::<Vec<_>>()
         .join(" ");
     let mut cmdline: Vec<u16> = to_wide(&cmdline_str);
-    let env_block = make_env_block(env_map);
+    let env_block = make_env_block(env_map)?;
     // SAFETY: STARTUPINFOEXW contains integer and pointer fields with a valid all-zero initial
     // representation.
     let mut si: STARTUPINFOEXW = unsafe { std::mem::zeroed() };

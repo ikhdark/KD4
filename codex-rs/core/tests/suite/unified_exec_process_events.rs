@@ -671,7 +671,6 @@ async fn exec_command_consumes_pushed_remote_process_events(
                 .permissions
                 .set_permission_profile(PermissionProfile::Disabled)
                 .expect("test config should allow an unsandboxed permission profile");
-            config.permissions.network = None;
             config
                 .features
                 .enable(Feature::ShellTool)

@@ -1167,3 +1167,46 @@ async fn pairing_errors_do_not_disclose_malformed_or_scalar_credentials() {
         assert!(!err.contains("secret-credential"));
     }
 }
+#[tokio::test]
+async fn pairing_status_http_releases_enrollment_and_preserves_rotated_token() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let handle = remote_control_handle_with_current_enrollment(&remote_control_url_for_listener(&listener), remote_control_auth_manager());
+    let request_handle = handle.clone();
+    let task = tokio::spawn(async move {
+        request_handle.pairing_status(RemoteControlPairingStatusParams {
+            pairing_code: Some("pairing-code".into()), manual_pairing_code: None,
+        }).await
+    });
+    let request = accept_http_request(&listener).await;
+    {
+        let mut lease = timeout(Duration::from_secs(1), handle.current_enrollment.lock()).await
+            .expect("status HTTP must not own enrollment");
+        lease.as_mut().unwrap().remote_control_token = Some("new-generation".into());
+    }
+    respond_with_status(request.stream, "401 Unauthorized", "").await;
+    let retry = accept_http_request(&listener).await;
+    assert!(retry.request_line.contains("/pair/status"), "stale auth failure must not refresh/clear the new token");
+    assert_eq!(retry.headers.get("authorization").map(String::as_str), Some("Bearer new-generation"));
+    drop(timeout(Duration::from_secs(1), handle.current_enrollment.lock()).await.expect("retry HTTP must not own enrollment"));
+    respond_with_json(retry.stream, json!({"claimed":true})).await;
+    assert!(task.await.unwrap().unwrap().claimed);
+    assert_eq!(handle.current_enrollment.snapshot().unwrap().remote_control_token.as_deref(), Some("new-generation"));
+}
+
+#[tokio::test]
+async fn explicit_disable_retires_pairing_across_immediate_reenable() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let home = TempDir::new().unwrap();
+    let mut handle = remote_control_handle_with_current_enrollment(&remote_control_url_for_listener(&listener), remote_control_auth_manager());
+    handle.state_db = Some(remote_control_state_runtime(&home).await);
+    let request_handle = handle.clone();
+    let task = tokio::spawn(async move { request_handle.start_pairing(RemoteControlPairingStartParams::default(), None).await });
+    let request = accept_http_request(&listener).await;
+    timeout(Duration::from_secs(1), handle.disable_ephemeral()).await.expect("disable is prompt");
+    handle.enable_ephemeral().unwrap();
+    let error = timeout(Duration::from_secs(1), task).await.expect("obsolete pairing is cancelled").unwrap().unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+    drop(request);
+    assert!(handle.desired_state_tx.borrow().is_enabled());
+    assert_eq!(handle.current_enrollment.snapshot().unwrap().remote_control_token.as_deref(), Some(TEST_REMOTE_CONTROL_SERVER_TOKEN));
+}

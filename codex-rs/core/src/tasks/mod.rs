@@ -44,7 +44,6 @@ use codex_analytics::TurnTokenUsageFact;
 use codex_code_mode::CancellationCause;
 use codex_otel::SessionTelemetry;
 use codex_otel::TURN_E2E_DURATION_METRIC;
-use codex_otel::TURN_NETWORK_PROXY_METRIC;
 use codex_otel::TURN_TOKEN_USAGE_METRIC;
 use codex_otel::TURN_TOOL_CALL_METRIC;
 use codex_protocol::models::ResponseItem;
@@ -221,21 +220,6 @@ fn last_message_before_turn_error(
     ))
 }
 
-fn emit_turn_network_proxy_metric(
-    session_telemetry: &SessionTelemetry,
-    network_proxy_active: bool,
-) {
-    let active = if network_proxy_active {
-        "true"
-    } else {
-        "false"
-    };
-    session_telemetry.counter(
-        TURN_NETWORK_PROXY_METRIC,
-        /*inc*/ 1,
-        &[("active", active)],
-    );
-}
 
 pub(crate) fn emit_compact_metric(
     session_telemetry: &SessionTelemetry,
@@ -987,7 +971,16 @@ impl Session {
                         {
                             return TerminalSchedule::NotFound;
                         }
-                        let Some(permit) = coordinator.try_claim() else {
+                        let worker_finished = active_turn
+                            .task
+                            .as_ref()
+                            .is_some_and(|task| task.worker_done.load(Ordering::Acquire));
+                        let permit = if worker_finished {
+                            coordinator.try_claim_after_worker_finished()
+                        } else {
+                            coordinator.try_claim()
+                        };
+                        let Some(permit) = permit else {
                             return TerminalSchedule::AlreadyRunning(coordinator);
                         };
                         let Some(task) = active_turn.task.take() else {
@@ -1134,22 +1127,6 @@ impl Session {
         turn_tool_calls: u64,
         turn_token_usage: &TokenUsage,
     ) {
-        let network_proxy = self.services.network_proxy.load_full();
-        let network_proxy_active = match network_proxy.as_ref() {
-            Some(started_network_proxy) => {
-                match started_network_proxy.proxy().current_cfg().await {
-                    Ok(config) => config.enabled,
-                    Err(err) => {
-                        warn!(
-                            "failed to read managed network proxy state for turn metrics: {err:#}"
-                        );
-                        false
-                    }
-                }
-            }
-            None => false,
-        };
-        emit_turn_network_proxy_metric(&self.services.session_telemetry, network_proxy_active);
         self.services.session_telemetry.histogram(
             TURN_TOOL_CALL_METRIC,
             i64::try_from(turn_tool_calls).unwrap_or(i64::MAX),
@@ -1623,18 +1600,6 @@ impl Session {
                     &unsaved_records.join("; "),
                 ));
         }
-        if let Some(snapshot) = self
-            .services
-            .validation_uncertainty
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .snapshot_for_turn(&turn_context.sub_id)
-        {
-            timing
-                .completion_assessment
-                .get_or_insert_with(Default::default)
-                .validation_uncertainty = Some(snapshot);
-        }
         if finalization
             .permit
             .as_ref()
@@ -1835,18 +1800,6 @@ impl Session {
             &self.thread_id.to_string(),
         )
         .await;
-        if let Some(snapshot) = self
-            .services
-            .validation_uncertainty
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .snapshot_for_turn(&turn_context.sub_id)
-        {
-            timing
-                .completion_assessment
-                .get_or_insert_with(Default::default)
-                .validation_uncertainty = Some(snapshot);
-        }
         let event = if let Some(reason) = finalization.abort_reason.clone() {
             EventMsg::TurnAborted(TurnAbortedEvent {
                 turn_id: Some(turn_context.sub_id.clone()),

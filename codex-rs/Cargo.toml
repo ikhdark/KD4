@@ -1,6 +1,5 @@
 [workspace]
 members = [
-    "third-party/rama-socks5",
     "aws-auth",
     "analytics",
     "agent-graph-store",
@@ -51,14 +50,11 @@ members = [
     "ext/builtins",
     "ext/connectors",
     "ext/extension-api",
-    "ext/goal",
     "ext/image-generation",
     "ext/items",
     "ext/mcp",
     "ext/skills",
     "ext/web-search",
-    "external-agent-migration",
-    "external-agent-sessions",
     "keyring-store",
     "file-search",
     "file-watcher",
@@ -67,16 +63,13 @@ members = [
     "codex-mcp",
     "model-provider-info",
     "models-manager",
-    "network-proxy",
     "network-types",
     "ollama",
     "process-hardening",
     "protocol",
     "prompts",
     "rollout",
-    "rollout-trace",
     "rmcp-client",
-    "responses-api-proxy",
     "response-debug-context",
     "sandboxing",
     "stdio-to-uds",
@@ -167,10 +160,7 @@ codex-exec-server = { path = "exec-server" }
 codex-execpolicy = { path = "execpolicy" }
 codex-extension-api = { path = "ext/extension-api" }
 codex-extension-items = { path = "ext/items" }
-codex-goal-extension = { path = "ext/goal" }
 codex-image-generation-extension = { path = "ext/image-generation" }
-codex-external-agent-migration = { path = "external-agent-migration" }
-codex-external-agent-sessions = { path = "external-agent-sessions" }
 codex-experimental-api-macros = { path = "codex-experimental-api-macros" }
 codex-features = { path = "features" }
 codex-feedback = { path = "feedback" }
@@ -187,7 +177,6 @@ codex-mcp = { path = "codex-mcp" }
 codex-mcp-extension = { path = "ext/mcp" }
 codex-model-provider-info = { path = "model-provider-info" }
 codex-models-manager = { path = "models-manager" }
-codex-network-proxy = { path = "network-proxy" }
 codex-network-types = { path = "network-types" }
 codex-ollama = { path = "ollama" }
 codex-otel = { path = "otel" }
@@ -196,11 +185,9 @@ codex-model-provider = { path = "model-provider" }
 codex-process-hardening = { path = "process-hardening" }
 codex-protocol = { path = "protocol" }
 codex-prompts = { path = "prompts" }
-codex-responses-api-proxy = { path = "responses-api-proxy" }
 codex-response-debug-context = { path = "response-debug-context" }
 codex-rmcp-client = { path = "rmcp-client" }
 codex-rollout = { path = "rollout" }
-codex-rollout-trace = { path = "rollout-trace" }
 codex-sandboxing = { path = "sandboxing" }
 codex-secrets = { path = "secrets" }
 codex-shell-command = { path = "shell-command" }
@@ -341,13 +328,6 @@ protoc-bin-vendored = "=3.3.0"
 pulldown-cmark = "0.13.4"
 quick-xml = "0.42.0"
 quote = "1"
-rama-core = "=0.3.0-alpha.4"
-rama-http = "=0.3.0-alpha.4"
-rama-http-backend = "=0.3.0-alpha.4"
-rama-net = "=0.3.0-alpha.4"
-rama-socks5 = "=0.3.0-alpha.4"
-rama-tcp = "=0.3.0-alpha.4"
-rama-tls-rustls = "=0.3.0-alpha.4"
 rand = "0.10.3"
 rcgen = { version = "0.14.7", default-features = false, features = [
     "aws_lc_rs",
@@ -528,6 +508,9 @@ opt-level = 0
 debug = "none"
 strip = "symbols"
 
+[profile.dev-small.package."*"]
+debug = "none"
+
 [profile.release]
 lto = "thin"
 debug = "line-tables-only"
@@ -541,15 +524,30 @@ codegen-units = 4
 
 [profile.local-release]
 inherits = "release"
-lto = false
-# Local publishes rebuild the serial core -> app-server -> cli chain
-# after core edits. Parallelize and reuse workspace codegen; dependencies keep
-# the release settings so their artifacts and sccache entries stay valid.
-codegen-units = 16
+opt-level = 3
+lto = "fat"
+# Favor runtime optimization over local build throughput.
+codegen-units = 1
 incremental = true
 
 [profile.local-release.package."*"]
-codegen-units = 4
+codegen-units = 1
+
+# Warm local publish builds: reuse incremental codegen and avoid whole-program LTO.
+# Keep release semantics (no debug assertions/overflow checks), but trade peak
+# runtime optimization for shorter edit/build/publish cycles.
+[profile.local-fast]
+inherits = "release"
+opt-level = 2
+lto = "off"
+codegen-units = 16
+incremental = true
+
+# rustc 1.99.1/LLVM 23 reports `Missing .seh_endepilogue` while optimizing
+# icu_calendar's AnyCalendar::day_of_year for Windows. Limit the workaround to
+# this dependency in local-fast; leave the other crates and final builds alone.
+[profile.local-fast.package.icu_calendar]
+opt-level = 0
 
 [profile.profiling]
 inherits = "release"
@@ -560,7 +558,6 @@ strip = false
 [patch.crates-io]
 notify = { path = "../third_party/notify" }
 # Keep the locked release; narrowly repair UDP wildcard endpoint binding and port pinning.
-rama-socks5 = { path = "third-party/rama-socks5" }
 tokio-tungstenite = { git = "https://github.com/openai-oss-forks/tokio-tungstenite", rev = "0e5b2d73aa18dd9f0a50ee9ff199d5aef7594186" }
 tungstenite = { git = "https://github.com/openai-oss-forks/tungstenite-rs", rev = "4fffad30fe373adbdcffab9545e9e9bf4f2fc19f" }
 

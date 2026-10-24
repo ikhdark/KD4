@@ -40,8 +40,6 @@ use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::GranularApprovalConfig;
 use codex_protocol::protocol::McpInvocation;
 use codex_protocol::protocol::SessionSource;
-use codex_rollout_trace::ThreadStartedTraceMetadata;
-use codex_rollout_trace::replay_bundle;
 use codex_utils_path_uri::PathUri;
 use pretty_assertions::assert_eq;
 use serde::Deserialize;
@@ -386,11 +384,6 @@ async fn execute_mcp_tool_call_records_replayable_correlation() -> anyhow::Resul
     let server = start_mock_server().await;
     AppsTestServer::mount(&server).await?;
     let (mut session, turn_context, rx_event) = make_session_and_context_with_rx().await;
-    attach_trace_bundle(
-        Arc::get_mut(&mut session).expect("test session has one owner before registration"),
-        &turn_context,
-        temp.path(),
-    )?;
     let (step_context, startup_cancellation_token) =
         step_context_with_live_apps(&turn_context, &server.uri()).await;
     let tools = step_context.mcp.manager().list_all_tools().await;
@@ -457,21 +450,7 @@ async fn execute_mcp_tool_call_records_replayable_correlation() -> anyhow::Resul
             .and_then(JsonValue::as_str),
         Some("trace")
     );
-    let backend_correlation = calls[0]
-        .pointer("/params/_meta/codex_bridge_mcp_call_id")
-        .and_then(JsonValue::as_str)
-        .expect("actual backend request carries rollout correlation");
-    uuid::Uuid::parse_str(backend_correlation).expect("backend correlation is a concrete UUID");
-    session.terminal_tasks.close();
-    tokio::time::timeout(Duration::from_secs(5), session.terminal_tasks.wait())
-        .await
-        .expect("all tracked trace writes finish before replay");
-    let replayed = replay_bundle(single_bundle_dir(temp.path())?)?;
-    assert_eq!(
-        replayed.tool_calls[call_id].mcp_call_id.as_deref(),
-        Some(backend_correlation),
-        "replayed registered dispatch and actual backend request share the same correlation"
-    );
+    assert!(calls[0].pointer("/params/_meta/codex_bridge_mcp_call_id").is_none());
     startup_cancellation_token.cancel();
     Ok(())
 }
@@ -554,44 +533,7 @@ print({hook_output:?})
     log_path.to_path_buf()
 }
 
-/// Attaches a replayable rollout bundle to one synthetic session under test.
-fn attach_trace_bundle(
-    session: &mut Session,
-    turn_context: &TurnContext,
-    root: &Path,
-) -> anyhow::Result<()> {
-    let rollout_thread_trace =
-        codex_rollout_trace::ThreadTraceContext::start_root_in_root_for_test(
-            root,
-            ThreadStartedTraceMetadata {
-                thread_id: session.thread_id.to_string(),
-                agent_path: "/root".to_string(),
-                task_name: None,
-                nickname: None,
-                agent_role: None,
-                session_source: SessionSource::Exec,
-                cwd: PathBuf::from("/workspace"),
-                rollout_path: None,
-                model: "gpt-test".to_string(),
-                provider_name: "test-provider".to_string(),
-                approval_policy: "never".to_string(),
-                sandbox_policy: "danger-full-access".to_string(),
-            },
-        )?;
-    rollout_thread_trace.record_codex_turn_started(turn_context.sub_id.as_str());
-    session.services.rollout_thread_trace = rollout_thread_trace;
-    Ok(())
-}
 
-/// Returns the sole bundle emitted under a temporary rollout trace root.
-fn single_bundle_dir(root: &Path) -> anyhow::Result<PathBuf> {
-    let mut entries = fs::read_dir(root)?
-        .map(|entry| entry.map(|entry| entry.path()))
-        .collect::<Result<Vec<_>, _>>()?;
-    entries.sort();
-    assert_eq!(entries.len(), 1);
-    Ok(entries.remove(0))
-}
 
 #[test]
 fn mcp_app_resource_uri_reads_known_tool_meta_keys() {

@@ -44,6 +44,10 @@ impl ToolExecutor<ToolInvocation> for PacketTestTool {
                 panic!("nested function dispatch must preserve its payload kind");
             };
             let args: serde_json::Value = serde_json::from_str(&arguments).unwrap();
+            if args["oversized_json"] == true {
+                return Ok(crate::tools::context::boxed_tool_output(codex_tools::JsonToolOutput::with_success(
+                    serde_json::json!({"body":"x".repeat(33*1024*1024)}), Some(true))));
+            }
             if args["serial_retention"] == true
                 && let crate::tools::router::ToolCallSource::CodeMode { cell_id, .. } =
                     &invocation.source
@@ -126,7 +130,7 @@ impl ToolExecutor<ToolInvocation> for PacketTestTool {
                         environment_id: Some("local".to_string()),
                         retry: None,
                         diagnostics: Vec::new(),
-                        concurrent_sessions: None,
+
                     },
                 ));
             }
@@ -165,6 +169,13 @@ impl ToolExecutor<ToolInvocation> for PacketTestTool {
             };
             let output = FunctionToolOutput::from_text(text, Some(true));
             let output = match args["outcome"].as_str() {
+                Some("admission_busy") => output
+                    .with_outcome(ToolOutputOutcome::Failure)
+                    .with_sampling_request_signal(serde_json::json!({
+                        "outcome": "blocked",
+                        "validation_admission_pending": true,
+                        "semantic_evidence": "Rust admission busy: validation did not start and is not queued.",
+                    })),
                 Some("blocked") => output.with_skip_disposition(
                     codex_tools::ToolOutputSkipDisposition::BlockingRequiredOperation,
                 ),
@@ -584,6 +595,94 @@ fn packet_output_text(output: &dyn ToolOutput) -> String {
         panic!("exec projection must produce a custom tool output");
     };
     output.body.to_text().unwrap()
+}
+
+#[tokio::test]
+async fn audit144_append_receipt_survives_progress_yield_and_later_failure() {
+    let workspace = tempfile::tempdir().unwrap();
+    std::fs::write(workspace.path().join("effect.txt"), "base\n").unwrap();
+    let runtime = PacketRuntime::with_nested_runtimes_in_workspace(
+        vec![Arc::new(
+            crate::tools::handlers::ApplyPatchHandler::default(),
+        )],
+        Some(workspace.path()),
+    )
+    .await;
+    let patch = "*** Begin Patch\n*** Update File: effect.txt\n@@\n+effect\n*** End Patch";
+    let initial = runtime.exec(&format!("await tools.apply_patch({}); text('progress'); await yield_control(); throw Error('later failure');", serde_json::to_string(patch).unwrap())).await;
+    let visible = packet_output_text(initial.as_ref());
+    assert!(visible.contains("effect.txt"), "{visible}");
+    assert!(visible.contains("Success"), "{visible}");
+    let terminal = runtime.wait(&runtime.live_cell()).await;
+    assert_eq!(terminal.outcome_for_logging(), ToolOutputOutcome::Failure);
+    assert!(packet_output_text(terminal.as_ref()).contains("later failure"));
+    let actual = std::fs::read_to_string(workspace.path().join("effect.txt")).unwrap();
+    assert_eq!(
+        actual.matches("effect\n").count(),
+        1,
+        "a failed cell must not replay the append"
+    );
+    runtime.finish().await;
+}
+
+#[tokio::test]
+async fn audit144_caught_patch_routing_error_can_be_repaired_in_cell() {
+    let workspace = tempfile::tempdir().unwrap();
+    let runtime = PacketRuntime::with_nested_runtimes_in_workspace(
+        vec![
+            Arc::new(PacketTestTool {
+                name: "exec_command",
+            }),
+            Arc::new(crate::tools::handlers::ApplyPatchHandler::default()),
+        ],
+        Some(workspace.path()),
+    )
+    .await;
+    let patch = "*** Begin Patch\n*** Add File: repaired.txt\n+once\n*** End Patch";
+    // Use the recognized PowerShell here-string wrapper, matching the routing
+    // guard's existing contract rather than an unrecognized shell spelling.
+    let wrapper = format!("@'\n{patch}\n'@ | apply_patch");
+    let output = runtime.exec(&format!("let rejected=false; try {{ await tools.exec_command({{cmd:{}}}); }} catch(error) {{ rejected=error.message.includes('was not run'); }} if(!rejected) throw Error('wrapper ran'); const result=await tools.apply_patch({}); if(!result.success) throw Error('repair failed'); text('repaired');", serde_json::to_string(&wrapper).unwrap(), serde_json::to_string(patch).unwrap())).await;
+    assert_eq!(
+        output.outcome_for_logging(),
+        ToolOutputOutcome::Success,
+        "{}",
+        packet_output_text(output.as_ref())
+    );
+    assert_eq!(
+        std::fs::read_to_string(workspace.path().join("repaired.txt")).unwrap(),
+        "once\n"
+    );
+    runtime.finish().await;
+}
+
+#[tokio::test]
+async fn audit144_oversized_delegate_result_has_an_in_cell_artifact_route() {
+    let runtime = PacketRuntime::with_nested_runtimes(vec![
+        Arc::new(PacketTestTool {
+            name: "large_result",
+        }),
+        Arc::new(crate::tools::handlers::ReadToolOutputHandler),
+    ])
+    .await;
+    let output=runtime.exec(r#"
+    const r=await tools.large_result({oversized_json:true});
+    if(!r.result_retained || !r.completed || r.failed) throw Error('lost successful outcome');
+    const id=r.outcome.artifact_id; if(!id) throw Error('lost locator');
+    // Synchronize with the existing fixture's actual retention owner, not an
+    // invented storage latency SLO or repeated destructive producer calls.
+    await tools.large_result({serial_retention:true});
+    const page=await tools.read_tool_output({artifact_id:id,selectors:[{kind:'bytes',start:0,end:32}]});
+    if(!page || !page.results[0].text.startsWith('{"body":"xxxx')) throw Error('exact recovery failed');
+    text('one producer, retained success, exact prefix recovered');
+"#).await;
+    assert_eq!(
+        output.outcome_for_logging(),
+        ToolOutputOutcome::Success,
+        "{}",
+        packet_output_text(output.as_ref())
+    );
+    runtime.finish().await;
 }
 
 /// No provider calls: measures the real JS/broker/router/projection round trip
@@ -1014,6 +1113,24 @@ async fn exec_reports_omitted_nested_fallback_results() {
     assert!(visible.contains("explicit result"), "{visible}");
     assert!(!visible.contains("results were omitted"), "{visible}");
     assert!(!visible.contains("READ_RESULT_42"), "{visible}");
+    runtime.finish().await;
+}
+
+#[tokio::test]
+async fn exec_busy_validation_does_not_abort_independent_work() {
+    let runtime = PacketRuntime::new().await;
+    let output = runtime
+        .exec(
+            "try { await tools.read_tool_output({outcome: 'admission_busy'}); } \
+             catch { text('VALIDATION_STILL_PENDING'); } \
+             text(await tools.read_tool_output({}));",
+        )
+        .await;
+    assert_eq!(output.outcome_for_logging(), ToolOutputOutcome::Success);
+    let visible = packet_output_text(output.as_ref());
+    assert!(visible.contains("VALIDATION_STILL_PENDING"));
+    assert!(visible.contains("READ_RESULT_42"));
+    assert!(!visible.contains("Required nested tool outcome"));
     runtime.finish().await;
 }
 
@@ -3233,140 +3350,60 @@ async fn completion_audit_retained_intent_requires_authoritative_terminal_comman
     }
 }
 #[tokio::test]
-async fn nested_read_dispatch_seeds_replay_without_duplicate_outcomes() {
-    use crate::session::turn_execution::SamplingRequestSettledState;
-    use crate::session::turn_execution::SessionPathReplays;
-    use crate::session::turn_execution::TurnExecutionControl;
-    use codex_protocol::models::ResponseInputItem;
-
+async fn nested_reads_keep_provenance_without_printing_it_or_replaying_reads() {
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("source.txt");
     std::fs::write(&path, "first\nsecond\n").unwrap();
-    // Runtime path watches require a repository root; a non-Git workspace
-    // deliberately cannot certify the source observation for replay.
     let init = std::process::Command::new("git")
         .args(["init", "--quiet"])
         .current_dir(root.path())
         .output()
         .unwrap();
-    assert!(
-        init.status.success(),
-        "{}",
-        String::from_utf8_lossy(&init.stderr)
-    );
+    assert!(init.status.success(), "{}", String::from_utf8_lossy(&init.stderr));
     let runtime = PacketRuntime::with_nested_runtimes_in_workspace(
         vec![Arc::new(crate::tools::handlers::ReadFileHandler)],
         Some(root.path()),
-    )
-    .await;
-    let args = serde_json::json!({"path": path});
-    let payload = ToolPayload::Function {
-        arguments: args.to_string(),
-    };
-    let source = format!("text(await tools.read_file({args}));");
-    let captures_before = runtime
-        .session
-        .services
-        .git_workspace
-        .workspace_evidence_capture_count();
-    let output = runtime.exec(&source).await;
-    assert_eq!(output.outcome_for_logging(), ToolOutputOutcome::Success);
+    ).await;
+    let source = format!("text(await tools.read_file({}));", serde_json::json!({"path":path}));
+    let payload = ToolPayload::Custom { input: source.clone() };
+    let captures_before = runtime.session.services.git_workspace.workspace_evidence_capture_count();
+    let first = runtime.exec(&source).await;
+    assert_eq!(first.outcome_for_logging(), ToolOutputOutcome::Success);
+    let visible = serde_json::to_string(&first.to_response_item("first", &payload)).unwrap();
+    assert!(visible.contains("first"));
+    assert!(!visible.contains("canonical_uri"), "{visible}");
     assert_eq!(
-        runtime
-            .session
-            .services
-            .git_workspace
-            .workspace_evidence_capture_count(),
+        runtime.session.services.git_workspace.workspace_evidence_capture_count(),
         captures_before,
-        "exporting replay evidence must not force a new whole-workspace capture"
-    );
-    let history = runtime.session.clone_history().await.tool_history_state();
-    let history_json = serde_json::to_value(&history).unwrap();
-    let child = history_json["workspace_evidence"]
-        .as_object()
-        .unwrap()
-        .iter()
-        .find(|(call_id, _)| call_id.starts_with("exec-"))
-        .expect("the nested read must retain its original history evidence")
-        .1;
-    assert!(
-        !child["source_path_observations"]
-            .as_array()
-            .unwrap()
-            .is_empty(),
-        "the replay export must not steal history's pre-read watches"
+        "a nested read must not force a whole-workspace capture"
     );
 
-    // Only the carrier was invoked by the test: the real JS broker, read
-    // handler and nested result recorder must supply every replay prerequisite.
-    let shared = Arc::new(SessionPathReplays::default());
-    let mut control = TurnExecutionControl::new().with_session_path_replays(shared.clone());
-    let baseline = control.baselines(0);
-    control.settle(
-        &baseline,
-        &runtime.signals,
-        &SamplingRequestSettledState {
-            mutation_revision: 0,
-            attributed_mutation_revision: 0,
-            tool_exposure_revision: 0,
-        },
+    let history = runtime.session.clone_history().await;
+    let status = history.tool_history_state().read_status(
+        std::slice::from_ref(&path), None, history.raw_items(),
     );
-    let next = TurnExecutionControl::new().with_session_path_replays(shared);
-    let collector = next.collector(&next.baselines(0));
-    let guard = collector
-        .register_deterministic_tool_call(
-            &codex_tools::ToolName::plain("read_file"),
-            &payload,
-            "later-read",
-        )
-        .replayed_success
-        .expect("the dispatched nested read must seed a replay candidate");
-    let cache = &runtime.session.services.git_workspace;
-    // Reuse validates the actual repository identity, just like dispatch;
-    // `None` describes a non-Git workspace and must not match this fixture.
-    let workspace = cache
-        .workspace_evidence_for_turn(&runtime.step.turn, root.path())
-        .await
-        .identity;
-    assert!(guard.is_fresh(0, cache, workspace.as_ref()));
-    let authority = crate::tools::registry::authorized_tool_invocation_sha256(
-        &runtime.step.turn,
-        &payload,
-        None,
-    );
-    assert!(guard.matches_authorization(authority.as_deref()));
-    assert!(!guard.matches_authorization(Some("changed-permissions")));
-    let ResponseInputItem::FunctionCallOutput { call_id, output } =
-        guard.response_for_call("later-read").unwrap()
-    else {
-        panic!("read response");
-    };
-    assert_eq!(call_id, "later-read");
-    let text = output.body.to_text().unwrap();
-    let replay: serde_json::Value = serde_json::from_str(&text).unwrap();
-    assert_eq!(replay["results"][0]["text"], "first\nsecond\n");
-    let other = ToolPayload::Function {
-        arguments: serde_json::json!({"path": root.path().join("unobserved.txt")}).to_string(),
-    };
-    assert!(
-        collector
-            .register_deterministic_tool_call(
-                &codex_tools::ToolName::plain("read_file"),
-                &other,
-                "other",
-            )
-            .replayed_success
-            .is_none()
-    );
+    let snapshot = &status["paths"][0]["snapshots"][0];
+    assert_eq!(snapshot["source_attribution"], "recorded");
+    assert!(snapshot["canonical_uri"].is_string());
+    assert_eq!(snapshot["coverage"], "full");
+    assert_eq!(snapshot["obtained_bytes"], 13);
+    let original_hash = snapshot["source_sha256"].clone();
 
+    // Same request, new bytes: the ordinary owner must observe them even
+    // without a tracker mutation or a delivered watcher event.
     std::fs::write(&path, "changed\n").unwrap();
-    cache
-        .note_host_workspace_mutation_paths(root.path(), &["source.txt".into()])
-        .await;
-    assert!(
-        !guard.is_fresh(0, cache, workspace.as_ref()),
-        "changed source must not replay"
+    let second = runtime.exec(&source).await;
+    assert_eq!(second.outcome_for_logging(), ToolOutputOutcome::Success);
+    let visible = serde_json::to_string(&second.to_response_item("second", &payload)).unwrap();
+    assert!(visible.contains("changed"), "{visible}");
+    let history = runtime.session.clone_history().await;
+    let status = history.tool_history_state().read_status(
+        std::slice::from_ref(&path), None, history.raw_items(),
     );
+    let latest = &status["paths"][0]["snapshots"][0];
+    assert_eq!(latest["obtained_bytes"], 8);
+    assert_ne!(latest["source_sha256"], original_hash);
+    assert_eq!(latest["source_attribution"], "recorded");
     runtime.finish().await;
 }
 
@@ -3501,4 +3538,93 @@ async fn delivery_waits_for_admitted_nested_calls_to_settle() {
         Some("final answer".to_string())
     );
     service.finish_cell_dispatch(&cell);
+}
+#[tokio::test]
+async fn cancelled_cell_preserves_typed_settled_child_without_committing_store() {
+    check_cancelled_cell_typed_settlement(false).await;
+}
+
+#[tokio::test]
+async fn cancelled_cell_indexes_retained_success_without_reembedding_body() {
+    check_cancelled_cell_typed_settlement(true).await;
+}
+
+async fn check_cancelled_cell_typed_settlement(retained_file: bool) {
+    use crate::tools::registry::CoreToolRuntime;
+    let root = tempfile::tempdir().unwrap();
+    let body = "RETAINED_FILE_BODY_SENTINEL\n".repeat(2_000);
+    let path = root.path().join("retained.txt");
+    std::fs::write(&path, &body).unwrap();
+    let probe = Arc::new(GateWaitProbe::default());
+    let read: Arc<dyn CoreToolRuntime> = if retained_file {
+        Arc::new(crate::tools::handlers::ReadFileHandler)
+    } else {
+        Arc::new(PacketTestTool { name: "read_tool_output" })
+    };
+    let pending: Arc<dyn CoreToolRuntime> = Arc::new(GateWaitTool {
+        name: "gate_holder", shared: true, probe: Arc::clone(&probe),
+    });
+    let mut nested = vec![read, pending];
+    if retained_file { nested.push(Arc::new(crate::tools::handlers::ReadToolOutputHandler)); }
+    let runtime = PacketRuntime::with_nested_runtimes_in_workspace(nested.clone(), Some(root.path())).await;
+    let execute: Arc<dyn CoreToolRuntime> = Arc::new(super::execute_handler::CodeModeExecuteHandler::new(
+        super::execute_spec::create_code_mode_tool(false, false, &[], &[]),
+        nested.iter().map(|tool| tool.spec()).collect(), Vec::new(),
+    ).unwrap());
+    let mut outer = nested;
+    outer.push(execute);
+    let router = Arc::new(crate::tools::router::ToolRouter::from_parts(
+        crate::tools::registry::ToolRegistry::from_tools(outer), Vec::new(),
+    ));
+    let step = crate::session::step_context::StepContext::for_test(Arc::clone(&runtime.step.turn))
+        .with_tool_router_for_test(router);
+    let owner = crate::tools::parallel::ToolCallRuntime::new(
+        Arc::clone(&runtime.session), step, Arc::clone(&runtime.tracker),
+    );
+    let cancellation = tokio_util::sync::CancellationToken::new();
+    let read_name = if retained_file { "read_file" } else { "read_tool_output" };
+    let args = if retained_file {
+        serde_json::json!({"path":path,"selectors":[{"kind":"bytes","start":0,"end":body.len()}]})
+    } else { serde_json::json!({}) };
+    let source = format!("const done = await tools.{read_name}({args}); store('cancelled_write', done); await tools.gate_holder({{}});");
+    let response = tokio::spawn(owner.handle_tool_call_with_source(
+        crate::tools::router::ToolCall {
+            tool_name: codex_tools::ToolName::plain("exec"), call_id: "cancelled-typed-cell".into(),
+            payload: ToolPayload::Custom { input: source },
+        }, crate::tools::router::ToolCallSource::Direct, cancellation.clone(),
+    ));
+    tokio::time::timeout(Duration::from_secs(10), probe.started.cancelled()).await.unwrap();
+    cancellation.cancel();
+    let response = tokio::time::timeout(Duration::from_secs(10), response).await.unwrap().unwrap().unwrap();
+    let value = response.result.code_mode_result(&response.payload);
+    let recovery = &value["cancellation_recovery"];
+    assert!(recovery.is_object(), "{value}");
+    assert_eq!(recovery["retry_safe"], false);
+    assert_eq!(recovery["handler_settlement"]["disposition"], "settled_failure");
+    let children = recovery.pointer("/handler_settlement/result/cancelled_nested_calls/calls")
+        .and_then(serde_json::Value::as_array).expect("native child recovery directory");
+    let settled = children.iter().find(|child| child["tool_name"] == read_name).expect("completed child");
+    assert_eq!(settled["disposition"], "settled_success");
+    assert!(settled["outcome"].is_object(), "exact result/recovery stays native JSON");
+    if retained_file {
+        let outcome = &settled["outcome"];
+        let artifact = outcome["artifact_id"].as_str().expect("native directory retains exact artifact ID");
+        assert_eq!(outcome["canonical_bytes"], body.len());
+        assert_eq!(outcome["recovery"]["arguments"]["artifact_id"], artifact);
+        assert!(outcome.get("result").is_none(), "raw successful payload must not be duplicated");
+        assert!(!serde_json::to_string(children).unwrap().contains("RETAINED_FILE_BODY_SENTINEL"));
+        let read_args = serde_json::json!({"artifact_id":artifact,"selectors":[{"kind":"bytes","start":0,"end":body.len()}],"max_bytes":1048576});
+        let source = format!("const recovered = await tools.read_tool_output({read_args}); if (recovered.results[0].text !== 'RETAINED_FILE_BODY_SENTINEL\\n'.repeat(2000)) throw new Error('incorrect retained bytes'); text('exact artifact recovered');");
+        let recovered = runtime.exec(&source).await;
+        assert_eq!(recovered.outcome_for_logging(), ToolOutputOutcome::Success, "{}", recovered.log_preview());
+        assert!(recovered.log_preview().contains("exact artifact recovered"));
+    } else {
+        assert!(settled["outcome"].to_string().contains("READ_RESULT_42"));
+    }
+    assert!(children.iter().any(|child| child["tool_name"] == "gate_holder" && child["disposition"] == "unresolved"), "{children:?}");
+    assert_eq!(recovery["effects_state"], "unknown", "settled child cannot prove rollback or settle its sibling");
+    let after = runtime.exec("if (load('cancelled_write') !== undefined) throw new Error('cancelled store committed'); text('store remains transactional');").await;
+    assert_eq!(after.outcome_for_logging(), ToolOutputOutcome::Success, "{}", after.log_preview());
+    assert!(after.log_preview().contains("store remains transactional"));
+    runtime.finish().await;
 }

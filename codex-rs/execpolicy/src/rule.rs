@@ -292,10 +292,15 @@ pub(crate) fn normalize_network_rule_host(raw: &str) -> Result<String> {
         ));
     }
     if bracketed || normalized.contains(':') {
-        // Match the proxy's IP identity, including raw and URL-escaped IPv6 scopes.
-        let scoped = normalized
-            .split_once("%25")
-            .or_else(|| normalized.split_once('%'));
+        // Bracketed URI input may escape the delimiter. Canonical policy hosts
+        // are unbracketed and use a raw delimiter, including numeric 25 scopes.
+        let scoped = if bracketed {
+            normalized
+                .split_once("%25")
+                .or_else(|| normalized.split_once('%'))
+        } else {
+            normalized.split_once('%')
+        };
         let (literal, scope) = match scoped {
             Some((literal, scope)) if !scope.is_empty() && !scope.contains('%') => {
                 (literal, Some(scope))

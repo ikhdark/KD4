@@ -134,6 +134,11 @@ fn append_rule_line(policy_path: &Path, rule: &str, deduplicate: bool) -> Result
         .ok_or_else(|| AmendError::MissingParent {
             path: policy_path.to_path_buf(),
         })?;
+    let dir = if dir.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        dir
+    };
     match std::fs::create_dir(dir) {
         Ok(()) => {}
         Err(ref source) if source.kind() == std::io::ErrorKind::AlreadyExists => {}
@@ -298,6 +303,63 @@ mod tests {
     use super::*;
     use pretty_assertions::assert_eq;
     use tempfile::tempdir;
+
+    fn in_isolated_cwd(test_name: &str, test: impl FnOnce()) {
+        const CHILD: &str = "CODEX_EXECPOLICY_RELATIVE_PATH_TEST";
+        if std::env::var(CHILD).as_deref() == Ok(test_name) {
+            test();
+            return;
+        }
+        let dir = tempdir().unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", test_name, "--nocapture"])
+            .env(CHILD, test_name)
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "child failed: {output:?}");
+        assert!(
+            dir.path().join("default.rules").is_file(),
+            "child test must run"
+        );
+    }
+
+    #[test]
+    fn appends_prefix_rule_to_bare_relative_filename() {
+        in_isolated_cwd(
+            "amend::tests::appends_prefix_rule_to_bare_relative_filename",
+            || {
+                let path = Path::new("default.rules");
+                blocking_append_allow_prefix_rule(path, &["echo".into()]).unwrap();
+                assert_eq!(
+                    std::fs::read_to_string(path).unwrap(),
+                    "prefix_rule(pattern=[\"echo\"], decision=\"allow\")\n"
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn appends_network_rule_to_bare_relative_filename() {
+        in_isolated_cwd(
+            "amend::tests::appends_network_rule_to_bare_relative_filename",
+            || {
+                let path = Path::new("default.rules");
+                blocking_append_network_rule(
+                    path,
+                    "example.com",
+                    NetworkRuleProtocol::Https,
+                    Decision::Allow,
+                    None,
+                )
+                .unwrap();
+                assert_eq!(
+                    std::fs::read_to_string(path).unwrap(),
+                    "network_rule(host=\"example.com\", protocol=\"https\", decision=\"allow\")\n"
+                );
+            },
+        );
+    }
 
     #[test]
     fn oversized_policy_is_rejected_without_appending() {

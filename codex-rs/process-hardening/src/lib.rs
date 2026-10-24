@@ -57,14 +57,7 @@ const PRCTL_FAILED_EXIT_CODE: i32 = 5;
 #[cfg(target_os = "macos")]
 const PTRACE_DENY_ATTACH_FAILED_EXIT_CODE: i32 = 6;
 
-#[cfg(any(
-    target_os = "linux",
-    target_os = "android",
-    target_os = "macos",
-    target_os = "freebsd",
-    target_os = "netbsd",
-    target_os = "openbsd"
-))]
+#[cfg(unix)]
 const SET_RLIMIT_CORE_FAILED_EXIT_CODE: i32 = 7;
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -125,16 +118,11 @@ fn set_core_file_size_limit_to_zero() {
 }
 
 #[cfg(unix)]
-fn fatal_hardening_error(operation: &str, exit_code: i32) -> ! {
-    // Capture errno before diagnostic I/O can overwrite it. A broken sink must
-    // not panic in place of the reserved native-failure exit classification.
-    let error = std::io::Error::last_os_error();
-    use std::io::Write;
-    let _ = writeln!(
-        std::io::stderr().lock(),
-        "ERROR: {operation} failed: {error}"
-    );
-    std::process::exit(exit_code);
+fn fatal_hardening_error(_operation: &str, exit_code: i32) -> ! {
+    // This can run before Rust initializes SIGPIPE. Diagnostic I/O can block
+    // indefinitely or replace our reserved exit code with a signal status.
+    // SAFETY: _exit terminates without invoking cleanup or flushing any streams.
+    unsafe { libc::_exit(exit_code) }
 }
 
 #[cfg(windows)]
@@ -178,6 +166,17 @@ mod tests {
         let Ok(code) = std::env::var("HARDENING_TEST_FATAL_CODE") else {
             return;
         };
+        // SAFETY: this is an isolated disposable child before the fatal call.
+        unsafe {
+            libc::signal(
+                libc::SIGPIPE,
+                if std::env::var_os("HARDENING_TEST_SIGPIPE_DEFAULT").is_some() {
+                    libc::SIG_DFL
+                } else {
+                    libc::SIG_IGN
+                },
+            );
+        }
         // This branch is reached only in a disposable child, never in the
         // outer test harness. Keep the unread pipe alive through process exit.
         let _pipe = if std::env::var_os("HARDENING_TEST_BROKEN_STDERR").is_some() {
@@ -229,12 +228,80 @@ mod tests {
                 if broken {
                     command.env("HARDENING_TEST_BROKEN_STDERR", "1");
                 }
-                let output = command.output().unwrap();
-                assert_eq!(output.status.code(), Some(code), "broken stderr: {broken}");
-                if !broken {
-                    let diagnostic = String::from_utf8(output.stderr).unwrap();
-                    assert!(diagnostic.contains("synthetic native protection failed"));
-                    assert!(diagnostic.contains(&format!("os error {}", libc::EBADF)));
+                let mut child = command.stdout(std::process::Stdio::null()).spawn().unwrap();
+                wait_for_fatal_child(&mut child, code);
+            }
+        }
+    }
+
+    fn wait_for_fatal_child(child: &mut std::process::Child, code: i32) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                assert_eq!(status.code(), Some(code));
+                return;
+            }
+            if std::time::Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("fatal hardening child did not exit within deadline");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn fatal_status_survives_blocking_and_closed_stderr() {
+        for code in [5, 6, 7] {
+            for closed in [false, true] {
+                for default_sigpipe in [false, true] {
+                    let mut fds = [-1; 2];
+                    // SAFETY: fds has space for the two new owned descriptors.
+                    assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+                    // SAFETY: pipe transferred ownership of these new descriptors.
+                    let reader = unsafe { File::from_raw_fd(fds[0]) };
+                    // SAFETY: this is the distinct new pipe write descriptor.
+                    let writer = unsafe { File::from_raw_fd(fds[1]) };
+                    let reader = if closed {
+                        drop(reader);
+                        None
+                    } else {
+                        // SAFETY: only the fixture's owned descriptor flags change.
+                        assert_eq!(
+                            unsafe { libc::fcntl(fds[1], libc::F_SETFL, libc::O_NONBLOCK) },
+                            0
+                        );
+                        let bytes = [b'x'; 4096];
+                        loop {
+                            // SAFETY: buffer is live and sized to the requested write.
+                            if unsafe { libc::write(fds[1], bytes.as_ptr().cast(), bytes.len()) }
+                                < 0
+                            {
+                                assert_eq!(
+                                    std::io::Error::last_os_error().kind(),
+                                    std::io::ErrorKind::WouldBlock
+                                );
+                                break;
+                            }
+                        }
+                        // SAFETY: restore blocking mode on the owned fixture descriptor.
+                        assert_eq!(unsafe { libc::fcntl(fds[1], libc::F_SETFL, 0) }, 0);
+                        Some(reader)
+                    };
+                    let mut command = Command::new(std::env::current_exe().unwrap());
+                    command
+                        .args(["--exact", "tests::fatal_error_child", "--nocapture"])
+                        .env("HARDENING_TEST_FATAL_CODE", code.to_string())
+                        .env_remove("HARDENING_TEST_BROKEN_STDERR")
+                        .env_remove("HARDENING_TEST_SIGPIPE_DEFAULT")
+                        .stdout(std::process::Stdio::null())
+                        .stderr(writer);
+                    if default_sigpipe {
+                        command.env("HARDENING_TEST_SIGPIPE_DEFAULT", "1");
+                    }
+                    let mut child = command.spawn().unwrap();
+                    wait_for_fatal_child(&mut child, code);
+                    drop(reader);
                 }
             }
         }

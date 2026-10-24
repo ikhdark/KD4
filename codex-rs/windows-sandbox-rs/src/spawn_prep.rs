@@ -15,7 +15,7 @@ use crate::env::normalize_null_device_env;
 use crate::identity::SandboxCreds;
 use crate::identity::require_logon_sandbox_creds_with_additional_read_roots;
 use crate::logging::log_start;
-use crate::path_normalization::canonical_path_key;
+use crate::path_normalization::security_path_key as canonical_path_key;
 use crate::path_normalization::canonicalize_path;
 use crate::resolved_permissions::ResolvedWindowsSandboxPermissions;
 use crate::sandbox_utils::ensure_codex_home_exists;
@@ -87,6 +87,7 @@ fn prepare_spawn_context_common(
     command: &[String],
     options: SpawnPrepOptions,
 ) -> Result<SpawnContext> {
+    crate::env::normalize_environment(env_map)?;
     let permissions =
         ResolvedWindowsSandboxPermissions::try_from_permission_profile_for_workspace_roots(
             permission_profile,
@@ -276,6 +277,7 @@ pub(crate) fn apply_legacy_session_acl_rules(
 ) -> Result<()> {
     let AllowDenyPaths { allow, mut deny } =
         compute_allow_paths_for_permissions(permissions, current_dir, env_map);
+    crate::setup::ensure_safe_write_roots(&allow, codex_home)?;
     // SAFETY: LegacyAclSids borrows LocalSid owners that outlive these synchronous ACL operations,
     // so the readonly and root-capability pointers remain valid throughout each call.
     unsafe {
@@ -365,7 +367,10 @@ pub(crate) fn prepare_elevated_spawn_context_for_permissions(
     deny_write_paths_override: &[PathBuf],
     proxy_enforced: bool,
     proxy_settings_mode: crate::WindowsSandboxProxySettingsMode,
+    cancellation: Option<&crate::WindowsSandboxCancellationToken>,
 ) -> Result<ElevatedSpawnContext> {
+    crate::setup::check_setup_cancellation(cancellation)?;
+    crate::env::normalize_environment(env_map)?;
     normalize_null_device_env(env_map);
     ensure_non_interactive_pager(env_map);
     inherit_path_env(env_map);
@@ -381,6 +386,7 @@ pub(crate) fn prepare_elevated_spawn_context_for_permissions(
 
     let AllowDenyPaths { allow, deny } =
         compute_allow_paths_for_permissions(&permissions, cwd, env_map);
+    crate::setup::ensure_safe_write_roots(&allow, codex_home)?;
     let write_roots: Vec<PathBuf> = allow.into_iter().collect();
     let deny_write_paths: Vec<PathBuf> = deny.into_iter().collect();
     let computed_write_roots_override = if uses_write_capabilities {
@@ -422,6 +428,7 @@ pub(crate) fn prepare_elevated_spawn_context_for_permissions(
         },
         proxy_enforced,
         proxy_settings_mode,
+        cancellation,
     )?;
     let caps = load_or_create_cap_sids(codex_home)?;
     let write_root_sids = if uses_write_capabilities {

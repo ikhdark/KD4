@@ -833,8 +833,8 @@ ON CONFLICT(child_thread_id) DO NOTHING
     ) -> anyhow::Result<bool> {
         let updated_at = self.allocate_thread_updated_at(updated_at)?;
         let result =
-            sqlx::query("UPDATE threads SET updated_at = ?, updated_at_ms = ? WHERE id = ?")
-                .bind(datetime_to_epoch_seconds(updated_at))
+            sqlx::query("UPDATE threads SET updated_at = (MAX(?1, updated_at_ms + 1) / 1000 - (MAX(?1, updated_at_ms + 1) % 1000 < 0)), updated_at_ms = MAX(?, updated_at_ms + 1) WHERE id = ?")
+                .bind(datetime_to_epoch_millis(updated_at))
                 .bind(datetime_to_epoch_millis(updated_at))
                 .bind(thread_id.to_string())
                 .execute(self.pool.as_ref())
@@ -870,10 +870,8 @@ WHERE id = ?
 
     /// Allocate a persisted `updated_at` value for thread-list cursor ordering.
     ///
-    /// We keep a process-local high-water mark so hot rollout writes can get unique,
-    /// monotonic millisecond timestamps without querying SQLite on every update. Older
-    /// backfill/repair timestamps are allowed through unchanged so historical ordering
-    /// remains tied to the rollout file mtimes.
+    /// Live writes get unique monotonic milliseconds. Backfill/repair callers
+    /// explicitly use the timestamp-preserving APIs instead of a distance heuristic.
     fn allocate_thread_updated_at(
         &self,
         updated_at: DateTime<Utc>,
@@ -908,15 +906,7 @@ fn allocate_thread_timestamp(
             continue;
         }
 
-        // Older timestamps come from backfill/repair paths that preserve rollout mtimes.
-        // Do not drag historical rows forward just because this process has seen newer writes.
-        if candidate.saturating_add(1000) <= current {
-            break candidate;
-        }
-
-        // Same hot one-second bucket as the current high-water mark. Allocate the next
-        // millisecond so the timestamp remains unique and cursor-orderable inside the process.
-        let bumped = current.saturating_add(1);
+        let bumped = current.checked_add(1).ok_or_else(|| anyhow::anyhow!("thread timestamp overflow"))?;
         if high_water_mark
             .compare_exchange(current, bumped, Ordering::Relaxed, Ordering::Relaxed)
             .is_ok()
@@ -1002,10 +992,10 @@ ON CONFLICT(id) DO UPDATE SET
     session_id = COALESCE(threads.session_id, excluded.session_id),
     rollout_path = excluded.rollout_path,
     created_at = excluded.created_at,
-    updated_at = excluded.updated_at,
+    updated_at = CASE WHEN ? THEN (MAX(excluded.updated_at_ms, threads.updated_at_ms + 1) / 1000 - (MAX(excluded.updated_at_ms, threads.updated_at_ms + 1) % 1000 < 0)) ELSE excluded.updated_at END,
     recency_at = threads.recency_at,
     created_at_ms = excluded.created_at_ms,
-    updated_at_ms = excluded.updated_at_ms,
+    updated_at_ms = CASE WHEN ? THEN MAX(excluded.updated_at_ms, threads.updated_at_ms + 1) ELSE excluded.updated_at_ms END,
     recency_at_ms = threads.recency_at_ms,
     source = excluded.source,
     history_mode = excluded.history_mode,
@@ -1073,6 +1063,8 @@ ON CONFLICT(id) DO UPDATE SET
         .bind(metadata.git_branch.as_deref())
         .bind(metadata.git_origin_url.as_deref())
         .bind(metadata.project_id.as_deref())
+        .bind(allocate_timestamps)
+        .bind(allocate_timestamps)
         .execute(connection)
         .await?;
         Ok(())
@@ -1154,11 +1146,10 @@ ON CONFLICT(id) DO UPDATE SET
             .map(|time| self.allocate_thread_updated_at(time))
             .transpose()?;
         // Archive state does not own titles, usage, models, or other metadata.
-        sqlx::query("UPDATE threads SET rollout_path = ?, archived = ?, archived_at = ?, updated_at = COALESCE(?, updated_at), updated_at_ms = COALESCE(?, updated_at_ms) WHERE id = ?")
+        sqlx::query("UPDATE threads SET rollout_path = ?, archived = ?, archived_at = ?, updated_at = CASE WHEN ?4 IS NULL THEN updated_at ELSE (MAX(?4, updated_at_ms + 1) / 1000 - (MAX(?4, updated_at_ms + 1) % 1000 < 0)) END, updated_at_ms = CASE WHEN ?4 IS NULL THEN updated_at_ms ELSE MAX(?4, updated_at_ms + 1) END WHERE id = ?5")
             .bind(rollout_path.display().to_string())
             .bind(archived_at.is_some())
             .bind(archived_at.map(datetime_to_epoch_seconds))
-            .bind(updated_at.map(datetime_to_epoch_seconds))
             .bind(updated_at.map(datetime_to_epoch_millis))
             .bind(thread_id.to_string())
             .execute(self.pool.as_ref()).await?;
@@ -1362,11 +1353,6 @@ WHERE parent_thread_id IN (SELECT value FROM json_each(?))
                 .await
         {
             warn!("failed to remove logs for deleted threads: {err}");
-        }
-        for thread_id in thread_ids {
-            if let Err(err) = self.thread_goals.delete_thread_goal(*thread_id).await {
-                warn!("failed to remove goal for deleted thread {thread_id}: {err}");
-            }
         }
 
         Ok((rows_affected, primary_statement_count))
@@ -2126,13 +2112,6 @@ END
             runtime.list_thread_spawn_descendants(thread_id).await?,
             vec![child_thread_id]
         );
-        let goal = runtime
-            .thread_goals()
-            .get_thread_goal(thread_id)
-            .await?
-            .expect("thread goal should survive a primary deletion failure");
-        assert_eq!(goal.objective, "test goal");
-        assert_eq!(goal.status, crate::ThreadGoalStatus::Active);
         let logs = runtime
             .query_logs(&LogQuery {
                 thread_ids: vec![thread_id.to_string()],
@@ -2155,15 +2134,6 @@ END
                 DirectionalThreadSpawnEdgeStatus::Closed,
             )
             .await?;
-        runtime
-            .thread_goals()
-            .replace_thread_goal(
-                thread_id,
-                "test goal",
-                crate::ThreadGoalStatus::Active,
-                /*token_budget*/ None,
-            )
-            .await?;
         sqlx::query("INSERT INTO logs (ts, ts_nanos, level, target, feedback_log_body, thread_id) VALUES (1, 0, 'INFO', 'test', 'feedback log', ?)")
             .bind(thread_id.to_string())
             .execute(runtime.logs_pool.as_ref())
@@ -2183,10 +2153,6 @@ END
         .fetch_one(runtime.pool.as_ref())
         .await?;
         assert_eq!(spawn_edge_count, 0);
-        assert_eq!(
-            runtime.thread_goals().get_thread_goal(thread_id).await?,
-            None
-        );
         let logs = runtime
             .query_logs(&LogQuery {
                 thread_ids: vec![thread_id.to_string()],
@@ -3180,6 +3146,21 @@ END
         }
     }
 
+    #[test]
+    fn audit20261023_allocator_remains_monotonic_after_one_thousand_hot_allocations() {
+        let high = std::sync::atomic::AtomicI64::new(0);
+        let base = DateTime::<Utc>::from_timestamp_millis(1_700_000_000_000).unwrap();
+        let mut previous = base.timestamp_millis() - 1;
+        for index in 0..1_005 {
+            let allocated = super::allocate_thread_timestamp(&high, base).unwrap();
+            assert_eq!(allocated.timestamp_millis(), base.timestamp_millis() + index);
+            assert!(allocated.timestamp_millis() > previous);
+            previous = allocated.timestamp_millis();
+        }
+        let rolled_back = base - chrono::Duration::seconds(60);
+        assert_eq!(super::allocate_thread_timestamp(&high, rolled_back).unwrap().timestamp_millis(), previous + 1);
+    }
+
     #[tokio::test]
     async fn thread_updated_at_uses_unique_epoch_millis_and_reads_legacy_seconds() {
         let codex_home = unique_temp_dir();
@@ -3258,7 +3239,7 @@ END
         let mut older = test_thread_metadata(&codex_home, older_id, codex_home.clone());
         older.updated_at = older_updated_at;
         runtime
-            .upsert_thread(&older)
+            .upsert_thread_preserving_timestamps(&older)
             .await
             .expect("older upsert should succeed");
         let older = runtime

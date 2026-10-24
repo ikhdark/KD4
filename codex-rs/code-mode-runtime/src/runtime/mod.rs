@@ -7,6 +7,7 @@ mod output_projection;
 mod timers;
 mod value;
 
+use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::ops::ControlFlow;
@@ -61,6 +62,11 @@ pub(crate) enum RuntimeCommand {
         id: String,
         error_text: String,
     },
+    ToolResponseAfterDeadline {
+        id: String,
+        result: JsonValue,
+        error_text: String,
+    },
     NotificationResponse {
         id: String,
     },
@@ -84,6 +90,7 @@ pub(crate) struct RuntimeInspection {
     stored_payload_address: usize,
     stored_payload_shared: bool,
     rust_conversion_bytes: usize,
+    description_materializations: usize,
 }
 
 #[derive(Debug)]
@@ -578,6 +585,7 @@ struct RuntimeConfig {
 pub(crate) struct EnabledToolCatalog {
     tools: Vec<EnabledToolMetadata>,
     presentation_names: Vec<String>,
+    namespace_aliases: BTreeMap<(String, String), usize>,
     by_global_name: HashMap<String, usize>,
     by_requested_name: HashMap<String, Option<usize>>,
     input_bytes: usize,
@@ -677,6 +685,25 @@ impl EnabledToolCatalog {
         for (index, alias) in short_aliases.iter().enumerate() {
             if let Some(alias) = alias { by_requested_name.insert(alias.clone(), Some(index)); }
         }
+        // Discovery and installation must admit precisely the same paths,
+        // including collisions between registered identities and legacy names.
+        let mut aliases = BTreeMap::new();
+        for (index, tool) in tools.iter().enumerate() {
+            let legacy = tool.global_name.split_once("__")
+                .filter(|(_, member)| !member.contains("__"));
+            let registered = tool.tool_name.namespace.as_deref()
+                .map(|namespace| (namespace, tool.tool_name.name.as_str()));
+            for (namespace, member) in legacy.into_iter().chain(registered) {
+                if namespace.is_empty() || member.is_empty() { continue; }
+                aliases.entry((namespace.to_owned(), member.to_owned()))
+                    .and_modify(|owner| { if *owner != Some(index) { *owner = None; } })
+                    .or_insert(Some(index));
+            }
+        }
+        let namespace_aliases = aliases.into_iter().filter_map(|((namespace, member), owner)| {
+            owner.filter(|_| !by_global_name.contains_key(&namespace))
+                .map(|index| ((namespace, member), index))
+        }).collect::<BTreeMap<_, _>>();
         let mut presentation_names = Vec::with_capacity(tools.len());
         for (index, tool) in tools.iter_mut().enumerate() {
             let mut presentation = tool.global_name.clone();
@@ -687,7 +714,7 @@ impl EnabledToolCatalog {
                 let qualified = format!("{namespace}.{member}");
                 if safe(namespace) && safe(member)
                     && short_aliases[index].as_ref().is_none_or(|alias| qualified.len() <= alias.len())
-                    && !by_global_name.contains_key(namespace)
+                    && namespace_aliases.get(&(namespace.clone(), member.clone())) == Some(&index)
                     && by_requested_name.get(&qualified) == Some(&Some(index))
                 {
                     // Rewrite only the generated declaration, not tool prose or
@@ -729,9 +756,13 @@ impl EnabledToolCatalog {
         });
         let input_bytes = presentation_names.iter().fold(input_bytes, |bytes, name|
             bytes.saturating_add(std::mem::size_of::<String>()).saturating_add(name.len()));
+        let input_bytes = namespace_aliases.keys().fold(input_bytes, |bytes, (namespace, member)|
+            bytes.saturating_add(std::mem::size_of::<((String, String), usize)>())
+                .saturating_add(namespace.len()).saturating_add(member.len()));
         Ok(Self {
             tools,
             presentation_names,
+            namespace_aliases,
             by_global_name,
             by_requested_name,
             input_bytes,
@@ -825,6 +856,8 @@ pub(super) struct RuntimeState {
     completion_collections: usize,
     #[cfg(test)]
     rust_conversion_bytes: usize,
+    #[cfg(test)]
+    description_materializations: usize,
     enabled_tools: Arc<EnabledToolCatalog>,
     next_tool_call_id: u64,
     tool_functions: HashMap<usize, v8::Global<v8::Function>>,
@@ -989,6 +1022,8 @@ fn run_runtime(
         completion_collections: 0,
         #[cfg(test)]
         rust_conversion_bytes: 0,
+        #[cfg(test)]
+        description_materializations: 0,
         enabled_tools: config.enabled_tools,
         next_tool_call_id: 1,
         tool_functions: HashMap::new(),
@@ -1045,6 +1080,7 @@ fn run_runtime(
                     heap_bytes,
                     completion_collections: state.completion_collections,
                     rust_conversion_bytes: state.rust_conversion_bytes,
+                    description_materializations: state.description_materializations,
                     stored_payload_address: state
                         .stored_value_writes
                         .get("payload")
@@ -1063,7 +1099,7 @@ fn run_runtime(
                     runtime_tool_call_id = %id, transport_outcome = "completed",
                     endpoint = "runtime_command_received", "runtime received nested result");
                 if let Err(error_text) =
-                    module_loader::resolve_tool_response(scope, &id, Ok(result))
+                    module_loader::resolve_tool_response(scope, &id, Ok(result), None)
                 {
                     capture_scope_send_error(scope, &event_tx, Some(error_text));
                     return;
@@ -1074,7 +1110,7 @@ fn run_runtime(
                     runtime_tool_call_id = %id, transport_outcome = "failed",
                     endpoint = "runtime_command_received", "runtime received nested error");
                 if let Err(runtime_error) =
-                    module_loader::resolve_tool_response(scope, &id, Err(error_text))
+                    module_loader::resolve_tool_response(scope, &id, Err(error_text), None)
                 {
                     capture_scope_send_error(scope, &event_tx, Some(runtime_error));
                     return;
@@ -1084,6 +1120,12 @@ fn run_runtime(
                 if let Err(runtime_error) =
                     module_loader::resolve_notification_response(scope, &id, Ok(()))
                 {
+                    capture_scope_send_error(scope, &event_tx, Some(runtime_error));
+                    return;
+                }
+            }
+            RuntimeCommand::ToolResponseAfterDeadline { id, result, error_text } => {
+                if let Err(runtime_error) = module_loader::resolve_tool_response(scope, &id, Err(error_text), Some(result)) {
                     capture_scope_send_error(scope, &event_tx, Some(runtime_error));
                     return;
                 }

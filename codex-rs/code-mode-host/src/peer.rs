@@ -152,6 +152,18 @@ impl HostPeer {
         self.send_frame(frame)
     }
 
+    fn send_mandatory_control(&self, message: HostToClient, reservation: OwnedSemaphorePermit) {
+        let result = self.prepare_frame(&message).and_then(|mut frame| {
+            // Admission is reusable only once its control obligation leaves
+            // the queue/writer, not merely once the producer enqueues it.
+            frame._slot = Some(reservation);
+            self.send_frame(frame)
+        });
+        if let Err(error) = result {
+            self.fail(format!("code-mode mandatory control delivery failed: {error}"));
+        }
+    }
+
     fn prepare_frame(&self, message: &HostToClient) -> Result<OutgoingFrame, PeerSendError> {
         let control = matches!(
             message,
@@ -584,7 +596,7 @@ impl HostPeer {
         if let Some(pending) = self.remove_pending(id)
             && pending.dispatched
         {
-            let _ = self.send(HostToClient::CancelDelegateRequest { id, cause });
+            self.send_mandatory_control(HostToClient::CancelDelegateRequest { id, cause }, pending._permit);
         }
     }
 
@@ -627,7 +639,7 @@ async fn drive_cell(
     started: StartedCell,
     messages_rx: Arc<CellQueue>,
     initial_response_sent_tx: oneshot::Sender<()>,
-    _active_cell_permit: OwnedSemaphorePermit,
+    active_cell_permit: OwnedSemaphorePermit,
 ) {
     let mut initial_response_sent_tx = Some(initial_response_sent_tx);
     let initial_response = started.initial_response();
@@ -691,10 +703,10 @@ async fn drive_cell(
             }
         }
     }
-    let _ = peer.send(HostToClient::CellClosed {
+    peer.send_mandatory_control(HostToClient::CellClosed {
         session_id: key.0.clone(),
         cell_id: (&key.1).into(),
-    });
+    }, active_cell_permit);
     peer.remove_cell_route(&key);
 }
 
@@ -749,9 +761,10 @@ impl Drop for PendingDelegateRequest {
         {
             // Dropped without reaching a cancellation origin, so there is no
             // cause to report.
-            let _ = self
-                .peer
-                .send(HostToClient::CancelDelegateRequest { id, cause: None });
+            self.peer.send_mandatory_control(
+                HostToClient::CancelDelegateRequest { id, cause: None },
+                pending._permit,
+            );
         }
     }
 }

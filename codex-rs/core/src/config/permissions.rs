@@ -7,23 +7,11 @@ use std::path::PathBuf;
 
 use codex_config::permissions_toml::FilesystemPermissionToml;
 use codex_config::permissions_toml::FilesystemPermissionsToml;
-use codex_config::permissions_toml::NetworkDomainPermissionToml;
-use codex_config::permissions_toml::NetworkDomainPermissionsToml;
 use codex_config::permissions_toml::NetworkToml;
-use codex_config::permissions_toml::NetworkUnixSocketPermissionToml;
-use codex_config::permissions_toml::NetworkUnixSocketPermissionsToml;
 use codex_config::permissions_toml::PermissionProfileToml;
 use codex_config::permissions_toml::PermissionsToml;
 use codex_config::permissions_toml::WorkspaceRootsToml;
 use codex_config::types::SandboxWorkspaceWrite;
-use codex_features::NetworkProxyConfigToml;
-use codex_features::NetworkProxyDomainPermissionToml;
-use codex_features::NetworkProxyModeToml;
-use codex_features::NetworkProxyUnixSocketPermissionToml;
-use codex_network_proxy::NetworkMode;
-use codex_network_proxy::NetworkProxyConfig;
-#[cfg(test)]
-use codex_network_proxy::NetworkUnixSocketPermission as ProxyNetworkUnixSocketPermission;
 use codex_protocol::config_types::WindowsSandboxLevel;
 use codex_protocol::models::BUILT_IN_PERMISSION_PROFILE_DANGER_FULL_ACCESS;
 use codex_protocol::models::BUILT_IN_PERMISSION_PROFILE_READ_ONLY;
@@ -209,79 +197,7 @@ pub(crate) fn validate_user_permission_profile_names(
     Ok(())
 }
 
-pub(crate) fn network_proxy_config_from_profile_network(
-    network: Option<&NetworkToml>,
-) -> NetworkProxyConfig {
-    let mut config = network.map_or_else(
-        NetworkProxyConfig::default,
-        NetworkToml::to_network_proxy_config,
-    );
-    // Profile `network.enabled` controls sandbox network access. Profiles may
-    // provide proxy settings for the feature gate to consume when that network
-    // access is enabled, but they do not start the managed proxy on their own.
-    config.enabled = false;
-    config
-}
 
-pub(crate) fn apply_network_proxy_feature_config(
-    config: &mut NetworkProxyConfig,
-    feature_config: &NetworkProxyConfigToml,
-) {
-    NetworkToml {
-        enabled: feature_config.enabled,
-        proxy_url: feature_config.proxy_url.clone(),
-        enable_socks5: feature_config.enable_socks5,
-        socks_url: feature_config.socks_url.clone(),
-        enable_socks5_udp: feature_config.enable_socks5_udp,
-        allow_upstream_proxy: feature_config.allow_upstream_proxy,
-        dangerously_allow_non_loopback_proxy: feature_config.dangerously_allow_non_loopback_proxy,
-        dangerously_allow_all_unix_sockets: feature_config.dangerously_allow_all_unix_sockets,
-        mode: feature_config.mode.map(|mode| match mode {
-            NetworkProxyModeToml::Limited => NetworkMode::Limited,
-            NetworkProxyModeToml::Full => NetworkMode::Full,
-        }),
-        domains: feature_config
-            .domains
-            .as_ref()
-            .map(|domains| NetworkDomainPermissionsToml {
-                entries: domains
-                    .iter()
-                    .map(|(pattern, permission)| {
-                        let permission = match permission {
-                            NetworkProxyDomainPermissionToml::Allow => {
-                                NetworkDomainPermissionToml::Allow
-                            }
-                            NetworkProxyDomainPermissionToml::Deny => {
-                                NetworkDomainPermissionToml::Deny
-                            }
-                        };
-                        (pattern.clone(), permission)
-                    })
-                    .collect(),
-            }),
-        unix_sockets: feature_config.unix_sockets.as_ref().map(|unix_sockets| {
-            NetworkUnixSocketPermissionsToml {
-                entries: unix_sockets
-                    .iter()
-                    .map(|(path, permission)| {
-                        let permission = match permission {
-                            NetworkProxyUnixSocketPermissionToml::Allow => {
-                                NetworkUnixSocketPermissionToml::Allow
-                            }
-                            NetworkProxyUnixSocketPermissionToml::Deny => {
-                                NetworkUnixSocketPermissionToml::Deny
-                            }
-                        };
-                        (path.clone(), permission)
-                    })
-                    .collect(),
-            }
-        }),
-        allow_local_binding: feature_config.allow_local_binding,
-        mitm: None,
-    }
-    .apply_to_network_proxy_config(config);
-}
 
 pub(crate) fn resolve_permission_profile(
     permissions: &PermissionsToml,
@@ -406,26 +322,6 @@ fn insert_scoped_filesystem_permission_toml(
     }
 }
 
-pub(crate) fn network_proxy_config_for_profile_selection(
-    permissions: Option<&PermissionsToml>,
-    profile_name: &str,
-) -> io::Result<NetworkProxyConfig> {
-    if is_builtin_permission_profile_name(profile_name) {
-        return Ok(NetworkProxyConfig::default());
-    }
-    reject_unknown_builtin_permission_profile(profile_name)?;
-
-    let permissions = permissions.ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "default_permissions requires a `[permissions]` table",
-        )
-    })?;
-    let profile = resolve_permission_profile(permissions, profile_name)?;
-    Ok(network_proxy_config_from_profile_network(
-        profile.network.as_ref(),
-    ))
-}
 
 pub(crate) fn compile_permission_profile(
     permissions: &PermissionsToml,
@@ -804,12 +700,23 @@ fn contains_glob_chars(path: &str) -> bool {
 }
 
 fn contains_glob_chars_for_platform(path: &str, is_windows: bool) -> bool {
-    let normalized_windows_path = if is_windows {
-        normalize_windows_device_path(path)
+    // Namespace punctuation is not glob syntax, even when the device spelling
+    // must be retained to preserve an exact filename's identity.
+    let path = if is_windows {
+        path.strip_prefix(r"\\?\")
+            .or_else(|| path.strip_prefix(r"\\.\"))
+            .filter(|tail| {
+                let bytes = tail.as_bytes();
+                tail.starts_with(r"UNC\")
+                    || (bytes.len() >= 3
+                        && bytes[0].is_ascii_alphabetic()
+                        && bytes[1] == b':'
+                        && matches!(bytes[2], b'\\' | b'/'))
+            })
+            .unwrap_or(path)
     } else {
-        None
+        path
     };
-    let path = normalized_windows_path.as_deref().unwrap_or(path);
     path.chars().any(|ch| matches!(ch, '*' | '?' | '[' | ']'))
 }
 

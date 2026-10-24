@@ -1,5 +1,5 @@
-//! Wall-clock split of the turn/start dispatch path: transport-loop occupancy,
-//! queue hand-off, response, and mock-model completion.
+//! Internal turn/start dispatch timings through outgoing-envelope observation.
+//! These exclude routing, physical transport, client receipt, and real model latency.
 use super::*;
 use crate::connection_rpc_gate::ConnectionRpcGate;
 use crate::outgoing_message::OutgoingEnvelope;
@@ -64,14 +64,17 @@ where
 }
 
 struct TurnTiming {
+    parse_us: f64,
     inline_us: f64,
     response_us: f64,
     started_us: f64,
     completed_us: f64,
 }
 
-async fn timed_turn(harness: &mut TracingHarness, id: i64, line: &str) -> TurnTiming {
+async fn timed_turn(harness: &mut TracingHarness, id: i64, thread_id: &str, line: &str) -> TurnTiming {
+    let parse_start = Instant::now();
     let request = parse_request(line);
+    let parse_us = parse_start.elapsed().as_secs_f64() * 1e6;
     let start = Instant::now();
     harness
         .processor
@@ -84,6 +87,7 @@ async fn timed_turn(harness: &mut TracingHarness, id: i64, line: &str) -> TurnTi
         .await;
     let inline = start.elapsed();
     let (mut response, mut started, mut completed) = (None, None, None);
+    let mut response_turn_id = None;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
     while response.is_none() || started.is_none() || completed.is_none() {
         let envelope = tokio::time::timeout_at(deadline, harness.outgoing_rx.recv())
@@ -96,14 +100,17 @@ async fn timed_turn(harness: &mut TracingHarness, id: i64, line: &str) -> TurnTi
         };
         match message {
             OutgoingMessage::Response(r) if r.id == RequestId::Integer(id) => {
+                response_turn_id = r.result["turn"]["id"].as_str().map(str::to_owned);
                 response = Some(start.elapsed());
             }
             OutgoingMessage::Error(error) => panic!("turn/start failed: {error:?}"),
-            OutgoingMessage::AppServerNotification(ServerNotification::TurnStarted(_)) => {
-                started = Some(start.elapsed());
+            OutgoingMessage::AppServerNotification(ServerNotification::TurnStarted(notification))
+                if notification.thread_id == thread_id => {
+                started = Some((notification.turn.id, start.elapsed()));
             }
-            OutgoingMessage::AppServerNotification(ServerNotification::TurnCompleted(_)) => {
-                completed = Some(start.elapsed());
+            OutgoingMessage::AppServerNotification(ServerNotification::TurnCompleted(notification))
+                if notification.thread_id == thread_id => {
+                completed = Some((notification.turn.id, start.elapsed()));
             }
             OutgoingMessage::AppServerNotification(ServerNotification::Error(error)) => {
                 panic!("turn failed: {error:?}");
@@ -111,12 +118,18 @@ async fn timed_turn(harness: &mut TracingHarness, id: i64, line: &str) -> TurnTi
             _ => {}
         }
     }
+    let response_turn_id = response_turn_id.expect("turn/start response identifies its turn");
+    let (started_id, started) = started.unwrap();
+    let (completed_id, completed) = completed.unwrap();
+    assert_eq!(started_id, response_turn_id);
+    assert_eq!(completed_id, response_turn_id);
     let us = |duration: Option<Duration>| duration.unwrap().as_secs_f64() * 1e6;
     TurnTiming {
+        parse_us,
         inline_us: inline.as_secs_f64() * 1e6,
         response_us: us(response),
-        started_us: us(started),
-        completed_us: us(completed),
+        started_us: us(Some(started)),
+        completed_us: us(Some(completed)),
     }
 }
 
@@ -129,16 +142,19 @@ async fn timed_turn(harness: &mut TracingHarness, id: i64, line: &str) -> TurnTi
 )]
 fn turn_start_dispatch_wall_clock_benchmark() -> Result<()> {
     run_multi_thread_with_stack("turn_start_dispatch_wall_clock_benchmark", async {
-        let mut harness = TracingHarness::new().await?;
-        let thread_id = harness.start_thread(2, None).await.thread.id;
         let mut next_id = 100;
         for (label, bytes) in PAYLOADS {
             let text = "x".repeat(bytes);
             let mut rows: Vec<TurnTiming> = Vec::new();
             for round in 0..WARMUP_ROUNDS + MEASURED_ROUNDS {
+                // Every sample begins with equivalent empty thread history and
+                // a fresh mock harness; payload groups cannot inherit history.
+                let mut harness = TracingHarness::new().await?;
+                let thread_id = harness.start_thread(2, None).await.thread.id;
                 next_id += 1;
                 let line = turn_line(next_id, &thread_id, &text);
-                let timing = timed_turn(&mut harness, next_id, &line).await;
+                let timing = timed_turn(&mut harness, next_id, &thread_id, &line).await;
+                harness.shutdown().await;
                 if round >= WARMUP_ROUNDS {
                     rows.push(timing);
                 }
@@ -148,17 +164,21 @@ fn turn_start_dispatch_wall_clock_benchmark() -> Result<()> {
             eprintln!(
                 "{}",
                 json!({
-                    "scenario": "turn-start-end-to-end",
+                    "scenario": "turn-start-internal-envelope-observation",
+                    "transport_included": false,
+                    "model": "mock",
+                    "initial_history_turns": 0,
+                    "fixture_state": "fresh-harness-and-thread-per-sample",
                     "payload": label,
                     "rounds": MEASURED_ROUNDS,
-                    "median_inline_transport_loop_us": pick(|t| t.inline_us),
+                    "median_input_parse_us": pick(|t| t.parse_us),
+                    "median_inline_dispatch_us": pick(|t| t.inline_us),
                     "median_request_to_response_us": pick(|t| t.response_us),
                     "median_request_to_turn_started_us": pick(|t| t.started_us),
                     "median_request_to_turn_completed_us": pick(|t| t.completed_us),
                 })
             );
         }
-        harness.shutdown().await;
         Ok(())
     })
 }

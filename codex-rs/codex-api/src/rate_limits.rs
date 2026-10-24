@@ -205,19 +205,15 @@ fn parse_rate_limit_window(
 ) -> Option<RateLimitWindow> {
     let used_percent: Option<f64> = parse_header_f64(headers, used_percent_header);
 
-    used_percent.and_then(|used_percent| {
+    used_percent.map(|used_percent| {
         let window_minutes = parse_header_i64(headers, window_minutes_header);
         let resets_at = parse_header_i64(headers, resets_at_header);
 
-        let has_data = used_percent != 0.0
-            || window_minutes.is_some_and(|minutes| minutes != 0)
-            || resets_at.is_some();
-
-        has_data.then_some(RateLimitWindow {
+        RateLimitWindow {
             used_percent,
             window_minutes,
             resets_at,
-        })
+        }
     })
 }
 
@@ -280,6 +276,7 @@ fn normalize_limit_id(name: impl Into<String>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use http::HeaderName;
     use http::HeaderValue;
     use pretty_assertions::assert_eq;
 
@@ -417,5 +414,42 @@ mod tests {
         assert_eq!(updates[0].primary, None);
         assert_eq!(updates[0].secondary, None);
         assert_eq!(updates[0].credits, None);
+    }
+
+    #[test]
+    fn zero_percent_header_updates_preserve_custom_windows_like_events() {
+        for window in ["primary", "secondary"] {
+            let header =
+                HeaderName::from_bytes(format!("x-example-{window}-used-percent").as_bytes()).unwrap();
+            let mut headers = HeaderMap::new();
+            for percent in ["42", "0"] {
+                headers.insert(header.clone(), HeaderValue::from_static(percent));
+                let snapshots = parse_all_rate_limits(&headers);
+                let snapshot = snapshots
+                    .iter()
+                    .find(|snapshot| snapshot.limit_id.as_deref() == Some("example"))
+                    .expect("explicit percentage update");
+                let mut event = serde_json::json!({"metered_limit_name":"example","rate_limits":{}});
+                event["rate_limits"][window] =
+                    serde_json::json!({"used_percent":percent.parse::<f64>().unwrap()});
+                let event: RateLimitEventBody = serde_json::from_value(event).unwrap();
+                assert_eq!(*snapshot, rate_limit_snapshot_from_event(event).unwrap());
+                assert!(snapshot.credits.is_none());
+            }
+            headers.remove(&header);
+            assert!(
+                parse_all_rate_limits(&headers)
+                    .iter()
+                    .all(|snapshot| snapshot.limit_id.as_deref() != Some("example"))
+            );
+            for invalid in ["bad", "NaN", "inf"] {
+                headers.insert(header.clone(), HeaderValue::from_static(invalid));
+                assert!(
+                    parse_all_rate_limits(&headers)
+                        .iter()
+                        .all(|snapshot| snapshot.limit_id.as_deref() != Some("example"))
+                );
+            }
+        }
     }
 }

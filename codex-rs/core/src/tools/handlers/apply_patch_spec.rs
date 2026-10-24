@@ -17,7 +17,6 @@ pub fn create_apply_patch_freeform_tool(include_environment_id: bool) -> ToolSpe
     if include_environment_id {
         description.push_str(" Put `*** Environment ID: <id>` immediately after `*** Begin Patch` to select the target execution environment; it is required when multiple environments are available.");
     }
-    description.push_str("\n\nA failed call may return `retry`: a single-use patch_id with instructions for resubmitting only the corrected hunk or chunk instead of the whole patch.");
     description.push_str("\n\n");
     description.push_str("A current read_file source hash supports exact range replacement of a region already fully read: `@@ codex-range START:END sha256:HASH` followed only by `+` lines (inclusive lines of the complete file; HASH is the whole-file source_sha256, never an excerpt hash; multiple ranges ordered and nonoverlapping). A stale hash is rejected before any write: read current source and reconcile before retrying. A patch built in JavaScript can be applied in the same cell as the read that feeds it.\n\n");
     description.push_str(codex_prompts::APPLY_PATCH_TOOL_INSTRUCTIONS);

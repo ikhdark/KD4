@@ -63,14 +63,7 @@ fn uncertain_workspace_changes_preserve_cache_freshness_but_do_not_credit_progre
     for index in 0..3 {
         let mut baseline = control.baselines(tracker.current_mutation_revision());
         baseline.set_attributed_mutation_revision(tracker.attributed_mutation_revision());
-        tracker.record_exec_command_end_with_mutation_at(
-            &[],
-            0,
-            false,
-            "",
-            None,
-            crate::turn_diff_tracker::CommandMutation::Uncertain,
-        );
+        tracker.record_command_execution();
         let state = SamplingRequestSettledState {
             mutation_revision: tracker.current_mutation_revision(),
             attributed_mutation_revision: tracker.attributed_mutation_revision(),
@@ -89,20 +82,7 @@ fn uncertain_workspace_changes_preserve_cache_freshness_but_do_not_credit_progre
     }
     let mut baseline = control.baselines(tracker.current_mutation_revision());
     baseline.set_attributed_mutation_revision(tracker.attributed_mutation_revision());
-    tracker.record_exec_command_end_with_mutation_at(
-        &[],
-        0,
-        false,
-        "",
-        None,
-        crate::turn_diff_tracker::CommandMutation::KnownMutation {
-            paths: Some(
-                [std::path::PathBuf::from("changed.rs")]
-                    .into_iter()
-                    .collect(),
-            ),
-        },
-    );
+    tracker.record_unknown_mutation();
     let state = SamplingRequestSettledState {
         mutation_revision: tracker.current_mutation_revision(),
         attributed_mutation_revision: tracker.attributed_mutation_revision(),
@@ -210,29 +190,21 @@ fn nested_poll_does_not_exempt_unrelated_direct_work() {
 }
 
 #[test]
-fn unknown_and_empty_cycles_preserve_soft_advisory_accounting() {
+fn unknown_and_empty_cycles_do_not_inject_workflow_advice() {
     let mut control = TurnExecutionControl::new();
     let baselines = control.baselines(0);
-    for index in 0..SOFT_CONVERGENCE_NO_PROGRESS_GENERATIONS {
+    for index in 0..8 {
         let collector = control.collector(&baselines);
         if index % 2 == 1 {
-            collector.register_tool_call(); // An unclassified/incomplete observation.
+            collector.register_tool_call();
         }
         assert!(!control.observe_budget_progress(&baselines, &collector, &settled(0)));
-        let decision = control.evaluate_convergence(&baselines, &collector, &settled(0));
-        assert_eq!(decision, SamplingConvergenceDecision::default());
-        if index + 1 < SOFT_CONVERGENCE_NO_PROGRESS_GENERATIONS {
-            assert!(control.take_soft_convergence_directive(true).is_none());
-        }
+        assert_eq!(control.evaluate_convergence(&baselines, &collector, &settled(0)), SamplingConvergenceDecision::default());
     }
-    assert_eq!(
-        control.take_soft_convergence_directive(true).as_deref(),
-        Some(SOFT_CONVERGENCE_DIRECTIVE),
-    );
 }
 
 #[test]
-fn delivered_agent_progress_ends_the_soft_no_progress_streak() {
+fn delivered_agent_progress_resets_progress_accounting() {
     // A coordinating parent's evidence is its children's progress. Novel
     // deliveries and mailbox reports end the streak; empty waits, admission
     // events and re-read events remain a no-progress loop.
@@ -292,22 +264,12 @@ fn delivered_agent_progress_ends_the_soft_no_progress_streak() {
         // A child's report or final answer delivered through the mailbox.
         control.accepted_context_input(false);
         assert_eq!(control.continuations_without_progress, 0, "nested={nested}");
-        for _ in 0..SOFT_CONVERGENCE_NO_PROGRESS_GENERATIONS - 1 {
+        for _ in 0..8 {
             wait_generation(&mut control, Vec::new());
         }
-        assert!(control.take_soft_convergence_directive(true).is_none());
-        wait_generation(&mut control, Vec::new());
-        assert_eq!(
-            control.take_soft_convergence_directive(true).as_deref(),
-            Some(SOFT_CONVERGENCE_DIRECTIVE),
-            "nested={nested}"
-        );
-        // Reports end a streak but only new instructions re-arm the intervention.
+        assert_eq!(control.continuations_without_progress, 8);
         control.accepted_context_input(false);
-        for _ in 0..SOFT_CONVERGENCE_NO_PROGRESS_GENERATIONS {
-            wait_generation(&mut control, Vec::new());
-        }
-        assert!(control.take_soft_convergence_directive(true).is_none());
+        assert_eq!(control.continuations_without_progress, 0);
     }
 }
 
@@ -464,7 +426,6 @@ fn malformed_json_has_a_diagnostic_identity_only() {
             &payload(arguments),
             "bad-json",
         );
-        assert!(call.replayed_success.is_none());
         assert!(call.blocked_wait_guard.is_none());
         collector.record_failure(call.ordinal, "failed to parse arguments", false);
         let cycle = collector
@@ -487,7 +448,6 @@ fn malformed_json_has_a_diagnostic_identity_only() {
         None,
     );
     assert!(collector.deterministic_cycle().is_none());
-    assert!(collector.successful_replay_candidates().is_empty());
 }
 
 #[test]

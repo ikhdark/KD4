@@ -89,10 +89,18 @@ impl RequestSerializationQueueKey {
         if let ClientRequestSerializationScope::ThreadPath { path } = scope {
             static RESOLVERS: std::sync::OnceLock<Arc<tokio::sync::Semaphore>> =
                 std::sync::OnceLock::new();
-            let permit = RESOLVERS
+            let admission = RESOLVERS
                 .get_or_init(|| Arc::new(tokio::sync::Semaphore::new(4)))
                 .clone()
-                .try_acquire_owned()
+                .acquire_owned();
+            let permit = tokio::time::timeout(std::time::Duration::from_secs(1), admission)
+                .await
+                .map_err(|_| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "thread path preparation admission timed out",
+                    )
+                })?
                 .map_err(|_| {
                     std::io::Error::new(
                         std::io::ErrorKind::WouldBlock,

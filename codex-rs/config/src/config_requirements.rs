@@ -516,11 +516,11 @@ impl FilesystemDenyReadPattern {
     }
 
     pub fn contains_glob(&self) -> bool {
-        self.0.chars().any(is_glob_metacharacter)
+        first_glob_metacharacter(&self.0).is_some()
     }
 
     pub fn from_input(input: &str) -> Result<Self, String> {
-        if !input.chars().any(is_glob_metacharacter) {
+        if first_glob_metacharacter(input).is_none() {
             let path = deserialize_absolute_path(input)?;
             return Ok(Self(path.to_string_lossy().into_owned()));
         }
@@ -565,7 +565,7 @@ fn deserialize_absolute_path(input: &str) -> Result<AbsolutePathBuf, String> {
 }
 
 fn split_glob_pattern(input: &str) -> (&str, &str) {
-    let Some(first_glob) = input.find(is_glob_metacharacter) else {
+    let Some(first_glob) = first_glob_metacharacter(input) else {
         return ("", input);
     };
     let separator_index = input[..first_glob]
@@ -577,8 +577,8 @@ fn split_glob_pattern(input: &str) -> (&str, &str) {
     match separator_index {
         Some(0) => ("/", &input[1..]),
         Some(index)
-            if index == 2
-                && input.as_bytes().get(1) == Some(&b':')
+            if (index == 2 || (index == 6 && input.starts_with(r"\\?\")))
+                && input.as_bytes().get(index - 1) == Some(&b':')
                 && input.as_bytes().get(2).is_some() =>
         {
             (&input[..=index], &input[index + 1..])
@@ -586,6 +586,14 @@ fn split_glob_pattern(input: &str) -> (&str, &str) {
         Some(index) => (&input[..index], &input[index + 1..]),
         None => ("", input),
     }
+}
+
+fn first_glob_metacharacter(input: &str) -> Option<usize> {
+    // The question mark in a Windows verbatim namespace is not a wildcard.
+    let namespace_len = if input.starts_with(r"\\?\") { 4 } else { 0 };
+    input[namespace_len..]
+        .find(is_glob_metacharacter)
+        .map(|index| namespace_len + index)
 }
 
 fn is_path_separator(ch: char) -> bool {
@@ -1964,6 +1972,46 @@ mod tests {
             format!("{}/**/*.txt", temp_dir.join("private").to_string_lossy())
         );
         assert!(filesystem.value.deny_read[0].contains_glob());
+        Ok(())
+    }
+
+    #[test]
+    fn verbatim_namespace_markers_are_not_glob_metacharacters() {
+        for path in [r"\\?\C:\secret", r"\\?\UNC\server\share\secret"] {
+            assert_eq!(first_glob_metacharacter(path), None);
+            assert!(!FilesystemDenyReadPattern(path.to_string()).contains_glob());
+        }
+        for (pattern, directory, suffix) in [
+            (r"\\?\C:\secret\*.env", r"\\?\C:\secret", "*.env"),
+            (
+                r"\\?\UNC\server\share\secret\*.env",
+                r"\\?\UNC\server\share\secret",
+                "*.env",
+            ),
+            (r"\\?\C:\*.env", r"\\?\C:\", "*.env"),
+        ] {
+            assert_eq!(split_glob_pattern(pattern), (directory, suffix));
+            assert!(FilesystemDenyReadPattern(pattern.to_string()).contains_glob());
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn verbatim_deny_paths_keep_their_literal_target_and_real_wildcards() -> Result<()> {
+        for path in [r"\\?\C:\secret", r"\\?\UNC\server\share\secret"] {
+            let literal =
+                FilesystemDenyReadPattern::from_input(path).map_err(anyhow::Error::msg)?;
+            let expected = AbsolutePathBuf::from_absolute_path(path)?;
+            assert_eq!(literal.as_str(), expected.to_string_lossy());
+            assert!(!literal.contains_glob());
+            let wildcard = FilesystemDenyReadPattern::from_input(&format!("{path}\\*.env"))
+                .map_err(anyhow::Error::msg)?;
+            assert_eq!(
+                wildcard.as_str(),
+                format!("{}/{}.env", expected.to_string_lossy(), "*")
+            );
+            assert!(wildcard.contains_glob());
+        }
         Ok(())
     }
 

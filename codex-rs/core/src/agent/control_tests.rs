@@ -1,8 +1,8 @@
 use super::*;
-#[path = "control_audit53_tests.rs"]
-mod audit53;
-#[path = "control_audit142_tests.rs"]
-mod audit142;
+#[path = "control_subtree_lifecycle_tests.rs"]
+mod subtree_lifecycle_tests;
+#[path = "control_recovery_isolation_tests.rs"]
+mod recovery_isolation_tests;
 use crate::CodexThread;
 use crate::StateDbHandle;
 use crate::ThreadManager;
@@ -486,7 +486,7 @@ fn has_subagent_notification(history_items: &[ResponseItem]) -> bool {
             ContentItem::InputText { text } | ContentItem::OutputText { text } => {
                 SubagentNotification::matches_text(text)
             }
-            ContentItem::InputImage { .. } => false,
+            ContentItem::InputImage { .. } | ContentItem::Refusal { .. } => false,
         })
     })
 }
@@ -498,7 +498,9 @@ fn history_contains_text(history_items: &[ResponseItem], needle: &str) -> bool {
             return false;
         };
         content.iter().any(|content_item| match content_item {
-            ContentItem::InputText { text } | ContentItem::OutputText { text } => {
+            ContentItem::InputText { text }
+            | ContentItem::OutputText { text }
+            | ContentItem::Refusal { refusal: text } => {
                 text.contains(needle)
             }
             ContentItem::InputImage { .. } => false,
@@ -554,13 +556,13 @@ async fn wait_for_subagent_notification(parent_thread: &Arc<CodexThread>) -> boo
 }
 
 async fn persist_thread_for_tree_resume(thread: &Arc<CodexThread>, message: &str) {
-    // These fixtures exercise the legacy persisted spawn-edge reconstruction path. Pin the
+    // Internal (non-collaborating) fixtures exercise persisted spawn-edge reconstruction. Pin the
     // version before materializing the rollout so metadata-less histories remain reserved for
     // the separate V2 migration coverage.
     thread
         .codex
         .session
-        .set_multi_agent_version_if_unset(MultiAgentVersion::V1);
+        .set_multi_agent_version_if_unset(MultiAgentVersion::Disabled);
     let turn_context = thread.codex.session.new_default_turn().await;
     thread
         .codex
@@ -1162,6 +1164,83 @@ async fn send_inter_agent_communication_without_turn_queues_message_without_trig
 }
 
 #[tokio::test]
+async fn subagent_progress_is_rejected_before_parent_mailbox_delivery() {
+    let harness = AgentControlHarness::new().await;
+    let (parent_id, parent) = harness.start_thread().await;
+    for (author, recipient) in [
+        ("/root/worker", "/root"),
+        ("/root/lead/worker", "/root/lead"),
+        ("/root/lead/worker", "/root"),
+    ] {
+        for kind in [AgentCommunicationKind::Message, AgentCommunicationKind::Followup] {
+            for trigger_turn in [false, true] {
+                let message = InterAgentCommunication::new(
+                    AgentPath::try_from(author).unwrap(),
+                    AgentPath::try_from(recipient).unwrap(),
+                    Vec::new(), "progress".into(), trigger_turn,
+                );
+                let result = harness.control.send_inter_agent_communication(
+                    parent_id, message,
+                    AgentCommunicationContext::new(kind, ThreadId::new()),
+                ).await;
+                assert_matches!(result, Err(CodexErr::InvalidRequest(message))
+                    if message.contains("report to ancestors only at the end"));
+            }
+        }
+    }
+    assert!(harness.manager.captured_ops().is_empty());
+    assert!(!parent.codex.session.input_queue.has_pending_mailbox_items().await);
+    assert!(parent.codex.session.active_turn.lock().await.is_none());
+}
+
+#[tokio::test]
+async fn subagent_terminal_outcomes_arrive_once_without_progress_messages() {
+    for failure in [false, true] {
+        let (home, mut config) = test_config().await;
+        config.features.enable(Feature::MultiAgentV2).unwrap();
+        let harness = AgentControlHarness::new_with_config(home, config).await;
+        let (parent_id, parent) = harness.start_thread().await;
+        let (child_id, child) = harness.start_thread().await;
+        let child_path = AgentPath::root().join("worker").unwrap();
+        let mut turn = child.codex.session.new_default_turn().await;
+        Arc::get_mut(&mut turn).unwrap().session_source =
+            SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+                parent_thread_id: parent_id, depth: 1,
+                agent_path: Some(child_path.clone()),
+                agent_nickname: None, agent_role: None,
+            });
+        let result = harness.control.send_inter_agent_communication(
+            parent_id,
+            InterAgentCommunication::new(
+                child_path.clone(), AgentPath::root(), Vec::new(),
+                "progress must not reach parent".into(), false,
+            ),
+            AgentCommunicationContext::new(AgentCommunicationKind::Message, child_id),
+        ).await;
+        assert!(matches!(result, Err(CodexErr::InvalidRequest(_))));
+        let terminal = EventMsg::TurnComplete(TurnCompleteEvent {
+            turn_id: turn.sub_id.clone(), surfaced_result: None,
+            last_agent_message: (!failure).then(|| "finished; blockers: none".into()),
+            error: failure.then(|| CodexErr::Fatal("blocked: missing required input".into()).to_error_event(None)),
+            completed_at: None, duration_ms: None, time_to_first_token_ms: None, timing: None,
+        });
+        child.codex.session.send_event(&turn, terminal.clone()).await;
+        child.codex.session.send_event(&turn, terminal).await;
+        let pending = parent.codex.session.input_queue
+            .get_pending_input(&parent.codex.session.active_turn).await;
+        let [crate::session::TurnInput::InterAgentCommunication(message)] = pending.as_slice()
+        else { panic!("exactly one terminal report expected: {pending:?}"); };
+        assert_eq!(message.author, child_path);
+        assert!(!message.content.contains("progress must not reach parent"));
+        assert!(message.content.contains(if failure {
+            "blocked: missing required input"
+        } else { "finished; blockers: none" }));
+        assert!(parent.codex.session.active_turn.lock().await.is_none(),
+            "terminal delivery remains queue-only for an idle parent");
+    }
+}
+
+#[tokio::test]
 async fn ensure_v2_agent_loaded_replaces_stopped_registered_agent() {
     let (home, mut config) = test_config().await;
     let _ = config.features.enable(Feature::MultiAgentV2);
@@ -1317,10 +1396,21 @@ async fn missing_loaded_v2_agent_clears_protected_residency() {
         .get_thread(spawned_agent.thread_id)
         .await
         .expect("child thread should exist");
-    child_thread
-        .shutdown_and_wait()
-        .await
-        .expect("child thread should shut down");
+    let shutdown = child_thread.shutdown_and_wait().await;
+    if matches!(&shutdown, Err(CodexErr::Fatal(message)) if message == "thread persistence shutdown remains owned and pending; durability is unconfirmed") {
+        // The bounded foreground observation is not the retirement owner.
+        // Wait for that same owner and require confirmed durability before
+        // simulating a runtime missing from the manager.
+        timeout(Duration::from_secs(10), child_thread.codex.session.persistence_tasks.wait())
+            .await.expect("owned child persistence retirement should complete");
+        assert_eq!(
+            *child_thread.codex.session.persistence_retirement_result.lock().unwrap(),
+            Some(Ok(())),
+            "pending shutdown must finish successfully, not be ignored"
+        );
+    } else {
+        shutdown.expect("child thread should shut down");
+    }
     assert!(
         harness
             .manager
@@ -1930,7 +2020,7 @@ async fn cancelled_spawn_cleans_hidden_thread_and_releases_path() {
 }
 
 #[tokio::test]
-async fn cancelled_v1_spawn_cleans_hidden_thread_and_releases_path() {
+async fn cancelled_legacy_collab_spawn_uses_v2_capacity_and_cleans_hidden_thread() {
     cancelled_spawn_retains_capacity_until_termination(MultiAgentVersion::V1).await;
 }
 
@@ -1947,7 +2037,8 @@ async fn cancelled_spawn_retains_capacity_until_termination(version: MultiAgentV
             .features
             .disable(Feature::MultiAgentV2)
             .expect("disable V2");
-        config.features.enable(Feature::Collab).expect("enable V1");
+        config.features.enable(Feature::Collab).expect("legacy setting selects V2");
+        config.multi_agent_v2.max_concurrent_threads_per_session = 2;
         config.agent_max_threads = Some(1);
     }
     assert_eq!(config.effective_agent_max_threads(version), Some(1));
@@ -3489,12 +3580,15 @@ fn spawn_agent_fork_last_n_turns_keeps_only_recent_turns() {
                 .await;
             let spawn_turn_context = parent_thread.codex.session.new_default_turn().await;
             let parent_spawn_call_id = "spawn-call-last-n".to_string();
+            let parent_plan = crate::plan_store::plan_snapshot_item(&serde_json::json!({
+                "current_plan": {"plan": [{"step": "parent-only unfinished work", "status": "pending"}]}
+            }));
             parent_thread
                 .codex
                 .session
                 .record_conversation_items(
                     spawn_turn_context.as_ref(),
-                    &[spawn_agent_call(&parent_spawn_call_id)],
+                    &[parent_plan.clone(), spawn_agent_call(&parent_spawn_call_id)],
                 )
                 .await
                 .unwrap();
@@ -3545,6 +3639,11 @@ fn spawn_agent_fork_last_n_turns_keeps_only_recent_turns() {
                 .await
                 .expect("child thread should be registered");
             let history = child_thread.codex.session.clone_history().await;
+
+            assert!(crate::plan_store::plan_snapshot_from_item(&parent_plan).is_some());
+            assert!(child_thread.codex.session.services.plan_store.snapshot().await.is_none(),
+                "a bounded fork must not inherit the parent's unfinished obligations");
+            assert!(!history_contains_text(history.raw_items(), "parent-only unfinished work"));
 
             assert!(
                 !history_contains_text(history.raw_items(), "old parent context"),
@@ -3945,7 +4044,7 @@ async fn resume_agent_respects_max_threads_limit() {
     persist_thread_for_tree_resume(&resumable_thread, "legacy resumable agent").await;
     assert_eq!(
         resumable_thread.multi_agent_version(),
-        Some(MultiAgentVersion::V1)
+        Some(MultiAgentVersion::Disabled)
     );
     let _ = control
         .shutdown_live_agent(resumable_id)
@@ -6985,275 +7084,6 @@ fn resume_agent_from_rollout_closes_unrecoverable_child_and_does_not_retry() {
     );
 }
 
-#[test]
-fn registered_v2_child_completion_records_only_delivered_parent_result() {
-    const CHILD_ENV: &str = "CODEX_TEST_REGISTERED_PARENT_RESULT_TRACE";
-    if std::env::var_os(CHILD_ENV).is_none() {
-        let trace_root = TempDir::new().expect("isolated trace root");
-        let stdout_path = trace_root.path().join("child.stdout");
-        let stderr_path = trace_root.path().join("child.stderr");
-        let mut child = std::process::Command::new(std::env::current_exe().expect("test binary"))
-            .arg("--exact")
-            .arg("agent::control::tests::registered_v2_child_completion_records_only_delivered_parent_result")
-            .arg("--nocapture")
-            .env(CHILD_ENV, "1")
-            .env(codex_rollout_trace::CODEX_ROLLOUT_TRACE_ROOT_ENV, trace_root.path())
-            .stdout(std::fs::File::create(&stdout_path).expect("child stdout"))
-            .stderr(std::fs::File::create(&stderr_path).expect("child stderr"))
-            .spawn().expect("isolated parent result test");
-        let deadline = std::time::Instant::now() + Duration::from_secs(60);
-        let status = loop {
-            if let Some(status) = child.try_wait().expect("poll child") {
-                break Some(status);
-            }
-            if std::time::Instant::now() >= deadline {
-                child.kill().expect("terminate timed-out test");
-                child.wait().expect("reap timed-out test");
-                break None;
-            }
-            std::thread::sleep(Duration::from_millis(10));
-        };
-        let stdout = std::fs::read_to_string(stdout_path).expect("read child stdout");
-        let stderr = std::fs::read_to_string(stderr_path).expect("read child stderr");
-        assert!(
-            status.is_some_and(|status| status.success()) && stdout.contains("1 passed"),
-            "isolated parent result failed or timed out: {stdout}\n{stderr}"
-        );
-        return;
-    }
-
-    run_current_thread_test_with_stack(
-        "registered_v2_child_completion_records_only_delivered_parent_result",
-        || async {
-            use crate::session::TurnInput;
-            use codex_rollout_trace::RawTraceEvent;
-            use codex_rollout_trace::RawTraceEventPayload;
-
-            let trace_root = std::path::PathBuf::from(
-                std::env::var_os(codex_rollout_trace::CODEX_ROLLOUT_TRACE_ROOT_ENV)
-                    .expect("normal trace configuration"),
-            );
-            let (home, mut config) = test_config().await;
-            config
-                .features
-                .enable(Feature::MultiAgentV2)
-                .expect("enable V2");
-            let harness = AgentControlHarness::new_with_config(home, config).await;
-            let (parent_id, parent) = harness.start_thread().await;
-            assert_eq!(
-                parent
-                    .codex
-                    .session
-                    .new_default_turn()
-                    .await
-                    .multi_agent_version,
-                MultiAgentVersion::V2
-            );
-            let child_path = AgentPath::root().join("trace_child").expect("child path");
-            let mut options = harness.manager.start_thread_options(harness.config.clone());
-            options.session_source = Some(SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
-                parent_thread_id: parent_id,
-                depth: 1,
-                agent_path: Some(child_path.clone()),
-                agent_nickname: None,
-                agent_role: Some("worker".to_string()),
-            }));
-            let child = harness
-                .manager
-                .start_thread_with_options(options)
-                .await
-                .expect("registered child");
-            assert!(
-                parent
-                    .codex
-                    .session
-                    .services
-                    .rollout_thread_trace
-                    .is_enabled()
-            );
-            assert!(
-                child
-                    .thread
-                    .codex
-                    .session
-                    .services
-                    .rollout_thread_trace
-                    .is_enabled()
-            );
-            let turn = child.thread.codex.session.new_default_turn().await;
-            assert_eq!(turn.multi_agent_version, MultiAgentVersion::V2);
-            child
-                .thread
-                .codex
-                .session
-                .send_event(
-                    turn.as_ref(),
-                    EventMsg::TurnComplete(TurnCompleteEvent {
-                        surfaced_result: None,
-                        turn_id: turn.sub_id.clone(),
-                        last_agent_message: Some("completed child payload".to_string()),
-                        error: None,
-                        completed_at: None,
-                        duration_ms: None,
-                        time_to_first_token_ms: None,
-                        timing: None,
-                    }),
-                )
-                .await;
-
-            timeout(Duration::from_secs(5), async {
-                while !parent
-                    .codex
-                    .session
-                    .input_queue
-                    .has_pending_mailbox_items()
-                    .await
-                {
-                    tokio::task::yield_now().await;
-                }
-            })
-            .await
-            .expect("actual parent mailbox delivery");
-            let pending = parent
-                .codex
-                .session
-                .input_queue
-                .get_pending_input(&parent.codex.session.active_turn)
-                .await;
-            let [TurnInput::InterAgentCommunication(delivered)] = pending.as_slice() else {
-                panic!("one delivered parent message expected: {pending:?}");
-            };
-            let expected_message = "Message Type: FINAL_ANSWER\nTask name: /root\nSender: /root/trace_child\nPayload:\ncompleted child payload";
-            assert_eq!(delivered.author, child_path);
-            assert_eq!(delivered.recipient, AgentPath::root());
-            assert_eq!(delivered.content, expected_message);
-            assert!(delivered.other_recipients.is_empty());
-            assert!(!delivered.trigger_turn);
-            assert!(parent.codex.session.active_turn.lock().await.is_none());
-
-            let bundles = std::fs::read_dir(&trace_root)
-                .expect("read trace root")
-                .map(|entry| entry.expect("trace bundle entry").path())
-                .filter(|path| path.join("trace.jsonl").is_file())
-                .collect::<Vec<_>>();
-            assert_eq!(
-                bundles.len(),
-                1,
-                "child must inherit its parent's actual trace bundle"
-            );
-            let bundle = &bundles[0];
-            let read_results = || -> Vec<RawTraceEvent> {
-                std::fs::read_to_string(bundle.join("trace.jsonl"))
-                    .expect("read raw trace")
-                    .lines()
-                    .map(|line| {
-                        serde_json::from_str::<RawTraceEvent>(line).expect("raw trace event")
-                    })
-                    .filter(|event| {
-                        matches!(
-                            event.payload,
-                            RawTraceEventPayload::AgentResultObserved { .. }
-                        )
-                    })
-                    .collect()
-            };
-            let results = read_results();
-            assert_eq!(
-                results.len(),
-                1,
-                "one delivered terminal must produce exactly one result edge"
-            );
-            let event = &results[0];
-            assert_eq!(
-                event.thread_id.as_deref(),
-                Some(child.thread_id.to_string().as_str())
-            );
-            assert_eq!(event.codex_turn_id.as_deref(), Some(turn.sub_id.as_str()));
-            let RawTraceEventPayload::AgentResultObserved {
-                child_thread_id,
-                child_codex_turn_id,
-                parent_thread_id,
-                message,
-                carried_payload,
-                ..
-            } = &event.payload
-            else {
-                unreachable!("filtered result event")
-            };
-            assert_eq!(child_thread_id, &child.thread_id.to_string());
-            assert_eq!(child_codex_turn_id, &turn.sub_id);
-            assert_eq!(parent_thread_id, &parent_id.to_string());
-            assert_eq!(message, expected_message);
-            let payload = carried_payload.as_ref().expect("actual carried payload");
-            assert_eq!(
-                payload.kind,
-                codex_rollout_trace::RawPayloadKind::AgentResult
-            );
-            let payload: serde_json::Value = serde_json::from_str(
-                &std::fs::read_to_string(bundle.join(&payload.path)).expect("read carried payload"),
-            )
-            .expect("agent result payload JSON");
-            assert_eq!(
-                payload,
-                serde_json::json!({
-                    "child_agent_path": "/root/trace_child",
-                    "message": expected_message,
-                    "status": {"completed": "completed child payload"}
-                })
-            );
-
-            harness
-                .control
-                .shutdown_live_agent(parent_id)
-                .await
-                .expect("normal parent shutdown");
-            assert!(harness.manager.get_thread(parent_id).await.is_err());
-            let undelivered_turn = child.thread.codex.session.new_default_turn().await;
-            child
-                .thread
-                .codex
-                .session
-                .send_event(
-                    undelivered_turn.as_ref(),
-                    EventMsg::TurnComplete(TurnCompleteEvent {
-                        surfaced_result: None,
-                        turn_id: undelivered_turn.sub_id.clone(),
-                        last_agent_message: Some("missing parent payload".to_string()),
-                        error: None,
-                        completed_at: None,
-                        duration_ms: None,
-                        time_to_first_token_ms: None,
-                        timing: None,
-                    }),
-                )
-                .await;
-            assert_eq!(
-                read_results(),
-                results,
-                "a failed delivery must not create a result edge"
-            );
-            assert!(
-                parent
-                    .codex
-                    .session
-                    .input_queue
-                    .get_pending_input(&parent.codex.session.active_turn)
-                    .await
-                    .is_empty()
-            );
-            assert!(!harness.manager.captured_ops().into_iter().any(|(id, op)| {
-                id == parent_id
-                    && matches!(op, Op::InterAgentCommunication { communication }
-                    if communication.content.contains("missing parent payload"))
-            }));
-            harness
-                .control
-                .shutdown_live_agent(child.thread_id)
-                .await
-                .expect("normal child shutdown");
-        },
-    );
-}
 
 #[test]
 fn registered_v2_child_publication_panic_preserves_parent_result() {

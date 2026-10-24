@@ -98,6 +98,31 @@ fn capped_backoff_preserves_growth_below_the_ceiling() {
     assert_eq!(capped_backoff(Duration::ZERO, 100, maximum), Duration::ZERO);
 }
 
+#[test]
+fn capped_backoff_preserves_fractional_milliseconds() {
+    let maximum = Duration::from_secs(30);
+    // Expected values are exact base * 2^(retry - 1), before jitter.
+    for (base_micros, retry, expected_micros) in [
+        (500, 1, 500),
+        (500, 2, 1_000),
+        (500, 10, 256_000),
+        (1_500, 2, 3_000),
+        (1_500, 10, 768_000),
+    ] {
+        let delay = capped_backoff(Duration::from_micros(base_micros), retry, maximum);
+        let expected = Duration::from_micros(expected_micros);
+        assert!((expected.mul_f64(0.9)..=expected.mul_f64(1.1)).contains(&delay));
+    }
+    for retry in [100, u64::MAX] {
+        let delay = capped_backoff(Duration::from_micros(500), retry, maximum);
+        assert!((Duration::from_secs(27)..=maximum).contains(&delay));
+        assert_eq!(
+            capped_backoff(Duration::ZERO, retry, maximum),
+            Duration::ZERO
+        );
+    }
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn ordinary_retry_recovers_pre_dispatch_failures_and_honors_policy() {
     for (enabled, max_retries, expected_attempts) in [(true, 2, 2), (false, 2, 1), (true, 0, 1)] {

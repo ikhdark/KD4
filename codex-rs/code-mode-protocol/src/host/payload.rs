@@ -540,9 +540,11 @@ impl From<WireNestedToolCall> for CodeModeNestedToolCall {
 /// Renders a local deadline for transport. Prefers the shared monotonic
 /// timeline; the remaining-duration form is only a fallback.
 fn encode_nested_deadline(deadline: Instant) -> (Option<SharedMonotonicNanos>, Option<u64>) {
-    let remaining = deadline.saturating_duration_since(Instant::now());
+    let pair = bounded_clock_pair(Instant::now, shared_monotonic_now);
+    let now = pair.map_or_else(Instant::now, |(now, _)| now);
+    let remaining = deadline.saturating_duration_since(now);
     let remaining_ms = u64::try_from(remaining.as_millis()).ok();
-    let Some(now_nanos) = shared_monotonic_now() else {
+    let Some((_, now_nanos)) = pair else {
         return (None, remaining_ms);
     };
     let deadline_nanos = u64::try_from(remaining.as_nanos())
@@ -561,11 +563,46 @@ fn decode_nested_deadline(
     deadline_shared_monotonic_nanos: Option<SharedMonotonicNanos>,
     remaining_ms_at_send: Option<u64>,
 ) -> Option<Instant> {
-    let now = Instant::now();
     if let Some(deadline_nanos) = deadline_shared_monotonic_nanos
-        && let Some(now_nanos) = shared_monotonic_now()
+        && let Some((now, now_nanos)) = bounded_clock_pair(Instant::now, shared_monotonic_now)
     {
-        return Some(now + Duration::from_nanos(deadline_nanos.saturating_sub(now_nanos)));
+        return now.checked_add(Duration::from_nanos(deadline_nanos.saturating_sub(now_nanos)));
     }
-    remaining_ms_at_send.map(|remaining_ms| now + Duration::from_millis(remaining_ms))
+    remaining_ms_at_send.and_then(|remaining_ms| Instant::now().checked_add(Duration::from_millis(remaining_ms)))
+}
+
+fn bounded_clock_pair(
+    mut local_now: impl FnMut() -> Instant,
+    mut shared_now: impl FnMut() -> Option<SharedMonotonicNanos>,
+) -> Option<(Instant, SharedMonotonicNanos)> {
+    // Bound sampling skew rather than translating scheduler pauses into drift.
+    // After bounded retries, explicitly use the non-preserving fallback.
+    for _ in 0..8 {
+        let before = local_now();
+        let shared = shared_now()?;
+        let after = local_now();
+        let skew = after.saturating_duration_since(before);
+        if skew <= Duration::from_millis(1) {
+            return Some((before + skew / 2, shared));
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+#[test]
+fn clock_pair_sampling_rejects_preemption_instead_of_translating_it_into_drift() {
+    let base = Instant::now();
+    let mut local = [0, 60_000, 60_000, 60_002].into_iter();
+    let mut shared = [100, 200].into_iter();
+    let pair = bounded_clock_pair(
+        || base + Duration::from_micros(local.next().unwrap()),
+        || shared.next(),
+    ).unwrap();
+    assert_eq!(pair, (base + Duration::from_micros(60_001), 200));
+    let mut ticks = 0;
+    assert!(bounded_clock_pair(
+        || { ticks += 1; base + Duration::from_millis(ticks * 2) },
+        || Some(1),
+    ).is_none());
 }

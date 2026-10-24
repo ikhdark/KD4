@@ -79,6 +79,16 @@ impl ComposableRequirementsLayer {
             .and_then(|_| hostname_resolver());
         requirements.apply_remote_sandbox_config(hostname.as_deref());
         materialize_remote_sandbox_config(&mut regular_toml, &requirements)?;
+        // Each source is already validated; merge only its canonical network
+        // spelling so aliases compose with the same per-key precedence.
+        if let Some(network) = requirements.network.as_ref()
+            && let Some(table) = regular_toml.as_table_mut()
+        {
+            table.insert(
+                "experimental_network".to_string(),
+                toml_value_from_serializable(network)?,
+            );
+        }
         strip_special_fields(&mut regular_toml);
         // Validate first so a layer declaring both spellings still fails.
         // Across layers, the accepted alias must share the canonical merge key.

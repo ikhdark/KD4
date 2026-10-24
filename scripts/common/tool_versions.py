@@ -1,53 +1,12 @@
-"""Shared tool versions for local scripts and drift checks."""
+"""Formatter version and shared Cargo lane naming."""
 
 from __future__ import annotations
 
 import json
-import re
 from functools import cache
 from pathlib import Path
 
-# Python < 3.11 lacks tomllib; dev_env_doctor must still import and report the floor.
-try:
-    import tomllib
-except ModuleNotFoundError:
-    tomllib = None
-
-
-REPO_ROOT = Path(__file__).resolve().parents[2]
 RUSTFMT_TOOLCHAIN = "nightly-2025-09-18"
-RUST_TOOLCHAIN_FILE = REPO_ROOT / "codex-rs" / "rust-toolchain.toml"
-
-
-@cache
-def scripts_ruff_requirement() -> str:
-    data = tomllib.loads(
-        (REPO_ROOT / "scripts" / "pyproject.toml").read_text(encoding="utf-8")
-    )
-    for dependency in data.get("project", {}).get("dependencies", []):
-        if isinstance(dependency, str) and re.match(
-            r"^\s*ruff(?=\s|\[|[<>=!~@;]|$)", dependency, re.IGNORECASE
-        ):
-            return dependency
-    raise RuntimeError("scripts/pyproject.toml must declare a ruff dependency")
-
-
-@cache
-def rust_toolchain_channel() -> str | None:
-    """Return the codex-rs pinned channel, or None when this Python lacks tomllib."""
-    if tomllib is None:
-        return None
-    try:
-        data = tomllib.loads(RUST_TOOLCHAIN_FILE.read_text(encoding="utf-8"))
-    except (OSError, tomllib.TOMLDecodeError) as error:
-        raise RuntimeError(f"could not read {RUST_TOOLCHAIN_FILE}: {error}") from None
-    toolchain = data.get("toolchain")
-    channel = toolchain.get("channel") if isinstance(toolchain, dict) else None
-    if not isinstance(channel, str) or not channel:
-        raise RuntimeError(f"{RUST_TOOLCHAIN_FILE} must pin toolchain.channel")
-    return channel
-
-
 @cache
 def cargo_lane_patterns() -> dict[str, object]:
     pattern_path = (

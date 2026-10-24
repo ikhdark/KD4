@@ -23,8 +23,6 @@ use crate::request_processors::CatalogRequestProcessor;
 use crate::request_processors::CommandExecRequestProcessor;
 use crate::request_processors::ConfigRequestProcessor;
 use crate::request_processors::EnvironmentRequestProcessor;
-use crate::request_processors::ExternalAgentConfigRequestProcessor;
-use crate::request_processors::ExternalAgentConfigRequestProcessorArgs;
 use crate::request_processors::FeedbackRequestProcessor;
 use crate::request_processors::FsRequestProcessor;
 use crate::request_processors::InitializeRequestProcessor;
@@ -37,7 +35,6 @@ use crate::request_processors::ProjectRequestProcessor;
 use crate::request_processors::QueueOrigin;
 use crate::request_processors::RemoteControlRequestProcessor;
 use crate::request_processors::SearchRequestProcessor;
-use crate::request_processors::ThreadGoalRequestProcessor;
 use crate::request_processors::ThreadQueueRequestProcessor;
 use crate::request_processors::ThreadRequestProcessor;
 use crate::request_processors::TurnRequestProcessor;
@@ -54,6 +51,7 @@ use crate::transport::AppServerTransport;
 use crate::transport::RemoteControlHandle;
 use codex_analytics::AnalyticsEventsClient;
 use codex_analytics::AppServerRpcTransport;
+use codex_app_server_transport::serialized_request_bytes_up_to;
 use codex_app_server_protocol::ClientNotification;
 use codex_app_server_protocol::ClientRequest;
 use codex_app_server_protocol::ClientResponsePayload;
@@ -74,7 +72,6 @@ use codex_core::ThreadManager;
 use codex_core::config::Config;
 use codex_exec_server::EnvironmentManager;
 use codex_feedback::CodexFeedback;
-use codex_goal_extension::GoalService;
 use codex_home::CodexHomeUserInstructionsProvider;
 use codex_login::AuthManager;
 use codex_protocol::protocol::SessionSource;
@@ -148,23 +145,7 @@ fn serialized_request_queue_bytes<T: Serialize + ?Sized>(
     if !is_serialized {
         return 0;
     }
-    struct CountingWriter(usize);
-
-    impl std::io::Write for CountingWriter {
-        fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
-            self.0 = self.0.saturating_add(buffer.len());
-            Ok(buffer.len())
-        }
-
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-
-    let mut writer = CountingWriter(0);
-    serde_json::to_writer(&mut writer, request)
-        .map(|()| writer.0)
-        .unwrap_or(usize::MAX)
+    serialized_request_bytes_up_to(request, 16 * 1024 * 1024)
 }
 
 pub(crate) struct MessageProcessor {
@@ -179,7 +160,6 @@ pub(crate) struct MessageProcessor {
     process_exec_processor: ProcessExecRequestProcessor,
     config_processor: ConfigRequestProcessor,
     environment_processor: EnvironmentRequestProcessor,
-    external_agent_config_processor: ExternalAgentConfigRequestProcessor,
     feedback_processor: FeedbackRequestProcessor,
     fs_processor: FsRequestProcessor,
     pub(crate) initialize_processor: InitializeRequestProcessor,
@@ -189,7 +169,6 @@ pub(crate) struct MessageProcessor {
     project_processor: ProjectRequestProcessor,
     remote_control_processor: RemoteControlRequestProcessor,
     search_processor: SearchRequestProcessor,
-    thread_goal_processor: ThreadGoalRequestProcessor,
     pub(crate) thread_processor: ThreadRequestProcessor,
     pub(crate) thread_manager: Arc<ThreadManager>,
     turn_processor: TurnRequestProcessor,
@@ -325,21 +304,16 @@ impl MessageProcessor {
         let thread_store = codex_core::thread_store_from_config(config.as_ref(), state_db.clone());
         let environment_manager_for_requests = Arc::clone(&environment_manager);
         let environment_manager_for_extensions = Arc::clone(&environment_manager);
-        let goal_service = Arc::new(GoalService::new());
-        let thread_manager = Arc::new_cyclic(|thread_manager| {
+        let thread_manager = Arc::new({
             ThreadManager::new(
                 config.as_ref(),
                 auth_manager.clone(),
                 session_source.clone(),
                 environment_manager,
                 thread_extensions(
-                    app_server_extension_event_sink(outgoing.clone(), thread_state_manager.clone()),
+                    app_server_extension_event_sink(outgoing.clone()),
                     BuiltinExtensionDependencies {
                         auth_manager: auth_manager.clone(),
-                        state_db: state_db.clone(),
-                        analytics_events_client: Some(analytics_events_client.clone()),
-                        thread_manager: thread_manager.clone(),
-                        goal_service: Arc::clone(&goal_service),
                         environment_manager: Arc::clone(&environment_manager_for_extensions),
                         session_source,
                     },
@@ -463,14 +437,6 @@ impl MessageProcessor {
         );
         let remote_control_processor = RemoteControlRequestProcessor::new(remote_control_handle);
         let search_processor = SearchRequestProcessor::new(outgoing.clone());
-        let thread_goal_processor = ThreadGoalRequestProcessor::new(
-            Arc::clone(&thread_manager),
-            outgoing.clone(),
-            Arc::clone(&config),
-            thread_state_manager.clone(),
-            state_db.clone(),
-            Arc::clone(&goal_service),
-        );
         let project_processor = ProjectRequestProcessor::new(
             Arc::clone(&thread_store),
             thread_state_manager.clone(),
@@ -489,7 +455,6 @@ impl MessageProcessor {
             thread_state_manager.clone(),
             thread_watch_manager,
             Arc::clone(&thread_list_state_permit),
-            thread_goal_processor.clone(),
             state_db.clone(),
             log_db,
             Arc::clone(&skills_watcher),
@@ -531,18 +496,6 @@ impl MessageProcessor {
             thread_manager.clone(),
             analytics_events_client.clone(),
         );
-        let external_agent_config_processor =
-            ExternalAgentConfigRequestProcessor::new(ExternalAgentConfigRequestProcessorArgs {
-                outgoing: outgoing.clone(),
-                thread_manager: Arc::clone(&thread_manager),
-                thread_store,
-                config_manager: config_manager.clone(),
-                config_processor: config_processor.clone(),
-                state_db,
-                analytics_events_client,
-                codex_home: config.codex_home.to_path_buf(),
-                background_tasks: thread_processor.background_tasks.clone(),
-            });
         let environment_processor =
             EnvironmentRequestProcessor::new(thread_manager.environment_manager());
         let fs_processor = FsRequestProcessor::new(
@@ -567,7 +520,6 @@ impl MessageProcessor {
             process_exec_processor,
             config_processor,
             environment_processor,
-            external_agent_config_processor,
             feedback_processor,
             fs_processor,
             initialize_processor,
@@ -577,7 +529,6 @@ impl MessageProcessor {
             project_processor,
             remote_control_processor,
             search_processor,
-            thread_goal_processor,
             thread_processor,
             thread_manager,
             turn_processor,
@@ -617,7 +568,7 @@ impl MessageProcessor {
         // Reject the complete wire envelope (including trace fields) before
         // cloning it into request contexts. Interrupt is the registered control RPC.
         if codex_app_server_protocol::client_request_is_control(&request.method)
-            && serialized_request_queue_bytes(true, &request) > 64 * 1024
+            && serialized_request_bytes_up_to(&request, 64 * 1024) > 64 * 1024
         {
             self.outgoing
                 .send_unregistered_error(
@@ -667,7 +618,7 @@ impl MessageProcessor {
                     Err(error) => Err(error),
                 };
                 if let Err(error) = result {
-                    self.outgoing.send_error(request_id.clone(), error).await;
+                    self.outgoing.queue_error(request_id.clone(), error).await;
                 }
             },
         )
@@ -687,7 +638,7 @@ impl MessageProcessor {
         parent_trace: Option<codex_protocol::protocol::W3cTraceContext>,
     ) {
         if request.is_control()
-            && serialized_request_queue_bytes(true, &(&request, &parent_trace)) > 64 * 1024
+            && serialized_request_bytes_up_to(&(&request, &parent_trace), 64 * 1024) > 64 * 1024
         {
             self.outgoing
                 .send_unregistered_error(
@@ -736,7 +687,7 @@ impl MessageProcessor {
                     )
                     .await;
                 if let Err(error) = result {
-                    self.outgoing.send_error(request_id.clone(), error).await;
+                    self.outgoing.queue_error(request_id.clone(), error).await;
                 }
             },
         )
@@ -927,7 +878,6 @@ impl MessageProcessor {
                     | ClientRequest::ThreadFork { .. }
                     | ClientRequest::ThreadQueueStart { .. }
                     | ClientRequest::ThreadQueueAdd { .. }
-                    | ClientRequest::ThreadGoalSet { .. }
                     | ClientRequest::ThreadShellCommand { .. }
             )
         {
@@ -1033,13 +983,17 @@ impl MessageProcessor {
         if let Some(scope) = serialization_scope {
             let preparation_processor = Arc::clone(self);
             let preparation_rejected_request_id = admission_error_request_id.clone();
+            // Resolve concurrently, but publish into per-thread queues in the
+            // existing FIFO ticket order. An unresolved path may alias an ID.
+            let resolution = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(
+                RequestSerializationQueueKey::try_from_scope(connection_id, scope),
+            ));
             let prepare = async move {
-                let (key, access) = match RequestSerializationQueueKey::try_from_scope(
-                    connection_id,
-                    scope,
-                )
-                .await
-                {
+                let resolved = resolution
+                    .await
+                    .map_err(std::io::Error::other)
+                    .and_then(|result| result);
+                let (key, access) = match resolved {
                     Ok(prepared) => prepared,
                     Err(error) => {
                         preparation_processor
@@ -1050,7 +1004,7 @@ impl MessageProcessor {
                             );
                         preparation_processor
                             .outgoing
-                            .send_error(
+                            .queue_error(
                                 ConnectionRequestId {
                                     connection_id,
                                     request_id: error_id,
@@ -1082,7 +1036,7 @@ impl MessageProcessor {
                         .track_initialized_request_error(connection_id, admission_error_request_id);
                     preparation_processor
                         .outgoing
-                        .send_error(
+                        .queue_error(
                             ConnectionRequestId {
                                 connection_id,
                                 request_id: error_id,
@@ -1172,21 +1126,6 @@ impl MessageProcessor {
                         .windows_sandbox_readiness()
                         .await
                         .map(|response| Some(response.into())),
-                    ClientRequest::ExternalAgentConfigDetect { params, .. } => self
-                        .external_agent_config_processor
-                        .detect(params)
-                        .await
-                        .map(|response| Some(response.into())),
-                    ClientRequest::ExternalAgentConfigImport { params, .. } => self
-                        .external_agent_config_processor
-                        .import(request_id.clone(), params)
-                        .await
-                        .map(|()| None),
-                    ClientRequest::ExternalAgentConfigImportHistoriesRead { .. } => self
-                        .external_agent_config_processor
-                        .read_import_histories()
-                        .await
-                        .map(|response| Some(response.into())),
                     ClientRequest::ConfigValueWrite { params, .. } => {
                         self.config_processor.value_write(params).await.map(Some)
                     }
@@ -1243,9 +1182,6 @@ impl MessageProcessor {
                         .config_requirements_read()
                         .await
                         .map(|response| Some(response.into())),
-                    ClientRequest::EnvironmentAdd { params, .. } => {
-                        self.environment_processor.environment_add(params).await
-                    }
                     ClientRequest::EnvironmentInfo { params, .. } => {
                         self.environment_processor.environment_info(params).await
                     }
@@ -1369,19 +1305,6 @@ impl MessageProcessor {
                     ClientRequest::ThreadSetName { params, .. } => {
                         self.thread_processor
                             .thread_set_name(request_id.clone(), params)
-                            .await
-                    }
-                    ClientRequest::ThreadGoalSet { params, .. } => {
-                        self.thread_goal_processor
-                            .thread_goal_set(request_id.clone(), params)
-                            .await
-                    }
-                    ClientRequest::ThreadGoalGet { params, .. } => {
-                        self.thread_goal_processor.thread_goal_get(params).await
-                    }
-                    ClientRequest::ThreadGoalClear { params, .. } => {
-                        self.thread_goal_processor
-                            .thread_goal_clear(request_id.clone(), params)
                             .await
                     }
                     ClientRequest::ThreadMetadataUpdate { params, .. } => self
@@ -1804,6 +1727,30 @@ mod admission_regression_tests {
     use codex_app_server_protocol::RequestId;
 
     #[test]
+    fn bounded_request_count_stops_at_the_rejection_boundary() {
+        use serde::ser::SerializeSeq;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct ManyFields<'a>(&'a AtomicUsize);
+        impl Serialize for ManyFields<'_> {
+            fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+                let mut seq = serializer.serialize_seq(Some(10_000))?;
+                for _ in 0..10_000 {
+                    self.0.fetch_add(1, Ordering::Relaxed);
+                    seq.serialize_element("é\\\"")?;
+                }
+                seq.end()
+            }
+        }
+        let visited = AtomicUsize::new(0);
+        assert_eq!(serialized_request_bytes_up_to(&ManyFields(&visited), 64), usize::MAX);
+        assert!(visited.load(Ordering::Relaxed) < 64, "rejected tails must not be serialized");
+        let request = serde_json::json!({"id": "é\\\"", "trace": "λ", "params": [1, 2, 3]});
+        let exact = serde_json::to_vec(&request).unwrap().len();
+        assert_eq!(serialized_request_bytes_up_to(&request, exact), exact);
+        assert_eq!(serialized_request_bytes_up_to(&request, exact - 1), usize::MAX);
+    }
+
+    #[test]
     fn request_decode_preserves_method_and_parameter_error_categories() {
         let decode = |method: &str, params| {
             deserialize_client_request(JSONRPCRequest {
@@ -1848,8 +1795,8 @@ mod admission_regression_tests {
             request_id: RequestId::Integer(7),
         };
         let context = || RequestContext::new(request_id.clone(), tracing::Span::none(), None);
-        assert!(outgoing.register_request_context(context()).await);
         let mut original = context();
+        assert!(outgoing.register_request_context(original.clone()).await);
         assert!(outgoing.admit_request_work(&mut original, 100, false).await);
         drop(original);
         // Fill the remaining slots before the protocol violation retires delivery.

@@ -47,6 +47,7 @@ use codex_features::user_settable_feature_for_key;
 use codex_model_provider::create_model_provider;
 use codex_plugin::PluginId;
 use codex_protocol::config_types::WebSearchMode;
+use futures::StreamExt;
 use serde_json::json;
 use std::path::PathBuf;
 
@@ -296,26 +297,35 @@ impl ConfigRequestProcessor {
 
     async fn reload_user_config(&self, refreshed_features: &[Feature]) {
         let thread_ids = self.thread_manager.list_thread_ids().await;
-        for thread_id in thread_ids {
-            let Ok(thread) = self.thread_manager.get_thread(thread_id).await else {
-                continue;
-            };
-            let current_config = thread.config().await;
-            let next_config = match self
-                .config_manager
-                .load_latest_config_for_thread(current_config.as_ref())
-                .await
-            {
-                Ok(config) => config,
-                Err(err) => {
-                    tracing::warn!("failed to rebuild thread config for runtime refresh: {err}");
-                    continue;
-                }
-            };
-            thread
-                .refresh_runtime_config_features(next_config, refreshed_features)
-                .await;
-        }
+        // handle_config_mutation already invalidated the shared discovery state.
+        // Do not let one refreshed thread evict another's newly loaded plugins.
+        futures::stream::iter(thread_ids)
+            .for_each_concurrent(5, |thread_id| async move {
+                let Ok(thread) = self.thread_manager.get_thread(thread_id).await else {
+                    return;
+                };
+                let current_config = thread.config().await;
+                let next_config = match self
+                    .config_manager
+                    .load_latest_config_for_thread(current_config.as_ref())
+                    .await
+                {
+                    Ok(config) => config,
+                    Err(err) => {
+                        tracing::warn!(
+                            "failed to rebuild thread config for runtime refresh: {err}"
+                        );
+                        return;
+                    }
+                };
+                thread
+                    .refresh_runtime_config_features_after_discovery_invalidation(
+                        next_config,
+                        refreshed_features,
+                    )
+                    .await;
+            })
+            .await;
     }
 
     async fn emit_plugin_toggle_events(
@@ -323,13 +333,22 @@ impl ConfigRequestProcessor {
         pending_changes: std::collections::BTreeMap<String, bool>,
     ) {
         let plugins_manager = self.thread_manager.plugins_manager();
-        for (plugin_id, enabled) in pending_changes {
-            let Ok(plugin_id) = PluginId::parse(&plugin_id) else {
-                continue;
-            };
-            let metadata = plugins_manager
-                .telemetry_metadata_for_installed_plugin(&plugin_id)
-                .await;
+        let metadata = futures::stream::iter(pending_changes)
+            .filter_map(|(plugin_id, enabled)| async move {
+                PluginId::parse(&plugin_id).ok().map(|id| (id, enabled))
+            })
+            .map(|(plugin_id, enabled)| {
+                let plugins_manager = &plugins_manager;
+                async move {
+                    let metadata = plugins_manager
+                        .telemetry_metadata_for_installed_plugin(&plugin_id)
+                        .await;
+                    (metadata, enabled)
+                }
+            })
+            .buffered(5);
+        futures::pin_mut!(metadata);
+        while let Some((metadata, enabled)) = metadata.next().await {
             if enabled {
                 self.analytics_events_client.track_plugin_enabled(metadata);
             } else {

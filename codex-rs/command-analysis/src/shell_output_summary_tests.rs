@@ -1616,7 +1616,7 @@ fn oversized_rg_leads_with_complete_per_file_counts() {
         &output,
         1,
         false,
-        options(Some("rg -n needle src; rg -n other src"), Some(500)),
+        options(Some("rg --no-config -n --with-filename --no-heading --color never needle src; rg --no-config -n --with-filename --no-heading --color never other src"), Some(500)),
     )
     .unwrap();
     assert!(summary.starts_with("rg output summary"));

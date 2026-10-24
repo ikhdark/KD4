@@ -38,9 +38,6 @@ use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::TokenUsage;
 use codex_protocol::protocol::TurnStartedEvent;
 use codex_protocol::protocol::WarningEvent;
-#[cfg(test)]
-use codex_rollout_trace::CompactionTraceContext;
-use codex_rollout_trace::InferenceTraceContext;
 use futures::StreamExt;
 use tokio_util::sync::CancellationToken;
 
@@ -49,9 +46,6 @@ mod attempt;
 use attempt::RemoteCompactV2Attempt;
 use attempt::run_remote_compact_v2_attempt;
 
-#[path = "compact_remote_v2_trace.rs"]
-mod trace;
-use trace::AsyncCompactionTraceContext;
 
 // Compact attempts can run much longer than normal turns, so keep the per-transport
 // retry budget smaller than the general Responses stream retry budget.
@@ -309,15 +303,6 @@ async fn run_remote_compact_task_inner_impl(
     cancellation_token: &CancellationToken,
 ) -> CodexResult<()> {
     let turn_context = &step_context.turn;
-    let compaction_trace = AsyncCompactionTraceContext::new(
-        &sess.terminal_tasks,
-        sess.services.rollout_thread_trace.compaction_trace_context(
-            turn_context.sub_id.as_str(),
-            &compaction_item.id,
-            turn_context.model_info.slug.as_str(),
-            turn_context.provider.info().name.as_str(),
-        ),
-    );
 
     // Each attempt discounts its own trimming from this pre-compaction baseline.
     let active_context_tokens_before = analytics_details.active_context_tokens_before;
@@ -325,7 +310,6 @@ async fn run_remote_compact_task_inner_impl(
         sess,
         step_context,
         client_session.as_deref_mut(),
-        &compaction_trace,
         compaction_metadata,
         analytics_details,
         cancellation_token,
@@ -349,20 +333,11 @@ async fn run_remote_compact_task_inner_impl(
                 .await?;
             }
             let fallback_turn_context = &fallback_step_context.turn;
-            let fallback_compaction_trace = compaction_trace.with_context(
-                sess.services.rollout_thread_trace.compaction_trace_context(
-                    fallback_turn_context.sub_id.as_str(),
-                    &compaction_item.id,
-                    fallback_turn_context.model_info.slug.as_str(),
-                    fallback_turn_context.provider.info().name.as_str(),
-                ),
-            );
             analytics_details.active_context_tokens_before = active_context_tokens_before;
             let fallback_result = run_remote_compact_v2_attempt(
                 sess,
                 fallback_step_context,
                 client_session.as_deref_mut(),
-                &fallback_compaction_trace,
                 compaction_metadata,
                 analytics_details,
                 cancellation_token,
@@ -389,7 +364,6 @@ async fn run_remote_compact_task_inner_impl(
         }
     };
     let RemoteCompactV2Attempt {
-        trace_input_history,
         retained_input,
         compaction_output,
         token_usage,
@@ -423,7 +397,6 @@ async fn run_remote_compact_task_inner_impl(
         }
     };
     let compacted_item = persisted_v2_compacted_item(new_history.clone());
-    let trace_replacement_history = trace_input_history.as_ref().map(|_| new_history.clone());
     sess.replace_compacted_history(
         compaction_turn_context,
         new_history,
@@ -433,13 +406,6 @@ async fn run_remote_compact_task_inner_impl(
         compacted_item,
     )
     .await?;
-    if let (Some(trace_input_history), Some(replacement_history)) =
-        (trace_input_history, trace_replacement_history)
-    {
-        compaction_trace
-            .record_installed(trace_input_history, replacement_history)
-            .await;
-    }
     if let Some(client_session) = client_session {
         // Refreshed instructions and local recovery/pin metadata were not part of
         // the provider's response. Send the complete installed checkpoint once;
@@ -462,13 +428,6 @@ struct RemoteCompactionV2Output {
     token_usage: Option<TokenUsage>,
 }
 
-#[derive(serde::Serialize)]
-struct RemoteCompactionV2TraceRequest<'a> {
-    model: &'a str,
-    instructions: &'a str,
-    input: &'a [ResponseItem],
-    parallel_tool_calls: bool,
-}
 
 async fn run_remote_compaction_request_v2(
     sess: &Session,
@@ -476,7 +435,6 @@ async fn run_remote_compaction_request_v2(
     client_session: &mut ModelClientSession,
     prompt: &Prompt,
     responses_metadata: &CodexResponsesMetadata,
-    compaction_trace: &AsyncCompactionTraceContext,
     cancellation_token: &CancellationToken,
 ) -> CodexResult<RemoteCompactionV2Output> {
     client_session.set_turn_timing(Arc::clone(&turn_context.turn_timing_state));
@@ -490,22 +448,7 @@ async fn run_remote_compaction_request_v2(
     turn_context.turn_timing_state.begin_compaction_generation();
     loop {
         let attempt_started = tokio::time::Instant::now();
-        let trace_owner = if compaction_trace.is_enabled() {
-            tokio::select! {
-                biased;
-                _ = cancellation_token.cancelled() => return Err(CodexErr::TurnAborted),
-                owner = compaction_trace.start_attempt(
-                    turn_context.model_info.slug.clone(),
-                    prompt.base_instructions.text.clone(),
-                    Arc::clone(&prompt.input),
-                    prompt.parallel_tool_calls,
-                ) => owner,
-            }
-        } else {
-            None
-        };
         let model_request_timing_guard = turn_context.turn_timing_state.begin_model_request_wait();
-        let inference_trace_context = InferenceTraceContext::disabled();
         let service_tier =
             crate::session::turn::service_tier_for_sampling(sess, turn_context).await;
         let stream_result = tokio::select! {
@@ -518,35 +461,21 @@ async fn run_remote_compaction_request_v2(
                 codex_protocol::config_types::ReasoningSummary::None,
                 service_tier,
                 responses_metadata,
-                &inference_trace_context,
             ) => result,
         };
         drop(model_request_timing_guard);
-        let mut terminal_receipt = None;
         let result = match stream_result {
             Ok(stream) => {
-                collect_compaction_output_with_receipt(
+                collect_compaction_output(
                     stream,
                     Some(&turn_context.turn_timing_state),
                     Some((sess, turn_context)),
                     cancellation_token,
-                    &mut terminal_receipt,
                 )
                 .await
             }
             Err(err) => Err(err),
         };
-        // Transfer terminal ownership before optional persistence. A forced
-        // drop while the terminal write is queued must not race it with a
-        // fabricated physical cancellation.
-        if let Some(trace_owner) = trace_owner {
-            let cancelled = matches!(&result, Err(CodexErr::TurnAborted));
-            let trace_result = result
-                .as_ref()
-                .map(|output| vec![output.compaction_output.clone()])
-                .map_err(ToString::to_string);
-            trace_owner.record_result(trace_result, terminal_receipt, cancelled);
-        }
 
         match result {
             Ok(compaction_output) => return Ok(compaction_output),
@@ -578,32 +507,13 @@ async fn run_remote_compaction_request_v2(
     }
 }
 
-/// Test convenience; production retains the terminal receipt for its trace.
-#[cfg(test)]
-async fn collect_compaction_output(
-    stream: ResponseStream,
-    timing_state: Option<&Arc<TurnTimingState>>,
-    accounting_context: Option<(&Session, &TurnContext)>,
-    cancellation_token: &CancellationToken,
-) -> CodexResult<RemoteCompactionV2Output> {
-    collect_compaction_output_with_receipt(
-        stream,
-        timing_state,
-        accounting_context,
-        cancellation_token,
-        &mut None,
-    )
-    .await
-}
 
-async fn collect_compaction_output_with_receipt(
+async fn collect_compaction_output(
     mut stream: ResponseStream,
     timing_state: Option<&Arc<TurnTimingState>>,
     accounting_context: Option<(&Session, &TurnContext)>,
     cancellation_token: &CancellationToken,
-    terminal_receipt: &mut Option<codex_rollout_trace::CompactionResponseReceipt>,
 ) -> CodexResult<RemoteCompactionV2Output> {
-    let identity = stream.attempt_identity().cloned();
     let mut output_item_count = 0usize;
     let mut compaction_count = 0usize;
     let mut compaction_output = None;
@@ -623,19 +533,6 @@ async fn collect_compaction_output_with_receipt(
         let event = match event {
             Ok(event) => event,
             Err(error) => {
-                if error.terminal_usage().is_some() || error.terminal_response_id().is_some() {
-                    *terminal_receipt = Some(codex_rollout_trace::CompactionResponseReceipt {
-                        response_id: error.terminal_response_id().map(str::to_owned),
-                        sampling_request_id: identity
-                            .as_ref()
-                            .map(|id| id.sampling_request_id.clone()),
-                        physical_attempt_id: identity
-                            .as_ref()
-                            .map(|id| id.physical_attempt_id.clone()),
-                        token_usage: error.terminal_usage().and_then(Clone::clone),
-                        provider_completed: false,
-                    });
-                }
                 if let Some(token_usage) = error.terminal_usage() {
                     if let Some(timing) = timing_state {
                         timing.record_generation_token_usage(token_usage.as_ref());
@@ -676,18 +573,9 @@ async fn collect_compaction_output_with_receipt(
                 }
             }
             ResponseEvent::Completed {
-                response_id,
                 token_usage,
                 ..
             } => {
-                // Capture before accounting or checkpoint validation can fail.
-                *terminal_receipt = Some(codex_rollout_trace::CompactionResponseReceipt {
-                    response_id: Some(response_id),
-                    sampling_request_id: identity.as_ref().map(|id| id.sampling_request_id.clone()),
-                    physical_attempt_id: identity.as_ref().map(|id| id.physical_attempt_id.clone()),
-                    token_usage: token_usage.clone(),
-                    provider_completed: true,
-                });
                 // Consumption belongs to the physical response, even when its
                 // checkpoint is invalid and must never be installed.
                 if let Some((sess, turn)) = accounting_context {
@@ -818,10 +706,6 @@ mod tests {
     use codex_protocol::models::BaseInstructions;
     use codex_protocol::models::ContentItem;
     use codex_protocol::models::MessagePhase;
-    use codex_rollout_trace::ExecutionStatus;
-    use codex_rollout_trace::RawTraceEventPayload;
-    use codex_rollout_trace::TraceWriter;
-    use codex_rollout_trace::replay_bundle;
     use codex_utils_output_truncation::approx_token_count;
     use pretty_assertions::assert_eq;
     use tempfile::TempDir;
@@ -952,7 +836,6 @@ mod tests {
                 &mut client,
                 &Prompt::default(),
                 &metadata,
-                &AsyncCompactionTraceContext::disabled(),
                 &CancellationToken::new(),
             )
             .await?;
@@ -1038,7 +921,6 @@ mod tests {
             &mut client,
             &Prompt::default(),
             &metadata,
-            &AsyncCompactionTraceContext::disabled(),
             &CancellationToken::new(),
         )
         .await;
@@ -1123,7 +1005,6 @@ mod tests {
             &mut client,
             &prompt,
             &metadata,
-            &AsyncCompactionTraceContext::disabled(),
             &CancellationToken::new(),
         )
         .await;
@@ -1181,261 +1062,6 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn remote_compaction_v2_retry_records_distinct_trace_attempts() -> anyhow::Result<()> {
-        crate::test_harness::require_network!();
-
-        let server = responses::start_mock_server().await;
-        let request_log = responses::mount_sse_sequence(
-            &server,
-            vec![
-                responses::sse_failed(
-                    "resp-compact-failed",
-                    "server_error",
-                    "temporary compaction failure",
-                ),
-                responses::sse(vec![
-                    serde_json::json!({
-                        "type": "response.output_item.done",
-                        "item": {
-                            "type": "compaction",
-                            "encrypted_content": "encrypted replacement context",
-                        }
-                    }),
-                    responses::ev_completed("resp-compact-succeeded"),
-                ]),
-            ],
-        )
-        .await;
-
-        let (mut session, mut turn_context) =
-            crate::session::tests::make_session_and_context().await;
-        let mut config = (*turn_context.config).clone();
-        config.model_provider.base_url = Some(format!("{}/v1", server.uri()));
-        config.model_provider.supports_websockets = false;
-        config.model_provider.request_max_retries = Some(0);
-        config.model_provider.stream_max_retries = Some(1);
-        let config = Arc::new(config);
-        turn_context.provider = create_model_provider(
-            config.model_provider.clone(),
-            turn_context.auth_manager.clone(),
-        );
-        turn_context.config = Arc::clone(&config);
-        session.services.model_client = ModelClient::new(
-            Some(Arc::clone(&session.services.auth_manager)),
-            AgentIdentityAuthPolicy::JwtOnly,
-            session.thread_id,
-            config.model_provider.clone(),
-            turn_context.session_source.clone(),
-            turn_context.originator.clone(),
-            config.model_verbosity,
-            /*enable_request_compression*/ false,
-            /*include_timing_metrics*/ false,
-            /*beta_features_header*/ None,
-            /*concurrent_reasoning_summaries_enabled*/ false,
-            /*attestation_provider*/ None,
-            config.http_client_factory(),
-        );
-
-        let trace_dir = TempDir::new()?;
-        let thread_id = session.thread_id.to_string();
-        let turn_id = turn_context.sub_id.clone();
-        let compaction_id = "compaction-retry-test".to_string();
-        let writer = Arc::new(TraceWriter::create(
-            trace_dir.path(),
-            "trace-retry-test".to_string(),
-            "rollout-retry-test".to_string(),
-            thread_id.clone(),
-        )?);
-        writer.append(RawTraceEventPayload::ThreadStarted {
-            thread_id: thread_id.clone(),
-            agent_path: "/root".to_string(),
-            metadata_payload: None,
-        })?;
-        writer.append(RawTraceEventPayload::CodexTurnStarted {
-            codex_turn_id: turn_id.clone(),
-            thread_id: thread_id.clone(),
-        })?;
-        let compaction_trace = CompactionTraceContext::enabled(
-            Arc::clone(&writer),
-            thread_id,
-            turn_id,
-            compaction_id.clone(),
-            turn_context.model_info.slug.clone(),
-            turn_context.provider.info().name.clone(),
-        );
-        let compaction_trace =
-            AsyncCompactionTraceContext::new(&session.terminal_tasks, compaction_trace);
-
-        let prompt = Prompt {
-            input: vec![
-                message("user", "compact this history", /*phase*/ None),
-                ResponseItem::CompactionTrigger {},
-            ]
-            .into(),
-            base_instructions: BaseInstructions {
-                text: "compact the conversation".to_string(),
-            },
-            ..Default::default()
-        };
-        let compaction_metadata = CompactionTurnMetadata::new(
-            CompactionTrigger::Manual,
-            CompactionReason::UserRequested,
-            CompactionImplementation::ResponsesCompactionV2,
-            CompactionPhase::StandaloneTurn,
-        );
-        let responses_metadata = turn_context.turn_metadata_state.to_responses_metadata(
-            session.installation_id.clone(),
-            session.current_window_id().await,
-            CodexResponsesRequestKind::Compaction(compaction_metadata),
-        );
-        let mut client_session = session.services.model_client.new_session();
-
-        struct HeldTracePayload {
-            entered: std::sync::mpsc::SyncSender<()>,
-            release: std::sync::mpsc::Receiver<()>,
-            timed_out: Arc<std::sync::atomic::AtomicBool>,
-        }
-        impl serde::Serialize for HeldTracePayload {
-            fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-                self.entered.send(()).expect("signal the real writer lock");
-                if self
-                    .release
-                    .recv_timeout(std::time::Duration::from_secs(2))
-                    .is_err()
-                {
-                    self.timed_out
-                        .store(true, std::sync::atomic::Ordering::SeqCst);
-                }
-                serializer.serialize_unit()
-            }
-        }
-        let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
-        let (release_tx, release_rx) = std::sync::mpsc::channel();
-        let timed_out = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let holding_writer = std::thread::spawn({
-            let writer = Arc::clone(&writer);
-            let timed_out = Arc::clone(&timed_out);
-            move || {
-                writer.write_json_payload(
-                    codex_rollout_trace::RawPayloadKind::SessionMetadata,
-                    &HeldTracePayload {
-                        entered: entered_tx,
-                        release: release_rx,
-                        timed_out,
-                    },
-                )
-            }
-        });
-        entered_rx
-            .recv_timeout(std::time::Duration::from_secs(2))
-            .expect("the real trace writer holds its normal serialization lock");
-        let cancellation = CancellationToken::new();
-        let mut request = Box::pin(run_remote_compaction_request_v2(
-            &session,
-            &turn_context,
-            &mut client_session,
-            &prompt,
-            &responses_metadata,
-            &compaction_trace,
-            &cancellation,
-        ));
-        assert!(futures::poll!(request.as_mut()).is_pending());
-        // Optional tracing must not hold dispatch or the model result behind
-        // storage. Persistence remains ordered and owned by the session drain.
-        let output = tokio::time::timeout(Duration::from_secs(1), request.as_mut())
-            .await
-            .expect("compaction must finish while optional trace storage is blocked")?;
-        assert!(
-            !timed_out.load(std::sync::atomic::Ordering::SeqCst),
-            "trace lock contention must not block the async runtime thread"
-        );
-        assert_eq!(request_log.requests().len(), 2);
-        release_tx
-            .send(())
-            .expect("release writer after independent async progress");
-        holding_writer.join().expect("trace writer thread joins")?;
-        drop(request);
-        drop(compaction_trace);
-        session.terminal_tasks.close();
-        session.terminal_tasks.wait().await;
-        assert!(
-            matches!(output.compaction_output, ResponseItem::Compaction { encrypted_content, .. }
-            if encrypted_content == "encrypted replacement context")
-        );
-
-        assert_eq!(request_log.requests().len(), 2);
-        let rollout = replay_bundle(trace_dir.path())?;
-        assert_eq!(rollout.compaction_requests.len(), 2);
-        let request_ids = rollout
-            .compaction_requests
-            .keys()
-            .cloned()
-            .collect::<std::collections::BTreeSet<_>>();
-        assert_eq!(request_ids.len(), 2);
-        assert!(rollout.compaction_requests.values().all(|request| {
-            request.compaction_id == compaction_id
-                && matches!(
-                    request.execution.status,
-                    ExecutionStatus::Failed | ExecutionStatus::Completed
-                )
-        }));
-        assert_eq!(
-            rollout
-                .compaction_requests
-                .values()
-                .filter(|request| request.execution.status == ExecutionStatus::Failed)
-                .count(),
-            1
-        );
-        assert_eq!(
-            rollout
-                .compaction_requests
-                .values()
-                .filter(|request| request.execution.status == ExecutionStatus::Completed)
-                .count(),
-            1
-        );
-        let events = std::fs::read_to_string(trace_dir.path().join("trace.jsonl"))?
-            .lines()
-            .map(serde_json::from_str::<codex_rollout_trace::RawTraceEvent>)
-            .collect::<Result<Vec<_>, _>>()?;
-        let attempts = events
-            .iter()
-            .filter_map(|event| match &event.payload {
-                RawTraceEventPayload::CompactionRequestStarted {
-                    compaction_request_id,
-                    ..
-                } => Some(("started", compaction_request_id.as_str())),
-                RawTraceEventPayload::CompactionRequestFailed {
-                    compaction_request_id,
-                    ..
-                } => Some(("failed", compaction_request_id.as_str())),
-                RawTraceEventPayload::CompactionRequestCompleted {
-                    compaction_request_id,
-                    ..
-                } => Some(("completed", compaction_request_id.as_str())),
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(attempts.len(), 4);
-        assert_eq!(
-            attempts.iter().map(|(kind, _)| *kind).collect::<Vec<_>>(),
-            vec!["started", "failed", "started", "completed"]
-        );
-        assert_eq!(attempts[0].1, attempts[1].1);
-        assert_eq!(attempts[2].1, attempts[3].1);
-        assert_ne!(attempts[0].1, attempts[2].1);
-        assert!(
-            !events.iter().any(|event| matches!(
-                event.payload,
-                RawTraceEventPayload::CompactionInstalled { .. }
-            )),
-            "request attempts alone must not claim history checkpoint installation"
-        );
-
-        Ok(())
-    }
 
     #[test]
     fn build_v2_compacted_history_filters_to_installed_retention_shape() {
@@ -1897,26 +1523,13 @@ mod tests {
                     },
                 )))],
             };
-            let mut receipt = None;
-            let result = collect_compaction_output_with_receipt(
+            let result = collect_compaction_output(
                 response_stream(events),
                 Some(&turn.turn_timing_state),
                 Some((&session, &turn)),
                 &CancellationToken::new(),
-                &mut receipt,
             )
             .await;
-            let receipt = receipt.expect("capture the terminal before checkpoint validation");
-            assert_eq!(receipt.token_usage.as_ref(), Some(&usage));
-            assert_eq!(receipt.provider_completed, checkpoint.is_some());
-            assert_eq!(
-                receipt.response_id.as_deref(),
-                Some(if checkpoint.is_some() {
-                    "compacted"
-                } else {
-                    "incomplete"
-                })
-            );
             match checkpoint {
                 Some("") => assert!(matches!(result, Err(CodexErr::Fatal(message))
                     if message.contains("empty checkpoint"))),
@@ -2223,8 +1836,8 @@ mod ctxaudit_usage_tests {
 }
 
 #[cfg(test)]
-#[path = "compact_remote_v2_audit146_tests.rs"]
-mod audit146_tests;
+#[path = "compact_remote_v2_recovery_tests.rs"]
+mod recovery_tests;
 
 #[cfg(test)]
 #[path = "compact_remote_v2_manual_tests.rs"]

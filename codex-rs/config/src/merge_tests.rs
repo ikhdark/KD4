@@ -5,36 +5,10 @@ fn parse_toml(value: &str) -> TomlValue {
     toml::from_str(value).expect("TOML should parse")
 }
 
-#[test]
-fn merge_toml_values_normalizes_permission_network_domains_before_overlaying() {
-    let mut base = parse_toml(
-        r#"
-[permissions.dev.network.domains]
-"example.com" = "deny"
-"#,
-    );
-    let overlay = parse_toml(
-        r#"
-[permissions.dev.network.domains]
-"EXAMPLE.COM" = "allow"
-"#,
-    );
-
-    merge_toml_values(&mut base, &overlay);
-
-    let expected = parse_toml(
-        r#"
-[permissions.dev.network.domains]
-"example.com" = "allow"
-"#,
-    );
-    assert_eq!(base, expected);
-}
 
 #[test]
-fn merge_toml_values_normalizes_nested_overlay_subtrees_absent_from_base() {
-    // The overlay-only branch normalizes an owned subtree instead of a borrowed
-    // one. Unrelated keys must remain unchanged, and
+fn merge_toml_values_preserves_nested_overlay_subtrees_absent_from_base() {
+    // The overlay-only branch inserts an owned subtree. Unrelated keys must remain unchanged, and
     // nested tables and arrays of tables must survive that handoff intact.
     let mut base = parse_toml(
         r#"
@@ -79,9 +53,8 @@ name = "second"
 }
 
 #[test]
-fn merge_toml_values_replaces_scalar_base_with_normalized_overlay_table() {
-    // A non-table base takes the whole overlay through the same owned
-    // normalization path that nested tables use.
+fn merge_toml_values_replaces_scalar_base_with_overlay_table() {
+    // A non-table base takes the whole overlay, as nested table replacements do.
     let mut base = parse_toml(r#"example = "unset""#);
     let overlay = parse_toml(
         r#"
@@ -130,24 +103,4 @@ first = "high"
 "#,
         )
     );
-}
-#[test]
-fn domain_normalization_applies_to_inserted_and_replaced_ancestors() {
-    for original in [
-        "",
-        "permissions = false",
-        "[permissions]\ndev = false",
-        "[permissions.dev]\nnetwork = false",
-    ] {
-        let mut base = parse_toml(original);
-        merge_toml_values(
-            &mut base,
-            &parse_toml("[permissions.dev.network.domains]\n'EXAMPLE.COM' = 'deny'"),
-        );
-        assert_eq!(
-            base,
-            parse_toml("[permissions.dev.network.domains]\n'example.com' = 'deny'"),
-            "{original}"
-        );
-    }
 }

@@ -250,6 +250,7 @@ where
 }
 
 pub(crate) struct RpcClient {
+    cleanup_runtime: tokio::runtime::Handle,
     write_tx: mpsc::Sender<JSONRPCMessage>,
     pending: Arc<Mutex<HashMap<RequestId, PendingRequest>>>,
     // Shared transport state from `JsonRpcConnection`. Calls use this to fail
@@ -333,6 +334,7 @@ impl RpcClient {
 
         (
             Self {
+                cleanup_runtime: tokio::runtime::Handle::current(),
                 write_tx,
                 pending,
                 disconnected_rx,
@@ -376,6 +378,10 @@ impl RpcClient {
         for task in &self.transport_tasks {
             task.abort();
         }
+    }
+
+    pub(crate) fn cleanup_runtime(&self) -> tokio::runtime::Handle {
+        self.cleanup_runtime.clone()
     }
 
     pub(crate) async fn close_transport(&self) {

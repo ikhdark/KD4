@@ -1737,8 +1737,9 @@ async fn command_handlers_normalize_status_and_distinguish_search_misses_from_er
 }
 
 #[tokio::test]
-async fn identical_tagged_validation_rg_misses_both_launch() {
+async fn identical_tagged_validation_rg_misses_are_refused_without_another_launch() {
     let (session, mut turn) = make_session_and_context().await;
+    turn.validation_mode = codex_protocol::validation::ValidationMode::Full;
     turn.permission_profile = PermissionProfile::Disabled;
     let session = Arc::new(session);
     let turn = Arc::new(turn);
@@ -1757,8 +1758,8 @@ async fn identical_tagged_validation_rg_misses_both_launch() {
         arguments: serde_json::json!({
             "kind": "argv",
             "program": "rg",
-            // Without the validation tag this exact miss is cacheable, so
-            // only the tag explains the second launch.
+            // Explicit validation attribution must not bypass the validation
+            // policy's unchanged-input guard.
             "args": [
                 "--no-config",
                 "--no-ignore-global",
@@ -1768,7 +1769,7 @@ async fn identical_tagged_validation_rg_misses_both_launch() {
                 search_target.clone(),
             ],
             "validation": {
-                "covered_paths": [search_target],
+                "covered_paths": ["search-target.txt"],
             },
             "workdir": validation_repository.path(),
             "yield_time_ms": 10_000,
@@ -1796,25 +1797,25 @@ async fn identical_tagged_validation_rg_misses_both_launch() {
         })
         .await;
 
-    assert_eq!(launches.process_launches, 2);
+    assert_eq!(launches.process_launches, 1);
     assert_eq!(
         session
             .services
             .command_execution
             .started_attempt_count()
             .await,
-        2,
-        "validation launches must enter the ordinary retry ledger"
+        1,
+        "policy refusals must not enter the ordinary retry ledger"
     );
     assert_eq!(first.code_mode_result(&payload)["exit_code"], 1);
-    assert_eq!(second.code_mode_result(&payload)["exit_code"], 1);
+    assert_eq!(second.sampling_request_signal().unwrap()["validation_policy_refusal"], true);
     let counters = turn
         .turn_timing_state
         .complete_snapshot()
         .protocol_timing()
         .counters;
     assert_eq!(
-        counters.executed_validation_count, 2,
+        counters.executed_validation_count, 1,
         "every launched validation must publish exactly one result",
     );
     assert!(

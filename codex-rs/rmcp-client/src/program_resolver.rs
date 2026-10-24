@@ -40,11 +40,10 @@ pub fn resolve(
             tracing::debug!("Resolved {program:?} to {resolved:?}");
             Ok(resolved.into_os_string())
         }
-        Err(e) => {
-            tracing::debug!("Failed to resolve {program:?}: {e}. Using original path");
-            // Fallback to original program - let Command::new() handle the error
-            Ok(program)
-        }
+        Err(error) => Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("failed to resolve MCP program {program:?} in the server environment: {error}"),
+        )),
     }
 }
 
@@ -200,9 +199,11 @@ mod tests {
 
         env.insert(OsString::from("pAtHeXt"), OsString::from(".EXE"));
         assert_eq!(
-            resolve(OsString::from(&fixture.program_name), &env, cwd)?,
-            OsString::from(&fixture.program_name),
-            "a script excluded by the server's PATHEXT must not be selected"
+            resolve(OsString::from(&fixture.program_name), &env, cwd)
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::NotFound,
+            "a script excluded by the server's PATHEXT must not fall back to host lookup"
         );
         Ok(())
     }

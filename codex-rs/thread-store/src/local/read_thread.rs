@@ -8,6 +8,7 @@ use codex_rollout::RolloutRecorder;
 use codex_rollout::find_thread_name_by_id;
 use codex_rollout::read_session_meta_line;
 use codex_rollout::read_thread_item_from_rollout;
+use codex_rollout::read_thread_preview_from_rollout;
 use codex_state::ThreadMetadata;
 
 use super::LocalThreadStore;
@@ -47,18 +48,14 @@ pub(super) async fn read_thread(
         } else {
             if !params.include_history
                 && let Some(rollout_path) = thread.rollout_path.clone()
-                && let Some(item) = read_thread_item_from_rollout(rollout_path).await
-                && item.thread_id == Some(thread_id)
-                && let Some(rollout_thread) = stored_thread_from_rollout_item(
-                    item,
-                    false,
-                    &store.config.default_model_provider_id,
-                )
-                && !rollout_thread.preview.is_empty()
+                && let Ok(Some((preview_thread_id, preview))) =
+                    read_thread_preview_from_rollout(&rollout_path).await
+                && preview_thread_id == thread_id
+                && !preview.is_empty()
             {
                 // Preview extraction can be newer than the last SQLite flush, but the SQLite-backed
                 // object remains authoritative for every persisted metadata field.
-                thread.preview = rollout_thread.preview;
+                thread.preview = preview;
             }
             if let Some(items) = preloaded_history {
                 thread.history = Some(StoredThreadHistory { thread_id, items });

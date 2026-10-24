@@ -271,7 +271,7 @@ pub(super) struct RolloutReconstruction {
     pub(super) history: Vec<ResponseItem>,
     pub(super) plan: Option<UpdatePlanArgs>,
     pub(super) plan_lineage: Option<crate::plan_store::PlanLineage>,
-    pub(super) accepted_input: Option<crate::plan_store::AcceptedPlanInput>,
+
     pub(super) previous_turn_settings: Option<PreviousTurnSettings>,
     pub(super) reference_context_item: Option<TurnContextItem>,
     pub(super) world_state_baseline: Option<WorldStateSnapshot>,
@@ -535,7 +535,7 @@ enum TurnReferenceContextItem {
 struct ActiveReplaySegment<'a> {
     turn_id: Option<String>,
     // Outer None: no accepted boundary. Some(None): legacy/unknown provenance.
-    accepted_input: Option<Option<crate::plan_store::AcceptedPlanInput>>,
+
     plan: Option<UpdatePlanArgs>,
     plan_lineage: Option<crate::plan_store::PlanLineage>,
     plan_revision: Option<String>,
@@ -561,7 +561,7 @@ struct ReplacementCheckpoint<'a> {
 
 struct FinalizedReplayState<'items, 'state> {
     plan: &'state mut Option<UpdatePlanArgs>,
-    accepted_input: &'state mut Option<Option<crate::plan_store::AcceptedPlanInput>>,
+
     plan_lineage: &'state mut Option<crate::plan_store::PlanLineage>,
     plan_revision: &'state mut Option<String>,
     base_replacement_history: &'state mut Option<&'items [ResponseItem]>,
@@ -574,7 +574,7 @@ struct FinalizedReplayState<'items, 'state> {
     has_surviving_legacy_compaction_without_window_number: &'state mut bool,
     window: &'state mut Option<ReconstructedWindow>,
     pending_rollback_turns: &'state mut usize,
-    collect_inputs_only: bool,
+
 }
 
 fn turn_ids_are_compatible(active_turn_id: Option<&str>, item_turn_id: Option<&str>) -> bool {
@@ -588,7 +588,7 @@ fn finalize_active_segment<'a>(
 ) {
     let FinalizedReplayState {
         plan,
-        accepted_input,
+
         plan_lineage,
         plan_revision,
         base_replacement_history,
@@ -601,7 +601,7 @@ fn finalize_active_segment<'a>(
         has_surviving_legacy_compaction_without_window_number,
         window,
         pending_rollback_turns,
-        collect_inputs_only,
+
     } = state;
     // Thread rollback drops the newest surviving real user-message boundaries. In replay, that
     // means skipping the next finalized segments that contain a non-contextual
@@ -614,16 +614,7 @@ fn finalize_active_segment<'a>(
         return;
     }
 
-    if let Some(Some(latest)) = accepted_input.as_mut()
-        && let Some(Some(earlier)) = active_segment.accepted_input.as_ref()
-    {
-        latest.retain_earlier(earlier);
-    } else if accepted_input.is_none() {
-        *accepted_input = active_segment.accepted_input;
-    }
-    if collect_inputs_only {
-        return;
-    }
+
     world_state_replay.extend(active_segment.world_state_replay);
     if plan.is_none() {
         *plan = active_segment.plan;
@@ -732,8 +723,8 @@ impl Session {
         });
         let mut base_replacement_history: Option<&[ResponseItem]> = None;
         let mut plan = None;
-        let mut accepted_input = None;
-        let mut collect_inputs_only = false;
+
+
         let mut plan_lineage = None;
         let mut plan_revision = None;
         let update_plan_call_ids = rollout_items
@@ -769,10 +760,7 @@ impl Session {
             .position(|item| matches!(item, RolloutItem::EventMsg(EventMsg::TurnStarted(_))));
         let mut started_turn = None;
         let mut legacy_user_boundaries = HashSet::new();
-        // Canonical accepted items are persisted before their legacy fanout.
-        // The duplicate legacy event is not a newer, unknown authorization.
-        let mut accepted_legacy_duplicates = HashSet::new();
-        let mut pending_accepted_legacy = None;
+
         let mut in_review = false;
         let mut saw_review_entry = false;
         let mut review_marker_gap = false;
@@ -786,29 +774,7 @@ impl Session {
             if legacy_inter_agent_mail.observe(item).is_some() {
                 legacy_inter_agent_mail_indexes.insert(index);
             }
-            match item {
-                RolloutItem::EventMsg(EventMsg::ItemCompleted(event))
-                    if matches!(&event.item, codex_protocol::items::TurnItem::UserMessage(message)
-                        if crate::event_mapping::is_user_input_item_id(&message.id)) =>
-                {
-                    let codex_protocol::items::TurnItem::UserMessage(message) = &event.item else {
-                        unreachable!()
-                    };
-                    pending_accepted_legacy =
-                        serde_json::to_string(&message.as_legacy_user_message_event()).ok();
-                }
-                RolloutItem::EventMsg(EventMsg::UserMessage(message)) => {
-                    let legacy = serde_json::to_string(message).ok();
-                    if pending_accepted_legacy
-                        .take()
-                        .is_some_and(|canonical| legacy.as_ref() == Some(&canonical))
-                    {
-                        accepted_legacy_duplicates.insert(index);
-                    }
-                }
-                RolloutItem::EventMsg(EventMsg::TurnStarted(_)) => pending_accepted_legacy = None,
-                _ => {}
-            }
+
             // Review delegates historically forwarded ownerless checklist
             // events. Only retained review markers establish foreign ownership;
             // ordinary legacy PlanUpdate events remain supported.
@@ -991,28 +957,12 @@ impl Session {
                     };
                     let segment = active_segment.get_or_insert_with(ActiveReplaySegment::default);
                     segment.counts_as_user_turn = true;
-                    let input = crate::plan_store::AcceptedPlanInput::from_texts(
-                        &event.turn_id,
-                        message.content.iter().filter_map(|item| match item {
-                            codex_protocol::user_input::UserInput::Text { text, .. } => {
-                                Some(text.as_str())
-                            }
-                            _ => None,
-                        }),
-                    );
-                    match segment.accepted_input.as_mut() {
-                        Some(Some(latest)) => latest.retain_earlier(&input),
-                        None => segment.accepted_input = Some(Some(input)),
-                        Some(None) => {}
-                    }
                 }
                 RolloutItem::EventMsg(EventMsg::UserMessage(_)) => {
                     let active_segment =
                         active_segment.get_or_insert_with(ActiveReplaySegment::default);
                     active_segment.counts_as_user_turn = true;
-                    if !accepted_legacy_duplicates.contains(&index) {
-                        active_segment.accepted_input.get_or_insert(None);
-                    }
+
                 }
                 RolloutItem::TurnContext(ctx) => {
                     let active_segment =
@@ -1076,7 +1026,7 @@ impl Session {
                             active_segment,
                             FinalizedReplayState {
                                 plan: &mut plan,
-                                accepted_input: &mut accepted_input,
+
                                 plan_lineage: &mut plan_lineage,
                                 plan_revision: &mut plan_revision,
                                 base_replacement_history: &mut base_replacement_history,
@@ -1091,7 +1041,7 @@ impl Session {
                                     &mut has_surviving_legacy_compaction_without_window_number,
                                 window: &mut window,
                                 pending_rollback_turns: &mut pending_rollback_turns,
-                                collect_inputs_only,
+
                             },
                         );
                     }
@@ -1102,26 +1052,7 @@ impl Session {
                     active_segment.history_effect_indexes.push(index);
                     active_segment.counts_as_user_turn |= is_user_turn_boundary(response_item)
                         || legacy_inter_agent_mail_indexes.contains(&index);
-                    if let Some(decision) = thread_id.and_then(|thread_id| {
-                        super::user_decision::AcceptedUserDecision::from_snapshot(
-                            response_item,
-                            thread_id,
-                        )
-                    }) && let Some(input) = decision.accepted_input()
-                        && turn_ids_are_compatible(
-                            active_segment.turn_id.as_deref(),
-                            Some(&input.0),
-                        )
-                    {
-                        if active_segment.turn_id.is_none() {
-                            active_segment.turn_id = Some(input.0.clone());
-                        }
-                        match active_segment.accepted_input.as_mut() {
-                            Some(Some(latest)) => latest.retain_earlier(&input),
-                            None => active_segment.accepted_input = Some(Some(input)),
-                            Some(None) => {}
-                        }
-                    }
+
                     if let Some(snapshot) =
                         crate::plan_store::plan_snapshot_from_item(response_item)
                     {
@@ -1197,7 +1128,7 @@ impl Session {
                     active_segment,
                     FinalizedReplayState {
                         plan: &mut plan,
-                        accepted_input: &mut accepted_input,
+
                         plan_lineage: &mut plan_lineage,
                         plan_revision: &mut plan_revision,
                         base_replacement_history: &mut base_replacement_history,
@@ -1211,25 +1142,19 @@ impl Session {
                             &mut has_surviving_legacy_compaction_without_window_number,
                         window: &mut window,
                         pending_rollback_turns: &mut pending_rollback_turns,
-                        collect_inputs_only,
+
                     },
                 );
             }
 
-            if !collect_inputs_only
-                && base_replacement_history.is_some()
-                && accepted_input.is_some()
+            if base_replacement_history.is_some()
                 && previous_turn_settings.is_some()
                 && !matches!(reference_context_item, TurnReferenceContextItem::NeverSet)
                 && window.is_some()
                 && ((plan.is_some() && (plan_revision.is_none() || plan_lineage.is_some()))
                     || !has_plan_updates)
             {
-                // Resume metadata is now final, as at the former early exit.
-                // Older surviving segments still carry pending input authority;
-                // collect only that provenance, without changing window counts,
-                // world-state replay, settings, history or selected plan lineage.
-                collect_inputs_only = true;
+                break;
             }
         }
 
@@ -1238,7 +1163,7 @@ impl Session {
                 active_segment,
                 FinalizedReplayState {
                     plan: &mut plan,
-                    accepted_input: &mut accepted_input,
+
                     plan_lineage: &mut plan_lineage,
                     plan_revision: &mut plan_revision,
                     base_replacement_history: &mut base_replacement_history,
@@ -1252,7 +1177,7 @@ impl Session {
                         &mut has_surviving_legacy_compaction_without_window_number,
                     window: &mut window,
                     pending_rollback_turns: &mut pending_rollback_turns,
-                    collect_inputs_only,
+
                 },
             );
         }
@@ -1433,7 +1358,7 @@ impl Session {
             history,
             plan,
             plan_lineage,
-            accepted_input: accepted_input.flatten(),
+
             previous_turn_settings,
             reference_context_item,
             world_state_baseline,

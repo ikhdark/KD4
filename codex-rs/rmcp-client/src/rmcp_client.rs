@@ -117,6 +117,9 @@ enum ClientState {
     Closed,
 }
 
+type SharedOAuthRuntime =
+    Arc<Mutex<Option<(AuthClient<StreamableHttpClientAdapter>, OAuthPersistor)>>>;
+
 #[derive(Clone)]
 enum TransportRecipe {
     Stdio {
@@ -134,6 +137,7 @@ enum TransportRecipe {
         keyring_backend_kind: AuthKeyringBackendKind,
         http_client: Arc<dyn HttpClient>,
         auth_provider: Option<SharedAuthProvider>,
+        oauth_runtime: SharedOAuthRuntime,
     },
 }
 
@@ -673,6 +677,7 @@ impl RmcpClient {
             keyring_backend_kind,
             http_client,
             auth_provider,
+            oauth_runtime: Arc::default(),
         };
         let transport = Self::create_pending_transport(&transport_recipe).await?;
         Ok(Self {
@@ -1175,6 +1180,7 @@ impl RmcpClient {
                 keyring_backend_kind,
                 http_client,
                 auth_provider,
+                oauth_runtime,
             } => {
                 let default_headers =
                     build_default_headers(http_headers.clone(), env_http_headers.clone())?;
@@ -1185,6 +1191,22 @@ impl RmcpClient {
                         auth_provider.clone()
                     };
 
+                // Reinitialization must reuse the live credential store and
+                // refresh lock; disk can lag a one-use refresh-token rotation.
+                let mut cached_oauth = oauth_runtime.lock().await;
+                if bearer_token.is_none()
+                    && auth_provider.is_none()
+                    && !default_headers.contains_key(AUTHORIZATION)
+                    && let Some((auth_client, oauth_persistor)) = cached_oauth.as_ref()
+                {
+                    return Ok(PendingTransport::StreamableHttpWithOAuth {
+                        transport: StreamableHttpClientTransport::with_client(
+                            auth_client.clone(),
+                            StreamableHttpClientTransportConfig::with_uri(url.clone()),
+                        ),
+                        oauth_persistor: oauth_persistor.clone(),
+                    });
+                }
                 let initial_oauth_tokens = if bearer_token.is_none()
                     && auth_provider.is_none()
                     && !default_headers.contains_key(AUTHORIZATION)
@@ -1228,7 +1250,8 @@ impl RmcpClient {
                     })
                     .await
                     {
-                        Ok((transport, oauth_persistor)) => {
+                        Ok((transport, oauth_persistor, auth_client)) => {
+                            *cached_oauth = Some((auth_client, oauth_persistor.clone()));
                             Ok(PendingTransport::StreamableHttpWithOAuth {
                                 transport,
                                 oauth_persistor,
@@ -1646,6 +1669,7 @@ async fn create_oauth_transport_and_runtime(
 ) -> Result<(
     StreamableHttpClientTransport<AuthClient<StreamableHttpClientAdapter>>,
     OAuthPersistor,
+    AuthClient<StreamableHttpClientAdapter>,
 )> {
     let OAuthTransportRuntimeParams {
         server_name,
@@ -1657,10 +1681,10 @@ async fn create_oauth_transport_and_runtime(
         default_headers,
         http_client,
     } = params;
-    let oauth_http_client = Arc::new(OAuthHttpClientAdapter::new(
-        http_client.clone(),
-        default_headers.clone(),
-    ));
+    let oauth_http_client = Arc::new(
+        OAuthHttpClientAdapter::new(http_client.clone(), url, default_headers.clone())
+            .map_err(anyhow::Error::from_boxed)?,
+    );
     let mut oauth_state =
         OAuthState::new_with_oauth_http_client(url.to_string(), oauth_http_client).await?;
 
@@ -1693,7 +1717,7 @@ async fn create_oauth_transport_and_runtime(
     );
 
     let transport = StreamableHttpClientTransport::with_client(
-        auth_client,
+        auth_client.clone(),
         StreamableHttpClientTransportConfig::with_uri(url.to_string()),
     );
 
@@ -1707,7 +1731,7 @@ async fn create_oauth_transport_and_runtime(
         Some(initial_tokens),
     );
 
-    Ok((transport, runtime))
+    Ok((transport, runtime, auth_client))
 }
 
 #[cfg(test)]

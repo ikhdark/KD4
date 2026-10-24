@@ -1194,6 +1194,10 @@ fn reference_context_item() -> TurnContextItem {
         multi_agent_version: None,
         multi_agent_mode: None,
         effort: None,
+        validation_mode: None,
+        validation_full_budget: None,
+        validation_root_turn: None,
+        validation_attempts: Vec::new(),
         context_provenance: None,
     }
 }
@@ -2095,7 +2099,8 @@ fn for_prompt_preserves_image_generation_calls_when_images_are_supported() {
             id: Some(ResponseItemId::with_suffix("ig", "123")),
             status: "generating".to_string(),
             revised_prompt: Some("lobster".to_string()),
-            result: "Zm9v".to_string(),
+            result: Some("Zm9v".to_string()),
+            error: None,
             internal_chat_message_metadata_passthrough: None,
         },
         ResponseItem::Message {
@@ -2116,7 +2121,8 @@ fn for_prompt_preserves_image_generation_calls_when_images_are_supported() {
                 id: Some(ResponseItemId::with_suffix("ig", "123")),
                 status: "generating".to_string(),
                 revised_prompt: Some("lobster".to_string()),
-                result: "Zm9v".to_string(),
+                result: Some("Zm9v".to_string()),
+                error: None,
                 internal_chat_message_metadata_passthrough: None,
             },
             ResponseItem::Message {
@@ -2148,7 +2154,8 @@ fn for_prompt_discloses_omitted_image_generation_result() {
             id: Some(ResponseItemId::with_suffix("ig", "123")),
             status: "completed".to_string(),
             revised_prompt: Some("lobster".to_string()),
-            result: "Zm9v".to_string(),
+            result: Some("Zm9v".to_string()),
+            error: None,
             internal_chat_message_metadata_passthrough: None,
         },
     ]);
@@ -2169,7 +2176,8 @@ fn for_prompt_discloses_omitted_image_generation_result() {
                 id: Some(ResponseItemId::with_suffix("ig", "123")),
                 status: "completed".to_string(),
                 revised_prompt: Some("lobster".to_string()),
-                result: String::new(),
+                result: None,
+                error: None,
                 internal_chat_message_metadata_passthrough: None,
             },
             developer_msg("Generated image content omitted because you do not support image input"),
@@ -2184,12 +2192,12 @@ fn for_prompt_discloses_omitted_image_generation_result() {
     );
     assert!(matches!(
         &history.raw_items()[1],
-        ResponseItem::ImageGenerationCall { result, .. } if result == "Zm9v"
+        ResponseItem::ImageGenerationCall { result, .. } if result.as_deref() == Some("Zm9v")
     ));
 
     let mut empty_generation = history.raw_items()[1].clone();
     if let ResponseItem::ImageGenerationCall { result, .. } = &mut empty_generation {
-        result.clear();
+        *result = None;
     }
     let empty_history = create_history_with_items(vec![empty_generation.clone()]);
     assert_eq!(
@@ -3726,92 +3734,7 @@ fn continuation_sampling_prompts_keep_the_previous_request_as_a_prefix() {
     assert_eq!(continued.items().last(), Some(&continuation));
 }
 
-#[test]
-fn user_turns_append_after_task_state_snapshots_and_freshness_notices() {
-    let workspace = crate::git_workspace::GitWorkspaceCache::with_noop_watcher_for_tests();
-    // The production sampling path, which anchors each request's projection.
-    let prepare = |history: &ContextManager| {
-        history
-            .clone()
-            .prepare_for_sampling_prompt_with_workspace_freshness(
-                &default_input_modalities(),
-                StableContextTarget::Sampling,
-                None,
-                &workspace,
-            )
-    };
-    let task_state = |revision: usize| {
-        let mut item = user_input_text_msg(&format!(
-            "<codex_task_state>plan revision {revision}</codex_task_state>"
-        ));
-        crate::stable_context::mark_trusted_stable_context_item(&mut item);
-        item
-    };
-    let is_notice = |item: &ResponseItem| {
-        matches!(item, ResponseItem::Message { role, content, .. }
-        if role == "developer" && content.iter().any(|content| matches!(content,
-            ContentItem::InputText { text } if text.starts_with("<workspace_evidence_invalidation>\n"))))
-    };
 
-    let mut history = ContextManager::new();
-    let mut previous: Option<PreparedPromptInput> = None;
-    let mut snapshots = Vec::new();
-    for turn in 0..3 {
-        history.record_items(
-            [&user_input_text_msg(&format!("task {turn}"))],
-            TruncationPolicy::Tokens(10_000),
-        );
-        for step in 0..2 {
-            // A plan update mid-turn, then a result with no workspace evidence,
-            // which gets a freshness notice appended after it.
-            let snapshot = task_state(turn * 2 + step);
-            let call_id = format!("turn-{turn}-step-{step}");
-            let call = ResponseItem::FunctionCall {
-                id: None,
-                name: "functions.exec".into(),
-                namespace: None,
-                arguments: "{}".into(),
-                call_id: call_id.clone(),
-                internal_chat_message_metadata_passthrough: None,
-            };
-            let output = ResponseItem::FunctionCallOutput {
-                id: None,
-                call_id,
-                output: FunctionCallOutputPayload::from_text("evidence ".repeat(3_000)),
-                internal_chat_message_metadata_passthrough: None,
-            };
-            history.record_items(
-                [&snapshot, &call, &output],
-                TruncationPolicy::Tokens(10_000),
-            );
-            snapshots.push(snapshot);
-            let prepared = prepare(&history);
-            if let Some(previous) = &previous {
-                assert!(
-                    prepared.items().starts_with(previous.items()),
-                    "turn {turn} step {step} rewrote the previous request"
-                );
-            }
-            previous = Some(prepared);
-        }
-        history.record_items(
-            [&assistant_msg(&format!("finished task {turn}"))],
-            TruncationPolicy::Tokens(10_000),
-        );
-    }
-    let last = previous.expect("prepared requests");
-    for snapshot in &snapshots {
-        assert!(
-            last.items().contains(snapshot),
-            "sent task-state snapshots stay until compaction"
-        );
-    }
-    assert_eq!(
-        last.items().iter().filter(|item| is_notice(item)).count(),
-        snapshots.len(),
-        "each continuation appends its own notice instead of consolidating earlier ones"
-    );
-}
 
 #[test]
 fn pressure_retirement_checkpoint_lowers_the_estimate_before_the_next_request() {
@@ -4023,116 +3946,7 @@ fn agent_message_sampling_preserves_prepared_and_projected_prefixes() {
     }
 }
 
-#[test]
-fn sampling_tool_projection_reuses_shared_input_and_preserves_fail_open_context() {
-    let old_repository =
-        "# AGENTS.md instructions for /repo\n\n<INSTRUCTIONS>\nold\n</INSTRUCTIONS>";
-    let current_repository =
-        "# AGENTS.md instructions for /repo\n\n<INSTRUCTIONS>\ncurrent\n</INSTRUCTIONS>";
-    let incomplete_repository = "# AGENTS.md instructions for /repo\n\n<INSTRUCTIONS>\ncurrent";
-    let call = ResponseItem::FunctionCall {
-        id: None,
-        name: "exec_command".to_string(),
-        namespace: None,
-        arguments: r#"{"cmd":"cat source.rs"}"#.to_string(),
-        call_id: "read-source".to_string(),
-        internal_chat_message_metadata_passthrough: None,
-    };
-    let output = ResponseItem::FunctionCallOutput {
-        id: None,
-        call_id: "read-source".to_string(),
-        output: FunctionCallOutputPayload::from_text("unverified source contents".to_string()),
-        internal_chat_message_metadata_passthrough: None,
-    };
-    let workspace = crate::git_workspace::GitWorkspaceCache::new();
-    for fail_open in [false, true] {
-        let mut items = vec![call.clone(), output.clone()];
-        let latest_repository = if fail_open {
-            incomplete_repository
-        } else {
-            current_repository
-        };
-        for text in [old_repository, latest_repository] {
-            let mut item = user_input_text_msg(text);
-            crate::stable_context::mark_trusted_stable_context_item(&mut item);
-            items.push(item);
-        }
-        let mut history = ContextManager::new();
-        history.record_items(items.iter(), TruncationPolicy::Tokens(10_000));
-        for completed_tool_projection in [false, true] {
-            let prepared = if completed_tool_projection {
-                history
-                    .clone()
-                    .prepare_for_sampling_prompt_with_completed_tool_projection(
-                        &default_input_modalities(),
-                        StableContextTarget::Sampling,
-                        None,
-                        &workspace,
-                    )
-            } else {
-                history
-                    .clone()
-                    .prepare_for_sampling_prompt_with_workspace_freshness(
-                        &default_input_modalities(),
-                        StableContextTarget::Sampling,
-                        None,
-                        &workspace,
-                    )
-            };
-            let sampling = prepared.shared_items();
-            let fallback = prepared.shared_fallback_items();
-            assert!(Arc::ptr_eq(&sampling, &fallback));
-            assert!(prepared.stable_context_manifest().fail_open());
-            for projected in [&sampling, &fallback] {
-                let call_index = projected
-                    .iter()
-                    .position(|item| matches!(item, ResponseItem::FunctionCall { .. }))
-                    .expect("source read call");
-                let ResponseItem::FunctionCall { arguments, .. } = &projected[call_index] else {
-                    panic!("tool call must remain paired");
-                };
-                assert_eq!(
-                    serde_json::from_str::<serde_json::Value>(arguments).unwrap(),
-                    serde_json::json!({"cmd": "cat source.rs"})
-                );
-                let ResponseItem::FunctionCallOutput { output, .. } = &projected[call_index + 1]
-                else {
-                    panic!("tool output must remain paired");
-                };
-                assert_eq!(output.text_content(), Some("unverified source contents"));
-                let notice = projected
-                    .iter()
-                    .find_map(|item| match item {
-                        ResponseItem::Message { role, content, .. } if role == "developer" => {
-                            content.iter().find_map(|part| match part {
-                                ContentItem::InputText { text }
-                                    if text.contains("<workspace_evidence_invalidation>") =>
-                                {
-                                    Some(text)
-                                }
-                                _ => None,
-                            })
-                        }
-                        _ => None,
-                    })
-                    .expect("missing observation must append an invalidation");
-                assert!(notice.contains("missing_observation"));
-                assert!(notice.contains("read-source"));
-                assert!(!notice.contains("unverified source contents"));
-                let context = projected
-                    .iter()
-                    .filter(
-                        |item| matches!(item, ResponseItem::Message { role, .. } if role == "user"),
-                    )
-                    .cloned()
-                    .collect::<Vec<_>>();
-                assert_eq!(context, items[2..].to_vec());
-                assert_eq!(projected.len(), 3 + context.len());
-            }
-        }
-        assert_eq!(history.raw_items(), items);
-    }
-}
+
 
 #[test]
 fn prepared_prompt_cache_does_not_cross_divergent_clone_branches() {

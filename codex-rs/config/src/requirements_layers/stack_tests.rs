@@ -51,6 +51,54 @@ fn expected_requirements(contents: impl AsRef<str>) -> ConfigRequirementsToml {
 }
 
 #[test]
+fn legacy_network_layers_compose_like_canonical_maps() {
+    for (legacy, canonical, expected) in [
+        (
+            "[experimental_network]\nallowed_domains = ['legacy.example.com']",
+            "[experimental_network.domains]\n'new.example.com' = 'allow'",
+            "[experimental_network.domains]\n'legacy.example.com' = 'allow'\n'new.example.com' = 'allow'",
+        ),
+        (
+            "[experimental_network]\nallow_unix_sockets = ['/tmp/legacy.sock']",
+            "[experimental_network.unix_sockets]\n'/tmp/new.sock' = 'allow'",
+            "[experimental_network.unix_sockets]\n'/tmp/legacy.sock' = 'allow'\n'/tmp/new.sock' = 'allow'",
+        ),
+    ] {
+        for reversed in [false, true] {
+            let mut layers = vec![
+                layer("low", "Low", legacy),
+                layer("high", "High", canonical),
+            ];
+            if reversed {
+                layers.reverse();
+            }
+            let composed = compose(layers)
+                .expect("individually valid network layers compose")
+                .unwrap();
+            assert_eq!(composed.network, expected_requirements(expected).network);
+        }
+    }
+    let legacy = compose(vec![
+        layer(
+            "low",
+            "Low",
+            "[experimental_network]\ndenied_domains = ['example.com']",
+        ),
+        layer(
+            "high",
+            "High",
+            "[experimental_network]\nallowed_domains = ['example.com']",
+        ),
+    ])
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        legacy.network,
+        expected_requirements("[experimental_network.domains]\n'example.com' = 'allow'").network
+    );
+}
+
+#[test]
 fn empty_layers_compose_to_none() {
     let composed = compose(Vec::new()).expect("compose empty layers");
     assert_eq!(composed, None);
@@ -1206,6 +1254,37 @@ extends = ":workspace"
 "#
         ))
     );
+}
+
+#[test]
+fn combined_permission_sources_follow_global_priority() {
+    for high_adds_profile in [false, true] {
+        let low = layer(
+            "low",
+            "Low",
+            "[permissions.managed]\nextends = ':workspace'",
+        );
+        let high_toml = if high_adds_profile {
+            "[permissions.filesystem]\ndeny_read = ['C:\\secret']\n[permissions.managed]\ndescription = 'High profile'"
+        } else {
+            "[permissions.filesystem]\ndeny_read = ['C:\\secret']"
+        };
+        let high = layer("high", "High", high_toml);
+        let expected_source =
+            RequirementSource::composite([high.source.clone(), low.source.clone()]);
+        let output = super::compose_requirements([low, high])
+            .unwrap()
+            .expect("permissions");
+        assert_eq!(output.permissions.as_ref().unwrap().source, expected_source);
+        let value = output.into_toml().permissions.unwrap();
+        assert_eq!(
+            value.profiles["managed"].extends.as_deref(),
+            Some(":workspace")
+        );
+        let paths = value.filesystem.unwrap().deny_read.unwrap();
+        assert_eq!(paths.len(), 1);
+        assert_eq!(paths[0].as_str(), "C:\\secret");
+    }
 }
 
 #[test]

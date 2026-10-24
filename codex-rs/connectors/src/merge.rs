@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 
 use crate::AppInfo;
+use crate::canonical_connector_id;
 use crate::metadata::connector_install_url;
 use crate::metadata::sort_connectors_by_accessibility_and_name;
 
@@ -11,13 +12,14 @@ pub fn merge_connectors(
 ) -> Vec<AppInfo> {
     let mut merged: HashMap<String, AppInfo> = connectors
         .into_iter()
+        .filter_map(canonicalize_connector)
         .map(|mut connector| {
             connector.is_accessible = false;
             (connector.id.clone(), connector)
         })
         .collect();
 
-    for mut connector in accessible_connectors {
+    for mut connector in accessible_connectors.into_iter().filter_map(canonicalize_connector) {
         connector.is_accessible = true;
         let connector_id = connector.id.clone();
         if let Some(existing) = merged.get_mut(&connector_id) {
@@ -79,15 +81,16 @@ pub fn merge_plugin_connectors<I>(connectors: Vec<AppInfo>, plugin_app_ids: I) -
 where
     I: IntoIterator<Item = String>,
 {
-    let mut merged = connectors;
-    let mut connector_ids = merged
-        .iter()
-        .map(|connector| connector.id.clone())
-        .collect::<HashSet<_>>();
+    let mut connector_ids = HashSet::new();
+    let mut merged = connectors
+        .into_iter()
+        .filter_map(canonicalize_connector)
+        .filter(|connector| connector_ids.insert(connector.id.clone()))
+        .collect::<Vec<_>>();
 
-    for connector_id in plugin_app_ids {
-        if connector_ids.insert(connector_id.clone()) {
-            merged.push(plugin_connector_to_app_info(connector_id));
+    for connector in plugin_app_ids.into_iter().filter_map(plugin_connector_to_app_info) {
+        if connector_ids.insert(connector.id.clone()) {
+            merged.push(connector);
         }
     }
 
@@ -106,12 +109,14 @@ where
     merge_connectors(Vec::new(), accessible_connectors)
 }
 
-pub fn plugin_connector_to_app_info(connector_id: String) -> AppInfo {
+/// Creates a metadata-only placeholder for a nonempty canonical connector ID.
+pub fn plugin_connector_to_app_info(connector_id: String) -> Option<AppInfo> {
+    let connector_id = canonical_connector_id(&connector_id)?.to_string();
     // Leave the placeholder name as the connector id so merge_connectors() can
     // replace it with canonical app metadata from directory fetches or
     // connector_name values from codex_apps tool discovery.
     let name = connector_id.clone();
-    AppInfo {
+    Some(AppInfo {
         id: connector_id.clone(),
         name: name.clone(),
         description: None,
@@ -127,7 +132,26 @@ pub fn plugin_connector_to_app_info(connector_id: String) -> AppInfo {
         is_accessible: false,
         is_enabled: true,
         plugin_display_names: Vec::new(),
+    })
+}
+
+fn canonicalize_connector(mut connector: AppInfo) -> Option<AppInfo> {
+    let id = canonical_connector_id(&connector.id)?;
+    if id != connector.id {
+        let id = id.to_string();
+        let generated_install_url = connector
+            .install_url
+            .as_ref()
+            .is_some_and(|url| *url == connector_install_url(&connector.name, &connector.id));
+        if connector.name == connector.id {
+            connector.name = id.clone();
+        }
+        connector.id = id;
+        if generated_install_url {
+            connector.install_url = Some(connector_install_url(&connector.name, &connector.id));
+        }
     }
+    Some(connector)
 }
 
 #[cfg(test)]
@@ -171,7 +195,7 @@ mod tests {
                 vec!["alpha", "beta", "sample"],
             ),
         ] {
-            let mut plugin = plugin_connector_to_app_info("calendar".to_string());
+            let mut plugin = plugin_connector_to_app_info("calendar".to_string()).unwrap();
             plugin.plugin_display_names = plugin_names(&declared);
             let accessible = google_calendar_accessible_connector(&runtime);
 
@@ -222,19 +246,101 @@ mod tests {
         expected.install_url = Some(connector_install_url("calendar", "calendar"));
         assert_eq!(
             merge_connectors(
-                vec![plugin_connector_to_app_info("calendar".to_string())],
+                vec![plugin_connector_to_app_info("calendar".to_string()).unwrap()],
                 vec![accessible.clone()]
             ),
             vec![expected]
         );
 
-        let mut directory = plugin_connector_to_app_info("calendar".to_string());
+        let mut directory = plugin_connector_to_app_info("calendar".to_string()).unwrap();
         directory.labels = Some(HashMap::from([(
             "directory".to_string(),
             "kept".to_string(),
         )]));
         let merged = merge_connectors(vec![directory.clone()], vec![accessible]);
         assert_eq!(merged[0].labels, directory.labels);
+    }
+
+    #[test]
+    fn plugin_merge_canonicalizes_raw_declarations_like_snapshots() {
+        let declarations = crate::parse_plugin_app_config(
+            r#"{"apps":{"Calendar":{"id":" calendar "},"Duplicate":{"id":"calendar"},"CaseDistinct":{"id":"Calendar"},"Blank":{"id":" \t "}}}"#,
+        )
+        .unwrap();
+        let raw_ids = declarations
+            .iter()
+            .map(|declaration| declaration.connector_id.0.clone())
+            .collect::<Vec<_>>();
+        let snapshot = crate::ConnectorSnapshot::from_plugin_sources([
+            crate::PluginConnectorSource::new("plugin", "Plugin", declarations),
+        ]);
+        let directory = vec![plugin_connector_to_app_info("calendar".to_string()).unwrap()];
+        let raw = merge_plugin_connectors(directory.clone(), raw_ids);
+        let normalized = merge_plugin_connectors(
+            directory,
+            snapshot.connector_ids().iter().map(|id| id.0.clone()),
+        );
+        assert_eq!(raw, normalized);
+        assert_eq!(raw.len(), 2);
+        assert!(raw.iter().any(|connector| connector.id == "Calendar"));
+        assert!(raw.iter().any(|connector| connector.id == "calendar"));
+        let merged = merge_connectors(raw, vec![google_calendar_accessible_connector(&[])]);
+        assert_eq!(merged.len(), 2);
+        let calendar = merged
+            .iter()
+            .find(|connector| connector.id == "calendar")
+            .unwrap();
+        assert!(calendar.is_accessible);
+        assert_eq!(calendar.name, "Google Calendar");
+        assert_eq!(
+            calendar.install_url,
+            Some(connector_install_url("calendar", "calendar"))
+        );
+    }
+
+    #[test]
+    fn merge_boundaries_canonicalize_existing_and_accessible_rows() {
+        let mut padded = plugin_connector_to_app_info("calendar".to_string()).unwrap();
+        padded.id = " calendar ".to_string();
+        padded.name = padded.id.clone();
+        padded.install_url = Some(connector_install_url(&padded.name, &padded.id));
+        let mut invalid = padded.clone();
+        invalid.id = " \t ".to_string();
+        let mut accessible = google_calendar_accessible_connector(&[]);
+        accessible.id = "\tcalendar ".to_string();
+        let mut expected = accessible.clone();
+        expected.id = "calendar".to_string();
+        expected.install_url = Some(connector_install_url("calendar", "calendar"));
+        assert_eq!(
+            merge_connectors(
+                vec![padded.clone(), invalid.clone()],
+                vec![accessible, invalid.clone()]
+            ),
+            vec![expected]
+        );
+        assert_eq!(
+            merge_plugin_connectors(
+                vec![padded.clone(), padded.clone(), invalid],
+                [" calendar ".to_string()]
+            ),
+            vec![plugin_connector_to_app_info("calendar".to_string()).unwrap()]
+        );
+        assert_eq!(plugin_connector_to_app_info(" \t ".to_string()), None);
+        assert_eq!(
+            plugin_connector_to_app_info(" calendar ".to_string()),
+            plugin_connector_to_app_info("calendar".to_string())
+        );
+        // Only generated install URLs are repaired; canonicalization must not
+        // replace real metadata supplied by the directory.
+        padded.name = "Google Calendar".to_string();
+        padded.install_url = Some("https://example.com/custom-calendar-install".to_string());
+        let merged = merge_connectors(vec![padded], Vec::new());
+        assert_eq!(merged[0].id, "calendar");
+        assert_eq!(merged[0].name, "Google Calendar");
+        assert_eq!(
+            merged[0].install_url.as_deref(),
+            Some("https://example.com/custom-calendar-install")
+        );
     }
 
     #[test]

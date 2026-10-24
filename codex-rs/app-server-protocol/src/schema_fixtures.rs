@@ -13,7 +13,6 @@ use crate::protocol::common::visit_client_response_types;
 use crate::protocol::common::visit_server_response_types;
 use anyhow::Context;
 use anyhow::Result;
-use serde_json::Map;
 use serde_json::Value;
 use std::any::TypeId;
 use std::collections::BTreeMap;
@@ -39,9 +38,12 @@ pub fn read_schema_fixture_subtree(
 
 #[doc(hidden)]
 pub fn generate_json_schema_fixture_subtree_for_tests() -> Result<BTreeMap<PathBuf, Vec<u8>>> {
-    crate::export::generate_json_schema_tree(/*experimental_api*/ false)?
+    crate::export::generate_json_schema_values(/*experimental_api*/ false)?
         .into_iter()
-        .map(|(path, bytes)| Ok((path.clone(), normalize_fixture_bytes(&path, bytes)?)))
+        .map(|(path, value)| {
+            let bytes = normalize_json_fixture_value(&path, value)?;
+            Ok((path, bytes))
+        })
         .collect()
 }
 
@@ -161,10 +163,7 @@ fn normalize_fixture_bytes(path: &Path, bytes: Vec<u8>) -> Result<Vec<u8>> {
     if path.extension().is_some_and(|ext| ext == "json") {
         let value: Value = serde_json::from_slice(&bytes)
             .with_context(|| format!("failed to parse JSON in {}", path.display()))?;
-        let value = canonicalize_json(&value);
-        let normalized = serde_json::to_vec_pretty(&value)
-            .with_context(|| format!("failed to reserialize JSON in {}", path.display()))?;
-        return Ok(normalized);
+        return normalize_json_fixture_value(path, value);
     }
     if path.extension().is_some_and(|ext| ext == "ts") {
         // Windows checkouts (and some generators) may produce CRLF; normalize so the
@@ -183,64 +182,55 @@ fn normalize_fixture_bytes(path: &Path, bytes: Vec<u8>) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
+fn normalize_json_fixture_value(path: &Path, mut value: Value) -> Result<Vec<u8>> {
+    // Sort objects before computing array sort keys, including when workspace
+    // feature unification enables serde_json/preserve_order.
+    value.sort_all_objects();
+    canonicalize_json(&mut value);
+    serde_json::to_vec_pretty(&value)
+        .with_context(|| format!("failed to reserialize JSON in {}", path.display()))
+}
+
 // Only schema keywords define unordered arrays. Literal data and tuple positions
 // preserve their order even when their contents resemble schema keywords.
-fn canonicalize_json(value: &Value) -> Value {
+fn canonicalize_json(value: &mut Value) {
     let Value::Object(map) = value else {
-        return canonicalize_literal(value);
+        return;
     };
-    let mut sorted = Map::new();
     for (key, child) in map {
-        let normalized = match key.as_str() {
+        match key.as_str() {
             "properties" | "patternProperties" | "$defs" | "definitions" | "dependentSchemas" => {
                 if let Value::Object(entries) = child {
-                    Value::Object(
-                        entries
-                            .iter()
-                            .map(|(name, schema)| {
-                                // Mixed app-server bundles group definitions under v1/v2.
-                                let schema = if key == "definitions"
-                                    && matches!(name.as_str(), "v1" | "v2")
-                                {
-                                    match schema.as_object() {
-                                        Some(namespace) => Value::Object(
-                                            namespace
-                                                .iter()
-                                                .map(|(name, schema)| {
-                                                    (name.clone(), canonicalize_json(schema))
-                                                })
-                                                .collect(),
-                                        ),
-                                        None => canonicalize_literal(schema),
-                                    }
-                                } else {
-                                    canonicalize_json(schema)
-                                };
-                                (name.clone(), schema)
-                            })
-                            .collect(),
-                    )
-                } else {
-                    canonicalize_literal(child)
+                    for (name, schema) in entries {
+                        // Mixed app-server bundles group definitions under v1/v2.
+                        if key == "definitions" && matches!(name.as_str(), "v1" | "v2") {
+                            if let Value::Object(namespace) = schema {
+                                for schema in namespace.values_mut() {
+                                    canonicalize_json(schema);
+                                }
+                            }
+                        } else {
+                            canonicalize_json(schema);
+                        }
+                    }
                 }
             }
             "anyOf" | "oneOf" | "allOf" | "items" | "prefixItems" => {
                 if let Value::Array(items) = child {
-                    let mut items: Vec<_> = items.iter().map(canonicalize_json).collect();
+                    for item in items.iter_mut() {
+                        canonicalize_json(item);
+                    }
                     if matches!(key.as_str(), "anyOf" | "oneOf" | "allOf") {
                         items.sort_by_cached_key(Value::to_string);
                     }
-                    Value::Array(items)
                 } else {
-                    canonicalize_json(child)
+                    canonicalize_json(child);
                 }
             }
             "required" | "type" | "enum" => {
-                let mut child = canonicalize_literal(child);
-                if let Value::Array(items) = &mut child {
+                if let Value::Array(items) = child {
                     items.sort_by_cached_key(Value::to_string);
                 }
-                child
             }
             "additionalProperties"
             | "additionalItems"
@@ -252,22 +242,8 @@ fn canonicalize_json(value: &Value) -> Value {
             | "propertyNames"
             | "unevaluatedProperties"
             | "unevaluatedItems" => canonicalize_json(child),
-            _ => canonicalize_literal(child),
-        };
-        sorted.insert(key.clone(), normalized);
-    }
-    Value::Object(sorted)
-}
-
-fn canonicalize_literal(value: &Value) -> Value {
-    match value {
-        Value::Object(map) => Value::Object(
-            map.iter()
-                .map(|(key, child)| (key.clone(), canonicalize_literal(child)))
-                .collect(),
-        ),
-        Value::Array(items) => Value::Array(items.iter().map(canonicalize_literal).collect()),
-        _ => value.clone(),
+            _ => {}
+        }
     }
 }
 
@@ -502,6 +478,21 @@ mod tests {
                 serde_json::json!({"properties":{"required":{"required":["a","b"],"anyOf":[{"$ref":"#/A"},{"$ref":"#/B"}]}}})
             ),
         );
+    }
+
+    #[test]
+    fn owned_fixture_values_match_disk_normalization_with_shuffled_object_keys() -> Result<()> {
+        let value: Value = serde_json::from_str(
+            r##"{"required":["z","a"],"anyOf":[{"title":"B","type":"object"},{"type":"object","title":"A"}],"const":{"required":["z","a"]},"items":[{"title":"B"},{"title":"A"}]}"##,
+        )?;
+        let normalized = normalize_json_fixture_value(Path::new("schema.json"), value.clone())?;
+        assert_eq!(normalized, read_normalized(value));
+        let normalized: Value = serde_json::from_slice(&normalized)?;
+        assert_eq!(normalized["required"], serde_json::json!(["a", "z"]));
+        assert_eq!(normalized["anyOf"][0]["title"], "A");
+        assert_eq!(normalized["const"]["required"], serde_json::json!(["z", "a"]));
+        assert_eq!(normalized["items"][0]["title"], "B");
+        Ok(())
     }
 
     #[test]

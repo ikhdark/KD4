@@ -794,6 +794,30 @@ enum ParsedProxyListDecision {
     Unavailable,
 }
 
+#[cfg(any(target_os = "windows", test))]
+fn parse_static_proxy_list(input: &str, target_scheme: &str) -> ParsedProxyListDecision {
+    let mut saw_mapping = false;
+    let mut saw_default = false;
+    for token in input
+        .split(|ch: char| ch == ';' || ch.is_whitespace())
+        .filter(|token| !token.is_empty())
+    {
+        if let Some((key, _)) = token.split_once('=') {
+            saw_mapping = true;
+            if key.eq_ignore_ascii_case(target_scheme) {
+                return parse_proxy_token(token, target_scheme);
+            }
+        } else {
+            saw_default = true;
+        }
+    }
+    if saw_mapping && !saw_default {
+        ParsedProxyListDecision::Direct
+    } else {
+        parse_proxy_list(input, target_scheme)
+    }
+}
+
 fn parse_proxy_list(input: &str, target_scheme: &str) -> ParsedProxyListDecision {
     let mut saw_unsupported = false;
 

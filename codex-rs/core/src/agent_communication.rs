@@ -35,6 +35,10 @@ impl AgentCommunicationContext {
             sender_thread_id,
         }
     }
+
+    pub(crate) fn is_terminal_result(&self) -> bool {
+        self.kind == AgentCommunicationKind::Result
+    }
 }
 
 pub(crate) fn logging_enabled() -> bool {

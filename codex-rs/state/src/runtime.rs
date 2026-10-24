@@ -5,7 +5,6 @@ use crate::AgentJobItemCreateParams;
 use crate::AgentJobItemStatus;
 use crate::AgentJobProgress;
 use crate::AgentJobStatus;
-use crate::GOALS_DB_FILENAME;
 use crate::LOGS_DB_FILENAME;
 use crate::LogEntry;
 use crate::LogQuery;
@@ -18,7 +17,6 @@ use crate::ThreadsPage;
 use crate::migrations::migrate_tolerating_concurrent_initializers;
 use crate::migrations::repair_legacy_recency_migration_version;
 use crate::migrations::repair_legacy_validation_index_migration_order;
-use crate::migrations::runtime_goals_migrator;
 use crate::migrations::runtime_logs_migrator;
 use crate::migrations::runtime_migrator_for_pool;
 use crate::migrations::runtime_state_migrator;
@@ -63,12 +61,10 @@ use uuid::Uuid;
 
 mod agent_jobs;
 mod backfill;
-mod external_agent_config_imports;
 
 #[cfg(test)]
 #[path = "runtime_compat_tests.rs"]
 mod compatibility_tests;
-mod goals;
 mod logs;
 pub use logs::LogReader;
 pub(crate) use logs::LogRetentionScope;
@@ -86,15 +82,6 @@ async fn file_modified_time_utc(path: &Path) -> Option<DateTime<Utc>> {
     Some(updated_at)
 }
 
-pub use external_agent_config_imports::ExternalAgentConfigImportFailureRecord;
-pub use external_agent_config_imports::ExternalAgentConfigImportHistoryRecord;
-pub use external_agent_config_imports::ExternalAgentConfigImportSuccessRecord;
-pub use goals::GoalAccountingMode;
-pub use goals::GoalAccountingOutcome;
-pub use goals::GoalStore;
-pub use goals::GoalTerminalTransition;
-pub use goals::GoalTerminalTransitionOutcome;
-pub use goals::GoalUpdate;
 pub use recovery::RuntimeDbBackup;
 pub use recovery::backup_runtime_db_for_fresh_start;
 pub use recovery::is_sqlite_corruption_error;
@@ -145,15 +132,7 @@ const LOGS_DB: RuntimeDbSpec = RuntimeDbSpec {
     migrate_phase: "migrate_logs",
 };
 
-const GOALS_DB: RuntimeDbSpec = RuntimeDbSpec {
-    label: "goals DB",
-    filename: GOALS_DB_FILENAME,
-    kind: DbKind::Goals,
-    open_phase: "open_goals",
-    migrate_phase: "migrate_goals",
-};
-
-const RUNTIME_DBS: [RuntimeDbSpec; 3] = [STATE_DB, LOGS_DB, GOALS_DB];
+const RUNTIME_DBS: [RuntimeDbSpec; 2] = [STATE_DB, LOGS_DB];
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RuntimeDbPath {
@@ -168,12 +147,12 @@ pub struct StateRuntime {
     pool: Arc<sqlx::SqlitePool>,
     logs_pool: Arc<sqlx::SqlitePool>,
     agent_job_runner_instance_id: String,
+    agent_job_runner_registered: bool,
     agent_job_runner_heartbeat_shutdown: tokio::sync::watch::Sender<bool>,
     agent_job_updates: tokio::sync::watch::Sender<u64>,
     db_telemetry: Option<DbTelemetryHandle>,
     #[cfg(test)]
     log_retention_test_control: Arc<logs::LogRetentionTestControl>,
-    thread_goals: GoalStore,
     thread_updated_at_millis: Arc<AtomicI64>,
     thread_recency_at_millis: Arc<AtomicI64>,
 }
@@ -189,8 +168,15 @@ impl StateRuntime {
             codex_home,
             default_provider,
             /*telemetry_override*/ None,
+            /*register_job_runner*/ true,
         )
         .await
+    }
+
+    /// Open state for non-owning access without starting a job-runner lease.
+    /// Database migrations remain enabled; this is not a SQLite read-only pool.
+    pub async fn init_for_read(codex_home: PathBuf, default_provider: String) -> anyhow::Result<Arc<Self>> {
+        Self::init_serialized(codex_home, default_provider, None, false).await
     }
 
     #[cfg(test)]
@@ -199,19 +185,20 @@ impl StateRuntime {
         default_provider: String,
         telemetry_override: DbTelemetryHandle,
     ) -> anyhow::Result<Arc<Self>> {
-        Self::init_serialized(codex_home, default_provider, Some(telemetry_override)).await
+        Self::init_serialized(codex_home, default_provider, Some(telemetry_override), true).await
     }
 
     async fn init_serialized(
         codex_home: PathBuf,
         default_provider: String,
         telemetry_override: Option<DbTelemetryHandle>,
+        register_job_runner: bool,
     ) -> anyhow::Result<Arc<Self>> {
         // The owned task retains exclusion through pool cleanup even if its
         // caller stops waiting during a migration.
         tokio::spawn(async move {
             let _owners = recovery::lock_runtime_initialization(&codex_home).await?;
-            Self::init_inner(codex_home, default_provider, telemetry_override).await
+            Self::init_inner(codex_home, default_provider, telemetry_override, register_job_runner).await
         })
         .await?
     }
@@ -232,7 +219,7 @@ impl StateRuntime {
             let mut attempted = BTreeSet::new();
             loop {
                 let error =
-                    match Self::init_inner(home.clone(), default_provider.clone(), None).await {
+                    match Self::init_inner(home.clone(), default_provider.clone(), None, true).await {
                         Ok(runtime) => {
                             runtime.close().await;
                             return Ok(backups);
@@ -260,36 +247,29 @@ impl StateRuntime {
         codex_home: PathBuf,
         default_provider: String,
         telemetry_override: Option<DbTelemetryHandle>,
+        register_job_runner: bool,
     ) -> anyhow::Result<Arc<Self>> {
         tokio::fs::create_dir_all(&codex_home).await?;
 
         let state_migrator = runtime_state_migrator();
         let logs_migrator = runtime_logs_migrator();
-        let goals_migrator = runtime_goals_migrator();
         let state_path = STATE_DB.path(codex_home.as_path());
         let logs_path = LOGS_DB.path(codex_home.as_path());
-        let goals_path = GOALS_DB.path(codex_home.as_path());
         let telemetry = telemetry_override.as_deref();
         // These migrations touch only their own database. Await every opener
         // so failure cleanup also closes pools that succeeded concurrently.
         let results = tokio::join!(
             open_state_sqlite(&state_path, &state_migrator, telemetry),
             open_logs_sqlite(&logs_path, &logs_migrator, telemetry),
-            open_goals_sqlite(&goals_path, &goals_migrator, telemetry),
         );
-        let results = [results.0, results.1, results.2];
+        let results = [results.0, results.1];
         if results.iter().any(Result::is_err) {
             for pool in results.iter().filter_map(|result| result.as_ref().ok()) {
                 pool.close().await;
             }
         }
-        let [pool, logs_pool, goals_pool] = results;
-        let (pool, logs_pool, goals_pool) =
-            (Arc::new(pool?), Arc::new(logs_pool?), Arc::new(goals_pool?));
-        if let Err(error) = goals::transfer_legacy_goals(pool.as_ref(), goals_pool.as_ref()).await {
-            close_sqlite_pools(&[pool.as_ref(), logs_pool.as_ref(), goals_pool.as_ref()]).await;
-            return Err(error);
-        }
+        let [pool, logs_pool] = results;
+        let (pool, logs_pool) = (Arc::new(pool?), Arc::new(logs_pool?));
         let started = Instant::now();
         let backfill_state_result = ensure_backfill_state_row_in_pool(pool.as_ref())
             .await
@@ -309,7 +289,7 @@ impl StateRuntime {
             &backfill_state_result,
         );
         if let Err(err) = backfill_state_result {
-            close_sqlite_pools(&[pool.as_ref(), logs_pool.as_ref(), goals_pool.as_ref()]).await;
+            close_sqlite_pools(&[pool.as_ref(), logs_pool.as_ref()]).await;
             return Err(err);
         }
         let started = Instant::now();
@@ -342,7 +322,7 @@ SELECT
             match thread_timestamp_millis_result {
                 Ok(value) => value,
                 Err(err) => {
-                    close_sqlite_pools(&[pool.as_ref(), logs_pool.as_ref(), goals_pool.as_ref()])
+                    close_sqlite_pools(&[pool.as_ref(), logs_pool.as_ref()])
                         .await;
                     return Err(err);
                 }
@@ -350,13 +330,13 @@ SELECT
         let thread_updated_at_millis = thread_updated_at_millis.unwrap_or(0);
         let thread_recency_at_millis = thread_recency_at_millis.unwrap_or(0);
         let agent_job_runner_instance_id = Uuid::new_v4().to_string();
-        if let Err(err) = agent_jobs::register_agent_job_runner_instance(
+        if register_job_runner && let Err(err) = agent_jobs::register_agent_job_runner_instance(
             pool.as_ref(),
             agent_job_runner_instance_id.as_str(),
         )
         .await
         {
-            close_sqlite_pools(&[pool.as_ref(), logs_pool.as_ref(), goals_pool.as_ref()]).await;
+            close_sqlite_pools(&[pool.as_ref(), logs_pool.as_ref()]).await;
             return Err(recovery::RuntimeDbInitError::new(
                 STATE_DB.label,
                 "register agent job runner",
@@ -367,16 +347,18 @@ SELECT
         }
         let (agent_job_runner_heartbeat_shutdown, heartbeat_shutdown_rx) =
             tokio::sync::watch::channel(false);
-        agent_jobs::spawn_agent_job_runner_heartbeat(
-            Arc::clone(&pool),
-            agent_job_runner_instance_id.clone(),
-            heartbeat_shutdown_rx,
-        );
+        if register_job_runner {
+            agent_jobs::spawn_agent_job_runner_heartbeat(
+                Arc::clone(&pool),
+                agent_job_runner_instance_id.clone(),
+                heartbeat_shutdown_rx,
+            );
+        }
         let runtime = Arc::new(Self {
-            thread_goals: GoalStore::new(Arc::clone(&goals_pool)),
             pool,
             logs_pool,
             agent_job_runner_instance_id,
+            agent_job_runner_registered: register_job_runner,
             agent_job_runner_heartbeat_shutdown,
             agent_job_updates: tokio::sync::watch::channel(0).0,
             db_telemetry: telemetry_override,
@@ -395,10 +377,6 @@ SELECT
         self.codex_home.as_path()
     }
 
-    pub fn thread_goals(&self) -> &GoalStore {
-        &self.thread_goals
-    }
-
     pub fn is_closed(&self) -> bool {
         self.pool.is_closed()
     }
@@ -406,7 +384,7 @@ SELECT
     /// Close all SQLite pools and wait for outstanding pool workers to exit.
     pub async fn close(&self) {
         self.agent_job_runner_heartbeat_shutdown.send_replace(true);
-        if let Err(error) = agent_jobs::unregister_agent_job_runner_instance(
+        if self.agent_job_runner_registered && let Err(error) = agent_jobs::unregister_agent_job_runner_instance(
             self.pool.as_ref(),
             self.agent_job_runner_instance_id.as_str(),
         )
@@ -414,7 +392,6 @@ SELECT
         {
             warn!(%error, "failed to unregister agent job runner instance");
         }
-        self.thread_goals.close().await;
         self.logs_pool.close().await;
         self.pool.close().await;
     }
@@ -453,14 +430,6 @@ async fn open_logs_sqlite(
     telemetry_override: Option<&dyn DbTelemetry>,
 ) -> anyhow::Result<SqlitePool> {
     open_sqlite(path, migrator, LOGS_DB, telemetry_override).await
-}
-
-async fn open_goals_sqlite(
-    path: &Path,
-    migrator: &Migrator,
-    telemetry_override: Option<&dyn DbTelemetry>,
-) -> anyhow::Result<SqlitePool> {
-    open_sqlite(path, migrator, GOALS_DB, telemetry_override).await
 }
 
 /// Connect a SQLite pool using the shared bounded retry for startup PRAGMA contention.
@@ -512,11 +481,13 @@ async fn open_sqlite(
         if matches!(spec.kind, DbKind::State) {
             repair_legacy_validation_index_migration_order(pool_ref, migrator).await?;
         }
-        let migrator = runtime_migrator_for_pool(pool_ref, migrator).await?;
+        let compatible = runtime_migrator_for_pool(pool_ref, migrator).await?;
         if matches!(spec.kind, DbKind::State) {
-            repair_legacy_recency_migration_version(pool_ref, &migrator).await?;
-            goals::preserve_legacy_goals(pool_ref, &migrator).await?;
+            repair_legacy_recency_migration_version(pool_ref, &compatible).await?;
         }
+        // A legacy repair can move a checksum to a different version. Rebuild
+        // from the embedded source, not the pre-repair per-version overrides.
+        let migrator = runtime_migrator_for_pool(pool_ref, migrator).await?;
         if matches!(spec.kind, DbKind::State) {
             crate::migrations::run_state_migrations(pool_ref, &migrator).await?;
         } else {
@@ -581,14 +552,6 @@ pub fn logs_db_filename() -> String {
 
 pub fn logs_db_path(codex_home: &Path) -> PathBuf {
     LOGS_DB.path(codex_home)
-}
-
-pub fn goals_db_filename() -> String {
-    GOALS_DB.filename.to_string()
-}
-
-pub fn goals_db_path(codex_home: &Path) -> PathBuf {
-    GOALS_DB.path(codex_home)
 }
 
 pub fn runtime_db_paths(codex_home: &Path) -> Vec<RuntimeDbPath> {
@@ -843,8 +806,6 @@ mod tests {
             "migrate_state",
             "open_logs",
             "migrate_logs",
-            "open_goals",
-            "migrate_goals",
             "ensure_backfill_state",
             "post_init_query",
         ]
@@ -868,3 +829,7 @@ mod tests {
         let _ = tokio::fs::remove_dir_all(codex_home).await;
     }
 }
+
+#[cfg(test)]
+#[path = "runtime/audit20261023_tests.rs"]
+mod audit20261023_tests;

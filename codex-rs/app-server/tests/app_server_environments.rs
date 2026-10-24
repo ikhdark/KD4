@@ -7,8 +7,6 @@ mod suite {
     mod v2 {
         #[path = "auto_env.rs"]
         mod auto_env;
-        #[path = "environment_add.rs"]
-        mod environment_add;
         #[path = "environment_info.rs"]
         mod environment_info;
         #[path = "exec_server_test_support.rs"]

@@ -327,7 +327,7 @@ async fn loads_policies_from_policy_subdirectory() {
 }
 
 #[tokio::test]
-async fn merges_requirements_exec_policy_network_rules() -> anyhow::Result<()> {
+async fn rejects_unenforceable_requirements_exec_policy_network_rules() -> anyhow::Result<()> {
     let temp_dir = tempdir()?;
 
     let mut requirements_exec_policy = Policy::empty();
@@ -353,11 +353,14 @@ async fn merges_requirements_exec_policy_network_rules() -> anyhow::Result<()> {
     let config_stack =
         ConfigLayerStack::new(vec![layer], requirements, ConfigRequirementsToml::default())?;
 
-    let policy = load_exec_policy(&config_stack).await?;
-    let (allowed, denied) = policy.compiled_network_domains();
-
-    assert!(allowed.is_empty());
-    assert_eq!(denied, vec!["blocked.example.com".to_string()]);
+    assert!(matches!(
+        load_exec_policy(&config_stack).await,
+        Err(ExecPolicyError::UnsupportedNetworkRules)
+    ));
+    assert!(matches!(
+        load_exec_policy_with_warning(&config_stack).await,
+        Err(ExecPolicyError::UnsupportedNetworkRules)
+    ));
     Ok(())
 }
 
@@ -409,13 +412,9 @@ host_executable(name = "git", paths = ["{git_path_literal}"])
         ),
     )?;
 
-    let mut requirements_exec_policy = Policy::empty();
-    requirements_exec_policy.add_network_rule(
-        "blocked.example.com",
-        codex_execpolicy::NetworkRuleProtocol::Https,
-        Decision::Forbidden,
-        /*justification*/ None,
-    )?;
+    let mut parser = PolicyParser::new();
+    parser.parse("requirements", r#"prefix_rule(pattern = ["blocked-command"], decision = "forbidden")"#)?;
+    let requirements_exec_policy = parser.build();
 
     let requirements = ConfigRequirements {
         exec_policy: Some(codex_config::Sourced::new(

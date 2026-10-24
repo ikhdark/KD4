@@ -399,16 +399,22 @@
           evidence,
         );
       }
-      if (
-        result.streams_complete !== true ||
-        typeof result.stdout !== "string"
-      ) {
+      const observations = evidence.observations ?? [result];
+      if (observations.some((packet) => packet.streams_complete !== true ||
+        typeof packet.stdout !== "string" ||
+        (packet.stderr != null && typeof packet.stderr !== "string"))) {
         fail(
           "search output exceeded exact capture; narrow path or glob, or omit lines",
           evidence,
         );
       }
-      const errors = (result.stderr ?? "")
+      // Native observations contain successive packets, not cumulative streams.
+      // Join before parsing so NUL records and JSON events can cross packets.
+      result = {...result,
+        stdout: observations.map((packet) => packet.stdout).join(""),
+        stderr: observations.map((packet) => packet.stderr ?? "").join(""),
+      };
+      const errors = result.stderr
         .split("\n")
         .map((line) => line.trimEnd())
         .filter(Boolean);
@@ -588,10 +594,11 @@
   Object.defineProperty(globalThis, "await_command", {
     value: async function await_command(
       initial,
-      { max_observations = 256, max_wait_ms = 300_000, on_progress } = {},
+      { max_observations = 256, max_wait_ms = 300_000, max_bytes = 4 * 1024 * 1024, on_progress } = {},
     ) {
       integer(max_observations, 1, 1024, "max_observations");
       integer(max_wait_ms, 5_000, 300_000, "max_wait_ms");
+      integer(max_bytes, 65536, 4 * 1024 * 1024, "max_bytes");
       // Capture the host's steady clock for this observation chain. Wall-clock
       // corrections must not lengthen the budget or invalidate a live handle.
       const now = globalThis.__codex_monotonic_now;
@@ -606,6 +613,10 @@
       while (true) {
         observations.push(current);
         const evidence = { terminal: current, observations };
+        const retainedBytes = bytes(JSON.stringify(evidence, (_key, value) =>
+          typeof value === 'bigint' ? value.toString() : value));
+        if (retainedBytes >= max_bytes)
+          fail("command evidence byte limit reached; retain these observations and resume only the retained handle", evidence);
         if (
           !current ||
           current.error != null ||
@@ -656,6 +667,10 @@
         }
         session = current.session_id;
         incarnation = current.session_capabilities.incarnation;
+        // Stop with the exact observations and live handle before consuming
+        // another packet. The caller can page/retain these bytes and resume the
+        // same command; a successful process is never restarted or silently
+        // stripped of its earlier output to fit text()/store().
         // Silence is not failure. The owner's no-output notice stays in this
         // observation, so keep waiting on the same handle; a process that stays
         // silent stops at the wait budget with that silence named.

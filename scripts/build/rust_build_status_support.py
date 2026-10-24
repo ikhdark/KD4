@@ -15,15 +15,11 @@ from concurrent.futures import ThreadPoolExecutor
 import math
 import os
 from pathlib import Path
-import shutil
 import stat
-import tomllib
 from typing import Callable
-from typing import Mapping
 from typing import Sequence
 from typing import TYPE_CHECKING
 
-from scripts.build.rust_tool_env import local_rust_env
 
 if TYPE_CHECKING:
     from scripts.build.rust_build_status import BuildStatusSnapshot
@@ -43,10 +39,6 @@ DEFAULT_PRUNE_MAX_AGE_DAYS = 7.0
 # identity only for files of at least 1 MiB removed 94% of the double-counted
 # bytes in a 43 GiB target for about 0.4 s instead of 11 s for every file.
 HARDLINK_CHECK_MIN_BYTES = BYTES_PER_MIB
-WINDOWS_MSVC_TARGETS = (
-    "x86_64-pc-windows-msvc",
-    "aarch64-pc-windows-msvc",
-)
 
 
 def _runtime():
@@ -294,123 +286,6 @@ def target_disk_report_lines(
     return lines
 
 
-def build_doctor_report(
-    *,
-    repo_root: Path = REPO_ROOT,
-    processes: Sequence[RustProcess] | None = None,
-    snapshot: BuildStatusSnapshot | None = None,
-    tool_lookup: Callable[[str], str | None] = shutil.which,
-    env: Mapping[str, str] | None = None,
-    include_disk: bool = True,
-    warn_bytes: int = DEFAULT_TARGET_WARN_BYTES,
-    keep_warm_per_base: int = DEFAULT_PRUNE_KEEP_WARM_PER_BASE,
-    max_age_days: float | None = DEFAULT_PRUNE_MAX_AGE_DAYS,
-    max_lane_bytes: int | None = None,
-    max_total_lane_bytes: int | None = None,
-    max_total_target_bytes: int | None = None,
-    size_workers: int = DEFAULT_LANE_SIZE_WORKERS,
-) -> str:
-    env = os.environ if env is None else env
-    snapshot = snapshot or _runtime().BuildStatusSnapshot.collect(
-        repo_root=repo_root,
-        processes=processes,
-    )
-    processes = snapshot.processes
-    shared = _runtime().shared_target_rust_processes(
-        processes,
-        snapshot.lane_names_by_process,
-    )
-    lane_processes = [
-        process for process in processes if snapshot.lane_name_for(process)
-    ]
-    sccache = tool_lookup("sccache")
-    msvc_linkers = msvc_linkers_from_cargo_config(repo_root)
-
-    lines = [
-        "Rust build doctor",
-        f"repo: {repo_root}",
-        f"sccache: {sccache or 'not found'}",
-        f"RUSTC_WRAPPER: {env.get('RUSTC_WRAPPER') or '(unset)'}",
-    ]
-    for target in WINDOWS_MSVC_TARGETS:
-        env_name = f"CARGO_TARGET_{target.upper().replace('-', '_')}_LINKER"
-        lines.append(
-            f"MSVC linker config {target}: {msvc_linkers.get(target) or '(unset)'}"
-        )
-        lines.append(f"MSVC linker env {env_name}: {env.get(env_name) or '(unset)'}")
-    # Just recipes and run-lane add these to the values above before Cargo runs.
-    additions = local_rust_env(env, repo_root=repo_root, which=tool_lookup)
-    lines.append(
-        "just/run-lane env additions: "
-        + (
-            "; ".join(f"{name}={value}" for name, value in sorted(additions.items()))
-            or "(none)"
-        )
-    )
-
-    if snapshot.process_scan_error is not None:
-        lines.append(f"active Rust processes: unknown ({snapshot.process_scan_error})")
-    else:
-        lines.append(
-            f"active Rust processes: {len(processes)} total, {len(lane_processes)} lane, "
-            f"{len(shared)} without lane"
-        )
-    if shared:
-        lines.append(
-            "Rust jobs without a lane are running; their target dir is not verified "
-            "(codex-rs/target or another workspace). For codex-rs builds prefer "
-            "`just test-lane-fast <lane> ...`"
-        )
-    active_lanes = sorted(snapshot.active_lanes - snapshot.quarantined_lanes)
-    if active_lanes:
-        lines.append(
-            "active lanes: " + ", ".join(lane for lane in active_lanes if lane)
-        )
-
-    if include_disk:
-        lines.extend(
-            target_disk_report_lines(
-                repo_root=repo_root, warn_bytes=warn_bytes, snapshot=snapshot
-            )
-        )
-    else:
-        lines.append("target disk: not scanned (use `doctor --include-disk` or `disk`)")
-    lines.extend(
-        lane_report_lines(
-            repo_root=repo_root,
-            processes=processes,
-            snapshot=snapshot,
-            keep_warm_per_base=keep_warm_per_base,
-            max_age_days=max_age_days,
-            max_lane_bytes=max_lane_bytes,
-            max_total_lane_bytes=max_total_lane_bytes,
-            max_total_target_bytes=max_total_target_bytes,
-            size_workers=size_workers,
-        )
-    )
-    return "\n".join(lines)
-
-
-def msvc_linkers_from_cargo_config(repo_root: Path) -> dict[str, str]:
-    config_path = repo_root / "codex-rs" / ".cargo" / "config.toml"
-    try:
-        config = tomllib.loads(config_path.read_text(encoding="utf-8"))
-    except (OSError, tomllib.TOMLDecodeError):
-        return {}
-    target_config = config.get("target", {})
-    if not isinstance(target_config, dict):
-        return {}
-
-    linkers: dict[str, str] = {}
-    for target in WINDOWS_MSVC_TARGETS:
-        target_table = target_config.get(target, {})
-        if isinstance(target_table, dict):
-            linker = target_table.get("linker")
-            if isinstance(linker, str):
-                linkers[target] = linker
-    return linkers
-
-
 def lane_report(
     *,
     repo_root: Path = REPO_ROOT,
@@ -493,15 +368,6 @@ def lane_report_lines(
     lines.append(
         "active: " + (", ".join(active_existing) if active_existing else "(none)")
     )
-    lane_paths = {path.name: path for path in snapshot.lane_dirs}
-    for name in active_existing:
-        holder = _runtime().lane_runner_holder(lane_paths[name])
-        if holder is not None:
-            lines.append(
-                f"  {name} runner: {' '.join(holder['argv'])} "
-                f"(cwd {holder['working_directory']}; started {holder['started_at']}; "
-                f"ledger {holder['ledger']})"
-            )
     if snapshot.quarantined_lanes:
         lines.append(
             "quarantined (process cleanup unconfirmed; not pruned or reused until "
@@ -556,35 +422,14 @@ def target_optimize_report(
     size_workers: int = DEFAULT_LANE_SIZE_WORKERS,
 ) -> str:
     snapshot = _runtime().BuildStatusSnapshot.collect(repo_root=repo_root)
-    return "\n".join(
-        [
-            build_doctor_report(
-                repo_root=repo_root,
-                snapshot=snapshot,
-                warn_bytes=warn_bytes,
-                keep_warm_per_base=keep_warm_per_base,
-                max_age_days=max_age_days,
-                max_lane_bytes=max_lane_bytes,
-                max_total_lane_bytes=max_total_lane_bytes,
-                max_total_target_bytes=max_total_target_bytes,
-                size_workers=size_workers,
-            ),
-            _runtime().prune_stale_lanes_report(
-                repo_root=repo_root,
-                snapshot=snapshot,
-                dry_run=dry_run,
-                warn_bytes=warn_bytes,
-                keep_warm_per_base=keep_warm_per_base,
-                max_age_days=max_age_days,
-                max_lane_bytes=max_lane_bytes,
-                max_total_lane_bytes=max_total_lane_bytes,
-                max_total_target_bytes=max_total_target_bytes,
-                include_disk_report=include_prune_disk_report,
-                size_workers=size_workers,
-            ),
-        ]
+    return _runtime().prune_stale_lanes_report(
+        repo_root=repo_root, snapshot=snapshot, dry_run=dry_run,
+        warn_bytes=warn_bytes, keep_warm_per_base=keep_warm_per_base,
+        max_age_days=max_age_days, max_lane_bytes=max_lane_bytes,
+        max_total_lane_bytes=max_total_lane_bytes,
+        max_total_target_bytes=max_total_target_bytes,
+        include_disk_report=include_prune_disk_report, size_workers=size_workers,
     )
-
 
 def warn_bytes_from_gib(warn_gib: float) -> int:
     # Scale as integers: a valid finite GiB value can exceed float range

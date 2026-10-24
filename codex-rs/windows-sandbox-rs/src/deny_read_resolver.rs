@@ -96,15 +96,15 @@ fn collect_existing_glob_matches(
         return Ok(());
     }
 
-    // Canonical directory keys keep recursive scans from following a symlink or
-    // junction cycle forever while preserving the original matched path for the
-    // ACL layer.
-    let scan_key = dunce::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-    if !seen_scan_dirs.insert(scan_key) {
+    if max_depth.is_some_and(|max_depth| depth >= max_depth) {
         return Ok(());
     }
 
-    if max_depth.is_some_and(|max_depth| depth >= max_depth) {
+    // Canonical ancestry keys keep recursive scans from following a symlink or
+    // junction cycle forever while preserving the original matched path for the
+    // ACL layer.
+    let scan_key = dunce::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    if !seen_scan_dirs.insert(scan_key.clone()) {
         return Ok(());
     }
 
@@ -131,6 +131,7 @@ fn collect_existing_glob_matches(
             depth + 1,
         )?;
     }
+    seen_scan_dirs.remove(&scan_key);
 
     Ok(())
 }
@@ -191,7 +192,7 @@ fn effective_glob_scan_max_depth(
         .split(['/', '\\'])
         .filter(|component| !component.is_empty())
         .collect::<Vec<_>>();
-    if components.contains(&"**") {
+    if pattern_suffix.contains("**") {
         return configured_max_depth;
     }
     Some(configured_max_depth.map_or(components.len(), |max_depth| {

@@ -33,6 +33,8 @@ from typing import TYPE_CHECKING
 import uuid
 
 from scripts.codex_package.targets import BINARY_TARGETS
+from scripts.codex_package.archive import is_relative_to
+from scripts.codex_package.layout import sha256_file as file_sha256
 
 if TYPE_CHECKING:
     from scripts.codex_package.stage_npm_packages import BinaryComponent
@@ -399,14 +401,6 @@ def cache_tree_digest(root: Path) -> str:
     return digest.hexdigest()
 
 
-def file_sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        while chunk := handle.read(1024 * 1024):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
 def extract_tar_data(archive_path: Path, dest_dir: Path) -> None:
     with tarfile.open(archive_path, "r:gz") as archive:
         try:
@@ -433,14 +427,6 @@ def validate_tar_members_for_legacy_python(
                 "archive special files require Python tarfile data_filter "
                 f"support: {member.name}"
             )
-
-
-def is_relative_to(path: Path, parent: Path) -> bool:
-    try:
-        path.relative_to(parent)
-        return True
-    except ValueError:
-        return False
 
 
 def install_binary_components(

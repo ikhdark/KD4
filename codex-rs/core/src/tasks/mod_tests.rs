@@ -4,7 +4,6 @@ use super::TASK_COMPACT_METRIC;
 use super::TerminalSchedule;
 use super::TurnTerminalOutcome;
 use super::emit_compact_metric;
-use super::emit_turn_network_proxy_metric;
 use crate::session::TurnInput;
 use crate::session::tests::attach_thread_persistence;
 use crate::session::tests::make_session_and_context_with_rx;
@@ -19,7 +18,6 @@ use crate::turn_timing::ToolCallTimingLineage;
 use codex_otel::MetricsClient;
 use codex_otel::MetricsConfig;
 use codex_otel::SessionTelemetry;
-use codex_otel::TURN_NETWORK_PROXY_METRIC;
 use codex_protocol::ThreadId;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::FunctionCallOutputPayload;
@@ -2056,6 +2054,82 @@ async fn terminal_schedule_waits_for_active_turn_admission() {
 }
 
 #[tokio::test]
+async fn stopped_worker_resolves_abandoned_interrupt_without_replacing_durability() {
+    for durable in [false, true] {
+        let coordinator = TurnTerminalCoordinator::new("stopped-worker".to_string());
+        assert!(coordinator.mark_interrupt_pending().await);
+        let generation = coordinator.wake_generation_id();
+        assert!(coordinator.try_claim().is_none());
+        if durable {
+            assert_eq!(
+                coordinator.mark_interrupt_output_durable(&generation),
+                TerminalWakeResult::Applied
+            );
+        }
+
+        let permit = coordinator
+            .try_claim_after_worker_finished()
+            .expect("a stopped worker cannot leave an unowned persistence fence");
+        assert_eq!(coordinator.interrupt_persistence_failed(), !durable);
+        assert_eq!(coordinator.sampling_admission(), SamplingAdmission::Fenced);
+        assert_eq!(
+            coordinator.wait_for_interrupt_resolution(&generation).await,
+            TerminalWakeResult::Applied
+        );
+        permit.complete_cleanup();
+        assert_eq!(coordinator.sampling_admission(), SamplingAdmission::Allowed);
+    }
+}
+
+#[tokio::test]
+async fn failed_worker_finalizes_an_accepted_pending_interrupt_once() {
+    for mode in [FailureMode::Fatal, FailureMode::Panicked] {
+        let (session, turn_context, mut events) = make_session_and_context_with_rx().await;
+        let release = CancellationToken::new();
+        session
+            .start_task(
+                Arc::clone(&turn_context),
+                Vec::new(),
+                FailureOnReleaseTask(release.clone(), mode),
+            )
+            .await;
+        let coordinator = session
+            .active_turn
+            .lock()
+            .await
+            .as_ref()
+            .and_then(|turn| turn.terminal.clone())
+            .expect("installed worker owns the terminal coordinator");
+        assert!(coordinator.mark_interrupt_pending().await);
+
+        // Fault only the worker, after accepting the pre-terminal interrupt.
+        // No tool-output durability resolution will arrive from this worker.
+        release.cancel();
+        tokio::time::timeout(Duration::from_secs(5), coordinator.wait_cleanup_completed())
+            .await
+            .expect("worker failure must not strand terminal finalization");
+        assert!(session.active_turn.lock().await.is_none());
+
+        let mut terminals = 0;
+        while let Ok(event) = events.try_recv() {
+            match event.msg {
+                EventMsg::TurnComplete(event) if event.turn_id == turn_context.sub_id => {
+                    assert!(event.error.is_some(), "preserve the worker failure");
+                    terminals += 1;
+                }
+                EventMsg::TurnAborted(event)
+                    if event.turn_id.as_deref() == Some(turn_context.sub_id.as_str()) =>
+                {
+                    terminals += 1;
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(terminals, 1, "publish exactly one terminal for the failed turn");
+    }
+}
+
+#[tokio::test]
 async fn interrupt_pending_fences_sampling_without_terminalizing() {
     let coordinator = TurnTerminalCoordinator::new("turn-fenced".to_string());
     assert_eq!(coordinator.sampling_admission(), SamplingAdmission::Allowed);
@@ -2236,23 +2310,6 @@ fn terminal_analytics_claim_converges_across_in_process_recovery() {
     assert!(!recovery.try_claim_analytics_emission());
 }
 
-#[test]
-fn emit_turn_network_proxy_metric_records_active_and_inactive_turns() {
-    for (active, expected) in [(true, "true"), (false, "false")] {
-        let session_telemetry = test_session_telemetry();
-        emit_turn_network_proxy_metric(&session_telemetry, active);
-        let snapshot = session_telemetry
-            .snapshot_metrics()
-            .expect("runtime metrics snapshot");
-        let (attrs, value) = metric_point(&snapshot, TURN_NETWORK_PROXY_METRIC);
-
-        assert_eq!(value, 1);
-        assert_eq!(
-            attrs,
-            BTreeMap::from([("active".to_string(), expected.to_string())])
-        );
-    }
-}
 
 #[test]
 fn emit_compact_metric_records_manual_and_automatic_compaction() {

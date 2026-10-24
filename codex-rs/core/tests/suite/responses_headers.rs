@@ -166,7 +166,6 @@ async fn responses_stream_includes_subagent_identity_headers(
             summary.unwrap_or(model_info.default_reasoning_summary),
             /*service_tier*/ None,
             &responses_metadata,
-            &codex_rollout_trace::InferenceTraceContext::disabled(),
         )
         .await
         .expect("stream failed");
@@ -311,7 +310,6 @@ async fn responses_includes_configured_reasoning_summary_for_supported_model() {
             summary.unwrap_or(model_info.default_reasoning_summary),
             /*service_tier*/ None,
             &responses_metadata,
-            &codex_rollout_trace::InferenceTraceContext::disabled(),
         )
         .await
         .expect("stream failed");

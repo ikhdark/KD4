@@ -1112,17 +1112,24 @@ impl AccountRequestProcessor {
 
         let client = self.backend_client_for_auth(&auth);
 
-        let (response, detailed_rate_limit_reset_credits) = tokio::join!(
-            client.get_rate_limits_with_reset_credits(),
-            Self::detailed_rate_limit_reset_credits(&client),
-        );
-        let response = response
-            .map_err(|err| internal_error(format!("failed to fetch codex rate limits: {err}")))?;
-        if response.rate_limits.is_empty() {
-            return Err(internal_error(
-                "failed to fetch codex rate limits: no snapshots returned",
-            ));
-        }
+        let required = async {
+            let response = client
+                .get_rate_limits_with_reset_credits()
+                .await
+                .map_err(|err| {
+                    internal_error(format!("failed to fetch codex rate limits: {err}"))
+                })?;
+            if response.rate_limits.is_empty() {
+                return Err(internal_error(
+                    "failed to fetch codex rate limits: no snapshots returned",
+                ));
+            }
+            Ok(response)
+        };
+        // Details cannot salvage a failed required response. Dropping this branch
+        // cancels its local request instead of waiting for the optional timeout.
+        let optional = async { Ok(Self::detailed_rate_limit_reset_credits(&client).await) };
+        let (response, detailed_rate_limit_reset_credits) = tokio::try_join!(required, optional)?;
 
         let rate_limits_by_limit_id: HashMap<_, _> = response
             .rate_limits

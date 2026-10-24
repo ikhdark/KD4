@@ -88,7 +88,7 @@ impl Hunk {
 #[cfg(test)]
 use Hunk::*;
 
-#[derive(Debug, PartialEq, Clone)]
+#[derive(Debug, Clone)]
 pub struct UpdateFileChunk {
     /// A source line immediately preceding the chunk, or a revision-bound
     /// `codex-range` descriptor. A textual anchor is not a containing scope.
@@ -98,10 +98,25 @@ pub struct UpdateFileChunk {
     /// With a textual `change_context`, `old_lines` must immediately follow it.
     pub old_lines: Vec<String>,
     pub new_lines: Vec<String>,
+    /// Original marker intent, retained because equal repeated lines can have
+    /// different physical endings. Empty for legacy programmatic chunks.
+    pub line_kinds: Vec<UpdateLineKind>,
 
     /// If set to true, `old_lines` must occur at the end of the source file.
     /// (Tolerance around trailing newlines should be encouraged.)
     pub is_end_of_file: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UpdateLineKind { Context, Add, Remove }
+
+// Preserve the existing logical-text equality contract. Marker provenance is
+// used by application, not by callers comparing logical parser representations.
+impl PartialEq for UpdateFileChunk {
+    fn eq(&self, other: &Self) -> bool {
+        self.change_context == other.change_context && self.old_lines == other.old_lines
+            && self.new_lines == other.new_lines && self.is_end_of_file == other.is_end_of_file
+    }
 }
 
 /// Parse patches leniently for compatibility with models that wrap patch text
@@ -179,6 +194,19 @@ fn parse_patch_text(patch: &str, mode: ParseMode) -> Result<ApplyPatchArgs, Pars
 #[cfg(test)]
 mod review_regressions {
     use super::*;
+
+    #[test]
+    fn repeated_context_keeps_the_intended_physical_line_ending() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = codex_utils_path_uri::PathUri::from_host_native_path(directory.path().join("mixed.txt")).unwrap();
+        for (body, expected) in [("-same\n same", "same\n"), (" same\n-same", "same\r\n")] {
+            let patch = format!("*** Begin Patch\n*** Update File: mixed.txt\n@@\n{body}\n*** End Patch");
+            let args = parse_patch(&patch).unwrap();
+            let Hunk::UpdateFile { chunks, .. } = &args.hunks[0] else { panic!("update") };
+            let result = crate::new_contents_from_chunks(&path, "same\r\nsame\n", chunks, Some(1)).unwrap();
+            assert_eq!(result, expected);
+        }
+    }
 
     #[test]
     fn batch_streaming_and_replay_preserve_extra_carriage_returns() {
@@ -384,7 +412,8 @@ fn test_parse_patch() {
                     change_context: Some("def f():".to_string()),
                     old_lines: vec!["    pass".to_string()],
                     new_lines: vec!["    return 123".to_string()],
-                    is_end_of_file: false
+                    is_end_of_file: false,
+                    line_kinds: Vec::new(),
                 }]
             }
         ]
@@ -411,7 +440,8 @@ fn test_parse_patch() {
                     change_context: None,
                     old_lines: vec![],
                     new_lines: vec!["line".to_string()],
-                    is_end_of_file: false
+                    is_end_of_file: false,
+                    line_kinds: Vec::new(),
                 }],
             },
             AddFile {
@@ -442,6 +472,7 @@ fn test_parse_patch() {
                 old_lines: vec!["import foo".to_string()],
                 new_lines: vec!["import foo".to_string(), "bar".to_string()],
                 is_end_of_file: false,
+                line_kinds: Vec::new(),
             }],
         }]
     );
@@ -462,6 +493,7 @@ fn test_parse_patch_preserves_end_of_file_marker() {
                     old_lines: Vec::new(),
                     new_lines: vec!["quux".to_string()],
                     is_end_of_file: true,
+                    line_kinds: Vec::new(),
                 }],
             }],
             patch: patch.to_string(),
@@ -509,7 +541,8 @@ fn test_parse_patch_accepts_relative_and_absolute_hunk_paths() {
                     change_context: None,
                     old_lines: vec!["old".to_string()],
                     new_lines: vec!["new".to_string()],
-                    is_end_of_file: false
+                    is_end_of_file: false,
+                    line_kinds: Vec::new(),
                 }]
             },
         ]
@@ -588,6 +621,7 @@ fn test_parse_patch_lenient() {
             old_lines: vec!["import foo".to_string()],
             new_lines: vec!["import foo".to_string(), "bar".to_string()],
             is_end_of_file: false,
+            line_kinds: Vec::new(),
         }],
     }];
     let expected_error =

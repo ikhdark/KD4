@@ -91,7 +91,8 @@ impl ModelContextBudget {
     /// Truncating rendered text can cut a marker, and a fragment missing either
     /// marker no longer matches its registration, so a user-role fragment would
     /// be treated as user input. When the markers leave no room for body text,
-    /// the fragment is omitted without charging the budget.
+    /// the fragment is omitted without charging the budget. Fragments whose
+    /// bodies cannot be truncated safely are admitted whole or omitted.
     pub fn take_fragment<F>(&mut self, fragment: &F) -> Option<String>
     where
         F: ContextualUserFragment + ?Sized,
@@ -102,6 +103,9 @@ impl ModelContextBudget {
         let body = if markers_len.saturating_add(body.len()) <= self.remaining_bytes {
             body
         } else {
+            if !fragment.can_truncate_body() {
+                return None;
+            }
             let mut body_budget = Self {
                 remaining_bytes: self.remaining_bytes.checked_sub(markers_len)?,
             };

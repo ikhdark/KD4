@@ -111,9 +111,9 @@ pub struct ProcessWriteStdinParams {
     /// Optional base64-encoded stdin bytes to write.
     #[ts(optional = nullable)]
     pub delta_base64: Option<String>,
-    /// Close input after queued bytes. Unix PTYs send canonical VEOF (including
-    /// flushing a partial line); raw/disabled-VEOF terminals return an error.
-    /// Terminal EOF is not a permanent pipe half-close.
+    /// Close input after queued bytes. Unix PTYs drain accepted input and return
+    /// an error because terminal input cannot be half-closed reliably. No
+    /// terminal-control bytes are synthesized; use pipe stdin for EOF.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub close_stdin: bool,
 }

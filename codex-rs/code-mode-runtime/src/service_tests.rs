@@ -1611,3 +1611,37 @@ async fn wait_reports_missing_cell_separately_from_runtime_results() {
     assert_eq!(receipt["terminal_state"], "unknown");
     assert_eq!(receipt["automatic_replay_allowed"], false);
 }
+
+#[tokio::test]
+async fn existing_empty_snapshot_does_not_recover_a_volatile_receipt() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("empty.json");
+    std::fs::write(&path, serde_json::to_vec(&serde_json::json!({
+        "version": 7, "revision": 0, "completed_call_id": "", "values": {},
+        "completed_cells": {}, "completed_cell_order": [], "next_cell_id": 1,
+    })).unwrap()).unwrap();
+    let service = InProcessCodeModeSession::new();
+    let started = service.execute(execute_request("text('volatile');")).await.unwrap();
+    let id = started.cell_id.clone();
+    started.initial_response().await.unwrap();
+    // Wait for actor close/custody transfer without enabling persistence.
+    service.terminate(id.clone()).await.unwrap();
+    let outcome = service.wait(WaitRequest {
+        cell_id: id, yield_time_ms: 1,
+        recovery: Some(crate::ReceiptRecovery { path: path.clone(), terminal_only: true }),
+    }).await.unwrap();
+    assert!(matches!(outcome, WaitOutcome::MissingCell(_)));
+
+    // Later publication must not expand the immutable imported-identity set.
+    let mut request = execute_request("text('new durable receipt');");
+    request.state_path = Some(path.clone());
+    let started = service.execute(request).await.unwrap();
+    let current_id = started.cell_id.clone();
+    started.initial_response().await.unwrap();
+    service.terminate(current_id.clone()).await.unwrap();
+    assert!(matches!(service.wait(WaitRequest {
+        cell_id: current_id, yield_time_ms: 1,
+        recovery: Some(crate::ReceiptRecovery { path, terminal_only: true }),
+    }).await.unwrap(), WaitOutcome::MissingCell(_)));
+    service.shutdown().await.unwrap();
+}

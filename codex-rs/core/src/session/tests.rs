@@ -2,6 +2,47 @@ use super::turn_context::TurnEnvironment;
 use super::*;
 
 #[tokio::test]
+async fn cancelled_source_snapshot_observer_keeps_registration_custody() {
+    let (session, _) = make_session_and_context().await;
+    let session = Arc::new(session);
+    let canonical = Arc::new(codex_tools::CanonicalToolResult::text("cancelled source receipt"));
+    let gate = session.tool_history_reconciliation_gate.acquire().await.unwrap();
+    let owner_session = Arc::clone(&session);
+    let owner_canonical = Arc::clone(&canonical);
+    let observer = tokio::spawn(async move {
+        owner_session.create_source_snapshot_artifact("cancelled-source".into(), owner_canonical, None).await
+    });
+    let directory = session.codex_home().await.join("tool-output").join(session.thread_id.to_string());
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if let Ok(mut entries) = tokio::fs::read_dir(&directory).await {
+                while let Some(entry) = entries.next_entry().await.unwrap() {
+                    if entry.path().extension().is_some_and(|extension| extension == "active-tool-history") {
+                        return;
+                    }
+                }
+            }
+            tokio::task::yield_now().await;
+        }
+    }).await.expect("creation must finish without holding the reconciliation gate");
+    observer.abort();
+    assert!(observer.await.unwrap_err().is_cancelled());
+    drop(gate);
+    let id = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if let Some(id) = session.reusable_tool_artifact("cancelled-source", canonical.exact_bytes, &canonical.sha256).await {
+                return id;
+            }
+            tokio::task::yield_now().await;
+        }
+    }).await.expect("cancelled observer must not strand a protected source without provenance");
+    crate::tools::command_output_artifact::verify_tool_history_artifact(
+        session.codex_home().await.as_path(), &session.thread_id.to_string(), &id,
+        canonical.exact_bytes, &canonical.sha256,
+    ).await.unwrap();
+}
+
+#[tokio::test]
 async fn shutdown_loop_panic_is_shared_with_later_waiters() {
     let outcome =
         session_loop_termination_from_handle(tokio::spawn(async { panic!("shutdown sentinel") }));
@@ -153,8 +194,6 @@ use codex_config::ConfigLayerStack;
 use codex_config::ConfigLayerStackOrdering;
 use codex_config::LoaderOverrides;
 use codex_config::NetworkConstraints;
-use codex_config::NetworkDomainPermissionToml;
-use codex_config::NetworkDomainPermissionsToml;
 use codex_config::RequirementSource;
 use codex_config::Sourced;
 use codex_config::loader::project_trust_key;
@@ -393,7 +432,6 @@ use codex_config::permissions_toml::PermissionsToml;
 use codex_execpolicy::Decision;
 use codex_execpolicy::NetworkRuleProtocol;
 use codex_execpolicy::Policy;
-use codex_network_proxy::NetworkProxyConfig;
 use codex_otel::MetricsClient;
 use codex_otel::MetricsConfig;
 use codex_otel::THREAD_SKILLS_DESCRIPTION_TRUNCATED_CHARS_METRIC;
@@ -421,7 +459,6 @@ use codex_protocol::protocol::GranularApprovalConfig;
 use codex_protocol::protocol::InitialHistory;
 use codex_protocol::protocol::InterAgentCommunication;
 use codex_protocol::protocol::MultiAgentVersion;
-use codex_protocol::protocol::NetworkApprovalProtocol;
 use codex_protocol::protocol::RateLimitSnapshot;
 use codex_protocol::protocol::RateLimitWindow;
 use codex_protocol::protocol::RawResponseItemEvent;
@@ -2047,512 +2084,17 @@ fn assistant_message_stream_parsers_seed_plan_parser_across_added_and_delta_boun
     assert!(tail.plan_segments.is_empty());
 }
 
-#[test]
-fn validated_network_policy_amendment_host_allows_normalized_match() {
-    let amendment = NetworkPolicyAmendment {
-        host: "ExAmPlE.Com.:443".to_string(),
-        action: NetworkPolicyRuleAction::Allow,
-    };
-    let context = NetworkApprovalContext {
-        host: "example.com".to_string(),
-        protocol: NetworkApprovalProtocol::Https,
-    };
 
-    let host = Session::validated_network_policy_amendment_host(&amendment, &context)
-        .expect("normalized hosts should match");
 
-    assert_eq!(host, "example.com");
-}
 
-#[test]
-fn validated_network_policy_amendment_host_rejects_mismatch() {
-    let amendment = NetworkPolicyAmendment {
-        host: "evil.example.com".to_string(),
-        action: NetworkPolicyRuleAction::Deny,
-    };
-    let context = NetworkApprovalContext {
-        host: "api.example.com".to_string(),
-        protocol: NetworkApprovalProtocol::Https,
-    };
 
-    let err = Session::validated_network_policy_amendment_host(&amendment, &context)
-        .expect_err("mismatched hosts should be rejected");
 
-    let message = err.to_string();
-    assert!(message.contains("does not match approved host"));
-}
 
-#[tokio::test]
-async fn start_managed_network_proxy_applies_execpolicy_network_rules() -> anyhow::Result<()> {
-    let codex_home = tempfile::tempdir()?;
-    let permission_profile = PermissionProfile::workspace_write();
-    let spec = crate::config::NetworkProxySpec::from_config_and_constraints(
-        NetworkProxyConfig::default(),
-        /*requirements*/ None,
-        &permission_profile,
-    )?;
-    let mut exec_policy = Policy::empty();
-    exec_policy.add_network_rule(
-        "example.com",
-        NetworkRuleProtocol::Https,
-        Decision::Allow,
-        /*justification*/ None,
-    )?;
-    exec_policy.add_network_rule(
-        "denied.example.com",
-        NetworkRuleProtocol::Https,
-        Decision::Forbidden,
-        /*justification*/ None,
-    )?;
 
-    let (started_proxy, _) = Session::start_managed_network_proxy(
-        &spec,
-        codex_home.path(),
-        &exec_policy,
-        &permission_profile,
-        /*network_policy_decider*/ None,
-        /*blocked_request_observer*/ None,
-        /*managed_network_requirements_enabled*/ false,
-        crate::config::NetworkProxyAuditMetadata::default(),
-    )
-    .await?;
 
-    let current_cfg = started_proxy.proxy().current_cfg().await?;
-    assert_eq!(
-        current_cfg.allowed_domains(),
-        Some(vec!["example.com".to_string()])
-    );
-    assert_eq!(
-        current_cfg.denied_domains(),
-        Some(vec!["denied.example.com".to_string()])
-    );
-    Ok(())
-}
 
-#[tokio::test]
-async fn start_managed_network_proxy_rejects_invalid_execpolicy_network_rules() -> anyhow::Result<()>
-{
-    let codex_home = tempfile::tempdir()?;
-    let permission_profile = PermissionProfile::workspace_write();
-    let spec = crate::config::NetworkProxySpec::from_config_and_constraints(
-        NetworkProxyConfig::default(),
-        Some(NetworkConstraints {
-            domains: Some(NetworkDomainPermissionsToml {
-                entries: std::collections::BTreeMap::from([(
-                    "managed.example.com".to_string(),
-                    NetworkDomainPermissionToml::Allow,
-                )]),
-            }),
-            managed_allowed_domains_only: Some(true),
-            ..Default::default()
-        }),
-        &permission_profile,
-    )?;
-    let mut exec_policy = Policy::empty();
-    exec_policy.add_network_rule(
-        "example.com",
-        NetworkRuleProtocol::Https,
-        Decision::Allow,
-        /*justification*/ None,
-    )?;
 
-    // A conflicting allow must not cause the merge to discard this valid deny.
-    exec_policy.add_network_rule(
-        "managed.example.com",
-        NetworkRuleProtocol::Https,
-        Decision::Forbidden,
-        /*justification*/ None,
-    )?;
-    let error = Session::start_managed_network_proxy(
-        &spec,
-        codex_home.path(),
-        &exec_policy,
-        &permission_profile,
-        /*network_policy_decider*/ None,
-        /*blocked_request_observer*/ None,
-        /*managed_network_requirements_enabled*/ false,
-        crate::config::NetworkProxyAuditMetadata::default(),
-    )
-    .await
-    .err()
-    .expect("invalid merged policy must prevent proxy startup");
-    assert_eq!(
-        error.downcast_ref::<std::io::Error>().unwrap().kind(),
-        std::io::ErrorKind::InvalidInput
-    );
-    assert!(
-        error
-            .to_string()
-            .contains("failed to apply execpolicy network rules")
-    );
-    Ok(())
-}
 
-#[tokio::test]
-async fn managed_network_proxy_decider_survives_full_access_start() -> anyhow::Result<()> {
-    let codex_home = tempfile::tempdir()?;
-    let full_access_permission_profile = PermissionProfile::Disabled;
-    let spec = crate::config::NetworkProxySpec::from_config_and_constraints(
-        NetworkProxyConfig::default(),
-        Some(NetworkConstraints {
-            enabled: Some(true),
-            ..Default::default()
-        }),
-        &full_access_permission_profile,
-    )?;
-    let exec_policy = Policy::empty();
-    let decider_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let network_policy_decider: Arc<dyn codex_network_proxy::NetworkPolicyDecider> = Arc::new({
-        let decider_calls = Arc::clone(&decider_calls);
-        move |_request| {
-            decider_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            async { codex_network_proxy::NetworkDecision::ask("not_allowed") }
-        }
-    });
-
-    let (started_proxy, _) = Session::start_managed_network_proxy(
-        &spec,
-        codex_home.path(),
-        &exec_policy,
-        &full_access_permission_profile,
-        Some(network_policy_decider),
-        /*blocked_request_observer*/ None,
-        /*managed_network_requirements_enabled*/ true,
-        crate::config::NetworkProxyAuditMetadata::default(),
-    )
-    .await?;
-
-    let spec = spec.recompute_for_permission_profile(&PermissionProfile::workspace_write())?;
-    spec.apply_to_started_proxy(&started_proxy).await?;
-    let current_cfg = started_proxy.proxy().current_cfg().await?;
-    assert_eq!(current_cfg.allowed_domains(), None);
-
-    use tokio::io::AsyncReadExt as _;
-    use tokio::io::AsyncWriteExt as _;
-
-    let mut stream = tokio::net::TcpStream::connect(started_proxy.proxy().http_addr()).await?;
-    stream
-        .write_all(
-            b"GET http://example.com/ HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n",
-        )
-        .await?;
-    // TCP may split headers across reads. The request asks for connection close;
-    // retain the same byte and wall-clock bounds while collecting that response.
-    let mut buffer = Vec::new();
-    tokio::time::timeout(
-        StdDuration::from_secs(2),
-        stream.take(4096).read_to_end(&mut buffer),
-    )
-    .await
-    .expect("timed out waiting for proxy response")?;
-    let response = String::from_utf8_lossy(&buffer);
-
-    assert!(
-        response.starts_with("HTTP/1.1 403 Forbidden"),
-        "unexpected proxy response: {response}"
-    );
-    assert!(
-        response.contains("x-proxy-error: blocked-by-allowlist"),
-        "unexpected proxy response: {response}"
-    );
-    assert_eq!(
-        decider_calls.load(std::sync::atomic::Ordering::SeqCst),
-        1,
-        "unexpected proxy response: {response}"
-    );
-    Ok(())
-}
-
-#[tokio::test]
-async fn new_turn_refreshes_managed_network_proxy_for_sandbox_change() -> anyhow::Result<()> {
-    let (session, turn_context) = make_session_and_context().await;
-    let initial_permission_profile = PermissionProfile::workspace_write();
-
-    let mut network_config = NetworkProxyConfig::default();
-    network_config.set_allowed_domains(vec!["evil.com".to_string()]);
-    let requirements = NetworkConstraints {
-        domains: Some(NetworkDomainPermissionsToml {
-            entries: std::collections::BTreeMap::from([(
-                "*.example.com".to_string(),
-                NetworkDomainPermissionToml::Allow,
-            )]),
-        }),
-        ..Default::default()
-    };
-    let spec = crate::config::NetworkProxySpec::from_config_and_constraints(
-        network_config,
-        Some(requirements),
-        &initial_permission_profile,
-    )?;
-    let (started_proxy, _) = Session::start_managed_network_proxy(
-        &spec,
-        turn_context.config.codex_home.as_path(),
-        &Policy::empty(),
-        &initial_permission_profile,
-        /*network_policy_decider*/ None,
-        /*blocked_request_observer*/ None,
-        /*managed_network_requirements_enabled*/ false,
-        crate::config::NetworkProxyAuditMetadata::default(),
-    )
-    .await?;
-    assert_eq!(
-        started_proxy.proxy().current_cfg().await?.allowed_domains(),
-        Some(vec!["*.example.com".to_string(), "evil.com".to_string()])
-    );
-
-    {
-        let mut state = session.state.lock().await;
-        let mut config = (*state.session_configuration.original_config_do_not_use).clone();
-        config.permissions.network = Some(spec);
-        config
-            .permissions
-            .set_permission_profile(initial_permission_profile.clone())
-            .expect("test setup should allow permission profile");
-        state.session_configuration.original_config_do_not_use = Arc::new(config);
-        state
-            .session_configuration
-            .set_permission_profile_for_tests(initial_permission_profile)
-            .expect("test setup should allow permission profile");
-    }
-    session
-        .services
-        .network_proxy
-        .store(Some(Arc::new(started_proxy)));
-
-    session
-        .new_turn_with_sub_id(
-            "sandbox-policy-change".to_string(),
-            SessionSettingsUpdate {
-                sandbox_policy: Some(SandboxPolicy::DangerFullAccess),
-                ..Default::default()
-            },
-        )
-        .await?;
-
-    let started_proxy = session
-        .services
-        .network_proxy
-        .load_full()
-        .expect("managed network proxy should be present");
-    assert_eq!(
-        started_proxy.proxy().current_cfg().await?.allowed_domains(),
-        Some(vec!["*.example.com".to_string()])
-    );
-
-    Ok(())
-}
-
-#[tokio::test]
-async fn danger_full_access_turns_do_not_expose_managed_network_proxy() -> anyhow::Result<()> {
-    let network_spec = crate::config::NetworkProxySpec::from_config_and_constraints(
-        NetworkProxyConfig::default(),
-        Some(NetworkConstraints {
-            enabled: Some(true),
-            ..Default::default()
-        }),
-        &PermissionProfile::Disabled,
-    )?;
-
-    let session = make_session_with_config(move |config| {
-        config
-            .permissions
-            .set_permission_profile(PermissionProfile::Disabled)
-            .expect("test setup should allow permission profile");
-        config.permissions.network = Some(network_spec);
-    })
-    .await?;
-
-    let turn_context = session.new_default_turn().await;
-    assert!(turn_context.network.is_none());
-    Ok(())
-}
-
-#[tokio::test]
-async fn danger_full_access_tool_attempts_do_not_enforce_managed_network() -> anyhow::Result<()> {
-    #[derive(Default)]
-    struct ProbeToolRuntime {
-        enforce_managed_network: Vec<bool>,
-    }
-
-    impl crate::tools::sandboxing::Approvable<()> for ProbeToolRuntime {
-        type ApprovalKey = String;
-
-        fn approval_keys(&self, _req: &()) -> Vec<Self::ApprovalKey> {
-            vec!["probe".to_string()]
-        }
-
-        fn start_approval_async<'a>(
-            &'a mut self,
-            _req: &'a (),
-            _ctx: crate::tools::sandboxing::ApprovalCtx<'a>,
-        ) -> futures::future::BoxFuture<'a, ReviewDecision> {
-            Box::pin(async { ReviewDecision::Approved })
-        }
-    }
-
-    impl crate::tools::sandboxing::Sandboxable for ProbeToolRuntime {
-        fn sandbox_preference(&self) -> codex_sandboxing::SandboxablePreference {
-            codex_sandboxing::SandboxablePreference::Auto
-        }
-    }
-
-    impl crate::tools::sandboxing::ToolRuntime<(), ()> for ProbeToolRuntime {
-        async fn run(
-            &mut self,
-            _req: &(),
-            attempt: &crate::tools::sandboxing::SandboxAttempt<'_>,
-            _ctx: &crate::tools::sandboxing::ToolCtx,
-        ) -> Result<(), crate::tools::sandboxing::ToolError> {
-            self.enforce_managed_network
-                .push(attempt.enforce_managed_network);
-            Ok(())
-        }
-    }
-
-    let network_spec = crate::config::NetworkProxySpec::from_config_and_constraints(
-        NetworkProxyConfig::default(),
-        Some(NetworkConstraints {
-            enabled: Some(true),
-            ..Default::default()
-        }),
-        &PermissionProfile::Disabled,
-    )?;
-
-    let session = make_session_with_config(move |config| {
-        config
-            .permissions
-            .set_permission_profile(PermissionProfile::Disabled)
-            .expect("test setup should allow permission profile");
-        config.permissions.network = Some(network_spec);
-
-        let layers = config
-            .config_layer_stack
-            .get_layers(
-                ConfigLayerStackOrdering::LowestPrecedenceFirst,
-                /*include_disabled*/ true,
-            )
-            .into_iter()
-            .cloned()
-            .collect();
-        let mut requirements = config.config_layer_stack.requirements().clone();
-        requirements.network = Some(Sourced::new(
-            NetworkConstraints {
-                enabled: Some(true),
-                ..Default::default()
-            },
-            RequirementSource::LegacyManagedConfigTomlFromMdm,
-        ));
-        let mut requirements_toml = config.config_layer_stack.requirements_toml().clone();
-        requirements_toml.network = Some(codex_config::NetworkRequirementsToml {
-            enabled: Some(true),
-            ..Default::default()
-        });
-        config.config_layer_stack = ConfigLayerStack::new(layers, requirements, requirements_toml)
-            .expect("rebuild config layer stack with network requirements")
-            .into();
-    })
-    .await?;
-
-    let turn = session.new_default_turn().await;
-    assert!(turn.network.is_none());
-
-    let mut orchestrator = crate::tools::orchestrator::ToolOrchestrator::new();
-    let mut tool = ProbeToolRuntime::default();
-    let tool_ctx = crate::tools::sandboxing::ToolCtx {
-        session: Arc::clone(&session),
-        turn: Arc::clone(&turn),
-        call_id: "probe-call".to_string(),
-        tool_name: codex_tools::ToolName::plain("probe"),
-    };
-
-    orchestrator
-        .run(
-            &mut tool,
-            &(),
-            &tool_ctx,
-            turn.as_ref(),
-            AskForApproval::Never,
-        )
-        .await
-        .expect("probe runtime should succeed");
-
-    assert_eq!(tool.enforce_managed_network, vec![false]);
-
-    Ok(())
-}
-
-#[tokio::test]
-async fn workspace_write_turns_continue_to_expose_managed_network_proxy() -> anyhow::Result<()> {
-    let permission_profile = PermissionProfile::workspace_write();
-    let network_spec = crate::config::NetworkProxySpec::from_config_and_constraints(
-        NetworkProxyConfig::default(),
-        Some(NetworkConstraints {
-            enabled: Some(true),
-            ..Default::default()
-        }),
-        &permission_profile,
-    )?;
-
-    let session = make_session_with_config(move |config| {
-        config
-            .permissions
-            .set_permission_profile(permission_profile)
-            .expect("test setup should allow permission profile");
-        config.permissions.network = Some(network_spec);
-    })
-    .await?;
-
-    let turn_context = session.new_default_turn().await;
-    assert!(turn_context.network.is_some());
-    Ok(())
-}
-
-#[tokio::test]
-async fn user_shell_commands_do_not_inherit_managed_network_proxy() -> anyhow::Result<()> {
-    let permission_profile = PermissionProfile::workspace_write();
-    let network_spec = crate::config::NetworkProxySpec::from_config_and_constraints(
-        NetworkProxyConfig::default(),
-        Some(NetworkConstraints {
-            enabled: Some(true),
-            ..Default::default()
-        }),
-        &permission_profile,
-    )?;
-
-    let (session, rx) = make_session_with_config_and_rx(move |config| {
-        config
-            .permissions
-            .set_permission_profile(permission_profile)
-            .expect("test setup should allow permission profile");
-        config.permissions.network = Some(network_spec);
-    })
-    .await?;
-
-    let turn_context = session.new_default_turn().await;
-    assert!(turn_context.network.is_some());
-
-    let command = r#"$val = $env:HTTP_PROXY; if ([string]::IsNullOrEmpty($val)) { $val = 'not-set' } ; [System.Console]::Write($val)"#.to_string();
-
-    execute_user_shell_command(
-        Arc::clone(&session),
-        turn_context,
-        command,
-        CancellationToken::new(),
-        UserShellCommandMode::StandaloneTurn,
-    )
-    .await;
-
-    loop {
-        let event = rx.recv().await.expect("channel open");
-        if let EventMsg::ExecCommandEnd(event) = event.msg {
-            assert_eq!(event.exit_code, Some(0));
-            assert_eq!(event.stdout.trim(), "not-set");
-            break;
-        }
-    }
-
-    Ok(())
-}
 
 #[tokio::test]
 async fn get_base_instructions_no_user_content() {
@@ -2966,6 +2508,57 @@ fn refresh_runtime_config_cancelled_during_hook_preparation_keeps_accepted_state
         );
         assert!(!Arc::ptr_eq(&session.hooks(), &original_hooks));
     });
+}
+
+#[tokio::test]
+async fn batch_runtime_refresh_does_not_invalidate_shared_plugin_discovery_again() {
+    let (session, _turn_context) = make_session_and_context().await;
+    let mut config = (*session.get_config().await).clone();
+    config.features.enable(Feature::Plugins).unwrap();
+    let input = config.plugins_config_input();
+    session.services.plugins_manager.clear_cache();
+    session.services.skills_service.clear_cache();
+    session
+        .services
+        .plugins_manager
+        .plugins_for_config(&input)
+        .await;
+    assert!(
+        session
+            .services
+            .plugins_manager
+            .plugin_skill_snapshots_for_config(&input)
+            .is_some()
+    );
+    config.features.disable(Feature::Plugins).unwrap();
+    for _ in 0..3 {
+        session
+            .refresh_runtime_config_features_after_discovery_invalidation(
+                config.clone(),
+                &[Feature::Plugins],
+            )
+            .await;
+        assert!(
+            session
+                .services
+                .plugins_manager
+                .plugin_skill_snapshots_for_config(&input)
+                .is_some(),
+            "batch refresh must retain discovery completed after the shared invalidation"
+        );
+    }
+    // Standalone refreshes still invalidate, including filesystem changes not
+    // preceded by ConfigRequestProcessor's accepted mutation boundary.
+    session
+        .refresh_runtime_config_features(config, &[Feature::Plugins])
+        .await;
+    assert!(
+        session
+            .services
+            .plugins_manager
+            .plugin_skill_snapshots_for_config(&input)
+            .is_none()
+    );
 }
 
 #[tokio::test]
@@ -3819,7 +3412,7 @@ fn resolve_multi_agent_version_defaults_metadata_less_history_to_v2() {
             }),
             Some(MultiAgentVersion::V1),
         ),
-        Some(MultiAgentVersion::V1)
+        Some(MultiAgentVersion::V2)
     );
     assert_eq!(
         resolve_multi_agent_version(
@@ -3833,7 +3426,7 @@ fn resolve_multi_agent_version_defaults_metadata_less_history_to_v2() {
             }),
             Some(MultiAgentVersion::V2),
         ),
-        Some(MultiAgentVersion::V1)
+        Some(MultiAgentVersion::V2)
     );
     assert_eq!(
         resolve_multi_agent_version(
@@ -5138,6 +4731,10 @@ async fn record_initial_history_forked_hydrates_previous_turn_settings() {
         multi_agent_version: None,
         multi_agent_mode: None,
         effort: turn_context.reasoning_effort.clone(),
+        validation_mode: None,
+        validation_full_budget: None,
+        validation_root_turn: None,
+        validation_attempts: Vec::new(),
         context_provenance: None,
     });
     let turn_id = previous_context_item
@@ -6095,6 +5692,10 @@ async fn set_rate_limits_retains_previous_credits() {
         provider: config.model_provider.clone(),
         collaboration_mode,
         model_reasoning_summary: config.model_reasoning_summary,
+        validation_mode: config.validation_mode,
+        validation_full_budget: config.validation_full_budget,
+        validation_root_turn: None,
+        validation_attempts: Vec::new(),
         developer_instructions: config.developer_instructions.clone(),
         service_tier: None,
         personality: config.personality,
@@ -6204,6 +5805,10 @@ async fn set_rate_limits_updates_plan_type_when_present() {
         provider: config.model_provider.clone(),
         collaboration_mode,
         model_reasoning_summary: config.model_reasoning_summary,
+        validation_mode: config.validation_mode,
+        validation_full_budget: config.validation_full_budget,
+        validation_root_turn: None,
+        validation_attempts: Vec::new(),
         developer_instructions: config.developer_instructions.clone(),
         service_tier: None,
         personality: config.personality,
@@ -6364,7 +5969,15 @@ async fn request_effort_uses_model_default_and_preserves_explicit_choice() {
 #[tokio::test]
 async fn turn_context_with_model_updates_model_fields() {
     let (_session, mut turn_context) = make_session_and_context().await;
-    turn_context.full_suite_budget.admit(true).unwrap();
+    let suite = turn_context
+        .full_suite_budget
+        .reserve(true, "previous-call".into())
+        .unwrap();
+    turn_context
+        .full_suite_budget
+        .start("previous-call", None)
+        .unwrap();
+    drop(suite);
     let models_manager: codex_models_manager::manager::SharedModelsManager =
         Arc::new(codex_models_manager::manager::StaticModelsManager::new(
             None,
@@ -6387,9 +6000,13 @@ async fn turn_context_with_model_updates_model_fields() {
 
     assert_eq!(updated.config.model.as_deref(), Some("gpt-5.4"));
     assert!(
-        updated.full_suite_budget.admit(true).is_err(),
-        "switching models must not reset full-suite admission"
+        updated
+            .full_suite_budget
+            .reserve(true, "previous-call".into())
+            .is_err(),
+        "switching models must not allow a duplicate launch from the same call"
     );
+    assert!(updated.full_suite_budget.reserve(true, "new-call".into()).is_ok());
     assert_eq!(updated.collaboration_mode.model(), "gpt-5.4");
     assert_eq!(updated.model_info, expected_model_info);
     assert!(Arc::ptr_eq(
@@ -6784,6 +6401,10 @@ pub(crate) async fn make_session_configuration_for_tests() -> SessionConfigurati
         provider: config.model_provider.clone(),
         collaboration_mode,
         model_reasoning_summary: config.model_reasoning_summary,
+        validation_mode: config.validation_mode,
+        validation_full_budget: config.validation_full_budget,
+        validation_root_turn: None,
+        validation_attempts: Vec::new(),
         developer_instructions: config.developer_instructions.clone(),
         service_tier: None,
         personality: config.personality,
@@ -7161,113 +6782,6 @@ async fn session_configuration_apply_retargets_implicit_workspace_root_on_cwd_up
     assert!(!updated_policy.can_write_path_with_cwd(old_root.as_path(), updated.cwd().as_path()));
 }
 
-#[tokio::test]
-async fn active_profile_update_rebuilds_network_proxy_config() -> std::io::Result<()> {
-    let codex_home = tempfile::tempdir().expect("create codex home");
-    let cwd = tempfile::tempdir().expect("create cwd");
-    let permissions = PermissionsToml {
-        entries: std::collections::BTreeMap::from([
-            (
-                "locked-down".to_string(),
-                PermissionProfileToml {
-                    description: None,
-                    extends: None,
-                    workspace_roots: None,
-                    filesystem: Some(FilesystemPermissionsToml {
-                        glob_scan_max_depth: None,
-                        entries: std::collections::BTreeMap::from([(
-                            ":minimal".to_string(),
-                            FilesystemPermissionToml::Access(FileSystemAccessMode::Read),
-                        )]),
-                    }),
-                    network: None,
-                },
-            ),
-            (
-                "web-enabled".to_string(),
-                PermissionProfileToml {
-                    description: None,
-                    extends: None,
-                    workspace_roots: None,
-                    filesystem: Some(FilesystemPermissionsToml {
-                        glob_scan_max_depth: None,
-                        entries: std::collections::BTreeMap::from([(
-                            ":minimal".to_string(),
-                            FilesystemPermissionToml::Access(FileSystemAccessMode::Read),
-                        )]),
-                    }),
-                    network: Some(NetworkToml {
-                        enabled: Some(true),
-                        proxy_url: Some("http://127.0.0.1:43128".to_string()),
-                        enable_socks5: Some(false),
-                        ..Default::default()
-                    }),
-                },
-            ),
-        ]),
-    };
-    let base_config = ConfigToml {
-        features: Some(toml::from_str("network_proxy = true").expect("valid features")),
-        default_permissions: Some("locked-down".to_string()),
-        permissions: Some(permissions),
-        ..Default::default()
-    };
-    std::fs::write(
-        codex_home.path().join(codex_config::CONFIG_TOML_FILE),
-        toml::to_string(&base_config).expect("serialize config"),
-    )?;
-    let locked_config = Arc::new(
-        ConfigBuilder::default()
-            .codex_home(codex_home.path().to_path_buf())
-            .harness_overrides(ConfigOverrides {
-                cwd: Some(cwd.path().to_path_buf()),
-                ..Default::default()
-            })
-            .build()
-            .await?,
-    );
-    assert_ne!(
-        locked_config
-            .permissions
-            .network
-            .as_ref()
-            .map(crate::config::NetworkProxySpec::proxy_host_and_port)
-            .as_deref(),
-        Some("127.0.0.1:43128")
-    );
-    let selected_config = ConfigBuilder::default()
-        .codex_home(codex_home.path().to_path_buf())
-        .harness_overrides(ConfigOverrides {
-            cwd: Some(cwd.path().to_path_buf()),
-            default_permissions: Some("web-enabled".to_string()),
-            ..Default::default()
-        })
-        .build()
-        .await?;
-
-    let mut session_configuration = make_session_configuration_for_tests().await;
-    session_configuration.permission_profile_state =
-        locked_config.permissions.permission_profile_state().clone();
-    session_configuration.original_config_do_not_use = Arc::clone(&locked_config);
-
-    let updated = session_configuration
-        .apply(&SessionSettingsUpdate {
-            permission_profile: Some(selected_config.permissions.permission_profile().clone()),
-            active_permission_profile: selected_config.permissions.active_permission_profile(),
-            ..Default::default()
-        })
-        .expect("active profile update should apply");
-
-    let network = updated
-        .original_config_do_not_use
-        .permissions
-        .network
-        .as_ref()
-        .expect("selected profile proxy should become the session proxy config");
-    assert_eq!(network.proxy_host_and_port(), "127.0.0.1:43128");
-    assert!(!network.socks_enabled());
-    Ok(())
-}
 
 #[tokio::test]
 async fn new_default_turn_uses_config_aware_skills_for_role_overrides() {
@@ -7525,247 +7039,16 @@ async fn session_update_settings_does_not_rewrite_sticky_environment_cwds() {
     assert_eq!(next_turn.config.cwd, turn_cwd);
 }
 
-#[tokio::test]
-async fn proxy_settings_commit_preserves_concurrent_updates() -> anyhow::Result<()> {
-    for turn_settings in [false, true] {
-        assert_proxy_settings_atomicity(turn_settings, ProxySettingsOutcome::Commit).await?;
-    }
-    Ok(())
-}
 
-#[tokio::test]
-async fn proxy_settings_failure_preserves_concurrent_updates() -> anyhow::Result<()> {
-    for turn_settings in [false, true] {
-        assert_proxy_settings_atomicity(turn_settings, ProxySettingsOutcome::Failure).await?;
-    }
-    Ok(())
-}
 
-#[tokio::test]
-async fn proxy_settings_cancellation_preserves_concurrent_updates() -> anyhow::Result<()> {
-    for turn_settings in [false, true] {
-        assert_proxy_settings_atomicity(turn_settings, ProxySettingsOutcome::Cancel).await?;
-    }
-    Ok(())
-}
 
-#[derive(Clone, Copy)]
-enum ProxySettingsOutcome {
-    Commit,
-    Failure,
-    Cancel,
-}
 
-async fn assert_proxy_settings_atomicity(
-    turn_settings: bool,
-    outcome: ProxySettingsOutcome,
-) -> anyhow::Result<()> {
-    let initial_profile = PermissionProfile::workspace_write();
-    let spec = crate::config::NetworkProxySpec::from_config_and_constraints(
-        NetworkProxyConfig::default(),
-        None,
-        &initial_profile,
-    )?;
-    let (session, rx_event) = make_session_with_config_and_rx(|config| {
-        config
-            .permissions
-            .set_permission_profile(initial_profile.clone())
-            .expect("test permission profile");
-        config.permissions.network = Some(spec);
-    })
-    .await?;
-    let original_proxy = session.services.network_proxy.load_full().expect("proxy");
-    // Session initialization resolves project-root permissions to this cwd.
-    let initial_profile = session
-        .state
-        .lock()
-        .await
-        .session_configuration
-        .permission_profile();
-    let original_cwd = session
-        .state
-        .lock()
-        .await
-        .session_configuration
-        .cwd()
-        .clone();
-    let new_workspace = tempfile::tempdir()?;
-    let new_cwd = new_workspace.path().abs();
-    let original_tier = session
-        .state
-        .lock()
-        .await
-        .session_configuration
-        .service_tier
-        .clone();
-    let original_generation = session.services.planning_generation();
-    if matches!(outcome, ProxySettingsOutcome::Failure) {
-        // Exercise the real proxy builder's error path, after the scheduling
-        // gate, without relying on port allocation or background listener races.
-        let invalid_spec = crate::config::NetworkProxySpec::from_config_and_constraints(
-            NetworkProxyConfig {
-                // Loose nonempty addresses intentionally fall back to loopback.
-                // A missing host is rejected by the production runtime parser.
-                proxy_url: String::new(),
-                ..Default::default()
-            },
-            None,
-            &initial_profile,
-        )?;
-        let mut state = session.state.lock().await;
-        Arc::make_mut(&mut state.session_configuration.original_config_do_not_use)
-            .permissions
-            .network = Some(invalid_spec);
-    }
-    let start_guard = session.managed_network_proxy_start_gate.acquire().await?;
-    let updates = SessionSettingsUpdate {
-        sandbox_policy: Some(SandboxPolicy::DangerFullAccess),
-        service_tier: Some(Some("priority".to_string())),
-        environments: Some(TurnEnvironmentSelections::new(
-            new_cwd.clone(),
-            vec![local(new_cwd.clone())],
-        )),
-        ..Default::default()
-    };
-    let update_session = Arc::clone(&session);
-    let update = tokio::spawn(async move {
-        if turn_settings {
-            update_session
-                .apply_turn_settings("proxy-settings", &updates)
-                .await
-                .map(|_| ())
-                .map_err(|err| err.to_string())
-        } else {
-            update_session
-                .update_settings(updates.clone())
-                .await
-                .map_err(|err| err.to_string())
-        }
-    });
-    // The update may first await filesystem projection. Keep driving it until
-    // the real proxy-start boundary reports that the state lock was released.
-    tokio::time::timeout(
-        Duration::from_secs(5),
-        session.managed_network_proxy_start_entered.notified(),
-    )
-    .await
-    .expect("settings update reaches the held proxy-start gate");
-    assert!(
-        !update.is_finished(),
-        "proxy startup remains blocked at its gate"
-    );
-    assert_eq!(
-        session
-            .managed_network_proxy_refresh_lock
-            .available_permits(),
-        0
-    );
-
-    session
-        .update_settings(SessionSettingsUpdate {
-            personality: Some(Personality::Pragmatic),
-            ..Default::default()
-        })
-        .await?;
-    let visible = session
-        .apply_turn_settings("during-refresh", &SessionSettingsUpdate::default())
-        .await?;
-    assert_eq!(visible.permission_profile(), initial_profile);
-    assert_eq!(visible.cwd(), &original_cwd);
-    assert_eq!(visible.service_tier, original_tier);
-    assert_eq!(visible.personality, Some(Personality::Pragmatic));
-    assert!(Arc::ptr_eq(
-        &session.services.network_proxy.load_full().expect("proxy"),
-        &original_proxy,
-    ));
-
-    if matches!(outcome, ProxySettingsOutcome::Cancel) {
-        update.abort();
-        assert!(
-            update
-                .await
-                .expect_err("cancel the pending proxy update")
-                .is_cancelled(),
-            "the actual update task must be cancelled before releasing startup"
-        );
-        drop(start_guard);
-    } else {
-        drop(start_guard);
-        let result = update.await.expect("proxy update task must not panic");
-        if matches!(outcome, ProxySettingsOutcome::Failure) {
-            let error = result.expect_err("invalid proxy address must reject settings");
-            assert!(
-                error.contains("failed to start managed network proxy"),
-                "{error}"
-            );
-            if turn_settings {
-                let event = rx_event.recv().await?;
-                assert_eq!(event.id, "proxy-settings");
-                assert!(matches!(
-                    event.msg,
-                    EventMsg::Error(ErrorEvent {
-                        codex_error_info: Some(CodexErrorInfo::BadRequest),
-                        ..
-                    })
-                ));
-            }
-        } else {
-            result.expect("valid proxy settings should commit");
-        }
-    }
-    assert!(
-        rx_event.try_recv().is_err(),
-        "no extra or success events on failure"
-    );
-    if matches!(outcome, ProxySettingsOutcome::Commit) {
-        assert!(session.services.planning_generation() > original_generation);
-    } else {
-        assert_eq!(session.services.planning_generation(), original_generation);
-    }
-    let committed_tier = session
-        .state
-        .lock()
-        .await
-        .session_configuration
-        .service_tier
-        .clone();
-    let next_turn = session.new_default_turn().await;
-    assert_eq!(next_turn.personality, Some(Personality::Pragmatic));
-    if matches!(outcome, ProxySettingsOutcome::Commit) {
-        assert_eq!(next_turn.cwd(), &new_cwd);
-        assert_eq!(next_turn.permission_profile(), PermissionProfile::Disabled);
-        assert_eq!(committed_tier.as_deref(), Some("priority"));
-        assert!(next_turn.network.is_none());
-        assert!(!Arc::ptr_eq(
-            &session
-                .services
-                .network_proxy
-                .load_full()
-                .expect("replacement proxy"),
-            &original_proxy,
-        ));
-    } else {
-        assert_eq!(next_turn.cwd(), &original_cwd);
-        assert_eq!(next_turn.permission_profile(), initial_profile);
-        assert_eq!(committed_tier, original_tier);
-        assert!(next_turn.network.is_some());
-        assert!(Arc::ptr_eq(
-            &session
-                .services
-                .network_proxy
-                .load_full()
-                .expect("preserved proxy"),
-            &original_proxy,
-        ));
-    }
-    Ok(())
-}
 
 #[tokio::test]
 async fn nonempty_turn_settings_wait_for_proxy_refresh() {
     let (session, _turn_context) = make_session_and_context().await;
     let refresh_guard = session
-        .managed_network_proxy_refresh_lock
+        .configuration_update_lock
         .acquire()
         .await
         .expect("proxy refresh semaphore remains open");
@@ -7790,7 +7073,7 @@ async fn nonempty_turn_settings_wait_for_proxy_refresh() {
 async fn unrelated_settings_update_does_not_wait_for_proxy_refresh_lock() {
     let (session, _turn_context) = make_session_and_context().await;
     let refresh_guard = session
-        .managed_network_proxy_refresh_lock
+        .configuration_update_lock
         .acquire()
         .await
         .expect("proxy refresh semaphore remains open");
@@ -7814,71 +7097,12 @@ async fn unrelated_settings_update_does_not_wait_for_proxy_refresh_lock() {
     drop(refresh_guard);
 }
 
-#[tokio::test]
-async fn workspace_roots_update_serializes_with_proxy_refresh() -> anyhow::Result<()> {
-    let initial_profile = PermissionProfile::workspace_write();
-    let spec = crate::config::NetworkProxySpec::from_config_and_constraints(
-        NetworkProxyConfig::default(),
-        None,
-        &initial_profile,
-    )?;
-    let (session, _rx_event) = make_session_with_config_and_rx(|config| {
-        config
-            .permissions
-            .set_permission_profile(initial_profile)
-            .expect("test permission profile");
-        config.permissions.network = Some(spec);
-    })
-    .await?;
-    let original_proxy = session.services.network_proxy.load_full().expect("proxy");
-    let original_profile = session
-        .state
-        .lock()
-        .await
-        .session_configuration
-        .permission_profile();
-    let new_workspace = tempfile::tempdir()?;
-    let new_root = new_workspace.path().abs();
-    let refresh_guard = session.managed_network_proxy_refresh_lock.acquire().await?;
-
-    // Project-root materialization makes this update change the effective
-    // permission profile, so it must serialize with other proxy refreshes.
-    let mut update = Box::pin(session.update_settings(SessionSettingsUpdate {
-        workspace_roots: Some(vec![new_root.clone()]),
-        ..Default::default()
-    }));
-    assert!(
-        tokio::time::timeout(Duration::from_millis(200), update.as_mut())
-            .await
-            .is_err(),
-        "a workspace-roots update must wait for proxy refresh serialization"
-    );
-    assert!(Arc::ptr_eq(
-        &session.services.network_proxy.load_full().expect("proxy"),
-        &original_proxy,
-    ));
-    drop(refresh_guard);
-    update.await?;
-
-    let committed = session.state.lock().await.session_configuration.clone();
-    assert_eq!(committed.workspace_roots, vec![new_root]);
-    assert_ne!(committed.permission_profile(), original_profile);
-    assert!(!Arc::ptr_eq(
-        &session
-            .services
-            .network_proxy
-            .load_full()
-            .expect("replacement proxy"),
-        &original_proxy,
-    ));
-    Ok(())
-}
 
 #[tokio::test]
 async fn default_turn_settings_skip_proxy_refresh_and_full_apply() {
     let (session, _turn_context) = make_session_and_context().await;
     let refresh_guard = session
-        .managed_network_proxy_refresh_lock
+        .configuration_update_lock
         .acquire()
         .await
         .expect("proxy refresh semaphore remains open");
@@ -10350,6 +9574,10 @@ async fn make_session_with_history_source_and_agent_control_and_rx(
         provider: config.model_provider.clone(),
         collaboration_mode,
         model_reasoning_summary: config.model_reasoning_summary,
+        validation_mode: config.validation_mode,
+        validation_full_budget: config.validation_full_budget,
+        validation_root_turn: None,
+        validation_attempts: Vec::new(),
         developer_instructions: config.developer_instructions.clone(),
         service_tier: None,
         personality: config.personality,
@@ -10423,7 +9651,6 @@ async fn make_session_with_history_source_and_agent_control_and_rx(
             codex_thread_store::LocalThreadStoreConfig::from_config(config.as_ref()),
             Some(state_db),
         )),
-        codex_rollout_trace::ThreadTraceContext::disabled(),
         /*attestation_provider*/ None,
         /*external_time_provider*/ None,
         Some(config.multi_agent_version_from_features()),
@@ -10504,6 +9731,10 @@ where
         provider: config.model_provider.clone(),
         collaboration_mode,
         model_reasoning_summary: config.model_reasoning_summary,
+        validation_mode: config.validation_mode,
+        validation_full_budget: config.validation_full_budget,
+        validation_root_turn: None,
+        validation_attempts: Vec::new(),
         developer_instructions: config.developer_instructions.clone(),
         service_tier: None,
         personality: config.personality,
@@ -10567,26 +9798,6 @@ where
         config.codex_home.clone(),
         /*bundled_skills_enabled*/ true,
     ));
-    let network_approval = Arc::new(NetworkApprovalService::default());
-    let started_network_proxy = if let Some(spec) = config.permissions.network.as_ref() {
-        Some(
-            Session::start_managed_network_proxy(
-                spec,
-                config.codex_home.as_path(),
-                exec_policy.current().as_ref(),
-                config.permissions.permission_profile(),
-                /*network_policy_decider*/ None,
-                /*blocked_request_observer*/ None,
-                /*managed_network_requirements_enabled*/ false,
-                crate::config::NetworkProxyAuditMetadata::default(),
-            )
-            .await
-            .expect("configured test network proxy should start")
-            .0,
-        )
-    } else {
-        None
-    };
     // Bind the fixture runtime to this session's environments exactly as a
     // published refresh does (`refresh_mcp_servers_inner`): step reuse compares
     // environment identity and the local cwd, never a separate test manager.
@@ -10613,8 +9824,7 @@ where
         ),
         command_execution: crate::tools::command_execution::CommandExecutionLedger::default(),
         retained_patches: Default::default(),
-        path_replays: Default::default(),
-        validation_uncertainty: Default::default(),
+
         plan_store: crate::plan_store::PlanStore::default(),
         elicitations: crate::elicitation::ElicitationService::new(),
         analytics_events_client: AnalyticsEventsClient::new(
@@ -10627,7 +9837,6 @@ where
             legacy_notify_argv: config.notify.clone(),
             ..HooksConfig::default()
         })),
-        rollout_thread_trace: codex_rollout_trace::ThreadTraceContext::disabled(),
         user_shell: default_user_shell().into(),
         show_raw_agent_reasoning: config.show_raw_agent_reasoning,
         exec_policy,
@@ -10649,11 +9858,6 @@ where
         mcp_thread_init: codex_extension_api::ExtensionDataInit::default(),
         supports_openai_form_elicitation: std::sync::atomic::AtomicBool::new(false),
         agent_control,
-        network_proxy: arc_swap::ArcSwapOption::from(started_network_proxy.map(Arc::new)),
-        network_proxy_audit_metadata: crate::config::NetworkProxyAuditMetadata::default(),
-        managed_network_requirements_configured: false,
-        network_approval: Arc::clone(&network_approval),
-        network_policy_decider: None,
         state_db: state_db.clone(),
         live_thread: None,
         thread_store: Arc::new(codex_thread_store::LocalThreadStore::new(
@@ -10728,7 +9932,6 @@ where
         per_turn_config,
         model_info,
         available_models,
-        /*network*/ None,
         resolved_turn_environments,
         git_metadata_source,
         "turn_id".to_string(),
@@ -10756,9 +9959,7 @@ where
         tool_history_reconciliation_gate: Semaphore::new(/*permits*/ 1),
         tool_history_io_gate,
         tool_history_persistence,
-        managed_network_proxy_refresh_lock: Semaphore::new(/*permits*/ 1),
-        managed_network_proxy_start_gate: Semaphore::new(/*permits*/ 1),
-        managed_network_proxy_start_entered: tokio::sync::Notify::new(),
+        configuration_update_lock: Semaphore::new(/*permits*/ 1),
         features: config.features.clone(),
         multi_agent_version: OnceLock::from(config.multi_agent_version_from_features()),
         pending_mcp_server_refresh_config: Mutex::new(None),
@@ -12278,174 +11479,7 @@ async fn spawn_task_does_not_update_previous_turn_settings_for_non_run_turn_task
     assert_eq!(sess.previous_turn_settings().await, None);
 }
 
-#[tokio::test]
-async fn network_context_labels_proxy_configuration_separately_from_network_access()
--> anyhow::Result<()> {
-    for (permission_profile, proxy_enabled, expected_access) in [
-        (PermissionProfile::Disabled, false, "enabled"),
-        (PermissionProfile::Disabled, true, "enabled"),
-        (PermissionProfile::read_only(), true, "restricted"),
-    ] {
-        let profile_is_disabled = matches!(permission_profile, PermissionProfile::Disabled);
-        let domains = NetworkDomainPermissionsToml {
-            entries: std::collections::BTreeMap::from([
-                (
-                    "api.example.com".to_string(),
-                    NetworkDomainPermissionToml::Allow,
-                ),
-                (
-                    "blocked.example.com".to_string(),
-                    NetworkDomainPermissionToml::Deny,
-                ),
-            ]),
-        };
-        let constraints = NetworkConstraints {
-            enabled: Some(proxy_enabled),
-            domains: Some(domains.clone()),
-            ..Default::default()
-        };
-        let network_spec = crate::config::NetworkProxySpec::from_config_and_constraints(
-            NetworkProxyConfig {
-                proxy_url: "http://127.0.0.1:0".to_string(),
-                socks_url: "http://127.0.0.1:0".to_string(),
-                ..Default::default()
-            },
-            Some(constraints.clone()),
-            &permission_profile,
-        )?;
-        let session = make_session_with_config(move |config| {
-            config
-                .permissions
-                .set_permission_profile(permission_profile)
-                .expect("test profile should be allowed");
-            let mut requirements = config.config_layer_stack.requirements().clone();
-            requirements.network = Some(Sourced::new(
-                constraints,
-                RequirementSource::LegacyManagedConfigTomlFromMdm,
-            ));
-            let mut requirements_toml = config.config_layer_stack.requirements_toml().clone();
-            requirements_toml.network = Some(codex_config::NetworkRequirementsToml {
-                enabled: Some(proxy_enabled),
-                domains: Some(domains),
-                ..Default::default()
-            });
-            let layers = config
-                .config_layer_stack
-                .get_layers(
-                    ConfigLayerStackOrdering::LowestPrecedenceFirst,
-                    /*include_disabled*/ true,
-                )
-                .into_iter()
-                .cloned()
-                .collect();
-            config.config_layer_stack =
-                ConfigLayerStack::new(layers, requirements, requirements_toml)
-                    .expect("network requirements should be accepted")
-                    .into();
-            config.permissions.network = Some(network_spec);
-        })
-        .await?;
-        let turn_context = session.new_default_turn().await;
-        if profile_is_disabled {
-            assert!(
-                turn_context.network.is_none(),
-                "configured proxy enablement must not imply an active proxy in full access"
-            );
-        }
-        let items = build_initial_context(&session, &turn_context).await;
-        let permissions = developer_input_texts(&items).join("\n");
-        assert!(
-            permissions.contains(&format!("Network access is {expected_access}.")),
-            "{permissions}"
-        );
-        let environment = user_input_texts(&items)
-            .into_iter()
-            .find(|text| text.contains("<environment_context>"))
-            .expect("environment context should be delivered to the model");
-        let expected = format!(
-            "<managed_network_proxy configured_enabled=\"{proxy_enabled}\"><required_allowed>api.example.com</required_allowed><required_denied>blocked.example.com</required_denied></managed_network_proxy>"
-        );
-        assert!(environment.contains(&expected), "{environment}");
-        assert!(
-            !environment.contains("<network enabled="),
-            "proxy configuration must not masquerade as network access: {environment}"
-        );
-    }
-    Ok(())
-}
 
-#[tokio::test]
-async fn record_context_updates_emits_environment_item_for_network_changes() {
-    let (session, previous_context) = make_session_and_context().await;
-    let previous_context = Arc::new(previous_context);
-    let mut current_context = previous_context
-        .with_model(
-            previous_context.model_info.slug.clone(),
-            &session.services.models_manager,
-        )
-        .await;
-
-    let mut config = (*current_context.config).clone();
-    let mut requirements = config.config_layer_stack.requirements().clone();
-    requirements.network = Some(Sourced::new(
-        NetworkConstraints {
-            domains: Some(NetworkDomainPermissionsToml {
-                entries: std::collections::BTreeMap::from([
-                    (
-                        "api.example.com".to_string(),
-                        NetworkDomainPermissionToml::Allow,
-                    ),
-                    (
-                        "blocked.example.com".to_string(),
-                        NetworkDomainPermissionToml::Deny,
-                    ),
-                ]),
-            }),
-            ..Default::default()
-        },
-        RequirementSource::LegacyManagedConfigTomlFromMdm,
-    ));
-    let layers = config
-        .config_layer_stack
-        .get_layers(
-            ConfigLayerStackOrdering::LowestPrecedenceFirst,
-            /*include_disabled*/ true,
-        )
-        .into_iter()
-        .cloned()
-        .collect();
-    config.config_layer_stack = ConfigLayerStack::new(
-        layers,
-        requirements,
-        config.config_layer_stack.requirements_toml().clone(),
-    )
-    .expect("rebuild config layer stack with network requirements")
-    .into();
-    let active_permission_profile = config
-        .permissions
-        .active_permission_profile()
-        .unwrap_or_else(ActivePermissionProfile::read_only);
-    let permission_profile = config.permissions.permission_profile().clone();
-    config.permissions.network = config
-        .network_proxy_spec_for_active_permission_profile(
-            &active_permission_profile,
-            &permission_profile,
-        )
-        .expect("build network proxy spec from updated requirements");
-    current_context.config = Arc::new(config);
-
-    let session = Arc::new(session);
-    let update_items =
-        record_context_update_items(&session, previous_context, current_context).await;
-
-    let environment_update = user_input_texts(&update_items)
-        .into_iter()
-        .find(|text| text.contains("<environment_context>"))
-        .expect("environment update item should be emitted");
-    assert!(environment_update.contains(
-        "<managed_network_proxy configured_enabled=\"false\"><required_allowed>api.example.com</required_allowed><required_denied>blocked.example.com</required_denied></managed_network_proxy>"
-    ), "{environment_update}");
-}
 
 #[tokio::test]
 async fn record_context_updates_emits_environment_item_for_cwd_changes() {
@@ -17547,51 +16581,7 @@ async fn tool_manifest_persistence_failure_stops_ordered_request_prefix() {
     );
 }
 
-#[tokio::test]
-async fn tool_manifest_and_first_sampling_boundary_share_one_ordered_append() {
-    let (mut sess, tc, _rx) = make_session_and_context_with_rx().await;
-    let store = attach_in_memory_thread_store(
-        Arc::get_mut(&mut sess).expect("session should be uniquely owned"),
-    )
-    .await;
-    let before = store.calls().await;
 
-    super::turn::persist_sampling_prefix_before_dispatch(
-        sess.as_ref(),
-        Some(codex_protocol::protocol::ToolManifestItem::full(
-            "manifest-before-dispatch".to_string(),
-            serde_json::json!([]),
-        )),
-        codex_protocol::protocol::SamplingBoundaryItem {
-            sampling_request_id: "request-1".to_string(),
-            physical_attempt_id: "attempt-1".to_string(),
-            turn_id: Some(tc.sub_id.clone()),
-            unresolved_context: true,
-            timing_checkpoint: None,
-            workspace_freshness_notices: vec!["<workspace_evidence_invalidation>\nexact notice\n</workspace_evidence_invalidation>".into()],
-        },
-    )
-    .await
-    .expect("persist sampling prefix");
-
-    let after = store.calls().await;
-    assert_eq!(after.append_items_ordered, before.append_items_ordered + 1);
-    let history = codex_thread_store::ThreadStore::load_history(
-        store.as_ref(),
-        codex_thread_store::LoadThreadHistoryParams {
-            thread_id: sess.thread_id,
-            include_archived: false,
-        },
-    )
-    .await
-    .expect("load persisted sampling prefix");
-    assert!(matches!(
-        history.items.as_slice(),
-        [.., RolloutItem::ToolManifest(_), RolloutItem::SamplingBoundary(boundary)]
-            if boundary.sampling_request_id == "request-1"
-                && boundary.workspace_freshness_notices == vec!["<workspace_evidence_invalidation>\nexact notice\n</workspace_evidence_invalidation>"]
-    ));
-}
 
 #[tokio::test]
 async fn ordinary_rollout_items_join_the_terminal_batch_when_stage3_is_enabled() {
@@ -19672,343 +18662,7 @@ async fn abort_review_task_emits_exited_then_aborted_and_records_history() {
     );
 }
 
-#[tokio::test]
-async fn resumed_legacy_artifact_recovery_enforces_workspace_freshness_at_sampling() {
-    for (case, retained_command, legacy, expect_stale) in [
-        ("legacy_compacted", None, true, true),
-        ("legacy_retained_read", Some("cat source.rs"), true, true),
-        (
-            "current_repository_history",
-            Some("git log -1 --oneline"),
-            false,
-            false,
-        ),
-    ] {
-        let home = tempfile::tempdir().expect("isolated recovery home");
-        let mut config = test_config().await;
-        config.codex_home = home.path().to_path_buf().abs();
-        config.cwd = home.path().to_path_buf().abs();
-        config.completed_tool_history_projection = true;
-        let manager = crate::ThreadManager::with_models_provider_and_home_for_tests(
-            CodexAuth::from_api_key("dummy"),
-            config.model_provider.clone(),
-            home.path().to_path_buf(),
-            Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
-            Arc::new(crate::test_support::EmptyUserInstructionsProvider),
-        );
-        let source = manager
-            .start_thread(config.clone())
-            .await
-            .expect("start source thread");
-        let source_session = Arc::clone(&source.thread.codex.session);
-        let source_turn = source_session.new_default_turn().await;
-        let origin_call_id = "historical-origin";
-        let original_text = format!("exact retained output for {case}\n");
-        let canonical = codex_tools::CanonicalToolResult::text(original_text.clone());
-        let artifact = crate::tools::command_output_artifact::create_canonical_output_artifact(
-            home.path(),
-            &source.thread_id.to_string(),
-            &canonical,
-        )
-        .await;
-        assert!(artifact.complete, "{case}: real artifact must be complete");
-        let artifact_id = artifact.artifact_id().expect("stored artifact identity");
-        crate::tools::command_output_artifact::protect_active_tool_history_artifact(
-            home.path(),
-            &source.thread_id.to_string(),
-            &artifact_id,
-            canonical.exact_bytes,
-            &canonical.sha256,
-        )
-        .await
-        .expect("protect artifact before normal resume reconciliation");
 
-        let mut initial_items = vec![user_message("Recover the retained tool output")];
-        if let Some(command) = retained_command {
-            initial_items.extend([
-                ResponseItem::FunctionCall {
-                    id: None,
-                    name: "exec_command".to_string(),
-                    namespace: None,
-                    arguments: serde_json::json!({"cmd": command}).to_string(),
-                    call_id: origin_call_id.to_string(),
-                    internal_chat_message_metadata_passthrough: None,
-                },
-                ResponseItem::FunctionCallOutput {
-                    id: None,
-                    call_id: origin_call_id.to_string(),
-                    output: FunctionCallOutputPayload::from_text(original_text.clone()),
-                    internal_chat_message_metadata_passthrough: None,
-                },
-            ]);
-        }
-        if retained_command.is_none() {
-            // A compacted history retains a recovery reference but no original
-            // workspace command. Obtain its contents from the real artifact.
-            let prior_recovery = crate::tools::command_output_artifact::read_tool_output_selectors(
-                home.path(),
-                &source.thread_id.to_string(),
-                &artifact_id,
-                vec![
-                    crate::tools::command_output_artifact::ToolOutputSelector::Lines {
-                        start: 1,
-                        end: 1,
-                    },
-                ],
-            )
-            .await
-            .expect("read real retained recovery before saving its history");
-            assert_eq!(
-                prior_recovery.results[0].text.as_deref(),
-                Some(original_text.as_str())
-            );
-            initial_items.extend([
-                ResponseItem::FunctionCall {
-                    id: None,
-                    name: "read_tool_output".to_string(),
-                    namespace: None,
-                    arguments: serde_json::json!({"artifact_id": artifact_id}).to_string(),
-                    call_id: "prior-recovery".to_string(),
-                    internal_chat_message_metadata_passthrough: None,
-                },
-                ResponseItem::FunctionCallOutput {
-                    id: None,
-                    call_id: "prior-recovery".to_string(),
-                    output: FunctionCallOutputPayload::from_text(
-                        serde_json::to_string(&prior_recovery)
-                            .expect("persist exact prior recovery"),
-                    ),
-                    internal_chat_message_metadata_passthrough: None,
-                },
-            ]);
-        }
-        source_session
-            .record_conversation_items_ordered(&source_turn, &initial_items)
-            .await
-            .expect("persist historical conversation");
-        source_session
-            .flush_rollout_after_ordered_commits(&source_turn)
-            .await
-            .expect("materialize source rollout");
-        let rollout_path = source.thread.rollout_path().expect("saved rollout");
-        source
-            .thread
-            .shutdown_and_wait()
-            .await
-            .expect("shutdown source");
-        manager.remove_thread(&source.thread_id).await;
-
-        // Exact ToolHistoryCandidate and ledger V1 shape emitted by df89702c4d^.
-        // This producer predates dependency freshness and workspace observations.
-        let mut candidate = serde_json::json!({
-            "call_id": origin_call_id,
-            "tool_identity": "exec_command",
-            "semantic_class": "tool_output",
-            "artifact_id": artifact_id,
-            "artifact_bytes": canonical.exact_bytes,
-            "artifact_sha256": canonical.sha256,
-            "original_output_sha256": crate::tool_history::sha256(original_text.as_bytes()),
-            "original_tokens": canonical.approximate_tokens,
-            "bounded_digest": original_text,
-            "complete": true,
-            "projection_eligible": true,
-            "proof_identity": null,
-            "supersession_identity": null,
-            "consumed_by_generation": null
-        });
-        if !legacy {
-            let fields = candidate.as_object_mut().expect("candidate object");
-            fields.insert("successful".to_string(), serde_json::json!(true));
-            fields.insert("source_dependencies".to_string(), serde_json::json!([]));
-            fields.insert(
-                "source_dependencies_current".to_string(),
-                serde_json::json!(true),
-            );
-            fields.insert(
-                "preserved_non_text_tokens".to_string(),
-                serde_json::json!(0),
-            );
-        }
-        let ledger = serde_json::json!({
-            "version": 1,
-            "state": {"candidates": {(origin_call_id): candidate}}
-        });
-        let ledger_dir = home.path().join("tool-history");
-        tokio::fs::create_dir_all(&ledger_dir)
-            .await
-            .expect("ledger directory");
-        tokio::fs::write(
-            ledger_dir.join(format!("{}.json", source.thread_id)),
-            serde_json::to_vec(&ledger).expect("serialize historical producer ledger"),
-        )
-        .await
-        .expect("persist historical producer ledger");
-
-        let resumed = manager
-            .resume_thread_from_rollout(config, rollout_path, manager.auth_manager(), None, false)
-            .await
-            .expect("resume through real Session::new and ledger loader");
-        assert!(!resumed.was_already_running);
-        assert_eq!(resumed.thread_id, source.thread_id);
-        let session = Arc::clone(&resumed.thread.codex.session);
-        let turn = session.new_default_turn().await;
-        let loaded = serde_json::to_value(session.state.lock().await.tool_history_state())
-            .expect("inspect normally restored candidate");
-        assert_eq!(
-            loaded["candidates"][origin_call_id]["artifact_id"],
-            artifact_id
-        );
-
-        let recovery_call_id = "registered-recovery";
-        let recovery_call = ResponseItem::FunctionCall {
-            id: None,
-            name: "read_tool_output".to_string(),
-            namespace: None,
-            arguments: serde_json::json!({
-                "artifact_id": artifact_id,
-                "selectors": [{"kind": "lines", "start": 1, "end": 1}]
-            })
-            .to_string(),
-            call_id: recovery_call_id.to_string(),
-            internal_chat_message_metadata_passthrough: None,
-        };
-        let step = StepContext::for_test(Arc::clone(&turn));
-        let router = ToolRouter::from_context(
-            step.as_ref(),
-            crate::tools::router::ToolRouterParams {
-                tool_suggest_candidates: None,
-                deferred_mcp_tools: None,
-                mcp_tools: None,
-                extension_tool_executors: Vec::new(),
-                dynamic_tools: turn.dynamic_tools.as_slice(),
-                exposure_identity: Default::default(),
-            },
-            &Default::default(),
-        );
-        let call = ToolRouter::build_tool_call(&recovery_call)
-            .expect("build registered recovery call")
-            .expect("function call");
-        let dispatch = Arc::new(ToolDispatchState::new());
-        assert!(dispatch.try_admit());
-        let recovered = router
-            .dispatch_tool_call_with_terminal_outcome(
-                Arc::clone(&session),
-                step,
-                CancellationToken::new(),
-                Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new())),
-                call,
-                ToolCallSource::Direct,
-                dispatch,
-            )
-            .await
-            .expect("registered recovery must read actual artifact");
-        assert!(
-            recovered.success_for_logging(),
-            "{case}: recovery must succeed"
-        );
-        let recovered_item = ResponseItem::from(recovered.response());
-        let ResponseItem::FunctionCallOutput { output, .. } = &recovered_item else {
-            panic!("expected registered function output");
-        };
-        let recovered_text = output.body.to_text().expect("recovery JSON text");
-        let recovered_json: serde_json::Value =
-            serde_json::from_str(&recovered_text).expect("registered recovery JSON");
-        assert_eq!(recovered_json["artifact_id"], artifact_id);
-        assert_eq!(recovered_json["complete"], true);
-        assert_eq!(
-            recovered_json["results"]
-                .as_array()
-                .expect("selector results")
-                .len(),
-            1
-        );
-        assert_eq!(recovered_json["results"][0]["status"], "ok");
-        assert_eq!(recovered_json["results"][0]["text"], original_text);
-        session
-            .record_conversation_items_ordered(&turn, &[recovery_call, recovered_item])
-            .await
-            .expect("record the actual registered recovery result");
-
-        let prompt = super::turn::prepare_sampling_prompt_for_client(
-            session.clone_history().await,
-            &turn,
-            &session.services.git_workspace,
-        )
-        .await;
-        for (route, items) in [
-            ("sampling", prompt.shared_items()),
-            ("fallback", prompt.shared_fallback_items()),
-        ] {
-            let outputs = items
-                .iter()
-                .filter_map(|item| match item {
-                    ResponseItem::FunctionCallOutput {
-                        call_id, output, ..
-                    } if call_id == recovery_call_id => output.body.to_text(),
-                    _ => None,
-                })
-                .collect::<Vec<_>>();
-            assert_eq!(
-                outputs.len(),
-                1,
-                "{case}/{route}: exactly one recovery output"
-            );
-            assert_eq!(
-                outputs[0], recovered_text,
-                "{case}/{route}: recovery bytes must preserve the historical prompt prefix"
-            );
-            let notices = items
-                .iter()
-                .filter_map(|item| match item {
-                    ResponseItem::Message { role, content, .. } if role == "developer" => {
-                        Some(content)
-                    }
-                    _ => None,
-                })
-                .flatten()
-                .filter_map(|part| match part {
-                    ContentItem::InputText { text }
-                        if text.starts_with("<workspace_evidence_invalidation>") =>
-                    {
-                        text.lines()
-                            .find_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
-                    }
-                    _ => None,
-                })
-                .flat_map(crate::tool_history::expand_workspace_notices)
-                .filter(|notice| notice["call_id"] == recovery_call_id)
-                .collect::<Vec<_>>();
-            if expect_stale {
-                assert_eq!(notices.len(), 1, "{case}/{route}: append one invalidation");
-                let notice = &notices[0];
-                assert_eq!(notice["stale_workspace_evidence"], true);
-                assert_eq!(notice["valid_for_current_workspace"], false);
-                assert_eq!(notice["reason_code"], "missing_observation");
-                let guidance = serde_json::to_string(items.as_ref()).unwrap();
-                assert!(guidance.contains("report the affected claim as unverified"));
-                assert!(
-                    guidance.contains("read_tool_output recovers historical bytes, not freshness")
-                );
-                assert!(guidance.contains("not a request to rerun tests or builds"));
-                assert!(
-                    !notice.to_string().contains(&original_text),
-                    "{case}/{route}: invalidation must not promote tool bytes into developer instructions"
-                );
-            } else {
-                assert!(
-                    notices.is_empty(),
-                    "{case}/{route}: repository history remains usable"
-                );
-            }
-        }
-        resumed
-            .thread
-            .shutdown_and_wait()
-            .await
-            .expect("shutdown resumed recovery thread");
-        manager.remove_thread(&resumed.thread_id).await;
-    }
-}
 
 #[tokio::test]
 async fn incompatible_tool_payload_returns_recoverable_error() {
@@ -21086,35 +19740,6 @@ fn turn_context_projection_uses_one_worker_and_preserves_gitdir_permissions() {
     runtime.shutdown_timeout(std::time::Duration::from_secs(2));
 }
 
-fn attach_session_trace_bundle(
-    session: &mut Session,
-    _turn_context: &TurnContext,
-    root: &std::path::Path,
-) -> anyhow::Result<std::path::PathBuf> {
-    session.services.rollout_thread_trace =
-        codex_rollout_trace::ThreadTraceContext::start_root_in_root_for_test(
-            root,
-            codex_rollout_trace::ThreadStartedTraceMetadata {
-                thread_id: session.thread_id.to_string(),
-                agent_path: "/root".to_string(),
-                task_name: None,
-                nickname: None,
-                agent_role: None,
-                session_source: SessionSource::Exec,
-                cwd: root.to_path_buf(),
-                rollout_path: None,
-                model: "trace-test-model".to_string(),
-                provider_name: "trace-test-provider".to_string(),
-                approval_policy: "never".to_string(),
-                sandbox_policy: "danger-full-access".to_string(),
-            },
-        )?;
-    let mut dirs = std::fs::read_dir(root)?
-        .map(|entry| entry.map(|entry| entry.path()))
-        .collect::<Result<Vec<_>, _>>()?;
-    assert_eq!(dirs.len(), 1, "one session creates one actual trace bundle");
-    Ok(dirs.remove(0))
-}
 
 struct SessionTracePayloadGate {
     release: Option<std::sync::mpsc::Sender<()>>,
@@ -21142,66 +19767,7 @@ impl Drop for SessionTracePayloadGate {
     }
 }
 
-async fn hold_session_trace_payload(
-    session: &Session,
-    turn_context: &TurnContext,
-) -> SessionTracePayloadGate {
-    struct GatePayload {
-        entered: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
-        release: std::sync::mpsc::Receiver<()>,
-    }
-    impl serde::Serialize for GatePayload {
-        fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-            if let Some(entered) = self.entered.lock().expect("gate signal lock").take() {
-                let _ = entered.send(());
-            }
-            // Watchdog makes the old synchronous implementation fail without wedging teardown.
-            let _ = self.release.recv_timeout(std::time::Duration::from_secs(5));
-            serde::Serialize::serialize(
-                &serde_json::json!({"held_payload_serializer": true}),
-                serializer,
-            )
-        }
-    }
-    let context = session
-        .services
-        .rollout_thread_trace
-        .compaction_trace_context(
-            turn_context.sub_id.clone(),
-            "writer-gate",
-            "trace-test-model",
-            "trace-test-provider",
-        );
-    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
-    let (release_tx, release_rx) = std::sync::mpsc::channel();
-    let owned_payload = session.terminal_tasks.token();
-    let worker = std::thread::spawn(move || {
-        let _owned_payload = owned_payload;
-        context
-            .start_attempt(&GatePayload {
-                entered: std::sync::Mutex::new(Some(entered_tx)),
-                release: release_rx,
-            })
-            .record_failed("test writer gate released");
-    });
-    let gate = SessionTracePayloadGate {
-        release: Some(release_tx),
-        worker: Some(worker),
-    };
-    tokio::time::timeout(std::time::Duration::from_secs(2), entered_rx)
-        .await
-        .expect("trace payload enters serialization before acquiring the writer")
-        .expect("writer gate signal");
-    gate
-}
 
-fn session_trace_events(bundle: &std::path::Path) -> Vec<codex_rollout_trace::RawTraceEvent> {
-    std::fs::read_to_string(bundle.join("trace.jsonl"))
-        .expect("read actual flushed trace log")
-        .lines()
-        .map(|line| serde_json::from_str(line).expect("actual raw trace event"))
-        .collect()
-}
 
 fn session_trace_turn_started(turn_context: &TurnContext) -> EventMsg {
     EventMsg::TurnStarted(TurnStartedEvent {
@@ -21287,371 +19853,9 @@ async fn late_terminal_and_durable_status_leave_successor_running() {
     ));
 }
 
-#[tokio::test(flavor = "current_thread")]
-async fn session_trace_send_is_not_blocked_by_unrelated_payload_serialization() -> anyhow::Result<()>
-{
-    use codex_rollout_trace::RawTraceEventPayload;
-    let temp = tempfile::tempdir()?;
-    let (mut session, turn_context, rx) = make_session_and_context_with_rx().await;
-    let bundle = attach_session_trace_bundle(
-        Arc::get_mut(&mut session).expect("fixture session has a single owner"),
-        &turn_context,
-        temp.path(),
-    )?;
-    let gate = hold_session_trace_payload(&session, &turn_context).await;
-    let expected = session_trace_turn_started(&turn_context);
-    tokio::time::timeout(
-        Duration::from_secs(2),
-        session.send_event(&turn_context, expected.clone()),
-    )
-    .await
-    .expect("payload serialization must not hold the shared writer lock");
-    let live = rx
-        .try_recv()
-        .expect("event delivered while the unrelated payload remains blocked");
-    assert_eq!(live.id, turn_context.sub_id);
-    assert_eq!(
-        serde_json::to_value(&live.msg)?,
-        serde_json::to_value(&expected)?
-    );
-    let events = session_trace_events(&bundle);
-    assert_eq!(events.iter().filter(|event| matches!(&event.payload,
-        RawTraceEventPayload::CodexTurnStarted { codex_turn_id, thread_id }
-        if codex_turn_id == &turn_context.sub_id && thread_id == &session.thread_id.to_string()
-    )).count(), 1);
-    assert_eq!(events.iter().filter(|event| matches!(&event.payload,
-        RawTraceEventPayload::ProtocolEventObserved { event_type, .. } if event_type == "turn_started"
-    )).count(), 1);
-    assert!(
-        rx.try_recv().is_err(),
-        "one send delivers exactly one live event"
-    );
-    gate.release();
-    session.terminal_tasks.close();
-    tokio::time::timeout(Duration::from_secs(2), session.terminal_tasks.wait())
-        .await
-        .expect("owned payload drains after release");
-    Ok(())
-}
 
-#[tokio::test(flavor = "current_thread")]
-async fn session_trace_send_persists_exact_protocol_payload_before_live_delivery()
--> anyhow::Result<()> {
-    use codex_rollout_trace::RawTraceEventPayload;
-    let temp = tempfile::tempdir()?;
-    let (mut session, turn_context, rx) = make_session_and_context_with_rx().await;
-    let bundle = attach_session_trace_bundle(
-        Arc::get_mut(&mut session).expect("fixture session has a single owner"),
-        &turn_context,
-        temp.path(),
-    )?;
-    let expected = session_trace_turn_started(&turn_context);
-    let expected_json = serde_json::to_value(&expected)?;
-    let sending = {
-        let session = Arc::clone(&session);
-        let turn_context = Arc::clone(&turn_context);
-        tokio::spawn(async move { session.send_event(&turn_context, expected).await })
-    };
-    let live = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
-        .await
-        .expect("healthy send delivers event")
-        .expect("event channel remains open");
-    assert_eq!(live.id, turn_context.sub_id);
-    assert_eq!(serde_json::to_value(&live.msg)?, expected_json);
-    // Inspect at the delivery boundary, before joining or draining background work.
-    let events = session_trace_events(&bundle);
-    let typed = events.iter().find(|event| matches!(&event.payload,
-        RawTraceEventPayload::CodexTurnStarted { codex_turn_id, .. } if codex_turn_id == &turn_context.sub_id
-    )).expect("typed turn event precedes delivery");
-    let protocol = events
-        .iter()
-        .find_map(|event| match &event.payload {
-            RawTraceEventPayload::ProtocolEventObserved {
-                event_type,
-                event_payload,
-            } if event_type == "turn_started" => Some((event.seq, event_payload)),
-            _ => None,
-        })
-        .expect("raw turn protocol event persists before live delivery");
-    assert!(typed.seq < protocol.0);
-    let payload: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(bundle.join(&protocol.1.path))?)?;
-    assert_eq!(
-        payload, expected_json,
-        "consumer-visible event matches the real persisted payload"
-    );
-    sending.await?;
-    Ok(())
-}
 
-#[tokio::test(flavor = "current_thread")]
-async fn session_trace_mcp_item_bridge_persists_actual_legacy_begin_and_end() -> anyhow::Result<()>
-{
-    use codex_protocol::items::McpToolCallItem;
-    use codex_protocol::items::McpToolCallStatus;
-    use codex_rollout_trace::RawTraceEventPayload;
-    let temp = tempfile::tempdir()?;
-    let (mut session, turn_context, rx) = make_session_and_context_with_rx().await;
-    let bundle = attach_session_trace_bundle(
-        Arc::get_mut(&mut session).expect("fixture session has a single owner"),
-        &turn_context,
-        temp.path(),
-    )?;
-    let mut item = McpToolCallItem {
-        id: "session-trace-mcp".to_string(),
-        server: "fixture-server".to_string(),
-        tool: "read_document".to_string(),
-        arguments: serde_json::json!({"document": "expected-document"}),
-        connector_id: None,
-        mcp_app_resource_uri: None,
-        link_id: None,
-        app_name: None,
-        template_id: None,
-        action_name: None,
-        plugin_id: None,
-        status: McpToolCallStatus::InProgress,
-        result: None,
-        error: None,
-        duration: None,
-    };
-    session
-        .emit_turn_item_started(&turn_context, &TurnItem::McpToolCall(item.clone()))
-        .await;
-    let started = rx.recv().await?;
-    assert!(matches!(started.msg, EventMsg::ItemStarted(_)));
-    let legacy_begin = rx.recv().await?;
-    let EventMsg::McpToolCallBegin(begin) = legacy_begin.msg else {
-        panic!("normal item bridge emits legacy begin")
-    };
-    assert_eq!(begin.call_id, item.id);
-    assert_eq!(begin.invocation.server, "fixture-server");
-    assert_eq!(begin.invocation.tool, "read_document");
-    assert_eq!(
-        begin.invocation.arguments,
-        Some(serde_json::json!({"document": "expected-document"}))
-    );
-    let begin_events = session_trace_events(&bundle);
-    let (begin_seq, begin_payload) = begin_events
-        .iter()
-        .find_map(|event| match &event.payload {
-            RawTraceEventPayload::ToolCallRuntimeStarted {
-                tool_call_id,
-                runtime_payload,
-            } if tool_call_id == &item.id => Some((event.seq, runtime_payload)),
-            _ => None,
-        })
-        .expect("legacy begin runtime trace is durable at delivery");
-    let persisted_begin: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(bundle.join(&begin_payload.path))?)?;
-    assert_eq!(persisted_begin, serde_json::to_value(&begin)?);
-    item.status = McpToolCallStatus::Completed;
-    item.duration = Some(std::time::Duration::from_millis(13));
-    item.result = Some(codex_protocol::mcp::CallToolResult {
-        content: vec![serde_json::json!({"type":"text", "text":"actual document contents"})],
-        structured_content: None,
-        is_error: Some(false),
-        meta: None,
-    });
-    session
-        .emit_turn_item_completed(&turn_context, TurnItem::McpToolCall(item.clone()))
-        .await;
-    let completed = rx.recv().await?;
-    assert!(matches!(completed.msg, EventMsg::ItemCompleted(_)));
-    let legacy_end = rx.recv().await?;
-    let EventMsg::McpToolCallEnd(end) = legacy_end.msg else {
-        panic!("normal item bridge emits legacy end")
-    };
-    assert_eq!(end.call_id, item.id);
-    assert_eq!(end.duration, std::time::Duration::from_millis(13));
-    assert_eq!(
-        end.result
-            .as_ref()
-            .expect("successful actual legacy result")
-            .content[0]["text"],
-        "actual document contents"
-    );
-    let end_events = session_trace_events(&bundle);
-    let (end_seq, end_payload) = end_events
-        .iter()
-        .find_map(|event| match &event.payload {
-            RawTraceEventPayload::ToolCallRuntimeEnded {
-                tool_call_id,
-                status,
-                runtime_payload,
-            } if tool_call_id == &item.id => {
-                assert_eq!(*status, codex_rollout_trace::ExecutionStatus::Completed);
-                Some((event.seq, runtime_payload))
-            }
-            _ => None,
-        })
-        .expect("legacy completion runtime trace is durable at delivery");
-    assert!(begin_seq < end_seq);
-    let persisted_end: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(bundle.join(&end_payload.path))?)?;
-    assert_eq!(persisted_end, serde_json::to_value(&end)?);
-    assert!(
-        rx.try_recv().is_err(),
-        "one begin/end item produces exactly one legacy begin/end"
-    );
 
-    // The direct protocol entry point also owns runtime trace writing; it must
-    // not rely on the ItemStarted/ItemCompleted compatibility branch above.
-    let mut direct_begin = begin.clone();
-    direct_begin.call_id = "session-trace-direct-mcp".to_string();
-    session
-        .send_event(
-            &turn_context,
-            EventMsg::McpToolCallBegin(direct_begin.clone()),
-        )
-        .await;
-    let delivered = rx.recv().await?;
-    assert_eq!(
-        serde_json::to_value(&delivered.msg)?,
-        serde_json::to_value(EventMsg::McpToolCallBegin(direct_begin.clone()))?
-    );
-    let direct_events = session_trace_events(&bundle);
-    let direct_payload = direct_events
-        .iter()
-        .find_map(|event| match &event.payload {
-            RawTraceEventPayload::ToolCallRuntimeStarted {
-                tool_call_id,
-                runtime_payload,
-            } if tool_call_id == &direct_begin.call_id => Some(runtime_payload),
-            _ => None,
-        })
-        .expect("direct Session event records its runtime payload before delivery");
-    assert_eq!(
-        serde_json::from_slice::<serde_json::Value>(&std::fs::read(
-            bundle.join(&direct_payload.path)
-        )?)?,
-        serde_json::to_value(&direct_begin)?
-    );
-    let mut direct_end = end.clone();
-    direct_end.call_id = direct_begin.call_id;
-    session
-        .send_event(&turn_context, EventMsg::McpToolCallEnd(direct_end.clone()))
-        .await;
-    let delivered_end = rx.recv().await?;
-    assert_eq!(
-        serde_json::to_value(&delivered_end.msg)?,
-        serde_json::to_value(EventMsg::McpToolCallEnd(direct_end.clone()))?
-    );
-    let terminal_events = session_trace_events(&bundle);
-    let terminal_payload = terminal_events
-        .iter()
-        .find_map(|event| match &event.payload {
-            RawTraceEventPayload::ToolCallRuntimeEnded {
-                tool_call_id,
-                status,
-                runtime_payload,
-            } if tool_call_id == &direct_end.call_id => {
-                assert_eq!(*status, codex_rollout_trace::ExecutionStatus::Completed);
-                Some(runtime_payload)
-            }
-            _ => None,
-        })
-        .expect("direct Session terminal event records the actual result before delivery");
-    assert_eq!(
-        serde_json::from_slice::<serde_json::Value>(&std::fs::read(
-            bundle.join(&terminal_payload.path)
-        )?)?,
-        serde_json::to_value(&direct_end)?
-    );
-    assert!(
-        rx.try_recv().is_err(),
-        "direct protocol entry emits no additional compatibility event"
-    );
-    Ok(())
-}
-
-#[tokio::test]
-async fn shutdown_waits_for_owned_trace_and_finishes_bundle_before_acknowledgment()
--> anyhow::Result<()> {
-    use codex_rollout_trace::RawTraceEventPayload;
-    use codex_rollout_trace::RolloutStatus;
-
-    let root = tempfile::tempdir()?;
-    let (mut session, turn_context, rx_event) = make_session_and_context_with_rx().await;
-    let bundle = attach_session_trace_bundle(
-        Arc::get_mut(&mut session).expect("session has one owner before starting shutdown"),
-        &turn_context,
-        root.path(),
-    )?;
-    let writer_gate = hold_session_trace_payload(&session, &turn_context).await;
-    let shutdown = tokio::spawn({
-        let session = Arc::clone(&session);
-        async move { handlers::shutdown(&session, "trace-shutdown".to_string()).await }
-    });
-
-    // Normal shutdown first drains earlier terminal work, then owns the final
-    // trace transaction. Pausing an owned payload must keep shutdown waiting
-    // without blocking this current-thread runtime or acknowledging early.
-    tokio::time::timeout(Duration::from_secs(2), async {
-        while session.terminal_tasks.is_empty() && !shutdown.is_finished() {
-            tokio::time::sleep(Duration::from_millis(1)).await;
-        }
-    })
-    .await
-    .expect("normal shutdown reaches its trace transaction");
-    assert!(
-        !shutdown.is_finished() && !session.terminal_tasks.is_empty(),
-        "shutdown must await its owned payload before finalizing the trace"
-    );
-    tokio::time::sleep(Duration::from_millis(10)).await;
-    assert!(
-        rx_event.try_recv().is_err(),
-        "consumers must not receive shutdown acknowledgment before final trace writes"
-    );
-    writer_gate.release();
-
-    let event = tokio::time::timeout(Duration::from_secs(2), rx_event.recv())
-        .await
-        .expect("shutdown acknowledges after its writer finishes")?;
-    assert_eq!(event.id, "trace-shutdown");
-    assert!(matches!(event.msg, EventMsg::ShutdownComplete));
-    let events = session_trace_events(&bundle);
-    let terminal = events
-        .iter()
-        .filter(|event| {
-            matches!(
-                &event.payload,
-                RawTraceEventPayload::ProtocolEventObserved { event_type, .. }
-                    if event_type == "shutdown_complete"
-            ) || matches!(
-                &event.payload,
-                RawTraceEventPayload::ThreadEnded { .. }
-                    | RawTraceEventPayload::RolloutEnded { .. }
-            )
-        })
-        .collect::<Vec<_>>();
-    assert_eq!(
-        terminal.len(),
-        3,
-        "one shutdown protocol event and both terminal records"
-    );
-    let RawTraceEventPayload::ProtocolEventObserved { event_payload, .. } = &terminal[0].payload
-    else {
-        panic!("the shutdown protocol payload precedes bundle terminal records");
-    };
-    let persisted: EventMsg =
-        serde_json::from_slice(&std::fs::read(bundle.join(&event_payload.path))?)?;
-    assert!(matches!(persisted, EventMsg::ShutdownComplete));
-    assert!(matches!(
-        &terminal[1].payload,
-        RawTraceEventPayload::ThreadEnded { thread_id, status: RolloutStatus::Completed }
-            if thread_id == &session.thread_id.to_string()
-    ));
-    assert!(matches!(
-        &terminal[2].payload,
-        RawTraceEventPayload::RolloutEnded {
-            status: RolloutStatus::Completed
-        }
-    ));
-    assert!(terminal.windows(2).all(|pair| pair[0].seq < pair[1].seq));
-    assert!(shutdown.await?);
-    assert!(session.terminal_tasks.is_empty());
-    Ok(())
-}
 
 #[cfg(test)]
 mod abandoned_interactive_registry_tests {

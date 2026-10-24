@@ -24,6 +24,11 @@ pub struct ReviewSourceScope {
 }
 
 impl ReviewSourceScope {
+    /// Immutable revision resolved during capture, shared with prompt rendering.
+    pub fn comparison_revision(&self) -> Option<&str> {
+        self.comparison.last().map(String::as_str)
+    }
+
     pub fn capture(cwd: &Path, target: &ReviewTarget) -> Result<Self, String> {
         let custom = matches!(target, ReviewTarget::Custom { .. });
         // A custom prompt can contain all its source and need not name a Git repository.

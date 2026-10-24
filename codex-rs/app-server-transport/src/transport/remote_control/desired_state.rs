@@ -113,14 +113,13 @@ impl RemoteControlHandle {
         &self,
         app_server_client_name: Option<&str>,
     ) -> io::Result<RemoteControlStatusChangedNotification> {
+        let lifecycle = self.current_enrollment.lifecycle();
         self.run_with_policy(async {
             self.ensure_remote_control_allowed()
                 .map_err(|err| io::Error::new(io::ErrorKind::PermissionDenied, err))?;
-            let _transition = self
-                .desired_state_rpc_lock
-                .acquire()
-                .await
-                .unwrap_or_else(|_| unreachable!());
+            let _transition = self.run_with_lifecycle(&lifecycle, async {
+                Ok(self.desired_state_rpc_lock.acquire().await.unwrap_or_else(|_| unreachable!()))
+            }).await?;
             let state_db = self
                 .state_db
                 .as_deref()
@@ -130,8 +129,10 @@ impl RemoteControlHandle {
             let app_server_client_name = self.pairing_persistence_key(app_server_client_name)?;
             let app_server_client_name = app_server_client_name.as_deref();
             let status = self.status();
-            let mut current_enrollment = self.current_enrollment.lock().await;
-            let (enrollment, _) = self
+            let mut current_enrollment = self.run_with_lifecycle(&lifecycle, async {
+                Ok(self.current_enrollment.lock().await)
+            }).await?;
+            let (enrollment, _) = self.run_with_lifecycle(&lifecycle, self
                 .load_or_enroll_server_with_source(
                     super::RemoteControlHttpClientSource::Pool(&self.http_clients),
                     &current_enrollment,
@@ -140,7 +141,7 @@ impl RemoteControlHandle {
                     &status.server_name,
                     app_server_client_name,
                     super::RemoteControlEnrollmentSelection::ReuseOrCreate,
-                )
+                ))
                 .await?;
 
             let current_auth = super::auth::load_remote_control_auth(&self.auth_manager).await?;
@@ -152,6 +153,9 @@ impl RemoteControlHandle {
             }
 
             let _persistence = acquire_persistence_lock(&self.desired_state_persistence_lock).await;
+            if lifecycle.is_cancelled() {
+                return Err(io::Error::new(io::ErrorKind::Interrupted, "remote control enable superseded"));
+            }
             let updated = state_db
                 .set_remote_control_enabled(
                     &remote_control_target.websocket_url,
@@ -171,6 +175,13 @@ impl RemoteControlHandle {
                     Some(true),
                 )
                 .await?;
+            }
+            // Once persistence starts, retain both commit locks until it finishes.
+            // A newer disable then writes last, even if its intent arrived mid-write.
+            let _lifecycle_commit = self.current_enrollment.lifecycle.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if lifecycle.is_cancelled() {
+                return Err(io::Error::new(io::ErrorKind::Interrupted, "remote control enable superseded"));
             }
             publish_current_enrollment(&mut current_enrollment, &enrollment);
             self.enable_with_preference(Some(true)).map_err(|err| {

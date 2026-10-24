@@ -88,8 +88,8 @@ pub struct ThreadItem {
     pub recency_at: Option<String>,
 }
 
-#[derive(Default)]
-struct HeadTailSummary {
+#[derive(Clone, Default)]
+pub(crate) struct HeadTailSummary {
     saw_session_meta: bool,
     thread_id: Option<ThreadId>,
     first_user_message: Option<String>,
@@ -112,7 +112,8 @@ struct HeadTailSummary {
 // Filesystem fallback listing must consider every candidate: truncating before
 // sorting or filtering can hide threads permanently, even across cursor pages.
 // Created-time traversal stops once the page is full; other sorts enumerate
-// candidates to establish their order. Individual summary reads remain bounded.
+// candidates to establish their order. Indexed preview reads remain bounded;
+// filesystem recovery streams history on a source-version cache miss.
 const HEAD_RECORD_LIMIT: usize = 10;
 const USER_EVENT_SCAN_LIMIT: usize = 200;
 
@@ -1069,6 +1070,39 @@ pub async fn read_thread_item_from_rollout(path: PathBuf) -> Option<ThreadItem> 
     .await
 }
 
+/// Refresh an indexed thread's preview without replaying its settings/history.
+/// Keep the same preview window as summary extraction and verify its identity.
+pub async fn read_thread_preview_from_rollout(path: &Path) -> io::Result<Option<(ThreadId, String)>> {
+    let mut lines = compression::open_rollout_line_reader(path).await?;
+    let mut thread_id = None;
+    let mut preview = None;
+    let mut record = 0;
+    while record < HEAD_RECORD_LIMIT + USER_EVENT_SCAN_LIMIT {
+        let Some(line) = lines.next_line().await? else { break };
+        if line.trim().is_empty() {
+            continue;
+        }
+        record += 1;
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) else { continue };
+        if thread_id.is_none() {
+            crate::recorder::reject_unknown_thread_history_mode(&value)?;
+        }
+        let Ok(line) = serde_json::from_value::<RolloutLine>(value) else { continue };
+        match line.item {
+            RolloutItem::SessionMeta(meta) if thread_id.is_none() => thread_id = Some(meta.meta.id),
+            RolloutItem::EventMsg(event) if preview.is_none()
+                && (record <= HEAD_RECORD_LIMIT || thread_id.is_some()) => {
+                preview = event_msg_preview(&event);
+            }
+            _ => {}
+        }
+        if let (Some(id), Some(preview)) = (thread_id, preview.as_ref()) {
+            return Ok(Some((id, preview.clone())));
+        }
+    }
+    Ok(None)
+}
+
 /// Collects immediate subdirectories of `parent`, parses their (string) names with `parse`,
 /// and returns them sorted descending by the parsed key.
 async fn collect_dirs_desc<T, F>(parent: &Path, parse: F) -> io::Result<Vec<(T, PathBuf)>>
@@ -1339,6 +1373,11 @@ async fn read_head_summary(
     head_limit: usize,
     default_provider: &str,
 ) -> io::Result<HeadTailSummary> {
+    if head_limit == HEAD_RECORD_LIMIT
+        && let Some(summary) = crate::metadata::cached_head_summary(path, default_provider).await
+    {
+        return Ok(summary);
+    }
     let mut summary = HeadTailSummary::default();
     let mut settings_reducer = PersistedThreadSettingsReducer::default();
     let mut metadata_accumulator = RolloutMetadataAccumulator::default();
@@ -1449,7 +1488,11 @@ async fn read_head_summary(
         .finish(path, default_provider, parse_errors)
         .await
         .map_err(io::Error::other)?;
-    crate::metadata::cache_extraction_outcome(extraction_cache_guard, outcome).await;
+    crate::metadata::cache_extraction_outcome(
+        extraction_cache_guard,
+        outcome,
+        (head_limit == HEAD_RECORD_LIMIT).then(|| summary.clone()),
+    ).await;
 
     Ok(summary)
 }

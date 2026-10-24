@@ -91,7 +91,9 @@ impl<T: HttpTransport> ImagesClient<T> {
             )
             .await?;
         serde_json::from_slice(&resp.body)
-            .map_err(|e| ApiError::Stream(format!("failed to decode {operation} response: {e}")))
+            .map_err(|error| ApiError::invalid_response(crate::responses_stream::decode_diagnostic(
+                &format!("failed to decode {operation} response"), &error,
+            )))
     }
 }
 
@@ -450,13 +452,30 @@ mod tests {
             .await
             .expect_err("image response without data should fail");
 
-        let ApiError::Stream(message) = error else {
-            panic!("expected image response decode error");
-        };
-        assert!(
-            message.starts_with("failed to decode image generation response: missing field `data`"),
-            "{message}"
-        );
+        let message = error.to_string();
+        assert!(message.contains("failed to decode image generation response"), "{message}");
+        assert!(!crate::api_bridge::map_api_error(error).is_retryable());
+    }
+
+    #[tokio::test]
+    async fn malformed_image_bodies_are_permanent_and_content_free_for_generate_and_edit() {
+        for body in [b"{".to_vec(), b"{}".to_vec(), serde_json::to_vec(&json!("private-proxy-content".repeat(4096))).unwrap(),
+            serde_json::to_vec(&json!({"created": "private-proxy-content".repeat(4096), "data": []})).unwrap()] {
+            for edit in [false, true] {
+                let client = ImagesClient::new(CapturingTransport::new(body.clone()), provider(), Arc::new(DummyAuth));
+                let result = if edit {
+                    client.edit(&ImageEditRequest { images: Vec::new(), prompt: "test".into(), background: None,
+                        model: "test".into(), n: None, quality: None, size: None }, HeaderMap::new()).await
+                } else {
+                    client.generate(&ImageGenerationRequest { prompt: "test".into(), background: None,
+                        model: "test".into(), n: None, quality: None, size: None }, HeaderMap::new()).await
+                };
+                let error = result.unwrap_err();
+                assert!(!error.to_string().contains("private-proxy-content"));
+                assert!(error.to_string().len() < 512);
+                assert!(!crate::api_bridge::map_api_error(error).is_retryable());
+            }
+        }
     }
 
     #[tokio::test]
@@ -503,7 +522,7 @@ mod tests {
                         .await
                 };
 
-                assert!(result.is_err());
+                assert!(!crate::api_bridge::map_api_error(result.unwrap_err()).is_retryable());
                 assert_eq!(transport.attempts(), 1);
             }
         }

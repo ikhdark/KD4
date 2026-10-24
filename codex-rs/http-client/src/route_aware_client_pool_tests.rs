@@ -23,14 +23,42 @@ use crate::OutboundProxyPolicy;
 mod connection_benchmarks;
 
 #[test]
+fn url_userinfo_is_rejected_without_exposing_credentials() {
+    let pool = manual_redirect_pool();
+    for url in [
+        "https://user:secret@example.com/",
+        "https://user@example.com/",
+        "https://:secret@example.com/",
+    ] {
+        let builder = pool.get(url);
+        let error = builder.request.unwrap_err();
+        assert!(matches!(error, RouteAwareRequestError::Build(_)));
+        assert!(!error.to_string().contains("secret"));
+    }
+}
+
+#[tokio::test]
+async fn concrete_endpoint_client_rejects_userinfo_before_route_selection() {
+    let pool = manual_redirect_pool();
+    for url in [
+        "https://user:secret@example.com/",
+        "https://user@example.com/",
+        "https://:secret@example.com/",
+    ] {
+        let error = pool.client_for_url(url).await.err().expect("userinfo must be rejected before route selection");
+        assert!(matches!(&error, RouteAwareRequestError::Build(_)));
+        assert!(!error.to_string().contains("secret"));
+        assert_eq!(pool.cached_route_count(), 0);
+    }
+}
+
+#[test]
 fn request_builder_debug_redacts_url_secrets() {
     let pool = RouteAwareClientPool::new(
         HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault),
         ClientRouteClass::Api,
     );
-    let request = pool.get(
-        "https://username:password@private.example/secret-path?sig=query-secret#fragment-secret",
-    );
+    let request = pool.get("https://private.example/secret-path?sig=query-secret#fragment-secret");
 
     assert_eq!(
         format!("{request:?}"),
@@ -149,6 +177,28 @@ async fn without_url_redacts_transport_error_urls() {
     let error = RouteAwareRequestError::from(error).without_url();
 
     assert!(!error.to_string().contains(secret));
+}
+
+#[tokio::test]
+async fn forced_direct_client_selection_skips_the_resolver() {
+    for policy in [
+        OutboundProxyPolicy::ReqwestDefault,
+        OutboundProxyPolicy::RespectSystemProxy,
+    ] {
+        let pool = RouteAwareClientPool::new(HttpClientFactory::new(policy), ClientRouteClass::Api)
+            .with_direct_routing();
+        let (route, _) = pool
+            .client_for_url_with_resolver("https://example.com", |_| async {
+                Err(io::Error::other(
+                    "forced-direct selection must not discover a proxy",
+                ))
+            })
+            .await
+            .unwrap();
+        assert_eq!(route, OutboundProxyRoute::Direct);
+        pool.client_for_url("https://example.com").await.unwrap();
+        assert_eq!(pool.cached_route_count(), 1);
+    }
 }
 
 #[tokio::test]
@@ -583,7 +633,7 @@ async fn disabled_pool_logging_does_not_expose_request_or_response_data() {
     let _guard = tracing::subscriber::set_default(subscriber);
     tracing::debug!(target: "codex_http_client", "log capture sentinel");
     let request_url = format!(
-        "http://auth-user:password-secret-value@{address}/token?client_secret=query-secret-value"
+        "http://{address}/token?client_secret=query-secret-value"
     );
     let mut request = reqwest::Request::new(
         Method::POST,
@@ -593,6 +643,7 @@ async fn disabled_pool_logging_does_not_expose_request_or_response_data() {
         "x-sensitive-request",
         HeaderValue::from_static("request-header-secret-value"),
     );
+    request.headers_mut().insert(http::header::AUTHORIZATION, HeaderValue::from_static("Basic password-secret-value"));
     *request.body_mut() = Some("request-body-secret-value".into());
     *request.timeout_mut() = Some(Duration::from_secs(2));
 
@@ -609,12 +660,13 @@ async fn disabled_pool_logging_does_not_expose_request_or_response_data() {
         .local_addr()
         .expect("unresponsive listener should have an address");
     let failure_url = format!(
-        "http://auth-user:failure-password-secret-value@{unresponsive_address}/token?client_secret=failure-query-secret-value"
+        "http://{unresponsive_address}/token?client_secret=failure-query-secret-value"
     );
     let mut request = reqwest::Request::new(
         Method::POST,
         reqwest::Url::parse(&failure_url).expect("failure URL should parse"),
     );
+    request.headers_mut().insert(http::header::AUTHORIZATION, HeaderValue::from_static("Basic failure-password-secret-value"));
     *request.timeout_mut() = Some(Duration::from_millis(100));
 
     let error = pool

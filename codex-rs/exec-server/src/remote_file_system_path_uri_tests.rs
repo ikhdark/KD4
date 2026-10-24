@@ -244,8 +244,55 @@ async fn record_read_file_params(
     (websocket_url, captured_params_rx, server)
 }
 
+#[tokio::test]
+async fn bounded_remote_reads_reject_oversized_peer_payloads_for_both_path_modes() {
+    let cases = [(0_usize, Some(0_usize)), (0, Some(1)), (1, Some(1)), (1, Some(2)),
+        (2, Some(2)), (2, Some(3)), (3, Some(3)), (3, Some(4)), (4, None)];
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("ws://{}", listener.local_addr().unwrap());
+    let (release, released) = oneshot::channel();
+    let server = tokio::spawn(async move {
+        let mut websocket = accept_async(listener.accept().await.unwrap().0).await.unwrap();
+        complete_websocket_initialize(&mut websocket).await;
+        for confined in [false, true] {
+            for (limit, length) in cases {
+                let JSONRPCMessage::Request(request) = read_jsonrpc_websocket(&mut websocket).await else { panic!("request"); };
+                assert_eq!(request.method, crate::protocol::FS_READ_FILE_BOUNDED_METHOD);
+                let params: crate::protocol::FsReadFileBoundedParams = serde_json::from_value(request.params.unwrap()).unwrap();
+                assert_eq!(params.max_bytes, limit);
+                assert_eq!(params.confined_root.is_some(), confined);
+                let data = length.map(|length| STANDARD.encode(vec![b'x'; length]));
+                write_jsonrpc_websocket(&mut websocket, JSONRPCMessage::Response(JSONRPCResponse {
+                    id: request.id, result: serde_json::json!({"dataBase64":data}),
+                })).await;
+            }
+        }
+        let _ = released.await;
+    });
+    let filesystem = RemoteFileSystem::new(LazyRemoteExecServerClient::new(
+        ExecServerTransportParams::websocket_url(url, DEFAULT_REMOTE_EXEC_SERVER_CONNECT_TIMEOUT)));
+    let path = PathUri::parse("file:///remote/file").unwrap();
+    let root = PathUri::parse("file:///remote").unwrap();
+    for confined in [false, true] {
+        for (limit, length) in cases {
+            let result = if confined {
+                filesystem.read_file_bounded_confined(&path, &root, limit, None).await
+            } else {
+                filesystem.read_file_bounded(&path, limit, None).await
+            };
+            if length.is_some_and(|length| length > limit) {
+                assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::InvalidData);
+            } else {
+                assert_eq!(result.unwrap(), length.map(|length| vec![b'x'; length]));
+            }
+        }
+    }
+    let _ = release.send(());
+    server.await.unwrap();
+}
+
 fn non_native_cwd() -> PathUri {
-    let uri = "file:///usr/local/checkout";
+    let uri = if cfg!(windows) { "file:///usr/local/checkout" } else { "file:///C:/non-native/checkout" };
 
     PathUri::parse(uri).expect("non-native cwd URI")
 }

@@ -43,10 +43,7 @@ codex-home = { workspace = true }
 codex-install-context = { workspace = true }
 codex-exec-server = { workspace = true }
 codex-extension-api = { workspace = true }
-codex-external-agent-migration = { workspace = true }
-codex-external-agent-sessions = { workspace = true }
 codex-features = { workspace = true }
-codex-goal-extension = { workspace = true }
 codex-git-utils = { workspace = true }
 codex-file-watcher = { workspace = true }
 codex-hooks = { workspace = true }
@@ -70,7 +67,6 @@ codex-feedback = { workspace = true }
 codex-file-system = { workspace = true }
 codex-rmcp-client = { workspace = true }
 codex-rollout = { workspace = true }
-codex-rollout-trace = { workspace = true }
 codex-sandboxing = { workspace = true }
 codex-state = { workspace = true }
 codex-thread-store = { workspace = true }

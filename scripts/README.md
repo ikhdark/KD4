@@ -1,36 +1,24 @@
 # Repository scripts
 
-Scripts and their tests live together by owner:
+Keep executable paths small. Validation/test wrappers must save wall-clock time;
+policy gates, receipts, evidence ledgers, static oracles and audit inventories do
+not belong here.
 
-| Directory | Area |
-| --- | --- |
-| `benchmark_scripts/` | Compatibility helpers and non-audit regression fixtures still required by KD4 tooling; audit scripts moved to KDR |
-| `build/` | Rust runners, Cargo lanes, build diagnostics, and validation metrics |
-| `codex_package/` | Package construction, archives, and npm staging |
-| `common/` | Shared atomic I/O, process ownership, generation locks, and tool versions |
-| `install/` | Installation and local publishing |
-| `maintenance/` | Repository checks, formatting, source inventory, and Python test routing |
-| `schemas/` | Schema/protobuf validation helpers |
+- `build/`: warm Cargo lane reuse, shared sccache/linker setup, bounded process
+  execution and the opt-in LTO wall-clock benchmark. Lane commands execute once;
+  they do not publish validation receipts or enforce test-selection policy.
+- `maintenance/`: parallel formatting with explicit language/package selection.
+- `install/`: install and publish the CLI, Code Mode host and sandbox helpers.
+- `codex_package/`: construct and stage distributable packages.
+- `common/`: shared file locking, atomic writes and process-tree cleanup.
 
-The shared Python project and its lockfile remain here. Run commands from the
-repository root; direct Python entrypoints also resolve imports from their own
-location rather than the caller's working directory.
+Run Cargo directly from `codex-rs`, or use `just test-fast`,
+`just test-lane-package <package>` and `just cargo-lane <lane> ...` to reuse
+bounded warm build directories. Build any helper binaries required by the selected
+tests explicitly. Named target/gate runners and automatic consumer expansion
+have been removed.
 
-```powershell
-python -B scripts/maintenance/root_maintenance.py test-python --module scripts.build.test_rust_tool_env
-python -B scripts/maintenance/root_maintenance.py test-python --changed scripts/build/rust_tool_env.py
-python -I -B scripts/build/rust_test_runner.py list-targets
-```
-
-The `kd4-perf-snapshot` benchmark recipe was retired. Other `just` and package-manager recipe names are unchanged. Import helpers
-through their area, for example `from scripts.common import atomic_json`.
-Keep the area `__init__.py` files: standard unittest discovery needs them to
-recurse into the reorganized folders. Use the maintenance runner above for
-cross-environment execution, including Harbor's separate interpreter.
-Keep reusable scripts and regression tests. Run saved-session audits from KDR;
-live/build experiment launchers have been retired. The remaining compatibility
-modules preserve the imports used by validation ledgers, maintenance, and oracle
-tests; they do not provide benchmark launchers. Do not remove these shared helpers.
-
-Historical machine-readable audit results retain their original recorded paths
-and hashes; they are observations, not current invocation instructions.
+Formatting remains opt-in: `just fmt` selects Just and Rust;
+`just fmt-full` runs the independent formatters in parallel.
+The Python project retains only formatting and archive dependencies.
+Saved-session analysis belongs in KDR, not compatibility shims in this tree.

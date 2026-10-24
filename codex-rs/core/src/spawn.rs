@@ -1,4 +1,3 @@
-use codex_network_proxy::NetworkProxy;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_pty::WINDOWS_CREATE_SUSPENDED;
 use codex_utils_pty::WINDOWS_PROCESS_OPERATION_TIMEOUT;
@@ -44,7 +43,6 @@ pub(crate) struct SpawnChildRequest<'a> {
     pub arg0: Option<&'a str>,
     pub cwd: AbsolutePathBuf,
     pub network_sandbox_policy: NetworkSandboxPolicy,
-    pub network: Option<&'a NetworkProxy>,
     pub stdio_policy: StdioPolicy,
     pub env: HashMap<String, String>,
 
@@ -67,15 +65,11 @@ pub(crate) async fn spawn_child_with_observation_async(
         arg0,
         cwd,
         network_sandbox_policy,
-        network,
         stdio_policy,
         mut env,
         creation_flags,
     } = request;
 
-    if let Some(network) = network {
-        network.apply_to_env(&mut env);
-    }
 
     apply_network_sandbox_policy_to_env(&mut env, network_sandbox_policy);
     trace_spawn_child(

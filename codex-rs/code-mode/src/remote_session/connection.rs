@@ -32,7 +32,6 @@ use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
-use tracing::debug;
 use tracing::warn;
 
 use self::driver::ConnectionDriver;
@@ -53,6 +52,7 @@ const IPC_CHANNEL_CAPACITY: usize = 128;
 // connection, so it must not fill below that bound.
 const OUTGOING_FRAME_CAPACITY: usize = 2 * MAX_IN_FLIGHT_REQUESTS + MAX_PENDING_DELEGATE_REQUESTS;
 const HOST_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+const HOST_RESPONSE_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
 const OPEN_SESSION_TIMEOUT: Duration = Duration::from_secs(10);
 const TERMINATE_TIMEOUT: Duration = Duration::from_secs(10);
 const SHUTDOWN_SESSION_TIMEOUT: Duration = Duration::from_secs(15);
@@ -483,8 +483,10 @@ impl Connection {
             operation,
             armed: false,
         };
+        let mut submitted = false;
         let result = tokio::time::timeout(timeout, async {
             self.send(command).await?;
+            submitted = true;
             // No await separates command acceptance from cleanup ownership.
             // OpenSession retains its existing abandoned-session cleanup.
             accepted.armed = destructive;
@@ -494,6 +496,9 @@ impl Connection {
         accepted.armed = false;
         match result {
             Ok(result) => result,
+            Err(_) if !submitted => Err(format!(
+                "timed out submitting code-mode request to {operation}; no command was accepted"
+            )),
             Err(_) => {
                 let reason = format!(
                     "timed out waiting for code-mode host to {operation}; effects are uncertain; closing the unresponsive host connection"
@@ -547,14 +552,22 @@ impl Drop for Connection {
 impl ConnectionSupervisor {
     async fn run(mut self) {
         let mut child_exited = false;
+        let mut reader_finished = false;
+        let mut driver_finished = false;
         let reason = tokio::select! {
             biased;
             _ = self.cancellation.cancelled() => failure_message(&self.failure),
-            result = &mut self.driver_task => match result {
-                Ok(()) => "code-mode connection driver exited unexpectedly".to_string(),
-                Err(err) => format!("code-mode connection driver task failed: {err}"),
+            result = &mut self.driver_task => {
+                driver_finished = true;
+                match result {
+                    Ok(()) => "code-mode connection driver exited unexpectedly".to_string(),
+                    Err(err) => format!("code-mode connection driver task failed: {err}"),
+                }
             },
-            result = &mut self.reader_task => task_failure("reader", result),
+            result = &mut self.reader_task => {
+                reader_finished = true;
+                task_failure("reader", result)
+            },
             result = &mut self.writer_task => task_failure("writer", result),
             result = self.child.wait() => {
                 child_exited = true;
@@ -565,12 +578,39 @@ impl ConnectionSupervisor {
             }
         };
         mark_connection_dead(&self.alive, &self.failure, reason.clone());
-        let _ = self.event_tx.try_send(DriverEvent::Failed(reason));
+        if !driver_finished && !self.cancellation.is_cancelled() {
+            // Exit closes admission, not response custody. Drain stdout before
+            // queueing retirement behind the reader's already-decoded messages.
+            // Inherited pipes or a stuck driver must not delay explicit teardown.
+            let drain = drain_host_responses(
+                reader_finished, &mut self.reader_task, &self.event_tx,
+                &mut self.driver_task, reason,
+            );
+            tokio::select! {
+                biased;
+                _ = self.cancellation.cancelled() => {},
+                _ = tokio::time::timeout(HOST_RESPONSE_DRAIN_TIMEOUT, drain) => {},
+            }
+        }
         self.cancellation.cancel();
         if !child_exited {
             kill_and_reap(&mut self.child, &self.managed).await;
         }
     }
+}
+
+async fn drain_host_responses(
+    reader_finished: bool,
+    reader_task: &mut JoinHandle<Result<(), String>>,
+    events: &mpsc::Sender<DriverEvent>,
+    driver_task: &mut JoinHandle<()>,
+    reason: String,
+) {
+    if !reader_finished {
+        let _ = reader_task.await;
+    }
+    let _ = events.send(DriverEvent::Failed(reason)).await;
+    let _ = driver_task.await;
 }
 
 async fn drive_writer<W: tokio::io::AsyncWrite + Unpin>(
@@ -649,6 +689,31 @@ fn process_has_console() -> bool {
 mod tests {
     use super::*;
     use codex_code_mode_protocol::host::SessionId;
+
+    #[tokio::test]
+    async fn retiring_binding_keeps_connection_until_cleanup_custody_is_released() {
+        let (command_tx, _commands) = mpsc::channel(1);
+        let (execute_claim_tx, _claims) = mpsc::unbounded_channel();
+        let cancellation = CancellationToken::new();
+        let connection = Arc::new(Connection {
+            observation: Default::default(), command_tx, execute_claim_tx,
+            alive: Arc::new(AtomicBool::new(false)),
+            failure: Arc::new(std::sync::Mutex::new(None)), cancellation: cancellation.clone(),
+        });
+        let weak = Arc::downgrade(&connection);
+        let session = super::super::ProcessOwnedCodeModeSession::new();
+        let binding = super::super::SessionBinding {
+            connection, remote: RemoteSession { id: SessionId::new("retiring").unwrap(), generation: 1 },
+            cleanup: SessionCleanup::new(),
+        };
+        session.inner.retain_cleanup(&binding);
+        drop(binding);
+        assert!(weak.upgrade().is_some());
+        assert!(!cancellation.is_cancelled(), "replacement must not abort the stdout drain");
+        session.inner.retired_cleanups.lock().unwrap().clear();
+        assert!(weak.upgrade().is_none());
+        assert!(cancellation.is_cancelled());
+    }
 
     #[tokio::test]
     async fn session_wait_keeps_host_result_when_observer_drops_before_or_after_send() {
@@ -979,6 +1044,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn unadmitted_termination_cancellation_preserves_connection() {
+        for expire in [false, true] {
         let (command_tx, mut commands) = mpsc::channel(1);
         let (execute_claim_tx, _claims) = mpsc::unbounded_channel();
         let connection = Connection {
@@ -1006,7 +1072,12 @@ mod tests {
         let mut termination =
             Box::pin(connection.terminate(remote, CellId::new("unadmitted".into())));
         assert!(futures::poll!(&mut termination).is_pending());
-        drop(termination);
+        if expire {
+            let error = termination.await.unwrap_err();
+            assert!(error.contains("no command was accepted"), "{error}");
+        } else {
+            drop(termination);
+        }
 
         assert!(
             connection.is_alive(),
@@ -1022,6 +1093,7 @@ mod tests {
             commands.try_recv(),
             Err(mpsc::error::TryRecvError::Empty)
         ));
+        }
     }
 
     #[tokio::test]

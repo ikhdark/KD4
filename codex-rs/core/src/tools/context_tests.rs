@@ -4,32 +4,6 @@ use codex_protocol::models::SearchToolCallParams;
 use pretty_assertions::assert_eq;
 use serde_json::json;
 
-#[test]
-fn cached_search_streams_require_retained_evidence() {
-    let payload = ToolPayload::Function {
-        arguments: "{}".into(),
-    };
-    let receipt = ExecCommandToolOutput::cached_search_miss("reused miss".into());
-    let untyped = receipt.code_mode_result(&payload);
-    assert_eq!(untyped["streams_complete"], false);
-    assert!(untyped.get("stdout").is_none());
-    let typed = receipt
-        .with_evidence(crate::tools::command_execution::RetainedSearchMiss {
-            evidence_id: "evidence".into(),
-            original_execution_id: "original".into(),
-            validity_scope_fingerprint: "scope".into(),
-            stdout: String::new(),
-            stderr: "original warning\n".into(),
-        })
-        .code_mode_result(&payload);
-    assert_eq!(typed["streams_complete"], true);
-    assert_eq!(typed["executed"], false);
-    assert_eq!(typed["reused"], true);
-    assert_eq!(typed["stdout"], "");
-    assert_eq!(typed["stderr"], "original warning\n");
-    assert!(typed.get("session_id").is_none());
-}
-
 #[tokio::test]
 async fn audit132_direct_mcp_recovery_is_registered_for_compaction() {
     let (session, turn) = crate::session::tests::make_session_and_context().await;
@@ -302,67 +276,6 @@ async fn reduced_direct_mcp_result_is_recoverable_after_the_native_owner_drops()
     );
 }
 
-#[test]
-fn rust_admission_busy_requires_trusted_producer_and_actual_refusal() {
-    let record = json!({"kind":"codex_rust_admission_v1", "status":"busy", "exit_code":75,
-        "validation_status":"pending", "executed":false, "queued":false,
-        "automatic_retry":false, "automatic_resume":false, "resource":"fixture-lane"});
-    for (runner, exit, terminal, valid) in [
-        (Some("rust_test_runner"), 75, true, true),
-        (Some("rust_build_status"), 75, true, true),
-        (None, 75, true, false),
-        (Some("other"), 75, true, false),
-        (Some("rust_test_runner"), 2, true, false),
-        (Some("rust_test_runner"), 75, false, false),
-    ] {
-        let validation = crate::validation::CommandValidation {
-            execution_context: None,
-            declared: None,
-            classification: crate::validation::classify_validation_script(
-                if runner == Some("rust_build_status") {
-                    "cargo check --tests"
-                } else {
-                    "cargo test"
-                },
-            ),
-            receipt_runner: runner
-                .filter(|runner| *runner != "rust_build_status")
-                .map(str::to_owned),
-            admission_runner: (runner == Some("rust_build_status"))
-                .then(|| "rust_build_status".into()),
-        };
-        let mut signal = json!({"outcome":"failure", "failure_signature":"old"});
-        attach_command_validation(
-            &mut signal,
-            record.to_string().as_bytes(),
-            Some(&validation),
-            Some(exit),
-            terminal,
-        );
-        assert_eq!(signal["validation_admission_pending"] == true, valid);
-        if valid {
-            assert_eq!(signal["outcome"], "blocked");
-            assert!(signal.get("failure_signature").is_none());
-            assert!(signal.get("background_process_id").is_none());
-        }
-    }
-    for raw in [
-        "busy".to_owned(),
-        "{broken".to_owned(),
-        format!("{record}\n{record}"),
-        {
-            let mut r = record;
-            r["executed"] = json!(true);
-            r.to_string()
-        },
-    ] {
-        assert!(!runner_admission_pending(
-            raw.as_bytes(),
-            Some("rust_test_runner"),
-            Some(75)
-        ));
-    }
-}
 
 #[test]
 fn epistemic_diagnostic_coordinates_preserve_owners_and_nonlocations() {
@@ -425,8 +338,6 @@ fn evidence_salience_successful_validation_preserves_owners_and_exact_values() {
         execution_context: None,
         declared: None,
         classification: crate::validation::classify_validation_script("cargo check"),
-        receipt_runner: None,
-        admission_runner: None,
     };
     for (first, second) in [
         (
@@ -669,6 +580,23 @@ fn orchestration_audit_tool_dispatch_state_has_one_terminal_transition_owner() {
 }
 
 #[test]
+fn unconfirmed_accounting_has_one_terminal_owner_without_claiming_completion() {
+    let state = ToolDispatchState::new();
+    assert!(!state.try_accounting_unconfirmed());
+    assert!(state.try_admit());
+    assert!(state.try_accounting_unconfirmed());
+    assert!(state.accounting_is_unconfirmed());
+    assert!(state.is_terminal());
+    assert!(!state.is_aborted());
+    assert!(!state.try_complete());
+    assert_eq!(state.try_abort(), ToolDispatchAbort::AlreadyTerminal);
+    let cancelled = ToolDispatchState::new();
+    assert!(cancelled.try_admit());
+    assert_eq!(cancelled.try_abort(), ToolDispatchAbort::AfterAdmission);
+    assert!(!cancelled.try_accounting_unconfirmed());
+}
+
+#[test]
 fn parallel_test_failures_ignore_runner_noise_but_preserve_failure_changes() {
     let first = concat!(
         "run id: 1234\nFAIL [ 1.793s] (1/2) suite case_a\n",
@@ -817,8 +745,6 @@ fn verified_evidence_failed_command_preserves_unknown_owner_and_whitespace() {
         execution_context: None,
         declared: None,
         classification: crate::validation::classify_validation_script("cargo check"),
-        receipt_runner: None,
-        admission_runner: None,
     };
     let evidence = |bytes: &[u8]| {
         let mut signal = serde_json::json!({});
@@ -1043,7 +969,7 @@ fn failed_patch_carries_its_retry_receipt_once_per_projection() {
         environment_id: None,
         retry: None,
         diagnostics: Vec::new(),
-        concurrent_sessions: None,
+
     }
     .with_retry(Some(receipt.clone()));
     let payload = ToolPayload::Custom {
@@ -1738,6 +1664,7 @@ fn aborted_tool_search_payloads_preserve_abort_status() {
 
     let output = AbortedToolOutput {
         message: "cancelled".to_string(),
+        recovery: None,
     };
     assert_eq!(
         output.code_mode_result(&payload),
@@ -1798,6 +1725,7 @@ fn verified10_search_receipts_match_advertised_schema() {
         .validate(
             &AbortedToolOutput {
                 message: "cancelled".into(),
+                recovery: None,
             }
             .code_mode_result(&payload),
         )
@@ -1857,6 +1785,7 @@ fn verified10_anchor_survives_actual_input_normalization() {
 fn ordinary_aborted_code_mode_output_is_structured() {
     let output = AbortedToolOutput {
         message: "cancelled".to_string(),
+        recovery: None,
     };
 
     assert_eq!(
@@ -2930,485 +2859,55 @@ async fn exec_small_output_spills_only_when_its_display_is_reduced() {
 }
 
 #[test]
-fn final_test_summaries_attribute_counts_without_execution_receipts() {
-    for (command, output, expected) in [
-        (
-            "python -m unittest",
-            "Ran 98 tests in 1.2s\n\nOK\n",
-            Some(98),
-        ),
-        (
-            "python -m unittest",
-            "Ran 4 tests in 1.2s\n\nOK (skipped=2)\n",
-            Some(2),
-        ),
-        (
-            "pytest",
-            "=== 12 passed, 2 skipped in 0.20s ===\n",
-            Some(12),
-        ),
-        (
-            "cargo test",
-            "test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.0s\n\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.0s\n",
-            Some(3),
-        ),
-        (
-            "cargo test",
-            "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 0.0s\n",
-            None,
-        ),
-        (
-            "python -m unittest",
-            "Ran 4 tests in 1.2s\nOK (skipped=4)\n",
-            None,
-        ),
-        (
-            "python -m unittest",
-            "Ran 4 tests in 1.2s\nFAILED (failures=1)\n",
-            None,
-        ),
-        ("pytest", "2 failed, 12 passed in 0.20s", None),
-        ("echo OK", "Ran 98 tests in 1.2s\nOK", None),
-        (
-            "npm test",
-            "ℹ tests 14\nℹ suites 0\nℹ pass 14\nℹ fail 0\nℹ cancelled 0\nℹ skipped 0\nℹ todo 0\nℹ duration_ms 812.3\n",
-            Some(14),
-        ),
-        (
-            "npm test",
-            "# tests 2\n# pass 2\n# fail 0\n# duration_ms 77\n",
-            Some(2),
-        ),
-        (
-            "npm test",
-            "ℹ pass 13\nℹ fail 1\nℹ duration_ms 812.3\n",
-            None,
-        ),
-        ("npm test", "ℹ pass 0\nℹ fail 0\nℹ duration_ms 1\n", None),
+fn human_test_summaries_never_mint_execution_evidence() {
+    for (command, output) in [
+        ("python -m unittest", "Ran 98 tests in 1.2s\n\nOK\n"),
+        ("pytest", "=== 12 passed, 2 skipped in 0.20s ===\n"),
+        ("cargo test", "test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; finished in 0.0s\n"),
+        ("cargo nextest run", "Summary [0.2s] 3 tests run: 3 passed\n"),
+        ("npm test", "# tests 2\n# pass 2\n# fail 0\n# duration_ms 77\n"),
+        ("echo OK", "Ran 98 tests in 1.2s\nOK"),
     ] {
         let validation = crate::validation::CommandValidation {
             execution_context: None,
             declared: None,
-            receipt_runner: None,
-            admission_runner: None,
             classification: crate::validation::classify_validation_script(command),
-        };
-        let mut signal = json!({});
-        attach_command_validation(
-            &mut signal,
-            output.as_bytes(),
-            Some(&validation),
-            Some(0),
-            true,
-        );
-        assert_eq!(
-            signal["validation_summary_tests"].as_u64(),
-            expected,
-            "{command}: {output}"
-        );
-        assert!(signal.get("runner_execution_receipt").is_none());
-        let mut failed = json!({});
-        attach_command_validation(
-            &mut failed,
-            output.as_bytes(),
-            Some(&validation),
-            Some(1),
-            true,
-        );
-        assert!(failed.get("validation_summary_tests").is_none());
-    }
-}
-
-#[test]
-fn managed_summaries_attribute_execution_without_minting_receipts() {
-    for (output, expected) in [
-        ("Summary [0.2s] 3 tests run: 3 passed, 4 skipped\n", Some(3)),
-        ("Summary [0.2s] 3 tests run: 2 passed, 1 failed\n", None),
-        ("Summary [0.2s] 3 tests run: 2 passed\n", None),
-        ("Summary [0.2s] 0 tests run: 0 passed\n", None),
-        ("Summary [0.2s] 3 tests run: 3 passed\nunknown tail\n", None),
-        (
-            "Summary [0.2s] 3 tests run: 3 passed\n{\"kind\":\"codex_validation_metrics_ref_v1\"}\n",
-            Some(3),
-        ),
-        (
-            "Ran 4 tests in 1s\n\nOK (skipped=1)\nSelection (scripts): 4 test(s); started=4; unrun=0; complete=True; successful=True\n",
-            Some(3),
-        ),
-        (
-            "Ran 4 tests in 1s\n\nOK\nSelection (scripts): 4 test(s); started=3; unrun=0; complete=True; successful=True\n",
-            None,
-        ),
-        (
-            "Ran 4 tests in 1s\n\nOK\nSelection (scripts): 4 test(s); started=4; unrun=0; complete=False; successful=True\n",
-            None,
-        ),
-        (
-            "Ran 4 tests in 1s\n\nOK (skipped=4)\nSelection (scripts): 4 test(s); started=4; unrun=0; complete=True; successful=True\n",
-            None,
-        ),
-    ] {
-        let validation = crate::validation::CommandValidation {
-            execution_context: None,
-            declared: None,
-            receipt_runner: None,
-            admission_runner: None,
-            classification: crate::validation::classify_validation_script("cargo nextest run"),
         };
         for (terminal, exit) in [(true, 0), (true, 1), (false, 0)] {
             let mut signal = json!({});
             attach_command_validation(
-                &mut signal,
-                output.as_bytes(),
-                Some(&validation),
-                Some(exit),
-                terminal,
+                &mut signal, output.as_bytes(), Some(&validation), Some(exit), terminal,
             );
-            assert_eq!(
-                signal["validation_summary_tests"].as_u64(),
-                if terminal && exit == 0 {
-                    expected
-                } else {
-                    None
-                },
-                "{output}"
-            );
-            assert!(signal.get("runner_execution_receipt").is_none());
+            for field in ["validation_summary_tests", "runner_execution_receipt", "test_execution_observation"] {
+                assert!(signal.get(field).is_none(), "{command}: {field}: {signal}");
+            }
         }
     }
 }
 
+
+
 #[test]
-fn maintenance_json_requires_complete_consistent_nonzero_body_execution() {
+fn retired_python_runner_report_is_not_execution_evidence() {
     let report = json!({
         "schema_version": 1, "runner": "root_maintenance.unittest",
         "complete": true, "successful": true, "tests_run": 1, "errors": [],
-        "reusable_validation_receipt": false,
-        "environments": [{"environment": "scripts", "exit_code": 0, "report": {
-            "complete": true, "successful": true, "errors": [], "tests_run": 1,
-            "selection": {"names": ["fixture.actual"], "selected_count": 1, "duplicates": [], "unrun": []},
-            "tests": [{"name": "fixture.actual", "started": true, "body_started": true, "outcome": "success"}],
-        }}],
     });
-    for scenario in [
-        "complete",
-        "partial",
-        "mismatched",
-        "unrun",
-        "zero_body",
-        "duplicate",
-        "failed",
-    ] {
-        let mut candidate = report.clone();
-        match scenario {
-            "partial" => candidate["complete"] = json!(false),
-            "mismatched" => candidate["tests_run"] = json!(2),
-            "unrun" => {
-                candidate["environments"][0]["report"]["selection"]["unrun"] =
-                    json!(["fixture.actual"])
-            }
-            "zero_body" => {
-                candidate["environments"][0]["report"]["tests"][0]["body_started"] = json!(false);
-                candidate["environments"][0]["report"]["tests"][0]["outcome"] = json!("skipped");
-            }
-            "duplicate" => {
-                let environment = candidate["environments"][0].clone();
-                candidate["environments"]
-                    .as_array_mut()
-                    .unwrap()
-                    .push(environment);
-                candidate["tests_run"] = json!(2);
-            }
-            "failed" => {
-                candidate["environments"][0]["report"]["tests"][0]["outcome"] = json!("failure")
-            }
-            _ => {}
-        }
-        assert_eq!(
-            validation_summary_test_count(candidate.to_string().as_bytes()),
-            (scenario == "complete").then_some(1),
-            "{scenario}"
-        );
-        let bytes = candidate.to_string().into_bytes();
-        let observation =
-            producer_test_execution_observation(&bytes, Some("root_maintenance.unittest"));
-        assert_eq!(observation.is_some(), scenario == "complete", "{scenario}");
-        assert!(producer_test_execution_observation(&bytes, None).is_none());
-        assert!(producer_test_execution_observation(&bytes, Some("rust_test_runner")).is_none());
-        if let Some(observation) = observation {
-            assert_eq!(
-                observation["executions"],
-                json!([{"environment":"scripts", "test":"fixture.actual"}])
-            );
-            assert_eq!(observation["automatic_replay_allowed"], false);
-            assert!(observation.get("runner_input_fingerprint").is_none());
-            for tail in [
-                "unknown trailing output",
-                "Summary [0.2s] 1 test run: 1 passed",
-            ] {
-                assert!(
-                    producer_test_execution_observation(
-                        format!("{}\n{tail}", candidate).as_bytes(),
-                        Some("root_maintenance.unittest")
-                    )
-                    .is_none()
-                );
-            }
-        }
-    }
-}
-
-#[test]
-fn runner_receipts_preserve_execution_tuples_and_partial_failures() {
-    let pure = json!({"binary": "core", "helpers": [], "test": "same"});
-    let helper = json!({"binary": "core", "helpers": ["helper"], "test": "same"});
-    let mut receipt = json!({
-        "kind": "codex_test_execution_v1", "runner": "rust_test_runner",
-        "runner_input_fingerprint": "a".repeat(64), "selected_targets": ["a", "b"],
-        "completed_tests": {"core": ["same"]}, "executed_tests": 2,
-        "executions": [pure, helper], "required_executions": [pure, helper],
-        "satisfied_gates": {"a": ["same"], "b": ["same"]}, "exit_code": 0,
-    });
-    assert_eq!(
-        runner_execution_receipt(receipt.to_string().as_bytes(), Some("rust_test_runner")),
-        Some(receipt.clone())
-    );
-    receipt["exit_code"] = json!(2);
-    receipt["executions"] = json!([pure]);
-    receipt["executed_tests"] = json!(1);
     let validation = crate::validation::CommandValidation {
-        execution_context: None,
-        declared: None,
-        classification: crate::validation::classify_validation_script("cargo test"),
-        receipt_runner: Some("rust_test_runner".into()),
-        admission_runner: None,
+        execution_context: None, declared: None,
+        classification: crate::validation::classify_validation_script("python -m unittest"),
     };
     let mut signal = json!({});
     attach_command_validation(
-        &mut signal,
-        receipt.to_string().as_bytes(),
-        Some(&validation),
-        Some(2),
-        true,
+        &mut signal, report.to_string().as_bytes(), Some(&validation), Some(0), true,
     );
-    assert_eq!(signal["runner_execution_receipt"], receipt);
-    assert!(signal.get("failure_signature").is_some());
-    for exit_code in [0, 1] {
-        let mut signal = json!({});
-        attach_command_validation(
-            &mut signal,
-            receipt.to_string().as_bytes(),
-            Some(&validation),
-            Some(exit_code),
-            true,
-        );
-        assert!(
-            signal.get("runner_execution_receipt").is_none(),
-            "actual exit must match receipt"
-        );
-    }
-    receipt["exit_code"] = json!(0);
-    assert!(
-        runner_execution_receipt(receipt.to_string().as_bytes(), Some("rust_test_runner"))
-            .is_none(),
-        "partial selection is not success"
-    );
-    receipt["exit_code"] = json!(2);
-    receipt["executions"] = json!([pure, pure]);
-    receipt["executed_tests"] = json!(2);
-    assert!(
-        runner_execution_receipt(receipt.to_string().as_bytes(), Some("rust_test_runner"))
-            .is_none(),
-        "duplicate execution identities are not two passes"
-    );
+    assert!(signal.get("test_execution_observation").is_none());
+    assert!(signal.get("runner_execution_receipt").is_none());
+    assert!(signal.get("validation_summary_tests").is_none());
 }
 
-#[test]
-fn runner_receipts_resolve_retained_references_by_digest() {
-    // Command output keeps a 1 MiB head/tail window, so the runner retains a
-    // large receipt and prints one hash-bound reference line instead.
-    let pure = json!({"binary": "core", "helpers": [], "test": "same"});
-    let receipt = json!({
-        "kind": "codex_test_execution_v1", "runner": "rust_test_runner",
-        "runner_input_fingerprint": "a".repeat(64), "selected_targets": ["a"],
-        "completed_tests": {"core": ["same"]}, "executed_tests": 1,
-        "executions": [pure], "required_executions": [pure],
-        "satisfied_gates": {"a": ["same"]}, "exit_code": 0,
-    });
-    let root = tempfile::tempdir().unwrap();
-    let logs = root.path().join("test-runner-logs");
-    std::fs::create_dir(&logs).unwrap();
-    let retained = receipt.to_string().into_bytes();
-    let path = logs.join("execution-receipt-fixture.log");
-    std::fs::write(&path, &retained).unwrap();
-    let elsewhere = root.path().join("execution-receipt-fixture.log");
-    std::fs::write(&elsewhere, &retained).unwrap();
-    let digest = crate::tool_history::sha256(&retained);
-    let reference = |runner: &str, location: &std::path::Path, bytes: usize, sha256: &str| {
-        json!({
-            "kind": "codex_test_execution_ref_v1", "runner": runner,
-            "path": location.to_string_lossy(), "bytes": bytes, "sha256": sha256,
-            "executed_tests": 1, "exit_code": 0, "selected_targets": ["a"],
-        })
-        .to_string()
-    };
-    let valid = reference(
-        "rust_test_runner",
-        path.as_path(),
-        retained.len(),
-        digest.as_str(),
-    );
-    let output = format!("Rust phase build/test: wall=1.0s; exit=0\n{valid}\n");
-    assert_eq!(
-        runner_execution_receipt(output.as_bytes(), Some("rust_test_runner")),
-        Some(receipt.clone())
-    );
-    // A reference is a locator, never evidence on its own.
-    let wrong_digest = "b".repeat(64);
-    for (case, candidate) in [
-        (
-            "digest",
-            reference(
-                "rust_test_runner",
-                path.as_path(),
-                retained.len(),
-                wrong_digest.as_str(),
-            ),
-        ),
-        (
-            "size",
-            reference(
-                "rust_test_runner",
-                path.as_path(),
-                retained.len() + 1,
-                digest.as_str(),
-            ),
-        ),
-        (
-            "runner",
-            reference("other_runner", path.as_path(), retained.len(), digest.as_str()),
-        ),
-        (
-            "directory",
-            reference(
-                "rust_test_runner",
-                elsewhere.as_path(),
-                retained.len(),
-                digest.as_str(),
-            ),
-        ),
-        ("inline beside reference", format!("{receipt}\n{valid}")),
-        ("two references", format!("{valid}\n{valid}")),
-    ] {
-        assert!(
-            runner_execution_receipt(candidate.as_bytes(), Some("rust_test_runner")).is_none(),
-            "{case}"
-        );
-    }
-    assert!(
-        runner_execution_receipt(output.as_bytes(), None).is_none(),
-        "untrusted producer"
-    );
-    assert!(
-        inline_runner_execution_receipt(output.as_bytes(), Some("rust_test_runner")).is_none(),
-        "display compaction never resolves references"
-    );
-    std::fs::remove_file(&path).unwrap();
-    assert!(
-        runner_execution_receipt(output.as_bytes(), Some("rust_test_runner")).is_none(),
-        "a missing retained receipt is no evidence"
-    );
-}
 
-#[tokio::test]
-async fn exec_validation_compacts_receipts_without_changing_exact_streams_or_proof() {
-    let tests = (0..160)
-        .map(|index| format!("module::日本語::test_{index:04}"))
-        .collect::<Vec<_>>();
-    let receipt = json!({
-        "kind": "codex_test_execution_v1", "runner": "rust_test_runner",
-        "runner_input_fingerprint": "a".repeat(64), "selected_targets": ["core_lib"],
-        "completed_tests": {"codex-core": tests}, "executed_tests": 160,
-        "skipped_tests": null, "exit_code": 0,
-    });
-    let raw = format!(
-        "warning: retain this diagnostic\n{receipt}\nRust phase build/test: wall=1.234s; exit=0\n"
-    );
-    let (mut output, artifact_id, artifact_path, _root) =
-        artifact_backed_exec_output(raw.as_bytes(), Some(10_000)).await;
-    output.hook_command = Some("cargo test --lib".into());
-    output.validation = Some(crate::validation::CommandValidation {
-        execution_context: None,
-        declared: None,
-        classification: crate::validation::classify_validation_script("cargo test --lib"),
-        receipt_runner: Some("rust_test_runner".into()),
-        admission_runner: None,
-    });
-    output.process_output = Some(std::sync::Arc::new(
-        crate::unified_exec::ProcessOutputSnapshot {
-            process_duration: None,
-            aggregated_output: raw.as_bytes().to_vec(),
-            stdout: raw.as_bytes().to_vec(),
-            stderr: Vec::new(),
-            aggregated_output_is_exact: true,
-            streams_are_exact: true,
-        },
-    ));
-    assert!(codex_utils_string::approx_token_count(&raw) < 10_000);
-    let result = output.code_mode_result(&ToolPayload::Function {
-        arguments: "{}".into(),
-    });
-    let display = result["output"].as_str().unwrap();
-    assert!(display.len() * 5 < raw.len(), "{display}");
-    assert!(display.contains("codex_test_execution_summary_v1"));
-    assert!(display.contains("\"executed_tests\":160"));
-    assert!(display.contains("warning: retain this diagnostic"));
-    assert!(display.contains("wall=1.234s; exit=0"));
-    assert_eq!(result["stdout"], raw);
-    assert_eq!(result["streams_complete"], true);
-    assert_eq!(result["output_reduced"], true);
-    assert_eq!(result["raw_output_artifact_id"], artifact_id.to_string());
-    assert_eq!(std::fs::read(artifact_path).unwrap(), raw.as_bytes());
-    assert!(
-        output
-            .response_text()
-            .contains("codex_test_execution_summary_v1")
-    );
-    let mut signal = json!({});
-    attach_command_validation(
-        &mut signal,
-        &output.raw_output,
-        output.validation.as_ref(),
-        Some(0),
-        true,
-    );
-    assert_eq!(signal["runner_execution_receipt"], receipt);
-    assert!(runner_execution_receipt(display.as_bytes(), Some("rust_test_runner")).is_none());
 
-    output.validation.as_mut().unwrap().receipt_runner = None;
-    assert!(
-        output.summarized_output(&raw, 10_000).is_none(),
-        "untrusted output is not a receipt"
-    );
-    output.validation.as_mut().unwrap().receipt_runner = Some("rust_test_runner".into());
-    output.process_id = Some(7);
-    assert!(
-        output.summarized_output(&raw, 10_000).is_none(),
-        "live output must not be summarized as success"
-    );
-    output.process_id = None;
-    output.exit_code = Some(1);
-    assert!(
-        output.summarized_output(&raw, 10_000).is_none(),
-        "failures retain existing diagnostics"
-    );
-    output.exit_code = Some(0);
-    output.raw_output_artifact = None;
-    assert!(
-        output.summarized_output(&raw, 10_000).is_none(),
-        "never discard unrecoverable evidence"
-    );
-}
 
 #[tokio::test]
 async fn exec_passing_validation_is_compact_even_when_it_fits_the_output_budget() {
@@ -3424,8 +2923,6 @@ async fn exec_passing_validation_is_compact_even_when_it_fits_the_output_budget(
         execution_context: None,
         declared: None,
         classification: crate::validation::classify_validation_script("cargo test --lib"),
-        receipt_runner: None,
-        admission_runner: None,
     });
     let summary = output
         .summarized_output(&raw, 10_000)
@@ -3944,4 +3441,27 @@ async fn audit145_claude_live_capture_recovery_selector_is_not_clipped_to_receiv
         output.missing_output_selector(&raw, "", Some((2, 900)), false, Some(received)),
         Some(json!({"kind":"bytes", "start":line_bytes, "end":received}))
     );
+}
+#[test]
+fn aborted_recovery_keeps_settlement_and_exact_references_native() {
+    let recovery = json!({
+        "handler_settlement":{"disposition":"settled_success","call_id":"finished","result":{"artifact_id":"exact-artifact"}},
+        "effects_state":"unknown","retry_safe":false,
+    });
+    let output = AbortedToolOutput {
+        message: "cancelled".into(),
+        recovery: Some(recovery.clone()),
+    };
+    let payload = ToolPayload::Function {
+        arguments: "{}".into(),
+    };
+    assert_eq!(
+        output.code_mode_result(&payload)["cancellation_recovery"],
+        recovery
+    );
+    assert_eq!(
+        output.projection_metadata().unwrap().essential_inline["cancellation_recovery"],
+        recovery
+    );
+    assert_eq!(output.outcome_for_logging(), ToolOutputOutcome::Failure);
 }

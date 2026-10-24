@@ -61,7 +61,6 @@ codex-execpolicy = { workspace = true }
 codex-git-utils = { workspace = true }
 codex-hooks = { workspace = true }
 codex-http-client = { workspace = true }
-codex-network-proxy = { workspace = true }
 codex-otel = { workspace = true }
 codex-plugin = { workspace = true }
 codex-model-provider = { workspace = true }
@@ -69,7 +68,6 @@ codex-protocol = { workspace = true }
 codex-response-debug-context = { workspace = true }
 codex-prompts = { workspace = true }
 codex-rollout = { workspace = true }
-codex-rollout-trace = { workspace = true }
 codex-rmcp-client = { workspace = true }
 codex-sandboxing = { workspace = true }
 codex-state = { workspace = true }

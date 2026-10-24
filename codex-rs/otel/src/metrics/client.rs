@@ -375,6 +375,10 @@ impl MetricsClientInner {
 pub struct MetricsClient(std::sync::Arc<MetricsClientInner>);
 
 impl MetricsClient {
+    pub(crate) fn same_client(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+
     /// Build a metrics client from configuration and validate defaults.
     pub fn new(config: MetricsConfig) -> Result<Self> {
         let MetricsConfig {

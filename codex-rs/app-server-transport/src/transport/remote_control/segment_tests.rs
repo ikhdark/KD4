@@ -344,6 +344,30 @@ fn stale_and_duplicate_chunks_preserve_the_current_message() {
     }
 }
 
+#[tokio::test(start_paused = true)]
+async fn abandoned_unknown_assembly_expires_despite_duplicate_chunks() {
+    use super::segment::REMOTE_CONTROL_SEGMENT_ASSEMBLY_TIMEOUT;
+    let mut reassembler = ClientSegmentReassembler::default();
+    let client = ClientId("unknown".into());
+    let a = StreamId("a".into());
+    let b = StreamId("b".into());
+    let prefix = |stream: &StreamId| chunk_envelope(
+        client.clone(), Some(stream.clone()), 1, 0, 2,
+        super::segment::REMOTE_CONTROL_REASSEMBLED_MAX_BYTES, b"{",
+    );
+    assert!(matches!(reassembler.observe(prefix(&a)), ClientSegmentObservation::Pending));
+    tokio::time::advance(REMOTE_CONTROL_SEGMENT_ASSEMBLY_TIMEOUT / 2).await;
+    assert!(matches!(reassembler.observe(prefix(&a)), ClientSegmentObservation::Dropped));
+    reassembler.invalidate_stream(&client, &b);
+    assert!(matches!(reassembler.observe(prefix(&b)), ClientSegmentObservation::Dropped));
+    tokio::time::advance(REMOTE_CONTROL_SEGMENT_ASSEMBLY_TIMEOUT / 2).await;
+    // The same reassembler survives reconnect; admission itself expires unknown streams.
+    assert!(matches!(reassembler.observe(prefix(&b)), ClientSegmentObservation::Pending));
+    reassembler.expire_assemblies();
+    reassembler.invalidate_client(&client);
+    assert!(matches!(reassembler.observe(prefix(&a)), ClientSegmentObservation::Pending));
+}
+
 fn chunk_envelope(
     client_id: ClientId,
     stream_id: Option<StreamId>,
@@ -516,4 +540,27 @@ fn segmentation_rejects_exhausted_count_budget() {
         .expect_err("exhausting the finite count budget must fail");
     assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
     assert!(error.to_string().contains("segment count exceeds maximum"));
+}
+#[test]
+fn encoded_segments_preserve_escaped_metadata_and_decimal_boundaries() {
+    for seq_id in [9, 10, 99, 100, u64::MAX] {
+        let message = OutgoingMessage::AppServerNotification(ServerNotification::ConfigWarning(ConfigWarningNotification {
+            summary: "escaped \" unicode ☃ ".repeat(16 * 1024), details: None, path: None, range: None,
+        }));
+        let expected = serde_json::to_vec(&message).unwrap();
+        let envelope = ServerEnvelope {
+            event: ServerEvent::ServerMessage { message: Box::new(message) },
+            client_id: ClientId("\"\\\n☃".repeat(100)), stream_id: StreamId("\t雪".repeat(100)), seq_id,
+        };
+        let encoded = super::segment::encode_server_envelope_for_transport(envelope).unwrap();
+        let mut reconstructed = Vec::new();
+        for (envelope, payload) in encoded {
+            assert_eq!(payload, serde_json::to_string(&envelope).unwrap());
+            assert!(payload.len() <= REMOTE_CONTROL_SEGMENT_MAX_BYTES);
+            assert_eq!(envelope.seq_id, seq_id);
+            let ServerEvent::ServerMessageChunk { message_chunk_base64, .. } = envelope.event else { panic!("expected segment") };
+            reconstructed.extend(base64::engine::general_purpose::STANDARD.decode(message_chunk_base64).unwrap());
+        }
+        assert_eq!(reconstructed, expected);
+    }
 }

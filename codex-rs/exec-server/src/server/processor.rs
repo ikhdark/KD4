@@ -72,11 +72,18 @@ impl ConnectionProcessor {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             if self.stop.is_cancelled() {
-                return;
+                None
+            } else {
+                Some(connections.token())
             }
-            connections.token()
         };
-        let _owner = owner;
+        let Some(_owner) = owner else {
+            for task in connection.task_handles {
+                task.abort();
+                let _ = task.await;
+            }
+            return;
+        };
         run_connection_with_shutdown(
             connection,
             Arc::clone(&self.session_registry),
@@ -254,6 +261,13 @@ async fn run_connection_with_shutdown(
             }
             JsonRpcConnectionEvent::Message(message) => match message {
                 codex_exec_server_protocol::JSONRPCMessage::Request(request) => {
+                    if matches!(&request.id, codex_exec_server_protocol::RequestId::String(id) if id.len() > 4096) {
+                        if send_outbound(&outgoing_tx, RpcServerOutboundMessage::Error {
+                            request_id: request.id,
+                            error: invalid_request("JSON-RPC string request IDs must not exceed 4096 bytes; no operation started".into()),
+                        }, &cancelled).await.is_err() { break; }
+                        continue;
+                    }
                     let request_started_at = Instant::now();
                     let request_route = router.request_route(request.method.as_str());
                     let mut request_metrics = telemetry.request_started_at(
@@ -267,8 +281,7 @@ async fn run_connection_with_shutdown(
                         let control = initialized
                             && matches!(
                                 method,
-                                crate::protocol::EXEC_SIGNAL_METHOD
-                                    | crate::protocol::EXEC_TERMINATE_METHOD
+                                crate::protocol::EXEC_TERMINATE_METHOD
                                     | crate::protocol::HTTP_REQUEST_CANCEL_METHOD
                             );
                         let independent_read = initialized
@@ -452,7 +465,15 @@ async fn run_connection_with_shutdown(
                         } else {
                             None
                         };
-                        let predecessor = if admitted_terminate.is_some() {
+                        // Act on the exact stream present at admission, never a
+                        // same-named replacement reached by a deferred lookup.
+                        let admitted_http_cancel = if initialized && method == crate::protocol::HTTP_REQUEST_CANCEL_METHOD {
+                            Some(match serde_json::from_value::<crate::protocol::HttpRequestCancelParams>(request.params.clone().unwrap_or_default()) {
+                                Ok(params) => handler.cancel_http_body_stream(&params.request_id).await,
+                                Err(error) => Err(crate::rpc::invalid_params(error.to_string())),
+                            })
+                        } else { None };
+                        let predecessor = if admitted_terminate.is_some() || admitted_http_cancel.is_some() {
                             None
                         } else if initialized && method == crate::protocol::EXEC_WRITE_METHOD {
                             // A blocked terminal owns only its own FIFO. Starts
@@ -531,6 +552,8 @@ async fn run_connection_with_shutdown(
                                 };
                                 Some(process_response(request.id, result))
                             })
+                        } else if let Some(result) = admitted_http_cancel {
+                            Box::pin(async move { Some(process_response(request.id, result)) })
                         } else {
                             route(Arc::clone(&handler), request)
                         };
@@ -727,6 +750,17 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
     use std::time::Duration;
+
+    #[tokio::test]
+    async fn rejected_shutdown_connection_finishes_transport_tasks() {
+        let processor = super::ConnectionProcessor::new(test_runtime_paths());
+        processor.shutdown().await;
+        let (_silent_peer, reader) = tokio::io::duplex(64);
+        let connection = JsonRpcConnection::from_stdio(reader, tokio::io::sink(), "rejected-after-shutdown".into());
+        let tasks = connection.task_handles.iter().map(tokio::task::JoinHandle::abort_handle).collect::<Vec<_>>();
+        timeout(Duration::from_secs(1), processor.run_connection(connection, crate::telemetry::ConnectionTransport::Stdio)).await.unwrap();
+        assert!(tasks.iter().all(tokio::task::AbortHandle::is_finished));
+    }
 
     use codex_exec_server_protocol::JSONRPCMessage;
     use codex_exec_server_protocol::JSONRPCNotification;
@@ -1498,6 +1532,20 @@ mod tests {
             })
             .await
             .unwrap();
+            // Signals may wait on preparation but must not exhaust cleanup.
+            for request_id in 10..18 {
+                send_request(&mut writer, request_id, crate::protocol::EXEC_SIGNAL_METHOD,
+                    &crate::protocol::SignalParams { process_id: id.clone(), signal: crate::protocol::ProcessSignal::Interrupt }).await;
+            }
+            send_request(&mut writer, 19, crate::protocol::HTTP_REQUEST_CANCEL_METHOD,
+                &crate::protocol::HttpRequestCancelParams { request_id: "absent".into() }).await;
+            let mut pending = std::collections::VecDeque::new();
+            let _: () = timeout(
+                Duration::from_secs(1),
+                read_response_preserving_other_messages(&mut lines, 19, &mut pending),
+            )
+            .await
+            .expect("signals must not exhaust HTTP cleanup");
             send_request(
                 &mut writer,
                 3,
@@ -1508,7 +1556,7 @@ mod tests {
             )
             .await;
             let first: TerminateResponse =
-                timeout(Duration::from_secs(1), read_response(&mut lines, 3))
+                timeout(Duration::from_secs(1), read_response_preserving_other_messages(&mut lines, 3, &mut pending))
                     .await
                     .expect("control must not wait for preparation");
             assert!(first.running);
@@ -1520,22 +1568,33 @@ mod tests {
             )
             .await;
             let settled: TerminateResponse =
-                timeout(Duration::from_secs(1), read_response(&mut lines, 4))
+                timeout(Duration::from_secs(1), read_response_preserving_other_messages(&mut lines, 4, &mut pending))
                     .await
                     .unwrap();
             assert!(!settled.running);
             assert!(!forbidden.exists());
             drop(release);
             blocker.await.unwrap();
-            let line = timeout(Duration::from_secs(2), lines.next_line())
-                .await
-                .unwrap()
-                .unwrap()
-                .unwrap();
-            let JSONRPCMessage::Error(error) = serde_json::from_str(&line).unwrap() else {
-                panic!("cancelled start must fail")
-            };
-            assert_eq!(error.id, RequestId::Integer(2));
+            let mut receipts = std::collections::HashSet::new();
+            for _ in 0..9 {
+                let message = if let Some(message) = pending.pop_front() {
+                    message
+                } else {
+                    let line = timeout(Duration::from_secs(2), lines.next_line()).await.unwrap().unwrap().unwrap();
+                    serde_json::from_str::<JSONRPCMessage>(&line).unwrap()
+                };
+                let request_id = match message {
+                    JSONRPCMessage::Error(error) => error.id,
+                    JSONRPCMessage::Response(response) => {
+                        assert_ne!(response.id, RequestId::Integer(2), "cancelled start must fail");
+                        response.id
+                    }
+                    other => panic!("unexpected message: {other:?}"),
+                };
+                assert!(receipts.insert(request_id));
+            }
+            assert!(receipts.contains(&RequestId::Integer(2)));
+            for id in 10..18 { assert!(receipts.contains(&RequestId::Integer(id))); }
             tokio::task::spawn_blocking(|| ()).await.unwrap();
             assert!(!forbidden.exists());
             drop(writer);
@@ -1850,6 +1909,31 @@ mod tests {
         let encoded = serde_json::to_vec(message).expect("serialize JSON-RPC message");
         writer.write_all(&encoded).await.expect("write request");
         writer.write_all(b"\n").await.expect("write newline");
+    }
+
+    async fn read_response_preserving_other_messages<T: DeserializeOwned>(
+        lines: &mut Lines<BufReader<DuplexStream>>,
+        expected_id: i64,
+        pending: &mut std::collections::VecDeque<JSONRPCMessage>,
+    ) -> T {
+        loop {
+            let line = lines
+                .next_line()
+                .await
+                .expect("read response")
+                .expect("response line");
+            match serde_json::from_str::<JSONRPCMessage>(&line).expect("decode JSON-RPC response") {
+                JSONRPCMessage::Response(JSONRPCResponse { id, result })
+                    if id == RequestId::Integer(expected_id) =>
+                {
+                    return serde_json::from_value(result).expect("decode response result");
+                }
+                JSONRPCMessage::Error(error) if error.id == RequestId::Integer(expected_id) => {
+                    panic!("unexpected JSON-RPC error: {error:?}");
+                }
+                other => pending.push_back(other),
+            }
+        }
     }
 
     async fn read_response<T: DeserializeOwned>(

@@ -1,6 +1,5 @@
 use std::sync::Arc;
 
-use super::AsyncCompactionTraceContext as CompactionTraceContext;
 use super::RemoteCompactionV2Output;
 use super::prepare_v2_retained_input_source;
 use super::run_remote_compaction_request_v2;
@@ -24,7 +23,6 @@ use tokio_util::sync::CancellationToken;
 use tracing::info;
 
 pub(super) struct RemoteCompactV2Attempt {
-    pub(super) trace_input_history: Option<Vec<ResponseItem>>,
     pub(super) retained_input: crate::compact::TaskInputCheckpoint,
     #[cfg(test)]
     pub(super) retention_input: Vec<ResponseItem>,
@@ -38,7 +36,6 @@ pub(super) async fn run_remote_compact_v2_attempt(
     sess: &Arc<Session>,
     step_context: &Arc<StepContext>,
     client_session: Option<&mut ModelClientSession>,
-    compaction_trace: &CompactionTraceContext,
     compaction_metadata: CompactionTurnMetadata,
     analytics_details: &mut CompactionAnalyticsDetails,
     cancellation_token: &CancellationToken,
@@ -169,9 +166,6 @@ pub(super) async fn run_remote_compact_v2_attempt(
         return Err(codex_protocol::error::CodexErr::ContextWindowExceeded);
     }
 
-    let trace_input_history = compaction_trace
-        .is_enabled()
-        .then(|| history.raw_items().to_vec());
 
     // Required recovery must be available before spending a provider request.
     // Use source IDs, not the lossy sampling projection or synthetic trigger.
@@ -208,7 +202,6 @@ pub(super) async fn run_remote_compact_v2_attempt(
         client_session,
         &prompt,
         &responses_metadata,
-        compaction_trace,
         cancellation_token,
     )
     .await;
@@ -217,7 +210,6 @@ pub(super) async fn run_remote_compact_v2_attempt(
         token_usage,
     } = compaction_output_result?;
     Ok(RemoteCompactV2Attempt {
-        trace_input_history,
         retained_input,
         #[cfg(test)]
         retention_input: history.into_raw_items(),
@@ -308,253 +300,7 @@ mod tests {
         Ok(())
     }
 
-    #[test_case::test_case(false, false, false; "no evidence without trimming")]
-    #[test_case::test_case(false, true, false; "no evidence with trimming")]
-    #[test_case::test_case(true, false, false; "digest evidence without trimming")]
-    #[test_case::test_case(true, true, false; "digest evidence with trimming")]
-    #[test_case::test_case(true, true, true; "source edit after sizing")]
-    #[tokio::test]
-    async fn remote_compaction_captures_workspace_once_per_request(
-        evidence: bool,
-        trim: bool,
-        edit_after_sizing: bool,
-    ) -> anyhow::Result<()> {
-        use crate::session::turn::prepare_sampling_prompt_for_client;
-        use crate::test_harness::responses;
-        use crate::tool_history::WorkspaceEvidenceObservation;
-        use codex_analytics::CompactionImplementation;
-        use codex_analytics::CompactionPhase;
-        use codex_analytics::CompactionReason;
-        use codex_analytics::CompactionTrigger;
-        use codex_protocol::models::FunctionCallOutputPayload;
 
-        crate::test_harness::require_network!();
-        let server = responses::start_mock_server().await;
-        let home = tempfile::tempdir()?;
-        let workspace = tempfile::tempdir()?;
-        assert!(
-            std::process::Command::new("git")
-                .args(["init", "--quiet"])
-                .current_dir(workspace.path())
-                .status()?
-                .success()
-        );
-        let source = workspace.path().join("source.txt");
-        std::fs::write(&source, "original evidence")?;
-        let cwd = codex_utils_absolute_path::AbsolutePathBuf::from_absolute_path(workspace.path())?;
-        let (session, mut turn, _events) =
-            crate::session::tests::make_session_and_context_with_auth_config_home_and_rx(
-                codex_login::CodexAuth::from_api_key("test"),
-                Vec::new(),
-                home.path(),
-                |config| {
-                    config.cwd = cwd;
-                    config.model_provider.base_url = Some(format!("{}/v1", server.uri()));
-                    config.model_provider.supports_websockets = false;
-                },
-            )
-            .await;
-        let turn_mut = Arc::get_mut(&mut turn).unwrap();
-        turn_mut.model_info.context_window = Some(32_000);
-        turn_mut.model_info.effective_context_window_percent = 100;
-        let mut items = Vec::new();
-        if evidence {
-            let output = ResponseItem::FunctionCallOutput {
-                id: None,
-                call_id: "read-source".into(),
-                output: FunctionCallOutputPayload::from_text("original evidence".into()),
-                internal_chat_message_metadata_passthrough: None,
-            };
-            let revision = session
-                .services
-                .git_workspace
-                .workspace_evidence_for_turn(&turn, workspace.path())
-                .await
-                .identity;
-            assert!(
-                revision
-                    .as_ref()
-                    .is_some_and(|revision| !revision.unavailable)
-            );
-            let observation = WorkspaceEvidenceObservation::from_response_item(
-                revision,
-                &output,
-                Default::default(),
-            )
-            .unwrap();
-            session.register_workspace_evidence(observation, ()).await;
-            items.push(ResponseItem::FunctionCall {
-                id: None,
-                name: "read_file".into(),
-                namespace: None,
-                arguments: r#"{"path":"source.txt"}"#.into(),
-                call_id: "read-source".into(),
-                internal_chat_message_metadata_passthrough: None,
-            });
-            items.push(output);
-        }
-        items.extend([
-            ResponseItem::ToolSearchCall {
-                id: None,
-                call_id: Some("search".into()),
-                status: Some("completed".into()),
-                execution: "client".into(),
-                arguments: serde_json::json!({"query":"calendar", "namespace":"apps"}),
-                internal_chat_message_metadata_passthrough: None,
-            },
-            ResponseItem::ToolSearchOutput {
-                id: None,
-                call_id: Some("search".into()),
-                status: "completed".into(),
-                execution: "client".into(),
-                tools: vec![serde_json::json!({
-                    "namespace":"apps", "name":"calendar.search",
-                    "description": if trim { "schema detail ".repeat(30_000) } else { "small".into() },
-                })],
-                omitted_result_count: Some(0),
-                internal_chat_message_metadata_passthrough: None,
-            },
-        ]);
-        // Preserve the oversized input until the actual compaction owner trims it.
-        session.replace_history(items, None).await;
-        let original = session.clone_history().await;
-        assert_eq!(original.requires_workspace_evidence_validation(), evidence);
-        assert!(!original.can_use_root_only_workspace_identity());
-        let step = session.capture_step_context(Arc::clone(&turn)).await?;
-        let log = responses::mount_sse_once(
-            &server,
-            responses::sse(vec![
-                serde_json::json!({"type":"response.output_item.done",
-                    "item":{"type":"compaction","encrypted_content":"opaque"}}),
-                responses::ev_completed("compacted"),
-            ]),
-        )
-        .await;
-        let captures_before = session
-            .services
-            .git_workspace
-            .workspace_evidence_capture_count();
-        let source_edit = edit_after_sizing.then(|| {
-            let pause = session
-                .services
-                .git_workspace
-                .pause_next_workspace_evidence_capture();
-            let source = source.clone();
-            tokio_util::task::AbortOnDropHandle::new(tokio::spawn(async move {
-                tokio::time::timeout(
-                    std::time::Duration::from_secs(10),
-                    pause.wait_until_started(),
-                )
-                .await?;
-                let result = replace_source_preserving_metadata(&source, "modified evidence");
-                pause.release();
-                result.map_err(anyhow::Error::from)
-            }))
-        });
-        let result = run_remote_compact_v2_attempt(
-            &session,
-            &step,
-            None,
-            &CompactionTraceContext::disabled(),
-            CompactionTurnMetadata::new(
-                CompactionTrigger::Manual,
-                CompactionReason::UserRequested,
-                CompactionImplementation::ResponsesCompactionV2,
-                CompactionPhase::StandaloneTurn,
-            ),
-            &mut CompactionAnalyticsDetails::default(),
-            &CancellationToken::new(),
-        )
-        .await?;
-        if let Some(source_edit) = source_edit {
-            source_edit.await??;
-        }
-        assert_eq!(
-            session
-                .services
-                .git_workspace
-                .workspace_evidence_capture_count()
-                - captures_before,
-            u64::from(evidence),
-            "sizing and trimming one request must share one observation"
-        );
-        let search = result
-            .retention_input
-            .iter()
-            .find_map(|item| match item {
-                ResponseItem::ToolSearchOutput { tools, .. } => Some(tools),
-                _ => None,
-            })
-            .expect("retained search output");
-        assert_eq!(search[0].get("description").is_none(), trim);
-        let mut rewritten = original.clone();
-        rewritten.replace(result.retention_input.clone());
-        assert_eq!(rewritten.requires_workspace_evidence_validation(), evidence);
-        assert!(!rewritten.can_use_root_only_workspace_identity());
-        assert!(matches!(
-            result.compaction_output,
-            ResponseItem::Compaction { .. }
-        ));
-        assert!(
-            !log.single_request()
-                .body_json()
-                .to_string()
-                .contains("schema detail")
-        );
-        let request = log.single_request();
-        let notices = request
-            .input()
-            .iter()
-            .filter(|item| item["role"] == "developer")
-            .flat_map(|item| item["content"].as_array().into_iter().flatten())
-            .filter_map(|part| part["text"].as_str())
-            .filter(|text| text.starts_with("<workspace_evidence_invalidation>\n"))
-            .flat_map(str::lines)
-            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
-            .flat_map(crate::tool_history::expand_workspace_notices)
-            .filter(|notice| notice["call_id"] == "read-source")
-            .collect::<Vec<_>>();
-        assert_eq!(notices.len(), usize::from(evidence));
-        if evidence {
-            // Legacy digest-only provenance is unverified even without an edit.
-            // The final capture must distinguish that from an actual change
-            // made after sizing, without upgrading either to current proof.
-            assert_eq!(notices[0]["valid_for_current_workspace"], false);
-            assert_eq!(
-                notices[0]["reason_code"],
-                if edit_after_sizing {
-                    "workspace_identity_changed"
-                } else {
-                    "workspace_freshness_unverified"
-                }
-            );
-        }
-        session.flush_tool_history_persistence().await?;
-
-        if evidence {
-            // A later request must capture again, including equal-length edits.
-            replace_source_preserving_metadata(&source, "changed! evidence")?;
-            let next = prepare_sampling_prompt_for_client(
-                original,
-                &turn,
-                session.services.git_workspace.as_ref(),
-            )
-            .await;
-            assert_eq!(
-                session
-                    .services
-                    .git_workspace
-                    .workspace_evidence_capture_count()
-                    - captures_before,
-                2
-            );
-            assert!(next.items().iter().any(|item| matches!(item,
-                ResponseItem::Message { content, .. } if content.iter().any(|content| matches!(content,
-                    codex_protocol::models::ContentItem::InputText { text }
-                        if text.contains("<workspace_evidence_invalidation>"))))));
-        }
-        Ok(())
-    }
 
     #[tokio::test]
     async fn remote_compaction_sends_the_selected_turn_base() -> anyhow::Result<()> {
@@ -598,7 +344,6 @@ mod tests {
             &session,
             &step,
             None,
-            &CompactionTraceContext::disabled(),
             CompactionTurnMetadata::new(
                 CompactionTrigger::Manual,
                 CompactionReason::UserRequested,
@@ -699,7 +444,6 @@ mod tests {
             &session,
             &step,
             None,
-            &CompactionTraceContext::disabled(),
             metadata,
             &mut CompactionAnalyticsDetails::default(),
             &CancellationToken::new(),
@@ -762,7 +506,6 @@ mod tests {
             &session,
             &step,
             None,
-            &CompactionTraceContext::disabled(),
             metadata,
             &mut CompactionAnalyticsDetails::default(),
             &CancellationToken::new(),

@@ -169,6 +169,17 @@ impl ConnectionDriver {
         }
     }
 
+    fn admission_error(&self) -> Option<String> {
+        if !self.alive.load(Ordering::Acquire) {
+            return Some("code-mode host connection is retiring".into());
+        }
+        let reserved = codex_code_mode_protocol::host::MAX_IN_FLIGHT_REQUESTS
+            + codex_code_mode_protocol::host::MAX_PENDING_DELEGATE_REQUESTS;
+        (self.requests.operation_count() >= codex_code_mode_protocol::host::MAX_IN_FLIGHT_REQUESTS
+            || self.outgoing_tx.capacity() <= reserved)
+            .then(|| "code-mode host request capacity reached; retry after existing work progresses; no request was sent".into())
+    }
+
     fn queue_frame(&mut self, frame: EncodedFrame) -> bool {
         match self.outgoing_tx.try_send(frame) {
             Ok(()) => true,

@@ -42,10 +42,6 @@ executedValidationCount: number,
  */
 executedValidationDurationNs: bigint,
 /**
- * Validation tool outputs intentionally suppressed by admission policy.
- */
-suppressedValidationOutputCount: number,
-/**
  * Ready startup prewarms observed by the first model request.
  */
 readyStartupPrewarmCount: number,

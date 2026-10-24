@@ -9,8 +9,6 @@ use crate::agent::AgentControl;
 use crate::agents_md_manager::AgentsMdManager;
 use crate::attestation::AttestationProvider;
 use crate::client::ModelClient;
-use crate::config::NetworkProxyAuditMetadata;
-use crate::config::StartedNetworkProxy;
 use crate::current_time::TimeProvider;
 use crate::elicitation::ElicitationService;
 use crate::environment_selection::ThreadEnvironments;
@@ -22,7 +20,6 @@ use crate::session::McpRuntimeSnapshot;
 use crate::tools::code_mode::CodeModeService;
 use crate::tools::command_execution::CommandExecutionLedger;
 use crate::tools::handlers::ToolSearchHandlerCache;
-use crate::tools::network_approval::NetworkApprovalService;
 use crate::tools::sandboxing::ApprovalStore;
 use crate::unified_exec::UnifiedExecProcessManager;
 use anyhow::Result;
@@ -39,11 +36,9 @@ use codex_mcp::McpConfig;
 use codex_mcp::McpConnectionManager;
 use codex_mcp::McpRuntimeContext;
 use codex_models_manager::manager::SharedModelsManager;
-use codex_network_proxy::NetworkPolicyDecider;
 use codex_otel::SessionTelemetry;
 use codex_protocol::capabilities::SelectedCapabilityRoot;
 use codex_rollout::state_integration::StateDbHandle;
-use codex_rollout_trace::ThreadTraceContext;
 use codex_thread_store::LiveThread;
 use codex_thread_store::ThreadStore;
 use tokio::sync::Mutex;
@@ -66,14 +61,11 @@ pub(crate) struct SessionServices {
     pub(crate) retained_patches:
         std::sync::Mutex<crate::tools::handlers::apply_patch_retries::RetainedPatches>,
     /// Path-scoped successful reads reusable by later turns once re-proven fresh.
-    pub(crate) path_replays: Arc<crate::session::turn_execution::SessionPathReplays>,
-    pub(crate) validation_uncertainty:
-        Arc<std::sync::Mutex<crate::session::turn_execution::SessionValidationUncertainty>>,
+
     pub(crate) plan_store: PlanStore,
     pub(crate) elicitations: ElicitationService,
     pub(crate) analytics_events_client: AnalyticsEventsClient,
     pub(crate) hooks: ArcSwap<Hooks>,
-    pub(crate) rollout_thread_trace: ThreadTraceContext,
     pub(crate) user_shell: crate::shell::LocalShell,
     pub(crate) show_raw_agent_reasoning: bool,
     pub(crate) exec_policy: Arc<ExecPolicyManager>,
@@ -95,11 +87,6 @@ pub(crate) struct SessionServices {
     pub(crate) selected_capability_roots: Vec<SelectedCapabilityRoot>,
     pub(crate) mcp_thread_init: ExtensionDataInit,
     pub(crate) agent_control: AgentControl,
-    pub(crate) network_proxy: ArcSwapOption<StartedNetworkProxy>,
-    pub(crate) network_proxy_audit_metadata: NetworkProxyAuditMetadata,
-    pub(crate) managed_network_requirements_configured: bool,
-    pub(crate) network_approval: Arc<NetworkApprovalService>,
-    pub(crate) network_policy_decider: Option<Arc<dyn NetworkPolicyDecider>>,
     pub(crate) state_db: Option<StateDbHandle>,
     pub(crate) live_thread: Option<LiveThread>,
     pub(crate) thread_store: Arc<dyn ThreadStore>,

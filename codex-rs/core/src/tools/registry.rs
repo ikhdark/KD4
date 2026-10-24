@@ -24,13 +24,11 @@ use crate::tools::context::ToolOutput;
 use crate::tools::context::ToolPayload;
 use crate::tools::flat_tool_name;
 use crate::tools::handlers::ParsedFunctionArguments;
-use crate::tools::handlers::multi_agents_spec::MULTI_AGENT_V1_NAMESPACE;
 use crate::tools::handlers::parsed_function_argument_value;
 use crate::tools::handlers::with_parsed_function_arguments;
 use crate::tools::hook_names::HookToolName;
 use crate::tools::lifecycle::notify_tool_finish;
 use crate::tools::lifecycle::notify_tool_start;
-use crate::tools::tool_dispatch_trace::ToolDispatchTrace;
 use crate::tools::tool_dispatch_trace::mark_tool_handler_entry;
 use crate::tools::tool_dispatch_trace::mark_tool_handler_exit;
 use crate::tools::tool_dispatch_trace::record_history_persistence;
@@ -188,6 +186,12 @@ pub(crate) struct ToolSemanticCapabilities {
 /// Typed runtime contract for locally executed tools, including scheduling,
 /// evidence, cancellation and host-owned delivery capabilities.
 pub(crate) trait CoreToolRuntime: ToolExecutor<ToolInvocation> {
+    /// Canonical input contract for local Code Mode discovery. API-facing
+    /// compatibility projections remain in `spec()`.
+    fn code_mode_input_schema(&self) -> Option<Value> {
+        None
+    }
+
     /// Pure preparation may overlap baseline capture only when the runtime
     /// awaits `wait_for_workspace_baseline` before reading or changing files.
     fn prepares_during_workspace_baseline(&self) -> bool {
@@ -525,7 +529,10 @@ impl AnyToolResult {
 
     pub(crate) fn response(&self) -> ResponseInputItem {
         if let Some(projection) = self.model_projection.as_ref() {
-            return projection.response();
+            return with_model_delivery_notice(
+                projection.response(),
+                self.result.model_delivery_notice(),
+            );
         }
         self.result.to_response_item(&self.call_id, &self.payload)
     }
@@ -536,6 +543,19 @@ impl AnyToolResult {
 
     pub(crate) fn outcome_for_logging(&self) -> ToolOutputOutcome {
         self.result.outcome_for_logging()
+    }
+
+    pub(crate) fn cancellation_result(&self) -> Value {
+        let result = self.result.code_mode_result(&self.payload);
+        let children = self.result.projection_metadata().and_then(|metadata| {
+            metadata.essential_inline.get("cancelled_nested_calls").cloned()
+        });
+        match children {
+            Some(children) => {
+                serde_json::json!({"result":result,"cancelled_nested_calls":children})
+            }
+            None => result,
+        }
     }
 
     pub(crate) fn outcome_context(&self) -> codex_tools::ToolOutputOutcomeContext {
@@ -691,7 +711,10 @@ impl AnyToolResult {
 
     pub(crate) fn into_response(self) -> ResponseInputItem {
         if let Some(projection) = self.model_projection {
-            return projection.into_response();
+            return with_model_delivery_notice(
+                projection.into_response(),
+                self.result.model_delivery_notice(),
+            );
         }
         let Self {
             call_id,
@@ -958,6 +981,7 @@ struct PostToolUseFeedbackOutput {
     original: Box<dyn ToolOutput>,
     model_visible: FunctionToolOutput,
     context_error: Option<String>,
+    accounting_error: Option<String>,
 }
 
 fn apply_post_tool_use_outcome(
@@ -990,6 +1014,7 @@ fn apply_post_tool_use_outcome(
             ),
             model_visible,
             context_error: None,
+            accounting_error: None,
         });
     }
     outcome.additional_contexts
@@ -1005,23 +1030,41 @@ impl ToolOutput for PostToolUseFeedbackOutput {
     }
 
     fn code_mode_failure_is_error(&self) -> bool {
-        self.original.code_mode_failure_is_error()
+        self.accounting_error.is_some() || self.original.code_mode_failure_is_error()
+    }
+
+    fn model_delivery_notice(&self) -> Option<&str> {
+        self.accounting_error
+            .as_deref()
+            .or_else(|| self.original.model_delivery_notice())
     }
 
     fn log_preview(&self) -> String {
         self.original.log_preview()
     }
 
+    fn log_output_stats(&self) -> Option<(usize, usize)> {
+        self.original.log_output_stats()
+    }
+
     fn success_for_logging(&self) -> bool {
-        self.original.success_for_logging()
+        self.accounting_error.is_none() && self.original.success_for_logging()
     }
 
     fn outcome_for_logging(&self) -> ToolOutputOutcome {
-        self.original.outcome_for_logging()
+        if self.accounting_error.is_some() {
+            ToolOutputOutcome::Failure
+        } else {
+            self.original.outcome_for_logging()
+        }
     }
 
     fn outcome_context(&self) -> codex_tools::ToolOutputOutcomeContext {
-        self.original.outcome_context()
+        if self.accounting_error.is_some() {
+            codex_tools::ToolOutputOutcomeContext::new(ToolOutputOutcome::Failure)
+        } else {
+            self.original.outcome_context()
+        }
     }
 
     fn requires_canonical_artifact(&self) -> bool {
@@ -1032,6 +1075,10 @@ impl ToolOutput for PostToolUseFeedbackOutput {
         let mut signal = self.original.sampling_request_signal();
         if let Some(error) = &self.context_error {
             signal.get_or_insert_with(|| serde_json::json!({}))["post_tool_context_error"] =
+                Value::String(error.clone());
+        }
+        if let Some(error) = &self.accounting_error {
+            signal.get_or_insert_with(|| serde_json::json!({}))["required_accounting_error"] =
                 Value::String(error.clone());
         }
         signal
@@ -1072,7 +1119,11 @@ impl ToolOutput for PostToolUseFeedbackOutput {
                 FunctionCallOutputBody::Text(text) => {
                     for item in &self.model_visible.body {
                         if let FunctionCallOutputContentItem::InputText { text: feedback } = item {
-                            text.push_str("\n\nPostToolUse feedback: ");
+                            text.push_str(if self.accounting_error.is_some() {
+                                "\n\nHost settlement: "
+                            } else {
+                                "\n\nPostToolUse feedback: "
+                            });
                             text.push_str(feedback);
                         }
                     }
@@ -1082,7 +1133,11 @@ impl ToolOutput for PostToolUseFeedbackOutput {
                 }
             }
         }
-        response
+        if matches!(&response, ResponseInputItem::McpToolCallOutput { .. }) {
+            with_model_delivery_notice(response, self.model_delivery_notice())
+        } else {
+            response
+        }
     }
 
     fn code_mode_result(&self, payload: &ToolPayload) -> Value {
@@ -1146,6 +1201,10 @@ impl ToolOutput for UnavailableModelProjectionOutput {
 
     fn log_preview(&self) -> String {
         self.original.log_preview()
+    }
+
+    fn log_output_stats(&self) -> Option<(usize, usize)> {
+        self.original.log_output_stats()
     }
 
     fn success_for_logging(&self) -> bool {
@@ -1745,7 +1804,7 @@ impl ToolRegistry {
                 permission_profile_sandbox_tag(
                     &invocation.step_context.turn.permission_profile,
                     invocation.step_context.turn.windows_sandbox_level,
-                    invocation.step_context.turn.network.is_some(),
+                    false,
                 ),
             ),
             (
@@ -1764,8 +1823,6 @@ impl ToolRegistry {
                 turn_state.tool_calls = turn_state.tool_calls.saturating_add(1);
             }
         }
-        let dispatch_trace = ToolDispatchTrace::start(&invocation);
-        dispatch_state.attach_trace(dispatch_trace.clone());
         let (tool, tool_spec, code_mode_argument_preflight, external_tool) =
             match self.tools.get(&tool_name) {
                 Some(registered) => (
@@ -1789,7 +1846,6 @@ impl ToolRegistry {
                     );
                     let err = FunctionCallError::RespondToModel(message);
                     if dispatch_state.try_complete() {
-                        dispatch_trace.record_failed(&err).await;
                     }
                     return Err(err);
                 }
@@ -1833,7 +1889,6 @@ impl ToolRegistry {
             );
             let err = FunctionCallError::RespondToModel(message);
             if dispatch_state.try_complete() {
-                dispatch_trace.record_failed(&err).await;
             }
             return Err(err);
         }
@@ -1862,7 +1917,6 @@ impl ToolRegistry {
             );
             let err = FunctionCallError::RespondToModel(message);
             if dispatch_state.try_complete() {
-                dispatch_trace.record_failed(&err).await;
             }
             return Err(err);
         }
@@ -1874,13 +1928,12 @@ impl ToolRegistry {
             notify_tool_finish_if_unclaimed(
                 &invocation,
                 dispatch_state.as_ref(),
-                &dispatch_trace,
                 &error,
                 ToolCallOutcome::Failed {
                     handler_executed: false,
                 },
             )
-            .await;
+            .await?;
             return Err(error);
         }
 
@@ -1893,11 +1946,10 @@ impl ToolRegistry {
                     notify_tool_finish_if_unclaimed(
                         &invocation,
                         dispatch_state.as_ref(),
-                        &dispatch_trace,
                         &err,
                         ToolCallOutcome::Blocked,
                     )
-                    .await;
+                    .await?;
                     return Err(err);
                 }
             },
@@ -1954,13 +2006,12 @@ impl ToolRegistry {
             notify_tool_finish_if_unclaimed(
                 &invocation,
                 dispatch_state.as_ref(),
-                &dispatch_trace,
                 &err,
                 ToolCallOutcome::Failed {
                     handler_executed: false,
                 },
             )
-            .await;
+            .await?;
             return Err(err);
         }
 
@@ -2001,7 +2052,11 @@ impl ToolRegistry {
                     }
                 },
                 AnyToolResult::success_for_logging,
-                |result| result.result.log_preview(),
+                |result| {
+                    result.result.log_output_stats()
+                        .map(codex_otel::ToolResultOutputStats::from)
+                        .unwrap_or_else(|| result.result.log_preview().into())
+                },
             )
             .await;
         record_lifecycle_phase(&invocation, "handler", phase_started);
@@ -2111,6 +2166,7 @@ impl ToolRegistry {
                         ),
                         model_visible: FunctionToolOutput::from_text(message.clone(), Some(true)),
                         context_error: Some(message),
+                        accounting_error: None,
                     });
                 }
             }
@@ -2121,11 +2177,9 @@ impl ToolRegistry {
         // already claimed the terminal outcome. Do not continue into
         // projection, persistence, or finish notification for that result.
         if dispatch_state.is_aborted() {
-            let err = match result {
-                Err(error) => error,
-                Ok(result) => cancelled_tool_result_recovery(&result),
-            };
-            return Err(err);
+            // Cancellation owns lifecycle publication, not the handler's value.
+            // Return its typed result directly to the cleanup supervisor.
+            return result;
         }
 
         // A PostToolUse block rejects the result, not the already-completed tool execution.
@@ -2235,25 +2289,43 @@ impl ToolRegistry {
                 // Cancellation may win while projection or its bookkeeping is
                 // pending. Its owner publishes the aborted terminal outcome.
                 if dispatch_state.is_aborted() {
-                    let err = cancelled_tool_result_recovery(&result);
-                    return Err(err);
+                    return Ok(result);
                 }
-                crate::tools::lifecycle::notify_required_tool_finish(
+                if let Err(error) = crate::tools::lifecycle::notify_required_tool_finish(
                     &invocation,
                     lifecycle_outcome,
                 )
-                .await;
-                if dispatch_state.try_complete() {
-                    // Required commits precede the authoritative election. The
-                    // trace may only publish the disposition elected here.
-                    dispatch_trace
-                        .record_completed(
+                .await
+                {
+                    if dispatch_state.try_accounting_unconfirmed() {
+                        let message = error.to_string();
+                        result
+                            .code_mode_feedback
+                            .push(FunctionCallOutputContentItem::InputText {
+                                text: message.clone(),
+                            });
+                        result.result = Box::new(PostToolUseFeedbackOutput {
+                            original: result.result,
+                            model_visible: FunctionToolOutput::from_text(
+                                message.clone(),
+                                Some(false),
+                            ),
+                            context_error: None,
+                            accounting_error: Some(message),
+                        });
+                        notify_tool_finish(
                             &invocation,
-                            &result.call_id,
-                            &result.payload,
-                            result.result.as_ref(),
+                            ToolCallOutcome::Failed {
+                                handler_executed: true,
+                            },
                         )
                         .await;
+                    }
+                    // Cancellation may have elected its own terminal state;
+                    // either way, keep the handler's typed result in custody.
+                    return Ok(result);
+                }
+                if dispatch_state.try_complete() {
                     // The projected result and required commits are settled. A
                     // delayed observer must not turn these effects into an abort.
                     let phase_started = Instant::now();
@@ -2261,18 +2333,26 @@ impl ToolRegistry {
                     record_lifecycle_phase(&invocation, "notify_finish", phase_started);
                     Ok(result)
                 } else {
-                    Err(cancelled_tool_result_recovery(&result))
+                    Ok(result)
                 }
             }
             Err(err) => {
-                crate::tools::lifecycle::notify_required_tool_finish(
+                if let Err(accounting) = crate::tools::lifecycle::notify_required_tool_finish(
                     &invocation,
                     lifecycle_outcome,
                 )
-                .await;
+                .await
+                {
+                    if dispatch_state.try_accounting_unconfirmed() {
+                        let error =
+                            FunctionCallError::RespondToModel(format!("{err}\n\n{accounting}"));
+                        notify_tool_finish(&invocation, lifecycle_outcome).await;
+                        return Err(error);
+                    }
+                    return Err(err);
+                }
                 if dispatch_state.try_complete() {
-                    dispatch_trace.record_failed(&err).await;
-                    let phase_started = Instant::now();
+                        let phase_started = Instant::now();
                     notify_tool_finish(&invocation, lifecycle_outcome).await;
                     record_lifecycle_phase(&invocation, "notify_finish", phase_started);
                     Err(err)
@@ -2290,17 +2370,36 @@ impl ToolRegistry {
     }
 }
 
-fn cancelled_tool_result_recovery(result: &AnyToolResult) -> FunctionCallError {
-    FunctionCallError::RespondToModel(serde_json::json!({
-        "kind": "handler_result",
-        "message": "tool cancelled after runtime cleanup; retain this result for effect reconciliation",
-        "call_id": result.call_id,
-        "result": result.result.code_mode_result(&result.payload),
-    }).to_string())
-}
-
 fn projection_is_provider_visible(source: &ToolCallSource) -> bool {
     matches!(source, ToolCallSource::Direct)
+}
+
+fn with_model_delivery_notice(
+    mut response: ResponseInputItem,
+    notice: Option<&str>,
+) -> ResponseInputItem {
+    let Some(notice) = notice else {
+        return response;
+    };
+    match &mut response {
+        ResponseInputItem::FunctionCallOutput { output, .. }
+        | ResponseInputItem::CustomToolCallOutput { output, .. } => match &mut output.body {
+            FunctionCallOutputBody::Text(text) => {
+                text.push_str("\n\nHost settlement: ");
+                text.push_str(notice);
+            }
+            FunctionCallOutputBody::ContentItems(items) => {
+                items.push(FunctionCallOutputContentItem::InputText {
+                    text: notice.to_string(),
+                })
+            }
+        },
+        ResponseInputItem::McpToolCallOutput { output, .. } => output
+            .content
+            .push(serde_json::json!({"type":"text", "text":notice})),
+        _ => {}
+    }
+    response
 }
 
 fn admission_tracking_enabled(source: &ToolCallSource, configured: bool) -> bool {
@@ -2320,18 +2419,31 @@ fn projection_admission_required(
 async fn notify_tool_finish_if_unclaimed(
     invocation: &ToolInvocation,
     dispatch_state: &ToolDispatchState,
-    dispatch_trace: &ToolDispatchTrace,
     error: &FunctionCallError,
     outcome: ToolCallOutcome,
-) -> bool {
-    crate::tools::lifecycle::notify_required_tool_finish(invocation, outcome).await;
+) -> Result<bool, FunctionCallError> {
+    if let Err(accounting) =
+        crate::tools::lifecycle::notify_required_tool_finish(invocation, outcome).await
+    {
+        if dispatch_state.try_accounting_unconfirmed() {
+            let error = FunctionCallError::RespondToModel(format!("{error}\n\n{accounting}"));
+            notify_tool_finish(
+                invocation,
+                ToolCallOutcome::Failed {
+                    handler_executed: dispatch_state.handler_started(),
+                },
+            )
+            .await;
+            return Err(error);
+        }
+        return Ok(false);
+    }
     // Claim terminal ownership before an observer can yield to cancellation.
     if !dispatch_state.try_complete() {
-        return false;
+        return Ok(false);
     }
-    dispatch_trace.record_failed(error).await;
     notify_tool_finish(invocation, outcome).await;
-    true
+    Ok(true)
 }
 
 async fn handle_any_tool(
@@ -2355,19 +2467,12 @@ async fn handle_any_tool(
         .turn_timing_state
         .record_tool_handler_entry(invocation.tool_name.name.as_str());
     mark_tool_handler_entry();
-    let validation_observation =
-        crate::tools::typed_validation::Observation::capture(&invocation).await;
     let output = tool.handle(invocation.clone()).await;
     // Early argument failures must also settle capture before post-tool hooks.
     crate::tools::parallel::wait_for_workspace_baseline().await;
     mark_tool_handler_exit();
-    let mut output = output?;
-    let validation_feedback = if let Some(observation) = validation_observation {
-        observation.record(&invocation, output.as_mut()).await
-    } else {
-        None
-    };
-    let mut result = AnyToolResult {
+    let output = output?;
+    let result = AnyToolResult {
         call_id: invocation.call_id,
         payload: invocation.payload,
         result: output,
@@ -2375,15 +2480,6 @@ async fn handle_any_tool(
         source_dependencies: None,
         code_mode_feedback: Vec::new(),
     };
-    if let Some(feedback) = validation_feedback {
-        let model_visible = FunctionToolOutput::from_text(feedback, None);
-        result.code_mode_feedback = model_visible.body.clone();
-        result.result = Box::new(PostToolUseFeedbackOutput {
-            original: result.result,
-            model_visible,
-            context_error: None,
-        });
-    }
     Ok(result)
 }
 
@@ -3530,45 +3626,48 @@ async fn project_model_output(input: ModelProjectionInput) -> Option<ModelToolPr
             let artifact = if let Some(artifact_id) = existing_artifact_id {
                 let attached = attach_canonical_output_artifact(&codex_home, &thread_id, &artifact_id, &canonical)
                     .await;
-                if attached.complete && attached.retained_bytes == canonical.exact_bytes {
-                    attached
-                } else {
-                    // A cumulative stream and this poll's packet are different
-                    // coordinate spaces. Never weaken exact-byte attachment.
-                    artifact_created = true;
-                    crate::tools::command_output_artifact::create_tool_history_output_artifact(
-                        &codex_home, &thread_id, &canonical,
-                    ).await
-                }
+            if attached.complete && attached.retained_bytes == canonical.exact_bytes {
+                attached
             } else {
+                // A cumulative stream and this poll's packet are different
+                // coordinate spaces. Never weaken exact-byte attachment.
+                artifact_created = true;
                 crate::tools::command_output_artifact::create_tool_history_output_artifact(
                     &codex_home,
                     &thread_id,
                     &canonical,
                 )
                 .await
-            };
-            let artifact_id = artifact.artifact_id();
-            if let Some(artifact_id) = artifact_id
-                && artifact.complete
-                && artifact.retained_bytes == canonical.exact_bytes
-                && artifact.unavailable_ranges.is_empty()
-                && (artifact_created
-                    || crate::tools::command_output_artifact::protect_active_tool_history_artifact(
-                        &codex_home,
-                        &thread_id,
-                        &artifact_id,
-                        canonical.exact_bytes,
-                        &canonical.sha256,
-                    )
-                    .await
-                    .is_ok())
-            {
-                Some((artifact, artifact_id, artifact_created))
-            } else {
-                None
             }
+        } else {
+            crate::tools::command_output_artifact::create_tool_history_output_artifact(
+                &codex_home,
+                &thread_id,
+                &canonical,
+            )
+            .await
         };
+        let artifact_id = artifact.artifact_id();
+        if let Some(artifact_id) = artifact_id
+            && artifact.complete
+            && artifact.retained_bytes == canonical.exact_bytes
+            && artifact.unavailable_ranges.is_empty()
+            && (artifact_created
+                || crate::tools::command_output_artifact::protect_active_tool_history_artifact(
+                    &codex_home,
+                    &thread_id,
+                    &artifact_id,
+                    canonical.exact_bytes,
+                    &canonical.sha256,
+                )
+                .await
+                .is_ok())
+        {
+            Some((artifact, artifact_id, artifact_created))
+        } else {
+            None
+        }
+    };
     let non_text_tokens = non_text_projection_token_cost(&preserved_content);
     let non_text_bytes = non_text_projection_byte_cost(&preserved_content);
     let preserve_non_text_content = !preserved_content.is_empty()
@@ -4707,12 +4806,7 @@ fn function_hook_tool_name(invocation: &ToolInvocation) -> HookToolName {
 }
 
 fn function_hook_tool_name_for(tool_name: &ToolName) -> HookToolName {
-    if tool_name.name == "spawn_agent"
-        && matches!(
-            tool_name.namespace.as_deref(),
-            None | Some(MULTI_AGENT_V1_NAMESPACE)
-        )
-    {
+    if tool_name.name == "spawn_agent" && tool_name.namespace.is_none() {
         return HookToolName::spawn_agent();
     }
 
@@ -4777,12 +4871,27 @@ fn schema_property_names(schema: &Value) -> Vec<&str> {
 /// where the pointer itself selects a branch. Returns `None` when the pointer
 /// does not address a schema node, so no guidance is invented.
 fn schema_at<'a>(schema: &'a Value, pointer: &str) -> Option<&'a Value> {
-    fn dereference<'a>(root: &'a Value, mut node: &'a Value, budget: &mut usize) -> Option<&'a Value> {
+    fn dereference<'a>(
+        root: &'a Value,
+        mut node: &'a Value,
+        budget: &mut usize,
+    ) -> Option<&'a Value> {
         while let Some(reference) = node.get("$ref") {
             *budget = budget.checked_sub(1)?;
             // Do not invent a merged shape for constrained reference siblings.
-            if node.as_object()?.keys().any(|key| !matches!(key.as_str(),
-                "$ref" | "$defs" | "definitions" | "$id" | "$schema" | "title" | "description" | "$comment")) {
+            if node.as_object()?.keys().any(|key| {
+                !matches!(
+                    key.as_str(),
+                    "$ref"
+                        | "$defs"
+                        | "definitions"
+                        | "$id"
+                        | "$schema"
+                        | "title"
+                        | "description"
+                        | "$comment"
+                )
+            }) {
                 return None;
             }
             let reference = reference.as_str()?.strip_prefix('#')?;
@@ -5065,9 +5174,6 @@ fn unsupported_tool_call_message(payload: &ToolPayload, tool_name: &ToolName) ->
 mod tests;
 
 #[cfg(test)]
-#[path = "registry_audit145_tests.rs"]
-mod audit145_tests;
+#[path = "registry_output_dedup_tests.rs"]
+mod output_dedup_tests;
 
-#[cfg(test)]
-#[path = "typed_validation_tests.rs"]
-mod typed_validation_tests;

@@ -165,6 +165,11 @@ impl RequirementsLayerStack {
         let mut hooks = HookMergeState::new(hook_directory_field);
         let mut hooks_output = None;
         let mut deny_read = DenyReadMergeState::default();
+        let source_order = layers
+            .iter()
+            .rev()
+            .map(|layer| layer.source.clone())
+            .collect::<Vec<_>>();
         // Regular TOML fields are folded low-to-high like config. These custom
         // fields append or union values, so process them high-to-low to keep
         // priority order visible in the output.
@@ -177,6 +182,23 @@ impl RequirementsLayerStack {
         output.rules = rules;
         output.hooks = hooks_output;
         deny_read.apply_to(&mut output.permissions);
+        if let Some(permissions) = &mut output.permissions {
+            // Regular profiles and additive deny paths are merged independently.
+            // Restore their shared global priority rather than concatenating them.
+            let contributing = match permissions.source.clone() {
+                RequirementSource::Composite { sources } => sources,
+                source => vec![source],
+            };
+            let ordered = match RequirementSource::composite(source_order) {
+                RequirementSource::Composite { sources } => sources,
+                source => vec![source],
+            };
+            permissions.source = RequirementSource::composite(
+                ordered
+                    .into_iter()
+                    .filter(|source| contributing.contains(source)),
+            );
+        }
 
         let output_is_empty = output.is_empty();
         Ok((!output_is_empty).then_some(output))

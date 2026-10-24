@@ -79,6 +79,10 @@ pub fn arg0_dispatch() -> Option<Arg0PathEntryGuard> {
     // before creating any threads/the Tokio runtime.
     load_dotenv();
 
+    prepare_path_aliases()
+}
+
+fn prepare_path_aliases() -> Option<Arg0PathEntryGuard> {
     let (path_entry_guard, updated_path_env_var) = prepare_path_env_var_with_aliases(
         InstallContext::current(),
         std::env::var_os("PATH"),
@@ -146,8 +150,12 @@ where
     // Retain the TempDir so it exists for the lifetime of the invocation of
     // this executable. Admittedly, we could invoke `keep()` on it, but it
     // would be nice to avoid leaving temporary directories behind, if possible.
-    let path_entry_guard = arg0_dispatch();
+    arg0_dispatch_helper();
+    load_dotenv();
     let main_fn = prepare_main();
+    // Help/version parsing can exit before creating helper files. The callback
+    // still sees dotenv values and runs before runtime threads, as documented.
+    let path_entry_guard = prepare_path_aliases();
     let current_exe = std::env::current_exe().ok();
 
     // Regular invocation. Run the async entry point on a thread with the same
@@ -162,29 +170,26 @@ where
             let runtime = match build_runtime() {
                 Ok(runtime) => runtime,
                 Err(error) => {
-                    let _ = main_result_tx.send(Err(error));
+                    let _ = main_result_tx.send(Ok(Err(error)));
                     let _ = retired_tx.send(());
                     return;
                 }
             };
-            let result = runtime.block_on(run_main_with_arg0_guard(
-                path_entry_guard,
-                current_exe,
-                main_fn,
-            ));
+            // Main can panic while constructing or polling its future. Publish
+            // that outcome before runtime teardown, which can wait on blocking
+            // work, so panic and success share the same retirement deadline.
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                runtime.block_on(run_main_with_arg0_guard(None, current_exe, main_fn))
+            }));
             let _ = main_result_tx.send(result);
             // Keep real runtime custody on this thread. In particular, do not
             // claim shutdown_timeout stopped an admitted blocking filesystem effect.
             drop(runtime);
+            // Runtime-owned cleanup may still execute PATH aliases.
+            drop(path_entry_guard);
             let _ = retired_tx.send(());
         })?;
-    let result = match main_result_rx.recv() {
-        Ok(result) => result,
-        Err(_) => match handle.join() {
-            Err(payload) => std::panic::resume_unwind(payload),
-            Ok(()) => anyhow::bail!("native runtime exited without a main result"),
-        },
-    };
+    let result = main_result_rx.recv().ok();
     if retired_rx
         .recv_timeout(std::time::Duration::from_secs(5))
         .is_err()
@@ -194,12 +199,16 @@ where
         let message = "native runtime retirement exceeded 5 seconds; blocking I/O or committed effects may remain pending; recover the session before replaying work";
         eprintln!("{message}");
         return match result {
-            Ok(()) => Err(anyhow::anyhow!(message)),
-            Err(error) => Err(error.context(message)),
+            Some(Ok(Err(error))) => Err(error.context(message)),
+            _ => Err(anyhow::anyhow!(message)),
         };
     }
     match handle.join() {
-        Ok(()) => result,
+        Ok(()) => match result {
+            Some(Ok(result)) => result,
+            Some(Err(payload)) => std::panic::resume_unwind(payload),
+            None => anyhow::bail!("native runtime exited without a main result"),
+        },
         Err(payload) => std::panic::resume_unwind(payload),
     }
 }

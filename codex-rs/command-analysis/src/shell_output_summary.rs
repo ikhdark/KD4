@@ -237,6 +237,54 @@ pub fn summarize_shell_output_for_model_with_streams(
             Some((index, line))
         })
         .collect::<Vec<_>>();
+    // Fit source lines AND their gap markers before source-order rendering.
+    // Otherwise early progress samples can exhaust the line ceiling and hide
+    // the final status even though selection explicitly retained it.
+    let available_lines =
+        (SUMMARY_MAX_LINES - SUMMARY_FOOTER_LINES).saturating_sub(builder.lines);
+    let diagnostic_indexes = selected
+        .iter()
+        .filter_map(|(index, line)| {
+            let kind = classify_line(line);
+            (kind.critical || kind.advisory || kind.status).then_some(*index)
+        })
+        .collect::<Vec<_>>();
+    let mut removal_order = selected
+        .iter()
+        .map(|(index, line)| {
+            let kind = classify_line(line);
+            let priority = if kind.status {
+                4
+            } else if kind.critical || kind.advisory {
+                3
+            } else if progress_line_key(line).is_some() {
+                0
+            } else if diagnostic_indexes
+                .iter()
+                .any(|diagnostic| index.abs_diff(*diagnostic) <= FOCUS_CONTEXT_LINES)
+            {
+                2
+            } else {
+                1
+            };
+            (priority, *index)
+        })
+        .collect::<Vec<_>>();
+    removal_order.sort_unstable();
+    for (_, remove) in removal_order {
+        let gap_lines = selected
+            .windows(2)
+            .filter(|pair| pair[1].0 != pair[0].0 + 1)
+            .count();
+        if selected.len() + gap_lines <= available_lines {
+            break;
+        }
+        selected.retain(|(index, _)| *index != remove);
+        builder.capped = true;
+    }
+    if selected.is_empty() {
+        return None;
+    }
     let gap_bytes: usize = selected
         .windows(2)
         .filter(|pair| pair[1].0 != pair[0].0 + 1)
@@ -871,7 +919,7 @@ fn rg_file_summary(output: &str, command: &str, token_limit: Option<usize>) -> O
         || !commands.iter().all(|argv| {
             argv.first().is_some_and(|program| {
                 matches!(program.rsplit(['/', '\\']).next(), Some("rg" | "rg.exe"))
-            })
+            }) && rg_has_path_line_output(argv)
         })
     {
         return None;
@@ -938,6 +986,46 @@ fn rg_file_summary(output: &str, command: &str, token_limit: Option<usize>) -> O
         codex_utils_output_truncation::TruncationPolicy::Tokens(remaining),
     ));
     (summary.len() < output.len()).then_some(summary)
+}
+
+/// Text records are not self-describing: `1:worker:123:...` may be content
+/// from --no-filename, not a path. Admit only an explicit untransformed format;
+/// ambiguous/default/configured modes retain ordinary truncation instead.
+fn rg_has_path_line_output(argv: &[String]) -> bool {
+    let mut filename = false;
+    let mut line_number = false;
+    let mut no_heading = false;
+    let mut no_config = false;
+    let mut no_color = false;
+    let mut args = argv.iter().skip(1);
+    while let Some(arg) = args.next() {
+        if arg == "--" {
+            break;
+        }
+        match arg.as_str() {
+            "--with-filename" | "-H" => filename = true,
+            "--line-number" | "-n" => line_number = true,
+            "--no-heading" => no_heading = true,
+            "--no-config" => no_config = true,
+            "--color=never" => no_color = true,
+            "--color" => {
+                no_color = args.next().is_some_and(|value| value == "never");
+            }
+            "-e" | "--regexp" | "-g" | "--glob" | "--iglob" | "-t" | "--type" | "-T"
+            | "--type-not" => {
+                if args.next().is_none() {
+                    return false;
+                }
+            }
+            "--hidden" | "--no-hidden" | "--no-ignore" | "--no-ignore-parent"
+            | "--no-ignore-global" | "--fixed-strings" | "-F" | "--ignore-case" | "-i"
+            | "--smart-case" | "-S" | "--case-sensitive" | "-s" | "--word-regexp" | "-w"
+            | "--line-regexp" | "-x" => {}
+            option if option.starts_with('-') => return false,
+            _ => {}
+        }
+    }
+    filename && line_number && no_heading && no_config && no_color
 }
 
 /// Reads, searches, and listings are source material, not diagnostics: ranking
@@ -1632,6 +1720,48 @@ mod optimization_tests {
         sorted.sort_unstable();
         sorted.dedup();
         assert_eq!(sorted.len(), ordered.len());
+    }
+}
+
+#[cfg(test)]
+mod audit04_summary_regressions {
+    use super::*;
+
+    #[test]
+    fn distinct_early_progress_cannot_crowd_out_final_failure_status() {
+        let mut lines = (0..64).map(|index| format!("job {index} progress 1/10 elapsed 1s")).collect::<Vec<_>>();
+        for index in 0..8 {
+            lines.extend((0..30).map(|_| "ordinary context".to_owned()));
+            lines.push(format!("error: distinct failure {index}"));
+            lines.push(String::new());
+        }
+        lines.extend((0..300).map(|_| "ordinary tail".to_owned()));
+        lines.push("test result: FAILED. 0 passed; 8 failed".into());
+        let output = lines.join("\n");
+        let summary = summarize_shell_output_for_model(&output, 1, false, ShellOutputSummaryOptions {
+            enabled: true, applied_token_limit: None, command_text: Some("cargo test"),
+        }).unwrap();
+        assert!(summary.contains("test result: FAILED. 0 passed; 8 failed"), "{summary}");
+        assert!(summary.contains("error: distinct failure 0"));
+        assert!(summary.lines().count() <= SUMMARY_MAX_LINES);
+        assert!(summary.len() <= SUMMARY_MAX_BYTES);
+    }
+
+    #[test]
+    fn rg_counts_require_explicit_path_line_format_not_content_prefixes() {
+        let output = "1:worker:123:needle\n".repeat(700);
+        for command in [
+            "rg -n --no-filename needle src/a.log",
+            "rg -n needle src/a.log",
+            "rg --json needle src",
+            "rg --no-config -n --with-filename --no-heading --color never --replace 'a:123:' needle src",
+        ] {
+            assert!(rg_file_summary(&output, command, Some(500)).is_none(), "{command}");
+        }
+        let output = "src/a.log:1:worker:123:needle\n".repeat(700);
+        let summary = rg_file_summary(&output, "rg --no-config -n --with-filename --no-heading --color never needle src", Some(500)).unwrap();
+        assert!(summary.contains("700 hits across 1 files"));
+        assert!(summary.contains("src/a.log"));
     }
 }
 

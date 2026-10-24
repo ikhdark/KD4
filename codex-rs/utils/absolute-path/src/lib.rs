@@ -187,25 +187,67 @@ fn normalize_path_for_platform(path: &Path) -> Cow<'_, Path> {
     Cow::Borrowed(dunce::simplified(path))
 }
 
-/// Normalize supported Windows device-path prefixes into ordinary absolute paths.
+/// Simplify device syntax only when ordinary Windows parsing preserves identity.
+/// None means the caller must retain the original spelling.
 pub fn normalize_windows_device_path(path: &str) -> Option<String> {
-    if let Some(unc) = path.strip_prefix(r"\\?\UNC\") {
-        return Some(format!(r"\\{unc}"));
+    let tail = path
+        .strip_prefix(r"\\?\")
+        .or_else(|| path.strip_prefix(r"\\.\"))?;
+    let (normalized, components, unc) = if let Some(unc) = tail.strip_prefix(r"UNC\") {
+        (format!(r"\\{unc}"), unc, true)
+    } else if is_windows_drive_absolute_path(tail) && tail.as_bytes()[2] == b'\\' {
+        (tail.to_owned(), &tail[3..], false)
+    } else {
+        return None;
+    };
+    if path.encode_utf16().count() > 260 {
+        return None;
     }
-    if let Some(unc) = path.strip_prefix(r"\\.\UNC\") {
-        return Some(format!(r"\\{unc}"));
+    let components = components.strip_suffix('\\').unwrap_or(components);
+    if unc && components.split('\\').count() < 2 {
+        return None;
     }
-    if let Some(path) = path.strip_prefix(r"\\?\")
-        && is_windows_drive_absolute_path(path)
+    if (!components.is_empty() || unc)
+        && !components
+            .split('\\')
+            .all(ordinary_windows_component_is_safe)
     {
-        return Some(path.to_string());
+        return None;
     }
-    if let Some(path) = path.strip_prefix(r"\\.\")
-        && is_windows_drive_absolute_path(path)
+    Some(normalized)
+}
+
+fn ordinary_windows_component_is_safe(component: &str) -> bool {
+    if component.is_empty()
+        || component.encode_utf16().count() > 255
+        || component.ends_with(['.', ' '])
+        || component.bytes().any(|ch| {
+            ch < 32 || matches!(ch, b'<' | b'>' | b':' | b'"' | b'/' | b'|' | b'?' | b'*')
+        })
     {
-        return Some(path.to_string());
+        return false;
     }
-    None
+    let stem = component
+        .split('.')
+        .next()
+        .unwrap_or(component)
+        .trim_end_matches(' ');
+    if ["CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$"]
+        .iter()
+        .any(|reserved| stem.eq_ignore_ascii_case(reserved))
+    {
+        return false;
+    }
+    !["COM", "LPT"].iter().any(|prefix| {
+        stem.get(..3)
+            .is_some_and(|value| value.eq_ignore_ascii_case(prefix))
+            && stem.get(3..).is_some_and(|suffix| {
+                matches!(
+                    suffix,
+                    "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" | "¹" | "²" | "³"
+                )
+            })
+    })
 }
 
 fn is_windows_drive_absolute_path(path: &str) -> bool {
@@ -226,9 +268,10 @@ pub fn is_windows_absolute_path(path: &str) -> bool {
 ///
 /// Top-level system aliases such as macOS `/var -> /private/var` still remain
 /// canonicalized so existing runtime expectations around those paths stay
-/// stable. If the full path cannot be canonicalized, this returns the logical
-/// absolute path; use [`canonicalize_existing_preserving_symlinks`] for paths
-/// that must exist.
+/// stable. If the full path cannot be canonicalized, unresolved parent traversal
+/// is retained verbatim rather than changing its filesystem destination. Other
+/// missing paths use the logical absolute path. Use
+/// [`canonicalize_existing_preserving_symlinks`] for paths that must exist.
 pub fn canonicalize_preserving_symlinks(path: &Path) -> std::io::Result<PathBuf> {
     canonicalize_with_symlink_policy(path, false)
 }
@@ -257,7 +300,18 @@ fn canonicalize_with_symlink_policy(
     let canonical = match dunce::canonicalize(&input) {
         Ok(canonical) => canonical,
         Err(error) if require_existing => return Err(error),
-        Err(_) => return Ok(logical),
+        Err(_) => {
+            return Ok(
+                if input
+                    .components()
+                    .any(|part| part == std::path::Component::ParentDir)
+                {
+                    input
+                } else {
+                    logical
+                },
+            );
+        }
     };
     // Removing `symlink/..` lexically can name a different (or missing) file.
     // In that case only the canonical result establishes filesystem identity.
@@ -443,11 +497,69 @@ impl<'de> Deserialize<'de> for AbsolutePathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn unsafe_device_spellings_are_not_simplified() {
+        for raw in [
+            r"\\?\C:\name.",
+            r"\\?\C:\name ",
+            r"\\?\C:\NUL",
+            r"\\?\C:\con.txt",
+            r"\\?\C:\COM¹",
+            r"\\?\C:\x\..\y",
+            r"\\?\C:\x\.\y",
+            r"\\?\UNC\server\share\name.",
+            r"\\.\C:\name.",
+        ] {
+            assert_eq!(normalize_windows_device_path(raw), None, "{raw}");
+        }
+        assert_eq!(
+            normalize_windows_device_path(&format!(r"\\?\C:\{}", "x".repeat(260))),
+            None
+        );
+    }
+
     use crate::test_support::test_path_buf;
     use pretty_assertions::assert_eq;
     use std::fs;
 
     use tempfile::tempdir;
+
+    #[test]
+    fn missing_intermediate_parent_traversal_is_not_erased() -> std::io::Result<()> {
+        let dir = tempdir()?;
+        let input = dir.path().join("missing").join("..").join("leaf");
+        assert_eq!(canonicalize_preserving_symlinks(&input)?, input);
+        assert_eq!(
+            canonicalize_existing_preserving_symlinks(&input)
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::NotFound
+        );
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(any(unix, windows))]
+    fn missing_leaf_preserves_parent_traversal_identity() -> std::io::Result<()> {
+        let dir = tempdir()?;
+        let real = dir.path().join("real");
+        fs::create_dir_all(real.join("nested"))?;
+        let alias = dir.path().join("alias");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(real.join("nested"), &alias)?;
+        #[cfg(windows)]
+        create_directory_junction(&real.join("nested"), &alias);
+        let input = alias.join("..").join("new.txt");
+        let returned = canonicalize_preserving_symlinks(&input)?;
+        assert_eq!(returned, input);
+        fs::write(&input, "native target")?;
+        assert_eq!(fs::read_to_string(&returned)?, "native target");
+        assert_eq!(
+            dunce::canonicalize(&returned)?,
+            dunce::canonicalize(&input)?
+        );
+        Ok(())
+    }
 
     #[test]
     #[should_panic(expected = "path base must be absolute")]

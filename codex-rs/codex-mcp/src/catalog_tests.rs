@@ -405,3 +405,134 @@ fn equal_precedence_uses_insertion_order_not_source_identity() {
         }]
     );
 }
+
+#[test]
+fn materialization_preserves_explicit_veto_for_selected_plugin() {
+    let mut builder = ResolvedMcpCatalog::builder();
+    builder.register(McpServerRegistration::from_selected_plugin(
+        "docs".to_string(),
+        plugin("selected"),
+        10,
+        server("https://selected.example/mcp"),
+    ));
+    builder.disable("docs".to_string());
+    // A veto must also survive when its name has no current registration.
+    builder.disable("later".to_string());
+    let original = builder.build();
+    let materialized = original.with_materialized_servers(original.configured_servers());
+    let mut builder = materialized.to_builder();
+    for name in ["docs", "later"] {
+        builder.register(McpServerRegistration::from_extension(
+            name.to_string(),
+            "hosted",
+            0,
+            server("https://extension.example/mcp"),
+        ));
+    }
+    let resolved = builder.build();
+    for name in ["docs", "later"] {
+        assert!(
+            !resolved
+                .server(name)
+                .expect("resolved server")
+                .config()
+                .enabled
+        );
+    }
+}
+
+#[test]
+fn materialization_preserves_same_tier_registration_order() {
+    for source in [
+        plugin_source("original"),
+        selected_plugin_source("original"),
+        extension_source("original"),
+    ] {
+        let registration = |source: McpServerSource, order, url| match source {
+            McpServerSource::Plugin(attribution) => McpServerRegistration::from_plugin(
+                "docs".to_string(),
+                attribution,
+                order,
+                server(url),
+            ),
+            McpServerSource::SelectedPlugin(attribution) => {
+                McpServerRegistration::from_selected_plugin(
+                    "docs".to_string(),
+                    attribution,
+                    order,
+                    server(url),
+                )
+            }
+            McpServerSource::Extension { id } => {
+                McpServerRegistration::from_extension("docs".to_string(), id, order, server(url))
+            }
+            _ => unreachable!("ordinal-bearing source"),
+        };
+        let contender = match &source {
+            McpServerSource::Plugin(_) => plugin_source("contender"),
+            McpServerSource::SelectedPlugin(_) => selected_plugin_source("contender"),
+            McpServerSource::Extension { .. } => extension_source("contender"),
+            _ => unreachable!("ordinal-bearing source"),
+        };
+        let mut builder = ResolvedMcpCatalog::builder();
+        builder.register(registration(
+            source.clone(),
+            10,
+            "https://original.example/mcp",
+        ));
+        let original = builder.build();
+        let materialized = original.with_materialized_servers(original.configured_servers());
+        let mut direct = original.to_builder();
+        let mut refreshed = materialized.to_builder();
+        for builder in [&mut direct, &mut refreshed] {
+            builder.register(registration(
+                contender.clone(),
+                5,
+                "https://contender.example/mcp",
+            ));
+        }
+        let direct = direct.build();
+        let refreshed = refreshed.build();
+        let expected_source = if matches!(source, McpServerSource::Extension { .. }) {
+            &source
+        } else {
+            &contender
+        };
+        assert_eq!(
+            direct.server("docs").expect("winner").source(),
+            expected_source
+        );
+        assert_eq!(refreshed.server("docs"), direct.server("docs"));
+    }
+}
+
+#[test]
+fn materialization_does_not_turn_selected_disable_into_name_veto() {
+    let mut disabled = server("https://selected.example/mcp");
+    disabled.enabled = false;
+    let mut builder = ResolvedMcpCatalog::builder();
+    builder.register(McpServerRegistration::from_selected_plugin(
+        "docs".to_string(),
+        plugin("selected"),
+        10,
+        disabled,
+    ));
+    let original = builder.build();
+    let mut builder = original
+        .with_materialized_servers(original.configured_servers())
+        .to_builder();
+    builder.register(McpServerRegistration::from_extension(
+        "docs".to_string(),
+        "hosted",
+        0,
+        server("https://extension.example/mcp"),
+    ));
+    assert!(
+        builder
+            .build()
+            .server("docs")
+            .expect("winner")
+            .config()
+            .enabled
+    );
+}

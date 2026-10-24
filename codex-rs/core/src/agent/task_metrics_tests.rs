@@ -76,7 +76,6 @@ fn metric_input() -> TaskMetricInput {
                 capacity: 5,
             },
         ],
-        first_pass_validation_succeeded: false,
         acceptance_total: 4,
         acceptance_first_pass_closed: Some(3),
         acceptance_final_closed: 4,
@@ -98,7 +97,6 @@ fn metric_input() -> TaskMetricInput {
 fn terminal_input() -> TaskMetricTerminalInput {
     let input = metric_input();
     TaskMetricTerminalInput {
-        first_pass_validation_succeeded: input.first_pass_validation_succeeded,
         acceptance_total: input.acceptance_total,
         acceptance_first_pass_closed: input.acceptance_first_pass_closed,
         acceptance_final_closed: input.acceptance_final_closed,
@@ -685,7 +683,6 @@ fn emitter_vocabulary_is_static_and_low_cardinality() {
             TASK_TOKEN_USAGE_METRIC,
             TASK_INFERENCE_CALLS_METRIC,
             TASK_CONCURRENCY_UTILIZATION_METRIC,
-            TASK_FIRST_PASS_VALIDATION_METRIC,
             TASK_ACCEPTANCE_CLOSURE_METRIC,
             TASK_DUPLICATE_WORK_METRIC,
             TASK_CONFLICT_METRIC,
@@ -704,7 +701,6 @@ fn emitter_vocabulary_is_static_and_low_cardinality() {
             "codex.multi_agent.task.token_usage",
             "codex.multi_agent.task.inference_calls",
             "codex.multi_agent.task.concurrency_utilization.basis_points",
-            "codex.multi_agent.task.first_pass_validation",
             "codex.multi_agent.task.acceptance_closure.basis_points",
             "codex.multi_agent.task.duplicate_work",
             "codex.multi_agent.task.conflict",
@@ -721,7 +717,6 @@ fn emitter_vocabulary_is_static_and_low_cardinality() {
             ROLE_TAG,
             CAPABILITY_TAG,
             OUTCOME_TAG,
-            SUCCEEDED_TAG,
             PHASE_TAG,
             DISPOSITION_TAG,
         ],
@@ -729,7 +724,6 @@ fn emitter_vocabulary_is_static_and_low_cardinality() {
             "role",
             "capability",
             "outcome",
-            "succeeded",
             "phase",
             "disposition",
         ]
@@ -802,55 +796,6 @@ fn emitter_vocabulary_is_static_and_low_cardinality() {
     assert_eq!(saturating_metric_value(u64::MAX), i64::MAX);
 }
 
-#[test]
-fn first_pass_validation_rejects_stale_or_mismatched_structured_evidence() {
-    let task = completed_task_with_validation(
-        &["validation-1"],
-        &[("validation-1", ValidationCallStatus::Succeeded)],
-    );
-    assert!(super::terminal_input(&task).first_pass_validation_succeeded);
-    for (case, invalid) in [
-        ("no validation", completed_task_with_validation(&[], &[])),
-        (
-            "missing call",
-            completed_task_with_validation(&["validation-1"], &[]),
-        ),
-        (
-            "failed call",
-            completed_task_with_validation(
-                &["validation-1"],
-                &[("validation-1", ValidationCallStatus::Failed)],
-            ),
-        ),
-    ] {
-        assert!(
-            !super::terminal_input(&invalid).first_pass_validation_succeeded,
-            "{case} must not establish first-pass validation"
-        );
-    }
-    let mut missing_result = task.clone();
-    missing_result.validation_calls[0]
-        .evidence
-        .validation_result = None;
-    assert!(!super::terminal_input(&missing_result).first_pass_validation_succeeded);
-    let mut stale = task.clone();
-    stale.validation_calls[0].evidence.end_epoch = Some(1);
-    assert!(!super::terminal_input(&stale).first_pass_validation_succeeded);
-    let mut mismatched = task.clone();
-    mismatched.validation_calls[0]
-        .evidence
-        .validation_result
-        .as_mut()
-        .unwrap()["callId"] = "wrong-call".into();
-    assert!(!super::terminal_input(&mismatched).first_pass_validation_succeeded);
-    let mut failed = task;
-    failed.validation_calls[0]
-        .evidence
-        .validation_result
-        .as_mut()
-        .unwrap()["status"] = "failed".into();
-    assert!(!super::terminal_input(&failed).first_pass_validation_succeeded);
-}
 
 #[test]
 fn terminal_adapter_preserves_unavailable_measurements() {

@@ -137,7 +137,8 @@ fn build_http_client_inner(
     tls: &OtelTlsConfig,
     timeout_var: &str,
 ) -> Result<OtlpBlockingHttpClient, Box<dyn Error>> {
-    let mut builder = BlockingHttpClientBuilder::new().timeout(resolve_otlp_timeout(timeout_var));
+    let timeout = resolve_otlp_timeout(timeout_var);
+    let mut builder = BlockingHttpClientBuilder::new().timeout(timeout);
     let HttpTlsMaterial {
         ca_certificate,
         client_identity,
@@ -169,7 +170,7 @@ fn build_http_client_inner(
 
     builder
         .build_with_transport_default_proxy()
-        .map(OtlpBlockingHttpClient)
+        .map(|client| OtlpBlockingHttpClient(client, timeout))
         .map_err(|error| Box::new(error) as Box<dyn Error>)
 }
 
@@ -218,7 +219,9 @@ pub(crate) fn build_async_http_client(
 #[derive(Clone, Debug)]
 pub(crate) struct OtlpAsyncHttpClient(HttpClient);
 
-pub(crate) struct OtlpBlockingHttpClient(BlockingHttpClient);
+pub(crate) struct OtlpBlockingHttpClient(BlockingHttpClient, Duration);
+
+const MAX_OTLP_RESPONSE_BODY_BYTES: usize = 4 * 1024 * 1024;
 
 impl fmt::Debug for OtlpBlockingHttpClient {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -237,7 +240,7 @@ impl OtelHttpClient for OtlpAsyncHttpClient {
     {
         Box::pin(async move {
             let (parts, body) = request.into_parts();
-            let response = self
+            let mut response = self
                 .0
                 .request(parts.method, parts.uri.to_string())
                 .headers(parts.headers)
@@ -245,12 +248,17 @@ impl OtelHttpClient for OtlpAsyncHttpClient {
                 .send()
                 .await?;
             let status = response.status();
-            if !status.is_success() {
-                return Err(format!("request failed with status {status}").into());
-            }
             let headers = response.headers().clone();
-            let body = response.bytes().await?;
-            let mut response = Response::builder().status(status).body(body)?;
+            let mut body = Vec::new();
+            while let Some(chunk) = response.chunk().await? {
+                if chunk.len() > MAX_OTLP_RESPONSE_BODY_BYTES - body.len() {
+                    return Err(
+                        Box::new(opentelemetry_http::ResponseBodyTooLarge::new()) as OtelHttpError
+                    );
+                }
+                body.extend_from_slice(&chunk);
+            }
+            let mut response = Response::builder().status(status).body(Bytes::from(body))?;
             *response.headers_mut() = headers;
             Ok(response)
         })
@@ -268,19 +276,31 @@ impl OtelHttpClient for OtlpBlockingHttpClient {
     {
         Box::pin(async move {
             let (parts, body) = request.into_parts();
-            let response = self
+            let mut response = self
                 .0
                 .request(parts.method, parts.uri.to_string())
+                // Preserve one async-body deadline across repeated blocking reads.
+                .timeout(self.1)
                 .headers(parts.headers)
                 .body(body.to_vec())
                 .send()?;
             let status = response.status();
-            if !status.is_success() {
-                return Err(format!("request failed with status {status}").into());
-            }
             let headers = response.headers().clone();
-            let body = response.bytes()?;
-            let mut response = Response::builder().status(status).body(body)?;
+            let mut body = Vec::new();
+            let mut buffer = [0; 8192];
+            loop {
+                let count = std::io::Read::read(&mut response, &mut buffer)?;
+                if count == 0 {
+                    break;
+                }
+                if count > MAX_OTLP_RESPONSE_BODY_BYTES - body.len() {
+                    return Err(
+                        Box::new(opentelemetry_http::ResponseBodyTooLarge::new()) as OtelHttpError
+                    );
+                }
+                body.extend_from_slice(&buffer[..count]);
+            }
+            let mut response = Response::builder().status(status).body(Bytes::from(body))?;
             *response.headers_mut() = headers;
             Ok(response)
         })
@@ -317,6 +337,9 @@ fn load_http_tls_material(tls: &OtelTlsConfig) -> Result<HttpTlsMaterial, Box<dy
         (Some(cert_path), Some(key_path)) => {
             let (mut cert_pem, cert_location) = read_bytes(cert_path)?;
             let (key_pem, key_location) = read_bytes(key_path)?;
+            // Separate independently valid PEM files even when the certificate's
+            // final END boundary has no trailing newline.
+            cert_pem.push(b'\n');
             cert_pem.extend_from_slice(key_pem.as_slice());
             Some(ClientIdentityPem {
                 bytes: cert_pem,
@@ -381,6 +404,14 @@ mod tests {
     use tokio::runtime::Builder;
 
     fn spawn_http_response_server() -> (String, std::thread::JoinHandle<()>) {
+        spawn_http_response_server_with_wire_response(
+            b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\nx-otel-response: ok\r\n\r\nok".to_vec(),
+        )
+    }
+
+    fn spawn_http_response_server_with_wire_response(
+        wire_response: Vec<u8>,
+    ) -> (String, std::thread::JoinHandle<()>) {
         let listener = TcpListener::bind("127.0.0.1:0").expect("test listener should bind");
         let address = listener.local_addr().expect("test listener address");
         let server = std::thread::spawn(move || {
@@ -420,10 +451,211 @@ mod tests {
                 .expect("complete request body");
             assert_eq!(&request[header_end..], b"payload");
             stream
-                .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\nx-otel-response: ok\r\n\r\nok")
+                .write_all(&wire_response)
                 .expect("test response should write");
         });
         (format!("http://{address}/v1/traces"), server)
+    }
+
+    fn spawn_trickling_response() -> (String, std::thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let server = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + Duration::from_secs(3);
+            let mut stream = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(std::time::Instant::now() < deadline);
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(error) => panic!("{error}"),
+                }
+            };
+            stream
+                .set_read_timeout(Some(Duration::from_secs(1)))
+                .unwrap();
+            let mut request = Vec::new();
+            while !request.ends_with(b"payload") {
+                let mut byte = [0];
+                if stream.read_exact(&mut byte).is_err() {
+                    return;
+                }
+                request.push(byte[0]);
+                assert!(request.len() < 8192);
+            }
+            if stream
+                .write_all(b"HTTP/1.1 503 Busy\r\nContent-Length: 10\r\n\r\n")
+                .is_err()
+            {
+                return;
+            }
+            for _ in 0..10 {
+                std::thread::sleep(Duration::from_millis(60));
+                if stream.write_all(b"x").is_err() {
+                    return;
+                }
+            }
+        });
+        (format!("http://{address}/v1/traces"), server)
+    }
+
+    #[tokio::test]
+    async fn async_otlp_body_has_a_total_deadline() {
+        let (url, server) = spawn_trickling_response();
+        let client = OtlpAsyncHttpClient(
+            HttpClientBuilder::new()
+                .timeout(Duration::from_millis(180))
+                .build_direct()
+                .unwrap(),
+        );
+        let start = std::time::Instant::now();
+        assert!(
+            client
+                .send_bytes(
+                    Request::post(url)
+                        .body(Bytes::from_static(b"payload"))
+                        .unwrap()
+                )
+                .await
+                .is_err()
+        );
+        assert!(start.elapsed() < Duration::from_millis(500));
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn blocking_otlp_trickle_does_not_reset_total_body_deadline() {
+        let (url, server) = spawn_trickling_response();
+        let timeout = Duration::from_millis(180);
+        let client = OtlpBlockingHttpClient(
+            BlockingHttpClientBuilder::new()
+                .timeout(timeout)
+                .build_direct()
+                .unwrap(),
+            timeout,
+        );
+        let start = std::time::Instant::now();
+        let mut future = client.send_bytes(
+            Request::post(url)
+                .body(Bytes::from_static(b"payload"))
+                .unwrap(),
+        );
+        let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+        assert!(matches!(
+            future.as_mut().poll(&mut context),
+            std::task::Poll::Ready(Err(_))
+        ));
+        assert!(start.elapsed() < Duration::from_millis(500));
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn async_otlp_rejects_oversized_response_bodies() {
+        let mut wire = format!(
+            "HTTP/1.1 503 Busy\r\nContent-Length: {}\r\n\r\n",
+            MAX_OTLP_RESPONSE_BODY_BYTES + 1
+        )
+        .into_bytes();
+        wire.extend(std::iter::repeat_n(b'x', MAX_OTLP_RESPONSE_BODY_BYTES + 1));
+        let (url, server) = spawn_http_response_server_with_wire_response(wire);
+        let client = OtlpAsyncHttpClient(
+            HttpClientBuilder::new()
+                .timeout(Duration::from_secs(5))
+                .build_direct()
+                .unwrap(),
+        );
+        let error = client
+            .send_bytes(
+                Request::post(url)
+                    .header("x-otel-test", "shared")
+                    .body(Bytes::from_static(b"payload"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .downcast_ref::<opentelemetry_http::ResponseBodyTooLarge>()
+                .is_some()
+        );
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn async_otlp_adapter_preserves_error_responses() {
+        for status in [400, 429, 503] {
+            let (url, server) = spawn_http_response_server_with_wire_response(format!("HTTP/1.1 {status} Test\r\nContent-Length: 5\r\nRetry-After: 1\r\nConnection: close\r\n\r\nerror").into_bytes());
+            let client = OtlpAsyncHttpClient(
+                HttpClientBuilder::new()
+                    .timeout(Duration::from_secs(5))
+                    .build_direct()
+                    .unwrap(),
+            );
+            let response = client
+                .send_bytes(
+                    Request::post(url)
+                        .header("x-otel-test", "shared")
+                        .body(Bytes::from_static(b"payload"))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status().as_u16(), status);
+            assert_eq!(response.headers()["retry-after"], "1");
+            assert_eq!(response.body(), &Bytes::from_static(b"error"));
+            server.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn blocking_otlp_adapter_preserves_error_responses() {
+        for status in [400, 429, 503] {
+            let (url, server) = spawn_http_response_server_with_wire_response(format!("HTTP/1.1 {status} Test\r\nContent-Length: 5\r\nRetry-After: 1\r\nConnection: close\r\n\r\nerror").into_bytes());
+            let client = OtlpBlockingHttpClient(
+                BlockingHttpClientBuilder::new()
+                    .timeout(Duration::from_secs(5))
+                    .build_direct()
+                    .unwrap(),
+                Duration::from_secs(5),
+            );
+            let mut future = client.send_bytes(
+                Request::post(url)
+                    .header("x-otel-test", "shared")
+                    .body(Bytes::from_static(b"payload"))
+                    .unwrap(),
+            );
+            let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+            let std::task::Poll::Ready(response) = future.as_mut().poll(&mut context) else {
+                panic!("blocking adapter must finish synchronously");
+            };
+            let response = response.unwrap();
+            assert_eq!(response.status().as_u16(), status);
+            assert_eq!(response.headers()["retry-after"], "1");
+            assert_eq!(response.body(), &Bytes::from_static(b"error"));
+            server.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn http_clients_accept_mtls_identity_without_certificate_final_newline() {
+        let directory = tempfile::tempdir().unwrap();
+        let rcgen::CertifiedKey { cert, signing_key } =
+            rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let cert_path = directory.path().join("client.pem");
+        let key_path = directory.path().join("client-key.pem");
+        fs::write(&key_path, signing_key.serialize_pem()).unwrap();
+        for ending in ["", "\n", "\r\n"] {
+            fs::write(&cert_path, format!("{}{ending}", cert.pem().trim_end())).unwrap();
+            let tls = OtelTlsConfig {
+                client_certificate: Some(AbsolutePathBuf::from_absolute_path(&cert_path).unwrap()),
+                client_private_key: Some(AbsolutePathBuf::from_absolute_path(&key_path).unwrap()),
+                ..Default::default()
+            };
+            build_http_client(&tls, OTEL_EXPORTER_OTLP_TIMEOUT).unwrap();
+            build_async_http_client(Some(&tls), OTEL_EXPORTER_OTLP_TIMEOUT).unwrap();
+        }
     }
 
     #[tokio::test]
@@ -456,6 +688,7 @@ mod tests {
                 .timeout(Duration::from_secs(5))
                 .build_direct()
                 .expect("shared blocking client"),
+            Duration::from_secs(5),
         );
         let request = Request::post(url)
             .header("x-otel-test", "shared")

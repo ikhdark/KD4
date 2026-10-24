@@ -147,7 +147,9 @@ fn replace_mcp_servers(doc: &mut DocumentMut, servers: &BTreeMap<String, McpServ
     let mut table = TomlTable::new();
     table.set_implicit(true);
     for (name, config) in servers {
-        table.insert(name, serialize_mcp_server(config));
+        let existing = root.get("mcp_servers").and_then(TomlItem::as_table_like)
+            .and_then(|servers| servers.get(name));
+        table.insert(name, serialize_mcp_server_for_edit(config, existing));
     }
     root.insert("mcp_servers", TomlItem::Table(table));
 }
@@ -235,9 +237,7 @@ fn serialize_mcp_server_table(config: &McpServerConfig) -> TomlTable {
     if let Some(enabled_tools) = &config.enabled_tools {
         entry["enabled_tools"] = array_from_strings(enabled_tools);
     }
-    if let Some(disabled_tools) = &config.disabled_tools
-        && !disabled_tools.is_empty()
-    {
+    if let Some(disabled_tools) = &config.disabled_tools {
         entry["disabled_tools"] = array_from_strings(disabled_tools);
     }
     // An explicit empty list suppresses OAuth scope discovery; it is not unset.
@@ -288,6 +288,57 @@ pub fn serialize_mcp_server(config: &McpServerConfig) -> TomlItem {
 
 pub fn serialize_mcp_server_inline(config: &McpServerConfig) -> InlineTable {
     serialize_mcp_server_table(config).into_inline_table()
+}
+
+// Used only for comparing semantic fields during an edit, never as a new layer.
+fn complete_mcp_server_table(config: &McpServerConfig) -> TomlTable {
+    let mut table = serialize_mcp_server_table(config);
+    table["auth"] = value(match config.auth { McpServerAuth::OAuth => "oauth", McpServerAuth::ChatGpt => "chatgpt" });
+    table["enabled"] = value(config.enabled);
+    table["required"] = value(config.required);
+    table["environment_id"] = value(config.environment_id.clone());
+    table["supports_parallel_tool_calls"] = value(config.supports_parallel_tool_calls);
+    match &config.transport {
+        McpServerTransportConfig::Stdio { args, env, env_vars, .. } => {
+            table["args"] = array_from_strings(args);
+            table["env_vars"] = array_from_env_vars(env_vars);
+            if let Some(env) = env { table["env"] = table_from_pairs(env.iter()); }
+        }
+        McpServerTransportConfig::StreamableHttp { http_headers, env_http_headers, .. } => {
+            if let Some(headers) = http_headers { table["http_headers"] = table_from_pairs(headers.iter()); }
+            if let Some(headers) = env_http_headers { table["env_http_headers"] = table_from_pairs(headers.iter()); }
+        }
+    }
+    table
+}
+
+/// Preserve absent versus explicit fields in an existing configuration layer.
+/// Only fields whose typed values changed are rewritten; unknown fields and
+/// explicit defaults on untouched fields remain in the original document.
+pub fn serialize_mcp_server_for_edit(config: &McpServerConfig, existing: Option<&TomlItem>) -> TomlItem {
+    let Some(existing) = existing else { return serialize_mcp_server(config); };
+    let mut document = DocumentMut::new();
+    document["server"] = existing.clone();
+    let previous = toml::from_str::<BTreeMap<String, McpServerConfig>>(&document.to_string())
+        .ok().and_then(|mut servers| servers.remove("server"));
+    let Some(previous) = previous else { return serialize_mcp_server(config); };
+    let before = complete_mcp_server_table(&previous);
+    let after = complete_mcp_server_table(config);
+    let mut edited = existing.clone();
+    let Some(table) = edited.as_table_like_mut() else { return serialize_mcp_server(config); };
+    let keys = before.iter().chain(after.iter()).map(|(key, _)| key.to_owned())
+        .collect::<std::collections::BTreeSet<_>>();
+    for key in keys {
+        if before.get(&key).map(ToString::to_string) == after.get(&key).map(ToString::to_string) {
+            continue;
+        }
+        if let Some(replacement) = after.get(&key) {
+            table.insert(&key, replacement.clone());
+        } else {
+            table.remove(&key);
+        }
+    }
+    edited
 }
 
 fn array_from_strings(values: &[String]) -> TomlItem {

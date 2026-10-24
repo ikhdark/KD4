@@ -299,7 +299,7 @@ async fn send_client_management_request_once(
         .map_err(|err| io::Error::other(format!("failed to {action}: {err}")))?;
     let headers = response.headers().clone();
     let status = response.status();
-    let body = super::enroll::read_remote_control_response_body(response)
+    let body = super::enroll::read_remote_control_response_body_for_status(response)
         .await
         .map_err(|err| io::Error::other(format!("failed to read {action} response: {err}")))?;
     Ok(ClientManagementResponse {

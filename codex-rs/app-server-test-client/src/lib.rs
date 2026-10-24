@@ -95,6 +95,7 @@ mod request_user_input;
 use process::add_codex_parent_to_path;
 use process::build_serve_command;
 use process::listener_pids_on_port;
+use process::listeners_after_grace;
 use process::powershell_quote;
 use process::preflight_serve_restart;
 use process::runtime_dir;
@@ -111,6 +112,7 @@ const NOTIFICATIONS_TO_OPT_OUT: &[&str] = &[
 ];
 const APP_SERVER_GRACEFUL_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 const APP_SERVER_STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
+const APP_SERVER_RESTART_TIMEOUT: Duration = Duration::from_secs(30);
 const APP_SERVER_GRACEFUL_SHUTDOWN_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const RPC_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_ANALYTICS_ENABLED: bool = true;
@@ -124,7 +126,7 @@ const TRACE_DISABLED_MESSAGE: &str =
     author = "Codex",
     version,
     about = "Bootstrap Codex app-server",
-    long_about = "Bootstrap Codex app-server. Set CODEX_APP_SERVER_TEST_CLIENT_WIRE_DUMP to enable full wire diagnostics (user input answers are redacted)."
+    long_about = "Bootstrap Codex app-server. Use --command-timeout-seconds 600 for bounded, noninteractive finite commands (including turn completion); terminal user-input requests are rejected in this mode. On timeout, a remote turn may still be running: inspect its state rather than automatically resubmitting. Watch and login retain intentional unbounded waits. Set CODEX_APP_SERVER_TEST_CLIENT_WIRE_DUMP to enable full wire diagnostics (user input answers are redacted)."
 )]
 struct Cli {
     /// Path to the `codex` CLI binary. When set, requests use stdio by
@@ -161,6 +163,11 @@ struct Cli {
     ///   --dynamic-tools @/path/to/tools.json
     #[arg(long, value_name = "json-or-@file", global = true)]
     dynamic_tools: Option<String>,
+
+    /// Bound a finite command, including turn completion. This noninteractive
+    /// mode rejects terminal request_user_input; watch and login remain unbounded.
+    #[arg(long, value_name = "seconds", value_parser = clap::value_parser!(u64).range(1..), global = true)]
+    command_timeout_seconds: Option<u64>,
 
     #[command(subcommand)]
     command: CliCommand,
@@ -335,10 +342,19 @@ pub async fn run() -> Result<()> {
         url,
         config_overrides,
         dynamic_tools,
+        command_timeout_seconds,
         command,
     } = cli;
 
     let dynamic_tools = parse_dynamic_tools_arg(&dynamic_tools)?;
+    let command_timeout = command_timeout_seconds.map(Duration::from_secs);
+    let resolve_endpoint = |codex_bin, url| {
+        let endpoint = resolve_endpoint(codex_bin, url)?;
+        Ok::<_, anyhow::Error>(match command_timeout {
+            Some(timeout) => Endpoint::Budgeted(Box::new(endpoint), timeout),
+            None => endpoint,
+        })
+    };
 
     match command {
         CliCommand::Serve { listen, kill } => {
@@ -471,6 +487,7 @@ pub async fn run() -> Result<()> {
                 workspace,
                 script,
                 hold_seconds,
+                command_timeout,
             )
         }
         CliCommand::PluginAnalyticsSmoke {
@@ -531,6 +548,7 @@ pub async fn run() -> Result<()> {
 enum Endpoint {
     SpawnCodex(PathBuf),
     ConnectWs(String),
+    Budgeted(Box<Endpoint>, Duration),
 }
 
 struct BackgroundAppServer {
@@ -539,6 +557,24 @@ struct BackgroundAppServer {
 }
 
 fn validate_endpoint_options(cli: &Cli) -> Result<()> {
+    if cli.command_timeout_seconds.is_some()
+        && !matches!(
+            cli.command,
+            CliCommand::SendMessage { .. }
+                | CliCommand::SendMessageV2 { .. }
+                | CliCommand::ResumeMessageV2 { .. }
+                | CliCommand::TriggerCmdApproval { .. }
+                | CliCommand::TriggerPatchApproval { .. }
+                | CliCommand::NoTriggerCmdApproval
+                | CliCommand::SendFollowUpV2 { .. }
+                | CliCommand::GetAccountRateLimits
+                | CliCommand::ModelList
+                | CliCommand::ThreadList { .. }
+                | CliCommand::LiveElicitationTimeoutPause { .. }
+        )
+    {
+        bail!("--command-timeout-seconds requires a finite noninteractive command");
+    }
     if matches!(cli.command, CliCommand::Serve { .. }) {
         if cli.url.is_some() {
             bail!("serve does not support --url; use --listen to choose the binding");
@@ -632,19 +668,7 @@ impl BackgroundAppServer {
             .take()
             .context("missing app-server stderr")?;
         let (ready_tx, ready_rx) = mpsc::channel();
-        thread::spawn(move || {
-            let mut ready_tx = Some(ready_tx);
-            for line in BufReader::new(stderr).lines() {
-                let Ok(line) = line else { break };
-                // Keep draining and forwarding diagnostics after startup too.
-                let _ = writeln!(std::io::stderr(), "{line}");
-                if let Some(url) = line.trim().strip_prefix("listening on: ")
-                    && let Some(ready_tx) = ready_tx.take()
-                {
-                    let _ = ready_tx.send(url.to_owned());
-                }
-            }
-        });
+        relay_app_server_diagnostics(BufReader::new(stderr), std::io::stderr(), ready_tx);
         server.url = ready_rx
             .recv_timeout(APP_SERVER_STARTUP_TIMEOUT)
             .context("app-server did not report its websocket listening address")?;
@@ -653,6 +677,52 @@ impl BackgroundAppServer {
         }
         Ok(server)
     }
+}
+
+fn relay_app_server_diagnostics(
+    reader: impl BufRead + Send + 'static,
+    mut diagnostics: impl Write + Send + 'static,
+    ready_tx: mpsc::Sender<String>,
+) -> thread::JoinHandle<()> {
+    // Presentation must never gate readiness or draining the child's pipe.
+    // Overflow drops diagnostic presentation only, and is reported on recovery.
+    let (log_tx, log_rx) = mpsc::sync_channel::<String>(128);
+    let dropped = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let dropped_for_writer = dropped.clone();
+    thread::spawn(move || {
+        for line in log_rx {
+            let count = dropped_for_writer.swap(0, std::sync::atomic::Ordering::Relaxed);
+            if count > 0 {
+                let _ = writeln!(diagnostics, "[dropped {count} app-server diagnostic lines]");
+            }
+            let _ = writeln!(diagnostics, "{line}");
+        }
+    });
+    // Neither worker is joined by server teardown: a blocked viewer cannot hold
+    // startup, child cleanup, or process shutdown hostage.
+    thread::spawn(move || {
+        let mut ready_tx = Some(ready_tx);
+        for line in reader.lines() {
+            let Ok(mut line) = line else { break };
+            if let Some(url) = line.trim().strip_prefix("listening on: ")
+                && let Some(ready_tx) = ready_tx.take()
+            {
+                let _ = ready_tx.send(url.to_owned());
+            }
+            // Bound presentation storage in bytes as well as line count.
+            if line.len() > 64 * 1024 {
+                let mut end = 64 * 1024;
+                while !line.is_char_boundary(end) {
+                    end -= 1;
+                }
+                line.truncate(end);
+                line.push_str(" [diagnostic line truncated]");
+            }
+            if matches!(log_tx.try_send(line), Err(mpsc::TrySendError::Full(_))) {
+                dropped.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+    })
 }
 
 impl Drop for BackgroundAppServer {
@@ -688,11 +758,15 @@ fn serve(codex_bin: &Path, config_overrides: &[String], listen: &str, kill: bool
         .stdout(Stdio::from(log_file))
         .stderr(Stdio::from(log_file_stderr));
 
+    let restart_deadline = Instant::now() + APP_SERVER_RESTART_TIMEOUT;
     let child = start_prepared_serve(
         kill,
-        || preflight_serve_restart(codex_bin, config_overrides),
-        || kill_listeners_on_same_port(listen),
+        || preflight_serve_restart(codex_bin, config_overrides, restart_deadline),
+        || kill_listeners_on_same_port(listen, restart_deadline),
         || {
+            if kill && Instant::now() >= restart_deadline {
+                bail!("restart operation deadline expired before spawn");
+            }
             command
                 .spawn()
                 .with_context(|| format!("failed to start `{}` app-server", codex_bin.display()))
@@ -709,35 +783,45 @@ fn serve(codex_bin: &Path, config_overrides: &[String], listen: &str, kill: bool
     Ok(())
 }
 
-fn kill_listeners_on_same_port(listen: &str) -> Result<()> {
+fn kill_listeners_on_same_port(listen: &str, deadline: Instant) -> Result<()> {
     let url = Url::parse(listen).with_context(|| format!("invalid --listen URL `{listen}`"))?;
     let port = url
         .port_or_known_default()
         .with_context(|| format!("unable to infer port from --listen URL `{listen}`"))?;
 
-    let pids = listener_pids_on_port(port)?;
+    let pids = listener_pids_on_port(port, deadline)?;
     if pids.is_empty() {
         return Ok(());
     }
 
+    let grace_deadline = Instant::now() + Duration::from_millis(300);
     for pid in pids {
         println!("killing listener pid {pid} on port {port}");
-        let term_status = terminate_process(pid, false)?;
+        let term_status = terminate_process(pid, false, deadline)?;
         if !term_status.success() {
             continue;
         }
     }
 
-    thread::sleep(Duration::from_millis(300));
-
-    for pid in listener_pids_on_port(port)? {
+    let remaining = listeners_after_grace(
+        || listener_pids_on_port(port, deadline),
+        grace_deadline,
+        deadline,
+        thread::sleep,
+    )?;
+    if remaining.is_empty() {
+        return Ok(());
+    }
+    for pid in remaining {
         println!("force killing remaining listener pid {pid} on port {port}");
-        let status = terminate_process(pid, true)?;
+        let status = terminate_process(pid, true, deadline)?;
         if !status.success() {
             bail!("failed to force terminate listener pid {pid}: {status}");
         }
     }
-
+    if !listener_pids_on_port(port, deadline)?.is_empty() {
+        bail!("port {port} still has listeners after restart cleanup");
+    }
     Ok(())
 }
 
@@ -1181,10 +1265,23 @@ async fn with_client<T>(
     let trace_summary = command_span.in_scope(|| TraceSummary::capture(tracing.traces_enabled));
     let result = command_span.in_scope(|| {
         let mut client = CodexClient::connect(endpoint, config_overrides)?;
-        f(&mut client)
+        run_client_command(&mut client, endpoint, f)
     });
     print_trace_summary(&trace_summary);
     result
+}
+
+fn run_client_command<T>(
+    client: &mut CodexClient,
+    endpoint: &Endpoint,
+    operation: impl FnOnce(&mut CodexClient) -> Result<T>,
+) -> Result<T> {
+    match endpoint {
+        Endpoint::Budgeted(_, timeout) => client
+            .with_operation_deadline(Instant::now() + *timeout, operation)
+            .context("finite command failed; remote turn cancellation was not confirmed and it may still be running; do not automatically resubmit"),
+        _ => operation(client),
+    }
 }
 
 fn thread_increment_elicitation(url: &str, thread_id: String) -> Result<()> {
@@ -1244,6 +1341,7 @@ fn live_elicitation_timeout_pause(
     workspace: PathBuf,
     script: Option<PathBuf>,
     hold_seconds: u64,
+    command_timeout: Option<Duration>,
 ) -> Result<()> {
     if hold_seconds <= 10 {
         bail!("--hold-seconds must be greater than 10 to exceed the unified exec timeout");
@@ -1284,107 +1382,114 @@ fn live_elicitation_timeout_pause(
         .context("failed to resolve codex-app-server-test-client binary path")?;
     let endpoint = Endpoint::ConnectWs(websocket_url.clone());
     let mut client = CodexClient::connect(&endpoint, &[])?;
+    let endpoint = match command_timeout {
+        Some(timeout) => Endpoint::Budgeted(Box::new(endpoint), timeout),
+        None => endpoint,
+    };
+    run_client_command(&mut client, &endpoint, |client| {
+        let initialize = client.initialize()?;
+        println!("< initialize response: {initialize:?}");
 
-    let initialize = client.initialize()?;
-    println!("< initialize response: {initialize:?}");
+        let thread_response = client.thread_start(ThreadStartParams {
+            model: Some(model),
+            ..Default::default()
+        })?;
+        println!("< thread/start: {}", thread_response.thread.id);
 
-    let thread_response = client.thread_start(ThreadStartParams {
-        model: Some(model),
-        ..Default::default()
-    })?;
-    println!("< thread/start: {}", thread_response.thread.id);
-
-    let thread_id = thread_response.thread.id;
-    let command = format!(
-        "$env:APP_SERVER_URL={}; $env:APP_SERVER_TEST_CLIENT_BIN={}; \
+        let thread_id = thread_response.thread.id;
+        let command = format!(
+            "$env:APP_SERVER_URL={}; $env:APP_SERVER_TEST_CLIENT_BIN={}; \
          $env:ELICITATION_HOLD_SECONDS={}; \
          powershell -NoProfile -ExecutionPolicy Bypass -File {}",
-        powershell_quote(&websocket_url),
-        powershell_quote(&app_server_test_client_bin.display().to_string()),
-        powershell_quote(&hold_seconds.to_string()),
-        powershell_quote(&script_path.display().to_string()),
-    );
-    let prompt = format!(
-        "Use the `exec_command` tool exactly once. Set its `cmd` field to the exact shell command below. Do not rewrite it, do not split it, do not call any other tool, do not set `yield_time_ms`, and wait for the command to finish before replying.\n\n{command}\n\nAfter the command finishes, reply with exactly `DONE`."
-    );
+            powershell_quote(&websocket_url),
+            powershell_quote(&app_server_test_client_bin.display().to_string()),
+            powershell_quote(&hold_seconds.to_string()),
+            powershell_quote(&script_path.display().to_string()),
+        );
+        let prompt = format!(
+            "Use the `exec_command` tool exactly once. Set its `cmd` field to the exact shell command below. Do not rewrite it, do not split it, do not call any other tool, do not set `yield_time_ms`, and wait for the command to finish before replying.\n\n{command}\n\nAfter the command finishes, reply with exactly `DONE`."
+        );
 
-    client.helper_command = Some(command);
-    let turn_response = client.turn_start(TurnStartParams {
-        thread_id: thread_id.clone(),
-        client_user_message_id: None,
-        input: vec![V2UserInput::Text {
-            text: prompt,
-            text_elements: Vec::new(),
-        }],
-        approval_policy: Some(AskForApproval::Never),
-        sandbox_policy: Some(SandboxPolicy::DangerFullAccess),
-        effort: Some(ReasoningEffort::High),
-        cwd: Some(workspace),
-        ..Default::default()
-    })?;
-    println!("< turn/start: {}", turn_response.turn.id);
+        client.helper_command = Some(command);
+        let turn_response = client.turn_start(TurnStartParams {
+            thread_id: thread_id.clone(),
+            client_user_message_id: None,
+            input: vec![V2UserInput::Text {
+                text: prompt,
+                text_elements: Vec::new(),
+            }],
+            approval_policy: Some(AskForApproval::Never),
+            sandbox_policy: Some(SandboxPolicy::DangerFullAccess),
+            effort: Some(ReasoningEffort::High),
+            cwd: Some(workspace),
+            ..Default::default()
+        })?;
+        println!("< turn/start: {}", turn_response.turn.id);
 
-    let stream_result = client.stream_turn(&thread_id, &turn_response.turn.id);
-    let elapsed = client.helper_duration.unwrap_or_default();
+        let stream_result = client.stream_turn(&thread_id, &turn_response.turn.id);
+        let elapsed = client.helper_duration.unwrap_or_default();
 
-    let validation_result = (|| -> Result<()> {
-        stream_result?;
+        let validation_result = (|| -> Result<()> {
+            stream_result?;
 
-        let helper_output = client
-            .command_execution_outputs
-            .iter()
-            .find(|output| output.contains("[elicitation-hold]"))
-            .cloned()
-            .ok_or_else(|| anyhow::anyhow!("expected helper script markers in command output"))?;
-        let minimum_elapsed = Duration::from_secs(hold_seconds.saturating_sub(1));
+            let helper_output = client
+                .command_execution_outputs
+                .iter()
+                .find(|output| output.contains("[elicitation-hold]"))
+                .cloned()
+                .ok_or_else(|| {
+                    anyhow::anyhow!("expected helper script markers in command output")
+                })?;
+            let minimum_elapsed = Duration::from_secs(hold_seconds.saturating_sub(1));
 
-        if client.last_turn_status != Some(TurnStatus::Completed) {
-            bail!(
-                "expected completed turn, got {:?} (last error: {:?})",
-                client.last_turn_status,
-                client.last_turn_error_message
-            );
-        }
-        if !client
-            .command_execution_statuses
-            .contains(&CommandExecutionStatus::Completed)
-        {
-            bail!(
-                "expected a completed command execution, got {:?}",
-                client.command_execution_statuses
-            );
-        }
-        if !client.helper_done_seen || !helper_output.contains("[elicitation-hold] done") {
-            bail!(
-                "expected helper script completion marker in command output, got: {helper_output:?}"
-            );
-        }
-        if !client.unexpected_items_before_helper_done.is_empty() {
-            bail!(
-                "turn started new items before helper completion: {:?}",
-                client.unexpected_items_before_helper_done
-            );
-        }
-        if client.turn_completed_before_helper_done {
-            bail!("turn completed before helper script finished");
-        }
-        if elapsed < minimum_elapsed {
-            bail!(
-                "helper execution completed too quickly to prove timeout pause worked: elapsed={elapsed:?}, expected at least {minimum_elapsed:?}"
-            );
-        }
+            if client.last_turn_status != Some(TurnStatus::Completed) {
+                bail!(
+                    "expected completed turn, got {:?} (last error: {:?})",
+                    client.last_turn_status,
+                    client.last_turn_error_message
+                );
+            }
+            if !client
+                .command_execution_statuses
+                .contains(&CommandExecutionStatus::Completed)
+            {
+                bail!(
+                    "expected a completed command execution, got {:?}",
+                    client.command_execution_statuses
+                );
+            }
+            if !client.helper_done_seen || !helper_output.contains("[elicitation-hold] done") {
+                bail!(
+                    "expected helper script completion marker in command output, got: {helper_output:?}"
+                );
+            }
+            if !client.unexpected_items_before_helper_done.is_empty() {
+                bail!(
+                    "turn started new items before helper completion: {:?}",
+                    client.unexpected_items_before_helper_done
+                );
+            }
+            if client.turn_completed_before_helper_done {
+                bail!("turn completed before helper script finished");
+            }
+            if elapsed < minimum_elapsed {
+                bail!(
+                    "helper execution completed too quickly to prove timeout pause worked: elapsed={elapsed:?}, expected at least {minimum_elapsed:?}"
+                );
+            }
+
+            Ok(())
+        })();
+
+        validation_result?;
+
+        println!(
+            "[live elicitation timeout pause summary] thread_id={thread_id}, turn_id={}, elapsed={elapsed:?}, command_statuses={:?}",
+            turn_response.turn.id, client.command_execution_statuses
+        );
 
         Ok(())
-    })();
-
-    validation_result?;
-
-    println!(
-        "[live elicitation timeout pause summary] thread_id={thread_id}, turn_id={}, elapsed={elapsed:?}, command_statuses={:?}",
-        turn_response.turn.id, client.command_execution_statuses
-    );
-
-    Ok(())
+    })
 }
 
 fn ensure_dynamic_tools_unused(
@@ -1475,36 +1580,39 @@ impl BlockingWebSocket {
                             )
                             .await
                             {
-                                Ok((socket, _response)) => return socket,
+                                Ok((socket, _response)) => return Ok(socket),
                                 Err(tokio_tungstenite::tungstenite::Error::Http(response))
                                     if response.status().is_redirection() && redirect < 3 =>
                                 {
-                                    let Some(location) = response.headers().get("Location") else {
-                                        last_error = Some(
-                                            tokio_tungstenite::tungstenite::Error::Http(response),
-                                        );
-                                        break;
-                                    };
-                                    let Ok(location) = location.to_str() else {
-                                        last_error = Some(
-                                            tokio_tungstenite::tungstenite::Error::Http(response),
-                                        );
-                                        break;
+                                    let location = response
+                                        .headers()
+                                        .get("Location")
+                                        .and_then(|location| location.to_str().ok())
+                                        .and_then(|location| {
+                                            Url::parse(&target).ok()?.join(location).ok()
+                                        });
+                                    let Some(location) = location else {
+                                        return Err(tokio_tungstenite::tungstenite::Error::Http(
+                                            response,
+                                        ));
                                     };
                                     target = location.to_string();
                                 }
                                 Err(error) => {
+                                    let Some(delay) = websocket_connect_retry_delay(&error) else {
+                                        return Err(error);
+                                    };
                                     last_error = Some(error);
+                                    tokio::time::sleep(delay).await;
                                     break;
                                 }
                             }
                         }
-                        tokio::time::sleep(Duration::from_millis(50)).await;
                     }
                 })
                 .await;
                 match result {
-                    Ok(socket) => Ok(socket),
+                    Ok(result) => result.map_err(anyhow::Error::from),
                     Err(error) => Err(last_error
                         .map(anyhow::Error::from)
                         .unwrap_or_else(|| error.into()))
@@ -1583,6 +1691,38 @@ impl BlockingWebSocket {
     }
 }
 
+fn websocket_connect_retry_delay(error: &tungstenite::Error) -> Option<Duration> {
+    match error {
+        tungstenite::Error::Io(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::ConnectionRefused
+                    | std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::ConnectionAborted
+                    | std::io::ErrorKind::TimedOut
+                    | std::io::ErrorKind::WouldBlock
+                    | std::io::ErrorKind::Interrupted
+            ) =>
+        {
+            Some(Duration::from_millis(50))
+        }
+        tungstenite::Error::Http(response)
+            if matches!(response.status().as_u16(), 429 | 502 | 503 | 504) =>
+        {
+            Some(
+                response
+                    .headers()
+                    .get("Retry-After")
+                    .and_then(|value| value.to_str().ok())
+                    .and_then(|value| value.parse::<u64>().ok())
+                    .map(Duration::from_secs)
+                    .unwrap_or(Duration::from_millis(50)),
+            )
+        }
+        _ => None,
+    }
+}
+
 async fn socket_operation_until<T>(
     deadline: Option<Instant>,
     operation: impl std::future::Future<Output = Result<T>>,
@@ -1606,11 +1746,63 @@ impl Drop for BlockingWebSocket {
     }
 }
 
+struct StdioLineReader {
+    lines: mpsc::Receiver<std::io::Result<String>>,
+}
+
+impl From<BufReader<ChildStdout>> for StdioLineReader {
+    fn from(mut stdout: BufReader<ChildStdout>) -> Self {
+        let (sender, lines) = mpsc::sync_channel(1);
+        // A descendant can retain the pipe after the direct child is killed.
+        // Keep native reads detached, but bound read-ahead and caller waiting.
+        thread::spawn(move || {
+            loop {
+                let mut line = String::new();
+                let result = std::io::Read::take(&mut stdout, 32 * 1024 * 1024 + 1)
+                    .read_line(&mut line)
+                    .and_then(|bytes| {
+                        if bytes == 0 {
+                            Err(std::io::Error::new(
+                                std::io::ErrorKind::UnexpectedEof,
+                                "codex app-server closed stdout",
+                            ))
+                        } else if line.len() > 32 * 1024 * 1024 {
+                            Err(std::io::Error::new(
+                                std::io::ErrorKind::InvalidData,
+                                "codex app-server stdout line exceeds 32 MiB",
+                            ))
+                        } else {
+                            Ok(line)
+                        }
+                    });
+                let failed = result.is_err();
+                if sender.send(result).is_err() || failed {
+                    break;
+                }
+            }
+        });
+        Self { lines }
+    }
+}
+
+impl StdioLineReader {
+    fn read(&self, deadline: Option<Instant>) -> Result<String> {
+        let result = match deadline {
+            Some(deadline) => self
+                .lines
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                .context("stdio read operation deadline expired or reader stopped")?,
+            None => self.lines.recv().context("stdio reader stopped")?,
+        };
+        result.context("failed to read from codex app-server")
+    }
+}
+
 enum ClientTransport {
     Stdio {
         child: std::sync::Arc<std::sync::Mutex<Child>>,
         stdin: Option<ChildStdin>,
-        stdout: BufReader<ChildStdout>,
+        stdout: StdioLineReader,
     },
     WebSocket {
         url: String,
@@ -1620,6 +1812,7 @@ enum ClientTransport {
 
 struct CodexClient {
     transport: ClientTransport,
+    shutdown_grace: Duration,
     operation_deadline: Option<Instant>,
     wire_dump: bool,
     pending_notifications: VecDeque<JSONRPCNotification>,
@@ -1670,6 +1863,7 @@ impl CodexClient {
         match endpoint {
             Endpoint::SpawnCodex(codex_bin) => Self::spawn_stdio(codex_bin, config_overrides),
             Endpoint::ConnectWs(url) => Self::connect_websocket(url),
+            Endpoint::Budgeted(endpoint, _) => Self::connect(endpoint, config_overrides),
         }
     }
 
@@ -1711,7 +1905,7 @@ impl CodexClient {
         Ok(Self::from_transport(ClientTransport::Stdio {
             child: std::sync::Arc::new(std::sync::Mutex::new(codex_app_server)),
             stdin: Some(stdin),
-            stdout: BufReader::new(stdout),
+            stdout: BufReader::new(stdout).into(),
         }))
     }
 
@@ -1731,6 +1925,7 @@ impl CodexClient {
     fn from_transport(transport: ClientTransport) -> Self {
         Self {
             transport,
+            shutdown_grace: APP_SERVER_GRACEFUL_SHUTDOWN_TIMEOUT,
             operation_deadline: None,
             wire_dump: std::env::var_os("CODEX_APP_SERVER_TEST_CLIENT_WIRE_DUMP").is_some(),
             pending_notifications: VecDeque::new(),
@@ -1750,6 +1945,17 @@ impl CodexClient {
             unexpected_items_before_helper_done: Vec::new(),
             last_turn_status: None,
             last_turn_error_message: None,
+        }
+    }
+
+    fn child_exit_status(&mut self) -> Result<Option<std::process::ExitStatus>> {
+        match &self.transport {
+            ClientTransport::Stdio { child, .. } => child
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .try_wait()
+                .context("inspect app-server child exit status"),
+            ClientTransport::WebSocket { .. } => Ok(None),
         }
     }
 
@@ -1787,7 +1993,8 @@ impl CodexClient {
                 if matches!(
                     stop_rx.recv_timeout(deadline.saturating_duration_since(Instant::now())),
                     Err(std::sync::mpsc::RecvTimeoutError::Timeout)
-                ) {
+                ) || Instant::now() >= deadline
+                {
                     let mut child = child
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -2560,16 +2767,7 @@ impl CodexClient {
     fn read_payload(&mut self) -> Result<String> {
         self.check_operation_deadline()?;
         match &mut self.transport {
-            ClientTransport::Stdio { stdout, .. } => {
-                let mut response_line = String::new();
-                let bytes = stdout
-                    .read_line(&mut response_line)
-                    .context("failed to read from codex app-server")?;
-                if bytes == 0 {
-                    bail!("codex app-server closed stdout");
-                }
-                Ok(response_line)
-            }
+            ClientTransport::Stdio { stdout, .. } => stdout.read(self.operation_deadline),
             ClientTransport::WebSocket { socket, url } => loop {
                 let frame = socket
                     .read(self.operation_deadline)
@@ -2725,7 +2923,7 @@ impl Drop for CodexClient {
             return;
         }
 
-        let deadline = Instant::now() + APP_SERVER_GRACEFUL_SHUTDOWN_TIMEOUT;
+        let deadline = Instant::now() + self.shutdown_grace;
         loop {
             if let Ok(Some(status)) = child.try_wait() {
                 println!("[codex app-server exited: {status}]");
@@ -2746,6 +2944,9 @@ impl Drop for CodexClient {
         let _ = child.wait();
     }
 }
+
+#[cfg(test)]
+mod transport_audit_tests;
 
 #[cfg(test)]
 mod tests {
@@ -3219,16 +3420,23 @@ mod tests {
             let mut ready = String::new();
             stdout.read_line(&mut ready).expect("server startup");
             assert_eq!(ready.trim(), "ready");
-            let client = CodexClient::from_transport(ClientTransport::Stdio {
+            let mut client = CodexClient::from_transport(ClientTransport::Stdio {
                 child: std::sync::Arc::new(std::sync::Mutex::new(child)),
                 stdin,
-                stdout,
+                stdout: stdout.into(),
             });
+            assert_eq!(client.shutdown_grace, APP_SERVER_GRACEFUL_SHUTDOWN_TIMEOUT);
+            let grace = if must_wait_for_grace {
+                Duration::from_millis(300)
+            } else {
+                APP_SERVER_GRACEFUL_SHUTDOWN_TIMEOUT
+            };
+            client.shutdown_grace = grace;
             let started = Instant::now();
             drop(client);
             let elapsed = started.elapsed();
             if must_wait_for_grace {
-                assert!(elapsed >= APP_SERVER_GRACEFUL_SHUTDOWN_TIMEOUT);
+                assert!(elapsed >= grace);
             } else {
                 assert!(
                     elapsed < APP_SERVER_GRACEFUL_SHUTDOWN_TIMEOUT,
@@ -3491,7 +3699,7 @@ mod tests {
         CodexClient::from_transport(ClientTransport::Stdio {
             child: std::sync::Arc::new(std::sync::Mutex::new(child)),
             stdin,
-            stdout,
+            stdout: stdout.into(),
         })
     }
 
@@ -3531,7 +3739,7 @@ mod tests {
         let client = CodexClient::from_transport(ClientTransport::Stdio {
             child: std::sync::Arc::new(std::sync::Mutex::new(child)),
             stdin: recorder.stdin.take(),
-            stdout,
+            stdout: stdout.into(),
         });
         (client, RequestRecorder { recorder, lines })
     }

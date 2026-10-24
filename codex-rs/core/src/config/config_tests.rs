@@ -23,11 +23,6 @@ use codex_config::config_toml::ToolsToml;
 use codex_config::loader::project_trust_key;
 use codex_config::permissions_toml::FilesystemPermissionToml;
 use codex_config::permissions_toml::FilesystemPermissionsToml;
-use codex_config::permissions_toml::NetworkDomainPermissionToml;
-use codex_config::permissions_toml::NetworkDomainPermissionsToml;
-use codex_config::permissions_toml::NetworkMitmActionToml;
-use codex_config::permissions_toml::NetworkMitmHookToml;
-use codex_config::permissions_toml::NetworkMitmToml;
 use codex_config::permissions_toml::NetworkToml;
 use codex_config::permissions_toml::PermissionProfileToml;
 use codex_config::permissions_toml::PermissionsToml;
@@ -63,7 +58,6 @@ use codex_exec_server::LOCAL_FS;
 use codex_features::Feature;
 use codex_features::FeaturesToml;
 use codex_models_manager::bundled_models_response;
-use codex_network_proxy::NetworkMode;
 use codex_protocol::config_types::SERVICE_TIER_DEFAULT_REQUEST_VALUE;
 use codex_protocol::config_types::ServiceTier;
 use codex_protocol::models::ActivePermissionProfile;
@@ -141,30 +135,6 @@ fn discovered_codex_home_is_used_by_normal_config_entrypoints() {
                 let fallback = fallback.expect("fallback in discovered home");
                 assert_eq!(fallback.codex_home.as_path(), expected_home.as_path());
                 assert_eq!(fallback.model.as_deref(), Some("fallback-home-model"));
-                std::fs::write(
-                    home.join(CONFIG_TOML_FILE),
-                    r#"
-default_permissions = "network-home"
-[permissions.network-home.network]
-mode = "full"
-[permissions.network-home.network.domains]
-"home.example.com" = "deny"
-"allowed.example.com" = "allow"
-"#,
-                )
-                .expect("network home config");
-                let (network, reloader) =
-                    crate::network_proxy_loader::build_network_proxy_state_and_reloader()
-                        .await
-                        .expect("network config in discovered home");
-                assert!(network.deny_set.is_match("home.example.com"));
-                assert!(!network.deny_set.is_match("allowed.example.com"));
-                assert!(
-                    codex_network_proxy::ConfigReloader::maybe_reload(&reloader)
-                        .await
-                        .expect("unchanged discovered network config")
-                        .is_none()
-                );
             } else {
                 for result in [loaded, fallback] {
                     let err = result.expect_err("invalid home must fail");
@@ -178,10 +148,6 @@ mode = "full"
                 if case == "missing" {
                     assert!(!home.exists(), "failed discovery must not create the home");
                 }
-                let network =
-                    crate::network_proxy_loader::build_network_proxy_state_and_reloader().await;
-                let error = network.err().expect("network startup rejects invalid home");
-                assert!(format!("{error:#}").contains("CODEX_HOME"));
             }
         });
         return;
@@ -320,6 +286,30 @@ async fn load_config_normalizes_relative_cwd_override() -> std::io::Result<()> {
     .await?;
 
     assert_eq!(config.cwd, expected_cwd);
+    Ok(())
+}
+
+#[tokio::test]
+async fn validation_policy_uses_benchmark_and_two_attempts_by_default() -> std::io::Result<()> {
+    let config = Config::load_from_base_config_with_overrides(
+        ConfigToml::default(),
+        ConfigOverrides::default(),
+        tempdir()?.abs(),
+    ).await?;
+    assert_eq!(config.validation_mode, codex_protocol::validation::ValidationMode::Benchmark);
+    assert_eq!(config.validation_full_budget, 2);
+
+    let config = Config::load_from_base_config_with_overrides(
+        ConfigToml {
+            validation_mode: Some(codex_protocol::validation::ValidationMode::Full),
+            validation_full_budget: Some(0),
+            ..Default::default()
+        },
+        ConfigOverrides::default(),
+        tempdir()?.abs(),
+    ).await?;
+    assert_eq!(config.validation_mode, codex_protocol::validation::ValidationMode::Full);
+    assert_eq!(config.validation_full_budget, 0);
     Ok(())
 }
 
@@ -920,22 +910,6 @@ description = "Day-to-day workspace access."
 
 [permissions.dev.network]
 enabled = true
-proxy_url = "http://127.0.0.1:43128"
-enable_socks5 = false
-allow_upstream_proxy = false
-mode = "full"
-
-[permissions.dev.network.domains]
-"openai.com" = "allow"
-
-[permissions.dev.network.mitm.hooks.github_write]
-host = "api.github.com"
-methods = ["POST", "PUT"]
-path_prefixes = ["/repos/openai/"]
-action = ["strip_auth"]
-
-[permissions.dev.network.mitm.actions.strip_auth]
-strip_request_headers = ["authorization"]
 "#;
     let cfg: ConfigToml =
         toml::from_str(toml).expect("TOML deserialization should succeed for permissions profiles");
@@ -977,43 +951,6 @@ strip_request_headers = ["authorization"]
                     }),
                     network: Some(NetworkToml {
                         enabled: Some(true),
-                        proxy_url: Some("http://127.0.0.1:43128".to_string()),
-                        enable_socks5: Some(false),
-                        socks_url: None,
-                        enable_socks5_udp: None,
-                        allow_upstream_proxy: Some(false),
-                        dangerously_allow_non_loopback_proxy: None,
-                        dangerously_allow_all_unix_sockets: None,
-                        mode: Some(NetworkMode::Full),
-                        domains: Some(NetworkDomainPermissionsToml {
-                            entries: BTreeMap::from([(
-                                "openai.com".to_string(),
-                                NetworkDomainPermissionToml::Allow,
-                            )]),
-                        }),
-                        unix_sockets: None,
-                        allow_local_binding: None,
-                        mitm: Some(NetworkMitmToml {
-                            hooks: Some(IndexMap::from([(
-                                "github_write".to_string(),
-                                NetworkMitmHookToml {
-                                    host: "api.github.com".to_string(),
-                                    methods: vec!["POST".to_string(), "PUT".to_string()],
-                                    path_prefixes: vec!["/repos/openai/".to_string()],
-                                    query: BTreeMap::new(),
-                                    headers: BTreeMap::new(),
-                                    body: None,
-                                    action: vec!["strip_auth".to_string()],
-                                },
-                            )])),
-                            actions: Some(IndexMap::from([(
-                                "strip_auth".to_string(),
-                                NetworkMitmActionToml {
-                                    strip_request_headers: vec!["authorization".to_string()],
-                                    inject_request_headers: Vec::new(),
-                                },
-                            )])),
-                        }),
                     }),
                 },
             )]),
@@ -1022,7 +959,7 @@ strip_request_headers = ["authorization"]
 }
 
 #[test]
-fn config_toml_rejects_empty_mitm_action_reference_list() {
+fn config_toml_rejects_removed_mitm_hooks() {
     let toml = r#"
 default_permissions = "workspace"
 
@@ -1037,17 +974,17 @@ strip_request_headers = ["authorization"]
 "#;
 
     let err =
-        toml::from_str::<ConfigToml>(toml).expect_err("empty MITM action refs should fail closed");
+        toml::from_str::<ConfigToml>(toml).expect_err("removed MITM hooks should fail closed");
 
     assert!(
         err.to_string()
-            .contains("network.mitm.hooks.github_write.action must not be empty"),
+            .contains("unknown field `mitm`"),
         "{err}"
     );
 }
 
 #[test]
-fn config_toml_rejects_empty_mitm_action_definition() {
+fn config_toml_rejects_removed_mitm_actions() {
     let toml = r#"
 default_permissions = "workspace"
 
@@ -1061,429 +998,21 @@ action = ["strip_auth"]
 "#;
 
     let err = toml::from_str::<ConfigToml>(toml)
-        .expect_err("empty MITM action definitions should fail closed");
+        .expect_err("removed MITM actions should fail closed");
 
     assert!(
         err.to_string()
-            .contains("network.mitm.actions.strip_auth must define at least one operation"),
+            .contains("unknown field `mitm`"),
         "{err}"
     );
 }
 
-#[test]
-fn permissions_profile_network_to_proxy_config_preserves_mitm_hooks() {
-    let network = NetworkToml {
-        mode: Some(NetworkMode::Full),
-        mitm: Some(NetworkMitmToml {
-            hooks: Some(IndexMap::from([(
-                "github_write".to_string(),
-                NetworkMitmHookToml {
-                    host: "api.github.com".to_string(),
-                    methods: vec!["POST".to_string()],
-                    path_prefixes: vec!["/repos/openai/".to_string()],
-                    action: vec!["strip_auth".to_string()],
-                    ..NetworkMitmHookToml::default()
-                },
-            )])),
-            actions: Some(IndexMap::from([(
-                "strip_auth".to_string(),
-                NetworkMitmActionToml {
-                    strip_request_headers: vec!["authorization".to_string()],
-                    inject_request_headers: Vec::new(),
-                },
-            )])),
-        }),
-        ..NetworkToml::default()
-    };
 
-    let config = network.to_network_proxy_config();
 
-    assert_eq!(config.mode, NetworkMode::Full);
-    assert!(config.mitm);
-    assert_eq!(config.mitm_hooks.len(), 1);
-    assert_eq!(config.mitm_hooks[0].host, "api.github.com");
-    assert_eq!(
-        config.mitm_hooks[0].matcher.methods,
-        vec!["POST".to_string()]
-    );
-    assert_eq!(
-        config.mitm_hooks[0].actions.strip_request_headers,
-        vec!["authorization".to_string()]
-    );
-}
 
-#[test]
-fn permissions_profile_network_to_proxy_config_preserves_mitm_hook_declaration_order() {
-    let toml = r#"
-default_permissions = "workspace"
 
-[permissions.workspace.network.mitm.actions.noop]
-strip_request_headers = ["authorization"]
 
-[permissions.workspace.network.mitm.hooks.z_first]
-host = "api.github.com"
-methods = ["POST"]
-path_prefixes = ["/repos/openai/"]
-action = ["noop"]
 
-[permissions.workspace.network.mitm.hooks.a_second]
-host = "api.github.com"
-methods = ["POST"]
-path_prefixes = ["/repos/"]
-action = ["noop"]
-"#;
-    let cfg: ConfigToml = toml::from_str(toml).expect("permissions profile should deserialize");
-    let permissions = cfg.permissions.expect("permissions should deserialize");
-    let network = permissions
-        .entries
-        .get("workspace")
-        .expect("workspace profile should exist")
-        .network
-        .as_ref()
-        .expect("network profile should exist");
-
-    let config = network.to_network_proxy_config();
-
-    assert_eq!(config.mitm_hooks.len(), 2);
-    assert_eq!(
-        config.mitm_hooks[0].matcher.path_prefixes,
-        vec!["/repos/openai/".to_string()]
-    );
-    assert_eq!(
-        config.mitm_hooks[1].matcher.path_prefixes,
-        vec!["/repos/".to_string()]
-    );
-}
-
-#[tokio::test]
-async fn permissions_profiles_proxy_policy_does_not_start_managed_network_proxy_without_feature()
--> std::io::Result<()> {
-    let codex_home = TempDir::new()?;
-    let cwd = TempDir::new()?;
-    std::fs::write(cwd.path().join(".git"), "gitdir: nowhere")?;
-
-    let config = Config::load_from_base_config_with_overrides(
-        ConfigToml {
-            default_permissions: Some("dev".to_string()),
-            permissions: Some(PermissionsToml {
-                entries: BTreeMap::from([(
-                    "dev".to_string(),
-                    PermissionProfileToml {
-                        description: None,
-                        extends: None,
-                        workspace_roots: None,
-                        filesystem: Some(FilesystemPermissionsToml {
-                            glob_scan_max_depth: None,
-                            entries: BTreeMap::from([(
-                                ":minimal".to_string(),
-                                FilesystemPermissionToml::Access(FileSystemAccessMode::Read),
-                            )]),
-                        }),
-                        network: Some(NetworkToml {
-                            enabled: Some(true),
-                            ..Default::default()
-                        }),
-                    },
-                )]),
-            }),
-            ..Default::default()
-        },
-        ConfigOverrides {
-            cwd: Some(cwd.path().to_path_buf()),
-            ..Default::default()
-        },
-        codex_home.abs(),
-    )
-    .await?;
-    assert_eq!(
-        config.permissions.network_sandbox_policy(),
-        NetworkSandboxPolicy::Enabled
-    );
-    assert!(
-        config.permissions.network.is_none(),
-        "bare profile network.enabled should not start the managed network proxy"
-    );
-    Ok(())
-}
-
-#[tokio::test]
-async fn profile_proxy_url_still_requires_network_proxy_feature() -> std::io::Result<()> {
-    let codex_home = TempDir::new()?;
-    let cwd = TempDir::new()?;
-    std::fs::write(cwd.path().join(".git"), "gitdir: nowhere")?;
-
-    let config = Config::load_from_base_config_with_overrides(
-        ConfigToml {
-            default_permissions: Some("dev".to_string()),
-            permissions: Some(PermissionsToml {
-                entries: BTreeMap::from([(
-                    "dev".to_string(),
-                    PermissionProfileToml {
-                        description: None,
-                        extends: None,
-                        workspace_roots: None,
-                        filesystem: Some(FilesystemPermissionsToml {
-                            glob_scan_max_depth: None,
-                            entries: BTreeMap::from([(
-                                ":minimal".to_string(),
-                                FilesystemPermissionToml::Access(FileSystemAccessMode::Read),
-                            )]),
-                        }),
-                        network: Some(NetworkToml {
-                            enabled: Some(true),
-                            proxy_url: Some("http://127.0.0.1:43128".to_string()),
-                            enable_socks5: Some(false),
-                            ..Default::default()
-                        }),
-                    },
-                )]),
-            }),
-            ..Default::default()
-        },
-        ConfigOverrides {
-            cwd: Some(cwd.path().to_path_buf()),
-            ..Default::default()
-        },
-        codex_home.abs(),
-    )
-    .await?;
-    assert_eq!(
-        config.permissions.network_sandbox_policy(),
-        NetworkSandboxPolicy::Enabled
-    );
-    assert!(
-        config.permissions.network.is_none(),
-        "profile proxy policy should not start the managed network proxy without the feature"
-    );
-    Ok(())
-}
-
-#[tokio::test]
-async fn network_proxy_feature_is_no_op_without_sandbox_network() -> std::io::Result<()> {
-    let codex_home = TempDir::new()?;
-    let cwd = TempDir::new()?;
-    let config = Config::load_from_base_config_with_overrides(
-        ConfigToml {
-            features: Some(toml::from_str("network_proxy = true").expect("valid features")),
-            ..Default::default()
-        },
-        ConfigOverrides {
-            cwd: Some(cwd.path().to_path_buf()),
-            ..Default::default()
-        },
-        codex_home.abs(),
-    )
-    .await?;
-
-    assert_eq!(
-        config.permissions.network_sandbox_policy(),
-        NetworkSandboxPolicy::Restricted
-    );
-    assert!(
-        config.permissions.network.is_none(),
-        "network_proxy should not start the managed network proxy while network access is off"
-    );
-    Ok(())
-}
-
-#[tokio::test]
-async fn network_proxy_feature_matrix_preserves_sandbox_network_semantics() -> std::io::Result<()> {
-    #[derive(Clone, Copy)]
-    enum Surface {
-        PermissionProfile,
-        LegacyWorkspaceWrite,
-    }
-
-    struct Case {
-        name: &'static str,
-        surface: Surface,
-        network_enabled: bool,
-        proxy_enabled: bool,
-        expected_network_policy: NetworkSandboxPolicy,
-    }
-
-    let cases = [
-        Case {
-            name: "permission profile network disabled without proxy",
-            surface: Surface::PermissionProfile,
-            network_enabled: false,
-            proxy_enabled: false,
-            expected_network_policy: NetworkSandboxPolicy::Restricted,
-        },
-        Case {
-            name: "permission profile network disabled with proxy",
-            surface: Surface::PermissionProfile,
-            network_enabled: false,
-            proxy_enabled: true,
-            expected_network_policy: NetworkSandboxPolicy::Restricted,
-        },
-        Case {
-            name: "permission profile network enabled without proxy",
-            surface: Surface::PermissionProfile,
-            network_enabled: true,
-            proxy_enabled: false,
-            expected_network_policy: NetworkSandboxPolicy::Enabled,
-        },
-        Case {
-            name: "permission profile network enabled with proxy",
-            surface: Surface::PermissionProfile,
-            network_enabled: true,
-            proxy_enabled: true,
-            expected_network_policy: NetworkSandboxPolicy::Enabled,
-        },
-        Case {
-            name: "legacy workspace write network disabled without proxy",
-            surface: Surface::LegacyWorkspaceWrite,
-            network_enabled: false,
-            proxy_enabled: false,
-            expected_network_policy: NetworkSandboxPolicy::Restricted,
-        },
-        Case {
-            name: "legacy workspace write network disabled with proxy",
-            surface: Surface::LegacyWorkspaceWrite,
-            network_enabled: false,
-            proxy_enabled: true,
-            expected_network_policy: NetworkSandboxPolicy::Restricted,
-        },
-        Case {
-            name: "legacy workspace write network enabled without proxy",
-            surface: Surface::LegacyWorkspaceWrite,
-            network_enabled: true,
-            proxy_enabled: false,
-            expected_network_policy: NetworkSandboxPolicy::Enabled,
-        },
-        Case {
-            name: "legacy workspace write network enabled with proxy",
-            surface: Surface::LegacyWorkspaceWrite,
-            network_enabled: true,
-            proxy_enabled: true,
-            expected_network_policy: NetworkSandboxPolicy::Enabled,
-        },
-    ];
-
-    for case in cases {
-        let codex_home = TempDir::new()?;
-        let cwd = TempDir::new()?;
-        std::fs::write(cwd.path().join(".git"), "gitdir: nowhere")?;
-        let features = case
-            .proxy_enabled
-            .then(|| toml::from_str("network_proxy = true").expect("valid features"));
-        let base_config = match case.surface {
-            Surface::PermissionProfile => ConfigToml {
-                default_permissions: Some("dev".to_string()),
-                permissions: Some(PermissionsToml {
-                    entries: BTreeMap::from([(
-                        "dev".to_string(),
-                        PermissionProfileToml {
-                            description: None,
-                            extends: None,
-                            workspace_roots: None,
-                            filesystem: Some(FilesystemPermissionsToml {
-                                glob_scan_max_depth: None,
-                                entries: BTreeMap::from([(
-                                    ":minimal".to_string(),
-                                    FilesystemPermissionToml::Access(FileSystemAccessMode::Read),
-                                )]),
-                            }),
-                            network: Some(NetworkToml {
-                                enabled: Some(case.network_enabled),
-                                ..Default::default()
-                            }),
-                        },
-                    )]),
-                }),
-                features,
-                ..Default::default()
-            },
-            Surface::LegacyWorkspaceWrite => ConfigToml {
-                sandbox_mode: Some(SandboxMode::WorkspaceWrite),
-                sandbox_workspace_write: Some(SandboxWorkspaceWrite {
-                    network_access: case.network_enabled,
-                    ..Default::default()
-                }),
-                windows: Some(WindowsToml {
-                    sandbox: Some(WindowsSandboxModeToml::Elevated),
-                    sandbox_private_desktop: None,
-                }),
-                features,
-                ..Default::default()
-            },
-        };
-        let config = Config::load_from_base_config_with_overrides(
-            base_config,
-            ConfigOverrides {
-                cwd: Some(cwd.path().to_path_buf()),
-                ..Default::default()
-            },
-            codex_home.abs(),
-        )
-        .await?;
-
-        assert_eq!(
-            config.permissions.network_sandbox_policy(),
-            case.expected_network_policy,
-            "{}",
-            case.name
-        );
-        assert_eq!(
-            config.permissions.network.is_some(),
-            case.network_enabled && case.proxy_enabled,
-            "{}",
-            case.name
-        );
-    }
-
-    Ok(())
-}
-
-#[tokio::test]
-async fn network_proxy_cli_overrides_merge_toggle_with_proxy_config() -> std::io::Result<()> {
-    let codex_home = TempDir::new()?;
-    let cwd = TempDir::new()?;
-    std::fs::write(
-        codex_home.path().join(CONFIG_TOML_FILE),
-        r#"
-sandbox_mode = "workspace-write"
-
-[sandbox_workspace_write]
-network_access = true
-
-[windows]
-sandbox = "elevated"
-"#,
-    )?;
-    let config = ConfigBuilder::without_managed_config_for_tests()
-        .codex_home(codex_home.path().to_path_buf())
-        .cli_overrides(vec![
-            (
-                "features.network_proxy.enabled".to_string(),
-                toml::Value::Boolean(true),
-            ),
-            (
-                "features.network_proxy.enable_socks5".to_string(),
-                toml::Value::Boolean(false),
-            ),
-        ])
-        .harness_overrides(ConfigOverrides {
-            cwd: Some(cwd.path().to_path_buf()),
-            ..Default::default()
-        })
-        .build()
-        .await?;
-
-    assert_eq!(
-        config.permissions.network_sandbox_policy(),
-        NetworkSandboxPolicy::Enabled
-    );
-    let network = config
-        .permissions
-        .network
-        .as_ref()
-        .expect("network_proxy should start the managed network proxy");
-    assert_eq!(network.proxy_host_and_port(), "127.0.0.1:3128");
-    assert!(!network.socks_enabled());
-    Ok(())
-}
 
 #[tokio::test]
 async fn respect_system_proxy_feature_resolves_enabled() -> std::io::Result<()> {
@@ -1576,7 +1105,7 @@ respect_system_proxy = false
 }
 
 #[tokio::test]
-async fn experimental_network_requirements_enable_proxy_without_feature() -> std::io::Result<()> {
+async fn experimental_network_requirements_fail_closed_without_proxy_support() -> std::io::Result<()> {
     let codex_home = TempDir::new()?;
     let config = ConfigBuilder::without_managed_config_for_tests()
         .codex_home(codex_home.path().to_path_buf())
@@ -1590,189 +1119,14 @@ enabled = true
             ),
         )
         .build()
-        .await?;
+        .await;
 
-    assert!(!config.features.enabled(Feature::NetworkProxy));
-    assert!(config.managed_network_requirements_enabled());
-    assert!(
-        config
-            .permissions
-            .network
-            .as_ref()
-            .expect("experimental_network should configure the managed proxy")
-            .enabled()
-    );
+    assert_eq!(config.unwrap_err().kind(), std::io::ErrorKind::Unsupported);
     Ok(())
 }
 
-#[tokio::test]
-async fn network_proxy_feature_uses_profile_network_proxy_settings() -> std::io::Result<()> {
-    let codex_home = TempDir::new()?;
-    let cwd = TempDir::new()?;
-    let config = Config::load_from_base_config_with_overrides(
-        ConfigToml {
-            features: Some(toml::from_str("network_proxy = true").expect("valid features")),
-            default_permissions: Some("dev".to_string()),
-            permissions: Some(PermissionsToml {
-                entries: BTreeMap::from([(
-                    "dev".to_string(),
-                    PermissionProfileToml {
-                        description: None,
-                        extends: None,
-                        workspace_roots: None,
-                        filesystem: Some(FilesystemPermissionsToml {
-                            glob_scan_max_depth: None,
-                            entries: BTreeMap::from([(
-                                ":minimal".to_string(),
-                                FilesystemPermissionToml::Access(FileSystemAccessMode::Read),
-                            )]),
-                        }),
-                        network: Some(NetworkToml {
-                            enabled: Some(true),
-                            proxy_url: Some("http://127.0.0.1:43128".to_string()),
-                            enable_socks5: Some(false),
-                            ..Default::default()
-                        }),
-                    },
-                )]),
-            }),
-            ..Default::default()
-        },
-        ConfigOverrides {
-            cwd: Some(cwd.path().to_path_buf()),
-            ..Default::default()
-        },
-        codex_home.abs(),
-    )
-    .await?;
 
-    assert_eq!(
-        config.permissions.network_sandbox_policy(),
-        NetworkSandboxPolicy::Enabled
-    );
-    let network = config
-        .permissions
-        .network
-        .as_ref()
-        .expect("network_proxy should start the managed network proxy");
-    assert_eq!(network.proxy_host_and_port(), "127.0.0.1:43128");
-    assert!(!network.socks_enabled());
-    Ok(())
-}
 
-#[tokio::test]
-async fn disabled_network_proxy_feature_does_not_start_profile_proxy_policy() -> std::io::Result<()>
-{
-    let codex_home = TempDir::new()?;
-    let cwd = TempDir::new()?;
-    let config = Config::load_from_base_config_with_overrides(
-        ConfigToml {
-            features: Some(
-                toml::from_str(
-                    r#"
-[network_proxy]
-enabled = false
-"#,
-                )
-                .expect("valid features"),
-            ),
-            default_permissions: Some("dev".to_string()),
-            permissions: Some(PermissionsToml {
-                entries: BTreeMap::from([(
-                    "dev".to_string(),
-                    PermissionProfileToml {
-                        description: None,
-                        extends: None,
-                        workspace_roots: None,
-                        filesystem: Some(FilesystemPermissionsToml {
-                            glob_scan_max_depth: None,
-                            entries: BTreeMap::from([(
-                                ":minimal".to_string(),
-                                FilesystemPermissionToml::Access(FileSystemAccessMode::Read),
-                            )]),
-                        }),
-                        network: Some(NetworkToml {
-                            enabled: Some(true),
-                            proxy_url: Some("http://127.0.0.1:43128".to_string()),
-                            enable_socks5: Some(false),
-                            ..Default::default()
-                        }),
-                    },
-                )]),
-            }),
-            ..Default::default()
-        },
-        ConfigOverrides {
-            cwd: Some(cwd.path().to_path_buf()),
-            ..Default::default()
-        },
-        codex_home.abs(),
-    )
-    .await?;
-
-    assert!(!config.features.enabled(Feature::NetworkProxy));
-    assert!(
-        config.permissions.network.is_none(),
-        "disabled feature should keep profile proxy policy from starting the managed proxy"
-    );
-    Ok(())
-}
-
-#[tokio::test]
-async fn permissions_profiles_network_disabled_by_default_does_not_start_proxy()
--> std::io::Result<()> {
-    let codex_home = TempDir::new()?;
-    let cwd = TempDir::new()?;
-    std::fs::write(cwd.path().join(".git"), "gitdir: nowhere")?;
-
-    let config = Config::load_from_base_config_with_overrides(
-        ConfigToml {
-            features: Some(toml::from_str("network_proxy = true").expect("valid features")),
-            default_permissions: Some("dev".to_string()),
-            permissions: Some(PermissionsToml {
-                entries: BTreeMap::from([(
-                    "dev".to_string(),
-                    PermissionProfileToml {
-                        description: None,
-                        extends: None,
-                        workspace_roots: None,
-                        filesystem: Some(FilesystemPermissionsToml {
-                            glob_scan_max_depth: None,
-                            entries: BTreeMap::from([(
-                                ":minimal".to_string(),
-                                FilesystemPermissionToml::Access(FileSystemAccessMode::Read),
-                            )]),
-                        }),
-                        network: Some(NetworkToml {
-                            domains: Some(NetworkDomainPermissionsToml {
-                                entries: BTreeMap::from([(
-                                    "openai.com".to_string(),
-                                    NetworkDomainPermissionToml::Allow,
-                                )]),
-                            }),
-                            ..Default::default()
-                        }),
-                    },
-                )]),
-            }),
-            ..Default::default()
-        },
-        ConfigOverrides {
-            cwd: Some(cwd.path().to_path_buf()),
-            ..Default::default()
-        },
-        codex_home.abs(),
-    )
-    .await?;
-
-    assert!(config.features.enabled(Feature::NetworkProxy));
-    assert_eq!(
-        config.permissions.network_sandbox_policy(),
-        NetworkSandboxPolicy::Restricted
-    );
-    assert!(config.permissions.network.is_none());
-    Ok(())
-}
 
 #[tokio::test]
 async fn default_permissions_profile_populates_runtime_sandbox_policy() -> std::io::Result<()> {
@@ -2079,85 +1433,6 @@ async fn managed_unrestricted_permission_profile_still_enables_network_requireme
     Ok(())
 }
 
-#[tokio::test]
-async fn permission_profile_override_preserves_configured_network_policy_without_starting_proxy()
--> std::io::Result<()> {
-    // `Disabled` deliberately drops the selected profile's proxy policy, so the
-    // override must keep Codex responsible for the network.
-    let permission_profile = PermissionProfile::Managed {
-        file_system: ManagedFileSystemPermissions::Unrestricted,
-        network: NetworkSandboxPolicy::Enabled,
-    };
-
-    for proxy_enabled in [false, true] {
-        let codex_home = TempDir::new()?;
-        let cwd = TempDir::new()?;
-        let config = Config::load_from_base_config_with_overrides(
-            ConfigToml {
-                features: proxy_enabled
-                    .then(|| toml::from_str("network_proxy = true").expect("valid features")),
-                default_permissions: Some("dev".to_string()),
-                permissions: Some(PermissionsToml {
-                    entries: BTreeMap::from([(
-                        "dev".to_string(),
-                        PermissionProfileToml {
-                            description: None,
-                            extends: None,
-                            workspace_roots: None,
-                            filesystem: Some(FilesystemPermissionsToml {
-                                glob_scan_max_depth: None,
-                                entries: BTreeMap::from([(
-                                    ":minimal".to_string(),
-                                    FilesystemPermissionToml::Access(FileSystemAccessMode::Read),
-                                )]),
-                            }),
-                            network: Some(NetworkToml {
-                                enabled: Some(true),
-                                proxy_url: Some("http://127.0.0.1:43128".to_string()),
-                                enable_socks5: Some(false),
-                                allow_upstream_proxy: Some(false),
-                                domains: Some(NetworkDomainPermissionsToml {
-                                    entries: BTreeMap::from([(
-                                        "openai.com".to_string(),
-                                        NetworkDomainPermissionToml::Allow,
-                                    )]),
-                                }),
-                                ..Default::default()
-                            }),
-                        },
-                    )]),
-                }),
-                ..Default::default()
-            },
-            ConfigOverrides {
-                cwd: Some(cwd.path().to_path_buf()),
-                permission_profile: Some(permission_profile.clone()),
-                ..Default::default()
-            },
-            codex_home.abs(),
-        )
-        .await?;
-        assert_eq!(
-            config.permissions.effective_permission_profile(),
-            permission_profile
-        );
-        if proxy_enabled {
-            let network = config
-                .permissions
-                .network
-                .as_ref()
-                .expect("network_proxy should start the managed network proxy");
-            assert_eq!(network.proxy_host_and_port(), "127.0.0.1:43128");
-            assert!(!network.socks_enabled());
-        } else {
-            assert!(
-                config.permissions.network.is_none(),
-                "profile network.enabled should not start the managed network proxy"
-            );
-        }
-    }
-    Ok(())
-}
 
 #[tokio::test]
 async fn workspace_root_glob_none_compiles_to_filesystem_pattern_entry() -> std::io::Result<()> {
@@ -9787,30 +9062,34 @@ max_concurrent_threads_per_session = 17
 }
 
 #[test]
-fn multi_agent_v2_default_usage_hints_require_report_reconciliation() {
+fn multi_agent_v2_default_usage_hints_reference_report_policy() {
+    let policy = codex_protocol::models::BASE_INSTRUCTIONS_DEFAULT;
+    for required in [
+        "Read every returned report in full",
+        "Recover truncated or omitted portions from retained output",
+        "Account for every substantive finding or recommendation",
+        "rejected with an evidence-based reason",
+        "outside the user's scope",
+        "unresolved with a concrete next action or blocker",
+        "finish verified in-scope follow-through before finalizing",
+        "do not call a partial integration complete",
+    ] {
+        assert!(policy.contains(required), "missing base policy: {required}");
+    }
+
     let config = resolve_multi_agent_v2_config(&ConfigToml::default());
     for hint in [
         config.root_agent_usage_hint_text,
         config.subagent_usage_hint_text,
     ] {
-        let hint = hint.expect("root and worker parents need report reconciliation guidance");
+        let hint = hint.expect("root and worker parents need coordination guidance");
         let sections = crate::stable_context::multi_agent_usage_hint_sections(Some(&hint));
         let rendered = sections.join("\n");
-        for required in [
-            "Read every returned report in full",
-            "Recover truncated or omitted portions from retained output",
-            "Account for every substantive finding or recommendation",
-            "rejected with an evidence-based reason",
-            "outside the user's scope",
-            "unresolved with a concrete next action or blocker",
-            "finish verified in-scope follow-through before finalizing",
-            "do not call a partial integration complete",
-        ] {
-            assert!(
-                rendered.contains(required),
-                "missing report policy: {required}"
-            );
-        }
+        assert!(rendered.contains(
+            "Apply the base instructions for audit/review scope, evidence, validation, and completion"
+        ));
+        assert!(rendered.contains("The parent reconciles assigned slices"));
+        assert!(!rendered.contains("Read every returned report in full"));
     }
 }
 

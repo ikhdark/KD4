@@ -78,7 +78,6 @@ impl ToolExecutor<ToolInvocation> for ExtensionToolAdapter {
     fn handle(&self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'_> {
         let history_requirement = self.0.conversation_history_requirement(&invocation.payload);
         Box::pin(async move {
-            let requires_acceptance = self.0.requires_task_acceptance(&invocation.payload);
             let call = tokio::select! {
                 _ = invocation.cancellation_token.cancelled() => {
                     return Err(crate::FunctionCallError::RespondToModel(
@@ -87,115 +86,13 @@ impl ToolExecutor<ToolInvocation> for ExtensionToolAdapter {
                 }
                 call = to_extension_call(&invocation, history_requirement) => call,
             };
-            if requires_acceptance {
-                self.0
-                    .handle_with_task_acceptance(
-                        call,
-                        Arc::new(CoreTaskAcceptance(
-                            invocation,
-                            std::sync::atomic::AtomicU64::new(u64::MAX),
-                        )),
-                    )
-                    .await
-            } else {
-                self.0.handle(call).await
-            }
+            self.0.handle(call).await
         })
     }
 }
 
-struct CoreTaskAcceptance(ToolInvocation, std::sync::atomic::AtomicU64);
 
-impl codex_tools::TaskAcceptance for CoreTaskAcceptance {
-    fn is_current(&self) -> bool {
-        !self.0.cancellation_token.is_cancelled()
-            && self
-                .0
-                .session
-                .input_queue
-                .admit_code_mode_tool(self.0.step_context.user_intent_epoch, || ())
-                .is_ok()
-            && self.0.tracker.try_lock().is_ok_and(|tracker| {
-                tracker.current_mutation_revision()
-                    == self.1.load(std::sync::atomic::Ordering::SeqCst)
-            })
-    }
-    fn check(
-        &self,
-    ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Result<(), crate::FunctionCallError>> + Send + '_>,
-    > {
-        Box::pin(self.check_terminal(false))
-    }
-    fn check_blocked(
-        &self,
-    ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Result<(), crate::FunctionCallError>> + Send + '_>,
-    > {
-        Box::pin(self.check_terminal(true))
-    }
-}
 
-impl CoreTaskAcceptance {
-    async fn check_terminal(&self, blocked_intent: bool) -> Result<(), crate::FunctionCallError> {
-        let invocation = &self.0;
-        if invocation.step_context.user_intent_epoch
-            != invocation
-                .session
-                .input_queue
-                .incorporated_user_intent_epoch()
-            || invocation
-                .session
-                .input_queue
-                .has_pending_input(&invocation.session.active_turn)
-                .await
-        {
-            return Err(crate::FunctionCallError::RespondToModel(
-                "new user input requires reconciliation before the goal can close".into(),
-            ));
-        }
-        let revision = invocation.tracker.lock().await.current_mutation_revision();
-        let decision = tokio::select! {
-            _ = invocation.cancellation_token.cancelled() => return Err(crate::FunctionCallError::RespondToModel("task acceptance cancelled".into())),
-            result = tokio::time::timeout(std::time::Duration::from_secs(5),
-                invocation.session.services.plan_store.task_closure(
-                    &invocation.step_context.turn.sub_id, revision,
-                    invocation.session.services.agent_control.task_coordinator(),
-                )) => result.map_err(|_| crate::FunctionCallError::RespondToModel("task acceptance storage query timed out; terminal success remains unverified".into()))?,
-        };
-        let blocked = blocked_intent
-            && decision.request_state == crate::plan_store::acceptance::RequestState::Blocked;
-        let readiness = invocation
-            .step_context
-            .turn
-            .extension_data
-            .get::<crate::session::turn_execution::CompletionReadiness>()
-            .ok_or_else(|| {
-                crate::FunctionCallError::RespondToModel(
-                    "goal terminal intent has not reached a settled boundary".into(),
-                )
-            })?;
-        if (!decision.unmet_obligations.is_empty() && !blocked)
-            || !readiness
-                .remaining(blocked, &decision.unmet_obligations)
-                .is_empty()
-            || readiness.mutation_revision != revision
-            || invocation.tracker.lock().await.current_mutation_revision() != revision
-            || invocation.step_context.user_intent_epoch
-                != invocation
-                    .session
-                    .input_queue
-                    .incorporated_user_intent_epoch()
-        {
-            return Err(crate::FunctionCallError::RespondToModel(format!(
-                "terminal success is not accepted for the current declared task scope: {}",
-                serde_json::json!(decision),
-            )));
-        }
-        self.1.store(revision, std::sync::atomic::Ordering::SeqCst);
-        Ok(())
-    }
-}
 
 impl CoreToolRuntime for ExtensionToolAdapter {
     fn matches_kind(&self, payload: &ToolPayload) -> bool {
@@ -674,7 +571,8 @@ mod tests {
                             id: call.call_id.clone(),
                             status: "in_progress".to_string(),
                             revised_prompt: None,
-                            result: String::new(),
+                            result: None,
+                            error: None,
                             saved_path: None,
                             provider_usage: None,
                         }),
@@ -692,7 +590,8 @@ mod tests {
                             id: call.call_id.clone(),
                             status: "failed".to_string(),
                             revised_prompt: None,
-                            result: String::new(),
+                            result: None,
+                            error: None,
                             saved_path: None,
                             provider_usage: None,
                         }),
@@ -701,7 +600,8 @@ mod tests {
                                 call_id: call.call_id,
                                 status: "failed".to_string(),
                                 revised_prompt: None,
-                                result: String::new(),
+                                result: None,
+                                error: None,
                                 saved_path: None,
                             },
                         )],
@@ -1106,7 +1006,8 @@ mod tests {
             id: "call-image".to_string(),
             status: "in_progress".to_string(),
             revised_prompt: None,
-            result: String::new(),
+            result: None,
+            error: None,
             saved_path: None,
             provider_usage: None,
         });
@@ -1114,7 +1015,8 @@ mod tests {
             id: "call-image".to_string(),
             status: "completed".to_string(),
             revised_prompt: Some("A tiny blue square".to_string()),
-            result: "cG5n".to_string(),
+            result: Some("cG5n".to_string()),
+            error: None,
             saved_path: Some(expected_path.clone()),
             provider_usage: None,
         });
@@ -1136,7 +1038,8 @@ mod tests {
                     call_id: "call-image".to_string(),
                     status: "completed".to_string(),
                     revised_prompt: Some("A tiny blue square".to_string()),
-                    result: "cG5n".to_string(),
+                    result: Some("cG5n".to_string()),
+                    error: None,
                     saved_path: Some(expected_path.clone()),
                 })],
             },

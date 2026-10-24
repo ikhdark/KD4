@@ -35,7 +35,7 @@ pub(super) struct LoadedConfigLayers {
 
 pub(super) async fn load_config_layers_internal(
     fs: &dyn ExecutorFileSystem,
-    codex_home: &Path,
+    _codex_home: &Path,
     overrides: LoaderOverrides,
     strict_config: bool,
 ) -> io::Result<LoadedConfigLayers> {
@@ -45,7 +45,7 @@ pub(super) async fn load_config_layers_internal(
     } = overrides;
 
     let managed_config_path = AbsolutePathBuf::from_absolute_path(
-        managed_config_path.unwrap_or_else(|| managed_config_default_path(codex_home)),
+        managed_config_path.unwrap_or_else(managed_config_default_path),
     )?;
 
     let managed_config = read_config_from_path(
@@ -138,6 +138,6 @@ fn validate_config_toml_strictly(
 }
 
 /// Return the default managed config path.
-pub(super) fn managed_config_default_path(codex_home: &Path) -> PathBuf {
-    codex_home.join("managed_config.toml")
+pub(super) fn managed_config_default_path() -> PathBuf {
+    super::windows_codex_system_dir().join("managed_config.toml")
 }

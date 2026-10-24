@@ -217,6 +217,7 @@ struct ExtractionCacheKey {
 #[derive(Default)]
 struct ExtractionCache {
     entries: HashMap<ExtractionCacheKey, ExtractionOutcome>,
+    summaries: HashMap<ExtractionCacheKey, crate::list::HeadTailSummary>,
     order: VecDeque<ExtractionCacheKey>,
 }
 
@@ -235,7 +236,7 @@ async fn extraction_cache_key(
         path: rollout_path.to_path_buf(),
         physical_path,
         len: metadata.len(),
-        modified: metadata.modified().ok(),
+        modified: Some(metadata.modified().ok()?),
         default_provider: default_provider.to_string(),
     })
 }
@@ -256,6 +257,7 @@ pub(crate) async fn extraction_cache_guard(
 pub(crate) async fn cache_extraction_outcome(
     guard: ExtractionCacheGuard,
     outcome: ExtractionOutcome,
+    summary: Option<crate::list::HeadTailSummary>,
 ) {
     let Some(key) = guard.key else {
         return;
@@ -272,6 +274,9 @@ pub(crate) async fn cache_extraction_outcome(
     cache.entries.retain(|candidate, _| {
         candidate.path != key.path || candidate.default_provider != key.default_provider
     });
+    cache.summaries.retain(|candidate, _| {
+        candidate.path != key.path || candidate.default_provider != key.default_provider
+    });
     cache.order.retain(|candidate| {
         candidate.path != key.path || candidate.default_provider != key.default_provider
     });
@@ -281,12 +286,27 @@ pub(crate) async fn cache_extraction_outcome(
         return;
     }
     cache.order.push_back(key.clone());
+    if let Some(summary) = summary {
+        cache.summaries.insert(key.clone(), summary);
+    }
     cache.entries.insert(key, outcome);
     while cache.order.len() > EXTRACTION_CACHE_CAPACITY {
         if let Some(evicted) = cache.order.pop_front() {
             cache.entries.remove(&evicted);
+            cache.summaries.remove(&evicted);
         }
     }
+}
+
+pub(crate) async fn cached_head_summary(
+    rollout_path: &Path,
+    default_provider: &str,
+) -> Option<crate::list::HeadTailSummary> {
+    let key = extraction_cache_key(rollout_path, default_provider).await?;
+    extraction_cache()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .summaries.get(&key).cloned()
 }
 
 async fn cached_extraction_outcome(
@@ -473,6 +493,7 @@ pub(crate) enum PassRemainder {
 struct BackfillMemoEntry {
     source: RolloutSourceVersion,
     outcome: BackfillMemoOutcome,
+    observed_at: std::time::Instant,
 }
 
 enum BackfillMemoOutcome {
@@ -495,6 +516,9 @@ impl BackfillMemo {
         match &entry.outcome {
             BackfillMemoOutcome::Settled => Some(true),
             BackfillMemoOutcome::PayloadGap(Some(dependencies)) => {
+                if entry.observed_at.elapsed() >= std::time::Duration::from_secs(30) {
+                    return None;
+                }
                 crate::payload_artifact::payload_versions_match(dependencies)
                     .await
                     .then_some(false)
@@ -559,8 +583,12 @@ pub(crate) async fn backfill_sessions_until(
     if backfill_state.status == BackfillStatus::Complete {
         return BackfillPassReport::default();
     }
-    let claimed = match runtime.try_claim_backfill(backfill_lease_seconds).await {
-        Ok(claimed) => claimed,
+    let claim = match runtime.claim_backfill(backfill_lease_seconds).await {
+        Ok(Some(claim)) => claim,
+        Ok(None) => {
+            info!("state db backfill already running at {}; skipping duplicate worker", codex_home.display());
+            return BackfillPassReport::default();
+        }
         Err(err) => {
             warn!(
                 "failed to claim backfill worker at {}: {err}",
@@ -569,36 +597,11 @@ pub(crate) async fn backfill_sessions_until(
             return BackfillPassReport::default();
         }
     };
-    if !claimed {
-        info!(
-            "state db backfill already running at {}; skipping duplicate worker",
-            codex_home.display()
-        );
-        return BackfillPassReport::default();
-    }
-    let mut backfill_state = match runtime.get_backfill_state().await {
-        Ok(state) => state,
-        Err(err) => {
-            warn!(
-                "failed to read claimed backfill state at {}: {err}",
-                codex_home.display()
-            );
-            BackfillState {
-                status: BackfillStatus::Running,
-                ..Default::default()
-            }
-        }
+    let backfill_state = BackfillState {
+        status: BackfillStatus::Running,
+        last_watermark: claim.last_watermark.clone(),
+        ..Default::default()
     };
-    if backfill_state.status != BackfillStatus::Running {
-        if let Err(err) = runtime.mark_backfill_running().await {
-            warn!(
-                "failed to mark backfill running at {}: {err}",
-                codex_home.display()
-            );
-        } else {
-            backfill_state.status = BackfillStatus::Running;
-        }
-    }
 
     let sessions_root = codex_home.join(SESSIONS_SUBDIR);
     let archived_root = codex_home.join(ARCHIVED_SESSIONS_SUBDIR);
@@ -814,6 +817,7 @@ pub(crate) async fn backfill_sessions_until(
                         BackfillMemoEntry {
                             source: source_version,
                             outcome,
+                            observed_at: std::time::Instant::now(),
                         },
                     );
                 }
@@ -834,13 +838,14 @@ pub(crate) async fn backfill_sessions_until(
         if contiguous_watermark != checkpointed_watermark
             && let Some(watermark) = contiguous_watermark.as_deref()
         {
-            if let Err(err) = runtime.checkpoint_backfill(watermark).await {
+            if let Err(err) = runtime.checkpoint_backfill_claim(&claim, watermark).await {
                 unresolved_failures = true;
                 transient_failures = true;
                 warn!(
                     "failed to checkpoint backfill at {}: {err}",
                     codex_home.display()
                 );
+                break;
             } else {
                 checkpointed_watermark = contiguous_watermark.clone();
             }
@@ -851,7 +856,7 @@ pub(crate) async fn backfill_sessions_until(
     if stopped
         && contiguous_watermark != checkpointed_watermark
         && let Some(watermark) = contiguous_watermark.as_deref()
-        && let Err(err) = runtime.checkpoint_backfill(watermark).await
+        && let Err(err) = runtime.checkpoint_backfill_claim(&claim, watermark).await
     {
         warn!(
             "failed to checkpoint stopped backfill at {}: {err}",
@@ -865,14 +870,14 @@ pub(crate) async fn backfill_sessions_until(
                 codex_home.display()
             );
         }
-        if let Err(err) = runtime.mark_backfill_pending().await {
+        if let Err(err) = runtime.release_backfill_claim(&claim).await {
             warn!(
                 "failed to release incomplete backfill at {}: {err}",
                 codex_home.display()
             );
         }
     } else if let Err(err) = runtime
-        .mark_backfill_complete(contiguous_watermark.as_deref())
+        .complete_backfill_claim(&claim, contiguous_watermark.as_deref())
         .await
     {
         transient_failures = true;
@@ -880,7 +885,7 @@ pub(crate) async fn backfill_sessions_until(
             "failed to mark backfill complete at {}: {err}",
             codex_home.display()
         );
-        if let Err(pending_err) = runtime.mark_backfill_pending().await {
+        if let Err(pending_err) = runtime.release_backfill_claim(&claim).await {
             warn!(
                 "failed to release backfill after completion error at {}: {pending_err}",
                 codex_home.display()

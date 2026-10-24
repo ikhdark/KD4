@@ -455,771 +455,129 @@ async fn source_paging_advice_keeps_unicode_output_errors_and_exit_status() {
 }
 
 #[tokio::test]
-async fn missing_rg_paths_are_advisory_and_use_the_execution_workdir() {
+async fn missing_rg_paths_execute_unchanged_without_speculative_advice() {
     let fixture = tempfile::tempdir().unwrap();
     let cwd = fixture.path();
-    std::fs::create_dir(cwd.join("tools")).unwrap();
-    std::fs::write(cwd.join("tools/spec_plan.rs"), "needle\n").unwrap();
+    std::fs::write(cwd.join("present.txt"), "needle\n").unwrap();
     let invocation = CommandInvocation::Argv {
         program: "rg".into(),
-        args: strings(&[
-            "--no-config",
-            "-n",
-            "needle",
-            "tools/spec.rs",
-            "tools/spec_plan.rs",
-        ]),
+        args: strings(&["--no-config", "-n", "needle", "missing.txt", "present.txt"]),
     };
     let command = invocation.to_direct_argv().unwrap();
-    let outcome =
-        preflight_invocation_for_kd4_runtime(true, false, &invocation, &command, None, Some(cwd))
-            .await
-            .unwrap();
+    let outcome = preflight_invocation_for_kd4_runtime(
+        true, false, &invocation, &command, None, Some(cwd),
+    ).await.unwrap();
     assert_eq!(outcome.invocation, invocation);
     assert!(!outcome.repaired());
-    assert_eq!(outcome.validation_invocations, vec![invocation.clone()]);
-    let notice = outcome.model_notice().unwrap();
-    assert!(notice.contains("rg_missing_path"), "{notice}");
-    assert!(notice.contains("spec_plan.rs"), "{notice}");
-    assert!(notice.contains("not verified replacements"), "{notice}");
-    assert!(notice.contains("\"tools/spec_plan.rs\""), "{notice}");
-    assert!(
-        !notice.contains(&*cwd.to_string_lossy()),
-        "suggestions are cwd-relative: {notice}"
-    );
-    // The advisory never suppresses execution, the original error, or valid
-    // results from the other path.
+    assert!(outcome.advisory.is_none());
     let output = std::process::Command::new(&command[0])
-        .args(&command[1..])
-        .current_dir(cwd)
-        .output()
-        .unwrap();
+        .args(&command[1..]).current_dir(cwd).output().unwrap();
     assert_eq!(output.status.code(), Some(2));
     assert!(String::from_utf8_lossy(&output.stdout).contains("needle"));
-    assert!(String::from_utf8_lossy(&output.stderr).contains("spec.rs"));
-    for (enabled, direct, local_cwd) in [
-        (false, false, Some(cwd)),
-        (true, true, Some(cwd)),
-        (true, false, None),
-    ] {
-        let outcome = preflight_invocation_for_kd4_runtime(
-            enabled,
-            direct,
-            &invocation,
-            &command,
-            None,
-            local_cwd,
-        )
-        .await
-        .unwrap();
-        assert_eq!(outcome.invocation, invocation);
-        assert_eq!(outcome.advisory, None);
-    }
-    for args in [
-        strings(&["rg", "-n", "missing-pattern", "tools/spec_plan.rs"]),
-        strings(&["rg", "-e", "tools/spec.rs", "tools/spec_plan.rs"]),
-        strings(&["rg", "-n", "needle", "$TARGET"]),
-        strings(&["rg", "-n", "needle", "-"]),
-        strings(&["rg", "-n", "needle", "../spec.rs"]),
-    ] {
-        assert_eq!(missing_rg_path_advisory(&args, None, cwd), None);
-    }
-    let moved = strings(&["bash", "-c", "cd tools; rg needle spec.rs"]);
-    assert_eq!(
-        missing_rg_path_advisory(&moved, Some(ShellType::Bash), cwd),
-        None
-    );
-    let script = strings(&["bash", "-c", "rg needle tools/spec.rs"]);
-    assert!(
-        missing_rg_path_advisory(&script, Some(ShellType::Bash), cwd)
-            .unwrap()
-            .contains("spec_plan.rs")
-    );
+    assert!(String::from_utf8_lossy(&output.stderr).contains("missing.txt"));
+    // The existing post-error owner remains responsible for useful hints.
+    assert!(crate::command_search::missing_rg_path_advisory(
+        &String::from_utf8_lossy(&output.stderr), cwd,
+    ).is_none(), "there is no similarly named replacement in this fixture");
 }
 
 #[test]
 fn rg_argument_roles_preserve_flag_like_patterns_and_dependencies() {
-    use crate::command_search::rg_search_path_operands;
-
+    use crate::command_search::{rg_search_no_match_eligible, rg_search_dependency_paths, rg_search_path_operands};
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path();
     std::fs::create_dir(root.join("src")).unwrap();
-    std::fs::write(
-        root.join("src/input.txt"),
-        "--files\n--help\n--follow\n-e\n-L\n",
-    )
-    .unwrap();
+    std::fs::write(root.join("src/input.txt"), "--files\n--help\n--follow\n-e\n-L\n").unwrap();
     std::fs::write(root.join("patterns.txt"), "--files\n").unwrap();
-    let scope = dunce::canonicalize(root.join("src")).unwrap();
     for args in [
-        vec!["rg", "--", "--files", "src"],
-        vec!["rg", "--", "--help", "src"],
-        vec!["rg", "--", "--follow", "src"],
-        vec!["rg", "--", "-e", "src"],
-        vec!["rg", "-e", "--files", "src"],
-        vec!["rg", "-e", "--help", "src"],
-        vec!["rg", "-e-L", "src"],
-        vec!["rg", "-ne", "--files", "src"],
+        vec!["rg", "--", "--files", "src"], vec!["rg", "--", "--help", "src"],
+        vec!["rg", "--", "--follow", "src"], vec!["rg", "--", "-e", "src"],
+        vec!["rg", "-e", "--files", "src"], vec!["rg", "-e", "--help", "src"],
+        vec!["rg", "-e-L", "src"], vec!["rg", "-ne", "--files", "src"],
         vec!["rg", "-nfpatterns.txt", "src"],
     ] {
         let mut command = strings(&args);
-        command.splice(1..1, strings(&["--no-ignore-global", "--no-ignore-parent"]));
-        assert_eq!(
-            rg_search_path_operands(std::slice::from_ref(&command)),
-            Some(strings(&["src"])),
-            "{args:?}"
-        );
-        let search = classify_rg_search_narrowing(&command, None, root, root)
-            .unwrap()
-            .expect("pattern values must not disable search classification");
-        assert_eq!(search.scope_identity, scope.to_string_lossy(), "{args:?}");
-        assert_eq!(search.breadth, RgSearchBreadth::Narrow, "{args:?}");
-        assert!(
-            search.can_record_miss,
-            "pattern values must not enable link following: {args:?}"
-        );
-        assert!(!search.query_identity.contains("src"));
+        command.splice(1..1, strings(&["--no-config", "--no-ignore-global", "--no-ignore-parent"]));
+        assert_eq!(rg_search_path_operands(std::slice::from_ref(&command)), Some(strings(&["src"])), "{args:?}");
+        assert!(rg_search_no_match_eligible(&command, None), "{args:?}");
+        let dependencies = rg_search_dependency_paths(&command, root).unwrap();
+        assert!(dependencies.paths.contains(&root.join("src")));
         if args.contains(&"-nfpatterns.txt") {
-            assert!(
-                search
-                    .state_paths
-                    .contains(&dunce::canonicalize(root.join("patterns.txt")).unwrap())
-            );
+            assert!(dependencies.paths.contains(&root.join("patterns.txt")));
         }
-        let actual = std::process::Command::new("rg")
-            .args(&command[1..])
-            .current_dir(root)
-            .output()
-            .unwrap();
-        assert!(
-            actual.status.success(),
-            "{args:?}: {}",
-            String::from_utf8_lossy(&actual.stderr)
-        );
-        assert!(
-            String::from_utf8_lossy(&actual.stdout).contains("input.txt"),
-            "{args:?}"
-        );
+        let actual = std::process::Command::new("rg").args(&command[1..]).current_dir(root).output().unwrap();
+        assert!(actual.status.success(), "{args:?}: {}", String::from_utf8_lossy(&actual.stderr));
+        assert!(String::from_utf8_lossy(&actual.stdout).contains("input.txt"), "{args:?}");
     }
-    for args in [
-        vec!["rg", "--files", "src"],
-        vec!["rg", "-L", "needle", "src"],
-    ] {
-        let mut command = strings(&args);
-        command.splice(1..1, strings(&["--no-ignore-global", "--no-ignore-parent"]));
-        let search = classify_rg_search_narrowing(&command, None, root, root)
-            .unwrap()
-            .unwrap();
-        assert_eq!(rg_search_path_operands(&[command]), Some(strings(&["src"])));
-        assert_eq!(search.can_record_miss, !args.contains(&"-L"));
-    }
-    for args in [vec!["rg", "--help"], vec!["rg", "-V"]] {
-        let command = strings(&args);
-        assert_eq!(
-            classify_rg_search_narrowing(&command, None, root, root).unwrap(),
-            None
-        );
-        assert_eq!(rg_search_path_operands(&[command]), None);
-    }
-}
-
-#[test]
-fn rg_supported_executables_share_scope_and_dependency_classification() {
-    use crate::command_search::rg_search_path_operands;
-
-    let temp = tempfile::tempdir().unwrap();
-    let root = &dunce::canonicalize(temp.path()).unwrap();
-    for exists in [false, true] {
-        if exists {
-            std::fs::create_dir(root.join("src")).unwrap();
-        }
-        for program in ["rg", "rga", "ripgrep", "RIPGREP.EXE", "C:\\tools\\rg.exe"] {
-            let command = strings(&[program, "needle", "src"]);
-            let search = classify_rg_search_narrowing(&command, None, root, root)
-                .unwrap()
-                .expect(program);
-            assert_eq!(search.scope_identity, root.join("src").to_string_lossy());
-            assert!(search.query_identity.contains("needle"));
-            assert!(search.state_paths.contains(&root.join("src")));
-            assert_eq!(rg_search_path_operands(&[command]), Some(strings(&["src"])));
-        }
-    }
-    let command = strings(&["pwsh", "-Command", "ripgrep needle src"]);
-    let search = classify_rg_search_narrowing(&command, Some(ShellType::PowerShell), root, root)
-        .unwrap()
-        .expect("shell spelling");
-    assert_eq!(search.breadth, RgSearchBreadth::Narrow);
 }
 
 #[test]
 fn search_operands_respect_option_values_and_terminators() {
     use crate::command_search::rg_search_path_operands;
-
-    let temp = tempfile::tempdir().unwrap();
-    let root = &dunce::canonicalize(temp.path()).unwrap();
-    std::fs::create_dir(root.join("src")).unwrap();
     for args in [
-        vec!["rg", "--", "-error", "src"],
-        vec!["rg", "--", "--files", "src"],
-        vec!["rg", "--", "--help", "src"],
-        vec!["rg", "-g", "-error", "needle", "src"],
-        vec!["rg", "-g", "--files", "needle", "src"],
-        vec!["rg", "-e", "--help", "src"],
-        vec!["rg", "--regexp=needle", "--", "src"],
-        vec!["rg", "needle", "-e", "other", "src"],
+        vec!["rg", "--", "-error", "src"], vec!["rg", "--", "--files", "src"],
+        vec!["rg", "--", "--help", "src"], vec!["rg", "-g", "-error", "needle", "src"],
+        vec!["rg", "-g", "--files", "needle", "src"], vec!["rg", "-e", "--help", "src"],
+        vec!["rg", "--regexp=needle", "--", "src"], vec!["rg", "needle", "-e", "other", "src"],
+        vec!["rg", "--max-depth", "3", "--type-add", "source:*.rs", "needle", "src"],
     ] {
-        let command = strings(&args);
         let expected = if args == vec!["rg", "needle", "-e", "other", "src"] {
             strings(&["needle", "src"])
-        } else {
-            strings(&["src"])
-        };
-        assert_eq!(
-            rg_search_path_operands(std::slice::from_ref(&command)),
-            Some(expected.clone())
-        );
-        let search = classify_rg_search_narrowing(&command, None, root, root)
-            .unwrap()
-            .expect("search remains eligible after parsing its actual options");
-        for path in expected {
-            assert!(search.state_paths.contains(&root.join(path)));
-        }
-        if args.get(1) == Some(&"--") {
-            assert!(search.query_identity.contains(args[2]));
-            assert!(!search.state_paths.contains(&root.join(args[2])));
+        } else { strings(&["src"]) };
+        assert_eq!(rg_search_path_operands(&[strings(&args)]), Some(expected), "{args:?}");
+    }
+}
+
+#[test]
+fn search_exit_classification_is_independent_of_repository_and_path_existence() {
+    use crate::command_search::rg_search_no_match_eligible;
+    for program in ["rg"] {
+        for path in [".", "..", "src", "does-not-exist/subdir"] {
+            let command = strings(&[program, "--no-ignore-global", "--no-ignore-parent", "needle", path]);
+            assert!(rg_search_no_match_eligible(&command, None), "{command:?}");
         }
     }
-}
-
-#[test]
-fn search_root_is_discovered_only_after_a_search_is_identified() {
-    use crate::command_search::classify_rg_search_with_repository;
-    let root = Path::new("workspace");
-    for command in [strings(&["git", "status"]), strings(&["echo", "hello"])] {
-        assert!(
-            classify_rg_search_with_repository(&command, None, root, || {
-                panic!("ordinary commands must not discover a search root")
-            })
-            .unwrap()
-            .is_none()
-        );
-    }
-    let calls = std::cell::Cell::new(0);
-    let search =
-        classify_rg_search_with_repository(&strings(&["rg", "needle", "src"]), None, root, || {
-            calls.set(calls.get() + 1);
-            root.to_path_buf()
-        })
-        .unwrap()
-        .expect("search classified");
-    assert_eq!(calls.get(), 1);
-    assert!(search.1.search_identity.contains("needle"));
-}
-
-#[tokio::test]
-async fn expensive_search_scope_remains_searchable_without_reusable_miss_evidence() {
-    let temp = tempfile::tempdir().unwrap();
-    let root = temp.path();
-    std::fs::create_dir(root.join(".git")).unwrap();
-    std::fs::create_dir(root.join("ignored")).unwrap();
-    std::fs::write(root.join("visible.txt"), "needle\n").unwrap();
-    std::fs::write(root.join(".gitignore"), "ignored/\n").unwrap();
-    for index in 0..600 {
-        std::fs::write(root.join("ignored").join(format!("{index}.txt")), "needle").unwrap();
-    }
-    let command = strings(&[
-        "rg",
-        "--no-ignore-global",
-        "--no-ignore-parent",
-        "needle",
-        ".",
-    ]);
-    let mut search = classify_rg_search_narrowing(&command, None, root, root)
-        .unwrap()
-        .unwrap();
-    assert!(
-        search.can_record_miss,
-        "the fixture must attempt scope capture"
-    );
-    let identity = search.search_identity.clone();
-    crate::command_search::observe_rg_search_scope_state(&mut search).await;
-    assert_eq!(search.scope_state_identity, None);
-    assert_eq!(search.search_identity, identity);
-    let output = std::process::Command::new(&command[0])
-        .args(&command[1..])
-        .current_dir(root)
-        .output()
-        .unwrap();
-    assert!(output.status.success());
-    let output = String::from_utf8(output.stdout).unwrap();
-    assert!(output.contains("visible.txt"));
-    assert!(!output.contains("ignored"));
-    let miss = std::process::Command::new("rg")
-        .args(["missing-pattern", "."])
-        .current_dir(root)
-        .output()
-        .unwrap();
-    assert_eq!(miss.status.code(), Some(1));
-    assert!(miss.stdout.is_empty());
-}
-
-#[cfg(unix)]
-#[tokio::test]
-async fn linked_ignore_changes_search_results_without_reusable_miss_evidence() {
-    let fixture = tempfile::tempdir().unwrap();
-    let root = fixture.path().join("repo");
-    std::fs::create_dir_all(root.join(".git/info")).unwrap();
-    std::fs::write(root.join("data.txt"), "needle\n").unwrap();
-    let rules = fixture.path().join("external-rules");
-    let command = strings(&[
-        "rg",
-        "--no-config",
-        "--no-ignore-global",
-        "--no-ignore-parent",
-        "needle",
-        ".",
-    ]);
-    for name in [".ignore", ".rgignore", ".gitignore", ".git/info/exclude"] {
-        std::fs::write(&rules, "data.txt\n").unwrap();
-        let link = root.join(name);
-        std::os::unix::fs::symlink(&rules, &link).unwrap();
-        for (contents, expected_exit) in [("data.txt\n", 1), ("", 0)] {
-            std::fs::write(&rules, contents).unwrap();
-            // Establish visibility independently with rg, not the cache's own
-            // fingerprint. Only the external referent changes between searches.
-            let output = std::process::Command::new(&command[0])
-                .args(&command[1..])
-                .current_dir(&root)
-                .output()
-                .unwrap();
-            assert_eq!(
-                output.status.code(),
-                Some(expected_exit),
-                "{name}: {}",
-                String::from_utf8_lossy(&output.stderr)
-            );
-            if expected_exit == 1 {
-                assert!(output.stdout.is_empty(), "{name}");
-            } else {
-                let text = String::from_utf8(output.stdout).unwrap();
-                assert!(text.contains("data.txt:needle"), "{name}: {text}");
-            }
-            let mut search = classify_rg_search_narrowing(&command, None, &root, &root)
-                .unwrap()
-                .unwrap();
-            assert!(
-                search.can_record_miss,
-                "the fixture must exercise scope capture"
-            );
-            crate::command_search::observe_rg_search_scope_state(&mut search).await;
-            assert_eq!(search.scope_state_identity, None, "{name}");
-        }
-        std::fs::remove_file(link).unwrap();
-    }
-}
-
-#[test]
-fn classifies_repository_wide_and_owner_scoped_rg() {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .and_then(Path::parent)
-        .expect("codex-core is nested under the repository root");
-    let scoped = root.join("codex-rs/core/src/tools");
-
-    assert_eq!(
-        classify_rg_search_narrowing(&strings(&["rg", "needle", "."]), None, root, root)
-            .expect("classification")
-            .map(|search| search.breadth),
-        Some(RgSearchBreadth::Broad)
-    );
-    assert_eq!(
-        classify_rg_search_narrowing(
-            &strings(&["rg", "needle", "codex-rs/core/src/tools"]),
-            None,
-            root,
-            root,
-        )
-        .expect("classification")
-        .map(|search| search.breadth),
-        Some(RgSearchBreadth::Narrow)
-    );
-    assert_eq!(
-        classify_rg_search_narrowing(&strings(&["rg", "needle"]), None, &scoped, root)
-            .expect("classification")
-            .map(|search| search.breadth),
-        Some(RgSearchBreadth::Narrow)
-    );
-    assert_eq!(
-        classify_rg_search_narrowing(&strings(&["rg", "--files", "."]), None, root, root)
-            .expect("classification")
-            .map(|search| search.breadth),
-        Some(RgSearchBreadth::Broad)
-    );
-    assert_eq!(
-        classify_rg_search_narrowing(&strings(&["rg", "needle", "codex-rs"]), None, root, root,)
-            .expect("classification")
-            .map(|search| search.breadth),
-        Some(RgSearchBreadth::Narrow)
-    );
-    // `packages/*` does not exist, so it exercises the lexical fallback: a
-    // target inside the repository stays narrow whether or not it can be
-    // canonicalized.
-    for targets in [
-        vec!["codex-rs/core", "codex-rs/file-search"],
-        vec!["packages/alpha", "packages/beta"],
-        vec!["scripts", "docs"],
+    for args in [
+        vec!["rg", "--help"], vec!["rg", "--version"], vec!["rg", "--type-list"],
+        vec!["rg", "--pcre2-version"], vec!["rg", "--generate=complete-powershell"],
+        vec!["git", "status"], vec!["echo", "hello"],
+        // Recognized search aliases are not in the executable safety allowlist.
+        vec!["rga", "--no-ignore-global", "--no-ignore-parent", "needle", "src"],
+        vec!["ripgrep", "--no-ignore-global", "--no-ignore-parent", "needle", "src"],
+        vec!["rg", "--pre", "python", "needle", "src"],
+        vec!["rg", "--follow", "needle", "src"],
     ] {
-        let mut command = strings(&["rg", "--no-ignore-global", "--no-ignore-parent", "needle"]);
-        command.extend(targets.into_iter().map(str::to_string));
-        let search = classify_rg_search_narrowing(&command, None, root, root)
-            .unwrap()
-            .unwrap();
-        assert_eq!(search.breadth, RgSearchBreadth::Narrow);
-        assert!(search.can_record_miss);
+        assert!(!rg_search_no_match_eligible(&strings(&args), None), "{args:?}");
     }
-    for target in ["..", "."] {
-        let search =
-            classify_rg_search_narrowing(&strings(&["rg", "needle", target]), None, root, root)
-                .unwrap()
-                .unwrap();
-        assert_eq!(search.breadth, RgSearchBreadth::Broad);
-    }
-    assert_eq!(
-        classify_rg_search_narrowing(&strings(&["rg", "needle", "scripts"]), None, root, root,)
-            .expect("classification")
-            .map(|search| search.breadth),
-        Some(RgSearchBreadth::Narrow)
-    );
-    let compound = classify_rg_search_narrowing(
-        &strings(&[
-            "pwsh",
-            "-NoProfile",
-            "-Command",
-            "rg needle . | Measure-Object",
-        ]),
-        Some(ShellType::PowerShell),
-        root,
-        root,
-    )
-    .expect("classification")
-    .expect("compound rg should still be gated");
-    assert_eq!(compound.breadth, RgSearchBreadth::Broad);
-    assert!(!compound.can_record_miss);
-
-    let inventory = classify_rg_search_narrowing(
-        &strings(&[
-            "powershell.exe",
-            "-NoProfile",
-            "-Command",
-            "$files = rg --files -g 'README.md' -g 'AGENTS.md' -g '*terminal*' -g '*bench*' -g '*rollout*' -g '*eval*' -g '*prompt*'; Write-Output '---FILES---'; $files; Write-Output '---STATUS---'; git status --short; Write-Output '---ROOT---'; Get-Content -Path AGENTS.md -TotalCount 260; Write-Output '---README MATCHES---'; rg -n -i 'terminal|benchmark|rollout|prompt|agent loop|tool' README.md | Select-Object -First 180",
-        ]),
-        Some(ShellType::PowerShell),
-        root,
-        root,
-    )
-    .expect("inventory classification")
-    .expect("inventory rg should still be gated");
-    assert_eq!(inventory.breadth, RgSearchBreadth::Broad);
-    assert!(!inventory.can_record_miss);
-
-    let narrow = classify_rg_search_narrowing(
-        &strings(&["rg", "-n", "needle", "codex-rs/core/src"]),
-        None,
-        root,
-        root,
-    )
-    .expect("classification")
-    .expect("narrow rg");
-    let broad =
-        classify_rg_search_narrowing(&strings(&["rg", "-n", "needle", "."]), None, root, root)
-            .expect("classification")
-            .expect("broad rg");
-    assert_eq!(narrow.query_identity, broad.query_identity);
-    let equivalent_narrow = classify_rg_search_narrowing(
-        &strings(&["rg", "-n", "needle", "./codex-rs/core/src"]),
-        None,
-        root,
-        root,
-    )
-    .expect("classification")
-    .expect("equivalent narrow rg");
-    assert_eq!(narrow.search_identity, equivalent_narrow.search_identity);
-    assert_ne!(narrow.search_identity, broad.search_identity);
-
-    let reordered_targets = classify_rg_search_narrowing(
-        &strings(&[
-            "rg",
-            "-n",
-            "needle",
-            "codex-rs/core/src/session",
-            "codex-rs/core/src/tools",
-        ]),
-        None,
-        root,
-        root,
-    )
-    .expect("classification")
-    .expect("multi-target rg");
-    let equivalent_targets = classify_rg_search_narrowing(
-        &strings(&[
-            "rg",
-            "-n",
-            "needle",
-            "./codex-rs/core/src/tools",
-            "codex-rs/core/src/missing/../session",
-            "codex-rs/core/src/tools",
-        ]),
-        None,
-        root,
-        root,
-    )
-    .expect("classification")
-    .expect("equivalent multi-target rg");
-    assert_eq!(
-        reordered_targets.search_identity,
-        equivalent_targets.search_identity
-    );
-
-    let first_pattern = classify_rg_search_narrowing(
-        &strings(&["rg", "--files-with-matches", "first", "codex-rs/core/src"]),
-        None,
-        root,
-        root,
-    )
-    .expect("classification")
-    .expect("first files-with-matches query");
-    let second_pattern = classify_rg_search_narrowing(
-        &strings(&["rg", "--files-with-matches", "second", "codex-rs/core/src"]),
-        None,
-        root,
-        root,
-    )
-    .expect("classification")
-    .expect("second files-with-matches query");
-    assert_ne!(first_pattern.query_identity, second_pattern.query_identity);
-}
-
-#[test]
-fn classifies_repository_root_and_outside_repository_targets_as_broad() {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .and_then(Path::parent)
-        .expect("codex-core is nested under the repository root");
-
-    // Breadth records whether a search covered the whole repository, so only a
-    // target at or above the root is broad. Several directories inside the root
-    // still leave the rest of the repository unsearched.
-    for command in [
-        strings(&["rg", "needle", ".."]),
-        strings(&["rg", "needle", "."]),
-        strings(&["rg", "needle", "codex-rs/core", ".."]),
-    ] {
-        let search = classify_rg_search_narrowing(&command, None, root, root)
-            .expect("classification")
-            .expect("rg search");
-        assert_eq!(search.breadth, RgSearchBreadth::Broad, "{command:?}");
-    }
-    for command in [
-        strings(&["rg", "needle", ".codex", "scripts", "docs", "packages"]),
-        strings(&["rg", "needle", "codex-rs/core", "codex-rs/protocol"]),
-    ] {
-        let search = classify_rg_search_narrowing(&command, None, root, root)
-            .expect("classification")
-            .expect("rg search");
-        assert_eq!(search.breadth, RgSearchBreadth::Narrow, "{command:?}");
-    }
-}
-
-#[test]
-fn records_only_the_immediate_parent_as_the_next_expansion_scope() {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .and_then(Path::parent)
-        .expect("codex-core is nested under the repository root");
-    let narrow = classify_rg_search_narrowing(
-        &strings(&["rg", "needle", "codex-rs/core/src/tools"]),
-        None,
-        root,
-        root,
-    )
-    .expect("classification")
-    .expect("narrow rg");
-    let parent = classify_rg_search_narrowing(
-        &strings(&["rg", "needle", "codex-rs/core/src"]),
-        None,
-        root,
-        root,
-    )
-    .expect("classification")
-    .expect("parent rg");
-    let repository =
-        classify_rg_search_narrowing(&strings(&["rg", "needle", "."]), None, root, root)
-            .expect("classification")
-            .expect("repository rg");
-
-    assert_eq!(
-        narrow.parent_scope_identity.as_deref(),
-        Some(parent.scope_identity.as_str())
-    );
-    assert_ne!(
-        narrow.parent_scope_identity.as_deref(),
-        Some(repository.scope_identity.as_str())
-    );
-}
-
-#[test]
-fn search_narrowing_is_best_effort_for_dynamic_and_non_native_commands() {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .and_then(Path::parent)
-        .expect("codex-core is nested under the repository root");
-    let dynamic_powershell = strings(&[
-        "pwsh",
-        "-NoProfile",
-        "-Command",
+    for script in [
+        "rg --no-ignore-global --no-ignore-parent needle src | Measure-Object",
         "$tool = 'rg'; & $tool needle .",
-    ]);
-
-    assert_eq!(
-        classify_rg_search_narrowing(&dynamic_powershell, Some(ShellType::PowerShell), root, root,),
-        Ok(None)
-    );
-    assert_eq!(
-        classify_rg_search_narrowing_without_native_scope(&strings(&["rg", "needle", "src"]), None,),
-        None
-    );
-    assert_eq!(
-        classify_rg_search_narrowing_without_native_scope(
-            &strings(&["git", "status", "--short"]),
-            None,
-        ),
-        None
-    );
-}
-
-#[test]
-fn ignores_rg_metadata_modes_and_option_values_as_search_paths() {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .and_then(Path::parent)
-        .expect("codex-core is nested under the repository root");
-
-    for command in [
-        ["rg", "--help"].as_slice(),
-        ["rg", "--version"].as_slice(),
-        ["rg", "--type-list"].as_slice(),
-        ["rg", "--pcre2-version"].as_slice(),
-        ["rg", "--generate=complete-powershell"].as_slice(),
+        "rg needle src; echo done",
     ] {
-        assert_eq!(
-            classify_rg_search_narrowing(&strings(command), None, root, root),
-            Ok(None)
-        );
+        assert!(!rg_search_no_match_eligible(
+            &strings(&["pwsh", "-NoProfile", "-Command", script]), Some(ShellType::PowerShell)
+        ), "{script}");
     }
-
-    let command = strings(&[
-        "rg",
-        "--max-depth",
-        "3",
-        "--type-add",
-        "source:*.rs",
-        "needle",
-        "codex-rs/core/src/tools",
-    ]);
-    let search = classify_rg_search_narrowing(&command, None, root, root)
-        .expect("classification")
-        .expect("rg search with option value");
-    assert_eq!(search.breadth, RgSearchBreadth::Narrow);
-    assert!(search.query_identity.contains("source:*.rs"));
-    // A value read as the pattern would shift `needle` into the search paths.
-    assert_eq!(
-        crate::command_search::rg_search_path_operands(&[command]),
-        Some(strings(&["codex-rs/core/src/tools"]))
-    );
 }
 
 #[test]
-fn confirmed_performance_non_rg_commands_skip_search_path_normalization() {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-    crate::command_search::reset_search_path_normalization_count();
-
-    assert_eq!(
-        classify_rg_search_narrowing(&strings(&["git", "status", "--short"]), None, root, root,),
-        Ok(None)
-    );
-    assert_eq!(crate::command_search::search_path_normalization_count(), 0);
-
-    let repository_root = root
-        .parent()
-        .and_then(Path::parent)
-        .expect("codex-core is nested under the repository root");
-    crate::command_search::reset_search_path_normalization_count();
-    classify_rg_search_narrowing(
-        &strings(&["rg", "needle", "codex-rs/core/src/tools"]),
-        None,
-        repository_root,
-        repository_root,
-    )
-    .expect("search classification")
-    .expect("rg search");
-    assert_eq!(
-        crate::command_search::search_path_normalization_count(),
-        2,
-        "the repository root and target should each be normalized once"
-    );
+fn linked_worktree_dependencies_include_shared_ignore_inputs() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("linked");
+    let git = temp.path().join("main/.git");
+    let private = git.join("worktrees/linked");
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::create_dir_all(git.join("info")).unwrap();
+    std::fs::create_dir_all(&private).unwrap();
+    std::fs::write(root.join(".git"), "gitdir: ../main/.git/worktrees/linked\n").unwrap();
+    std::fs::write(private.join("commondir"), "../..\n").unwrap();
+    let command = strings(&["rg", "--no-config", "--no-ignore-global", "--no-ignore-parent", "needle", "src"]);
+    let paths = crate::command_search::rg_search_dependency_paths(&command, &root).unwrap().paths;
+    assert!(paths.contains(&root.join(".git")));
+    assert!(paths.iter().any(|path| path.file_name().is_some_and(|name| name == "commondir")));
+    assert!(paths.iter().any(|path| path.file_name().is_some_and(|name| name == "exclude")));
 }
 
-#[tokio::test]
-async fn search_scope_state_ignores_unrelated_content_and_detects_target_changes() {
-    let temp = tempfile::tempdir().expect("search scope fixture");
-    let root = temp.path();
-    let src = root.join("src");
-    std::fs::create_dir(&src).expect("create target scope");
-    std::fs::write(src.join("lib.rs"), b"original").expect("write target file");
-    std::fs::write(root.join("outside.bin"), vec![b'x'; 1024 * 1024])
-        .expect("write unrelated content");
-    // A target snapshot cannot certify global or parent ignore files.
-    let command = strings(&[
-        "rg",
-        "--no-ignore-global",
-        "--no-ignore-parent",
-        "needle",
-        "src",
-    ]);
-
-    let mut first = classify_rg_search_narrowing(&command, None, root, root)
-        .expect("classification")
-        .expect("rg search");
-    crate::command_search::observe_rg_search_scope_state(&mut first).await;
-    let first_identity = first
-        .scope_state_identity
-        .expect("target scope exposes a native filesystem identity");
-
-    std::fs::write(root.join("outside.bin"), vec![b'y'; 2 * 1024 * 1024])
-        .expect("change unrelated content");
-    let mut after_unrelated = classify_rg_search_narrowing(&command, None, root, root)
-        .expect("classification")
-        .expect("rg search");
-    crate::command_search::observe_rg_search_scope_state(&mut after_unrelated).await;
-    assert_eq!(
-        after_unrelated.scope_state_identity.as_deref(),
-        Some(first_identity.as_str()),
-        "content outside the rg targets must not invalidate the scoped miss"
-    );
-
-    std::fs::write(src.join("lib.rs"), b"changed!").expect("change target content");
-    let mut after_relevant = classify_rg_search_narrowing(&command, None, root, root)
-        .expect("classification")
-        .expect("rg search");
-    crate::command_search::observe_rg_search_scope_state(&mut after_relevant).await;
-    let relevant_identity = after_relevant
-        .scope_state_identity
-        .expect("changed target scope remains observable");
-    assert_ne!(
-        relevant_identity, first_identity,
-        "a target change must invalidate the scoped miss"
-    );
-}
 
 #[test]
 fn git_status_normalization_preserves_global_options_and_is_idempotent() {
@@ -2271,12 +1629,15 @@ fn preflight_validation_metadata_does_not_erase_shell_exit_guards() {
         let validation = crate::validation::CommandValidation {
             execution_context: None,
             declared: None,
-            receipt_runner: None,
-            admission_runner: None,
             classification: crate::validation::classify_validation_invocations(
                 &outcome.validation_invocations,
             ),
         };
-        assert_eq!(validation.signal()["proof"], false);
+        assert!(!matches!(validation.classification,
+            crate::validation::ValidationClassification::Validation {
+                exit_code_is_authoritative: true, has_unclassified_targets: false, ..
+            }
+        ));
+        assert!(validation.signal().get("proof").is_none());
     }
 }

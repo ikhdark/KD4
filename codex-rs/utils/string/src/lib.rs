@@ -11,6 +11,7 @@ pub use truncate::approx_token_count;
 pub use truncate::approx_token_count_exceeds;
 pub use truncate::approx_tokens_from_byte_count;
 pub use truncate::truncate_middle_chars;
+pub use truncate::truncate_middle_chars_from_parts;
 pub use truncate::truncate_middle_with_token_budget;
 
 /// Normalize CRLF and bare CR, retaining the input allocation when unchanged.
@@ -115,13 +116,11 @@ pub fn sanitize_metric_tag_value(value: &str) -> String {
         })
         .collect();
     let trimmed = sanitized.trim_matches('_');
-    if trimmed.is_empty() || trimmed.chars().all(|ch| !ch.is_ascii_alphanumeric()) {
-        return "unspecified".to_string();
-    }
-    if trimmed.len() <= MAX_LEN {
-        trimmed.to_string()
+    let trimmed = trimmed[..trimmed.len().min(MAX_LEN)].trim_matches('_');
+    if !trimmed.bytes().any(|byte| byte.is_ascii_alphanumeric()) {
+        "unspecified".to_string()
     } else {
-        trimmed[..MAX_LEN].to_string()
+        trimmed.to_string()
     }
 }
 
@@ -249,6 +248,25 @@ mod tests {
     use super::sanitize_metric_tag_value;
     use super::sha1_hex;
     use pretty_assertions::assert_eq;
+
+    #[test]
+    fn metric_tag_final_cutoff_preserves_normalization_invariants() {
+        for (input, expected) in [
+            (format!("{}a", "/".repeat(256)), "unspecified".into()),
+            (format!("{}a", ".".repeat(256)), "unspecified".into()),
+            (
+                format!("{}a", "/".repeat(255)),
+                format!("{}a", "/".repeat(255)),
+            ),
+            (format!("a{}b", "_".repeat(300)), "a".into()),
+            ("a".repeat(300), "a".repeat(256)),
+        ] {
+            let actual = sanitize_metric_tag_value(&input);
+            assert_eq!(actual, expected);
+            assert_eq!(sanitize_metric_tag_value(&actual), actual);
+            assert!(actual.len() <= 256);
+        }
+    }
 
     #[test]
     fn sanitize_metric_tag_value_trims_and_fills_unspecified() {

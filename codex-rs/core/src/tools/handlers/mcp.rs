@@ -210,6 +210,7 @@ pub struct McpHandler {
     tool_info: ToolInfo,
     spec: Arc<codex_tools::LoadableToolSpec>,
     input_validator: jsonschema::Validator,
+    canonical_input_schema: Value,
 }
 
 impl McpHandler {
@@ -229,6 +230,7 @@ impl McpHandler {
             tool_info,
             spec,
             input_validator,
+            canonical_input_schema: schema,
         })
     }
 
@@ -464,6 +466,10 @@ impl McpHandler {
 }
 
 impl CoreToolRuntime for McpHandler {
+    fn code_mode_input_schema(&self) -> Option<Value> {
+        Some(self.canonical_input_schema.clone())
+    }
+
     fn waits_for_runtime_cancellation(&self) -> bool {
         true
     }

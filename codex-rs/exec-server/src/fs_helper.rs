@@ -533,7 +533,7 @@ pub(crate) async fn run_direct_request(
     }
 }
 
-fn map_fs_error(err: io::Error) -> JSONRPCErrorError {
+pub(crate) fn map_fs_error(err: io::Error) -> JSONRPCErrorError {
     let mut error = match err.kind() {
         io::ErrorKind::NotFound => not_found(err.to_string()),
         io::ErrorKind::InvalidInput => invalid_request(err.to_string()),

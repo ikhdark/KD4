@@ -43,7 +43,6 @@ async fn both_response_queues_are_bound_to_the_actual_attempt() {
             upstream_request_id: None,
         },
         test_session_telemetry(),
-        InferenceTraceAttempt::disabled().into(),
         test_model_provider(),
         Some(attempt.into()),
         None,

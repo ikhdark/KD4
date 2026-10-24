@@ -24,33 +24,33 @@ use std::os::windows::io::AsRawHandle;
 use std::os::windows::io::FromRawHandle;
 use std::path::Path;
 use std::ptr;
+#[cfg(test)]
 use std::sync::Arc;
+#[cfg(test)]
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
+#[cfg(test)]
 use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
 use windows_sys::Win32::Foundation::CloseHandle;
-use windows_sys::Win32::Foundation::DUPLICATE_SAME_ACCESS;
-use windows_sys::Win32::Foundation::DuplicateHandle;
+use windows_sys::Win32::Foundation::ERROR_BROKEN_PIPE;
 use windows_sys::Win32::Foundation::ERROR_LOGON_FAILURE;
+use windows_sys::Win32::Foundation::ERROR_NO_DATA;
 use windows_sys::Win32::Foundation::ERROR_NO_SUCH_LOGON_SESSION;
-use windows_sys::Win32::Foundation::ERROR_NOT_FOUND;
 use windows_sys::Win32::Foundation::GetLastError;
 use windows_sys::Win32::Foundation::HANDLE;
+use windows_sys::Win32::Storage::FileSystem::ReadFile;
+#[cfg(test)]
 use windows_sys::Win32::System::IO::CancelSynchronousIo;
 use windows_sys::Win32::System::Threading::CreateProcessWithLogonW;
-use windows_sys::Win32::System::Threading::GetCurrentProcess;
-use windows_sys::Win32::System::Threading::GetCurrentThread;
 use windows_sys::Win32::System::Threading::LOGON_WITH_PROFILE;
 use windows_sys::Win32::System::Threading::PROCESS_INFORMATION;
 use windows_sys::Win32::System::Threading::STARTUPINFOW;
 use windows_sys::Win32::System::Threading::TerminateProcess;
-use windows_sys::Win32::System::Threading::WaitForSingleObject;
 
 const RUNNER_SPAWN_READY_TIMEOUT: Duration = Duration::from_secs(15);
 const RUNNER_PIPE_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
-const WAIT_OBJECT_0: u32 = 0;
 
 #[derive(Debug)]
 struct RunnerLogonError {
@@ -95,6 +95,7 @@ impl std::error::Error for RunnerStartupError {}
 pub(crate) struct RunnerTransport {
     pipe_write: File,
     pipe_read: File,
+    runner: RunnerProcess,
 }
 
 fn is_refreshable_windows_error(code: u32) -> bool {
@@ -146,203 +147,182 @@ pub(crate) fn retry_runner_spawn_once<T>(
 }
 
 impl RunnerTransport {
-    pub(crate) fn send_spawn_request(&mut self, request: SpawnRequest) -> Result<()> {
-        let spawn_request = FramedMessage {
-            version: IPC_PROTOCOL_VERSION,
-            message: Message::SpawnRequest {
-                payload: Box::new(request),
-            },
-        };
-        write_frame(&mut self.pipe_write, &spawn_request)
-    }
-
-    pub(crate) fn read_spawn_ready(&mut self) -> Result<()> {
-        let msg = read_frame_with_timeout(&self.pipe_read, RUNNER_SPAWN_READY_TIMEOUT)?
-            .ok_or_else(|| anyhow::anyhow!("runner pipe closed before spawn_ready"))?;
-        match msg.message {
-            Message::SpawnReady { .. } => Ok(()),
-            Message::Error { payload } => Err(RunnerStartupError::new(payload).into()),
-            other => Err(anyhow::anyhow!(
-                "expected spawn_ready from runner, got {other:?}"
-            )),
-        }
+    pub(crate) fn into_capture_files(self) -> (File, File, RunnerProcess) {
+        let Self { pipe_write, pipe_read, runner } = self;
+        (pipe_write, pipe_read, runner)
     }
 
     pub(crate) fn into_files(self) -> (File, File) {
-        (self.pipe_write, self.pipe_read)
+        let Self { pipe_write, pipe_read, mut runner } = self;
+        runner.disarmed = true;
+        (pipe_write, pipe_read)
     }
 }
 
-fn try_take_completed_connect_result(
-    connect_thread: &mut Option<thread::JoinHandle<()>>,
-    connect_result_rx: &mpsc::Receiver<Result<()>>,
-    thread_handle: HANDLE,
-    pipe_label: &str,
-) -> Result<Option<Result<()>>> {
-    // SAFETY: thread_handle is the duplicated connect-thread handle retained by
-    // connect_pipe_with_timeout until all wait/result checks return.
-    let thread_wait = unsafe { WaitForSingleObject(thread_handle, 0) };
-    if thread_wait != WAIT_OBJECT_0 {
-        return Ok(None);
-    }
-
-    if let Some(connect_thread) = connect_thread.take() {
-        let _ = connect_thread.join();
-    }
-
-    let result = connect_result_rx.recv().map_err(|_| {
-        anyhow::anyhow!("runner {pipe_label} connect thread exited before reporting its result")
-    })?;
-    Ok(Some(result))
+pub(crate) struct RunnerProcess {
+    process: File,
+    disarmed: bool,
 }
 
-fn connect_pipe_with_timeout(
-    h_pipe: HANDLE,
-    expected_runner_pid: u32,
-    pipe_label: &str,
-) -> Result<()> {
-    let pipe_label = pipe_label.to_string();
-    let pipe_label_for_thread = pipe_label.clone();
-    let pipe_handle_addr = h_pipe as usize;
-    let (thread_handle_tx, thread_handle_rx) = mpsc::sync_channel(1);
-    let (connect_result_tx, connect_result_rx) = mpsc::sync_channel(1);
-    let mut connect_thread = Some(
-        thread::Builder::new()
-            .name(format!("codex-runner-connect-{pipe_label}"))
-            .spawn(move || {
-                // SAFETY: GetCurrentProcess returns the current process pseudo-handle and takes no
-                // pointers or ownership.
-                let current_process = unsafe { GetCurrentProcess() };
-                let mut thread_handle: HANDLE = ptr::null_mut();
-                // SAFETY: The current process/thread pseudo-handles refer to this running thread;
-                // thread_handle is a writable output slot and the successful duplicate is
-                // sent to the parent for eventual closure.
-                let duplicate_ok = unsafe {
-                    DuplicateHandle(
-                        current_process,
-                        GetCurrentThread(),
-                        current_process,
-                        &mut thread_handle,
-                        0,
-                        0,
-                        DUPLICATE_SAME_ACCESS,
-                    )
-                };
-                if duplicate_ok == 0 {
-                    let _ = thread_handle_tx.send(Err(anyhow::anyhow!(
-                        "DuplicateHandle failed for runner {pipe_label_for_thread} connect thread: {}",
-                        unsafe { GetLastError() }
-                    )));
-                    return;
-                }
-
-                // Publish the helper thread HANDLE before the blocking pipe connect so the
-                // parent can cancel this specific operation if it times out.
-                let _ = thread_handle_tx.send(Ok(thread_handle as usize));
-
-                let result = connect_pipe(pipe_handle_addr as HANDLE, expected_runner_pid)
-                    .map_err(anyhow::Error::from)
-                    .context(format!("connect {pipe_label_for_thread}"));
-                let _ = connect_result_tx.send(result);
-            })?,
-    );
-    let thread_handle_addr = thread_handle_rx.recv().map_err(|_| {
-        anyhow::anyhow!("runner {pipe_label} connect thread exited before publishing its handle")
-    })??;
-    let thread_handle = thread_handle_addr as HANDLE;
-
-    let result = match connect_result_rx.recv_timeout(RUNNER_PIPE_CONNECT_TIMEOUT) {
-        Ok(result) => {
-            if let Some(connect_thread) = connect_thread.take() {
-                let _ = connect_thread.join();
-            }
-            result
-        }
-        Err(mpsc::RecvTimeoutError::Timeout) => {
-            if let Some(result) = try_take_completed_connect_result(
-                &mut connect_thread,
-                &connect_result_rx,
-                thread_handle,
-                &pipe_label,
-            )? {
-                result
-            } else {
-                // SAFETY: thread_handle is the still-open duplicated handle for this specific
-                // connect thread; cancellation does not transfer handle ownership.
-                let cancel_ok = unsafe { CancelSynchronousIo(thread_handle) };
-                if cancel_ok == 0 {
-                    // SAFETY: Read the thread-local result immediately after CancelSynchronousIo
-                    // reports failure; this call takes no pointers.
-                    let err = unsafe { GetLastError() };
-                    if err != ERROR_NOT_FOUND {
-                        Err(anyhow::anyhow!(
-                            "CancelSynchronousIo failed for runner {pipe_label} connect thread: {err}"
-                        ))
-                    } else if let Some(result) = try_take_completed_connect_result(
-                        &mut connect_thread,
-                        &connect_result_rx,
-                        thread_handle,
-                        &pipe_label,
-                    )? {
-                        result
-                    } else {
-                        Err(anyhow::anyhow!(
-                            "timed out after {}ms connecting runner {pipe_label}",
-                            RUNNER_PIPE_CONNECT_TIMEOUT.as_millis()
-                        ))
-                    }
-                } else {
-                    // Do not join the helper thread on the timeout path. Parent-side cleanup will
-                    // close the pipe handles, which lets the blocked connect unwind without
-                    // risking another indefinite wait here.
-                    Err(anyhow::anyhow!(
-                        "timed out after {}ms connecting runner {pipe_label}",
-                        RUNNER_PIPE_CONNECT_TIMEOUT.as_millis()
-                    ))
-                }
-            }
-        }
-        Err(mpsc::RecvTimeoutError::Disconnected) => {
-            if let Some(connect_thread) = connect_thread.take() {
-                let _ = connect_thread.join();
-            }
-            Err(anyhow::anyhow!(
-                "runner {pipe_label} connect thread exited before reporting its result"
-            ))
-        }
-    };
-
-    // SAFETY: The parent owns this duplicated thread handle and has finished wait/cancellation
-    // operations; closing it does not close the independently running thread.
-    unsafe {
-        CloseHandle(thread_handle);
+impl RunnerProcess {
+    pub(crate) fn terminate(&self) {
+        // SAFETY: This owner retains the process HANDLE throughout termination.
+        unsafe { TerminateProcess(self.process.as_raw_handle() as HANDLE, 1); }
     }
-
-    result
 }
 
-pub(crate) fn spawn_runner_transport(
+impl Drop for RunnerProcess {
+    fn drop(&mut self) {
+        if !self.disarmed {
+            // SAFETY: This guard owns the process HANDLE until File closes it.
+            unsafe { TerminateProcess(self.process.as_raw_handle() as HANDLE, 1); }
+        }
+    }
+}
+
+/// Cancellation and request admission share one atomic linearization point.
+pub(crate) struct RunnerAdmission {
+    state: std::sync::atomic::AtomicU8,
+    cancelled: Box<dyn Fn() -> bool + Send + Sync>,
+}
+
+impl RunnerAdmission {
+    pub(crate) fn new(cancelled: impl Fn() -> bool + Send + Sync + 'static) -> Self {
+        Self { state: std::sync::atomic::AtomicU8::new(0), cancelled: Box::new(cancelled) }
+    }
+    pub(crate) fn cancel(&self) { self.state.store(1, Ordering::Release); }
+    pub(crate) fn is_cancelled(&self) -> bool {
+        self.state.load(Ordering::Acquire) == 1 || (self.cancelled)()
+    }
+    fn admit(&self) -> Result<()> {
+        anyhow::ensure!(!self.is_cancelled(), "runner launch cancelled before admission");
+        let state = self.state.load(Ordering::Acquire);
+        anyhow::ensure!(state != 1 && self.state.compare_exchange(state, 2, Ordering::AcqRel, Ordering::Acquire).is_ok(), "runner launch cancelled before admission");
+        Ok(())
+    }
+}
+
+fn check_startup(deadline: std::time::Instant, admission: &RunnerAdmission) -> std::io::Result<()> {
+    if admission.is_cancelled() {
+        return Err(std::io::Error::new(std::io::ErrorKind::ConnectionAborted, "runner launch cancelled"));
+    }
+    if std::time::Instant::now() >= deadline {
+        return Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "runner startup timed out"));
+    }
+    Ok(())
+}
+
+fn connect_pipe_with_deadline(pipe: &File, expected_runner_pid: u32, deadline: std::time::Instant, admission: &RunnerAdmission) -> Result<()> {
+    loop {
+        check_startup(deadline, admission)?;
+        match connect_pipe(pipe.as_raw_handle() as HANDLE, expected_runner_pid) {
+            Ok(()) => return Ok(()),
+            Err(err) if matches!(err.raw_os_error(), Some(232 | 233 | 536)) => thread::sleep(Duration::from_millis(5)), // no connected client yet
+            Err(err) => return Err(err.into()),
+        }
+    }
+}
+
+struct StartupIo<'a> {
+    pipe: &'a File,
+    deadline: std::time::Instant,
+    admission: &'a RunnerAdmission,
+}
+
+impl Read for StartupIo<'_> {
+    fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+        if bytes.is_empty() { return Ok(0); }
+        loop {
+            check_startup(self.deadline, self.admission)?;
+            let mut read_bytes = 0;
+            // File::read maps ERROR_NO_DATA to BrokenPipe and then EOF. On a
+            // PIPE_NOWAIT pipe it only means the runner has not replied yet.
+            // SAFETY: self.pipe owns the synchronous, nonblocking pipe handle;
+            // bytes and read_bytes remain writable throughout this call.
+            let ok = unsafe {
+                ReadFile(
+                    self.pipe.as_raw_handle() as HANDLE,
+                    bytes.as_mut_ptr(),
+                    bytes.len().min(u32::MAX as usize) as u32,
+                    &mut read_bytes,
+                    ptr::null_mut(),
+                )
+            };
+            if ok != 0 {
+                return Ok(read_bytes as usize);
+            }
+            // SAFETY: Capture ReadFile's thread-local error before other calls.
+            match unsafe { GetLastError() } {
+                ERROR_NO_DATA => thread::sleep(Duration::from_millis(5)),
+                ERROR_BROKEN_PIPE => return Ok(0),
+                error => return Err(std::io::Error::from_raw_os_error(error as i32)),
+            }
+        }
+    }
+}
+
+impl std::io::Write for StartupIo<'_> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        if bytes.is_empty() { return Ok(0); }
+        loop {
+            check_startup(self.deadline, self.admission)?;
+            match std::io::Write::write(&mut self.pipe, bytes) {
+                Ok(0) => thread::sleep(Duration::from_millis(5)),
+                result => return result,
+            }
+        }
+    }
+    fn flush(&mut self) -> std::io::Result<()> { check_startup(self.deadline, self.admission) }
+}
+
+fn restore_blocking_pipe(pipe: &File) -> Result<()> {
+    set_pipe_wait_mode(pipe, false)
+}
+
+pub(crate) fn set_nonblocking_pipe(pipe: &File) -> Result<()> { set_pipe_wait_mode(pipe, true) }
+
+fn set_pipe_wait_mode(pipe: &File, nonblocking: bool) -> Result<()> {
+    let mode = windows_sys::Win32::System::Pipes::PIPE_READMODE_BYTE
+        | if nonblocking { windows_sys::Win32::System::Pipes::PIPE_NOWAIT } else { windows_sys::Win32::System::Pipes::PIPE_WAIT };
+    // SAFETY: This owner retains the duplex pipe and its FILE_WRITE_ATTRIBUTES
+    // access throughout the mode change; no other thread performs I/O yet.
+    if unsafe { windows_sys::Win32::System::Pipes::SetNamedPipeHandleState(pipe.as_raw_handle() as HANDLE, &mode, ptr::null(), ptr::null()) } == 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    Ok(())
+}
+
+/// Caller owns a duplex server pipe already placed in PIPE_NOWAIT mode.
+pub(crate) fn write_control_frame(pipe: &File, message: &FramedMessage) -> Result<()> {
+    let admission = RunnerAdmission::new(|| false);
+    write_frame(StartupIo { pipe, deadline: std::time::Instant::now() + Duration::from_secs(5), admission: &admission }, message)
+}
+
+pub(crate) fn spawn_runner_transport_with_admission(
     codex_home: &Path,
     cwd: &Path,
     sandbox_creds: &SandboxCreds,
     log_dir: Option<&Path>,
     spawn_request: SpawnRequest,
+    admission: &RunnerAdmission,
 ) -> Result<RunnerTransport> {
+    let deadline = std::time::Instant::now() + RUNNER_PIPE_CONNECT_TIMEOUT + RUNNER_SPAWN_READY_TIMEOUT;
+    check_startup(deadline, admission)?;
     let (pipe_in_name, pipe_out_name) = pipe_pair();
     let h_pipe_in =
-        create_named_pipe(&pipe_in_name, PIPE_ACCESS_OUTBOUND, &sandbox_creds.username)?;
+        create_named_pipe(&pipe_in_name, PIPE_ACCESS_OUTBOUND | PIPE_ACCESS_INBOUND, &sandbox_creds.username)?;
     // SAFETY: The successful pipe handle is uniquely owned here; File takes its close obligation.
     let pipe_write = unsafe { File::from_raw_handle(h_pipe_in as _) };
     let h_pipe_out =
-        create_named_pipe(&pipe_out_name, PIPE_ACCESS_INBOUND, &sandbox_creds.username)?;
+        create_named_pipe(&pipe_out_name, PIPE_ACCESS_OUTBOUND | PIPE_ACCESS_INBOUND, &sandbox_creds.username)?;
     // SAFETY: The successful pipe handle is uniquely owned here; File takes its close obligation.
     let pipe_read = unsafe { File::from_raw_handle(h_pipe_out as _) };
 
-    let runner_exe = find_runner_exe(codex_home, log_dir);
+    let runner_exe = find_runner_exe(codex_home, log_dir)?;
     let runner_cmdline = runner_exe
         .to_str()
         .map(str::to_owned)
-        .unwrap_or_else(|| "codex-command-runner.exe".to_string());
+        .ok_or_else(|| anyhow::anyhow!("runner executable path is not valid Unicode"))?;
     let runner_full_cmd = format!(
         "{} {} {}",
         quote_windows_arg(&runner_cmdline),
@@ -402,82 +382,35 @@ pub(crate) fn spawn_runner_transport(
             )),
         );
     }
-    let expected_runner_pid = pi.dwProcessId;
-
-    let connect_result = (|| -> Result<()> {
-        connect_pipe_with_timeout(h_pipe_in, expected_runner_pid, "pipe-in")?;
-        connect_pipe_with_timeout(h_pipe_out, expected_runner_pid, "pipe-out")?;
-        Ok(())
-    })();
-
-    // SAFETY: pi.hThread is the owned thread handle returned by successful process creation; the
-    // handshake no longer needs it and no other owner closes it.
-    unsafe {
-        if !pi.hThread.is_null() {
-            CloseHandle(pi.hThread);
-        }
+    // Own process rollback until the async caller accepts transport delivery.
+    // SAFETY: CreateProcessWithLogonW returned this unique owned process handle.
+    let runner = RunnerProcess { process: unsafe { File::from_raw_handle(pi.hProcess as _) }, disarmed: false };
+    // SAFETY: The successful process creation returned one thread handle, closed once here.
+    unsafe { if !pi.hThread.is_null() { CloseHandle(pi.hThread); } }
+    connect_pipe_with_deadline(&pipe_write, pi.dwProcessId, deadline, admission)?;
+    connect_pipe_with_deadline(&pipe_read, pi.dwProcessId, deadline, admission)?;
+    admission.admit()?;
+    let request = FramedMessage { version: IPC_PROTOCOL_VERSION, message: Message::SpawnRequest { payload: Box::new(spawn_request) } };
+    write_frame(StartupIo { pipe: &pipe_write, deadline, admission }, &request)?;
+    let response = read_frame(StartupIo { pipe: &pipe_read, deadline, admission })?
+        .ok_or_else(|| anyhow::anyhow!("runner pipe closed before spawn_ready"))?;
+    match response.message {
+        Message::SpawnReady { .. } => {}
+        Message::Error { payload } => return Err(RunnerStartupError::new(payload).into()),
+        other => anyhow::bail!("expected spawn_ready from runner, got {other:?}"),
     }
-
-    if let Err(err) = connect_result {
-        // SAFETY: The parent still owns the process and pipe handles on handshake failure; it
-        // requests runner termination before closing each handle, with no later File
-        // ownership transfer.
-        unsafe {
-            // Keep the process handle alive until the pipe handshake finishes. If the handshake
-            // fails after the runner process has already launched, we still need a way to stop
-            // that child instead of leaking a stray `codex-command-runner.exe`.
-            if !pi.hProcess.is_null() {
-                let _ = TerminateProcess(pi.hProcess, 1);
-                CloseHandle(pi.hProcess);
-            }
-        }
-        return Err(err);
-    }
-
-    let mut transport = RunnerTransport {
-        pipe_write,
-        pipe_read,
-    };
-    let startup_result = (|| -> Result<()> {
-        // Keep the runner process HANDLE alive until the *entire* startup handshake finishes.
-        // That way, a later `send_spawn_request` or `spawn_ready` failure can still terminate the
-        // runner instead of leaving a stray `codex-command-runner.exe` behind.
-        transport.send_spawn_request(spawn_request)?;
-        transport.read_spawn_ready()?;
-        Ok(())
-    })();
-    if let Err(err) = startup_result {
-        // SAFETY: The parent retains the runner process handle through startup; failure requests
-        // termination and closes that handle once, while transport owns the pipe handles.
-        unsafe {
-            if !pi.hProcess.is_null() {
-                let _ = TerminateProcess(pi.hProcess, 1);
-                CloseHandle(pi.hProcess);
-            }
-        }
-        drop(transport);
-        return Err(err);
-    }
-
-    // SAFETY: Startup has completed and the parent still owns this process handle; the transport
-    // owns its separate pipes, so closing the process handle does not release them.
-    unsafe {
-        if !pi.hProcess.is_null() {
-            // The runner has now connected both pipes *and* acknowledged the spawn request, so
-            // startup is complete. At that point the transport pipes become the only lifetime
-            // anchor we need to keep the session alive.
-            CloseHandle(pi.hProcess);
-        }
-    }
-
-    Ok(transport)
+    restore_blocking_pipe(&pipe_write)?;
+    restore_blocking_pipe(&pipe_read)?;
+    Ok(RunnerTransport { pipe_write, pipe_read, runner })
 }
 
+#[cfg(test)]
 struct StartupReader {
     pipe: File,
     cancelled: Arc<AtomicBool>,
 }
 
+#[cfg(test)]
 impl Read for StartupReader {
     fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
         if self.cancelled.load(Ordering::Acquire) {
@@ -490,6 +423,7 @@ impl Read for StartupReader {
     }
 }
 
+#[cfg(test)]
 fn read_frame_with_timeout(pipe_read: &File, timeout: Duration) -> Result<Option<FramedMessage>> {
     let cancelled = Arc::new(AtomicBool::new(false));
     let mut reader = StartupReader {

@@ -303,7 +303,6 @@ async fn config_summary_entries_include_runtime_workspace_roots() {
         cwd,
         reasoning_effort: Some(codex_protocol::openai_models::ReasoningEffort::High),
         initial_messages: None,
-        network_proxy: None,
         rollout_path: None,
     };
 

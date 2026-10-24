@@ -8,7 +8,6 @@ use crate::tools::shell_output_summary::ShellOutputSummaryOptions;
 #[cfg(test)]
 use crate::tools::shell_output_summary::summarize_shell_output_for_model;
 use crate::tools::shell_output_summary::summarize_shell_output_for_model_with_streams;
-use crate::tools::tool_dispatch_trace::ToolDispatchTrace;
 use crate::turn_diff_tracker::TurnDiffTracker;
 use codex_code_mode::CancellationCause;
 use codex_protocol::mcp::CallToolResult;
@@ -32,6 +31,9 @@ use codex_tools::ToolOutputSkipDisposition;
 use codex_tools::code_mode_tool_search_result;
 use codex_tools::sanitize_original_image_detail;
 use codex_tools::telemetry_preview;
+use codex_tools::telemetry_preview_body;
+use codex_tools::telemetry_preview_json;
+use codex_tools::telemetry_preview_text_parts;
 use codex_utils_output_truncation::OutputLimitResolution;
 use codex_utils_output_truncation::OutputOutcome;
 use codex_utils_output_truncation::TruncationPolicy;
@@ -153,7 +155,6 @@ impl ToolEffectRecovery {
 pub(crate) struct ToolDispatchState {
     state: AtomicU8,
     handler_started: AtomicBool,
-    trace: std::sync::OnceLock<ToolDispatchTrace>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -164,6 +165,7 @@ enum ToolDispatchPhase {
     Completed = 2,
     AbortedBeforeAdmission = 3,
     AbortedAfterAdmission = 4,
+    AccountingUnconfirmed = 5,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -178,27 +180,6 @@ impl ToolDispatchState {
         Self {
             state: AtomicU8::new(ToolDispatchPhase::WaitingForAdmission as u8),
             handler_started: AtomicBool::new(false),
-            trace: std::sync::OnceLock::new(),
-        }
-    }
-
-    #[expect(
-        clippy::expect_used,
-        reason = "Each dispatch must attach exactly one trace; a duplicate is a programming error"
-    )]
-    pub(crate) fn attach_trace(&self, trace: ToolDispatchTrace) {
-        self.trace.set(trace).expect("one trace per dispatch");
-    }
-
-    pub(crate) async fn record_cancelled_trace(&self) {
-        if let Some(trace) = self.trace.get() {
-            trace.record_cancelled().await;
-        }
-    }
-
-    pub(crate) async fn record_failed_trace(&self, error: &crate::FunctionCallError) {
-        if let Some(trace) = self.trace.get() {
-            trace.record_failed(error).await;
         }
     }
 
@@ -222,6 +203,24 @@ impl ToolDispatchState {
                 Ordering::Acquire,
             )
             .is_ok()
+    }
+
+    /// The handler settled, but required accounting did not confirm completion.
+    /// This is terminal for cancellation without claiming ordinary completion.
+    pub(crate) fn try_accounting_unconfirmed(&self) -> bool {
+        self.state
+            .compare_exchange(
+                ToolDispatchPhase::Admitted as u8,
+                ToolDispatchPhase::AccountingUnconfirmed as u8,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn accounting_is_unconfirmed(&self) -> bool {
+        self.state.load(Ordering::Acquire) == ToolDispatchPhase::AccountingUnconfirmed as u8
     }
 
     pub(crate) fn try_abort(&self) -> ToolDispatchAbort {
@@ -260,6 +259,7 @@ impl ToolDispatchState {
         matches!(
             self.state.load(Ordering::Acquire),
             value if value == ToolDispatchPhase::Completed as u8
+                || value == ToolDispatchPhase::AccountingUnconfirmed as u8
                 || value == ToolDispatchPhase::AbortedBeforeAdmission as u8
                 || value == ToolDispatchPhase::AbortedAfterAdmission as u8
         )
@@ -300,7 +300,7 @@ pub enum ToolCallSource {
         /// Read only when reporting a cancelled call, so a runtime deadline, a
         /// turn shutdown, and a user interrupt stay distinguishable instead of
         /// all reading as "aborted by user".
-        cancellation_cause: Option<Arc<OnceLock<CancellationCause>>>,
+        cancellation_cause: Option<Arc<codex_code_mode::CancellationCauseCell>>,
     },
 }
 
@@ -375,11 +375,10 @@ struct McpToolOutputProjections {
 impl ToolOutput for McpToolOutput {
     fn log_preview(&self) -> String {
         let payload = self.provider_payload();
-        let preview = payload.body.to_text().unwrap_or_else(|| {
-            serde_json::to_string(&self.result.content)
+        telemetry_preview_body(&payload.body).unwrap_or_else(|| {
+            telemetry_preview_json(&self.result.content)
                 .unwrap_or_else(|err| format!("failed to serialize mcp result: {err}"))
-        });
-        telemetry_preview(&preview)
+        })
     }
 
     fn success_for_logging(&self) -> bool {
@@ -629,9 +628,8 @@ pub struct ToolSearchOutput {
 
 impl ToolOutput for ToolSearchOutput {
     fn log_preview(&self) -> String {
-        let tools = serde_json::to_string(&self.tools)
-            .unwrap_or_else(|err| format!("failed to serialize tool_search output: {err}"));
-        telemetry_preview(&tools)
+        telemetry_preview_json(&self.tools)
+            .unwrap_or_else(|err| format!("failed to serialize tool_search output: {err}"))
     }
 
     fn success_for_logging(&self) -> bool {
@@ -792,31 +790,13 @@ impl FunctionToolOutput {
 }
 
 impl ToolOutput for FunctionToolOutput {
-    /// Trace results are built from `body` alone, as a response item or its
-    /// code-mode string. Bound the raw item bytes plus generous per-item
-    /// framing; the trace caller applies worst-case JSON escaping.
-    fn trace_detail_size_bound(&self, limit: usize) -> Option<usize> {
-        let mut size = 128_usize;
-        for item in &self.body {
-            let bytes = match item {
-                FunctionCallOutputContentItem::InputText { text } => text.len(),
-                FunctionCallOutputContentItem::InputImage { image_url, .. } => image_url.len(),
-                FunctionCallOutputContentItem::EncryptedContent { encrypted_content } => {
-                    encrypted_content.len()
-                }
-            };
-            size = size.checked_add(bytes)?.checked_add(64)?;
-            if size > limit {
-                return None;
-            }
-        }
-        Some(size)
-    }
 
     fn log_preview(&self) -> String {
-        telemetry_preview(
-            &function_call_output_content_items_to_text(&self.body).unwrap_or_default(),
-        )
+        telemetry_preview_text_parts(self.body.iter().filter_map(|item| match item {
+            FunctionCallOutputContentItem::InputText { text } => Some(text.as_str()),
+            _ => None,
+        }))
+        .unwrap_or_default()
     }
 
     fn success_for_logging(&self) -> bool {
@@ -959,8 +939,7 @@ pub struct ApplyPatchToolOutput {
     pub environment_id: Option<String>,
     pub retry: Option<JsonValue>,
     pub diagnostics: Vec<JsonValue>,
-    /// Other sessions running a turn in this checkout that edited these files.
-    pub concurrent_sessions: Option<String>,
+
 }
 
 /// Text-only projections carry the retry receipt inline. The structured result
@@ -1118,7 +1097,7 @@ impl ApplyPatchToolOutput {
             environment_id,
             retry: None,
             diagnostics,
-            concurrent_sessions: None,
+
         }
     }
 
@@ -1127,10 +1106,7 @@ impl ApplyPatchToolOutput {
         self
     }
 
-    pub(crate) fn with_concurrent_sessions(mut self, note: Option<String>) -> Self {
-        self.concurrent_sessions = note;
-        self
-    }
+
 
     pub(crate) fn with_patch_mismatch(
         mut self,
@@ -1187,10 +1163,7 @@ impl ApplyPatchToolOutput {
                 "\nchanges_exact=false: the committed change inventory is incomplete or uncertain.",
             );
         }
-        if let Some(note) = &self.concurrent_sessions {
-            text.push('\n');
-            text.push_str(note);
-        }
+
         if !self.changes.is_empty() {
             text.push_str("\nApplied changes (unified hunk +ranges are post-edit line numbers): ");
             let changes = self
@@ -1226,9 +1199,7 @@ impl ApplyPatchToolOutput {
         if let Some(retry) = &self.retry {
             result["retry"] = retry.clone();
         }
-        if let Some(note) = &self.concurrent_sessions {
-            result["concurrent_sessions"] = note.clone().into();
-        }
+
         result
     }
 }
@@ -1309,11 +1280,21 @@ impl ToolOutput for ApplyPatchToolOutput {
 
 pub struct AbortedToolOutput {
     pub message: String,
+    pub recovery: Option<JsonValue>,
+}
+
+impl AbortedToolOutput {
+    fn rendered(&self) -> String {
+        match &self.recovery {
+            Some(recovery) => format!("{}\n{recovery}", self.message),
+            None => self.message.clone(),
+        }
+    }
 }
 
 impl ToolOutput for AbortedToolOutput {
     fn log_preview(&self) -> String {
-        telemetry_preview(&self.message)
+        telemetry_preview(&self.rendered())
     }
 
     fn success_for_logging(&self) -> bool {
@@ -1326,10 +1307,16 @@ impl ToolOutput for AbortedToolOutput {
             diagnostic_class: ToolOutputDiagnosticClass::Normal,
             fragments: vec![ToolOutputProjectionFragment::new(
                 ToolOutputProjectionFragmentKind::ErrorOrDiagnostic,
-                self.message.clone(),
+                self.rendered(),
             )],
-            spillable_text: vec![self.message.clone()],
-            essential_inline: serde_json::json!({ "state": "aborted" }),
+            spillable_text: vec![self.rendered()],
+            essential_inline: {
+                let mut essential = serde_json::json!({ "state": "aborted" });
+                if let Some(recovery) = &self.recovery {
+                    essential["cancellation_recovery"] = recovery.clone();
+                }
+                essential
+            },
             requested_limit: None,
             predetermined_ranges: Vec::new(),
             predetermined_json_pointers: Vec::new(),
@@ -1353,7 +1340,7 @@ impl ToolOutput for AbortedToolOutput {
                 call_id,
                 payload,
                 vec![FunctionCallOutputContentItem::InputText {
-                    text: self.message.clone(),
+                    text: self.rendered(),
                 }],
                 /*success*/ None,
             ),
@@ -1365,10 +1352,13 @@ impl ToolOutput for AbortedToolOutput {
             ToolPayload::ToolSearch { .. } => {
                 code_mode_tool_search_result(CodeModeToolSearchStatus::Aborted, Vec::new(), None)
             }
-            _ => serde_json::json!({
-                "status": "aborted",
-                "message": self.message,
-            }),
+            _ => {
+                let mut result = serde_json::json!({ "status": "aborted", "message": self.message });
+                if let Some(recovery) = &self.recovery {
+                    result["cancellation_recovery"] = recovery.clone();
+                }
+                result
+            }
         }
     }
 }
@@ -1437,71 +1427,6 @@ pub struct ExecCommandToolOutput {
 }
 
 /// A validated negative-search receipt, not a newly executed process or retained streams.
-pub(crate) struct CachedExecSearchMiss {
-    notice: String,
-    evidence: Option<crate::tools::command_execution::RetainedSearchMiss>,
-}
-
-impl CachedExecSearchMiss {
-    pub(crate) fn with_evidence(
-        mut self,
-        evidence: crate::tools::command_execution::RetainedSearchMiss,
-    ) -> Self {
-        self.evidence = Some(evidence);
-        self
-    }
-}
-
-impl ToolOutput for CachedExecSearchMiss {
-    fn log_preview(&self) -> String {
-        self.notice.clone()
-    }
-
-    fn success_for_logging(&self) -> bool {
-        true
-    }
-
-    fn canonical_result(&self, _payload: &ToolPayload) -> Option<CanonicalToolResult> {
-        Some(CanonicalToolResult::text(self.notice.clone()))
-    }
-
-    fn projection_metadata(&self) -> Option<ToolOutputProjectionMetadata> {
-        FunctionToolOutput::from_text(self.notice.clone(), Some(true)).projection_metadata()
-    }
-
-    fn to_response_item(&self, call_id: &str, payload: &ToolPayload) -> ResponseInputItem {
-        FunctionToolOutput::from_text(self.notice.clone(), Some(true))
-            .to_response_item(call_id, payload)
-    }
-
-    fn code_mode_result(&self, _payload: &ToolPayload) -> JsonValue {
-        if let Some(evidence) = &self.evidence {
-            return serde_json::json!({
-                "output": self.notice, "exit_code": 1, "execution_state": "exited",
-                "process_exited": true, "search_no_match": true, "execution_suppressed": true,
-                "executed": false, "reused": true, "retained_search_miss_version": 1,
-                "evidence_id": evidence.evidence_id, "original_execution_id": evidence.original_execution_id,
-                "validity_scope_fingerprint": evidence.validity_scope_fingerprint,
-                "stdout": evidence.stdout, "stderr": evidence.stderr,
-                "streams_complete": true, "output_complete": true,
-                "output_reduced": false, "raw_output_artifact_retention_limit_hit": false,
-            });
-        }
-        serde_json::json!({
-            "output": self.notice,
-            "exit_code": 1,
-            "execution_state": "exited",
-            "process_exited": true,
-            "search_no_match": true,
-            "execution_suppressed": true,
-            "streams_complete": false,
-            "output_complete": false,
-            "output_reduced": false,
-            "raw_output_artifact_retention_limit_hit": false,
-        })
-    }
-}
-
 impl ToolOutput for ExecCommandToolOutput {
     fn code_mode_failure_is_error(&self) -> bool {
         false
@@ -2290,261 +2215,6 @@ pub(crate) fn declared_validation_metadata(
     })
 }
 
-/// Only a repository-declared producer's typed completed-test ledger can establish test
-/// execution. Plain command output, build success, and zero-test summaries do
-/// not become proof. Compound/wrapper commands remain conservatively unproven.
-fn runner_execution_receipt(raw_output: &[u8], trusted_runner: Option<&str>) -> Option<JsonValue> {
-    runner_execution_receipt_from(raw_output, trusted_runner, true)
-}
-
-/// Display compaction rewrites inline receipt lines only; it never resolves a
-/// retained reference.
-fn inline_runner_execution_receipt(
-    raw_output: &[u8],
-    trusted_runner: Option<&str>,
-) -> Option<JsonValue> {
-    runner_execution_receipt_from(raw_output, trusted_runner, false)
-}
-
-/// Receipts too large for bounded command-output retention are kept beside the
-/// runner logs and published as one hash-bound reference line. The reference
-/// only locates bytes: they must match its size and digest, then pass the same
-/// validation as an inline receipt.
-fn retained_runner_execution_receipt(text: &str, runner: &str) -> Option<JsonValue> {
-    use std::io::Read as _;
-    const RETAINED_RECEIPT_MAX_BYTES: u64 = 32 * 1024 * 1024;
-    let mut references = retained_receipt_references(text);
-    let reference = references.next()?;
-    if references.next().is_some() || reference["runner"] != runner {
-        return None;
-    }
-    let path = std::path::Path::new(reference["path"].as_str()?);
-    let bytes = reference["bytes"].as_u64()?;
-    let digest = reference["sha256"].as_str()?;
-    if !path.is_absolute()
-        || bytes > RETAINED_RECEIPT_MAX_BYTES
-        || path.parent()?.file_name()? != "test-runner-logs"
-        || !path.file_name()?.to_str()?.starts_with("execution-receipt-")
-    {
-        return None;
-    }
-    let mut retained = Vec::new();
-    std::fs::File::open(path)
-        .ok()?
-        .take(bytes.checked_add(1)?)
-        .read_to_end(&mut retained)
-        .ok()?;
-    if retained.len() as u64 != bytes
-        || crate::tool_history::sha256(&retained) != digest.to_ascii_lowercase()
-    {
-        return None;
-    }
-    serde_json::from_slice::<JsonValue>(&retained).ok()
-}
-
-fn retained_receipt_references(text: &str) -> impl Iterator<Item = JsonValue> + '_ {
-    text.lines()
-        .filter(|line| line.len() <= 64 * 1024)
-        .filter_map(|line| serde_json::from_str::<JsonValue>(line).ok())
-        .filter(|value| value["kind"] == "codex_test_execution_ref_v1")
-}
-
-fn runner_execution_receipt_from(
-    raw_output: &[u8],
-    trusted_runner: Option<&str>,
-    resolve_retained: bool,
-) -> Option<JsonValue> {
-    let runner = trusted_runner.filter(|runner| !runner.is_empty())?;
-    let text = std::str::from_utf8(raw_output).ok()?;
-    let mut receipts = text
-        .lines()
-        .filter_map(|line| serde_json::from_str::<JsonValue>(line).ok())
-        .filter(|value| value["kind"] == "codex_test_execution_v1");
-    let inline = receipts.next();
-    let duplicate = receipts.next().is_some();
-    // One publication form per run: an inline receipt beside a reference is
-    // ambiguous, not two proofs.
-    let referenced = resolve_retained && retained_receipt_references(text).next().is_some();
-    let receipt = match inline {
-        Some(receipt) if !duplicate && !referenced => receipt,
-        None if resolve_retained => retained_runner_execution_receipt(text, runner)?,
-        _ => return None,
-    };
-    if receipt["kind"] != "codex_test_execution_v1"
-        || receipt["runner"] != runner
-        || !matches!(receipt["exit_code"].as_i64(), Some(0 | 2))
-        || receipt["selected_targets"].as_array()?.is_empty()
-        || receipt["selected_targets"]
-            .as_array()?
-            .iter()
-            .any(|target| target.as_str().is_none_or(str::is_empty))
-        || !receipt["runner_input_fingerprint"]
-            .as_str()?
-            .bytes()
-            .all(|byte| byte.is_ascii_hexdigit())
-        || receipt["runner_input_fingerprint"].as_str()?.len() != 64
-    {
-        return None;
-    }
-    let mut executed = 0_u64;
-    if let Some(manifest) = receipt.get("dependency_manifest") {
-        // The instrumented runner records provenance, not hermeticity. Keep
-        // the complete declaration with its receipt, but never let an opaque
-        // script authorize replay or narrower freshness from its own claims.
-        if manifest["version"] != 1
-            || manifest["producer"] != runner
-            || manifest["captured"] != "before_execution"
-            || manifest["coverage"] != "declared_not_exhaustive"
-            || manifest["automatic_replay_allowed"] != false
-            || manifest["file_inputs"].as_array()?.len() > 256
-            || manifest["source_roots"].as_array()?.len() > 256
-            || manifest["execution_context_sha256"].as_str()?.len() != 64
-            || !manifest["execution_context_sha256"]
-                .as_str()?
-                .bytes()
-                .all(|byte| byte.is_ascii_hexdigit())
-            || manifest["unresolved_dependencies"].as_array()?.is_empty()
-        {
-            return None;
-        }
-    }
-    for tests in receipt["completed_tests"].as_object()?.values() {
-        let tests = tests.as_array()?;
-        let names = tests
-            .iter()
-            .map(JsonValue::as_str)
-            .collect::<Option<std::collections::BTreeSet<_>>>()?;
-        if names.len() != tests.len() || names.iter().any(|name| name.is_empty()) {
-            return None;
-        }
-        executed = executed.checked_add(tests.len() as u64)?;
-    }
-    if let Some(identities) = receipt.get("executions") {
-        let identities = crate::validation::runner_test_identities(identities)?;
-        let mut projection =
-            std::collections::BTreeMap::<&str, std::collections::BTreeSet<&str>>::new();
-        for identity in &identities {
-            projection
-                .entry(&identity.binary)
-                .or_default()
-                .insert(&identity.test);
-        }
-        if serde_json::to_value(projection).ok()? != receipt["completed_tests"] {
-            return None;
-        }
-        if !receipt["required_executions"].is_null() {
-            let required =
-                crate::validation::runner_test_identities(&receipt["required_executions"])?;
-            if !identities.is_subset(&required)
-                || (receipt["exit_code"] == 0 && identities != required)
-            {
-                return None;
-            }
-        }
-        executed = identities.len() as u64;
-    } else if receipt["exit_code"] != 0 {
-        // Legacy success projections cannot establish partial-failure identity.
-        return None;
-    }
-    ((executed > 0 || receipt["exit_code"] == 2)
-        && receipt["executed_tests"].as_u64() == Some(executed))
-    .then_some(receipt)
-}
-
-/// A declared producer can attest historical body execution without pretending
-/// its authored-test hashes bind all source inputs. Keep this separate from
-/// reusable Rust receipts and their source-freshness reconciliation.
-fn producer_test_execution_observation(
-    raw_output: &[u8],
-    trusted_runner: Option<&str>,
-) -> Option<JsonValue> {
-    if trusted_runner != Some("root_maintenance.unittest") {
-        return None;
-    }
-    let report = std::str::from_utf8(raw_output)
-        .ok()?
-        .lines()
-        .rev()
-        .map(str::trim)
-        .find(|line| {
-            !line.is_empty()
-                && !serde_json::from_str::<JsonValue>(line)
-                    .ok()
-                    .is_some_and(|value| {
-                        matches!(
-                            value["kind"].as_str(),
-                            Some("codex_validation_metrics_v1" | "codex_validation_metrics_ref_v1")
-                        )
-                    })
-        })?;
-    let report = serde_json::from_str::<JsonValue>(report).ok()?;
-    if report["runner"] != "root_maintenance.unittest" {
-        return None;
-    }
-    let executed = validation_summary_test_count(report.to_string().as_bytes())?;
-    let mut identities = Vec::new();
-    for environment in report["environments"].as_array()? {
-        let name = environment["environment"]
-            .as_str()
-            .filter(|name| !name.is_empty())?;
-        for test in environment["report"]["tests"].as_array()? {
-            if test["body_started"] == true
-                && matches!(
-                    test["outcome"].as_str(),
-                    Some("success" | "expected_failure")
-                )
-            {
-                identities.push(serde_json::json!({"environment":name, "test":test["name"]}));
-            }
-        }
-    }
-    if identities.len() as u64 != executed {
-        return None;
-    }
-    Some(serde_json::json!({
-        "kind":"producer_test_execution_observation_v1", "producer":"root_maintenance.unittest",
-        "executed_tests":executed, "executions":identities, "exit_code":0,
-        "freshness":"historical", "automatic_replay_allowed":false,
-    }))
-}
-
-fn runner_admission_pending(
-    raw_output: &[u8],
-    trusted_runner: Option<&str>,
-    exit_code: Option<i32>,
-) -> bool {
-    if !matches!(
-        trusted_runner,
-        Some("rust_test_runner" | "rust_build_status")
-    ) || exit_code != Some(75)
-        || raw_output.len() > 256 * 1024
-    {
-        return false;
-    }
-    let Ok(text) = std::str::from_utf8(raw_output) else {
-        return false;
-    };
-    let mut records = text
-        .lines()
-        .filter(|line| line.len() <= 64 * 1024)
-        .filter_map(|line| serde_json::from_str::<JsonValue>(line).ok())
-        .filter(|record| record["kind"] == "codex_rust_admission_v1");
-    let Some(record) = records.next() else {
-        return false;
-    };
-    records.next().is_none()
-        && record["status"] == "busy"
-        && record["exit_code"] == 75
-        && record["validation_status"] == "pending"
-        && record["executed"] == false
-        && record["queued"] == false
-        && record["automatic_retry"] == false
-        && record["automatic_resume"] == false
-        && record["resource"]
-            .as_str()
-            .is_some_and(|value| !value.is_empty())
-}
-
 pub(crate) fn attach_command_validation(
     signal: &mut JsonValue,
     raw_output: &[u8],
@@ -2554,25 +2224,16 @@ pub(crate) fn attach_command_validation(
 ) {
     let Some(validation) = validation else { return };
     signal["command_validation"] = validation.signal();
+    signal["command_validation"]["compile"] = serde_json::json!(validation.execution_context.as_ref()
+        .and_then(|context| context.command.split_first())
+        .is_some_and(|(program, args)| {
+            crate::validation::classify_validation_policy(
+                &crate::tools::handlers::command_shape::CommandInvocation::Argv {
+                    program: program.clone(), args: args.to_vec(),
+                },
+            ) == crate::validation::ValidationPolicyClassification::TargetedCompilation
+        }));
     if !terminal || !validation.is_validation() {
-        return;
-    }
-    if runner_admission_pending(
-        raw_output,
-        validation
-            .admission_runner
-            .as_deref()
-            .or(validation.receipt_runner.as_deref()),
-        exit_code,
-    ) {
-        signal["outcome"] = serde_json::json!("blocked");
-        signal["validation_admission_pending"] = serde_json::json!(true);
-        signal["semantic_evidence"] = serde_json::json!(
-            "Rust admission busy: requested validation did not start and is not queued."
-        );
-        if let Some(signal) = signal.as_object_mut() {
-            signal.remove("failure_signature");
-        }
         return;
     }
     let failed = exit_code != Some(0);
@@ -2586,22 +2247,6 @@ pub(crate) fn attach_command_validation(
         validation_diagnostic_evidence(raw_output)
     };
     signal["semantic_evidence"] = serde_json::json!(evidence);
-    if validation.is_test()
-        && let Some(receipt) =
-            runner_execution_receipt(raw_output, validation.receipt_runner.as_deref())
-        && receipt["exit_code"].as_i64() == exit_code.map(i64::from)
-    {
-        // Partial passing identities survive failure, but do not turn it into success.
-        signal["runner_execution_receipt"] = receipt;
-    }
-    if validation.is_test()
-        && !failed
-        && validation.signal()["proof"] == true
-        && let Some(observation) =
-            producer_test_execution_observation(raw_output, validation.receipt_runner.as_deref())
-    {
-        signal["test_execution_observation"] = observation;
-    }
     if failed {
         signal["failure_signature"] =
             serde_json::json!(command_failure_signature(&evidence, exit_code));
@@ -2609,245 +2254,12 @@ pub(crate) fn attach_command_validation(
         if let Some(lineage) = declared_lineage_evidence(raw_output) {
             signal["declared_lineage"] = lineage;
         }
-        // Summary counts only attribute this successful command to paths. They
-        // are not execution receipts and must never authorize replay or proof.
-        if validation.is_test()
-            && validation.signal()["proof"] == true
-            && let Some(count) = validation_summary_test_count(raw_output)
-        {
-            signal["validation_summary_tests"] = serde_json::json!(count);
-        }
     }
 }
 
-fn validation_summary_test_count(raw_output: &[u8]) -> Option<u64> {
-    use std::sync::LazyLock;
-    #[expect(
-        clippy::expect_used,
-        reason = "the regex is a fixed source literal, not runtime input"
-    )]
-    static CARGO: LazyLock<regex_lite::Regex> = LazyLock::new(|| {
-        regex_lite::Regex::new(r"^test result: ok\. ([0-9]+) passed; 0 failed; .*; finished in .+$")
-            .expect("valid cargo summary regex")
-    });
-    #[expect(
-        clippy::expect_used,
-        reason = "the regex is a fixed source literal, not runtime input"
-    )]
-    static UNITTEST: LazyLock<regex_lite::Regex> = LazyLock::new(|| {
-        regex_lite::Regex::new(r"^Ran ([0-9]+) tests? in .+$")
-            .expect("valid unittest summary regex")
-    });
-    #[expect(clippy::expect_used, reason = "fixed source literal")]
-    static NEXTEST: LazyLock<regex_lite::Regex> = LazyLock::new(|| {
-        regex_lite::Regex::new(
-            r"^Summary\s+\[[^]]+\]\s+([0-9]+) tests? run: ([0-9]+) passed(?:, [0-9]+ skipped)?$",
-        )
-        .expect("valid nextest summary regex")
-    });
-    #[expect(clippy::expect_used, reason = "fixed source literal")]
-    static SELECTION: LazyLock<regex_lite::Regex> = LazyLock::new(|| {
-        regex_lite::Regex::new(
-            r"^Selection \([^)]+\): ([0-9]+) test\(s\); started=([0-9]+); unrun=0; complete=True; successful=True$",
-        ).expect("valid maintenance selection regex")
-    });
-    #[expect(
-        clippy::expect_used,
-        reason = "the regex is a fixed source literal, not runtime input"
-    )]
-    static PYTEST: LazyLock<regex_lite::Regex> = LazyLock::new(|| {
-        regex_lite::Regex::new(
-        r"^=*[ ]*([0-9]+) passed(?:, [0-9]+ (?:skipped|deselected|xfailed|xpassed|warnings?))* in .+?(?:[ ]*=*)$").expect("valid pytest summary regex")
-    });
-    let text = std::str::from_utf8(raw_output).ok()?;
-    let mut lines = text.lines().map(strip_ansi_sequences).collect::<Vec<_>>();
-    // Managed launchers append metrics after the child terminates. These
-    // trailers are not test proof; ignore only their known JSON framing here.
-    while let Some(last) = lines.last() {
-        let trimmed = last.trim();
-        let metrics = serde_json::from_str::<JsonValue>(trimmed)
-            .ok()
-            .is_some_and(|value| {
-                matches!(
-                    value["kind"].as_str(),
-                    Some("codex_validation_metrics_v1" | "codex_validation_metrics_ref_v1")
-                )
-            });
-        if trimmed.is_empty() || metrics {
-            lines.pop();
-        } else {
-            break;
-        }
-    }
-    let last = lines
-        .iter()
-        .rev()
-        .find(|line| !line.trim().is_empty())?
-        .trim();
-    let count = if let Some(summary) = NEXTEST.captures(last) {
-        let run = summary[1].parse::<u64>().ok()?;
-        (run == summary[2].parse::<u64>().ok()?).then_some(run)?
-    } else if SELECTION.is_match(last) {
-        // Human maintenance output is a sequence of complete environment
-        // summaries. Require matching unittest terminals, excluding skips.
-        let selections = lines
-            .iter()
-            .rev()
-            .take_while(|line| SELECTION.is_match(line.trim()))
-            .filter_map(|line| SELECTION.captures(line.trim()))
-            .map(|captures| {
-                let selected = captures[1].parse::<u64>().ok()?;
-                (selected > 0 && selected == captures[2].parse::<u64>().ok()?).then_some(selected)
-            })
-            .collect::<Option<Vec<_>>>()?;
-        let mut terminals = Vec::new();
-        for (index, line) in lines.iter().enumerate() {
-            if let Some(captures) = UNITTEST.captures(line.trim()) {
-                let terminal = lines[index + 1..]
-                    .iter()
-                    .find(|line| !line.trim().is_empty())?
-                    .trim();
-                let run = captures[1].parse::<u64>().ok()?;
-                let skipped = if terminal == "OK" {
-                    0
-                } else {
-                    terminal
-                        .strip_prefix("OK (skipped=")?
-                        .strip_suffix(')')?
-                        .parse::<u64>()
-                        .ok()?
-                };
-                terminals.push((run, run.checked_sub(skipped)?));
-            }
-        }
-        if terminals.len() != selections.len()
-            || terminals.iter().rev().map(|(run, _)| *run).ne(selections)
-        {
-            return None;
-        }
-        terminals
-            .iter()
-            .try_fold(0_u64, |total, (_, run)| total.checked_add(*run))?
-    } else if let Ok(report) = serde_json::from_str::<JsonValue>(last)
-        && report["runner"] == "root_maintenance.unittest"
-    {
-        if report["schema_version"] != 1
-            || report["complete"] != true
-            || report["successful"] != true
-            || !report["errors"].as_array()?.is_empty()
-            || report["reusable_validation_receipt"] != false
-        {
-            return None;
-        }
-        let mut names = std::collections::BTreeSet::new();
-        let mut total = 0_u64;
-        let mut executed = 0_u64;
-        for environment in report["environments"].as_array()? {
-            let worker = &environment["report"];
-            if environment["exit_code"] != 0
-                || worker["complete"] != true
-                || worker["successful"] != true
-                || !worker["errors"].as_array()?.is_empty()
-                || !worker["selection"]["unrun"].as_array()?.is_empty()
-                || !worker["selection"]["duplicates"].as_array()?.is_empty()
-            {
-                return None;
-            }
-            let selected = worker["selection"]["names"].as_array()?;
-            let tests = worker["tests"].as_array()?;
-            let expected = selected
-                .iter()
-                .map(JsonValue::as_str)
-                .collect::<Option<std::collections::BTreeSet<_>>>()?;
-            if tests.len() != selected.len()
-                || expected.len() != selected.len()
-                || worker["tests_run"].as_u64()? != tests.len() as u64
-                || worker["selection"]["selected_count"].as_u64()? != tests.len() as u64
-            {
-                return None;
-            }
-            for test in tests {
-                let name = test["name"].as_str()?;
-                if name.is_empty()
-                    || !expected.contains(name)
-                    || !names.insert(name)
-                    || test["started"] != true
-                {
-                    return None;
-                }
-                if test["body_started"] == true
-                    && matches!(
-                        test["outcome"].as_str(),
-                        Some("success" | "expected_failure")
-                    )
-                {
-                    executed = executed.checked_add(1)?;
-                } else if test["outcome"] != "skipped" {
-                    return None;
-                }
-            }
-            total = total.checked_add(tests.len() as u64)?;
-        }
-        if report["tests_run"].as_u64()? != total {
-            return None;
-        }
-        executed
-    } else if CARGO.is_match(last) {
-        lines
-            .iter()
-            .filter_map(|line| CARGO.captures(line.trim()))
-            .try_fold(0_u64, |total, captures| {
-                total.checked_add(captures[1].parse::<u64>().ok()?)
-            })?
-    } else if last == "OK" || last.starts_with("OK (skipped=") {
-        let count = lines
-            .iter()
-            .rev()
-            .find_map(|line| UNITTEST.captures(line.trim()))?[1]
-            .parse::<u64>()
-            .ok()?;
-        let skipped = last
-            .strip_prefix("OK (skipped=")
-            .and_then(|s| s.strip_suffix(')'))
-            .map(str::parse::<u64>)
-            .transpose()
-            .ok()?
-            .unwrap_or(0);
-        count.checked_sub(skipped)?
-    } else if last
-        .strip_prefix("ℹ ")
-        .or_else(|| last.strip_prefix("# "))
-        .is_some_and(|rest| rest.starts_with("duration_ms "))
-    {
-        // node:test (spec `ℹ` or TAP `#`) prints its totals last.
-        let field = |name: &str| {
-            lines.iter().rev().find_map(|line| {
-                let line = line.trim();
-                line.strip_prefix("ℹ ")
-                    .or_else(|| line.strip_prefix("# "))?
-                    .strip_prefix(name)?
-                    .strip_prefix(' ')?
-                    .parse::<u64>()
-                    .ok()
-            })
-        };
-        if field("fail")? != 0 {
-            return None;
-        }
-        field("pass")?
-    } else {
-        PYTEST.captures(last)?[1].parse().ok()?
-    };
-    (count > 0).then_some(count)
-}
+
 
 impl ExecCommandToolOutput {
-    pub(crate) fn cached_search_miss(notice: String) -> CachedExecSearchMiss {
-        CachedExecSearchMiss {
-            notice,
-            evidence: None,
-        }
-    }
 
     fn missing_output_selector(
         &self,
@@ -2858,6 +2270,18 @@ impl ExecCommandToolOutput {
         artifact_bytes: Option<u64>,
     ) -> Option<JsonValue> {
         let retained = artifact_bytes?;
+        if self.raw_output_artifact.as_ref().is_some_and(RawOutputArtifact::is_plain_command_log) {
+            if retained == self.raw_output.len() as u64 {
+                if let Some((start, end)) = marked_lines.or_else(||
+                    codex_utils_output_truncation::first_omitted_line_range(raw_output, output)) {
+                    return Some(serde_json::json!({"kind":"lines","start":start,"end":end}));
+                }
+            }
+            // Poll byte offsets do not establish whole-log line numbers.
+            // Offer a plain first page rather than inventing coordinates.
+            return (raw_output != output || self.output_ranges.as_ref().is_some_and(|r| r.gap.is_some()))
+                .then(|| serde_json::json!({"kind":"lines","start":1,"end":200}));
+        }
         if self.raw_output.is_empty() {
             return None;
         }
@@ -3219,46 +2643,6 @@ impl ExecCommandToolOutput {
                         .retained_bytes()
                         .is_some_and(|bytes| bytes >= raw_output.len() as u64)
             });
-        if compact_validation
-            && raw_output.len() > 2_048
-            && let Some(mut receipt) = inline_runner_execution_receipt(
-                raw_output.as_bytes(),
-                self.validation
-                    .as_ref()
-                    .and_then(|validation| validation.receipt_runner.as_deref()),
-            )
-            && receipt["completed_tests"].to_string().len() > 2_048
-        {
-            let groups = receipt["completed_tests"].as_object()?.len();
-            receipt["kind"] = serde_json::json!("codex_test_execution_summary_v1");
-            receipt["completed_tests"] = serde_json::json!({
-                "groups": groups,
-                "tests": receipt["executed_tests"],
-                "detail": "exact test names retained in raw output; this display is not an execution receipt",
-            });
-            if let Some(object) = receipt.as_object_mut() {
-                object.remove("executions");
-                object.remove("required_executions");
-                object.remove("satisfied_gates");
-            }
-            let compact = receipt.to_string();
-            return Some(
-                raw_output
-                    .lines()
-                    .map(|line| {
-                        if serde_json::from_str::<JsonValue>(line)
-                            .ok()
-                            .is_some_and(|value| value["kind"] == "codex_test_execution_v1")
-                        {
-                            compact.as_str()
-                        } else {
-                            line
-                        }
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n"),
-            );
-        }
         if !compact_validation && codex_utils_string::approx_token_count(raw_output) <= token_limit
         {
             return None;

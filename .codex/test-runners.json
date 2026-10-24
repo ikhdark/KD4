@@ -2,146 +2,175 @@
   "version": 1,
   "runners": [
     {
-      "programs": ["python", "python3", "py"],
-      "prefixes": [["scripts/maintenance/root_maintenance.py", "test-python"]],
-      "options": {"-B": 0, "-u": 0},
-      "allow_extra_args": true,
-      "operations": ["test"],
-      "receipt_runner": "root_maintenance.unittest"
-    },
-    {
-      "programs": ["node"],
-      "prefixes": [["scripts/maintenance/run-python.js", "scripts/maintenance/root_maintenance.py", "test-python"]],
-      "allow_extra_args": true,
-      "operations": ["test"],
-      "receipt_runner": "root_maintenance.unittest"
-    },
-    {
-      "programs": ["python", "python3", "py"],
-      "prefixes": [["scripts/build/rust_build_status.py", "run-lane"]],
-      "options": {"-I": 0, "-B": 0, "-u": 0},
+      "programs": [
+        "python",
+        "python3",
+        "py"
+      ],
+      "prefixes": [
+        [
+          "scripts/build/rust_build_status.py",
+          "run-lane"
+        ]
+      ],
+      "options": {
+        "-I": 0,
+        "-B": 0,
+        "-u": 0
+      },
       "allow_extra_args": true,
       "passthrough_after": "--",
       "admission_runner": "rust_build_status"
     },
     {
-      "programs": ["python", "python3", "py"],
-      "prefixes": [
-        ["scripts/build/rust_test_runner.py", "run-target"],
-        ["scripts/build/rust_test_runner.py", "run-gate"]
+      "programs": [
+        "just"
       ],
-      "options": {"-I": 0, "-B": 0, "-u": 0, "--manifest": 1, "--target-dir": 1, "--profile": 1, "--cargo-profile": 1, "--admission-timeout-seconds": 1},
-      "allow_extra_args": true,
-      "operations": ["test"],
-      "receipt_runner": "rust_test_runner"
-    },
-    {
-      "programs": ["just"],
-      "just_numeric_variables": ["rust_validation_wait_seconds"],
       "prefixes": [
-        ["core-test"], ["core-test-fast"], ["core-test-small"], ["core-test-lane"],
-        ["core-gate"]
-      ],
-      "allow_extra_args": true,
-      "operations": ["test"],
-      "receipt_runner": "rust_test_runner"
-    },
-    {
-      "programs": ["just"],
-      "prefixes": [
-        ["test-fast"], ["test-lane"], ["test-lane-main"],
-        ["test-lane-fast"], ["test-lane-package"]
+        [
+          "test-fast"
+        ],
+        [
+          "test-lane"
+        ],
+        [
+          "test-lane-main"
+        ],
+        [
+          "test-lane-fast"
+        ],
+        [
+          "test-lane-package"
+        ]
       ],
       "allow_extra_args": true,
-      "operations": ["test"],
+      "operations": [
+        "test"
+      ],
       "admission_runner": "rust_build_status"
     },
     {
-      "programs": ["just"],
-      "prefixes": [["test-fast-nosccache"], ["validate-crate-focused"]],
+      "programs": [
+        "just"
+      ],
+      "prefixes": [
+        [
+          "test-fast-nosccache"
+        ]
+      ],
       "allow_extra_args": true,
-      "operations": ["test"]
+      "operations": [
+        "test"
+      ]
     },
     {
-      "programs": ["just"],
+      "programs": [
+        "just"
+      ],
       "prefixes": [
-        ["config-schema-protocol-check"], ["app-server-schema-protocol-check"],
-        ["test-slow-boundaries"], ["app-server-runtime-check"],
-        ["app-server-command-exec-check"],
-        ["app-server-process-exec-check"], ["app-server-thread-status-check"]
+        [
+          "hooks-schema-check"
+        ]
       ],
       "allow_extra_args": false,
-      "operations": ["test"],
-      "admission_runner": "rust_test_runner"
-    },
-    {
-      "programs": ["just"],
-      "prefixes": [["hooks-schema-check"]],
-      "allow_extra_args": false,
-      "operations": ["test"],
+      "operations": [
+        "test"
+      ],
       "admission_runner": "rust_build_status"
     },
     {
-      "programs": ["just"],
-      "prefixes": [["validate-crate"], ["validate-crate-full"]],
+      "programs": [
+        "just"
+      ],
+      "prefixes": [
+        [
+          "fmt-check"
+        ],
+        [
+          "fmt-check-fast"
+        ]
+      ],
       "allow_extra_args": true,
-      "operations": ["lint", "test"]
+      "operations": [
+        "lint"
+      ]
     },
     {
-      "programs": ["just"],
-      "prefixes": [["fmt-check"], ["fmt-check-fast"]],
+      "programs": [
+        "just"
+      ],
+      "prefixes": [
+        [
+          "clippy-lane"
+        ]
+      ],
       "allow_extra_args": true,
-      "operations": ["lint"]
-    },
-    {
-      "programs": ["just"],
-      "prefixes": [["clippy-lane"]],
-      "allow_extra_args": true,
-      "operations": ["lint"],
+      "operations": [
+        "lint"
+      ],
       "admission_runner": "rust_build_status"
     },
     {
-      "programs": ["just"],
-      "prefixes": [["check-lane"]],
+      "programs": [
+        "just"
+      ],
+      "prefixes": [
+        [
+          "check-lane"
+        ]
+      ],
       "allow_extra_args": true,
-      "operations": ["check"],
+      "operations": [
+        "check"
+      ],
       "admission_runner": "rust_build_status"
     },
     {
-      "programs": ["just"],
-      "prefixes": [["config-schema-check"]],
+      "programs": [
+        "just"
+      ],
+      "prefixes": [
+        [
+          "sdk-python-check"
+        ],
+        [
+          "sdk-ts-check"
+        ]
+      ],
       "allow_extra_args": false,
-      "operations": ["check", "test"]
+      "operations": [
+        "lint",
+        "test"
+      ]
     },
     {
-      "programs": ["just"],
-      "prefixes": [["app-server-schema-check"]],
+      "programs": [
+        "just"
+      ],
+      "prefixes": [
+        [
+          "test-compile"
+        ]
+      ],
       "allow_extra_args": true,
-      "operations": ["check", "test"]
-    },
-    {
-      "programs": ["just"],
-      "prefixes": [["sdk-python-check"], ["sdk-ts-check"]],
-      "allow_extra_args": false,
-      "operations": ["lint", "test"]
-    },
-    {
-      "programs": ["just"],
-      "prefixes": [["test-release-tooling"]],
-      "allow_extra_args": false,
-      "operations": ["test"]
-    },
-    {
-      "programs": ["just"],
-      "prefixes": [["test-compile"]],
-      "allow_extra_args": true,
-      "operations": ["check"],
+      "operations": [
+        "check"
+      ],
       "execution_mode": "compilation_only",
       "admission_runner": "rust_build_status"
     },
     {
-      "programs": ["just"],
-      "prefixes": [["cargo-lane"], ["cargo-lane-isolated-home"]],
+      "programs": [
+        "just"
+      ],
+      "prefixes": [
+        [
+          "cargo-lane"
+        ],
+        [
+          "cargo-lane-isolated-home"
+        ]
+      ],
       "allow_extra_args": true,
       "passthrough_args": 2,
       "admission_runner": "rust_build_status"

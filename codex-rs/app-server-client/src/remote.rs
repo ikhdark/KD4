@@ -67,6 +67,7 @@ use url::Url;
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const INITIALIZE_TIMEOUT: Duration = Duration::from_secs(10);
+const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 const REMOTE_APP_SERVER_MAX_WEBSOCKET_MESSAGE_SIZE: usize = 128 << 20;
 const METHOD_NOT_FOUND_ERROR_CODE: i64 = -32601;
 const INVALID_REQUEST_ERROR_CODE: i64 = -32600;
@@ -251,6 +252,30 @@ enum RemoteClientCommand {
     },
 }
 
+struct RemoteWrite {
+    // None is an ordered close, after all previously admitted frames.
+    message: Option<JSONRPCMessage>,
+    response_tx: Option<oneshot::Sender<IoResult<()>>>,
+}
+
+fn queue_remote_write(
+    writer_tx: &mpsc::Sender<RemoteWrite>,
+    message: Option<JSONRPCMessage>,
+    response_tx: Option<oneshot::Sender<IoResult<()>>>,
+) -> IoResult<()> {
+    writer_tx
+        .try_send(RemoteWrite { message, response_tx })
+        .map_err(|error| {
+            // Never await writer-queue capacity in the read coordinator. If
+            // bounded ordered ownership is exhausted, retire the connection.
+            let message = "remote app-server writer queue unavailable; connection retired";
+            if let Some(response_tx) = error.into_inner().response_tx {
+                let _ = response_tx.send(Err(IoError::new(ErrorKind::BrokenPipe, message)));
+            }
+            IoError::new(ErrorKind::BrokenPipe, message)
+        })
+}
+
 impl RemoteClientCommand {
     /// Drop requests cancelled while waiting in the bounded command channel so
     /// stale work cannot delay newer requests or reach the remote app-server.
@@ -367,6 +392,48 @@ impl RemoteAppServerClient {
             if let Some(pause) = worker_pause {
                 pause.notified().await;
             }
+            let (mut sink, mut stream) = stream.split();
+            let (writer_tx, mut writer_rx) = mpsc::channel::<RemoteWrite>(channel_capacity);
+            let writer_endpoint = endpoint.clone();
+            let mut writer_handle = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(async move {
+                while let Some(write) = writer_rx.recv().await {
+                    let close = write.message.is_none();
+                    let result = timeout(WRITE_TIMEOUT, async {
+                        if let Some(message) = write.message {
+                            let payload = serde_json::to_string(&message).map_err(IoError::other)?;
+                            sink.send(Message::Text(payload.into())).await.map_err(|error| {
+                                IoError::other(format!(
+                                    "failed to write websocket message to `{writer_endpoint}`: {error}"
+                                ))
+                            })
+                        } else {
+                            sink.close().await.or_else(|error| {
+                                if websocket_close_error_is_already_closed(&error) {
+                                    Ok(())
+                                } else {
+                                    Err(IoError::other(format!(
+                                        "failed to close websocket app server `{writer_endpoint}`: {error}"
+                                    )))
+                                }
+                            })
+                        }
+                    }).await.unwrap_or_else(|_| Err(IoError::new(
+                        ErrorKind::TimedOut,
+                        format!("remote app-server write to `{writer_endpoint}` timed out; connection retired"),
+                    )));
+                    if let Some(response_tx) = write.response_tx {
+                        let _ = response_tx.send(result.as_ref().map(|_| ()).map_err(|error| {
+                            IoError::new(error.kind(), error.to_string())
+                        }));
+                    }
+                    // A canceled/partial write is never followed by another frame.
+                    result?;
+                    if close { break; }
+                }
+                IoResult::Ok(())
+            }));
+            let mut writer_finished = false;
+            let mut closing = false;
             let mut pending_requests =
                 HashMap::<RequestId, oneshot::Sender<IoResult<RequestResult>>>::new();
             let mut pending_delivery = PendingRemoteEvents::default();
@@ -374,6 +441,16 @@ impl RemoteAppServerClient {
             let mut worker_exit_error: Option<(ErrorKind, String)> = None;
             loop {
                 tokio::select! {
+                    _ = event_tx.closed() => break,
+                    result = &mut writer_handle => {
+                        writer_finished = true;
+                        match result {
+                            Ok(Ok(())) => {}
+                            Ok(Err(error)) => worker_exit_error = Some((error.kind(), error.to_string())),
+                            Err(error) => worker_exit_error = Some((ErrorKind::BrokenPipe, format!("remote app-server writer failed: {error}"))),
+                        }
+                        break;
+                    }
                     permit = event_tx.reserve(), if !pending_delivery.is_empty() => {
                         let Ok(permit) = permit else {
                             break;
@@ -383,10 +460,17 @@ impl RemoteAppServerClient {
                         };
                         permit.send(event);
                     }
-                    command = command_rx.recv() => {
+                    // Wait for writer ownership only as a select branch, never
+                    // inside command processing where it would suspend reads.
+                    _ = writer_tx.reserve(), if !closing && writer_tx.capacity() == 0 => {}
+                    command = command_rx.recv(), if !closing && writer_tx.capacity() > 0 => {
                         let Some(command) = command else {
-                            let _ = stream.close(None).await;
-                            break;
+                            closing = true;
+                            if let Err(error) = queue_remote_write(&writer_tx, None, None) {
+                                worker_exit_error = Some((error.kind(), error.to_string()));
+                                break;
+                            }
+                            continue;
                         };
                         if command.is_abandoned_request() {
                             continue;
@@ -411,12 +495,11 @@ impl RemoteAppServerClient {
                                     continue;
                                 }
                                 pending_requests.insert(request_id.clone(), response_tx);
-                                if let Err(err) = write_jsonrpc_message(
-                                    &mut stream,
-                                    JSONRPCMessage::Request(*request),
-                                    &endpoint,
+                                if let Err(err) = queue_remote_write(
+                                    &writer_tx,
+                                    Some(JSONRPCMessage::Request(*request)),
+                                    None,
                                 )
-                                .await
                                 {
                                     let err_message = err.to_string();
                                     let message = format!(
@@ -430,18 +513,16 @@ impl RemoteAppServerClient {
                                 }
                             }
                             RemoteClientCommand::Notify { notification, response_tx } => {
-                                let result = write_jsonrpc_message(
-                                    &mut stream,
-                                    JSONRPCMessage::Notification(
+                                let result = queue_remote_write(
+                                    &writer_tx,
+                                    Some(JSONRPCMessage::Notification(
                                         jsonrpc_notification_from_client_notification(notification),
-                                    ),
-                                    &endpoint,
-                                )
-                                .await;
+                                    )),
+                                    Some(response_tx),
+                                );
                                 if let Err(err) = &result {
                                     worker_exit_error = Some((err.kind(), err.to_string()));
                                 }
-                                let _ = response_tx.send(result);
                                 if worker_exit_error.is_some() {
                                     break;
                                 }
@@ -451,19 +532,17 @@ impl RemoteAppServerClient {
                                 result,
                                 response_tx,
                             } => {
-                                let result = write_jsonrpc_message(
-                                    &mut stream,
-                                    JSONRPCMessage::Response(JSONRPCResponse {
+                                let result = queue_remote_write(
+                                    &writer_tx,
+                                    Some(JSONRPCMessage::Response(JSONRPCResponse {
                                         id: request_id,
                                         result,
-                                    }),
-                                    &endpoint,
-                                )
-                                .await;
+                                    })),
+                                    Some(response_tx),
+                                );
                                 if let Err(err) = &result {
                                     worker_exit_error = Some((err.kind(), err.to_string()));
                                 }
-                                let _ = response_tx.send(result);
                                 if worker_exit_error.is_some() {
                                     break;
                                 }
@@ -473,42 +552,34 @@ impl RemoteAppServerClient {
                                 error,
                                 response_tx,
                             } => {
-                                let result = write_jsonrpc_message(
-                                    &mut stream,
-                                    JSONRPCMessage::Error(JSONRPCError {
+                                let result = queue_remote_write(
+                                    &writer_tx,
+                                    Some(JSONRPCMessage::Error(JSONRPCError {
                                         error,
                                         id: request_id,
-                                    }),
-                                    &endpoint,
-                                )
-                                .await;
+                                    })),
+                                    Some(response_tx),
+                                );
                                 if let Err(err) = &result {
                                     worker_exit_error = Some((err.kind(), err.to_string()));
                                 }
-                                let _ = response_tx.send(result);
                                 if worker_exit_error.is_some() {
                                     break;
                                 }
                             }
                             RemoteClientCommand::Shutdown { response_tx } => {
-                                let close_result = stream.close(None).await.or_else(|err| {
-                                    if websocket_close_error_is_already_closed(&err) {
-                                        Ok(())
-                                    } else {
-                                        Err(IoError::other(format!(
-                                            "failed to close websocket app server `{endpoint}`: {err}"
-                                        )))
-                                    }
-                                });
-                                let _ = response_tx.send(close_result);
-                                break;
+                                closing = true;
+                                if let Err(error) = queue_remote_write(&writer_tx, None, Some(response_tx)) {
+                                    worker_exit_error = Some((error.kind(), error.to_string()));
+                                    break;
+                                }
                             }
                         }
                     }
                     // Retained lossless events pause reads for backpressure, except while a
                     // caller awaits an RPC: its response shares this socket, and a consumer
                     // blocked on that response cannot drain the event queue.
-                    message = stream.next(), if pending_delivery.is_empty() || !pending_requests.is_empty() => {
+                    message = stream.next(), if pending_delivery.is_empty() || pending_requests.values().any(|waiter| !waiter.is_closed()) => {
                         match message {
                             Some(Ok(Message::Text(text))) => {
                                 match serde_json::from_str::<JSONRPCMessage>(&text) {
@@ -555,18 +626,17 @@ impl RemoteAppServerClient {
                                                 ) {
                                                     Ok(Some(request)) => {
                                                         let request_id = request.id().clone();
-                                                        if let Err(err) = write_jsonrpc_message(
-                                                            &mut stream,
-                                                            JSONRPCMessage::Error(JSONRPCError {
+                                                        if let Err(err) = queue_remote_write(
+                                                            &writer_tx,
+                                                            Some(JSONRPCMessage::Error(JSONRPCError {
                                                                 error: overloaded_error(
                                                                     OverloadReason::RemoteAppServerEventQueue,
                                                                     "remote app-server event queue is full",
                                                                 ),
                                                                 id: request_id,
-                                                            }),
-                                                            &endpoint,
+                                                            })),
+                                                            None,
                                                         )
-                                                        .await
                                                         {
                                                             let message = format!(
                                                                 "remote app server at `{endpoint}` failed to reject a saturated server request: {err}"
@@ -586,9 +656,9 @@ impl RemoteAppServerClient {
                                             }
                                             Err(err) => {
                                                 warn!(%err, method, "rejecting unknown remote app-server request");
-                                                if let Err(reject_err) = write_jsonrpc_message(
-                                                    &mut stream,
-                                                    JSONRPCMessage::Error(JSONRPCError {
+                                                if let Err(reject_err) = queue_remote_write(
+                                                    &writer_tx,
+                                                    Some(JSONRPCMessage::Error(JSONRPCError {
                                                         error: JSONRPCErrorError {
                                                             code: METHOD_NOT_FOUND_ERROR_CODE,
                                                             message: format!(
@@ -597,10 +667,9 @@ impl RemoteAppServerClient {
                                                             data: None,
                                                         },
                                                         id: request_id,
-                                                    }),
-                                                    &endpoint,
+                                                    })),
+                                                    None,
                                                 )
-                                                .await
                                                 {
                                                     let err_message = reject_err.to_string();
                                                     let message = format!(
@@ -665,6 +734,11 @@ impl RemoteAppServerClient {
             // consumer. Rendering a disconnect must never gate request failure.
             command_rx.close();
             drop(command_rx);
+            drop(writer_tx);
+            if !writer_finished {
+                writer_handle.abort();
+                let _ = writer_handle.await;
+            }
             drop(stream);
             let disconnect_message = worker_exit_error
                 .as_ref()
@@ -1272,11 +1346,15 @@ fn forward_remote_event(
         });
     }
 
+    let mut sent_lagged = false;
     if *skipped_events > 0 {
         match event_tx.try_send(AppServerEvent::Lagged {
             skipped: *skipped_events,
         }) {
-            Ok(()) => *skipped_events = 0,
+            Ok(()) => {
+                *skipped_events = 0;
+                sent_lagged = true;
+            }
             Err(mpsc::error::TrySendError::Full(_)) => {
                 *skipped_events = skipped_events.saturating_add(1);
                 return Ok(match event {
@@ -1296,6 +1374,10 @@ fn forward_remote_event(
     match event_tx.try_send(event) {
         Ok(()) => Ok(None),
         Err(mpsc::error::TrySendError::Full(event)) => {
+            if sent_lagged && matches!(&event, AppServerEvent::ServerRequest(_)) {
+                pending_delivery.push_back(event)?;
+                return Ok(None);
+            }
             *skipped_events = skipped_events.saturating_add(1);
             Ok(match event {
                 AppServerEvent::ServerRequest(request) => Some(request),
@@ -1389,6 +1471,178 @@ fn websocket_close_error_is_already_closed(err: &TungsteniteError) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    async fn duplex_client(capacity: usize) -> (
+        RemoteAppServerClient,
+        WebSocketStream<tokio::io::DuplexStream>,
+    ) {
+        use tokio_tungstenite::tungstenite::protocol::Role;
+        let (transport, peer) = tokio::io::duplex(1024);
+        let stream = WebSocketStream::from_raw_socket(transport, Role::Client, None).await;
+        let mut peer = WebSocketStream::from_raw_socket(peer, Role::Server, None).await;
+        let initialize = async {
+            let message = peer.next().await.unwrap().unwrap();
+            let JSONRPCMessage::Request(request) =
+                serde_json::from_str(&message.into_text().unwrap()).unwrap()
+            else { panic!("initialize request"); };
+            write_jsonrpc_message(&mut peer, JSONRPCMessage::Response(JSONRPCResponse {
+                id: request.id, result: serde_json::json!({ "userAgent": "test/1" }),
+            }), "test").await.unwrap();
+            let initialized = peer.next().await.unwrap().unwrap();
+            let JSONRPCMessage::Notification(notification) =
+                serde_json::from_str(&initialized.into_text().unwrap()).unwrap()
+            else { panic!("initialized notification"); };
+            assert_eq!(notification.method, "initialized");
+            peer
+        };
+        let (client, peer) = tokio::join!(
+            RemoteAppServerClient::connect_with_stream(
+                capacity, "duplex-peer".into(), stream,
+                crate::initialize_params("test", "1", false, false, &[]), None,
+            ),
+            initialize,
+        );
+        (client.expect("real initialized worker"), peer)
+    }
+
+    fn rpc_request(id: i64, payload: Option<serde_json::Value>) -> JSONRPCRequest {
+        JSONRPCRequest {
+            id: RequestId::Integer(id), method: "test/request".into(), params: payload, trace: None,
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn remote_response_progresses_during_blocked_write_and_writer_timeout_retires() {
+        use tokio::io::AsyncReadExt;
+        let (client, mut peer) = duplex_client(2).await;
+        let worker = client.worker_handle.abort_handle();
+        let handle = client.request_handle();
+        let first = tokio::spawn(async move { handle.request_json_rpc(rpc_request(1, None)).await });
+        let first_frame = peer.next().await.unwrap().unwrap();
+        let JSONRPCMessage::Request(first_request) =
+            serde_json::from_str(&first_frame.into_text().unwrap()).unwrap()
+        else { panic!("first request"); };
+        assert_eq!(first_request.id, RequestId::Integer(1));
+        let handle = client.request_handle();
+        let second = tokio::spawn(async move {
+            handle.request_json_rpc(rpc_request(2, Some(serde_json::json!({
+                "payload": "x".repeat(4096)
+            })))).await
+        });
+        peer.get_mut().read_exact(&mut [0_u8; 1]).await.unwrap();
+        write_jsonrpc_message(&mut peer, JSONRPCMessage::Response(JSONRPCResponse {
+            id: RequestId::Integer(1), result: serde_json::json!("first result"),
+        }), "test").await.unwrap();
+        let response = timeout(Duration::from_secs(1), first).await
+            .expect("response routing must not wait for the blocked writer")
+            .unwrap().unwrap().unwrap();
+        assert_eq!(response, serde_json::json!("first result"));
+        assert!(!second.is_finished(), "second frame is still blocked");
+        tokio::time::advance(WRITE_TIMEOUT).await;
+        let error = timeout(Duration::from_secs(1), second).await.unwrap().unwrap()
+            .expect_err("a partially written frame must retire the connection");
+        assert_eq!(error.kind(), ErrorKind::TimedOut);
+        client.shutdown().await.unwrap();
+        assert!(worker.is_finished(), "writer timeout must reap its coordinator");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cancelled_remote_waiter_restores_event_backpressure_and_disposes_late_reply() {
+        let (mut client, mut peer) = duplex_client(1).await;
+        let worker = client.worker_handle.abort_handle();
+        let handle = client.request_handle();
+        let request = tokio::spawn(async move { handle.request_json_rpc(rpc_request(1, None)).await });
+        peer.next().await.unwrap().unwrap();
+        request.abort();
+        assert!(request.await.unwrap_err().is_cancelled());
+        // Send more than the retention limit. With no live waiter the real
+        // duplex must backpressure instead of consuming through to retirement.
+        let mut flood = tokio::spawn(async move {
+            for index in 0..MAX_PENDING_REMOTE_EVENTS + 2 {
+                write_jsonrpc_message(&mut peer, JSONRPCMessage::Notification(JSONRPCNotification {
+                    method: "thread/closed".into(),
+                    params: Some(serde_json::json!({ "threadId": index.to_string() })),
+                }), "test").await?;
+            }
+            write_jsonrpc_message(&mut peer, JSONRPCMessage::Response(JSONRPCResponse {
+                id: RequestId::Integer(1), result: serde_json::json!("late abandoned result"),
+            }), "test").await?;
+            write_jsonrpc_message(&mut peer, JSONRPCMessage::Notification(JSONRPCNotification {
+                method: "thread/closed".into(),
+                params: Some(serde_json::json!({ "threadId": "after-late-reply" })),
+            }), "test").await?;
+            IoResult::Ok(peer)
+        });
+        assert!(timeout(Duration::from_millis(100), &mut flood).await.is_err(),
+            "the peer must stop on read backpressure while the event consumer is paused");
+        assert!(!worker.is_finished());
+        for expected in 0..MAX_PENDING_REMOTE_EVENTS + 2 {
+            assert!(matches!(
+                timeout(Duration::from_secs(1), client.next_event()).await.unwrap(),
+                Some(AppServerEvent::ServerNotification(ServerNotification::ThreadClosed(notification)))
+                    if notification.thread_id == expected.to_string()
+            ));
+        }
+        assert!(matches!(
+            timeout(Duration::from_secs(1), client.next_event()).await.unwrap(),
+            Some(AppServerEvent::ServerNotification(ServerNotification::ThreadClosed(notification)))
+                if notification.thread_id == "after-late-reply"
+        ));
+        let mut peer = flood.await.unwrap().unwrap();
+        // The late response precedes this fence response on the wire. Once the
+        // latter is routed, the abandoned ID must be reusable, not misrouted.
+        for id in [2, 1] {
+            let handle = client.request_handle();
+            let fresh = tokio::spawn(async move { handle.request_json_rpc(rpc_request(id, None)).await });
+            let frame = timeout(Duration::from_secs(1), peer.next()).await.unwrap().unwrap().unwrap();
+            let JSONRPCMessage::Request(request) = serde_json::from_str(&frame.into_text().unwrap()).unwrap()
+            else { panic!("fresh request"); };
+            assert_eq!(request.id, RequestId::Integer(id));
+            write_jsonrpc_message(&mut peer, JSONRPCMessage::Response(JSONRPCResponse {
+                id: request.id, result: serde_json::json!("fresh result"),
+            }), "test").await.unwrap();
+            assert_eq!(timeout(Duration::from_secs(1), fresh).await.unwrap().unwrap().unwrap().unwrap(),
+                serde_json::json!("fresh result"));
+        }
+        client.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn remote_lag_marker_retains_adjacent_server_request() {
+        let request = || ServerRequest::ToolRequestUserInput {
+            request_id: RequestId::Integer(1),
+            params: codex_app_server_protocol::ToolRequestUserInputParams {
+                thread_id: "thread".into(), turn_id: "turn".into(), item_id: "item".into(),
+                questions: Vec::new(), auto_resolution_ms: None,
+            },
+        };
+        let (sender, mut receiver) = mpsc::channel(1);
+        let mut pending = PendingRemoteEvents::default();
+        let mut skipped = 1;
+        assert!(forward_remote_event(&sender, &mut pending, &mut skipped,
+            AppServerEvent::ServerRequest(request())).unwrap().is_none());
+        assert!(matches!(receiver.try_recv(), Ok(AppServerEvent::Lagged { skipped: 1 })));
+        assert!(matches!(pending.pop_front(), Some(AppServerEvent::ServerRequest(_))));
+        assert_eq!(skipped, 0);
+        sender.try_send(AppServerEvent::Lagged { skipped: 9 }).unwrap();
+        assert!(forward_remote_event(&sender, &mut pending, &mut skipped,
+            AppServerEvent::ServerRequest(request())).unwrap().is_some());
+        assert_eq!(skipped, 1);
+        drop(receiver);
+        assert!(forward_remote_event(&sender, &mut pending, &mut skipped,
+            AppServerEvent::ServerRequest(request())).is_err());
+    }
+
+    #[tokio::test]
+    async fn remote_writer_queue_is_bounded_and_unwritten_work_is_not_acknowledged() {
+        let (sender, mut receiver) = mpsc::channel(1);
+        queue_remote_write(&sender, Some(JSONRPCMessage::Request(rpc_request(1, None))), None).unwrap();
+        let (response_tx, response_rx) = oneshot::channel();
+        assert!(queue_remote_write(&sender, None, Some(response_tx)).is_err());
+        assert_eq!(response_rx.await.unwrap().unwrap_err().kind(), ErrorKind::BrokenPipe);
+        let write = receiver.try_recv().unwrap();
+        assert!(matches!(write.message, Some(JSONRPCMessage::Request(request)) if request.id == RequestId::Integer(1)));
+    }
 
     #[test]
     fn notification_decoder_distinguishes_unknown_from_invalid_known_methods() {
@@ -1880,24 +2134,12 @@ mod tests {
             .read_exact(&mut [0_u8; 1])
             .await
             .expect("request write begins");
-        let second_handle = client.request_handle();
-        let second = tokio::spawn(async move {
-            second_handle
-                .request_json_rpc(JSONRPCRequest {
-                    id: RequestId::Integer(2),
-                    method: "test/queued".to_owned(),
-                    params: None,
-                    trace: None,
-                })
-                .await
-        });
-        timeout(Duration::from_secs(1), async {
-            while client.command_tx.capacity() != 0 {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("second request fills the command queue");
+        let (response_tx, response_rx) = oneshot::channel();
+        client.command_tx.try_send(RemoteClientCommand::Notify {
+            notification: ClientNotification::Initialized,
+            response_tx,
+        }).unwrap_or_else(|_| panic!("second command fills the command queue"));
+        assert_eq!(client.command_tx.capacity(), 0);
 
         let shutdown = timeout(SHUTDOWN_TIMEOUT + Duration::from_secs(2), client.shutdown()).await;
         if shutdown.is_err() {
@@ -1910,13 +2152,9 @@ mod tests {
             worker.is_finished(),
             "shutdown must reap its blocked worker"
         );
-        for request in [first, second] {
-            let error = request
-                .await
-                .expect("request task")
-                .expect_err("pending request must fail");
-            assert_eq!(error.kind(), ErrorKind::BrokenPipe);
-        }
+        let error = first.await.expect("request task").expect_err("pending request must fail");
+        assert_eq!(error.kind(), ErrorKind::BrokenPipe);
+        assert!(response_rx.await.is_err(), "an unwritten notification must not acknowledge success");
     }
 
     #[test]

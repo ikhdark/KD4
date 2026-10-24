@@ -14,7 +14,10 @@ pub struct ImageGenerationItem {
     pub id: String,
     pub status: String,
     pub revised_prompt: Option<String>,
-    pub result: String,
+    pub result: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub error: Option<serde_json::Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub saved_path: Option<AbsolutePathBuf>,

@@ -54,7 +54,7 @@ pub struct InvalidIdentifier;
 
 impl fmt::Display for InvalidIdentifier {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("identifier must not be empty")
+        formatter.write_str("identifier must be nonblank and within its byte limit")
     }
 }
 
@@ -118,12 +118,16 @@ impl fmt::Display for Capability {
 }
 
 /// Identifies one logical code-mode session on a connection.
-#[derive(Clone, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(transparent)]
 pub struct SessionId(NonEmptyString);
 
+pub const MAX_SESSION_ID_BYTES: usize = 1024;
+
 impl SessionId {
     pub fn new(value: impl Into<String>) -> Result<Self, InvalidIdentifier> {
+        let value = value.into();
+        if value.len() > MAX_SESSION_ID_BYTES { return Err(InvalidIdentifier); }
         NonEmptyString::new(value).map(Self)
     }
 
@@ -135,6 +139,25 @@ impl SessionId {
 impl fmt::Display for SessionId {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for SessionId {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Self::new(String::deserialize(deserializer)?).map_err(D::Error::custom)
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn session_ids_enforce_the_same_byte_bound_for_construction_and_wire_input() {
+    for value in ["x".repeat(MAX_SESSION_ID_BYTES), "é".repeat(MAX_SESSION_ID_BYTES / 2)] {
+        assert!(SessionId::new(value.clone()).is_ok());
+        assert!(serde_json::from_str::<SessionId>(&serde_json::to_string(&value).unwrap()).is_ok());
+    }
+    for value in ["x".repeat(MAX_SESSION_ID_BYTES + 1), "é".repeat(MAX_SESSION_ID_BYTES / 2 + 1)] {
+        assert!(SessionId::new(value.clone()).is_err());
+        assert!(serde_json::from_str::<SessionId>(&serde_json::to_string(&value).unwrap()).is_err());
     }
 }
 

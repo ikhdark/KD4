@@ -36,12 +36,10 @@ mod windows_impl {
     use crate::ipc_framed::SpawnRequest;
     use crate::ipc_framed::decode_bytes;
     use crate::ipc_framed::read_frame;
-    use crate::ipc_framed::write_frame;
     use crate::logging::log_failure;
     use crate::logging::log_success;
     use crate::resolved_permissions::ResolvedWindowsSandboxPermissions;
     use crate::runner_client::retry_runner_spawn_once;
-    use crate::runner_client::spawn_runner_transport;
     use crate::spawn_prep::ElevatedSpawnContext;
     use crate::spawn_prep::prepare_elevated_spawn_context_for_permissions;
     use anyhow::Result;
@@ -57,10 +55,12 @@ mod windows_impl {
 
     /// Polls for cancellation and sends the runner's terminate IPC frame when requested.
     ///
-    /// The 50 ms park bounds cancellation latency without busy-waiting.
+    /// Polling uses a 50 ms park; control writes have a finite deadline and
+    /// terminate the owned runner if its control pipe stops draining.
     fn spawn_cancel_writer(
         pipe_write: &Arc<Mutex<File>>,
         cancellation: Option<crate::WindowsSandboxCancellationToken>,
+        runner: Option<Arc<crate::runner_client::RunnerProcess>>,
     ) -> Result<Option<(std::thread::JoinHandle<()>, Arc<AtomicBool>)>> {
         let Some(cancellation) = cancellation else {
             return Ok(None);
@@ -71,16 +71,15 @@ mod windows_impl {
         let handle = std::thread::spawn(move || {
             while !done_for_thread.load(Ordering::SeqCst) {
                 if cancellation.is_cancelled() {
-                    if let Ok(mut pipe_write) = pipe_write.lock() {
-                        let _ = write_frame(
-                            &mut *pipe_write,
-                            &FramedMessage {
+                    if let Ok(pipe_write) = pipe_write.lock() {
+                        let frame = FramedMessage {
                                 version: IPC_PROTOCOL_VERSION,
                                 message: Message::Terminate {
                                     payload: EmptyPayload::default(),
                                 },
-                            },
-                        );
+                            };
+                        if crate::runner_client::write_control_frame(&pipe_write, &frame).is_err()
+                            && let Some(runner) = runner.as_ref() { runner.terminate(); }
                     }
                     break;
                 }
@@ -115,6 +114,7 @@ mod windows_impl {
             output_sink,
             retained_bytes_cap,
         } = request;
+        crate::setup::check_setup_cancellation(cancellation.as_ref())?;
         let permissions =
             ResolvedWindowsSandboxPermissions::try_from_permission_profile_for_workspace_roots(
                 permission_profile,
@@ -152,6 +152,7 @@ mod windows_impl {
             &deny_write_paths_override,
             proxy_enforced,
             crate::WindowsSandboxProxySettingsMode::Reconcile,
+            cancellation.as_ref(),
         )?;
         let logs_base_dir = logs_base_dir.as_deref();
 
@@ -170,16 +171,21 @@ mod windows_impl {
                 stdin_open: false,
                 use_private_desktop,
             };
+            let admission = crate::runner_client::RunnerAdmission::new({
+                let cancellation = cancellation.clone();
+                move || cancellation.as_ref().is_some_and(|token| token.is_cancelled())
+            });
             let transport = retry_runner_spawn_once(
                 sandbox_creds,
                 &spawn_request.command,
                 |sandbox_creds| {
-                    spawn_runner_transport(
+                    crate::runner_client::spawn_runner_transport_with_admission(
                         codex_home,
                         cwd,
                         &sandbox_creds,
                         logs_base_dir,
                         spawn_request.clone(),
+                        &admission,
                     )
                 },
                 || {
@@ -196,12 +202,15 @@ mod windows_impl {
                         &deny_write_paths_override,
                         proxy_enforced,
                         crate::WindowsSandboxProxySettingsMode::Reconcile,
+                        cancellation.as_ref(),
                     )
                 },
             )?;
-            let (pipe_write, mut pipe_read) = transport.into_files();
+            let (pipe_write, mut pipe_read, runner) = transport.into_capture_files();
+            crate::runner_client::set_nonblocking_pipe(&pipe_write)?;
+            let runner = Arc::new(runner);
             let pipe_write = Arc::new(Mutex::new(pipe_write));
-            let cancel_writer = spawn_cancel_writer(&pipe_write, cancellation)?;
+            let cancel_writer = spawn_cancel_writer(&pipe_write, cancellation.clone(), Some(Arc::clone(&runner)))?;
 
             let mut stdout = crate::RetainedCapture::new(retained_bytes_cap);
             let mut stderr = crate::RetainedCapture::new(retained_bytes_cap);
@@ -245,8 +254,13 @@ mod windows_impl {
                             // frames and closes that pipe while output already in flight is
                             // still delivered; it needs no further credits, and its Exit frame
                             // (or pipe EOF) still ends this loop.
-                            if let Ok(mut pipe) = pipe_write.lock() {
-                                let _ = write_frame(&mut *pipe, &ack);
+                            if !cancellation.as_ref().is_some_and(|token| token.is_cancelled())
+                                && let Ok(pipe) = pipe_write.lock()
+                                && let Err(err) = crate::runner_client::write_control_frame(&pipe, &ack)
+                                && !err.downcast_ref::<std::io::Error>().is_some_and(|err| err.kind() == std::io::ErrorKind::BrokenPipe)
+                            {
+                                runner.terminate();
+                                break Err(err);
                             }
                         }
                         Err(err) => {
@@ -303,7 +317,7 @@ mod windows_impl {
             let pipe = std::sync::Arc::new(std::sync::Mutex::new(tempfile::tempfile()?));
             let cancellation = crate::WindowsSandboxCancellationToken::new(|| true);
             let (writer, _done) =
-                spawn_cancel_writer(&pipe, Some(cancellation))?.expect("cancel writer");
+                spawn_cancel_writer(&pipe, Some(cancellation), None)?.expect("cancel writer");
             writer.join().expect("join cancel writer");
 
             let mut pipe = pipe.lock().unwrap();

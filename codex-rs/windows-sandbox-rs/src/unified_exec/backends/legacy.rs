@@ -185,7 +185,8 @@ fn spawn_input_writer(
     normalize_newlines: bool,
 ) -> tokio::task::JoinHandle<()> {
     let input_write = input_write.map(|handle| handle as usize);
-    tokio::task::spawn_blocking(move || {
+    let (finished, completion) = tokio::sync::oneshot::channel();
+    std::thread::spawn(move || {
         let mut windows_input = WindowsTtyInputNormalizer::default();
         while let Some(bytes) = writer_rx.blocking_recv() {
             let Some(handle_addr) = input_write else {
@@ -208,7 +209,9 @@ fn spawn_input_writer(
                 CloseHandle(handle as HANDLE);
             }
         }
-    })
+        let _ = finished.send(());
+    });
+    tokio::spawn(async move { let _ = completion.await; })
 }
 
 fn terminate_job_or_process(
@@ -652,7 +655,6 @@ fn spawn_windows_sandbox_session_legacy_blocking(
         {
             let _ = guard.take();
         }
-        drop(conpty_owner.take());
         // SAFETY: The restricted token was transferred to this wait thread, remains owned until
         // process waiting completes, and is closed once here.
         unsafe {
@@ -670,6 +672,9 @@ fn spawn_windows_sandbox_session_legacy_blocking(
             command_for_wait,
             termination_requested,
         );
+        // Console destruction may synchronously wait for output consumption on
+        // supported older Windows versions. It must not withhold root exit.
+        drop(conpty_owner.take());
     });
 
     let terminator = {

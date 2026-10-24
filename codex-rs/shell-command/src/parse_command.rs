@@ -2199,6 +2199,24 @@ fn drop_small_formatting_commands(
         .collect()
 }
 
+fn has_effectful_option(args: &[String], short: char, long: &[&str], value_options: &[&str]) -> bool {
+    let mut index = 0;
+    while let Some(arg) = args.get(index) {
+        if arg == "--" { break; }
+        let flag = arg.split_once('=').map_or(arg.as_str(), |(flag, _)| flag);
+        if long.contains(&flag) { return true; }
+        if value_options.contains(&arg.as_str()) { index += 2; continue; }
+        if arg.starts_with('-') && !arg.starts_with("--") {
+            for ch in arg[1..].chars() {
+                if ch == short { return true; }
+                if value_options.iter().any(|value| value.len() == 2 && value.ends_with(ch)) { break; }
+            }
+        }
+        index += 1;
+    }
+    false
+}
+
 fn summarize_main_tokens(main_cmd: &[String]) -> ParsedCommand {
     if let Some(head) = main_cmd.first()
         && ((head == "find"
@@ -2240,6 +2258,9 @@ fn summarize_main_tokens(main_cmd: &[String]) -> ParsedCommand {
             }
         }
         Some((head, tail)) if head == "tree" => {
+            if has_effectful_option(tail, 'o', &[], &["-L", "-P", "-I", "--charset", "--filelimit", "--sort"]) {
+                return ParsedCommand::Unknown { cmd: shlex_join(main_cmd) };
+            }
             let path = first_non_flag_operand(
                 tail,
                 &["-L", "-P", "-I", "--charset", "--filelimit", "--sort"],
@@ -2311,7 +2332,13 @@ fn summarize_main_tokens(main_cmd: &[String]) -> ParsedCommand {
             }
         }
         Some((head, tail)) if head == "git" => match tail.split_first() {
-            Some((subcmd, sub_tail)) if subcmd == "grep" => parse_grep_like(main_cmd, sub_tail),
+            Some((subcmd, sub_tail)) if subcmd == "grep" => {
+                if has_effectful_option(sub_tail, 'O', &["--open-files-in-pager"], &["-e", "--regexp", "-f", "--file", "-A", "-B", "-C", "-m", "--max-count", "--after-context", "--before-context", "--context", "--threads", "--max-depth"]) {
+                    ParsedCommand::Unknown { cmd: shlex_join(main_cmd) }
+                } else {
+                    parse_grep_like(main_cmd, sub_tail)
+                }
+            },
             Some((subcmd, sub_tail)) if subcmd == "ls-files" => {
                 let path = first_non_flag_operand(
                     sub_tail,

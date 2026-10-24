@@ -50,7 +50,6 @@ use crate::session::turn_context::TurnContext;
 use crate::tools::exposure::AgentSurfaceStage;
 use crate::tools::exposure::ToolExposureIdentity;
 use crate::tools::handlers::ToolSearchHandlerCache;
-use crate::tools::handlers::multi_agents_spec::MULTI_AGENT_V1_NAMESPACE;
 use crate::tools::router::ToolRouter;
 use crate::tools::router::ToolRouterParams;
 use crate::tools::router::ToolSuggestCandidates;
@@ -934,52 +933,25 @@ async fn request_user_input_respects_coarse_mode_and_role_eligibility() {
 }
 
 #[tokio::test]
-async fn code_mode_eager_plan_contract_exposes_requirement_resolution() {
+async fn code_mode_eager_plan_contract_is_only_a_checklist() {
     let plan = probe(|turn| {
         set_features(turn, &[Feature::CodeMode, Feature::CodeModeOnly]);
-    })
-    .await;
+    }).await;
     let ToolSpec::Freeform(exec) = plan.visible_spec(codex_code_mode::PUBLIC_TOOL_NAME) else {
         panic!("expected code mode exec tool");
     };
-    // Completing renamed descendants requires explicit resolution even when the
-    // status update succeeds; the eager contract must explain that first call.
-    assert!(exec.description.contains("resolve?:"));
-    assert!(exec.description.contains("Original requirement IDs"));
-    assert!(
-        exec.description
-            .contains("completing renamed/split/merged descendants")
-    );
-    assert!(
-        exec.description
-            .contains("every mapped descendant must be completed")
-    );
-    assert!(
-        !exec
-            .description
-            .contains("a rejected revision names the field")
-    );
-    assert!(
-        exec.description
-            .contains("before retiring scope or linking")
-    );
-    // Keep unrelated administrative contracts lazy, not removed from the owner.
-    let ToolSpec::Function(full) = crate::tools::handlers::plan_spec::create_update_plan_tool()
-    else {
+    assert!(exec.description.contains("update_plan(args:"));
+    assert!(exec.description.contains("expected_revision?:"));
+    let ToolSpec::Function(full) = crate::tools::handlers::plan_spec::create_update_plan_tool() else {
         panic!("expected plan tool");
     };
     let properties = full.parameters.properties.as_ref().unwrap();
-    for field in [
-        "resolve",
-        "superseded",
-        "scope_change_instructions",
-        "scope_change_refs",
-        "workflow",
-    ] {
+    for field in ["plan", "set", "explanation", "expected_revision"] {
         assert!(properties.contains_key(field));
-        if field != "resolve" {
-            assert!(!exec.description.contains(&format!("{field}?:")));
-        }
+    }
+    for field in ["acceptance", "resolve", "superseded", "scope_change_instructions", "scope_change_refs", "workflow"] {
+        assert!(!properties.contains_key(field));
+        assert!(!exec.description.contains(&format!("{field}?:")));
     }
 }
 
@@ -1078,6 +1050,8 @@ async fn code_mode_exposes_bootstrap_contracts_and_keeps_other_builtins_resolvab
         .find(|line| line.starts_with("Other built-in nested tools (lazy contracts;"))
         .expect("code-mode-only sessions name lazily resolved built-ins");
     assert!(lazy_line.contains("list_files"), "{lazy_line}");
+    assert!(lazy_line.contains("tool_search"), "{lazy_line}");
+    nested_only.assert_registered_contains(&["tool_search"]);
     // The only lazy name the model mistook for task/validation status.
     assert!(
         lazy_line.contains("read_status (read-history coverage for given paths)"),
@@ -1123,7 +1097,7 @@ async fn code_mode_exposes_bootstrap_contracts_and_keeps_other_builtins_resolvab
         assert!(!exec.description.contains("Return the current time in UTC."));
         assert!(exec.description.contains("read_file(args:"));
         assert!(exec.description.contains("read_tool_output(args:"));
-        assert!(exec.description.contains("tool_search(args:"));
+        assert!(!exec.description.contains("tool_search(args:"));
         assert!(exec.description.contains("update_plan(args:"));
         assert!(exec.description.contains("apply_patch(input: string"));
         assert!(exec.description.contains("Nested apply_patch is available"));
@@ -1758,11 +1732,11 @@ async fn foreign_primary_hides_spawn_but_keeps_existing_agent_lifecycle_tools() 
     })
     .await;
     assert!(
-        !v1.namespace_function_names(MULTI_AGENT_V1_NAMESPACE)
+        !v1.namespace_function_names(MULTI_AGENT_V2_NAMESPACE)
             .contains(&"spawn_agent".to_string())
     );
     assert!(
-        v1.namespace_function_names(MULTI_AGENT_V1_NAMESPACE)
+        v1.namespace_function_names(MULTI_AGENT_V2_NAMESPACE)
             .contains(&"wait_agent".to_string())
     );
 
@@ -2909,59 +2883,13 @@ async fn excluded_deferred_namespaces_do_not_enable_nested_tool_guidance() {
 
 #[tokio::test]
 async fn multi_agent_feature_selects_one_agent_tool_family() {
-    let v1 = probe(|turn| {
-        set_feature(turn, Feature::Collab, /*enabled*/ true);
-        set_feature(turn, Feature::MultiAgentV2, /*enabled*/ false);
-    })
-    .await;
-    v1.assert_visible_contains(&[MULTI_AGENT_V1_NAMESPACE]);
-    v1.assert_visible_lacks(&[
-        MULTI_AGENT_V2_NAMESPACE,
-        "spawn_agent",
-        "send_input",
-        "resume_agent",
-        "wait_agent",
-        "close_agent",
-        "interrupt_agent",
-        "send_message",
-        "followup_task",
-        "assign_task",
-        "list_agents",
-    ]);
-    assert_eq!(
-        v1.namespace_function_names(MULTI_AGENT_V1_NAMESPACE),
-        &[
-            "close_agent".to_string(),
-            "resume_agent".to_string(),
-            "send_input".to_string(),
-            "spawn_agent".to_string(),
-            "wait_agent".to_string(),
-        ]
-    );
-    let ToolSpec::Namespace(namespace) = v1.visible_spec(MULTI_AGENT_V1_NAMESPACE) else {
-        panic!("expected v1 multi-agent namespace");
-    };
-    let Some(ResponsesApiNamespaceTool::Function(spawn_agent)) =
-        namespace.tools.iter().find(|tool| {
-            matches!(
-                tool,
-                ResponsesApiNamespaceTool::Function(tool) if tool.name == "spawn_agent"
-            )
-        })
-    else {
-        panic!("expected v1 spawn_agent function");
-    };
-    let properties = spawn_agent
-        .parameters
-        .properties
-        .as_ref()
-        .expect("spawn_agent should use object params");
-    for property in ["agent_type", "model", "reasoning_effort", "service_tier"] {
-        assert!(
-            properties.contains_key(property),
-            "expected v1 spawn_agent to expose `{property}`"
-        );
-    }
+    let legacy = probe(|turn| {
+        set_feature(turn, Feature::Collab, true);
+        set_feature(turn, Feature::MultiAgentV2, false);
+    }).await;
+    legacy.assert_visible_contains(&[MULTI_AGENT_V2_NAMESPACE]);
+    legacy.assert_visible_lacks(&["multi_agent_v1"]);
+    assert!(legacy.namespace_function_names("multi_agent_v1").is_empty());
 
     let v2 = probe(|turn| {
         set_feature(turn, Feature::MultiAgentV2, /*enabled*/ true);
@@ -2972,7 +2900,7 @@ async fn multi_agent_feature_selects_one_agent_tool_family() {
     .await;
     v2.assert_visible_contains(&[MULTI_AGENT_V2_NAMESPACE]);
     v2.assert_visible_lacks(&[
-        MULTI_AGENT_V1_NAMESPACE,
+        "multi_agent_v1",
         "spawn_agent",
         "send_message",
         "followup_task",
@@ -3118,7 +3046,7 @@ async fn collaboration_namespace_selection_tracks_the_active_agent_version_and_s
     set_feature(&mut turn, Feature::MultiAgentV2, /*enabled*/ false);
 
     let namespace = active_collaboration_namespace(&turn, AgentSurfaceStage::TypedAdministration);
-    assert_eq!(namespace, Some(MULTI_AGENT_V1_NAMESPACE));
+    assert_eq!(namespace, Some(MULTI_AGENT_V2_NAMESPACE));
 
     set_feature(&mut turn, Feature::MultiAgentV2, /*enabled*/ true);
     let namespace = active_collaboration_namespace(&turn, AgentSurfaceStage::TypedAdministration);
@@ -3316,7 +3244,7 @@ async fn tool_mode_selector_overrides_feature_flags() {
 }
 
 #[tokio::test]
-async fn v1_multi_agent_tools_defer_when_tool_search_available() {
+async fn legacy_collab_setting_defers_v2_tools() {
     let plan = probe(|turn| {
         turn.model_info.supports_search_tool = true;
         set_feature(turn, Feature::Collab, /*enabled*/ true);
@@ -3327,20 +3255,20 @@ async fn v1_multi_agent_tools_defer_when_tool_search_available() {
     plan.assert_visible_contains(&["tool_search"]);
     plan.assert_visible_lacks(&[
         "spawn_agent",
-        "send_input",
-        "resume_agent",
+        "send_message",
+        "followup_task",
         "wait_agent",
-        "close_agent",
+        "interrupt_agent",
         "interrupt_agent",
     ]);
     for tool_name in [
         "spawn_agent",
-        "send_input",
-        "resume_agent",
+        "send_message",
+        "followup_task",
         "wait_agent",
-        "close_agent",
+        "interrupt_agent",
     ] {
-        let namespaced_tool_name = ToolName::namespaced(MULTI_AGENT_V1_NAMESPACE, tool_name);
+        let namespaced_tool_name = ToolName::namespaced(MULTI_AGENT_V2_NAMESPACE, tool_name);
         let namespaced_tool_name = namespaced_tool_name.to_string();
         assert!(
             plan.registered_names.contains(&namespaced_tool_name),
@@ -3359,7 +3287,7 @@ async fn v1_multi_agent_tools_defer_when_tool_search_available() {
     };
     assert!(description.contains("<tool_search_sources>"));
     assert!(plan.tool_search_sources.contains(&format!(
-        "- Multi-agent tools [source:{MULTI_AGENT_V1_NAMESPACE}]: Spawn and manage sub-agents."
+        "- Multi-agent tools [source:{MULTI_AGENT_V2_NAMESPACE}]: Spawn and manage sub-agents."
     )));
 }
 
@@ -3688,7 +3616,7 @@ async fn local_provider_rejects_required_dynamic_namespaces_before_sampling() {
     }
 }
 #[tokio::test]
-async fn v1_initial_nested_catalog_keeps_child_lifecycle() {
+async fn legacy_metadata_uses_v2_nested_lifecycle() {
     for mode in [ToolMode::Direct, ToolMode::CodeMode, ToolMode::CodeModeOnly] {
         for search in [false, true] {
             for policy in ["normal", "excluded", "direct_only"] {
@@ -3701,11 +3629,11 @@ async fn v1_initial_nested_catalog_keeps_child_lifecycle() {
                         update_config(turn, |config| match policy {
                             "excluded" => {
                                 config.code_mode.excluded_tool_namespaces =
-                                    vec![MULTI_AGENT_V1_NAMESPACE.into()]
+                                    vec![MULTI_AGENT_V2_NAMESPACE.into()]
                             }
                             "direct_only" => {
                                 config.code_mode.direct_only_tool_namespaces =
-                                    vec![MULTI_AGENT_V1_NAMESPACE.into()]
+                                    vec![MULTI_AGENT_V2_NAMESPACE.into()]
                             }
                             _ => {}
                         });
@@ -3720,8 +3648,8 @@ async fn v1_initial_nested_catalog_keeps_child_lifecycle() {
                 )
                 .await;
                 let expected = mode != ToolMode::Direct && policy == "normal";
-                for tool in ["send_input", "resume_agent", "wait_agent", "close_agent"] {
-                    let name = ToolName::namespaced(MULTI_AGENT_V1_NAMESPACE, tool).to_string();
+                for tool in ["send_message", "followup_task", "wait_agent", "interrupt_agent"] {
+                    let name = ToolName::namespaced(MULTI_AGENT_V2_NAMESPACE, tool).to_string();
                     if expected {
                         plan.assert_registered_contains(&[&name]);
                     } else {

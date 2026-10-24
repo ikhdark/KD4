@@ -4,7 +4,7 @@ use crate::ToolSpec;
 use codex_code_mode::CodeModeToolKind;
 use codex_code_mode::ToolDefinition as CodeModeToolDefinition;
 
-const CODE_MODE_TOOL_SEARCH_RESULT_GUIDANCE: &str = "In code mode, this returns a structured result. Inspect `status` before using `tools`: `completed` is complete, `incomplete` reports an exact `omitted_result_count` when known, and `aborted` has `omitted_result_count: null`. A null count means the lower layer did not provide an exact count. `activated_omitted_tools` lists callable names activated without a returned schema; use `resolve_tool(name)` rather than repeating the search. A returned namespace tool is callable as `resolve_tool(\"<namespace>.<name>\")`.";
+const CODE_MODE_TOOL_SEARCH_RESULT_GUIDANCE: &str = "In code mode, this returns a structured result. Inspect `status` before using `tools`: `completed` is complete, `incomplete` reports an exact `omitted_result_count` when known, and `aborted` has `omitted_result_count: null`. A null count means the lower layer did not provide an exact count. `direct_only_tools` overrides local resolution: these excluded names are activated for the next direct model interface, not this cell. For other returned or `activated_omitted_tools` names, use `resolve_tool(name)` rather than repeating the search. A returned namespace tool outside `direct_only_tools` is callable as `resolve_tool(\"<namespace>.<name>\")`.";
 
 pub fn code_mode_tool_search_output_schema() -> serde_json::Value {
     serde_json::json!({
@@ -16,6 +16,8 @@ pub fn code_mode_tool_search_output_schema() -> serde_json::Value {
             },
             "execution": { "const": "client" },
             "tools": { "type": "array" },
+            "direct_only_tools": { "type": "array", "items": { "type": "string" } },
+            "direct_only_guidance": { "type": "string" },
             "activated_omitted_tools": {
                 "type": "array",
                 "items": { "type": "string" },
@@ -123,6 +125,13 @@ pub fn tool_spec_to_code_mode_tool_definition(spec: &ToolSpec) -> Option<CodeMod
 pub fn collect_code_mode_tool_definitions<'a>(
     specs: impl IntoIterator<Item = &'a ToolSpec>,
 ) -> Vec<CodeModeToolDefinition> {
+    collect_code_mode_tool_definitions_with_input_schemas(specs, &std::collections::HashMap::new())
+}
+
+pub fn collect_code_mode_tool_definitions_with_input_schemas<'a>(
+    specs: impl IntoIterator<Item = &'a ToolSpec>,
+    canonical_input_schemas: &std::collections::HashMap<ToolName, serde_json::Value>,
+) -> Vec<CodeModeToolDefinition> {
     let mut tool_definitions = specs
         .into_iter()
         .flat_map(code_mode_tool_definitions_for_spec)
@@ -136,7 +145,12 @@ pub fn collect_code_mode_tool_definitions<'a>(
 
     tool_definitions
         .into_iter()
-        .map(codex_code_mode::augment_tool_definition)
+        .map(|mut definition| {
+            if let Some(schema) = canonical_input_schemas.get(&definition.tool_name) {
+                definition.input_schema = Some(schema.clone());
+            }
+            codex_code_mode::augment_tool_definition(definition)
+        })
         .collect()
 }
 

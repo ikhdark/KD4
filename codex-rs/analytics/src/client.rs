@@ -7,10 +7,8 @@ use crate::facts::AnalyticsJsonRpcError;
 use crate::facts::AppInvocation;
 use crate::facts::AppMentionedInput;
 use crate::facts::AppUsedInput;
-use crate::facts::CodexGoalEvent;
+
 use crate::facts::CustomAnalyticsFact;
-use crate::facts::ExternalAgentConfigImportCompletedInput;
-use crate::facts::ExternalAgentConfigImportFailureInput;
 use crate::facts::HookRunFact;
 use crate::facts::HookRunInput;
 use crate::facts::PluginInstallFailedInput;
@@ -83,10 +81,51 @@ fn analytics_failure_log_metadata(
 
 #[derive(Clone)]
 pub(crate) struct AnalyticsEventsQueue {
+    pub(crate) auth_manager: Option<Arc<AuthManager>>,
     pub(crate) loss_epoch: Arc<AtomicU64>,
     pub(crate) sender: mpsc::Sender<AnalyticsFact>,
     pub(crate) app_used_emitted_keys: Arc<Mutex<HashSet<UsageEventKey>>>,
     pub(crate) plugin_used_emitted_keys: Arc<Mutex<HashSet<UsageEventKey>>>,
+}
+
+struct AnalyticsPermit<'a> {
+    permit: mpsc::Permit<'a, AnalyticsFact>,
+    epoch: Option<u64>,
+}
+
+impl AnalyticsPermit<'_> {
+    fn send(self, fact: AnalyticsFact) {
+        self.permit.send(bind_analytics_fact(self.epoch, fact));
+    }
+}
+
+fn bind_analytics_fact(epoch: Option<u64>, fact: AnalyticsFact) -> AnalyticsFact {
+    match epoch {
+        Some(epoch) => AnalyticsFact::AuthBound { epoch, fact: Box::new(fact) },
+        None => fact,
+    }
+}
+
+struct AnalyticsDispatchGuard { auth_manager: Arc<AuthManager>, epoch: u64 }
+impl codex_http_client::RequestDispatchGuard for AnalyticsDispatchGuard {
+    fn admit(&self, dispatch: &mut dyn FnMut()) -> Result<(), String> {
+        self.auth_manager.with_policy_auth_epoch(self.epoch, dispatch)
+            .map_err(|_| "analytics authentication changed before dispatch".into())
+    }
+}
+
+async fn ingest_bound_fact(
+    input: AnalyticsFact, reducer: &mut AnalyticsReducer, auth: &AuthManager,
+    reducer_epoch: &mut Option<u64>, events: &mut Vec<TrackEventRequest>,
+) {
+    let AnalyticsFact::AuthBound { epoch, fact } = input else { return; };
+    let Ok((current_epoch, _)) = auth.policy_auth_snapshot() else { return; };
+    if *reducer_epoch != Some(current_epoch) {
+        reducer.reset_for_auth_transition();
+        events.clear();
+        *reducer_epoch = Some(current_epoch);
+    }
+    if epoch == current_epoch { reducer.ingest(*fact, events).await; }
 }
 
 #[derive(Clone)]
@@ -159,18 +198,20 @@ impl AnalyticsEventsQueue {
         let http_clients = create_client_pool(http_client_factory, ClientRouteClass::Api);
         let loss_epoch = Arc::new(AtomicU64::new(0));
         let worker_loss_epoch = Arc::clone(&loss_epoch);
+        let queue_auth_manager = Arc::clone(&auth_manager);
         tokio::spawn(async move {
             let mut reducer = AnalyticsReducer::default();
+            let mut reducer_epoch = None;
             while let Some(input) = receiver.recv().await {
                 let mut events = Vec::new();
                 reducer.observe_delivery_loss(worker_loss_epoch.load(Ordering::Acquire));
-                reducer.ingest(input, &mut events).await;
+                ingest_bound_fact(input, &mut reducer, &auth_manager, &mut reducer_epoch, &mut events).await;
                 for _ in 1..ANALYTICS_EVENTS_BATCH_SIZE {
                     let Ok(input) = receiver.try_recv() else {
                         break;
                     };
                     reducer.observe_delivery_loss(worker_loss_epoch.load(Ordering::Acquire));
-                    reducer.ingest(input, &mut events).await;
+                    ingest_bound_fact(input, &mut reducer, &auth_manager, &mut reducer_epoch, &mut events).await;
                 }
                 // Read the loss epoch before the emptiness check. A loss that
                 // follows an earlier-enqueued fact must not be absorbed by this
@@ -179,10 +220,13 @@ impl AnalyticsEventsQueue {
                 if receiver.is_empty() {
                     reducer.delivery_queue_drained(drained_epoch);
                 }
-                send_track_events(&auth_manager, &destination, &http_clients, events).await;
+                if let Some(epoch) = reducer_epoch {
+                    send_track_events(&auth_manager, epoch, &destination, &http_clients, events).await;
+                }
             }
         });
         Self {
+            auth_manager: Some(queue_auth_manager),
             sender,
             loss_epoch,
             app_used_emitted_keys: Arc::new(Mutex::new(HashSet::new())),
@@ -191,15 +235,23 @@ impl AnalyticsEventsQueue {
     }
 
     fn try_send(&self, input: AnalyticsFact) {
-        if self.sender.try_send(input).is_err() {
+        let epoch = match self.admission_epoch() { Ok(epoch) => epoch, Err(()) => return };
+        if self.sender.try_send(bind_analytics_fact(epoch, input)).is_err() {
             self.record_delivery_loss();
             tracing::warn!("dropping analytics events: queue is full");
         }
     }
 
-    fn try_reserve(&self) -> Option<mpsc::Permit<'_, AnalyticsFact>> {
+    fn admission_epoch(&self) -> Result<Option<u64>, ()> {
+        self.auth_manager.as_ref().map(|auth| auth.policy_auth_snapshot()
+            .map(|(epoch, _)| epoch).map_err(|_| ())).transpose()
+    }
+
+    fn try_reserve(&self) -> Option<AnalyticsPermit<'_>> {
+        let epoch = self.admission_epoch().ok()?;
         self.sender
             .try_reserve()
+            .map(|permit| AnalyticsPermit { permit, epoch })
             .map_err(|err| {
                 self.record_delivery_loss();
                 tracing::warn!("dropping analytics events: {err}");
@@ -215,61 +267,31 @@ impl AnalyticsEventsQueue {
             });
     }
 
-    pub(crate) fn should_enqueue_app_used(
+    fn try_reserve_usage(
         &self,
-        tracking: &TrackEventsContext,
-        app: &AppInvocation,
-    ) -> bool {
-        let Some(connector_id) = app.connector_id.as_ref() else {
-            return true;
-        };
-        let mut emitted = self
-            .app_used_emitted_keys
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let key = (
-            tracking.thread_id.clone(),
-            tracking.turn_id.clone(),
-            connector_id.clone(),
-        );
-        if emitted.contains(&key) {
-            return false;
+        emitted: &Mutex<HashSet<UsageEventKey>>,
+        key: Option<UsageEventKey>,
+    ) -> Option<AnalyticsPermit<'_>> {
+        let Some(mut key) = key else { return self.try_reserve(); };
+        let epoch = self.admission_epoch().ok()?;
+        if let Some(epoch) = epoch {
+            key.0 = format!("{epoch}:{}", key.0);
         }
+        let mut emitted = emitted.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if emitted.contains(&key) {
+            return None;
+        }
+        // Admission and deduplication are one synchronous operation. A
+        // duplicate at capacity is not delivery loss, and a rejected first
+        // emission must remain retryable.
+        let permit = self.sender.try_reserve().map_err(|_| self.record_delivery_loss()).ok()?;
+        let permit = AnalyticsPermit { permit, epoch };
         if emitted.len() >= ANALYTICS_EVENT_DEDUPE_MAX_KEYS {
             emitted.clear();
         }
-        emitted.insert(key)
-    }
-
-    pub(crate) fn should_enqueue_plugin_used(
-        &self,
-        tracking: &TrackEventsContext,
-        plugin: &PluginTelemetryMetadata,
-    ) -> bool {
-        let mut emitted = self
-            .plugin_used_emitted_keys
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let Some(plugin_id) = plugin
-            .plugin_id
-            .as_ref()
-            .map(PluginId::as_key)
-            .or_else(|| plugin.remote_plugin_id.clone())
-        else {
-            return true;
-        };
-        let key = (
-            tracking.thread_id.clone(),
-            tracking.turn_id.clone(),
-            plugin_id,
-        );
-        if emitted.contains(&key) {
-            return false;
-        }
-        if emitted.len() >= ANALYTICS_EVENT_DEDUPE_MAX_KEYS {
-            emitted.clear();
-        }
-        emitted.insert(key)
+        emitted.insert(key);
+        Some(permit)
     }
 }
 
@@ -369,10 +391,20 @@ impl AnalyticsEventsClient {
         else {
             return;
         };
-        permit.send(AnalyticsFact::ClientRequest {
+        permit.send(AnalyticsFact::TurnRequest {
             connection_id,
             request_id,
-            request: Box::new(request.clone()),
+            request: match request {
+                ClientRequest::TurnStart { params, .. } => crate::facts::TurnRequestFact::Start {
+                    thread_id: params.thread_id.clone(),
+                    num_input_images: crate::reducer::num_input_images(&params.input),
+                },
+                ClientRequest::TurnSteer { params, .. } => crate::facts::TurnRequestFact::Steer {
+                    thread_id: params.thread_id.clone(), expected_turn_id: params.expected_turn_id.clone(),
+                    num_input_images: crate::reducer::num_input_images(&params.input),
+                },
+                _ => unreachable!("request selection above"),
+            },
         });
     }
 
@@ -380,12 +412,9 @@ impl AnalyticsEventsClient {
         let Some(queue) = self.queue.as_ref() else {
             return;
         };
-        let Some(permit) = queue.try_reserve() else {
-            return;
-        };
-        if !queue.should_enqueue_app_used(&tracking, &app) {
-            return;
-        }
+        let key = app.connector_id.as_ref().map(|id|
+            (tracking.thread_id.clone(), tracking.turn_id.clone(), id.clone()));
+        let Some(permit) = queue.try_reserve_usage(&queue.app_used_emitted_keys, key) else { return; };
         permit.send(AnalyticsFact::Custom(CustomAnalyticsFact::AppUsed(
             AppUsedInput { tracking, app },
         )));
@@ -401,12 +430,10 @@ impl AnalyticsEventsClient {
         let Some(queue) = self.queue.as_ref() else {
             return;
         };
-        let Some(permit) = queue.try_reserve() else {
-            return;
-        };
-        if !queue.should_enqueue_plugin_used(&tracking, &plugin) {
-            return;
-        }
+        let key = plugin.plugin_id.as_ref().map(PluginId::as_key)
+            .or_else(|| plugin.remote_plugin_id.clone())
+            .map(|id| (tracking.thread_id.clone(), tracking.turn_id.clone(), id));
+        let Some(permit) = queue.try_reserve_usage(&queue.plugin_used_emitted_keys, key) else { return; };
         permit.send(AnalyticsFact::Custom(CustomAnalyticsFact::PluginUsed(
             crate::facts::PluginUsedInput { tracking, plugin },
         )));
@@ -431,11 +458,7 @@ impl AnalyticsEventsClient {
         )));
     }
 
-    pub fn track_goal_event(&self, event: CodexGoalEvent) {
-        self.record_fact(AnalyticsFact::Custom(CustomAnalyticsFact::Goal(Box::new(
-            event,
-        ))));
-    }
+
 
     pub fn track_turn_resolved_config(&self, fact: TurnResolvedConfigFact) {
         self.record_fact(AnalyticsFact::Custom(
@@ -491,23 +514,7 @@ impl AnalyticsEventsClient {
         ));
     }
 
-    pub fn track_external_agent_config_import_completed(
-        &self,
-        input: ExternalAgentConfigImportCompletedInput,
-    ) {
-        self.record_fact(AnalyticsFact::Custom(
-            CustomAnalyticsFact::ExternalAgentConfigImportCompleted(input),
-        ));
-    }
 
-    pub fn track_external_agent_config_import_failure(
-        &self,
-        input: ExternalAgentConfigImportFailureInput,
-    ) {
-        self.record_fact(AnalyticsFact::Custom(
-            CustomAnalyticsFact::ExternalAgentConfigImportFailure(input),
-        ));
-    }
 
     pub fn track_plugin_uninstalled(&self, plugin: PluginTelemetryMetadata) {
         self.record_fact(AnalyticsFact::Custom(
@@ -574,7 +581,7 @@ impl AnalyticsEventsClient {
         &self,
         connection_id: u64,
         request_id: RequestId,
-        response: ClientResponsePayload,
+        mut response: ClientResponsePayload,
         thread_originator: Option<String>,
     ) {
         if !matches!(
@@ -586,6 +593,13 @@ impl AnalyticsEventsClient {
                 | ClientResponsePayload::TurnSteer(_)
         ) {
             return;
+        }
+        // Initialization analytics consumes metadata, never historic turns.
+        match &mut response {
+            ClientResponsePayload::ThreadStart(response) => response.thread.turns.clear(),
+            ClientResponsePayload::ThreadResume(response) => response.thread.turns.clear(),
+            ClientResponsePayload::ThreadFork(response) => response.thread.turns.clear(),
+            _ => {}
         }
         self.record_fact(AnalyticsFact::ClientResponse {
             connection_id,
@@ -743,7 +757,8 @@ impl AnalyticsEventsClient {
 }
 
 async fn send_track_events(
-    auth_manager: &AuthManager,
+    auth_manager: &Arc<AuthManager>,
+    epoch: u64,
     destination: &AnalyticsEventsDestination,
     http_clients: &RouteAwareClientPool,
     events: Vec<TrackEventRequest>,
@@ -758,9 +773,14 @@ async fn send_track_events(
     if !auth.uses_codex_backend() {
         return;
     }
+    if auth_manager.policy_auth_snapshot().ok().map(|snapshot| snapshot.0) != Some(epoch) {
+        return;
+    }
 
     for events in track_event_request_batches(events) {
-        send_track_events_request(&auth, destination, http_clients, events).await;
+        codex_http_client::with_dispatch_guard(Some(Arc::new(AnalyticsDispatchGuard {
+            auth_manager: Arc::clone(auth_manager), epoch,
+        })), send_track_events_request(&auth, destination, http_clients, events)).await;
     }
 }
 

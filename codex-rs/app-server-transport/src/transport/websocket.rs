@@ -620,6 +620,7 @@ mod tests {
                             id: RequestId::Integer(id as i64),
                             result,
                         }),
+                        encoded_json: None,
                         write_complete_tx,
                     })
                     .unwrap();
@@ -685,6 +686,7 @@ mod tests {
                         id: RequestId::Integer(id),
                         result: serde_json::json!(id),
                     }),
+                    encoded_json: None,
                     write_complete_tx,
                 })
                 .unwrap();
@@ -737,6 +739,7 @@ mod tests {
                     id: RequestId::Integer(1),
                     result: serde_json::json!("x".repeat(1024)),
                 }),
+                encoded_json: None,
                 write_complete_tx: Some(receipt_tx),
             })
             .unwrap();
@@ -809,6 +812,7 @@ mod tests {
                             id: RequestId::Integer(id),
                             result: serde_json::json!(id),
                         }),
+                        encoded_json: None,
                         write_complete_tx,
                     })
                     .unwrap();
@@ -870,6 +874,7 @@ mod tests {
                                 id: RequestId::Integer(id),
                                 result: serde_json::json!(id),
                             }),
+                            encoded_json: None,
                             write_complete_tx: if index == 129 { receipt.take() } else { None },
                         })
                         .unwrap();

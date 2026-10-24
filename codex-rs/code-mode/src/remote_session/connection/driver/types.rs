@@ -156,6 +156,7 @@ pub(super) enum PendingRequest {
     Terminate {
         session: RemoteSession,
         cell_id: WireCellId,
+        automatic: bool,
         response_tx: oneshot::Sender<Result<WaitOutcome, String>>,
     },
     ShutdownSession {

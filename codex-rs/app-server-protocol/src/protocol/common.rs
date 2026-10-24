@@ -674,21 +674,6 @@ client_request_definitions! {
         serialization: thread_id(params.thread_id),
         response: v2::ThreadSetNameResponse,
     },
-    ThreadGoalSet => "thread/goal/set" {
-        params: v2::ThreadGoalSetParams,
-        serialization: thread_id(params.thread_id),
-        response: v2::ThreadGoalSetResponse,
-    },
-    ThreadGoalGet => "thread/goal/get" {
-        params: v2::ThreadGoalGetParams,
-        serialization: thread_id(params.thread_id),
-        response: v2::ThreadGoalGetResponse,
-    },
-    ThreadGoalClear => "thread/goal/clear" {
-        params: v2::ThreadGoalClearParams,
-        serialization: thread_id(params.thread_id),
-        response: v2::ThreadGoalClearResponse,
-    },
     ThreadMetadataUpdate => "thread/metadata/update" {
         params: v2::ThreadMetadataUpdateParams,
         inspect_params: true,
@@ -1118,13 +1103,6 @@ client_request_definitions! {
         serialization: None,
         response: v2::MockExperimentalMethodResponse,
     },
-    #[experimental("environment/add")]
-    /// Adds or replaces a remote environment by id for later selection.
-    EnvironmentAdd => "environment/add" {
-        params: v2::EnvironmentAddParams,
-        serialization: global("environment"),
-        response: v2::EnvironmentAddResponse,
-    },
     #[experimental("environment/info")]
     /// Reads information from a configured execution environment.
     EnvironmentInfo => "environment/info" {
@@ -1292,21 +1270,6 @@ client_request_definitions! {
         params: v2::ConfigReadParams,
         serialization: global_shared_read("config"),
         response: v2::ConfigReadResponse,
-    },
-    ExternalAgentConfigDetect => "externalAgentConfig/detect" {
-        params: v2::ExternalAgentConfigDetectParams,
-        serialization: global("config"),
-        response: v2::ExternalAgentConfigDetectResponse,
-    },
-    ExternalAgentConfigImport => "externalAgentConfig/import" {
-        params: v2::ExternalAgentConfigImportParams,
-        serialization: global("config"),
-        response: v2::ExternalAgentConfigImportResponse,
-    },
-    ExternalAgentConfigImportHistoriesRead => "externalAgentConfig/import/readHistories" {
-        params: #[ts(type = "undefined")] #[serde(skip_serializing_if = "Option::is_none")] Option<()>,
-        serialization: global_shared_read("config"),
-        response: v2::ExternalAgentConfigImportHistoriesReadResponse,
     },
     ConfigValueWrite => "config/value/write" {
         params: v2::ConfigValueWriteParams,
@@ -1946,8 +1909,6 @@ server_notification_definitions! {
     SkillsChanged => "skills/changed" (v2::SkillsChangedNotification),
     #[delivery(required)]
     ThreadNameUpdated => "thread/name/updated" (v2::ThreadNameUpdatedNotification),
-    ThreadGoalUpdated => "thread/goal/updated" (v2::ThreadGoalUpdatedNotification),
-    ThreadGoalCleared => "thread/goal/cleared" (v2::ThreadGoalClearedNotification),
     #[experimental("project/changed")]
     ProjectChanged => "project/changed" (v2::ProjectChangedNotification),
     #[experimental("thread/project/updated")]
@@ -2003,9 +1964,6 @@ server_notification_definitions! {
     AccountRateLimitsUpdated => "account/rateLimits/updated" (v2::AccountRateLimitsUpdatedNotification),
     AppListUpdated => "app/list/updated" (v2::AppListUpdatedNotification),
     RemoteControlStatusChanged => "remoteControl/status/changed" (v2::RemoteControlStatusChangedNotification),
-    ExternalAgentConfigImportProgress => "externalAgentConfig/import/progress" (v2::ExternalAgentConfigImportProgressNotification),
-    #[delivery(required)]
-    ExternalAgentConfigImportCompleted => "externalAgentConfig/import/completed" (v2::ExternalAgentConfigImportCompletedNotification),
     #[delivery(required)]
     FsChanged => "fs/changed" (v2::FsChangedNotification),
     #[delivery(required)]
@@ -2621,20 +2579,17 @@ mod tests {
             Some(ClientRequestSerializationScope::Global("account-auth"))
         );
 
-        let thread_goal_set = ClientRequest::ThreadGoalSet {
+        let thread_name_set = ClientRequest::ThreadSetName {
             request_id: request_id(),
-            params: v2::ThreadGoalSetParams {
-                thread_id: "goal-thread".to_string(),
-                replace: false,
-                objective: Some("ship it".to_string()),
-                status: None,
-                token_budget: None,
+            params: v2::ThreadSetNameParams {
+                thread_id: "named-thread".to_string(),
+                name: "ship it".to_string(),
             },
         };
         assert_eq!(
-            thread_goal_set.serialization_scope(),
+            thread_name_set.serialization_scope(),
             Some(ClientRequestSerializationScope::Thread {
-                thread_id: "goal-thread".to_string()
+                thread_id: "named-thread".to_string()
             })
         );
 
@@ -2660,18 +2615,6 @@ mod tests {
             Some(ClientRequestSerializationScope::Global("account-auth"))
         );
 
-        let environment_add = ClientRequest::EnvironmentAdd {
-            request_id: request_id(),
-            params: v2::EnvironmentAddParams {
-                environment_id: "remote-a".to_string(),
-                exec_server_url: "ws://127.0.0.1:8765".to_string(),
-                connect_timeout_ms: None,
-            },
-        };
-        assert_eq!(
-            environment_add.serialization_scope(),
-            Some(ClientRequestSerializationScope::Global("environment"))
-        );
     }
 
     #[test]
@@ -3794,30 +3737,6 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn serialize_environment_add() -> Result<()> {
-        let request = ClientRequest::EnvironmentAdd {
-            request_id: RequestId::Integer(9),
-            params: v2::EnvironmentAddParams {
-                environment_id: "remote-a".to_string(),
-                exec_server_url: "ws://127.0.0.1:8765".to_string(),
-                connect_timeout_ms: Some(300_000),
-            },
-        };
-        assert_eq!(
-            json!({
-                "method": "environment/add",
-                "id": 9,
-                "params": {
-                    "environmentId": "remote-a",
-                    "execServerUrl": "ws://127.0.0.1:8765",
-                    "connectTimeoutMs": 300000
-                }
-            }),
-            serde_json::to_value(&request)?,
-        );
-        Ok(())
-    }
 
     #[test]
     fn serialize_fs_get_metadata() -> Result<()> {
@@ -4041,19 +3960,6 @@ mod tests {
         assert_eq!(reason, Some("mock/experimentalMethod"));
     }
 
-    #[test]
-    fn environment_add_is_marked_experimental() {
-        let request = ClientRequest::EnvironmentAdd {
-            request_id: RequestId::Integer(1),
-            params: v2::EnvironmentAddParams {
-                environment_id: "remote-a".to_string(),
-                exec_server_url: "ws://127.0.0.1:8765".to_string(),
-                connect_timeout_ms: None,
-            },
-        };
-        let reason = crate::experimental_api::ExperimentalApi::experimental_reason(&request);
-        assert_eq!(reason, Some("environment/add"));
-    }
 
     #[test]
     fn command_exec_permission_profile_is_marked_experimental() {
@@ -4081,75 +3987,7 @@ mod tests {
         assert_eq!(reason, Some("command/exec.permissionProfile"));
     }
 
-    #[test]
-    fn thread_goal_methods_are_not_marked_experimental() {
-        let set_request = ClientRequest::ThreadGoalSet {
-            request_id: RequestId::Integer(1),
-            params: v2::ThreadGoalSetParams {
-                thread_id: "thr_123".to_string(),
-                objective: Some("ship goal mode".to_string()),
-                replace: false,
-                status: Some(v2::ThreadGoalStatus::Active),
-                token_budget: Some(Some(10_000)),
-            },
-        };
-        let get_request = ClientRequest::ThreadGoalGet {
-            request_id: RequestId::Integer(2),
-            params: v2::ThreadGoalGetParams {
-                thread_id: "thr_123".to_string(),
-            },
-        };
-        let clear_request = ClientRequest::ThreadGoalClear {
-            request_id: RequestId::Integer(3),
-            params: v2::ThreadGoalClearParams {
-                thread_id: "thr_123".to_string(),
-            },
-        };
 
-        assert_eq!(
-            crate::experimental_api::ExperimentalApi::experimental_reason(&set_request),
-            None
-        );
-        assert_eq!(
-            crate::experimental_api::ExperimentalApi::experimental_reason(&get_request),
-            None
-        );
-        assert_eq!(
-            crate::experimental_api::ExperimentalApi::experimental_reason(&clear_request),
-            None
-        );
-    }
-
-    #[test]
-    fn thread_goal_notifications_are_not_marked_experimental() {
-        let goal = v2::ThreadGoal {
-            thread_id: "thr_123".to_string(),
-            objective: "ship goal mode".to_string(),
-            status: v2::ThreadGoalStatus::Active,
-            token_budget: Some(10_000),
-            tokens_used: 123,
-            time_used_seconds: 45,
-            created_at: 1_700_000_000,
-            updated_at: 1_700_000_123,
-        };
-        let updated = ServerNotification::ThreadGoalUpdated(v2::ThreadGoalUpdatedNotification {
-            thread_id: "thr_123".to_string(),
-            turn_id: None,
-            goal,
-        });
-        let cleared = ServerNotification::ThreadGoalCleared(v2::ThreadGoalClearedNotification {
-            thread_id: "thr_123".to_string(),
-        });
-
-        assert_eq!(
-            crate::experimental_api::ExperimentalApi::experimental_reason(&updated),
-            None
-        );
-        assert_eq!(
-            crate::experimental_api::ExperimentalApi::experimental_reason(&cleared),
-            None
-        );
-    }
 
     fn thread_settings_updated_notification() -> ServerNotification {
         ServerNotification::ThreadSettingsUpdated(v2::ThreadSettingsUpdatedNotification {

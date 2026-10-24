@@ -864,7 +864,7 @@ impl ExecPolicyAmendment {
 impl From<CoreExecPolicyAmendment> for ExecPolicyAmendment {
     fn from(value: CoreExecPolicyAmendment) -> Self {
         Self {
-            command: value.command().to_vec(),
+            command: value.command,
         }
     }
 }
@@ -938,4 +938,23 @@ pub struct PermissionsRequestApprovalResponse {
     pub permissions: GrantedPermissionProfile,
     #[serde(default)]
     pub scope: PermissionGrantScope,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn owned_exec_policy_amendment_conversion_reuses_command_storage() {
+        let command = vec!["echo".to_string(), "hello \"world\" 🌎".to_string()];
+        let command_storage = command.as_ptr();
+        let argument_storage = command[1].as_ptr();
+        let converted = ExecPolicyAmendment::from(CoreExecPolicyAmendment::new(command));
+        assert_eq!(converted.command.as_ptr(), command_storage);
+        assert_eq!(converted.command[1].as_ptr(), argument_storage);
+        assert_eq!(serde_json::to_value(&converted).unwrap(), serde_json::json!([
+            "echo", "hello \"world\" 🌎"
+        ]));
+        assert_eq!(converted.into_core().command(), &["echo", "hello \"world\" 🌎"]);
+    }
 }

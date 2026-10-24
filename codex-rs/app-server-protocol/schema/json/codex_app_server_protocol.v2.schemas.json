@@ -1540,78 +1540,6 @@
             },
             "method": {
               "enum": [
-                "thread/goal/set"
-              ],
-              "title": "Thread/goal/setRequestMethod",
-              "type": "string"
-            },
-            "params": {
-              "$ref": "#/definitions/ThreadGoalSetParams"
-            }
-          },
-          "required": [
-            "id",
-            "method",
-            "params"
-          ],
-          "title": "Thread/goal/setRequest",
-          "type": "object"
-        },
-        {
-          "properties": {
-            "id": {
-              "$ref": "#/definitions/RequestId"
-            },
-            "method": {
-              "enum": [
-                "thread/goal/get"
-              ],
-              "title": "Thread/goal/getRequestMethod",
-              "type": "string"
-            },
-            "params": {
-              "$ref": "#/definitions/ThreadGoalGetParams"
-            }
-          },
-          "required": [
-            "id",
-            "method",
-            "params"
-          ],
-          "title": "Thread/goal/getRequest",
-          "type": "object"
-        },
-        {
-          "properties": {
-            "id": {
-              "$ref": "#/definitions/RequestId"
-            },
-            "method": {
-              "enum": [
-                "thread/goal/clear"
-              ],
-              "title": "Thread/goal/clearRequestMethod",
-              "type": "string"
-            },
-            "params": {
-              "$ref": "#/definitions/ThreadGoalClearParams"
-            }
-          },
-          "required": [
-            "id",
-            "method",
-            "params"
-          ],
-          "title": "Thread/goal/clearRequest",
-          "type": "object"
-        },
-        {
-          "properties": {
-            "id": {
-              "$ref": "#/definitions/RequestId"
-            },
-            "method": {
-              "enum": [
                 "thread/metadata/update"
               ],
               "title": "Thread/metadata/updateRequestMethod",
@@ -3458,77 +3386,6 @@
             },
             "method": {
               "enum": [
-                "externalAgentConfig/detect"
-              ],
-              "title": "ExternalAgentConfig/detectRequestMethod",
-              "type": "string"
-            },
-            "params": {
-              "$ref": "#/definitions/ExternalAgentConfigDetectParams"
-            }
-          },
-          "required": [
-            "id",
-            "method",
-            "params"
-          ],
-          "title": "ExternalAgentConfig/detectRequest",
-          "type": "object"
-        },
-        {
-          "properties": {
-            "id": {
-              "$ref": "#/definitions/RequestId"
-            },
-            "method": {
-              "enum": [
-                "externalAgentConfig/import"
-              ],
-              "title": "ExternalAgentConfig/importRequestMethod",
-              "type": "string"
-            },
-            "params": {
-              "$ref": "#/definitions/ExternalAgentConfigImportParams"
-            }
-          },
-          "required": [
-            "id",
-            "method",
-            "params"
-          ],
-          "title": "ExternalAgentConfig/importRequest",
-          "type": "object"
-        },
-        {
-          "properties": {
-            "id": {
-              "$ref": "#/definitions/RequestId"
-            },
-            "method": {
-              "enum": [
-                "externalAgentConfig/import/readHistories"
-              ],
-              "title": "ExternalAgentConfig/import/readHistoriesRequestMethod",
-              "type": "string"
-            },
-            "params": {
-              "type": "null"
-            }
-          },
-          "required": [
-            "id",
-            "method"
-          ],
-          "title": "ExternalAgentConfig/import/readHistoriesRequest",
-          "type": "object"
-        },
-        {
-          "properties": {
-            "id": {
-              "$ref": "#/definitions/RequestId"
-            },
-            "method": {
-              "enum": [
                 "config/value/write"
               ],
               "title": "Config/value/writeRequestMethod",
@@ -4300,7 +4157,7 @@
       "description": "Write stdin bytes to a running `command/exec` session, close stdin, or both.",
       "properties": {
         "closeStdin": {
-          "description": "Close input after queued bytes. Unix PTYs send canonical VEOF (including flushing a partial line); raw/disabled-VEOF terminals return an error. Terminal EOF is not a permanent pipe half-close.",
+          "description": "Close input after queued bytes. Unix PTYs drain accepted input and return an error because terminal input cannot be half-closed reliably. No terminal-control bytes are synthesized; use pipe stdin for EOF.",
           "type": "boolean"
         },
         "deltaBase64": {
@@ -4438,17 +4295,6 @@
         "declined"
       ],
       "type": "string"
-    },
-    "CommandMigration": {
-      "properties": {
-        "name": {
-          "type": "string"
-        }
-      },
-      "required": [
-        "name"
-      ],
-      "type": "object"
     },
     "ComputerUseRequirements": {
       "properties": {
@@ -5511,6 +5357,27 @@
           ],
           "title": "OutputTextContentItem",
           "type": "object"
+        },
+        {
+          "description": "Provider refusal content, retained as a distinct type in history and replay.",
+          "properties": {
+            "refusal": {
+              "type": "string"
+            },
+            "type": {
+              "enum": [
+                "refusal"
+              ],
+              "title": "RefusalContentItemType",
+              "type": "string"
+            }
+          },
+          "required": [
+            "refusal",
+            "type"
+          ],
+          "title": "RefusalContentItem",
+          "type": "object"
         }
       ]
     },
@@ -5965,302 +5832,6 @@
         }
       ]
     },
-    "ExternalAgentConfigDetectParams": {
-      "$schema": "http://json-schema.org/draft-07/schema#",
-      "properties": {
-        "cwds": {
-          "description": "Zero or more working directories to include for repo-scoped detection.",
-          "items": {
-            "type": "string"
-          },
-          "type": [
-            "array",
-            "null"
-          ]
-        },
-        "includeHome": {
-          "description": "If true, include detection under the user's home directory.",
-          "type": "boolean"
-        }
-      },
-      "title": "ExternalAgentConfigDetectParams",
-      "type": "object"
-    },
-    "ExternalAgentConfigDetectResponse": {
-      "$schema": "http://json-schema.org/draft-07/schema#",
-      "properties": {
-        "items": {
-          "items": {
-            "$ref": "#/definitions/ExternalAgentConfigMigrationItem"
-          },
-          "type": "array"
-        }
-      },
-      "required": [
-        "items"
-      ],
-      "title": "ExternalAgentConfigDetectResponse",
-      "type": "object"
-    },
-    "ExternalAgentConfigImportCompletedNotification": {
-      "$schema": "http://json-schema.org/draft-07/schema#",
-      "properties": {
-        "importId": {
-          "type": "string"
-        },
-        "itemTypeResults": {
-          "items": {
-            "$ref": "#/definitions/ExternalAgentConfigImportTypeResult"
-          },
-          "type": "array"
-        }
-      },
-      "required": [
-        "importId",
-        "itemTypeResults"
-      ],
-      "title": "ExternalAgentConfigImportCompletedNotification",
-      "type": "object"
-    },
-    "ExternalAgentConfigImportHistoriesReadResponse": {
-      "$schema": "http://json-schema.org/draft-07/schema#",
-      "properties": {
-        "data": {
-          "items": {
-            "$ref": "#/definitions/ExternalAgentConfigImportHistory"
-          },
-          "type": "array"
-        }
-      },
-      "required": [
-        "data"
-      ],
-      "title": "ExternalAgentConfigImportHistoriesReadResponse",
-      "type": "object"
-    },
-    "ExternalAgentConfigImportHistory": {
-      "properties": {
-        "completedAtMs": {
-          "format": "int64",
-          "type": "integer"
-        },
-        "failures": {
-          "items": {
-            "$ref": "#/definitions/ExternalAgentConfigImportItemTypeFailure"
-          },
-          "type": "array"
-        },
-        "importId": {
-          "type": "string"
-        },
-        "successes": {
-          "items": {
-            "$ref": "#/definitions/ExternalAgentConfigImportItemTypeSuccess"
-          },
-          "type": "array"
-        }
-      },
-      "required": [
-        "completedAtMs",
-        "failures",
-        "importId",
-        "successes"
-      ],
-      "type": "object"
-    },
-    "ExternalAgentConfigImportItemTypeFailure": {
-      "properties": {
-        "cwd": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "errorType": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "failureStage": {
-          "type": "string"
-        },
-        "itemType": {
-          "$ref": "#/definitions/ExternalAgentConfigMigrationItemType"
-        },
-        "message": {
-          "type": "string"
-        },
-        "source": {
-          "type": [
-            "string",
-            "null"
-          ]
-        }
-      },
-      "required": [
-        "failureStage",
-        "itemType",
-        "message"
-      ],
-      "type": "object"
-    },
-    "ExternalAgentConfigImportItemTypeSuccess": {
-      "properties": {
-        "cwd": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "itemType": {
-          "$ref": "#/definitions/ExternalAgentConfigMigrationItemType"
-        },
-        "source": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "target": {
-          "type": [
-            "string",
-            "null"
-          ]
-        }
-      },
-      "required": [
-        "itemType"
-      ],
-      "type": "object"
-    },
-    "ExternalAgentConfigImportParams": {
-      "$schema": "http://json-schema.org/draft-07/schema#",
-      "properties": {
-        "migrationItems": {
-          "items": {
-            "$ref": "#/definitions/ExternalAgentConfigMigrationItem"
-          },
-          "type": "array"
-        },
-        "source": {
-          "description": "Source product that produced the migration items. Missing means unspecified.",
-          "type": [
-            "string",
-            "null"
-          ]
-        }
-      },
-      "required": [
-        "migrationItems"
-      ],
-      "title": "ExternalAgentConfigImportParams",
-      "type": "object"
-    },
-    "ExternalAgentConfigImportProgressNotification": {
-      "$schema": "http://json-schema.org/draft-07/schema#",
-      "properties": {
-        "importId": {
-          "type": "string"
-        },
-        "itemTypeResults": {
-          "items": {
-            "$ref": "#/definitions/ExternalAgentConfigImportTypeResult"
-          },
-          "type": "array"
-        }
-      },
-      "required": [
-        "importId",
-        "itemTypeResults"
-      ],
-      "title": "ExternalAgentConfigImportProgressNotification",
-      "type": "object"
-    },
-    "ExternalAgentConfigImportResponse": {
-      "$schema": "http://json-schema.org/draft-07/schema#",
-      "properties": {
-        "importId": {
-          "type": "string"
-        }
-      },
-      "required": [
-        "importId"
-      ],
-      "title": "ExternalAgentConfigImportResponse",
-      "type": "object"
-    },
-    "ExternalAgentConfigImportTypeResult": {
-      "properties": {
-        "failures": {
-          "items": {
-            "$ref": "#/definitions/ExternalAgentConfigImportItemTypeFailure"
-          },
-          "type": "array"
-        },
-        "itemType": {
-          "$ref": "#/definitions/ExternalAgentConfigMigrationItemType"
-        },
-        "successes": {
-          "items": {
-            "$ref": "#/definitions/ExternalAgentConfigImportItemTypeSuccess"
-          },
-          "type": "array"
-        }
-      },
-      "required": [
-        "failures",
-        "itemType",
-        "successes"
-      ],
-      "type": "object"
-    },
-    "ExternalAgentConfigMigrationItem": {
-      "properties": {
-        "cwd": {
-          "description": "Null or empty means home-scoped migration; non-empty means repo-scoped migration.",
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "description": {
-          "type": "string"
-        },
-        "details": {
-          "anyOf": [
-            {
-              "$ref": "#/definitions/MigrationDetails"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "itemType": {
-          "$ref": "#/definitions/ExternalAgentConfigMigrationItemType"
-        }
-      },
-      "required": [
-        "description",
-        "itemType"
-      ],
-      "type": "object"
-    },
-    "ExternalAgentConfigMigrationItemType": {
-      "enum": [
-        "AGENTS_MD",
-        "CONFIG",
-        "SKILLS",
-        "PLUGINS",
-        "MCP_SERVER_CONFIG",
-        "SUBAGENTS",
-        "HOOKS",
-        "COMMANDS",
-        "SESSIONS"
-      ],
-      "type": "string"
-    },
     "FeedbackUploadParams": {
       "$schema": "http://json-schema.org/draft-07/schema#",
       "properties": {
@@ -6318,6 +5889,48 @@
         "threadId"
       ],
       "title": "FeedbackUploadResponse",
+      "type": "object"
+    },
+    "FileChangeEffect": {
+      "properties": {
+        "after": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "before": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "path": {
+          "$ref": "#/definitions/PathUri"
+        }
+      },
+      "required": [
+        "path"
+      ],
+      "type": "object"
+    },
+    "FileChangeEffects": {
+      "description": "Ordered committed endpoint receipts. `exact=false` means additional effects may be unknown; an empty list then is not proof that nothing changed.",
+      "properties": {
+        "changes": {
+          "items": {
+            "$ref": "#/definitions/FileChangeEffect"
+          },
+          "type": "array"
+        },
+        "exact": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "changes",
+        "exact"
+      ],
       "type": "object"
     },
     "FileChangePatchUpdatedNotification": {
@@ -6556,48 +6169,6 @@
           "type": "object"
         }
       ]
-    },
-    "FileChangeEffect": {
-      "properties": {
-        "after": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "before": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "path": {
-          "$ref": "#/definitions/PathUri"
-        }
-      },
-      "required": [
-        "path"
-      ],
-      "type": "object"
-    },
-    "FileChangeEffects": {
-      "description": "Ordered committed endpoint receipts. `exact=false` means additional effects may be unknown; an empty list then is not proof that nothing changed.",
-      "properties": {
-        "changes": {
-          "items": {
-            "$ref": "#/definitions/FileChangeEffect"
-          },
-          "type": "array"
-        },
-        "exact": {
-          "type": "boolean"
-        }
-      },
-      "required": [
-        "changes",
-        "exact"
-      ],
-      "type": "object"
     },
     "FileUpdateChange": {
       "properties": {
@@ -7634,17 +7205,6 @@
         "sourcePath",
         "timeoutSec",
         "trustStatus"
-      ],
-      "type": "object"
-    },
-    "HookMigration": {
-      "properties": {
-        "name": {
-          "type": "string"
-        }
-      },
-      "required": [
-        "name"
       ],
       "type": "object"
     },
@@ -8906,17 +8466,6 @@
       ],
       "type": "object"
     },
-    "McpServerMigration": {
-      "properties": {
-        "name": {
-          "type": "string"
-        }
-      },
-      "required": [
-        "name"
-      ],
-      "type": "object"
-    },
     "McpServerOauthLoginCompletedNotification": {
       "$schema": "http://json-schema.org/draft-07/schema#",
       "properties": {
@@ -9340,60 +8889,6 @@
           "type": "string"
         }
       ]
-    },
-    "MigrationDetails": {
-      "properties": {
-        "commands": {
-          "default": [],
-          "items": {
-            "$ref": "#/definitions/CommandMigration"
-          },
-          "type": "array"
-        },
-        "hooks": {
-          "default": [],
-          "items": {
-            "$ref": "#/definitions/HookMigration"
-          },
-          "type": "array"
-        },
-        "mcpServers": {
-          "default": [],
-          "items": {
-            "$ref": "#/definitions/McpServerMigration"
-          },
-          "type": "array"
-        },
-        "plugins": {
-          "default": [],
-          "items": {
-            "$ref": "#/definitions/PluginsMigration"
-          },
-          "type": "array"
-        },
-        "sessions": {
-          "default": [],
-          "items": {
-            "$ref": "#/definitions/SessionMigration"
-          },
-          "type": "array"
-        },
-        "skills": {
-          "default": [],
-          "items": {
-            "$ref": "#/definitions/SkillMigration"
-          },
-          "type": "array"
-        },
-        "subagents": {
-          "default": [],
-          "items": {
-            "$ref": "#/definitions/SubagentMigration"
-          },
-          "type": "array"
-        }
-      },
-      "type": "object"
     },
     "ModeKind": {
       "description": "Initial collaboration mode to use when the TUI starts.",
@@ -11435,24 +10930,6 @@
       "title": "PluginUninstallResponse",
       "type": "object"
     },
-    "PluginsMigration": {
-      "properties": {
-        "marketplaceName": {
-          "type": "string"
-        },
-        "pluginNames": {
-          "items": {
-            "type": "string"
-          },
-          "type": "array"
-        }
-      },
-      "required": [
-        "marketplaceName",
-        "pluginNames"
-      ],
-      "type": "object"
-    },
     "ProcessExitedNotification": {
       "$schema": "http://json-schema.org/draft-07/schema#",
       "description": "Final process exit notification for `process/spawn`.",
@@ -12926,6 +12403,7 @@
         },
         {
           "properties": {
+            "error": true,
             "id": {
               "type": [
                 "string",
@@ -12943,7 +12421,10 @@
               ]
             },
             "result": {
-              "type": "string"
+              "type": [
+                "string",
+                "null"
+              ]
             },
             "revised_prompt": {
               "type": [
@@ -12963,7 +12444,6 @@
             }
           },
           "required": [
-            "result",
             "status",
             "type"
           ],
@@ -13615,46 +13095,6 @@
           "properties": {
             "method": {
               "enum": [
-                "thread/goal/updated"
-              ],
-              "title": "Thread/goal/updatedNotificationMethod",
-              "type": "string"
-            },
-            "params": {
-              "$ref": "#/definitions/ThreadGoalUpdatedNotification"
-            }
-          },
-          "required": [
-            "method",
-            "params"
-          ],
-          "title": "Thread/goal/updatedNotification",
-          "type": "object"
-        },
-        {
-          "properties": {
-            "method": {
-              "enum": [
-                "thread/goal/cleared"
-              ],
-              "title": "Thread/goal/clearedNotificationMethod",
-              "type": "string"
-            },
-            "params": {
-              "$ref": "#/definitions/ThreadGoalClearedNotification"
-            }
-          },
-          "required": [
-            "method",
-            "params"
-          ],
-          "title": "Thread/goal/clearedNotification",
-          "type": "object"
-        },
-        {
-          "properties": {
-            "method": {
-              "enum": [
                 "project/changed"
               ],
               "title": "Project/changedNotificationMethod",
@@ -14239,46 +13679,6 @@
           "properties": {
             "method": {
               "enum": [
-                "externalAgentConfig/import/progress"
-              ],
-              "title": "ExternalAgentConfig/import/progressNotificationMethod",
-              "type": "string"
-            },
-            "params": {
-              "$ref": "#/definitions/ExternalAgentConfigImportProgressNotification"
-            }
-          },
-          "required": [
-            "method",
-            "params"
-          ],
-          "title": "ExternalAgentConfig/import/progressNotification",
-          "type": "object"
-        },
-        {
-          "properties": {
-            "method": {
-              "enum": [
-                "externalAgentConfig/import/completed"
-              ],
-              "title": "ExternalAgentConfig/import/completedNotificationMethod",
-              "type": "string"
-            },
-            "params": {
-              "$ref": "#/definitions/ExternalAgentConfigImportCompletedNotification"
-            }
-          },
-          "required": [
-            "method",
-            "params"
-          ],
-          "title": "ExternalAgentConfig/import/completedNotification",
-          "type": "object"
-        },
-        {
-          "properties": {
-            "method": {
-              "enum": [
                 "fs/changed"
               ],
               "title": "Fs/changedNotificationMethod",
@@ -14616,27 +14016,6 @@
       "title": "ServerRequestResolvedNotification",
       "type": "object"
     },
-    "SessionMigration": {
-      "properties": {
-        "cwd": {
-          "type": "string"
-        },
-        "path": {
-          "type": "string"
-        },
-        "title": {
-          "type": [
-            "string",
-            "null"
-          ]
-        }
-      },
-      "required": [
-        "cwd",
-        "path"
-      ],
-      "type": "object"
-    },
     "SessionSource": {
       "oneOf": [
         {
@@ -14834,17 +14213,6 @@
         "name",
         "path",
         "scope"
-      ],
-      "type": "object"
-    },
-    "SkillMigration": {
-      "properties": {
-        "name": {
-          "type": "string"
-        }
-      },
-      "required": [
-        "name"
       ],
       "type": "object"
     },
@@ -15186,17 +14554,6 @@
           "type": "object"
         }
       ]
-    },
-    "SubagentMigration": {
-      "properties": {
-        "name": {
-          "type": "string"
-        }
-      },
-      "required": [
-        "name"
-      ],
-      "type": "object"
     },
     "SurfacedToolResult": {
       "description": "Authoritative typed tool result surfaced as the terminal result of a turn. `canonical_message`, when present, is owner-authored and may be copied unchanged into legacy last-message consumers. `value` is never rendered into synthetic assistant prose by the host.",
@@ -15763,208 +15120,6 @@
         "thread"
       ],
       "title": "ThreadForkResponse",
-      "type": "object"
-    },
-    "ThreadGoal": {
-      "properties": {
-        "createdAt": {
-          "format": "int64",
-          "type": "integer"
-        },
-        "objective": {
-          "type": "string"
-        },
-        "status": {
-          "$ref": "#/definitions/ThreadGoalStatus"
-        },
-        "threadId": {
-          "type": "string"
-        },
-        "timeUsedSeconds": {
-          "format": "int64",
-          "type": "integer"
-        },
-        "tokenBudget": {
-          "format": "int64",
-          "type": [
-            "integer",
-            "null"
-          ]
-        },
-        "tokensUsed": {
-          "format": "int64",
-          "type": "integer"
-        },
-        "updatedAt": {
-          "format": "int64",
-          "type": "integer"
-        }
-      },
-      "required": [
-        "createdAt",
-        "objective",
-        "status",
-        "threadId",
-        "timeUsedSeconds",
-        "tokensUsed",
-        "updatedAt"
-      ],
-      "type": "object"
-    },
-    "ThreadGoalClearParams": {
-      "$schema": "http://json-schema.org/draft-07/schema#",
-      "properties": {
-        "threadId": {
-          "type": "string"
-        }
-      },
-      "required": [
-        "threadId"
-      ],
-      "title": "ThreadGoalClearParams",
-      "type": "object"
-    },
-    "ThreadGoalClearResponse": {
-      "$schema": "http://json-schema.org/draft-07/schema#",
-      "properties": {
-        "cleared": {
-          "type": "boolean"
-        }
-      },
-      "required": [
-        "cleared"
-      ],
-      "title": "ThreadGoalClearResponse",
-      "type": "object"
-    },
-    "ThreadGoalClearedNotification": {
-      "$schema": "http://json-schema.org/draft-07/schema#",
-      "properties": {
-        "threadId": {
-          "type": "string"
-        }
-      },
-      "required": [
-        "threadId"
-      ],
-      "title": "ThreadGoalClearedNotification",
-      "type": "object"
-    },
-    "ThreadGoalGetParams": {
-      "$schema": "http://json-schema.org/draft-07/schema#",
-      "properties": {
-        "threadId": {
-          "type": "string"
-        }
-      },
-      "required": [
-        "threadId"
-      ],
-      "title": "ThreadGoalGetParams",
-      "type": "object"
-    },
-    "ThreadGoalGetResponse": {
-      "$schema": "http://json-schema.org/draft-07/schema#",
-      "properties": {
-        "goal": {
-          "anyOf": [
-            {
-              "$ref": "#/definitions/ThreadGoal"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        }
-      },
-      "title": "ThreadGoalGetResponse",
-      "type": "object"
-    },
-    "ThreadGoalSetParams": {
-      "$schema": "http://json-schema.org/draft-07/schema#",
-      "properties": {
-        "objective": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "replace": {
-          "description": "Replace the goal atomically, resetting usage and its identity. Requires an objective.",
-          "type": "boolean"
-        },
-        "status": {
-          "anyOf": [
-            {
-              "$ref": "#/definitions/ThreadGoalStatus"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "threadId": {
-          "type": "string"
-        },
-        "tokenBudget": {
-          "format": "int64",
-          "type": [
-            "integer",
-            "null"
-          ]
-        }
-      },
-      "required": [
-        "threadId"
-      ],
-      "title": "ThreadGoalSetParams",
-      "type": "object"
-    },
-    "ThreadGoalSetResponse": {
-      "$schema": "http://json-schema.org/draft-07/schema#",
-      "properties": {
-        "goal": {
-          "$ref": "#/definitions/ThreadGoal"
-        }
-      },
-      "required": [
-        "goal"
-      ],
-      "title": "ThreadGoalSetResponse",
-      "type": "object"
-    },
-    "ThreadGoalStatus": {
-      "enum": [
-        "active",
-        "paused",
-        "blocked",
-        "usageLimited",
-        "budgetLimited",
-        "complete"
-      ],
-      "type": "string"
-    },
-    "ThreadGoalUpdatedNotification": {
-      "$schema": "http://json-schema.org/draft-07/schema#",
-      "properties": {
-        "goal": {
-          "$ref": "#/definitions/ThreadGoal"
-        },
-        "threadId": {
-          "type": "string"
-        },
-        "turnId": {
-          "type": [
-            "string",
-            "null"
-          ]
-        }
-      },
-      "required": [
-        "goal",
-        "threadId"
-      ],
-      "title": "ThreadGoalUpdatedNotification",
       "type": "object"
     },
     "ThreadHistoryMode": {
@@ -16728,6 +15883,7 @@
         },
         {
           "properties": {
+            "error": true,
             "id": {
               "type": "string"
             },
@@ -16743,7 +15899,10 @@
               "description": "Separate image-model receipt; never add these tokens to text inference."
             },
             "result": {
-              "type": "string"
+              "type": [
+                "string",
+                "null"
+              ]
             },
             "revisedPrompt": {
               "type": [
@@ -16774,7 +15933,6 @@
           },
           "required": [
             "id",
-            "result",
             "status",
             "type"
           ],
@@ -19434,7 +18592,7 @@
         },
         "mutation_revision": {
           "format": "uint64",
-          "minimum": 0,
+          "minimum": 0.0,
           "type": "integer"
         },
         "plan_revision": {
@@ -19448,7 +18606,7 @@
         },
         "schema_version": {
           "format": "uint32",
-          "minimum": 0,
+          "minimum": 0.0,
           "type": "integer"
         },
         "terminal_action": {
@@ -20136,13 +19294,6 @@
         "suppressedDeterministicContinuationCount": {
           "default": 0,
           "description": "Authoritative number of model boundaries suppressed by accepted deterministic-continuation receipts. A receipt whose `suppressed_continuation_count` is N contributes N, not one. Invalid, rejected, and zero-count receipts contribute nothing. This counter is independent of `generations_by_disposition`.",
-          "format": "uint32",
-          "minimum": 0.0,
-          "type": "integer"
-        },
-        "suppressedValidationOutputCount": {
-          "default": 0,
-          "description": "Validation tool outputs intentionally suppressed by admission policy.",
           "format": "uint32",
           "minimum": 0.0,
           "type": "integer"

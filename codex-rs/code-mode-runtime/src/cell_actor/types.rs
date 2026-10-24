@@ -4,6 +4,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::Mutex;
 
+use codex_code_mode_protocol::CancellationCause;
 use codex_code_mode_protocol::NestedCancellation;
 use serde_json::Value as JsonValue;
 use tokio::sync::mpsc;
@@ -146,6 +147,7 @@ pub(crate) struct CellState {
     phase: Mutex<CellPhase>,
     terminal_event: Mutex<Option<CellEvent>>,
     cancellation_token: CancellationToken,
+    tool_cancellation: NestedCancellation,
     closed: CancellationToken,
     close_failed: std::sync::atomic::AtomicBool,
 }
@@ -186,10 +188,15 @@ pub(crate) enum ObservationDelivery {
 
 impl CellState {
     pub(crate) fn new(cancellation_token: CancellationToken) -> Self {
+        Self::with_cancellation(NestedCancellation::new(cancellation_token))
+    }
+
+    pub(crate) fn with_cancellation(tool_cancellation: NestedCancellation) -> Self {
         Self {
             phase: Mutex::new(CellPhase::Running),
             terminal_event: Mutex::new(None),
-            cancellation_token,
+            cancellation_token: tool_cancellation.token().clone(),
+            tool_cancellation,
             closed: CancellationToken::new(),
             close_failed: std::sync::atomic::AtomicBool::new(false),
         }
@@ -215,7 +222,7 @@ impl CellState {
             CellPhase::Running => {
                 let (response_tx, response_rx) = oneshot::channel();
                 *phase = CellPhase::Terminating { response_tx };
-                self.cancellation_token.cancel();
+                self.tool_cancellation.cancel_with(CancellationCause::RuntimeShutdown);
                 response_event(response_rx)
             }
             CellPhase::Terminating { response_tx } => {
@@ -228,7 +235,7 @@ impl CellState {
             } => {
                 let event = prepend_initial_yield(event, pending_initial_yield_items);
                 *phase = CellPhase::CompletionClaimed(event.clone());
-                self.cancellation_token.cancel();
+                self.tool_cancellation.cancel_with(CancellationCause::RuntimeShutdown);
                 ready_event(event)
             }
             CellPhase::CompletionClaimed(event) => {
@@ -303,7 +310,7 @@ impl CellState {
         match response_tx.send(Ok(event)) {
             Ok(()) => {
                 self.record_terminal_event(&terminal_event);
-                self.cancellation_token.cancel();
+                self.tool_cancellation.cancel_with(CancellationCause::RuntimeShutdown);
                 CompletionDelivery::Delivered
             }
             Err(Ok(event)) => {
@@ -386,7 +393,7 @@ impl CellState {
                 match response_tx.send(Ok(delivered_event)) {
                     Ok(()) => {
                         self.record_terminal_event(&terminal_event);
-                        self.cancellation_token.cancel();
+                        self.tool_cancellation.cancel_with(CancellationCause::RuntimeShutdown);
                         ObservationDelivery::Delivered
                     }
                     Err(Ok(_)) => {
@@ -443,7 +450,7 @@ impl CellState {
         if let Some(event) = observer_event.as_ref() {
             self.record_terminal_event(event);
         }
-        self.cancellation_token.cancel();
+        self.tool_cancellation.cancel_with(CancellationCause::RuntimeShutdown);
         observer_event
     }
 
@@ -469,11 +476,18 @@ impl CellState {
             .phase
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = CellPhase::Tombstone;
-        self.cancellation_token.cancel();
+        self.tool_cancellation.cancel_with(CancellationCause::RuntimeShutdown);
     }
 
     pub(crate) fn cancellation_token(&self) -> CancellationToken {
         self.cancellation_token.clone()
+    }
+
+    pub(crate) fn tool_cancellation(&self) -> NestedCancellation {
+        // Callback cleanup must not cancel the cell before its completion can
+        // commit. The actor owns this one child scope for all of its callbacks;
+        // explicit cell/session cancellation still flows down with its cause.
+        self.tool_cancellation.child(self.cancellation_token.child_token())
     }
 
     pub(crate) fn mark_closed(&self) {
@@ -557,4 +571,52 @@ fn ready_event(event: CellEvent) -> CellEventFuture {
 
 fn closed_event() -> CellEventFuture {
     Box::pin(async { Err(CellError::Closed) })
+}
+
+#[cfg(test)]
+#[test]
+fn cell_and_session_shutdown_publish_cause_before_waking_callbacks() {
+    for session_shutdown in [false, true] {
+        let session = NestedCancellation::new(CancellationToken::new());
+        let state = CellState::with_cancellation(session.child(session.token().child_token()));
+        let tools = state.tool_cancellation();
+        let callback = tools.child(tools.token().child_token());
+        let exported = callback.cause_cell();
+        if session_shutdown {
+            session.cancel_with(CancellationCause::RuntimeShutdown);
+        } else {
+            drop(state.request_termination());
+        }
+        assert!(callback.is_cancelled());
+        assert_eq!(exported.get(), Some(&CancellationCause::RuntimeShutdown));
+        callback.cancel_with(CancellationCause::NestedDeadline);
+        assert_eq!(callback.cause(), Some(CancellationCause::RuntimeShutdown));
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn callback_cleanup_preserves_the_cells_natural_completion_authority() {
+    let session = NestedCancellation::new(CancellationToken::new());
+    let state = CellState::with_cancellation(session.child(session.token().child_token()));
+    let callbacks = state.tool_cancellation();
+    let call = callbacks.child(callbacks.token().child_token());
+    callbacks.cancel_with(CancellationCause::RuntimeShutdown);
+    assert!(call.is_cancelled());
+    assert_eq!(call.cause(), Some(CancellationCause::RuntimeShutdown));
+    assert!(!state.cancellation_token().is_cancelled());
+    assert!(!session.is_cancelled());
+    assert_eq!(session.cause(), None);
+    assert!(matches!(
+        state.commit_completion(
+            CellEvent::Completed {
+                content_items: Vec::new(),
+                error_text: None,
+                output_loss: None,
+            },
+            None,
+            || {},
+        ),
+        CompletionCommit::Committed
+    ));
 }

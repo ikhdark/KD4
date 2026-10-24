@@ -414,76 +414,17 @@ pub struct ToolOutputProjectionJsonPointer {
     pub pointer: String,
 }
 
-fn json_trace_size_bound(value: &JsonValue, limit: usize, depth: usize) -> Option<usize> {
-    if depth > 64 {
-        return None;
-    }
-    let string_size = |value: &str| value.len().checked_mul(6)?.checked_add(2);
-    let size = match value {
-        JsonValue::Null => 4,
-        JsonValue::Bool(_) => 5,
-        JsonValue::Number(number) => {
-            struct Counter {
-                used: usize,
-                limit: usize,
-            }
-            impl std::fmt::Write for Counter {
-                fn write_str(&mut self, value: &str) -> std::fmt::Result {
-                    self.used = self
-                        .used
-                        .checked_add(value.len())
-                        .filter(|used| *used <= self.limit)
-                        .ok_or(std::fmt::Error)?;
-                    Ok(())
-                }
-            }
-            let mut counter = Counter { used: 0, limit };
-            std::fmt::write(&mut counter, format_args!("{number}")).ok()?;
-            counter.used
-        }
-        JsonValue::String(value) => string_size(value)?,
-        JsonValue::Array(values) => {
-            let mut size = 2_usize;
-            for value in values {
-                size = size.checked_add(1)?.checked_add(json_trace_size_bound(
-                    value,
-                    limit.checked_sub(size)?,
-                    depth + 1,
-                )?)?;
-                if size > limit {
-                    return None;
-                }
-            }
-            size
-        }
-        JsonValue::Object(values) => {
-            let mut size = 2_usize;
-            for (key, value) in values {
-                size = size.checked_add(string_size(key)?)?.checked_add(2)?;
-                size = size.checked_add(json_trace_size_bound(
-                    value,
-                    limit.checked_sub(size)?,
-                    depth + 1,
-                )?)?;
-                if size > limit {
-                    return None;
-                }
-            }
-            size
-        }
-    };
-    (size <= limit).then_some(size)
-}
 
 /// Model-facing output contract returned by executable tool runtimes.
 pub trait ToolOutput: Send {
-    /// Allocation-free upper bound for optional trace result materialization.
-    /// Unknown producers opt out; this never changes model-facing output.
-    fn trace_detail_size_bound(&self, _limit: usize) -> Option<usize> {
-        None
-    }
 
     fn log_preview(&self) -> String;
+
+    /// Exact UTF-8 byte and line counts for `log_preview`, when already known.
+    /// Returning `None` preserves the existing preview-based logging path.
+    fn log_output_stats(&self) -> Option<(usize, usize)> {
+        None
+    }
 
     fn success_for_logging(&self) -> bool;
 
@@ -551,6 +492,12 @@ pub trait ToolOutput: Send {
     /// Host delivery status, distinct from execution success and output text.
     fn model_delivery_unavailable(&self) -> bool {
         false
+    }
+
+    /// Bounded host settlement notice that must survive an already-built model
+    /// projection. This does not replace the producer's canonical result.
+    fn model_delivery_notice(&self) -> Option<&str> {
+        None
     }
 
     /// Returns the exact producer result before any model-facing rendering.
@@ -629,12 +576,13 @@ impl<T> ToolOutput for Box<T>
 where
     T: ToolOutput + ?Sized,
 {
-    fn trace_detail_size_bound(&self, limit: usize) -> Option<usize> {
-        (**self).trace_detail_size_bound(limit)
-    }
 
     fn log_preview(&self) -> String {
         (**self).log_preview()
+    }
+
+    fn log_output_stats(&self) -> Option<(usize, usize)> {
+        (**self).log_output_stats()
     }
 
     fn success_for_logging(&self) -> bool {
@@ -1001,7 +949,6 @@ fn essential_projection_fields_bounded(
                                 return Some((key.clone(), value.clone()));
                             }
                         }
-                        return None;
                     }
                     *remaining -= key_bytes;
                     let nested = essential_projection_fields_bounded(value, depth + 1, remaining);
@@ -1135,15 +1082,6 @@ fn is_essential_key(key: &str) -> bool {
 }
 
 impl ToolOutput for JsonToolOutput {
-    fn trace_detail_size_bound(&self, limit: usize) -> Option<usize> {
-        Some(
-            json_trace_size_bound(&self.value, limit, 0)?.max(json_trace_size_bound(
-                self.model_value.as_ref().unwrap_or(&self.value),
-                limit,
-                0,
-            )?),
-        )
-    }
 
     fn code_mode_failure_is_error(&self) -> bool {
         !self.code_mode_failure_as_data
@@ -1182,7 +1120,16 @@ impl ToolOutput for JsonToolOutput {
         if let Some(signal) = &self.sampling_signal {
             return Some(signal.clone());
         }
-        if self.outcome_for_logging() == ToolOutputOutcome::Success {
+        let context = self.outcome_context();
+        let failure_evidence = match context.outcome {
+            ToolOutputOutcome::Failure | ToolOutputOutcome::TimedOut => true,
+            ToolOutputOutcome::Skipped => {
+                context.skip_disposition
+                    == Some(ToolOutputSkipDisposition::BlockingRequiredOperation)
+            }
+            ToolOutputOutcome::Success | ToolOutputOutcome::Yielded => false,
+        };
+        if !failure_evidence {
             return None;
         }
         self.value
@@ -1242,9 +1189,23 @@ impl ToolOutput for JsonToolOutput {
 
 impl ToolOutput for codex_protocol::mcp::CallToolResult {
     fn log_preview(&self) -> String {
+        if self.structured_content.as_ref().is_none_or(JsonValue::is_null)
+            && self.content.iter().all(|item| item["type"] == "text"
+                && item["text"].is_string()
+                && item.get("_meta").and_then(|meta| meta.get("codex/encryptedContent"))
+                    .and_then(JsonValue::as_bool) != Some(true))
+        {
+            // This provider shape is just a newline join. Borrow text directly
+            // instead of constructing and flattening a full provider payload.
+            let error = (!self.success()).then_some("MCP tool reported an error.");
+            return telemetry_preview_joined_parts(error.into_iter().chain(
+                self.content.iter().filter_map(|item| item["text"].as_str()),
+            )).unwrap_or_default();
+        }
         let output = self.as_function_call_output_payload();
-        let preview = output.body.to_text().unwrap_or_else(|| output.to_string());
-        telemetry_preview(&preview)
+        telemetry_preview_body(&output.body).unwrap_or_else(|| {
+            telemetry_preview_json(&output).unwrap_or_else(|error| error.to_string())
+        })
     }
 
     fn success_for_logging(&self) -> bool {
@@ -1321,7 +1282,8 @@ fn response_input_to_code_mode_result(response: ResponseInputItem) -> JsonValue 
                 .into_iter()
                 .map(|item| match item {
                     codex_protocol::models::ContentItem::InputText { text }
-                    | codex_protocol::models::ContentItem::OutputText { text } => {
+                    | codex_protocol::models::ContentItem::OutputText { text }
+                    | codex_protocol::models::ContentItem::Refusal { refusal: text } => {
                         FunctionCallOutputContentItem::InputText { text }
                     }
                     codex_protocol::models::ContentItem::InputImage { image_url, detail } => {
@@ -1382,6 +1344,81 @@ fn content_items_to_code_mode_result(items: &[FunctionCallOutputContentItem]) ->
     JsonValue::String(output)
 }
 
+/// Render only the prefix telemetry can retain, without flattening the body.
+pub fn telemetry_preview_body(body: &FunctionCallOutputBody) -> Option<String> {
+    match body {
+        FunctionCallOutputBody::Text(text) => Some(telemetry_preview(text)),
+        FunctionCallOutputBody::ContentItems(items) => telemetry_preview_text_parts(
+            items.iter().filter_map(|item| match item {
+                FunctionCallOutputContentItem::InputText { text } => Some(text.as_str()),
+                _ => None,
+            }),
+        ),
+    }
+}
+
+pub fn telemetry_preview_text_parts<'a>(
+    parts: impl IntoIterator<Item = &'a str>,
+) -> Option<String> {
+    telemetry_preview_joined_parts(parts.into_iter().filter(|part| !part.trim().is_empty()))
+}
+
+fn telemetry_preview_joined_parts<'a>(
+    parts: impl IntoIterator<Item = &'a str>,
+) -> Option<String> {
+    // Four extra bytes admit any UTF-8 character straddling the preview limit
+    // and let the existing formatter distinguish a truncated prefix exactly.
+    let limit = TELEMETRY_PREVIEW_MAX_BYTES + 4;
+    let mut prefix = String::with_capacity(limit);
+    let mut found = false;
+    for part in parts {
+        if found {
+            prefix.push('\n');
+        }
+        found = true;
+        let available = limit.saturating_sub(prefix.len());
+        prefix.push_str(&part[..part.floor_char_boundary(available.min(part.len()))]);
+        if prefix.len() >= TELEMETRY_PREVIEW_MAX_BYTES + 1 {
+            break;
+        }
+    }
+    found.then(|| telemetry_preview(&prefix))
+}
+
+/// Stop JSON serialization once enough bytes exist to reproduce the preview.
+pub fn telemetry_preview_json(value: &impl Serialize) -> Result<String, serde_json::Error> {
+    struct PrefixWriter {
+        bytes: Vec<u8>,
+        overflowed: bool,
+    }
+    impl std::io::Write for PrefixWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            let available = (TELEMETRY_PREVIEW_MAX_BYTES + 4).saturating_sub(self.bytes.len());
+            self.bytes.extend_from_slice(&bytes[..bytes.len().min(available)]);
+            if bytes.len() > available {
+                self.overflowed = true;
+                return Err(std::io::Error::other("telemetry prefix complete"));
+            }
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut writer = PrefixWriter {
+        bytes: Vec::with_capacity(TELEMETRY_PREVIEW_MAX_BYTES + 4),
+        overflowed: false,
+    };
+    let result = serde_json::to_writer(&mut writer, value);
+    if !writer.overflowed {
+        result?;
+    }
+    // A partial final code point is beyond the retained preview boundary.
+    let prefix = String::from_utf8_lossy(&writer.bytes);
+    Ok(telemetry_preview(&prefix))
+}
+
 pub fn telemetry_preview(content: &str) -> String {
     let truncated_slice = &content[..content.floor_char_boundary(TELEMETRY_PREVIEW_MAX_BYTES)];
     let truncated_by_bytes = truncated_slice.len() < content.len();
@@ -1428,6 +1465,60 @@ pub fn telemetry_preview(content: &str) -> String {
 #[cfg(test)]
 mod canonical_tests {
     use super::*;
+
+    #[test]
+    fn oversized_essential_containers_preserve_nested_controls() {
+        let controls = serde_json::json!({"status":"failed","nextCursor":"page-2","complete":false,"task_id":"task-1"});
+        let mut inner = controls.clone();
+        inner["payload"] = JsonValue::String("x".repeat(3000));
+        for wrapper in ["state", "error", "gates", "result"] {
+            let mut value = serde_json::json!({});
+            value[wrapper] = inner.clone();
+            let mut expected = serde_json::json!({});
+            expected[wrapper] = controls.clone();
+            let output = JsonToolOutput::new(value.clone());
+            assert_eq!(
+                output.projection_metadata().unwrap().essential_inline,
+                expected
+            );
+            assert_eq!(output.value(), &value);
+        }
+        let mut items = vec![serde_json::json!({"payload":"x".repeat(1000)}); 17];
+        items[15] = controls.clone();
+        let projected = essential_projection_fields(&serde_json::json!({"gates":items}));
+        assert_eq!(projected["gates"].as_array().unwrap().len(), 17);
+        assert_eq!(projected["gates"][15], controls);
+        assert!(projected["gates"][0].is_null());
+        assert!(projected.to_string().len() <= 8192);
+    }
+
+    #[test]
+    fn automatic_failure_signals_respect_skip_disposition() {
+        for disposition in [
+            None,
+            Some(ToolOutputSkipDisposition::Deferred),
+            Some(ToolOutputSkipDisposition::Suppressed),
+            Some(ToolOutputSkipDisposition::NotApplicable),
+            Some(ToolOutputSkipDisposition::BlockingRequiredOperation),
+        ] {
+            let value = serde_json::json!({"failure_signature":"stable"});
+            let output = match disposition {
+                Some(disposition) => JsonToolOutput::skipped_with_disposition(value, disposition),
+                None => JsonToolOutput::skipped(value),
+            };
+            assert_eq!(
+                output.sampling_request_signal().is_some(),
+                disposition == Some(ToolOutputSkipDisposition::BlockingRequiredOperation)
+            );
+            let explicit = serde_json::json!({"owner":"explicit"});
+            assert_eq!(
+                output
+                    .with_sampling_request_signal(explicit.clone())
+                    .sampling_request_signal(),
+                Some(explicit)
+            );
+        }
+    }
 
     #[test]
     fn essential_fields_preserve_case_insensitive_controls_and_exact_id_rules() {
@@ -1902,31 +1993,6 @@ mod canonical_tests {
                 "tools": [{"name": "lookup"}],
                 "omitted_result_count": 4,
             })
-        );
-    }
-}
-#[cfg(test)]
-mod trace_byte_budget_regressions {
-    use super::*;
-
-    #[test]
-    fn trace_preflight_does_not_serialize_or_clone_an_oversized_result() {
-        let output = JsonToolOutput::new(serde_json::json!({"text": "x".repeat(2 * 1024 * 1024)}));
-        assert!(output.serialized.get().is_none());
-        assert_eq!(output.trace_detail_size_bound(1024), None);
-        assert!(
-            output.serialized.get().is_none(),
-            "admission must precede serialization"
-        );
-        let value = serde_json::json!({"text":"\"\\\n", "count": 0});
-        let output = JsonToolOutput::new(value.clone());
-        let bound = output.trace_detail_size_bound(1024).unwrap();
-        assert!(bound >= serde_json::to_vec(&value).unwrap().len());
-        assert_eq!(
-            output.code_mode_result(&ToolPayload::Function {
-                arguments: "{}".into()
-            }),
-            value
         );
     }
 }

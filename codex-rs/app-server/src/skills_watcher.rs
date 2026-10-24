@@ -16,6 +16,7 @@ use codex_core::config::Config;
 use codex_core::skills::SkillsLoadInput;
 use codex_core::skills::SkillsService;
 use codex_file_watcher::FileWatcher;
+use codex_file_watcher::FileWatcherEvent;
 use codex_file_watcher::FileWatcherSubscriber;
 use codex_file_watcher::Receiver;
 use codex_file_watcher::ThrottledWatchReceiver;
@@ -320,7 +321,7 @@ impl SkillsWatcher {
             'watch: loop {
                 let event = tokio::select! {
                     _ = shutdown_token.cancelled() => break,
-                    event = rx.recv_with_observer(|_| skills_service.clear_cache()) => event,
+                    event = rx.recv_with_observer(|event| invalidate_changed_skills(&skills_service, event)) => event,
                 };
                 if event.is_none() {
                     skills_service.disable_cache_reuse();
@@ -336,7 +337,7 @@ impl SkillsWatcher {
                         biased;
                         _ = shutdown_token.cancelled() => break 'watch,
                         _ = &mut notification => break,
-                        event = rx.recv_with_observer(|_| skills_service.clear_cache()) => {
+                        event = rx.recv_with_observer(|event| invalidate_changed_skills(&skills_service, event)) => {
                             if event.is_none() {
                                 skills_service.disable_cache_reuse();
                                 shutdown_token.cancel();
@@ -353,9 +354,59 @@ impl SkillsWatcher {
     }
 }
 
+fn invalidate_changed_skills(skills_service: &SkillsService, event: &FileWatcherEvent) {
+    // Registered skill roots are absolute. FileWatcher maps native reports back
+    // into that requested namespace, including roots removed or renamed. Keep
+    // the fail-safe invalidation for overflow or unattributable input.
+    if event.rescan_required || event.paths.is_empty() || event.paths.iter().any(|path| !path.is_absolute()) {
+        skills_service.clear_cache();
+    } else {
+        skills_service.invalidate_roots(&event.paths);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn scoped_events_keep_unrelated_skill_snapshots_warm_and_overflow_cools_them() {
+        let home = tempfile::tempdir().unwrap();
+        let repos = tempfile::tempdir().unwrap();
+        let service = SkillsService::new(AbsolutePathBuf::from_absolute_path(home.path()).unwrap(), false);
+        let mut inputs = Vec::new();
+        for name in ["a", "b"] {
+            let cwd = repos.path().join(name);
+            let skill = cwd.join(".agents/skills").join(name).join("SKILL.md");
+            std::fs::create_dir_all(skill.parent().unwrap()).unwrap();
+            std::fs::write(&skill, format!("---\nname: {name}\ndescription: initial\n---\nBody\n")).unwrap();
+            inputs.push(SkillsLoadInput::new(
+                AbsolutePathBuf::from_absolute_path(cwd).unwrap(),
+                Vec::new(),
+                codex_config::ConfigLayerStack::default(),
+                false,
+            ));
+        }
+        let a = service.snapshot_for_config(&inputs[0], None).await;
+        let b = service.snapshot_for_config(&inputs[1], None).await;
+        let path = repos.path().join("a/.agents/skills/a/SKILL.md");
+        std::fs::write(&path, "---\nname: a\ndescription: changed\n---\nBody\n").unwrap();
+        invalidate_changed_skills(&service, &FileWatcherEvent { paths: vec![path], rescan_required: false });
+        let fresh_a = service.snapshot_for_config(&inputs[0], None).await;
+        assert!(fresh_a.outcome().skills.iter().any(|skill| skill.name == "a" && skill.description == "changed"));
+        assert!(!std::ptr::eq(a.outcome(), fresh_a.outcome()));
+        let warm_b = service.snapshot_for_config(&inputs[1], None).await;
+        assert!(std::ptr::eq(b.outcome(), warm_b.outcome()));
+        for event in [
+            FileWatcherEvent { paths: Vec::new(), rescan_required: true },
+            FileWatcherEvent { paths: vec!["relative/SKILL.md".into()], rescan_required: false },
+        ] {
+            let before = service.snapshot_for_config(&inputs[1], None).await;
+            invalidate_changed_skills(&service, &event);
+            let after = service.snapshot_for_config(&inputs[1], None).await;
+            assert!(!std::ptr::eq(before.outcome(), after.outcome()), "ambiguous events must retain global freshness");
+        }
+    }
 
     #[tokio::test]
     async fn initialization_failure_retries_once_after_recovery_and_shutdown_stays_closed() {

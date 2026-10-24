@@ -10,9 +10,7 @@ use crate::session::session::Session;
 use crate::session::turn_context::TurnContext;
 use crate::state::SessionServices;
 use crate::tools::hook_names::HookToolName;
-use crate::tools::network_approval::NetworkApprovalSpec;
 use codex_file_system::FileSystemSandboxContext;
-use codex_network_proxy::NetworkProxy;
 use codex_protocol::approvals::ExecPolicyAmendment;
 use codex_protocol::approvals::NetworkApprovalContext;
 use codex_protocol::error::CodexErr;
@@ -37,7 +35,6 @@ use std::collections::HashMap;
 use std::fmt::Debug;
 use std::hash::Hash;
 use std::sync::Arc;
-use tokio_util::sync::CancellationToken;
 
 #[derive(Clone, Default, Debug)]
 pub(crate) struct ApprovalStore {
@@ -325,16 +322,6 @@ pub(crate) fn sandbox_permissions_preserving_denied_reads(
     }
 }
 
-pub(crate) fn managed_network_for_sandbox_permissions(
-    network: Option<&NetworkProxy>,
-    sandbox_permissions: SandboxPermissions,
-) -> Option<&NetworkProxy> {
-    if sandbox_permissions.requires_escalated_permissions() {
-        None
-    } else {
-        network
-    }
-}
 
 pub(crate) trait Approvable<Req> {
     type ApprovalKey: Hash + Eq + Clone + Debug + Serialize;
@@ -424,9 +411,6 @@ pub(crate) enum ToolError {
 }
 
 pub(crate) trait ToolRuntime<Req, Out>: Approvable<Req> + Sandboxable {
-    fn network_approval_spec(&self, _req: &Req, _ctx: &ToolCtx) -> Option<NetworkApprovalSpec> {
-        None
-    }
 
     fn sandbox_cwd<'a>(&self, _req: &'a Req) -> Option<&'a PathUri> {
         None
@@ -448,35 +432,21 @@ pub(crate) struct SandboxAttempt<'a> {
     pub permissions: &'a codex_protocol::models::PermissionProfile,
     /// Canonical permissions before this host materializes workspace roots.
     pub exec_server_permissions: &'a codex_protocol::models::PermissionProfile,
-    pub enforce_managed_network: bool,
     pub(crate) sandbox_cwd: &'a PathUri,
     pub(crate) workspace_roots: &'a [AbsolutePathBuf],
     pub windows_sandbox_level: codex_protocol::config_types::WindowsSandboxLevel,
     pub windows_sandbox_private_desktop: bool,
-    pub network_denial_cancellation_token: Option<CancellationToken>,
-    pub(crate) network_proxy: Option<&'a NetworkProxy>,
 }
 
 impl<'a> SandboxAttempt<'a> {
-    pub(crate) fn network_proxy<'b>(
-        &'b self,
-        fallback: Option<&'b NetworkProxy>,
-    ) -> Option<&'b NetworkProxy> {
-        fallback.map(|fallback| self.network_proxy.unwrap_or(fallback))
-    }
 
     pub async fn env_for(
         &self,
         command: SandboxCommand,
         options: ExecOptions,
-        network: Option<&NetworkProxy>,
-        environment_id: Option<&str>,
     ) -> Result<crate::sandboxing::ExecRequest, CodexErr> {
-        let network = self.network_proxy(network).cloned();
-        let environment_id = environment_id.map(str::to_owned);
         let permissions = self.permissions.clone();
         let sandbox = self.sandbox;
-        let enforce_managed_network = self.enforce_managed_network;
         let sandbox_cwd = self.sandbox_cwd.clone();
         let windows_sandbox_level = self.windows_sandbox_level;
         let windows_sandbox_private_desktop = self.windows_sandbox_private_desktop;
@@ -487,9 +457,6 @@ impl<'a> SandboxAttempt<'a> {
                 command,
                 permissions: &permissions,
                 sandbox,
-                enforce_managed_network,
-                environment_id: environment_id.as_deref(),
-                network: network.as_ref(),
                 sandbox_policy_cwd: &sandbox_cwd,
                 windows_sandbox_level,
                 windows_sandbox_private_desktop,
@@ -510,12 +477,8 @@ impl<'a> SandboxAttempt<'a> {
         &self,
         command: SandboxCommand,
         options: ExecOptions,
-        network: Option<&NetworkProxy>,
-        environment_id: Option<&str>,
         additional_permissions_uri: Option<&UriAdditionalPermissionProfile>,
     ) -> Result<crate::sandboxing::ExecRequest, CodexErr> {
-        let network = self.network_proxy(network);
-        let managed_network = command.managed_network.clone();
         let exec_server_permissions = effective_permission_profile_uri(
             self.exec_server_permissions,
             additional_permissions_uri,
@@ -525,9 +488,6 @@ impl<'a> SandboxAttempt<'a> {
             permissions: self.permissions,
             // The exec-server must receive the native command, not this host's wrapper.
             sandbox: SandboxType::None,
-            enforce_managed_network: self.enforce_managed_network,
-            environment_id,
-            network,
             sandbox_policy_cwd: self.sandbox_cwd,
             windows_sandbox_level: self.windows_sandbox_level,
             windows_sandbox_private_desktop: self.windows_sandbox_private_desktop,
@@ -539,7 +499,6 @@ impl<'a> SandboxAttempt<'a> {
             self.workspace_roots.to_vec(),
             self.codex_home.clone(),
         )?;
-        exec_request.exec_server_managed_network = managed_network;
         if self.sandbox_requested {
             exec_request.exec_server_sandbox = Some(FileSystemSandboxContext {
                 permissions: exec_server_permissions,
@@ -548,7 +507,6 @@ impl<'a> SandboxAttempt<'a> {
                 windows_sandbox_level: self.windows_sandbox_level,
                 windows_sandbox_private_desktop: self.windows_sandbox_private_desktop,
             });
-            exec_request.exec_server_enforce_managed_network = self.enforce_managed_network;
         }
         Ok(exec_request)
     }

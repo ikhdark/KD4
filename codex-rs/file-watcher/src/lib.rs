@@ -75,6 +75,8 @@ struct WatchState {
     subscribers: HashMap<SubscriberId, SubscriberState>,
     #[cfg(test)]
     actual_watch_path_resolution_count: usize,
+    #[cfg(test)]
+    before_registration_reconcile: Option<Box<dyn FnOnce() + Send + Sync>>,
 }
 
 struct SubscriberState {
@@ -764,7 +766,7 @@ impl FileWatcher {
             }
             return Err(notify::Error::generic("filesystem observer has terminated"));
         }
-        let newly_covered_paths = watched_paths
+        let mut newly_covered_paths = watched_paths
             .iter()
             .filter(|registration| {
                 !registration.key.namespace_guard
@@ -798,7 +800,7 @@ impl FileWatcher {
                     }))
             })
             .map(|registration| registration.key.requested.path.clone())
-            .collect();
+            .collect::<Vec<_>>();
         let mut committed = Vec::new();
 
         for registration in watched_paths {
@@ -860,6 +862,9 @@ impl FileWatcher {
                     }
                     subscriber.tx.mark_rescan_required();
                 }
+                if !registration.key.namespace_guard {
+                    newly_covered_paths.push(registration.key.requested.path.clone());
+                }
             }
             let actual = registration.actual.clone();
             let previous_counts = state
@@ -917,7 +922,108 @@ impl FileWatcher {
             committed.push(registration.key.clone());
         }
 
+        #[cfg(test)]
+        if let Some(hook) = state.before_registration_reconcile.take() {
+            hook();
+        }
+
+        // All requested namespace guards now have native coverage. Resolution
+        // before that coverage existed may have missed an alias retarget, even
+        // for a brand-new registration with no previous logical owner.
+        if let Err(err) = self.reconcile_registered_paths_locked(
+            &mut state,
+            subscriber_id,
+            watched_paths,
+            &mut newly_covered_paths,
+            &mut inner_guard,
+        ) {
+            for committed_watch in committed.iter().rev() {
+                self.unregister_path_locked(
+                    &mut state,
+                    subscriber_id,
+                    committed_watch,
+                    &mut inner_guard,
+                );
+            }
+            return Err(err);
+        }
+
+        newly_covered_paths.sort_unstable();
+        newly_covered_paths.dedup();
         Ok(newly_covered_paths)
+    }
+
+    fn reconcile_registered_paths_locked<'a>(
+        &'a self,
+        state: &mut WatchState,
+        subscriber_id: SubscriberId,
+        registrations: &[SubscriberWatchRegistration],
+        newly_covered_paths: &mut Vec<PathBuf>,
+        inner_guard: &mut Option<std::sync::MutexGuard<'a, FileWatcherInner>>,
+    ) -> notify::Result<()> {
+        // Moving to a previously uncovered canonical namespace installs its
+        // target guards too. Verify once after those moves; do not loop under
+        // the state lock indefinitely if the caller's namespace keeps moving.
+        let mut coverage_moved = false;
+        for verify_only in [false, true] {
+            for registration in registrations {
+                let key = &registration.key;
+                let (actual, matched, fallback) = actual_watch_path(&key.requested);
+                let Some(watch) = state
+                    .subscribers
+                    .get(&subscriber_id)
+                    .and_then(|subscriber| subscriber.watched_paths.get(key))
+                else {
+                    return Err(notify::Error::generic("file watcher subscriber was removed"));
+                };
+                let changed = watch.actual != actual || watch.matched != matched;
+                let old_actual = watch.actual.clone();
+                let count = watch.count;
+                coverage_moved |= old_actual != actual;
+                let reconciled = !(verify_only && changed)
+                    && Self::apply_actual_watch_move(
+                        state,
+                        &old_actual,
+                        &actual,
+                        count,
+                        self.inner.as_ref(),
+                        self.reconcile_tx.as_ref(),
+                        inner_guard,
+                    );
+                if !reconciled {
+                    state.pending_requests.insert((subscriber_id, key.clone()));
+                    if let Some(subscriber) = state.subscribers.get(&subscriber_id) {
+                        subscriber.tx.mark_rescan_required();
+                    }
+                    self.request_degraded_reconciliation();
+                    return Err(notify::Error::generic(
+                        "failed to reconcile the requested watch namespace",
+                    ));
+                }
+                if let Some(subscriber) = state.subscribers.get_mut(&subscriber_id) {
+                    if let Some(watch) = subscriber.watched_paths.get_mut(key) {
+                        watch.actual = actual;
+                        if changed {
+                            watch.last_exists = matched.path.exists();
+                        }
+                        watch.matched = matched;
+                        watch.fallback |= fallback;
+                    }
+                    if changed && !key.namespace_guard {
+                        // Existing owners may have observed the old target.
+                        // The acquiring consumer must reconcile its snapshot as
+                        // well, even if the pre-coverage resolution was shared.
+                        newly_covered_paths.push(key.requested.path.clone());
+                        subscriber.tx.mark_rescan_required();
+                    }
+                }
+                state.pending_requests.remove(&(subscriber_id, key.clone()));
+            }
+            if !coverage_moved {
+                break;
+            }
+        }
+        Ok(())
     }
 
     fn unregister_paths(&self, subscriber_id: SubscriberId, watched_paths: &[SubscriberWatchKey]) {
@@ -1101,9 +1207,9 @@ impl FileWatcher {
         if guard.needs_rebuild || retires_coverage {
             Self::rebuild_backend(guard, &effective)?;
         } else {
-            for (root, mode) in &effective {
-                if guard.native_paths.get(root) != Some(mode) {
-                    if let Err(err) = Self::watch_backend(guard, root, *mode) {
+            for (root, mode) in namespace_ordered_native_paths(&effective) {
+                if guard.native_paths.get(root) != Some(&mode) {
+                    if let Err(err) = Self::watch_backend(guard, root, mode) {
                         // A failed recursive add may already have installed descendants.
                         // Replace that uncertain instance, never accept its idempotent fast path.
                         guard.needs_rebuild = true;
@@ -1113,7 +1219,7 @@ impl FileWatcher {
                         }
                         return Err(err);
                     }
-                    guard.native_paths.insert(root.clone(), *mode);
+                    guard.native_paths.insert(root.clone(), mode);
                 }
             }
         }
@@ -1137,13 +1243,13 @@ impl FileWatcher {
             Arc::clone(&guard.raw_overflow),
             Arc::clone(&guard.raw_overflow_notify),
         )?;
-        for (root, mode) in roots {
+        for (root, mode) in namespace_ordered_native_paths(roots) {
             #[cfg(test)]
             if guard.fail_watch_attempts > 0 {
                 guard.fail_watch_attempts -= 1;
                 return Err(notify::Error::generic("injected watch failure"));
             }
-            watcher.watch(root, *mode)?;
+            watcher.watch(root, mode)?;
         }
         guard.watcher = watcher;
         guard.native_paths = roots.clone();
@@ -1836,7 +1942,8 @@ impl FileWatcher {
         guard.needs_rebuild = true;
         let roots = effective_native_paths(&guard.watched_paths);
         Self::rebuild_backend(guard, &roots)?;
-        guard.degraded_paths.clear();
+        // Re-arming installed coverage does not reconcile logical ownership.
+        // Preserve failed-unregistration obligations for the retry worker.
         Ok(())
     }
 
@@ -1933,6 +2040,19 @@ fn effective_native_paths(
         })
         .map(|(path, mode)| (path.clone(), *mode))
         .collect()
+}
+
+/// Cover a root's namespace before attaching to its current object. A removal
+/// and recreation during attachment must be observable even at the same path.
+fn namespace_ordered_native_paths(
+    paths: &HashMap<PathBuf, RecursiveMode>,
+) -> Vec<(&PathBuf, RecursiveMode)> {
+    let mut paths = paths
+        .iter()
+        .map(|(path, mode)| (path, *mode))
+        .collect::<Vec<_>>();
+    paths.sort_unstable_by_key(|(path, _)| path.components().count());
+    paths
 }
 
 fn canonical_watch_path(path: &Path) -> PathBuf {

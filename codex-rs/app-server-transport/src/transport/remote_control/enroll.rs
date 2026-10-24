@@ -21,6 +21,8 @@ use tracing::warn;
 const REMOTE_CONTROL_PAIRING_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 const REMOTE_CONTROL_RESPONSE_BODY_MAX_BYTES: usize = 4096;
 const REMOTE_CONTROL_RESPONSE_READ_MAX_BYTES: usize = 1024 * 1024;
+const REMOTE_CONTROL_FAILURE_BODY_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_millis(100);
 const REMOTE_CONTROL_SERVER_TOKEN_REFRESH_SKEW_SECS: i64 = 5 * 60;
 
 const REQUEST_ID_HEADER: &str = "x-request-id";
@@ -102,7 +104,7 @@ impl RemoteControlEnrollment {
             })?;
         let headers = response.headers().clone();
         let status = response.status();
-        let body = read_remote_control_response_body(response)
+        let body = read_remote_control_response_body_for_status(response)
             .await
             .map_err(|err| {
                 io::Error::other(format!(
@@ -213,7 +215,7 @@ impl RemoteControlEnrollment {
             })?;
         let headers = response.headers().clone();
         let status = response.status();
-        let body = read_remote_control_response_body(response)
+        let body = read_remote_control_response_body_for_status(response)
             .await
             .map_err(|err| {
                 io::Error::other(format!(
@@ -259,8 +261,11 @@ impl RemoteControlEnrollment {
     }
 
     pub(super) fn should_refresh_server_token(&self) -> bool {
+        // Critical-path consumers can already use a proactive-window token.
+        // Do not race a potentially rotating refresh against that bearer; defer
+        // refresh until expiry/missing credentials or an actual auth rejection.
         self.server_token_refresh_requirement()
-            != RemoteControlServerTokenRefreshRequirement::NotNeeded
+            == RemoteControlServerTokenRefreshRequirement::Required
     }
 
     pub(super) fn server_token_refresh_requirement_at(
@@ -412,6 +417,30 @@ pub(super) async fn update_persisted_remote_control_enrollment(
         );
         Ok(())
     }
+}
+
+// Error headers determine recovery. Diagnostics must neither delay it for the
+// request's entire budget nor replace its status with an unrelated body error.
+pub(super) async fn read_remote_control_response_body_for_status(
+    mut response: codex_http_client::HttpResponse,
+) -> io::Result<Vec<u8>> {
+    if response.status().is_success() {
+        return read_remote_control_response_body(response).await;
+    }
+    let diagnostics = async {
+        let mut body = Vec::new();
+        while let Ok(Some(chunk)) = response.chunk().await {
+            if chunk.len() > REMOTE_CONTROL_RESPONSE_BODY_MAX_BYTES - body.len() {
+                return Vec::new();
+            }
+            body.extend_from_slice(&chunk);
+        }
+        // Previewing incomplete JSON is deliberately omitted by the redactor.
+        body
+    };
+    Ok(tokio::time::timeout(REMOTE_CONTROL_FAILURE_BODY_TIMEOUT, diagnostics)
+        .await
+        .unwrap_or_default())
 }
 
 pub(super) async fn read_remote_control_response_body(

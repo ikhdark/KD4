@@ -81,9 +81,6 @@ use codex_mcp::McpRuntimeContext;
 use codex_mcp::codex_apps_tools_cache_key;
 use codex_models_manager::manager::RefreshStrategy;
 use codex_models_manager::manager::SharedModelsManager;
-use codex_network_proxy::NetworkProxy;
-use codex_network_proxy::NetworkProxyAuditMetadata;
-use codex_network_proxy::normalize_host;
 use codex_otel::current_span_trace_id;
 use codex_otel::current_span_w3c_trace_context;
 use codex_otel::set_parent_from_w3c_trace_context;
@@ -150,9 +147,6 @@ use codex_protocol::request_user_input::RequestUserInputArgs;
 use codex_protocol::request_user_input::RequestUserInputResponse;
 use codex_rmcp_client::ElicitationResponse;
 use codex_rollout::state_integration;
-use codex_rollout_trace::AgentResultTracePayload;
-use codex_rollout_trace::ThreadStartedTraceMetadata;
-use codex_rollout_trace::ThreadTraceContext;
 use codex_sandboxing::policy_transforms::intersect_uri_permission_profiles;
 use codex_shell_command::parse_command::parse_command;
 use codex_terminal_detection::user_agent;
@@ -213,7 +207,6 @@ use crate::config::Constrained;
 use crate::config::ConstraintResult;
 use crate::config::PermissionProfileSnapshot;
 use crate::config::PermissionProfileState;
-use crate::config::StartedNetworkProxy;
 use crate::config::resolve_web_search_mode_for_turn;
 use crate::context_manager::ContextManager;
 use crate::context_manager::missing_call_outputs;
@@ -469,7 +462,6 @@ use crate::SkillMetadata;
 use crate::SkillsService;
 use crate::exec_policy::ExecPolicyUpdateError;
 use crate::mcp::McpManager;
-use crate::network_policy_decision::execpolicy_network_rule_amendment;
 use crate::rollout::map_session_init_error;
 use crate::session_startup_prewarm::SessionStartupPrewarmHandle;
 use crate::session_startup_prewarm::SessionStartupTransportHandle;
@@ -489,13 +481,9 @@ use crate::stream_events_utils::OrderedResponseItemRecorder;
 #[cfg(test)]
 use crate::stream_events_utils::handle_output_item_done;
 use crate::tasks::ReviewTask;
-use crate::tools::network_approval::NetworkApprovalService;
-use crate::tools::network_approval::build_blocked_request_observer;
-use crate::tools::network_approval::build_network_policy_decider;
 #[cfg(test)]
 use crate::tools::parallel::ToolCallRuntime;
 use crate::tools::sandboxing::ApprovalStore;
-use crate::tools::tool_dispatch_trace::run_trace_recording;
 use crate::turn_timing::InteractiveWaitKind;
 use crate::turn_timing::TurnLocalPhase;
 use crate::turn_timing::TurnTimingState;
@@ -542,7 +530,6 @@ use codex_protocol::protocol::RequestUserInputEvent;
 use codex_protocol::protocol::ReviewDecision;
 use codex_protocol::protocol::SandboxPolicy;
 use codex_protocol::protocol::SessionConfiguredEvent;
-use codex_protocol::protocol::SessionNetworkProxyRuntime;
 use codex_protocol::protocol::StreamErrorEvent;
 use codex_protocol::protocol::Submission;
 use codex_protocol::protocol::TokenCountEvent;
@@ -626,11 +613,6 @@ pub(crate) struct CodexSpawnArgs {
     pub(crate) metrics_service_name: Option<String>,
     pub(crate) inherited_exec_policy: Option<Arc<ExecPolicyManager>>,
     pub(crate) inherited_environments: Option<TurnEnvironmentSnapshot>,
-    /// Parent rollout trace used only to derive fresh spawned child traces.
-    ///
-    /// Root sessions and non-thread-spawn subagents pass a disabled context;
-    /// `Session::new` creates the root trace itself when rollout tracing is enabled.
-    pub(crate) parent_rollout_thread_trace: ThreadTraceContext,
     pub(crate) user_shell_override: Option<shell::Shell>,
     pub(crate) parent_trace: Option<W3cTraceContext>,
     pub(crate) environment_selections: Vec<TurnEnvironmentSelection>,
@@ -659,6 +641,7 @@ pub(crate) fn resolve_multi_agent_version(
             // Threads created before runtime metadata existed join the current V2 tool surface.
             InitialHistory::Resumed(_) | InitialHistory::Forked(_) => Some(MultiAgentVersion::V2),
         })
+        .map(MultiAgentVersion::runtime_version)
 }
 
 pub(crate) const INITIAL_SUBMIT_ID: &str = "";
@@ -725,7 +708,6 @@ impl Codex {
             user_shell_override,
             inherited_exec_policy,
             inherited_environments,
-            parent_rollout_thread_trace,
             parent_trace: _,
             environment_selections,
             thread_extension_init,
@@ -761,13 +743,14 @@ impl Codex {
         // capabilities so a descriptor defect cannot make history inaccessible.
         let dynamic_tools = if dynamic_tools.is_empty() {
             let mut restored = Vec::new();
+            let mut validator = codex_tools::DynamicToolRegistrationValidator::default();
             for tool in conversation_history.get_dynamic_tools().unwrap_or_default() {
-                restored.push(tool);
-                if let Err(error) = codex_tools::validate_dynamic_tools(&restored) {
-                    restored.pop();
+                if let Err(error) = validator.validate(&tool) {
                     config
                         .startup_warnings
                         .push(format!("A restored dynamic tool is unavailable: {error}"));
+                } else {
+                    restored.push(tool);
                 }
             }
             restored
@@ -848,11 +831,39 @@ impl Codex {
         // Preserve the requested preference across metadata refreshes. Sampling
         // still filters unsupported tiers using the current model metadata.
         let service_tier = config.service_tier.clone();
+        let persisted_validation = conversation_history
+            .get_rollout_items()
+            .iter()
+            .rev()
+            .find_map(|item| match item {
+                RolloutItem::TurnContext(context) if context.validation_mode.is_some() => {
+                    Some(context)
+                }
+                _ => None,
+            });
+        let inherited_validation = agent_control.inherited_validation_context.as_ref();
         let session_configuration = SessionConfiguration {
             provider: config.model_provider.clone(),
             collaboration_mode,
             model_reasoning_summary: config.model_reasoning_summary,
             service_tier,
+            validation_mode: inherited_validation
+                .map(|context| context.mode)
+                .or_else(|| persisted_validation.and_then(|context| context.validation_mode))
+                .unwrap_or(config.validation_mode),
+            validation_full_budget: inherited_validation
+                .map(|context| context.full_budget)
+                .or_else(|| persisted_validation.and_then(|context| context.validation_full_budget))
+                .unwrap_or(config.validation_full_budget),
+            validation_root_turn: inherited_validation
+                .map(|context| context.scope.clone())
+                .or_else(|| persisted_validation.and_then(|context| context.validation_root_turn.clone())),
+            validation_attempts: persisted_validation
+                .filter(|context| inherited_validation.is_none_or(|inherited| {
+                    context.validation_root_turn.as_ref() == Some(&inherited.scope)
+                }))
+                .map(|context| context.validation_attempts.clone())
+                .unwrap_or_default(),
             developer_instructions: config.developer_instructions.clone(),
             personality: config.personality,
             base_instructions,
@@ -910,7 +921,6 @@ impl Codex {
             inherited_environments,
             analytics_events_client,
             thread_store,
-            parent_rollout_thread_trace,
             attestation_provider,
             external_time_provider,
             multi_agent_version,
@@ -1129,15 +1139,19 @@ impl Codex {
                 ));
             }
         }
-        match self
+        if let Some(Err(error)) = self
             .session
             .persistence_shutdown_result
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()
         {
+            return Err(CodexErr::Fatal(error));
+        }
+        match self.session.persistence_retirement_result.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner).clone() {
             Some(result) => result.map_err(CodexErr::Fatal),
-            None if self.session.live_thread().is_some() => Err(CodexErr::Fatal(
+            None if self.session.live_thread().is_some() || self.session.persistence_tasks.is_closed() => Err(CodexErr::Fatal(
                 "session persistence shutdown was not confirmed".to_string(),
             )),
             None => Ok(()),
@@ -1499,7 +1513,6 @@ fn response_item_needs_turn_id(item: &ResponseItem) -> bool {
 }
 
 struct StartupRolloutFacts {
-    validation_uncertainty: turn_execution::SessionValidationUncertainty,
     initial_messages: Option<Vec<EventMsg>>,
     mailbox_communication_ids: Vec<codex_protocol::ResponseItemId>,
     has_prior_user_turns: bool,
@@ -1515,7 +1528,6 @@ impl StartupRolloutFacts {
         let mut mailbox_communication_ids = Vec::new();
         let mut prior_user_turns = PriorUserTurnTracker::default();
         let mut last_token_info = None;
-        let mut validation_uncertainty = turn_execution::SessionValidationUncertainty::default();
         let mut persisted_settings =
             PersistedThreadSettingsReducer::new(PersistedThreadSettings::default());
 
@@ -1524,7 +1536,6 @@ impl StartupRolloutFacts {
             prior_user_turns.observe(items, idx, item);
             match item {
                 RolloutItem::EventMsg(event) => {
-                    validation_uncertainty.observe_durable_event(event);
                     if let Some(initial_messages) = initial_messages.as_mut() {
                         initial_messages.push(event.clone());
                     }
@@ -1547,7 +1558,6 @@ impl StartupRolloutFacts {
         }
 
         Self {
-            validation_uncertainty,
             initial_messages,
             mailbox_communication_ids,
             has_prior_user_turns: prior_user_turns.has_prior_user_turns(),
@@ -1679,11 +1689,6 @@ impl Session {
         }
     }
 
-    fn managed_network_proxy_active_for_permission_profile(
-        permission_profile: &PermissionProfile,
-    ) -> bool {
-        !matches!(permission_profile, PermissionProfile::Disabled)
-    }
 
     /// Builds the `x-codex-beta-features` header value for this session.
     ///
@@ -1712,93 +1717,7 @@ impl Session {
         }
     }
 
-    // These arguments mirror the proxy builder's policy and observer boundary.
-    #[allow(clippy::too_many_arguments)]
-    async fn start_managed_network_proxy(
-        spec: &crate::config::NetworkProxySpec,
-        codex_home: &std::path::Path,
-        exec_policy: &codex_execpolicy::Policy,
-        permission_profile: &PermissionProfile,
-        network_policy_decider: Option<Arc<dyn codex_network_proxy::NetworkPolicyDecider>>,
-        blocked_request_observer: Option<Arc<dyn codex_network_proxy::BlockedRequestObserver>>,
-        managed_network_requirements_enabled: bool,
-        audit_metadata: NetworkProxyAuditMetadata,
-    ) -> anyhow::Result<(StartedNetworkProxy, SessionNetworkProxyRuntime)> {
-        let spec = spec
-            .with_exec_policy_network_rules(exec_policy)
-            .context("failed to apply execpolicy network rules to managed proxy")?;
-        let network_proxy = spec
-            .start_proxy(
-                codex_home,
-                permission_profile,
-                network_policy_decider,
-                blocked_request_observer,
-                managed_network_requirements_enabled,
-                audit_metadata,
-            )
-            .await
-            .map_err(|err| anyhow::anyhow!("failed to start managed network proxy: {err}"))?;
-        let session_network_proxy = {
-            let proxy = network_proxy.proxy();
-            SessionNetworkProxyRuntime {
-                http_addr: proxy.http_addr().to_string(),
-                socks_addr: proxy.socks_addr().to_string(),
-            }
-        };
-        Ok((network_proxy, session_network_proxy))
-    }
 
-    async fn prepare_managed_network_proxy(
-        &self,
-        session_configuration: &SessionConfiguration,
-    ) -> anyhow::Result<Option<Arc<StartedNetworkProxy>>> {
-        let Some(spec) = session_configuration
-            .original_config_do_not_use
-            .permissions
-            .network
-            .as_ref()
-            .cloned()
-        else {
-            return Ok(None);
-        };
-
-        #[cfg(test)]
-        self.managed_network_proxy_start_entered.notify_one();
-        #[cfg(test)]
-        let _start_guard = self
-            .managed_network_proxy_start_gate
-            .acquire()
-            .await
-            .expect("proxy startup test gate remains open");
-
-        let spec = match spec
-            .recompute_for_permission_profile(&session_configuration.permission_profile())
-        {
-            Ok(spec) => spec,
-            Err(err) => {
-                return Err(anyhow::anyhow!(
-                    "failed to rebuild managed network proxy policy for sandbox change: {err}"
-                ));
-            }
-        };
-        let current_exec_policy = self.services.exec_policy.current();
-        let (started_proxy, _session_network_proxy) = Self::start_managed_network_proxy(
-            &spec,
-            session_configuration.codex_home().as_path(),
-            current_exec_policy.as_ref(),
-            &session_configuration.permission_profile(),
-            self.services.network_policy_decider.clone(),
-            self.services
-                .managed_network_requirements_configured
-                .then(|| {
-                    build_blocked_request_observer(Arc::clone(&self.services.network_approval))
-                }),
-            self.services.managed_network_requirements_configured,
-            self.services.network_proxy_audit_metadata.clone(),
-        )
-        .await?;
-        Ok(Some(Arc::new(started_proxy)))
-    }
 
     pub(crate) async fn codex_home(&self) -> AbsolutePathBuf {
         let state = self.state.lock().await;
@@ -2144,12 +2063,6 @@ impl Session {
         let has_prior_user_turns = startup_rollout_facts.has_prior_user_turns;
         let last_token_info = startup_rollout_facts.last_token_info;
         let reconstructed_provider_id = startup_rollout_facts.reconstructed_provider_id;
-        *self
-            .services
-            .validation_uncertainty
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) =
-            startup_rollout_facts.validation_uncertainty;
         {
             let mut state = self.state.lock().await;
             state.set_next_turn_is_first(!has_prior_user_turns);
@@ -2323,7 +2236,6 @@ impl Session {
             mut history,
             plan,
             plan_lineage,
-            accepted_input,
             mut previous_turn_settings,
             reference_context_item,
             world_state_baseline,
@@ -2365,7 +2277,7 @@ impl Session {
         prepare_response_items(&mut history);
         self.services
             .plan_store
-            .restore_reconstructed(plan, plan_lineage, accepted_input, &history)
+            .restore_reconstructed(plan, plan_lineage, &history)
             .await;
         let prefix_tokens = if matches!(
             turn_context.config.model_auto_compact_token_limit_scope,
@@ -2497,16 +2409,15 @@ impl Session {
         serialize_turn: bool,
         persist: bool,
     ) -> Result<SessionConfiguration, ThreadSettingsUpdateError> {
-        // Workspace roots materialize the profile's project-root entries, so
-        // changing them can also replace the managed proxy.
+        // Serialize accepted permission, environment and durable settings updates.
         let _refresh_guard = if serialize_turn
             || updates.permission_profile.is_some()
             || updates.sandbox_policy.is_some()
             || updates.environments.is_some()
             || updates.workspace_roots.is_some()
         {
-            let Ok(refresh_guard) = self.managed_network_proxy_refresh_lock.acquire().await else {
-                unreachable!("managed network proxy refresh semaphore is never closed");
+            let Ok(refresh_guard) = self.configuration_update_lock.acquire().await else {
+                unreachable!("configuration update semaphore is never closed");
             };
             Some(refresh_guard)
         } else {
@@ -2515,7 +2426,7 @@ impl Session {
         let notify_config_contributors = !self.services.extensions.config_contributors().is_empty();
         let (previous_config, new_config, updated) = {
             let mut state = self.state.lock().await;
-            let mut updated = match state.session_configuration.apply_async(updates).await {
+            let updated = match state.session_configuration.apply_async(updates).await {
                 Ok(updated) => updated,
                 Err(err) => {
                     warn!("rejected session settings update: {err}");
@@ -2523,26 +2434,6 @@ impl Session {
                 }
             };
 
-            let permission_profile_changed =
-                state.session_configuration.permission_profile() != updated.permission_profile();
-            let prepared_proxy = if permission_profile_changed {
-                // Startup may fail or be cancelled. Keep the accepted configuration
-                // visible until its replacement proxy is ready.
-                drop(state);
-                let proxy =
-                    self.prepare_managed_network_proxy(&updated)
-                        .await
-                        .map_err(|error| codex_config::ConstraintError::UpdateRejected {
-                            reason: error.to_string(),
-                        })?;
-                state = self.state.lock().await;
-                // Ordinary settings updates can complete during proxy startup.
-                // Reapply only this request so their accepted changes survive.
-                updated = state.session_configuration.apply_async(updates).await?;
-                Some(proxy)
-            } else {
-                None
-            };
             let previous_config = notify_config_contributors
                 .then(|| Self::build_effective_session_config(&state.session_configuration));
             let new_config =
@@ -2553,8 +2444,7 @@ impl Session {
                 self.persist_rollout_items_durable(&[RolloutItem::EventMsg(event)])
                     .await?;
             }
-            // No await separates successful durability from publishing the configuration
-            // and its prepared proxy. Failed writes leave both accepted values intact.
+            // Publish the new configuration only after its durable write succeeds.
             state.session_configuration = updated.clone();
             // Publish live policy at the accepted settings boundary, never from
             // an async context builder (including speculative startup previews).
@@ -2565,9 +2455,6 @@ impl Session {
             mcp_runtime
                 .manager()
                 .set_permission_profile(updated.permission_profile());
-            if let Some(proxy) = prepared_proxy {
-                self.services.network_proxy.store(proxy);
-            }
             if updates.environments.is_some() {
                 self.services
                     .turn_environments
@@ -2646,10 +2533,29 @@ impl Session {
         next_config: Config,
         refreshed_features: &[Feature],
     ) {
+        self.refresh_runtime_config_features_inner(next_config, refreshed_features, true)
+            .await;
+    }
+
+    pub(crate) async fn refresh_runtime_config_features_after_discovery_invalidation(
+        &self,
+        next_config: Config,
+        refreshed_features: &[Feature],
+    ) {
+        self.refresh_runtime_config_features_inner(next_config, refreshed_features, false)
+            .await;
+    }
+
+    async fn refresh_runtime_config_features_inner(
+        &self,
+        next_config: Config,
+        refreshed_features: &[Feature],
+        invalidate_discovery: bool,
+    ) {
         // Serialize refreshes with environment/profile updates while preparing
         // the hooks that will be published with this configuration.
-        let Ok(_refresh_guard) = self.managed_network_proxy_refresh_lock.acquire().await else {
-            unreachable!("managed network proxy refresh semaphore is never closed");
+        let Ok(_refresh_guard) = self.configuration_update_lock.acquire().await else {
+            unreachable!("configuration update semaphore is never closed");
         };
         // Refresh only the user layer from the incoming snapshot. Preserve thread-local
         // layers such as request/session overrides that were present when this session
@@ -2676,8 +2582,10 @@ impl Session {
                 resolve_tool_suggest_config_from_layer_stack(&config.config_layer_stack);
             Arc::new(config)
         };
-        self.services.skills_service.clear_cache();
-        self.services.plugins_manager.clear_cache();
+        if invalidate_discovery {
+            self.services.skills_service.clear_cache();
+            self.services.plugins_manager.clear_cache();
+        }
         let environments = self.services.turn_environments.snapshot().await;
         let hooks = build_hooks_for_config(
             config.as_ref(),
@@ -3053,20 +2961,6 @@ impl Session {
                 .await
                 .replace(error.clone());
         }
-        if self
-            .services
-            .rollout_thread_trace
-            .should_record_runtime_event(&turn_context.sub_id, &msg)
-        {
-            let trace = self.services.rollout_thread_trace.clone();
-            let turn_id = turn_context.sub_id.clone();
-            let trace_msg = msg.clone();
-            let _ = run_trace_recording(&self.terminal_tasks, move || {
-                trace.record_codex_turn_event(&turn_id, &trace_msg);
-                trace.record_tool_call_event(&turn_id, &trace_msg);
-            })
-            .await;
-        }
         let event = Event {
             id: turn_context.sub_id.clone(),
             msg,
@@ -3098,19 +2992,6 @@ impl Session {
             None => true,
         };
         for legacy in post_dispatch.legacy_events {
-            if self
-                .services
-                .rollout_thread_trace
-                .should_record_tool_call_event(&legacy)
-            {
-                let trace = self.services.rollout_thread_trace.clone();
-                let turn_id = turn_context.sub_id.clone();
-                let trace_msg = legacy.clone();
-                let _ = run_trace_recording(&self.terminal_tasks, move || {
-                    trace.record_tool_call_event(&turn_id, &trace_msg);
-                })
-                .await;
-            }
             let legacy_event = Event {
                 id: turn_context.sub_id.clone(),
                 msg: legacy,
@@ -3203,28 +3084,17 @@ impl Session {
             }
             if let Some(summary) = protected_host_summary.clone()
                 && let Err(error) = task_coordinator
-                    .record_host_completion_observation(
+                    .record_host_completion_and_seal(
                         binding,
+                        child_agent_path,
                         self.thread_id,
                         &turn_context.sub_id,
                         summary,
-                        Some(&status),
+                        &status,
                     )
                     .await
             {
                 warn!(%error, "failed to retain host completion observations");
-                return false;
-            }
-            if let Err(error) = task_coordinator
-                .seal_missing_receipt_for_attempt(
-                    child_agent_path,
-                    self.thread_id,
-                    &status,
-                    binding.attempt_id,
-                )
-                .await
-            {
-                warn!(agent_path = %child_agent_path, %error, "failed to seal missing typed-agent receipt");
                 return false;
             }
             let assignment_id = binding.assignment_id;
@@ -3307,7 +3177,7 @@ impl Session {
                     binding.assignment_id, binding.attempt_id,
                 )
             });
-        let Some(communication) =
+        let Some(mut communication) =
             crate::session_prefix::inter_agent_completion_communication_with_diagnostics(
                 parent_agent_path,
                 child_agent_path.clone(),
@@ -3319,13 +3189,14 @@ impl Session {
         else {
             return true;
         };
-        // `communication` owns the message. Keep a second copy only when the
-        // recorder will actually need it after parent delivery succeeds.
-        let trace_message = self
-            .services
-            .rollout_thread_trace
-            .is_enabled()
-            .then(|| communication.content.clone());
+        // Reuse mailbox identity deduplication for repeated terminal dispatch
+        // of this turn. Preserve the existing stronger error identity, which
+        // also coalesces repeated identical failed attempts.
+        if communication.id.is_none() {
+            communication.id = Some(codex_protocol::ResponseItemId::from_server(format!(
+                "agent-result-{}-{}", self.thread_id, turn_context.sub_id,
+            )));
+        }
         let context =
             AgentCommunicationContext::new(AgentCommunicationKind::Result, self.thread_id);
         if let Err(err) = self
@@ -3365,23 +3236,6 @@ impl Session {
                 }
             }
             return false;
-        }
-        if let Some(message) = trace_message {
-            let trace = self.services.rollout_thread_trace.clone();
-            let turn_id = turn_context.sub_id.clone();
-            let child_agent_path = child_agent_path.clone();
-            let _ = run_trace_recording(&self.terminal_tasks, move || {
-                trace.record_agent_result_interaction(
-                    &turn_id,
-                    parent_thread_id,
-                    &AgentResultTracePayload {
-                        child_agent_path: child_agent_path.as_str(),
-                        message: &message,
-                        status: &status,
-                    },
-                );
-            })
-            .await;
         }
         true
     }
@@ -3439,18 +3293,6 @@ impl Session {
             && let Err(error) = live_thread.append_activity_event_ordered(&event.msg).await
         {
             error!("failed to queue rollout activity event: {error:#}");
-        }
-        if self
-            .services
-            .rollout_thread_trace
-            .should_record_protocol_event(&event.msg)
-        {
-            let trace = self.services.rollout_thread_trace.clone();
-            let trace_msg = event.msg.clone();
-            let _ = run_trace_recording(&self.terminal_tasks, move || {
-                trace.record_protocol_event(&trace_msg);
-            })
-            .await;
         }
         self.deliver_event_raw_with_receipt(event, publication_receipt)
             .await;
@@ -3655,72 +3497,12 @@ impl Session {
 
     pub(crate) async fn persist_network_policy_amendment(
         &self,
-        amendment: &NetworkPolicyAmendment,
-        network_approval_context: &NetworkApprovalContext,
+        _amendment: &NetworkPolicyAmendment,
+        _network_approval_context: &NetworkApprovalContext,
     ) -> anyhow::Result<()> {
-        let _refresh_guard = self
-            .managed_network_proxy_refresh_lock
-            .acquire()
-            .await
-            .map_err(|_| anyhow::anyhow!("managed network proxy refresh semaphore closed"))?;
-        let host =
-            Self::validated_network_policy_amendment_host(amendment, network_approval_context)?;
-        let codex_home = self
-            .state
-            .lock()
-            .await
-            .session_configuration
-            .codex_home()
-            .clone();
-        let execpolicy_amendment =
-            execpolicy_network_rule_amendment(amendment, network_approval_context, &host);
-
-        if let Some(started_network_proxy) = self.services.network_proxy.load_full() {
-            let proxy = started_network_proxy.proxy();
-            match amendment.action {
-                NetworkPolicyRuleAction::Allow => proxy
-                    .add_allowed_domain(&host)
-                    .await
-                    .map_err(|err| anyhow::anyhow!("failed to update runtime allowlist: {err}"))?,
-                NetworkPolicyRuleAction::Deny => proxy
-                    .add_denied_domain(&host)
-                    .await
-                    .map_err(|err| anyhow::anyhow!("failed to update runtime denylist: {err}"))?,
-            }
-        }
-
-        self.services
-            .exec_policy
-            .append_network_rule_and_update(
-                &codex_home,
-                &host,
-                execpolicy_amendment.protocol,
-                execpolicy_amendment.decision,
-                Some(execpolicy_amendment.justification),
-            )
-            .await
-            .map_err(|err| {
-                anyhow::anyhow!("failed to persist network policy amendment to execpolicy: {err}")
-            })?;
-
-        Ok(())
+        anyhow::bail!("managed network proxy support was removed; network policy amendments cannot be enforced")
     }
 
-    fn validated_network_policy_amendment_host(
-        amendment: &NetworkPolicyAmendment,
-        network_approval_context: &NetworkApprovalContext,
-    ) -> anyhow::Result<String> {
-        let approved_host = normalize_host(&network_approval_context.host);
-        let amendment_host = normalize_host(&amendment.host);
-        if amendment_host != approved_host {
-            return Err(anyhow::anyhow!(
-                "network policy amendment host '{}' does not match approved host '{}'",
-                amendment.host,
-                network_approval_context.host
-            ));
-        }
-        Ok(approved_host)
-    }
 
     pub(crate) async fn record_network_policy_amendment_message(
         &self,
@@ -4991,15 +4773,6 @@ impl Session {
                                 .or(recovered_agents)
                         }),
                     )
-                    .replacing_section(
-                        self.services
-                            .plan_store
-                            .task_state(
-                                turn_context.collaboration_mode.mode
-                                    == codex_protocol::config_types::ModeKind::Plan,
-                            )
-                            .await,
-                    )
             },
         );
         // Desired-state equality is not delivery equality: a previous optional update may
@@ -5116,10 +4889,9 @@ impl Session {
                 .await?;
             Ok::<_, CodexErr>((selected_capability_roots, mcp))
         };
-        // Keep the turn-frozen environment view unless deferred executors are enabled, but refresh
-        // AGENTS.md for every sampling step in either mode. The deferred path captures live
-        // environments inside refresh serialization so the snapshot and returned instructions stay
-        // ordered as one request-scoped value.
+        // Keep the session's instructions while their environment/configuration scope
+        // is unchanged. Deferred executors may introduce a new scope; capture it
+        // inside instruction serialization before preparing its tools.
         let (environments, agents_md_observation, prepared_tools) = if deferred_executor_enabled {
             self.services
                 .agents_md_manager
@@ -5482,7 +5254,7 @@ impl Session {
         &self,
         multi_agent_version: MultiAgentVersion,
     ) -> MultiAgentVersion {
-        *self.multi_agent_version.get_or_init(|| multi_agent_version)
+        *self.multi_agent_version.get_or_init(|| multi_agent_version.runtime_version())
     }
 
     pub(crate) fn resolve_multi_agent_version_for_model(
@@ -5538,12 +5310,6 @@ impl Session {
                 continue;
             }
             let msg = EventMsg::RawResponseItem(RawResponseItemEvent { item: item.clone() });
-            self.services
-                .rollout_thread_trace
-                .record_codex_turn_event(&turn_context.sub_id, &msg);
-            self.services
-                .rollout_thread_trace
-                .record_tool_call_event(turn_context.sub_id.as_str(), &msg);
             self.send_event_raw_with_persistence(
                 Event {
                     id: turn_context.sub_id.clone(),
@@ -6626,6 +6392,81 @@ impl Session {
         .map_err(|error| {
             CodexErr::Fatal(format!("failed to protect artifact provenance: {error}"))
         })?;
+        self.register_protected_tool_artifact_origin(artifact_id, call_id, bytes, sha256)
+            .await
+    }
+
+    /// Create and register an immutable source without rehashing newly synced bytes.
+    /// The creation owner protects its newly synced bytes in the same retention
+    /// transaction; only inherited/attached artifacts need a second digest check.
+    pub(crate) async fn create_source_snapshot_artifact(
+        self: &Arc<Self>,
+        call_id: String,
+        canonical: Arc<codex_tools::CanonicalToolResult>,
+        backing: Option<String>,
+    ) -> crate::tools::command_output_artifact::CanonicalOutputArtifact {
+        // The native creation owner detaches only after bounded stage admission.
+        // Its completion keeps metadata, not the full source, through registration.
+        let session = Arc::clone(self);
+        let bytes = canonical.exact_bytes;
+        let sha256 = canonical.sha256.clone();
+        crate::tools::command_output_artifact::create_source_snapshot_artifact_with_completion(
+            self.codex_home().await.as_path(), &self.thread_id.to_string(), &canonical, backing,
+            move |artifact| async move {
+                session.register_created_source_snapshot(call_id, bytes, sha256, artifact).await
+            },
+        ).await
+    }
+
+    async fn register_created_source_snapshot(
+        &self,
+        call_id: String,
+        bytes: u64,
+        sha256: String,
+        mut artifact: crate::tools::command_output_artifact::CanonicalOutputArtifact,
+    ) -> crate::tools::command_output_artifact::CanonicalOutputArtifact {
+        let Ok(_permit) = self.tool_history_reconciliation_gate.acquire().await else {
+            unreachable!("session-owned tool-history reconciliation semaphore is never closed");
+        };
+        if artifact.complete
+            && let Some(id) = artifact.artifact_id()
+        {
+            let home = self.codex_home().await;
+            // Reconciliation may have removed the unregistered marker while
+            // staging ran. Fall back to strict protection in that uncommon case;
+            // never serialize unrelated source staging behind this session gate.
+            let protection = crate::tools::command_output_artifact::created_source_snapshot_is_protected(
+                &home, &self.thread_id.to_string(), &id,
+            ).await;
+            let protected = match protection {
+                Ok(true) => Ok(()),
+                Ok(false) => crate::tools::command_output_artifact::protect_active_tool_history_artifact(
+                    &home, &self.thread_id.to_string(), &id, bytes, &sha256,
+                ).await,
+                Err(error) => Err(error),
+            };
+            let registration = match protected {
+                Ok(()) => self.register_protected_tool_artifact_origin(
+                    id, call_id, bytes, sha256,
+                ).await,
+                Err(error) => Err(CodexErr::Fatal(error)),
+            };
+            if let Err(error) = registration {
+                artifact.complete = false;
+                artifact.error = Some(error.to_string());
+            }
+        }
+        artifact
+    }
+
+    // Caller holds tool_history_reconciliation_gate and owns verified protection.
+    async fn register_protected_tool_artifact_origin(
+        &self,
+        artifact_id: String,
+        call_id: String,
+        bytes: u64,
+        sha256: String,
+    ) -> CodexResult<()> {
         let mutation = crate::tool_history::ToolHistoryMutation::RegisterArtifactOrigin {
             artifact_id,
             call_id,
@@ -6920,44 +6761,16 @@ impl Session {
 
     pub(crate) async fn register_workspace_evidence<WorkspaceGateGuard: Send>(
         &self,
-        observation: crate::tool_history::WorkspaceEvidenceObservation,
+        _observation: crate::tool_history::WorkspaceEvidenceObservation,
         workspace_gate_guard: WorkspaceGateGuard,
     ) {
-        // The workspace gate protects handler effects, not completed-tool
-        // history serialization. Release it before recording the observation;
-        // the session-state lock orders snapshots, and the persistence worker
-        // commits those snapshots in the same order without delaying relay.
         drop(workspace_gate_guard);
-        self.register_workspace_evidence_batch(vec![observation])
-            .await;
     }
 
     pub(crate) async fn register_workspace_evidence_batch(
         &self,
-        observations: Vec<crate::tool_history::WorkspaceEvidenceObservation>,
-    ) {
-        if observations.is_empty() {
-            return;
-        }
-        let Ok(_reconciliation_permit) = self.tool_history_reconciliation_gate.acquire().await
-        else {
-            unreachable!("session-owned tool-history reconciliation semaphore is never closed");
-        };
-        let mut persistence_writer = self.tool_history_persistence.writer().await;
-        let mut state = self.state.lock().await;
-        for observation in observations {
-            let mutation =
-                crate::tool_history::ToolHistoryMutation::RegisterWorkspaceEvidence { observation };
-            state.apply_tool_history_mutation(&mutation);
-            if let Err(err) =
-                persistence_writer.enqueue_mutation(mutation, "workspace evidence metadata")
-            {
-                tracing::warn!(
-                    "failed to enqueue workspace evidence metadata; in-memory state is not durable: {err}"
-                );
-            }
-        }
-    }
+        _observations: Vec<crate::tool_history::WorkspaceEvidenceObservation>,
+    ) {}
 
     pub(crate) async fn register_code_mode_nested_evidence(
         &self,
@@ -7027,42 +6840,11 @@ impl Session {
 
     pub(crate) async fn invalidate_tool_history_source_dependencies_excluding_call_ids(
         &self,
-        affected_paths: Option<&std::collections::BTreeSet<std::path::PathBuf>>,
-        current_workspace_identity: Option<&crate::git_workspace::WorkspaceEvidenceIdentity>,
-        excluded_call_ids: &std::collections::BTreeSet<String>,
+        _affected_paths: Option<&std::collections::BTreeSet<std::path::PathBuf>>,
+        _current_workspace_identity: Option<&crate::git_workspace::WorkspaceEvidenceIdentity>,
+        _excluded_call_ids: &std::collections::BTreeSet<String>,
     ) -> CodexResult<()> {
-        let Ok(reconciliation_permit) = self.tool_history_reconciliation_gate.acquire().await
-        else {
-            unreachable!("session-owned tool-history reconciliation semaphore is never closed");
-        };
-        let mutation = crate::tool_history::ToolHistoryMutation::InvalidateSourceDependencies {
-            affected_paths: affected_paths.cloned(),
-            current_workspace_identity: current_workspace_identity.cloned(),
-            excluded_call_ids: excluded_call_ids.clone(),
-        };
-        {
-            let mut persistence_writer = self.tool_history_persistence.writer().await;
-            let mut state = self.state.lock().await;
-            if !state.apply_tool_history_mutation(&mutation) {
-                return self.check_tool_history_persistence();
-            }
-            persistence_writer
-                .enqueue_mutation(mutation, "source-dependency invalidation state")
-                .map_err(|error| {
-                    CodexErr::Fatal(format!(
-                        "source-dependency invalidation is not durable: {error}"
-                    ))
-                })?;
-        }
-        drop(reconciliation_permit);
-        self.tool_history_persistence
-            .drain()
-            .await
-            .map_err(|error| {
-                CodexErr::Fatal(format!(
-                    "source-dependency invalidation is not durable: {error}"
-                ))
-            })
+        Ok(())
     }
 
     pub(crate) async fn mark_tool_history_consumed(

@@ -64,7 +64,7 @@ async fn run_probe() -> Result<(), String> {
             .timeout(Duration::from_secs(5))
             .tls_certs_only_pem(&explicit_ca)
             .map_err(|error| format!("failed to parse explicit CA: {error}"))?
-            .build_with_transport_default_proxy()
+            .build_direct()
             .map_err(|error| error.to_string())?;
         if let Some(url) = target_url {
             post_http_client_probe_request(&client, &url).await?;

@@ -38,11 +38,6 @@ use codex_protocol::protocol::Op;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::W3cTraceContext;
 use codex_protocol::user_input::UserInput;
-use codex_rollout_trace::ConversationPart;
-use codex_rollout_trace::InferenceTraceContext;
-use codex_rollout_trace::RawTraceEventPayload;
-use codex_rollout_trace::TraceWriter;
-use codex_rollout_trace::replay_bundle;
 use core_test_support::TestCodexResponsesRequestKind;
 use core_test_support::load_default_config_for_test;
 use core_test_support::require_network;
@@ -568,7 +563,6 @@ async fn responses_websocket_forbidden_handshake_uses_http(setup: &str, http_den
                 harness.summary,
                 None,
                 &turn_metadata(&harness, None),
-                &InferenceTraceContext::disabled(),
             )
             .await;
         let Err(CodexErr::UnexpectedStatus(error)) = result else {
@@ -946,7 +940,7 @@ async fn responses_websocket_request_prewarm_uses_caller_supplied_metadata() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn responses_websocket_request_prewarm_traces_logical_request() {
+async fn responses_websocket_request_prewarm_preserves_followup_wire_requests() {
     require_network!();
 
     let server = start_websocket_server(vec![vec![
@@ -974,38 +968,6 @@ async fn responses_websocket_request_prewarm_traces_logical_request() {
         .await
         .expect("websocket prewarm failed");
 
-    let trace_dir = TempDir::new().expect("trace dir");
-    let writer = Arc::new(
-        TraceWriter::create(
-            trace_dir.path(),
-            "trace-1".to_string(),
-            harness.session_id.to_string(),
-            harness.thread_id.to_string(),
-        )
-        .expect("trace writer"),
-    );
-    writer
-        .append(RawTraceEventPayload::ThreadStarted {
-            thread_id: harness.thread_id.to_string(),
-            agent_path: "/root".to_string(),
-            metadata_payload: None,
-        })
-        .expect("thread started");
-    writer
-        .append(RawTraceEventPayload::CodexTurnStarted {
-            codex_turn_id: "turn-1".to_string(),
-            thread_id: harness.thread_id.to_string(),
-        })
-        .expect("turn started");
-
-    let inference_trace = InferenceTraceContext::enabled(
-        writer,
-        harness.thread_id.to_string(),
-        "turn-1".to_string(),
-        harness.model_info.slug.clone(),
-        "test-provider".to_string(),
-    );
-
     let responses_metadata = turn_metadata(&harness, /*turn_id*/ None);
     let mut stream = client_session
         .stream(
@@ -1016,7 +978,6 @@ async fn responses_websocket_request_prewarm_traces_logical_request() {
             harness.summary,
             /*service_tier*/ None,
             &responses_metadata,
-            &inference_trace,
         )
         .await
         .expect("websocket stream failed");
@@ -1035,47 +996,6 @@ async fn responses_websocket_request_prewarm_traces_logical_request() {
     assert_eq!(follow_up["previous_response_id"].as_str(), Some("warm-1"));
     assert_eq!(follow_up["input"], serde_json::json!([]));
 
-    let rollout = tokio::time::timeout(Duration::from_secs(10), async {
-        loop {
-            let rollout = replay_bundle(trace_dir.path()).expect("replay trace");
-            if rollout
-                .inference_calls
-                .values()
-                .any(|call| call.response_id.as_deref() == Some("resp-1"))
-            {
-                break rollout;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .expect("first inference trace must finish asynchronously");
-    let inference = rollout
-        .inference_calls
-        .values()
-        .next()
-        .expect("inference should be present");
-    assert_eq!(inference.request_item_ids.len(), 1);
-    assert_eq!(
-        rollout.conversation_items[&inference.request_item_ids[0]]
-            .body
-            .parts,
-        vec![ConversationPart::Text {
-            text: "hello".to_string(),
-        }],
-    );
-
-    let payload = &rollout.raw_payloads[inference
-        .raw_request_payload_id
-        .as_ref()
-        .expect("captured request")];
-    let captured: serde_json::Value = serde_json::from_slice(
-        &std::fs::read(trace_dir.path().join(&payload.path)).expect("read capture"),
-    )
-    .expect("capture JSON");
-    assert_eq!(captured["_codex"]["wire_request"], follow_up);
-    assert_eq!(captured["input"].as_array().unwrap().len(), 1);
-    assert!(captured["_codex"]["physical_attempt_id"].is_string());
     assert!(follow_up.get("_codex").is_none());
 
     let next_prompt = prompt_with_input(vec![message_item("hello"), message_item("continue")]);
@@ -1088,61 +1008,16 @@ async fn responses_websocket_request_prewarm_traces_logical_request() {
             harness.summary,
             None,
             &responses_metadata,
-            &inference_trace,
         )
         .await
         .expect("continuation stream");
     while let Some(event) = stream.next().await {
         event.expect("continuation event");
     }
-    let rollout = tokio::time::timeout(Duration::from_secs(10), async {
-        loop {
-            let rollout = replay_bundle(trace_dir.path()).expect("replay continuation trace");
-            if rollout
-                .inference_calls
-                .values()
-                .any(|call| call.response_id.as_deref() == Some("resp-2"))
-            {
-                break rollout;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .expect("second inference trace must finish asynchronously");
-    assert_eq!(rollout.inference_calls.len(), 2);
-    let next = rollout
-        .inference_calls
-        .values()
-        .find(|call| call.response_id.as_deref() == Some("resp-2"))
-        .expect("second inference");
-    let payload = &rollout.raw_payloads[next
-        .raw_request_payload_id
-        .as_ref()
-        .expect("captured next request")];
-    let next_capture: serde_json::Value = serde_json::from_slice(
-        &std::fs::read(trace_dir.path().join(&payload.path)).expect("read next capture"),
-    )
-    .expect("next capture JSON");
     let next_wire = server.single_connection()[2].body_json();
-    let mut captured_wire = next_capture.clone();
-    captured_wire.as_object_mut().unwrap().remove("_codex");
-    assert_eq!(captured_wire, next_wire);
-    assert_eq!(
-        next_capture["_codex"]["logical_request"]["input"]
-            .as_array()
-            .unwrap()
-            .len(),
-        2
-    );
-    assert_ne!(
-        next_capture["_codex"]["physical_attempt_id"],
-        captured["_codex"]["physical_attempt_id"]
-    );
-    assert_ne!(
-        next_capture["_codex"]["sampling_request_id"],
-        captured["_codex"]["sampling_request_id"]
-    );
+    assert!(next_wire.get("_codex").is_none());
+    assert_eq!(next_wire["previous_response_id"], "resp-1");
+    assert_eq!(next_wire["input"].as_array().unwrap().len(), 1);
     server.shutdown().await;
 }
 
@@ -1820,7 +1695,6 @@ async fn responses_websocket_emits_rate_limit_events() {
             harness.summary,
             /*service_tier*/ None,
             &responses_metadata,
-            &codex_rollout_trace::InferenceTraceContext::disabled(),
         )
         .await
         .expect("websocket stream failed");
@@ -2475,7 +2349,6 @@ async fn responses_websocket_v2_after_error_uses_full_create_without_previous_re
             harness.summary,
             /*service_tier*/ None,
             &responses_metadata,
-            &codex_rollout_trace::InferenceTraceContext::disabled(),
         )
         .await
         .expect("websocket stream failed");
@@ -2569,7 +2442,6 @@ async fn responses_websocket_v2_surfaces_terminal_error_without_close_handshake(
             harness.summary,
             /*service_tier*/ None,
             &responses_metadata,
-            &codex_rollout_trace::InferenceTraceContext::disabled(),
         )
         .await
         .expect("websocket stream failed");
@@ -2822,7 +2694,6 @@ async fn stream_until_complete_with_model_info(
             harness.summary,
             /*service_tier*/ None,
             &responses_metadata,
-            &codex_rollout_trace::InferenceTraceContext::disabled(),
         )
         .await
         .expect("websocket stream failed");
@@ -2871,7 +2742,6 @@ async fn stream_until_complete_with_metadata(
             harness.summary,
             service_tier.map(|service_tier| service_tier.request_value().to_string()),
             responses_metadata,
-            &codex_rollout_trace::InferenceTraceContext::disabled(),
         )
         .await
         .expect("websocket stream failed");

@@ -3,6 +3,51 @@ use pretty_assertions::assert_eq;
 use std::collections::BTreeMap;
 
 #[test]
+fn wrapped_negatives_do_not_become_positive_capabilities() {
+    for description in [
+        "Read records. Cannot\ndelete files.",
+        "Read records. Cannot\r\ndelete files.",
+        "Read records. Do\nnot delete files.",
+        "Read records. Can’t delete files.",
+        "Read records. **Cannot** delete files.",
+        "Read records. Do **not** delete files.",
+    ] {
+        let tool = ResponsesApiTool {
+            name: "lookup".into(),
+            description: description.into(),
+            strict: false,
+            defer_loading: None,
+            parameters: JsonSchema::default(),
+            output_schema: None,
+        };
+        let info = ToolSearchInfo::from_tool_spec(&ToolSpec::Function(tool.clone()), None).unwrap();
+        for activation in [
+            info.entry.callable_search_text(),
+            ToolSearchEntry::callable_function_search_text(&tool),
+        ] {
+            assert!(
+                !activation.contains("delete files"),
+                "{description}: {activation}"
+            );
+            assert!(
+                activation.contains("Read records"),
+                "{description}: {activation}"
+            );
+        }
+        assert!(info.entry.search_text.contains(description));
+    }
+    for description in [
+        "Cannot send email\n\nRead drafts",
+        "Cannot send email\r\n\r\nRead drafts",
+    ] {
+        let mut activation = String::new();
+        append_activation_description(description, &mut activation);
+        assert!(activation.contains("Read drafts"));
+        assert!(!activation.contains("send email"));
+    }
+}
+
+#[test]
 fn affordance_projection_preserves_contract_and_positive_clauses() {
     let spec = ToolSpec::Function(ResponsesApiTool {
         name: "preview".into(),
@@ -45,6 +90,9 @@ fn affordance_not_only_keeps_positive_capabilities() {
         "Does not only",
         "Do not only",
         "Doesn't only",
+        "Doesn’t only",
+        "Do **not** only",
+        "Does not\nonly",
         "DOES NOT   ONLY",
     ] {
         let tool = ResponsesApiTool {

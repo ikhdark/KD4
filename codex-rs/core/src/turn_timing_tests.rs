@@ -53,6 +53,33 @@ use crate::tools::tool_dispatch_trace::ToolDispatchTimingSnapshot;
 
 const NS_PER_MS: u128 = 1_000_000;
 
+#[tokio::test]
+async fn terminal_profile_omits_request_details_but_preserves_sampling_checkpoints() {
+    let (clock, state) = timing();
+    state.mark_turn_started();
+    state.begin_model_generation_with_metadata(
+        &mut None,
+        &SessionSource::Cli,
+        Some(TurnTimingGenerationPurpose::InitialReasoning),
+        TurnTimingGenerationDisposition::DecisionBearing,
+        None,
+    );
+    drop(state.begin_model_request_wait());
+    state.record_model_attempt_identity("sampling-1", "attempt-1");
+    clock.set_ms(5);
+    let checkpoint = state.sampling_checkpoint();
+    assert_eq!(checkpoint.timing.model_requests.len(), 1);
+    let full = state.complete_snapshot().protocol_timing();
+    let home = tempfile::tempdir().unwrap();
+    let terminal = super::retain_turn_timing_details(full.clone(), home.path(), "thread").await;
+    assert!(terminal.model_requests.is_empty());
+    assert_eq!(terminal.model_request_history_truncated, Some(true));
+    assert_eq!(terminal.counters, full.counters);
+    assert_eq!(terminal.inclusive_duration_ns, 5 * NS_PER_MS as u64);
+    assert_eq!(checkpoint.timing.model_requests[0].sampling_request_id.as_deref(), Some("sampling-1"));
+    assert!(serde_json::to_vec(&terminal).unwrap().len() < serde_json::to_vec(&full).unwrap().len());
+}
+
 #[test]
 fn assistant_text_publication_excludes_reasoning_empty_messages_and_completion_time() {
     use codex_protocol::items::AgentMessageContent;
@@ -3795,7 +3822,6 @@ fn wait_and_tool_output_counters_are_additive() {
     assert_eq!(counters.owner_drained_continuation_count, 1);
     assert_eq!(counters.executed_validation_count, 1);
     assert_eq!(counters.executed_validation_duration_ns, 125_000_000);
-    assert_eq!(counters.suppressed_validation_output_count, 0);
     assert_eq!(counters.ready_startup_prewarm_count, 1);
     assert_eq!(counters.suppressed_deterministic_continuation_count, 0);
     assert_eq!(counters.no_progress_directive_count, 1);

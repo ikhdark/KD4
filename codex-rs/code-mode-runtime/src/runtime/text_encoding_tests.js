@@ -49,6 +49,18 @@
   check(raised(() => decoder.decode("text"), TypeError), "string input accepted");
   check(raised(() => new TextDecoder("utf-8", { fatal: true })
     .decode(new Uint8Array([0xff])), TypeError), "fatal decode replaced an error");
+  const fatal = new TextDecoder("utf-8", {fatal:true});
+  const unread = new Uint8Array([0xff, 0x61]);
+  check(raised(() => fatal.decode(unread, {stream:true}), TypeError), "fatal stream accepted invalid byte");
+  unread[1] = 0x62;
+  check(fatal.decode(new Uint8Array([0x63])) === "ac", "fatal stream lost or aliased unread input");
+  check(fatal.decode(new Uint8Array([0x41]), {stream:true}) === "A", "fatal stream prefix");
+  check(raised(() => fatal.decode(new Uint8Array([0xff]), {stream:true}), TypeError), "fatal continuation");
+  check(fatal.decode(new Uint8Array([0xef,0xbb,0xbf,0x42])) === "\ufeffB", "fatal stream reset BOM state");
+  check(raised(() => fatal.decode(new Uint8Array([0xe2,0x61]), {stream:true}), TypeError), "invalid continuation");
+  check(fatal.decode() === "a", "fatal decoder failed to reprocess offending continuation");
+  check(raised(() => fatal.decode(new Uint8Array([0xff,0x61])), TypeError), "fatal flush");
+  check(fatal.decode(new Uint8Array([0x62])) === "b", "flushed fatal call retained old stream");
   check(raised(() => new TextDecoder("latin1"), RangeError), "unsupported label accepted");
   check(new TextDecoder(" UTF8 ").encoding === "utf-8", "label normalization");
   check(Object.prototype.toString.call(encoder) === "[object TextEncoder]" &&

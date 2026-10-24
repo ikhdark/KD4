@@ -9,7 +9,6 @@ use codex_exec_server::ExecEnvPolicy;
 use codex_exec_server::ExecOutputStream as ServerExecOutputStream;
 use codex_exec_server::ExecParams;
 use codex_exec_server::ExecProcess;
-use codex_network_proxy::PROXY_ACTIVE_ENV_KEY;
 use futures::future::BoxFuture;
 use tokio_util::sync::CancellationToken;
 use tracing::error;
@@ -30,7 +29,6 @@ use crate::state::TaskKind;
 use crate::tools::format_exec_output_str;
 
 use crate::tools::runtimes::maybe_wrap_shell_lc_with_snapshot_file;
-use crate::tools::runtimes::strip_managed_proxy_env;
 use crate::user_shell_command::user_shell_command_record_item_from_formatted_output;
 use codex_protocol::exec_output::ExecToolCallOutput;
 use codex_protocol::exec_output::StreamOutput;
@@ -406,9 +404,6 @@ async fn execute_local_user_shell_command(
         &turn_context.config.permissions.shell_environment_policy,
         Some(session.thread_id),
     );
-    if exec_env_map.contains_key(PROXY_ACTIVE_ENV_KEY) {
-        strip_managed_proxy_env(&mut exec_env_map);
-    }
     let exec_command = prepare_user_shell_exec_command(
         display_command,
         environment_shell,
@@ -429,8 +424,6 @@ async fn execute_local_user_shell_command(
         exec_server_env_config: None,
         // `/shell` is the explicit full-access escape hatch, so it must not
         // inherit a managed proxy from the surrounding session or turn.
-        network: None,
-        network_environment_id: None,
         expiration: USER_SHELL_TIMEOUT_MS.into(),
         capture_policy: ExecCapturePolicy::ShellTool,
         sandbox: SandboxType::None,
@@ -448,8 +441,6 @@ async fn execute_local_user_shell_command(
         windows_sandbox_additional_read_roots: Vec::new(),
         arg0: None,
         exec_server_sandbox: None,
-        exec_server_enforce_managed_network: false,
-        exec_server_managed_network: None,
     };
     let stdout_stream = Some(StdoutStream {
         sub_id: turn_context.sub_id.clone(),

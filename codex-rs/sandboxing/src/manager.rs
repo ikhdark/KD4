@@ -3,8 +3,6 @@ use crate::policy_transforms::should_require_platform_sandbox;
 use crate::resolve_windows_elevated_filesystem_overrides;
 use crate::resolve_windows_restricted_token_filesystem_overrides;
 use crate::windows_sandbox_uses_elevated_backend;
-use codex_network_proxy::ManagedNetworkSandboxContext;
-use codex_network_proxy::NetworkProxy;
 use codex_protocol::config_types::WindowsSandboxLevel;
 use codex_protocol::models::AdditionalPermissionProfile;
 use codex_protocol::models::PermissionProfile;
@@ -50,26 +48,6 @@ pub fn get_platform_sandbox(windows_sandbox_enabled: bool) -> Option<SandboxType
     }
 }
 
-pub fn with_managed_mitm_ca_readable_root(
-    permission_profile: PermissionProfile,
-    managed_mitm_ca_trust_bundle_path: Option<&AbsolutePathBuf>,
-    sandbox_policy_cwd: &Path,
-) -> PermissionProfile {
-    let Some(managed_mitm_ca_trust_bundle_path) = managed_mitm_ca_trust_bundle_path else {
-        return permission_profile;
-    };
-    let (file_system_sandbox_policy, network_sandbox_policy) =
-        permission_profile.to_runtime_permissions();
-    let file_system_sandbox_policy = file_system_sandbox_policy.with_additional_readable_roots(
-        sandbox_policy_cwd,
-        std::slice::from_ref(managed_mitm_ca_trust_bundle_path),
-    );
-    PermissionProfile::from_runtime_permissions_with_enforcement(
-        permission_profile.enforcement(),
-        &file_system_sandbox_policy,
-        network_sandbox_policy,
-    )
-}
 
 #[derive(Debug)]
 pub struct SandboxCommand {
@@ -77,7 +55,6 @@ pub struct SandboxCommand {
     pub args: Vec<String>,
     pub cwd: PathUri,
     pub env: HashMap<String, String>,
-    pub managed_network: Option<ManagedNetworkSandboxContext>,
     pub additional_permissions: Option<AdditionalPermissionProfile>,
 }
 
@@ -91,8 +68,6 @@ pub struct SandboxExecRequest {
     pub cwd: PathUri,
     pub sandbox_policy_cwd: PathUri,
     pub env: HashMap<String, String>,
-    pub network: Option<NetworkProxy>,
-    pub network_environment_id: Option<String>,
     pub sandbox: SandboxType,
     pub windows_sandbox_level: WindowsSandboxLevel,
     pub windows_sandbox_private_desktop: bool,
@@ -109,11 +84,6 @@ pub struct SandboxTransformRequest<'a> {
     pub command: SandboxCommand,
     pub permissions: &'a PermissionProfile,
     pub sandbox: SandboxType,
-    pub enforce_managed_network: bool,
-    pub environment_id: Option<&'a str>,
-    // TODO(viyatb): Evaluate switching this to Option<Arc<NetworkProxy>>
-    // to make shared ownership explicit across runtime/sandbox plumbing.
-    pub network: Option<&'a NetworkProxy>,
     pub sandbox_policy_cwd: &'a PathUri,
     pub windows_sandbox_level: WindowsSandboxLevel,
     pub windows_sandbox_private_desktop: bool,
@@ -142,7 +112,6 @@ impl PendingSandboxedExecRequest {
         command_cwd: &PathUri,
         sandbox_policy_cwd: &PathUri,
         effective_permission_profile: PermissionProfile,
-        managed_mitm_ca_trust_bundle_path: Option<&AbsolutePathBuf>,
     ) -> Result<Self, SandboxTransformError> {
         // TODO(anp): Move PathUri conversion into the platform sandbox implementations.
         let _native_command_cwd = command_cwd.to_abs_path().map_err(|source| {
@@ -151,17 +120,12 @@ impl PendingSandboxedExecRequest {
                 source,
             }
         })?;
-        let native_sandbox_policy_cwd = sandbox_policy_cwd.to_abs_path().map_err(|source| {
+        let _native_sandbox_policy_cwd = sandbox_policy_cwd.to_abs_path().map_err(|source| {
             SandboxTransformError::InvalidSandboxPolicyCwd {
                 cwd: sandbox_policy_cwd.clone(),
                 source,
             }
         })?;
-        let effective_permission_profile = with_managed_mitm_ca_readable_root(
-            effective_permission_profile,
-            managed_mitm_ca_trust_bundle_path,
-            native_sandbox_policy_cwd.as_path(),
-        );
         let (effective_file_system_policy, effective_network_policy) =
             effective_permission_profile.to_runtime_permissions();
         Ok(Self {
@@ -176,7 +140,6 @@ impl PendingSandboxedExecRequest {
 pub enum SandboxTransformError {
     InvalidCommandCwd { cwd: PathUri, source: io::Error },
     InvalidSandboxPolicyCwd { cwd: PathUri, source: io::Error },
-    EnvironmentNetworkProxy(String),
     WindowsSandboxPreparation(String),
 }
 
@@ -193,9 +156,6 @@ impl std::fmt::Display for SandboxTransformError {
                 f,
                 "sandbox policy cwd URI `{cwd}` is not valid on this host: {source}"
             ),
-            Self::EnvironmentNetworkProxy(err) => {
-                write!(f, "failed to prepare environment network proxy: {err}")
-            }
             Self::WindowsSandboxPreparation(err) => {
                 write!(f, "failed to prepare windows sandbox wrapper: {err}")
             }
@@ -208,7 +168,6 @@ impl std::error::Error for SandboxTransformError {
         match self {
             Self::InvalidCommandCwd { source, .. }
             | Self::InvalidSandboxPolicyCwd { source, .. } => Some(source),
-            Self::EnvironmentNetworkProxy(_) => None,
             Self::WindowsSandboxPreparation(_) => None,
         }
     }
@@ -260,9 +219,6 @@ pub fn transform(
         mut command,
         permissions,
         sandbox,
-        enforce_managed_network: _,
-        environment_id,
-        network,
         sandbox_policy_cwd,
         windows_sandbox_level,
         windows_sandbox_private_desktop,
@@ -271,18 +227,16 @@ pub fn transform(
     let effective = effective_permission_profile(permissions, additional_permissions.as_ref());
     let (permission_profile, file_system_sandbox_policy, network_sandbox_policy) = match sandbox {
         // Transport requests can carry foreign URIs. Only the selected sandbox
-        // needs host-native paths and the proxy CA readability overlay.
+        // needs host-native paths.
         SandboxType::None => {
             let (file_system, network) = effective.to_runtime_permissions();
             (effective, file_system, network)
         }
         SandboxType::WindowsRestrictedToken => {
-            let ca_path = network.and_then(NetworkProxy::managed_mitm_ca_trust_bundle_path);
             let pending = PendingSandboxedExecRequest::new(
                 &command.cwd,
                 sandbox_policy_cwd,
                 effective,
-                ca_path.as_ref(),
             )?;
             (
                 pending.effective_permission_profile,
@@ -300,8 +254,6 @@ pub fn transform(
         cwd: command.cwd,
         sandbox_policy_cwd: sandbox_policy_cwd.clone(),
         env: command.env,
-        network: network.cloned(),
-        network_environment_id: environment_id.map(str::to_string),
         sandbox,
         windows_sandbox_level,
         windows_sandbox_private_desktop,
@@ -379,7 +331,7 @@ fn wrap_windows_sandbox_exec_request_for_direct_spawn(
     *program = helper.to_string_lossy().into_owned();
 
     let inner_command = std::mem::take(&mut request.command);
-    let proxy_enforced = request.network.is_some();
+    let proxy_enforced = false;
     let use_elevated =
         windows_sandbox_uses_elevated_backend(request.windows_sandbox_level, proxy_enforced);
     let overrides = if use_elevated {

@@ -26,10 +26,6 @@ from scripts.common.process_owner import (  # noqa: E402 - direct script bootstr
     OwnedThreadPoolExecutor as ThreadPoolExecutor,
 )
 from scripts.common.process_owner import run_finite  # noqa: E402
-from scripts.maintenance.root_maintenance import (  # noqa: E402
-    python_lint_targets,
-    resolved_changed_paths,
-)
 from scripts.common.tool_versions import RUSTFMT_TOOLCHAIN  # noqa: E402
 
 PRETTIER_TARGETS = (
@@ -271,17 +267,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         metavar="PACKAGE",
         help="limit Rust formatting to a Cargo package; repeat for multiple packages",
     )
-    parser.add_argument(
-        "--changed",
-        action="append",
-        nargs="?",
-        const=None,
-        default=[],
-        help=(
-            "format changed scripts/*.py paths; with no path, detect changed "
-            "paths from git (requires --only python-scripts)"
-        ),
-    )
     args = parser.parse_args(argv)
     selected_groups = (
         {FORMATTER_ALIASES.get(name.lower(), name.lower()) for name in args.only}
@@ -295,30 +280,16 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "--fast-local excludes formatter groups selected by --only: "
                 + ", ".join(incompatible_groups)
             )
-    if args.changed and selected_groups != {"python-scripts"}:
-        parser.error("--changed requires --only python-scripts")
     if (
         args.rust_package
         and selected_groups is not None
         and "rust" not in selected_groups
     ):
         parser.error("--rust-package requires the Rust formatter to be selected")
-    python_script_targets: Sequence[str] = ("scripts",)
-    if args.changed:
-        changed_paths = resolved_changed_paths(args.changed)
-        if changed_paths is None:
-            return 2
-        python_script_targets = (
-            python_lint_targets(changed_paths) if changed_paths else []
-        )
-        if not python_script_targets:
-            print("No matching changed Python files to format.")
-            return 0
     groups = formatter_groups(
         check=args.check,
         fast_local=args.fast_local,
         selected_groups=selected_groups,
-        python_script_targets=python_script_targets,
         rust_packages=args.rust_package,
     )
     if not groups:

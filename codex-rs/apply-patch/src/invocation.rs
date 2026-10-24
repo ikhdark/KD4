@@ -514,6 +514,11 @@ pub(crate) async fn mutation_endpoint_identity(
 fn extract_apply_patch_from_bash(
     src: &str,
 ) -> std::result::Result<(String, Option<String>), ExtractHeredocError> {
+    // Both accepted AST forms contain a literal command name. Reject ordinary
+    // shell scripts before allocating a parser, including patch-scope probes.
+    if !APPLY_PATCH_COMMANDS.iter().any(|name| src.contains(name)) {
+        return Err(ExtractHeredocError::CommandDidNotStartWithApplyPatch);
+    }
     // This function uses a Tree-sitter query to recognize one of two
     // whole-script forms, each expressed as a single top-level statement:
     //
@@ -1388,8 +1393,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(windows)]
     async fn test_verify_keeps_case_alias_guard_for_prospective_endpoints() {
         let dir = tempdir().unwrap();
+        set_directory_case_sensitive(dir.path(), false);
         let cwd = PathUri::from_host_native_path(dir.path()).unwrap();
         let patch =
             wrap_patch("*** Add File: Missing.txt\n+first\n*** Add File: missing.txt\n+second");

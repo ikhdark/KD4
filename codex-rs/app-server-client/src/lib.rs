@@ -91,7 +91,6 @@ pub mod legacy_core {
         pub use codex_core::config::ConfigBuilder;
         pub use codex_core::config::ConfigOverrides;
         pub use codex_core::config::ConfigTomlLoadResult;
-        pub use codex_core::config::NetworkProxySpec;
         pub use codex_core::config::PermissionProfileCatalogEntry;
         pub use codex_core::config::PermissionProfileSnapshot;
         pub use codex_core::config::Permissions;
@@ -310,6 +309,9 @@ where
     F: FnMut(ServerRequest),
 {
     if event_tx.is_closed() {
+        if let InProcessServerEvent::ServerRequest(request) = event {
+            reject_server_request(request);
+        }
         return ForwardEventResult::DisableStream;
     }
     if event_requires_delivery(&event) {
@@ -335,11 +337,15 @@ where
         pending_delivery.push_back(event);
         return ForwardEventResult::Continue;
     }
+    let mut sent_lagged = false;
     if *skipped_events > 0 {
         match event_tx.try_send(InProcessServerEvent::Lagged {
             skipped: *skipped_events,
         }) {
-            Ok(()) => *skipped_events = 0,
+            Ok(()) => {
+                *skipped_events = 0;
+                sent_lagged = true;
+            }
             Err(mpsc::error::TrySendError::Full(_)) => {
                 *skipped_events = skipped_events.saturating_add(skipped_event_count(&event));
                 if let InProcessServerEvent::ServerRequest(request) = event {
@@ -347,13 +353,25 @@ where
                 }
                 return ForwardEventResult::Continue;
             }
-            Err(mpsc::error::TrySendError::Closed(_)) => return ForwardEventResult::DisableStream,
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                if let InProcessServerEvent::ServerRequest(request) = event {
+                    reject_server_request(request);
+                }
+                return ForwardEventResult::DisableStream;
+            }
         }
     }
 
     match event_tx.try_send(event) {
         Ok(()) => ForwardEventResult::Continue,
         Err(mpsc::error::TrySendError::Full(event)) => {
+            if sent_lagged && matches!(&event, InProcessServerEvent::ServerRequest(_)) {
+                // The advisory marker consumed capacity this request could have
+                // used. Retain just its adjacent request, in order, rather than
+                // manufacturing overload. The worker pauses reads while retained.
+                pending_delivery.push_back(event);
+                return ForwardEventResult::Continue;
+            }
             *skipped_events = skipped_events.saturating_add(skipped_event_count(&event));
             warn!("dropping in-process app-server event because consumer queue is full");
             if let InProcessServerEvent::ServerRequest(request) = event {
@@ -361,7 +379,12 @@ where
             }
             ForwardEventResult::Continue
         }
-        Err(mpsc::error::TrySendError::Closed(_)) => ForwardEventResult::DisableStream,
+        Err(mpsc::error::TrySendError::Closed(event)) => {
+            if let InProcessServerEvent::ServerRequest(request) = event {
+                reject_server_request(request);
+            }
+            ForwardEventResult::DisableStream
+        }
     }
 }
 
@@ -611,7 +634,7 @@ pub struct InProcessAppServerClient {
     command_tx: mpsc::Sender<ClientCommand>,
     event_rx: mpsc::Receiver<InProcessServerEvent>,
     initialize_response: AppServerInitializeResponse,
-    worker_handle: tokio::task::JoinHandle<()>,
+    worker_handle: tokio::task::JoinHandle<IoResult<()>>,
 }
 
 #[derive(Clone)]
@@ -658,11 +681,14 @@ impl InProcessAppServerClient {
             if let Some(pause) = worker_pause {
                 pause.notified().await;
             }
-            let mut event_stream_enabled = true;
+            let mut shutdown_ack = None;
             let mut skipped_events = 0usize;
             let mut pending_delivery = std::collections::VecDeque::new();
             loop {
                 tokio::select! {
+                    // A retained request handle cannot keep an input-capable
+                    // runtime alive after its only event consumer has gone away.
+                    _ = event_tx.closed() => break,
                     permit = event_tx.reserve(), if !pending_delivery.is_empty() => {
                         match permit {
                             Ok(permit) => {
@@ -671,8 +697,7 @@ impl InProcessAppServerClient {
                                 }
                             }
                             Err(_) => {
-                                pending_delivery.clear();
-                                event_stream_enabled = false;
+                                break;
                             }
                         }
                     }
@@ -714,17 +739,15 @@ impl InProcessAppServerClient {
                                 let _ = response_tx.send(send_result);
                             }
                             Some(ClientCommand::Shutdown { response_tx }) => {
-                                let shutdown_result = handle.shutdown().await;
-                                let _ = response_tx.send(shutdown_result);
+                                shutdown_ack = Some(response_tx);
                                 break;
                             }
                             None => {
-                                let _ = handle.shutdown().await;
                                 break;
                             }
                         }
                     }
-                    event = handle.next_event(), if event_stream_enabled && pending_delivery.is_empty() => {
+                    event = handle.next_event(), if pending_delivery.is_empty() => {
                         let Some(event) = event else {
                             break;
                         };
@@ -771,12 +794,24 @@ impl InProcessAppServerClient {
                                 }
                             }
                             ForwardEventResult::DisableStream => {
-                                event_stream_enabled = false;
+                                break;
                             }
                         }
                     }
                 }
             }
+            // Retire facade admission before joining the existing runtime owner.
+            // Closing unread runtime events fails outstanding interactions and
+            // preserves custody of committed work through graceful shutdown.
+            command_rx.close();
+            drop(command_rx);
+            let result = handle.shutdown().await;
+            if let Some(response_tx) = shutdown_ack {
+                let _ = response_tx.send(result.as_ref().map(|_| ()).map_err(|error| {
+                    IoError::new(error.kind(), error.to_string())
+                }));
+            }
+            result
         });
 
         Ok(Self {
@@ -938,43 +973,21 @@ impl InProcessAppServerClient {
         // and getting aborted with the runtime still attached.
         drop(event_rx);
         let (response_tx, response_rx) = oneshot::channel();
-        let deadline = tokio::time::Instant::now() + SHUTDOWN_TIMEOUT;
-        // Queue admission is part of graceful shutdown too. A live worker may
-        // stop draining before this command reaches it.
-        let shutdown_result = tokio::time::timeout_at(deadline, async {
-            if command_tx
-                .send(ClientCommand::Shutdown { response_tx })
-                .await
-                .is_err()
-            {
-                return Err(IoError::new(
-                    ErrorKind::BrokenPipe,
-                    "session persistence shutdown channel closed",
-                ));
-            }
-            response_rx.await.map_err(|_| {
-                IoError::new(
-                    ErrorKind::BrokenPipe,
-                    "in-process app-server shutdown channel is closed",
-                )
-            })?
-        })
-        .await;
-
-        // If admission timed out, the worker never saw Shutdown; releasing this
-        // sender lets it reach the channel-closed shutdown path once retained
-        // request handles are gone, instead of waiting on us forever.
+        // Only the public observer has a deadline. This retained owner keeps
+        // shutdown intent alive even while command admission is blocked.
+        if command_tx
+            .send(ClientCommand::Shutdown { response_tx })
+            .await
+            .is_ok()
+        {
+            let _ = response_rx.await;
+        }
         drop(command_tx);
-        // This retained task owns the actual worker after any observer timeout.
+        // Event-consumer closure may beat the queued command. The joined worker
+        // result still confirms runtime cleanup (or propagates its real failure).
         worker_handle
             .await
-            .map_err(|error| IoError::other(format!("in-process facade worker failed: {error}")))?;
-        shutdown_result.unwrap_or_else(|_| {
-            Err(IoError::new(
-                ErrorKind::TimedOut,
-                "session persistence shutdown unconfirmed",
-            ))
-        })
+            .map_err(|error| IoError::other(format!("in-process facade worker failed: {error}")))?
     }
 }
 
@@ -1864,6 +1877,59 @@ mod tests {
             assert_eq!(notification.thread_name.as_deref(), Some(name));
         }
         client.shutdown().await.expect("shutdown");
+    }
+
+    #[tokio::test]
+    async fn in_process_client_drop_retires_worker_with_retained_request_handle() {
+        let TestClient { _codex_home, client } = start_test_client(SessionSource::Cli).await;
+        let request_handle = client.request_handle();
+        let worker = client.worker_handle.abort_handle();
+        drop(client);
+        timeout(Duration::from_secs(5), request_handle.command_tx.closed())
+            .await
+            .expect("consumer loss must close request admission despite retained handles");
+        timeout(Duration::from_secs(5), async {
+            while !worker.is_finished() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }).await.expect("consumer loss must gracefully retire the runtime owner");
+    }
+
+    #[tokio::test]
+    async fn in_process_lag_marker_retains_adjacent_server_request_and_closed_consumer_rejects() {
+        let request = || ServerRequest::ToolRequestUserInput {
+            request_id: RequestId::Integer(5),
+            params: ToolRequestUserInputParams {
+                thread_id: "thread".into(), turn_id: "turn".into(),
+                item_id: "item".into(), questions: Vec::new(), auto_resolution_ms: None,
+            },
+        };
+        let (event_tx, mut event_rx) = mpsc::channel(1);
+        let mut pending = std::collections::VecDeque::new();
+        let mut skipped = 1;
+        let mut rejected = Vec::new();
+        assert_eq!(forward_in_process_event(
+            &event_tx, &mut pending, &mut skipped,
+            InProcessServerEvent::ServerRequest(request()), |request| rejected.push(request),
+        ), ForwardEventResult::Continue);
+        assert!(rejected.is_empty());
+        assert_eq!(skipped, 0);
+        assert!(matches!(event_rx.try_recv(), Ok(InProcessServerEvent::Lagged { skipped: 1 })));
+        assert!(matches!(pending.pop_front(), Some(InProcessServerEvent::ServerRequest(_))));
+        // A genuinely full queue still rejects immediately and counts the loss.
+        event_tx.try_send(InProcessServerEvent::Lagged { skipped: 9 }).unwrap();
+        assert_eq!(forward_in_process_event(
+            &event_tx, &mut pending, &mut skipped,
+            InProcessServerEvent::ServerRequest(request()), |request| rejected.push(request),
+        ), ForwardEventResult::Continue);
+        assert_eq!(rejected.len(), 1);
+        assert_eq!(skipped, 1);
+        drop(event_rx);
+        assert_eq!(forward_in_process_event(
+            &event_tx, &mut pending, &mut skipped,
+            InProcessServerEvent::ServerRequest(request()), |request| rejected.push(request),
+        ), ForwardEventResult::DisableStream);
+        assert_eq!(rejected.len(), 2, "closed-consumer request must also be rejected");
     }
 
     #[tokio::test]
@@ -3354,7 +3420,9 @@ mod tests {
         // A worker that exited without receiving Shutdown never confirmed session persistence.
         let (command_tx, _) = mpsc::channel(1);
         let (event_tx, event_rx) = mpsc::channel(1);
-        let worker_handle = tokio::spawn(async {});
+        let worker_handle = tokio::spawn(async {
+            Err(IoError::new(ErrorKind::BrokenPipe, "test worker did not confirm shutdown"))
+        });
         event_tx
             .send(InProcessServerEvent::Lagged { skipped: 3 })
             .await
@@ -3600,6 +3668,9 @@ mod tests {
         assert!(futures::poll!(&mut queued_request).is_pending());
         assert_eq!(client.command_tx.capacity(), 0);
 
+        // Initialization uses real I/O; only the established deadline phase
+        // runs on controlled time.
+        tokio::time::pause();
         // Timeout stops observation, not custody: an undrained worker is
         // reported as still pending and is never aborted.
         let error = timeout(SHUTDOWN_TIMEOUT + Duration::from_secs(2), client.shutdown())
@@ -3612,14 +3683,14 @@ mod tests {
             "an observer timeout must not abort the worker"
         );
 
-        // The retained owner reaps the worker once it can drain the admitted
-        // request and the last retained request handle is gone.
+        tokio::time::resume();
+        // The retained owner must reap the worker while a request handle is
+        // still alive, without relying on command-channel closure.
         pause.notify_one();
         let _ = timeout(Duration::from_secs(5), &mut queued_request)
             .await
             .expect("the admitted request must resolve once the worker drains it");
         drop(queued_request);
-        drop(request_handle);
         timeout(Duration::from_secs(5), async {
             while !worker.is_finished() {
                 tokio::time::sleep(Duration::from_millis(10)).await;
@@ -3627,6 +3698,7 @@ mod tests {
         })
         .await
         .expect("the retained shutdown owner must reap the worker");
+        assert!(request_handle.command_tx.is_closed());
     }
 
     #[tokio::test]

@@ -1035,8 +1035,6 @@ pub fn main() -> Result<()> {
     if let Ok(mut guard) = hpc_handle.lock() {
         let _ = guard.take();
     }
-    drop(conpty_owner.take());
-
     // Preserved or breakaway descendants can hold inherited output handles open indefinitely, and
     // a preserved job ignores Terminate, so reader EOF must not withhold the exit frame.
     let readers = std::iter::once(&out_thread)
@@ -1073,6 +1071,8 @@ pub fn main() -> Result<()> {
         log_note(&format!("runner exit write failed: {err}"), log_dir);
     }
 
+    // Publish root exit before potentially blocking older ConPTY teardown.
+    drop(conpty_owner.take());
     std::process::exit(exit_code);
 }
 

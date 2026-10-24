@@ -16,7 +16,7 @@ pub(crate) const KIND: &str = "rollout_payload_artifact";
 pub(crate) const PAYLOAD_DIRECTORY: &str = "rollout-payloads";
 const MAX_CONCURRENT_PAYLOAD_SYNCS: usize = 8;
 
-/// A reference is the small fixed-shape record `store_line` writes, always far
+/// A reference is the small fixed-shape record `store_value` writes, always far
 /// below the inline threshold. A longer line that only mentions the kind (tool
 /// output quoting this source, for example) is ordinary history: classify it
 /// without a JSON parse or a blocking-pool hop.
@@ -450,15 +450,22 @@ pub(crate) fn is_artifact_candidate(item: &RolloutItem) -> bool {
     }
 }
 
-/// Artifacts are content-addressed and atomically published before the referencing line.
-/// Per-record fsync is deferred to the durable rollout barrier.
-/// Failures fall back to the original inline record at the writer boundary.
-/// The caller selects eligible items with `is_artifact_candidate`.
+#[cfg(test)]
 pub(crate) fn store_line(path: &Path, line: &[u8]) -> io::Result<Vec<u8>> {
     if line.len() < INLINE_BYTES {
         return Ok(line.to_vec());
     }
-    let mut item: serde_json::Value = serde_json::from_slice(line)?;
+    Ok(store_value(path, serde_json::from_slice(line)?)?.unwrap_or_else(|| line.to_vec()))
+}
+
+/// Artifacts are content-addressed and atomically published before the referencing line.
+/// Per-record fsync is deferred to the durable rollout barrier.
+/// Failures and oversized bodies fall back to the original inline record at the writer boundary.
+/// The caller selects eligible items and checks the complete JSONL byte threshold.
+pub(crate) fn store_value(
+    path: &Path,
+    mut item: serde_json::Value,
+) -> io::Result<Option<Vec<u8>>> {
     // Full tool-manifest definitions are usually byte-identical across threads,
     // so the content address stores one copy for every rollout that uses them.
     let fields = item
@@ -468,7 +475,7 @@ pub(crate) fn store_line(path: &Path, line: &[u8]) -> io::Result<Vec<u8>> {
     let format_version = fields.remove("format_version");
     let bytes = serde_json::to_vec(&item)?;
     if bytes.len() as u64 > MAX_PAYLOAD_BYTES {
-        return Ok(line.to_vec());
+        return Ok(None);
     }
     let sha256 = digest(&bytes);
     let directory = root(path);
@@ -513,7 +520,7 @@ pub(crate) fn store_line(path: &Path, line: &[u8]) -> io::Result<Vec<u8>> {
     reference["payload"]["item_type"] = item["type"].clone();
     let mut serialized = serde_json::to_vec(&reference)?;
     serialized.push(b'\n');
-    Ok(serialized)
+    Ok(Some(serialized))
 }
 
 fn read_payload(directory: &Path, sha256: &str, bytes: u64) -> io::Result<Vec<u8>> {

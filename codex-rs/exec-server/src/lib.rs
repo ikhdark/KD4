@@ -3,7 +3,7 @@ mod client_api;
 mod client_error;
 mod client_transport;
 #[cfg(test)]
-mod concurrency_audit_tests;
+mod executor_concurrency_tests;
 mod connection;
 mod environment;
 mod environment_provider;

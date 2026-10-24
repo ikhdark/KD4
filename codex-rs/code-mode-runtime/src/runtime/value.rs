@@ -121,6 +121,18 @@ pub(super) fn serialize_console_text(
     let mut tc = tc.init();
     if value.is_native_error()
         && let Ok(object) = v8::Local::<v8::Object>::try_from(value)
+        && ["results", "evidence", "missing_capabilities"].iter().any(|field| {
+            v8::String::new(&tc, field)
+                .and_then(|key| object.get(&tc, key.into()))
+                .is_some_and(|value| !value.is_undefined())
+        })
+    {
+        tc.reset();
+        return serialize_output_text_with_limit(&mut tc, value, max_bytes);
+    }
+    tc.reset();
+    if value.is_native_error()
+        && let Ok(object) = v8::Local::<v8::Object>::try_from(value)
         && let Some(key) = v8::String::new(&tc, "stack")
         && let Some(stack) = object.get(&tc, key.into())
         && let Ok(stack) = v8::Local::<v8::String>::try_from(stack)

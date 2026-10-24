@@ -59,15 +59,6 @@ impl Session {
             };
         let mut world_state = WorldState::default();
         world_state.add_section(
-            self.services
-                .plan_store
-                .task_state(
-                    turn_context.collaboration_mode.mode
-                        == codex_protocol::config_types::ModeKind::Plan,
-                )
-                .await,
-        );
-        world_state.add_section(
             AgentsMdState::new_cached(
                 step_context.loaded_agents_md.as_deref(),
                 step_context.agents_md_stable_context.as_ref(),

@@ -38,6 +38,23 @@ pub unsafe fn sync_persistent_deny_read_acls(
     desired_paths: &[PathBuf],
     psid: *mut c_void,
 ) -> Result<Vec<PathBuf>> {
+    unsafe { sync_deny_read_acls(codex_home, principal_sid, desired_paths, psid, true) }
+}
+
+/// Shared logon principals can still belong to surviving descendants. Refuse
+/// policy relaxation without a principal-wide quiescence proof.
+///
+/// # Safety
+/// Caller must retain a valid SID matching principal_sid.
+pub unsafe fn sync_shared_principal_deny_read_acls(
+    codex_home: &Path, principal_sid: &str, desired_paths: &[PathBuf], psid: *mut c_void,
+) -> Result<Vec<PathBuf>> {
+    unsafe { sync_deny_read_acls(codex_home, principal_sid, desired_paths, psid, false) }
+}
+
+unsafe fn sync_deny_read_acls(
+    codex_home: &Path, principal_sid: &str, desired_paths: &[PathBuf], psid: *mut c_void, allow_relaxation: bool,
+) -> Result<Vec<PathBuf>> {
     let state_path = sandbox_dir(codex_home).join(DENY_READ_ACL_STATE_FILE);
     let state_dir = state_path
         .parent()
@@ -64,6 +81,11 @@ pub unsafe fn sync_persistent_deny_read_acls(
     // Resolve once: every path that can receive an ACE must already be in the
     // durable intent, including existing canonical targets of lexical denies.
     let planned_paths = plan_deny_read_acl_paths(desired_paths);
+    if !allow_relaxation {
+        let desired = planned_paths.iter().map(|path| lexical_path_key(path)).collect::<HashSet<_>>();
+        anyhow::ensure!(previous_paths.iter().all(|path| desired.contains(&lexical_path_key(path))),
+            "cannot relax shared sandbox read-deny policy while principal quiescence is unproven");
+    }
     for path in &planned_paths {
         match std::fs::symlink_metadata(path) {
             Ok(_) => {}

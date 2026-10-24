@@ -166,13 +166,6 @@ use codex_protocol::openai_models::ReasoningEffort;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::SubAgentSource;
 use codex_protocol::protocol::TokenUsage;
-use codex_rollout_trace::ExecutionStatus;
-use codex_rollout_trace::InferenceTraceAttempt;
-use codex_rollout_trace::InferenceTraceContext;
-use codex_rollout_trace::RawTraceEventPayload;
-use codex_rollout_trace::RolloutTrace;
-use codex_rollout_trace::TraceWriter;
-use codex_rollout_trace::replay_bundle;
 use codex_utils_output_truncation::approx_token_count;
 use futures::StreamExt;
 use http::HeaderMap;
@@ -483,7 +476,7 @@ fn throughput_collapse_replaces_websocket_history_and_sticky_turn_state() {
         .expect("turn state unset");
     session.websocket_session.last_response = Some(Arc::new(LastResponse {
         response_id: "response".to_string(),
-        items_added: Vec::new(),
+        items_added: Vec::new().into(),
     }));
 
     session.replace_websocket_after_throughput_collapse();
@@ -542,7 +535,6 @@ async fn websocket_throughput_censors_stalls_and_unattributable_terminal_rates()
                 notify: Arc::clone(&blocked),
             },
             test_session_telemetry(),
-            InferenceTraceAttempt::disabled(),
             test_model_provider(),
             None,
             Some(Arc::clone(&throughput)),
@@ -567,7 +559,7 @@ async fn websocket_throughput_censors_stalls_and_unattributable_terminal_rates()
         let response = last_response.await.expect("authoritative history retained");
         assert_eq!(response.response_id, "response-backpressure");
         assert_eq!(
-            response.items_added,
+            response.items_added.as_ref(),
             if stalled_before_completion {
                 vec![item]
             } else {
@@ -806,7 +798,6 @@ async fn prepared_turn_stays_on_http_after_cooldown_and_new_turn_retries_websock
     let telemetry = test_session_telemetry();
     let model = test_model_info();
     let prompt = Prompt::default();
-    let trace = InferenceTraceContext::disabled();
     let metadata = test_responses_metadata_for_client(
         &client,
         None,
@@ -834,7 +825,6 @@ async fn prepared_turn_stays_on_http_after_cooldown_and_new_turn_retries_websock
                 codex_protocol::config_types::ReasoningSummary::None,
                 None,
                 &metadata,
-                &trace,
                 None,
             )
             .await
@@ -859,7 +849,6 @@ async fn prepared_turn_stays_on_http_after_cooldown_and_new_turn_retries_websock
             codex_protocol::config_types::ReasoningSummary::None,
             None,
             &metadata,
-            &trace,
             None,
         )
         .await;
@@ -1095,6 +1084,106 @@ async fn websocket_fallback_counts_concurrent_websocket_failures_only_once_each(
 }
 
 #[tokio::test]
+async fn canceled_response_is_not_handed_to_the_next_turn_before_mapper_cleanup() {
+    use crate::test_harness::responses::ev_completed;
+    use crate::test_harness::responses::ev_response_created;
+    use crate::test_harness::responses::start_websocket_server;
+
+    for drop_session_first in [false, true] {
+        let server = start_websocket_server(vec![
+            vec![
+                vec![ev_response_created("cancelled")],
+                vec![ev_completed("must-not-dispatch")],
+            ],
+            vec![vec![ev_response_created("next-turn"), ev_completed("next-turn")]],
+        ])
+        .await;
+        let mut client = websocket_test_model_client();
+        let mut provider =
+            create_oss_provider_with_base_url(&format!("{}/v1", server.uri()), WireApi::Responses);
+        provider.supports_websockets = true;
+        Arc::get_mut(&mut client.state).unwrap().provider = create_model_provider(provider, None);
+        let metadata = test_responses_metadata_for_client(
+            &client,
+            None,
+            "window".into(),
+            None,
+            TestCodexResponsesRequestKind::Turn,
+        );
+        let telemetry = test_session_telemetry();
+        let model = test_model_info();
+        let prompt = Prompt::default();
+        let mut session = client.new_session();
+        let mut stream = session
+            .stream(
+                &prompt,
+                &model,
+                &telemetry,
+                None,
+                ReasoningSummaryConfig::None,
+                None,
+                &metadata,
+            )
+            .await
+            .unwrap();
+        loop {
+            if matches!(stream.next().await.unwrap().unwrap(), ResponseEvent::Created) {
+                break;
+            }
+        }
+        assert!(
+            session
+                .websocket_session
+                .connection
+                .as_ref()
+                .unwrap()
+                .has_active_response()
+        );
+        // The current-thread runtime cannot run asynchronous mapper cancellation
+        // between these drops and the next cache take.
+        if drop_session_first {
+            drop(session);
+            drop(stream);
+        } else {
+            drop(stream);
+            drop(session);
+        }
+        let mut next = client.new_session();
+        assert!(next.websocket_session.connection.is_none());
+        assert!(client.responses_websocket_enabled());
+        let mut stream = next
+            .stream(
+                &prompt,
+                &model,
+                &telemetry,
+                None,
+                ReasoningSummaryConfig::None,
+                None,
+                &metadata,
+            )
+            .await
+            .unwrap();
+        let mut completed = false;
+        while let Some(event) = stream.next().await {
+            if let ResponseEvent::Completed { response_id, .. } = event.unwrap() {
+                assert_eq!(response_id, "next-turn");
+                completed = true;
+            }
+        }
+        assert!(completed);
+        assert_eq!(
+            next.last_stream_transport,
+            Some(ModelAttemptTransport::ResponsesWebsocket)
+        );
+        assert!(client.responses_websocket_enabled());
+        let connections = server.connections();
+        assert_eq!(connections.len(), 2);
+        assert!(connections.iter().all(|requests| requests.len() == 1));
+        server.shutdown().await;
+    }
+}
+
+#[tokio::test]
 async fn websocket_fallback_recovered_connection_is_reused_across_turns() {
     use crate::test_harness::responses::ev_completed;
     use crate::test_harness::responses::ev_response_created;
@@ -1164,7 +1253,6 @@ async fn websocket_fallback_recovered_connection_is_reused_across_turns() {
                 codex_protocol::config_types::ReasoningSummary::None,
                 None,
                 &metadata,
-                &InferenceTraceContext::disabled(),
             )
             .await
             .unwrap();
@@ -1231,7 +1319,6 @@ async fn websocket_fallback_only_current_completed_requests_clear_failures() {
                 upstream_request_id: None,
             },
             telemetry.clone(),
-            InferenceTraceAttempt::disabled().into(),
             test_model_provider(),
             None,
             None,
@@ -1507,13 +1594,11 @@ async fn prepared_dispatch_charges_failed_preconnect_and_standalone_keeps_best_e
                     codex_protocol::config_types::ReasoningSummary::None,
                     None,
                     &metadata,
-                    &InferenceTraceContext::disabled(),
                     None,
                 )
                 .await } else {
                     session.stream(&Prompt::default(), &model, &telemetry, None,
-                        codex_protocol::config_types::ReasoningSummary::None, None, &metadata,
-                        &InferenceTraceContext::disabled()).await
+                        codex_protocol::config_types::ReasoningSummary::None, None, &metadata).await
                 };
             assert_eq!(session.logical_sampling_request_count, if persistent { 0 } else { 1 });
             assert!(session.pending_websocket_preconnect.is_none());
@@ -1701,7 +1786,6 @@ async fn turn_preconnect_replaces_unusable_cached_socket(expiring: bool) {
             codex_protocol::config_types::ReasoningSummary::None,
             None,
             &metadata,
-            &InferenceTraceContext::disabled(),
         )
         .await
         .unwrap();
@@ -1744,7 +1828,6 @@ async fn turn_preconnect_replaces_unusable_cached_socket(expiring: bool) {
             codex_protocol::config_types::ReasoningSummary::None,
             None,
             &metadata,
-            &InferenceTraceContext::disabled(),
         )
         .await
         .unwrap();
@@ -1827,7 +1910,7 @@ fn lane2_websocket_cache_drops_turn_scoped_state() {
         last_response_rx: Some(last_response_rx),
         last_response: Some(Arc::new(LastResponse {
             response_id: "completed-warmup".into(),
-            items_added: vec![history_test_item("old output", None)],
+            items_added: vec![history_test_item("old output", None)].into(),
         })),
         last_response_from_untraced_warmup: true,
         ..WebsocketSession::default()
@@ -3211,7 +3294,6 @@ async fn http_request_cache_identity_reaches_turn_timing_protocol_without_raw_ke
         /*parent_thread_id*/ None,
         TestCodexResponsesRequestKind::Turn,
     );
-    let inference_trace = InferenceTraceContext::disabled();
 
     for _ in 0..2 {
         let request_wait = timing.begin_model_request_wait();
@@ -3224,7 +3306,6 @@ async fn http_request_cache_identity_reaches_turn_timing_protocol_without_raw_ke
                 codex_protocol::config_types::ReasoningSummary::None,
                 /*service_tier*/ None,
                 &responses_metadata,
-                &inference_trace,
             )
             .await?;
         drop(request_wait);
@@ -3235,7 +3316,7 @@ async fn http_request_cache_identity_reaches_turn_timing_protocol_without_raw_ke
         // compares two fully measured requests, so wait for the measurement
         // task to release its session identity before starting the next one.
         tokio::time::timeout(Duration::from_secs(5), async {
-            while Arc::strong_count(&session.latest_measurement_attempt) != 1 {
+            while Arc::strong_count(&session.prompt_context_measurements) != 2 {
                 tokio::task::yield_now().await;
             }
         })
@@ -3415,30 +3496,6 @@ async fn turn_timing_carries_prefix_divergence() -> anyhow::Result<()> {
         /*parent_thread_id*/ None,
         TestCodexResponsesRequestKind::Turn,
     );
-    let trace_dir = TempDir::new()?;
-    let writer = Arc::new(TraceWriter::create(
-        trace_dir.path(),
-        "trace-audit".to_string(),
-        "rollout-audit".to_string(),
-        "thread-audit".to_string(),
-    )?);
-    writer.append(RawTraceEventPayload::ThreadStarted {
-        thread_id: "thread-audit".to_string(),
-        agent_path: "/root".to_string(),
-        metadata_payload: None,
-    })?;
-    writer.append(RawTraceEventPayload::CodexTurnStarted {
-        codex_turn_id: "turn-1".to_string(),
-        thread_id: "thread-audit".to_string(),
-    })?;
-    let inference_trace = InferenceTraceContext::enabled(
-        writer,
-        "thread-audit".to_string(),
-        "turn-1".to_string(),
-        "gpt-test".to_string(),
-        "test-provider".to_string(),
-    )
-    .with_request_metadata(|| json!({"parallel_tool_calls": false}));
 
     let prompts = vec![
         prompt_for(vec![first_item.clone(), second_item.clone()]),
@@ -3466,7 +3523,6 @@ async fn turn_timing_carries_prefix_divergence() -> anyhow::Result<()> {
                 codex_protocol::config_types::ReasoningSummary::None,
                 /*service_tier*/ None,
                 &responses_metadata,
-                &inference_trace,
             )
             .await?;
         drop(request_wait);
@@ -3476,7 +3532,7 @@ async fn turn_timing_carries_prefix_divergence() -> anyhow::Result<()> {
         // This test needs fully measured requests; provider completion no longer
         // joins optional diagnostics, and the next request can supersede them.
         tokio::time::timeout(Duration::from_secs(5), async {
-            while Arc::strong_count(&session.latest_measurement_attempt) != 1 {
+            while Arc::strong_count(&session.prompt_context_measurements) != 2 {
                 tokio::task::yield_now().await;
             }
         })
@@ -3487,64 +3543,9 @@ async fn turn_timing_carries_prefix_divergence() -> anyhow::Result<()> {
     let protocol = timing.complete_snapshot().protocol_timing();
     let received = server.received_requests().await.expect("received requests");
     assert_eq!(received.len(), 3);
-    // Diagnostics and trace persistence have independent lifetimes. Wait for the
-    // trace itself before reading its payloads, not for an unrelated measurement.
-    // Observe raw completion records: this fixture deliberately rewrites a tool
-    // result under the same call ID, which semantic replay correctly rejects.
-    tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            let trace = std::fs::read(trace_dir.path().join("trace.jsonl"))?;
-            let mut completed = std::collections::BTreeSet::new();
-            for line in trace.split_inclusive(|byte| *byte == b'\n') {
-                // The writer may still be appending the final JSONL record.
-                if !line.ends_with(b"\n") {
-                    continue;
-                }
-                let event: codex_rollout_trace::RawTraceEvent = serde_json::from_slice(line)?;
-                if let RawTraceEventPayload::InferenceCompleted {
-                    inference_call_id, ..
-                } = event.payload
-                {
-                    assert!(completed.insert(inference_call_id), "duplicate completion");
-                }
-            }
-            if completed.len() == prompts.len() {
-                break anyhow::Ok(());
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await??;
-    let mut captures = Vec::new();
-    for entry in std::fs::read_dir(trace_dir.path().join("payloads"))? {
-        let value: serde_json::Value = serde_json::from_slice(&std::fs::read(entry?.path())?)?;
-        if value.get("_codex").is_some() {
-            captures.push(value);
-        }
-    }
-    assert_eq!(captures.len(), 3);
-    for (wire, timed) in received.iter().zip(&protocol.model_requests) {
-        let capture = captures
-            .iter()
-            .find(|capture| {
-                capture["_codex"]["sampling_request_id"].as_str()
-                    == timed.sampling_request_id.as_deref()
-            })
-            .expect("sampling identity links capture to timing");
-        assert!(
-            timed
-                .physical_attempt_ids
-                .iter()
-                .any(|id| capture["_codex"]["physical_attempt_id"] == *id)
-        );
-        assert_eq!(capture["_codex"]["settings"]["parallel_tool_calls"], false);
-        let mut provider_capture = capture.clone();
-        provider_capture.as_object_mut().unwrap().remove("_codex");
-        let wire: serde_json::Value = serde_json::from_slice(&wire.body)?;
-        assert_eq!(
-            provider_capture, wire,
-            "trace sidecar must never enter the provider request"
-        );
+    for request in &received {
+        let wire: serde_json::Value = serde_json::from_slice(&request.body)?;
+        assert!(wire.get("_codex").is_none());
         assert_eq!(wire["instructions"], "stable base instructions");
         assert!(wire["input"].is_array());
         assert!(wire["tools"].is_array());
@@ -3623,7 +3624,6 @@ async fn turn_start_request_compares_with_previous_turn_final_request() -> anyho
     let mut next_model_info = test_model_info();
     next_model_info.slug = "gpt-test-next".to_string();
     let session_telemetry = test_session_telemetry();
-    let inference_trace = InferenceTraceContext::disabled();
     let first_item = history_test_tool_output("call-1", "first result");
     let second_item = history_test_tool_output("call-2", "second result");
     let third_item = history_test_tool_output("call-3", "third result");
@@ -3673,17 +3673,16 @@ async fn turn_start_request_compares_with_previous_turn_final_request() -> anyho
                 codex_protocol::config_types::ReasoningSummary::None,
                 /*service_tier*/ None,
                 &responses_metadata,
-                &inference_trace,
             )
             .await?;
         drop(request_wait);
         while let Some(event) = stream.next().await {
             event?;
         }
-        // Provider completion does not join optional diagnostics. The next turn
-        // can only compare with a baseline this turn has already published.
+        // Provider completion does not join optional diagnostics. This fixture
+        // inspects the fully enriched timing snapshot before moving to the next turn.
         tokio::time::timeout(Duration::from_secs(5), async {
-            while Arc::strong_count(&session.latest_measurement_attempt) != 1 {
+            while Arc::strong_count(&session.prompt_context_measurements) != 2 {
                 tokio::task::yield_now().await;
             }
         })
@@ -3892,7 +3891,7 @@ fn websocket_property_fingerprint_tracks_every_reuse_property() {
         sender
             .send(LastResponse {
                 response_id: "old-response".to_string(),
-                items_added: vec![],
+                items_added: vec![].into(),
             })
             .unwrap();
         session.websocket_session.last_response_rx = Some(receiver);
@@ -3955,7 +3954,7 @@ fn websocket_verified_prefix_survives_appended_context_manifest_change() {
     sender
         .send(LastResponse {
             response_id: "verified-response".to_string(),
-            items_added: vec![],
+            items_added: vec![].into(),
         })
         .expect("response receiver open");
     session.websocket_session.last_response_rx = Some(receiver);
@@ -3998,12 +3997,12 @@ fn websocket_incremental_history_uses_digest_and_preserves_full_compare_fallback
     session.websocket_session.last_request = Some(original.clone());
     let response = LastResponse {
         response_id: "response-1".to_string(),
-        items_added: vec![history_test_item("assistant", Some("turn-a"))],
+        items_added: vec![history_test_item("assistant", Some("turn-a"))].into(),
     };
     let delta = history_test_item("next", Some("turn-b"));
     let mut extended = original.clone();
     let mut extended_input = extended.input.to_vec();
-    extended_input.extend(response.items_added.clone());
+    extended_input.extend(response.items_added.iter().cloned());
     extended_input.push(delta.clone());
     extended.input = extended_input.into();
 
@@ -4041,7 +4040,7 @@ fn websocket_incremental_history_uses_digest_and_preserves_full_compare_fallback
         &[history_test_item("user", Some("turn-a"))]
     );
     assert_eq!(
-        response.items_added,
+        response.items_added.as_ref(),
         vec![history_test_item("assistant", Some("turn-a"))]
     );
 }
@@ -4118,7 +4117,6 @@ async fn websocket_send_preserves_appended_manifest_proof_but_rejects_replacemen
                 &metadata,
                 false,
                 None,
-                &InferenceTraceContext::disabled(),
                 None,
             )
             .await
@@ -4159,7 +4157,7 @@ fn websocket_exact_stable_prefix_inherits_existing_response_id() {
     session.websocket_session.last_request = Some(original.clone());
     let response = LastResponse {
         response_id: "response-old".to_string(),
-        items_added: vec![history_test_item("assistant", None)],
+        items_added: vec![history_test_item("assistant", None)].into(),
     };
     let (sender, receiver) = tokio::sync::oneshot::channel();
     sender
@@ -4172,7 +4170,7 @@ fn websocket_exact_stable_prefix_inherits_existing_response_id() {
         .input
         .iter()
         .cloned()
-        .chain(response.items_added)
+        .chain(response.items_added.iter().cloned())
         .chain([delta.clone()])
         .collect::<Vec<_>>()
         .into();
@@ -4206,7 +4204,7 @@ fn remote_compaction_replays_the_complete_locally_installed_checkpoint() {
     sender
         .send(LastResponse {
             response_id: "response-compact".to_string(),
-            items_added: vec![compacted.clone()],
+            items_added: vec![compacted.clone()].into(),
         })
         .expect("response receiver open");
     session.websocket_session.last_response_rx = Some(receiver);
@@ -4277,7 +4275,7 @@ fn websocket_stable_replacement_rebases_without_stale_inheritance() {
     sender
         .send(LastResponse {
             response_id: "response-stale".to_string(),
-            items_added: Vec::new(),
+            items_added: Vec::new().into(),
         })
         .expect("response receiver open");
     session.websocket_session.last_response_rx = Some(receiver);
@@ -4325,7 +4323,7 @@ fn tool_history_canonical_fallback_reuses_exact_provider_prefix() {
     sender
         .send(LastResponse {
             response_id: "response".to_string(),
-            items_added: Vec::new(),
+            items_added: Vec::new().into(),
         })
         .expect("receiver");
     session.websocket_session.last_response_rx = Some(receiver);
@@ -4363,10 +4361,11 @@ fn tool_history_receipt_inside_provider_prefix_forces_transactional_rebase() {
     let original = history_test_request(vec![history_test_tool_output("call-1", bounded)]);
     session.remember_request_history(&original, [7; 32]);
     session.websocket_session.last_request = Some(original);
-    *session
-        .prompt_context_baseline
+    session
+        .prompt_context_measurements
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(PromptContextBaseline {
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .baseline = Some(PromptContextBaseline {
         fixed_prefix_item_count: 0,
         full_prompt_estimated_tokens: 0,
         prompt_cache_key: Some("stale".to_string()),
@@ -4379,7 +4378,7 @@ fn tool_history_receipt_inside_provider_prefix_forces_transactional_rebase() {
     sender
         .send(LastResponse {
             response_id: "response-stale".to_string(),
-            items_added: Vec::new(),
+            items_added: Vec::new().into(),
         })
         .expect("response receiver open");
     session.websocket_session.last_response_rx = Some(receiver);
@@ -4420,9 +4419,10 @@ fn tool_history_receipt_inside_provider_prefix_forces_transactional_rebase() {
     assert!(session.websocket_session.last_request_history.is_none());
     assert!(
         session
-            .prompt_context_baseline
+            .prompt_context_measurements
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .baseline
             .is_some(),
         "provider rebasing must retain the diagnostic predecessor"
     );
@@ -4460,7 +4460,7 @@ fn tool_history_receipt_inside_provider_prefix_forces_transactional_rebase() {
     sender
         .send(LastResponse {
             response_id: "response-rebuilt".to_string(),
-            items_added: Vec::new(),
+            items_added: Vec::new().into(),
         })
         .expect("response receiver open");
     session.websocket_session.last_response_rx = Some(receiver);
@@ -4500,7 +4500,7 @@ fn tool_history_receipt_only_in_new_tail_keeps_proven_inheritance() {
     sender
         .send(LastResponse {
             response_id: "response-proven".to_string(),
-            items_added: vec![assistant.clone()],
+            items_added: vec![assistant.clone()].into(),
         })
         .expect("response receiver open");
     session.websocket_session.last_response_rx = Some(receiver);
@@ -5246,47 +5246,7 @@ where
     }
 }
 
-fn started_inference_attempt(temp: &TempDir) -> anyhow::Result<InferenceTraceAttempt> {
-    Ok(started_inference_attempt_with_writer(temp)?.0)
-}
 
-fn started_inference_attempt_with_writer(
-    temp: &TempDir,
-) -> anyhow::Result<(InferenceTraceAttempt, Arc<TraceWriter>)> {
-    let writer = Arc::new(TraceWriter::create(
-        temp.path(),
-        "trace-1".to_string(),
-        "rollout-1".to_string(),
-        "thread-root".to_string(),
-    )?);
-    writer.append(RawTraceEventPayload::ThreadStarted {
-        thread_id: "thread-root".to_string(),
-        agent_path: "/root".to_string(),
-        metadata_payload: None,
-    })?;
-    writer.append(RawTraceEventPayload::CodexTurnStarted {
-        codex_turn_id: "turn-1".to_string(),
-        thread_id: "thread-root".to_string(),
-    })?;
-
-    let inference_trace = InferenceTraceContext::enabled(
-        Arc::clone(&writer),
-        "thread-root".to_string(),
-        "turn-1".to_string(),
-        "gpt-test".to_string(),
-        "test-provider".to_string(),
-    );
-    let attempt = inference_trace.start_attempt();
-    attempt.record_started(&json!({
-        "model": "gpt-test",
-        "input": [{
-            "type": "message",
-            "role": "user",
-            "content": [{"type": "input_text", "text": "hello"}]
-        }],
-    }));
-    Ok((attempt, writer))
-}
 
 fn output_message(id: &str, text: &str) -> ResponseItem {
     ResponseItem::Message {
@@ -5300,22 +5260,6 @@ fn output_message(id: &str, text: &str) -> ResponseItem {
     }
 }
 
-async fn replay_until_cancelled(temp: &TempDir) -> anyhow::Result<RolloutTrace> {
-    let mut rollout = replay_bundle(temp.path())?;
-    for _ in 0..50 {
-        let inference = rollout
-            .inference_calls
-            .values()
-            .next()
-            .expect("inference should be reduced");
-        if inference.execution.status == ExecutionStatus::Cancelled {
-            return Ok(rollout);
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-        rollout = replay_bundle(temp.path())?;
-    }
-    Ok(rollout)
-}
 
 struct NotifyAfterEventStream {
     events: VecDeque<ResponseEvent>,
@@ -5451,7 +5395,6 @@ async fn provider_response_ids_cannot_replace_trusted_context() {
             None,
             api_stream,
             test_session_telemetry(),
-            InferenceTraceAttempt::disabled(),
             test_model_provider(),
             None,
             /*stream_throughput*/ None,
@@ -5476,7 +5419,7 @@ async fn provider_response_ids_cannot_replace_trusted_context() {
             stream.next().await,
             Some(Ok(ResponseEvent::Completed { .. }))
         ));
-        assert_eq!(last_response.await.unwrap().items_added, vec![done.clone()]);
+        assert_eq!(last_response.await.unwrap().items_added.as_ref(), &[done.clone()]);
 
         let restored: ResponseItem =
             serde_json::from_str(&serde_json::to_string(&done).unwrap()).unwrap();
@@ -5539,7 +5482,6 @@ async fn response_stream_does_not_wait_for_and_cancels_pending_request_measureme
         None,
         api_stream,
         test_session_telemetry(),
-        InferenceTraceAttempt::disabled(),
         test_model_provider(),
         Some(pending_test_attempt(
             identity,
@@ -5611,7 +5553,6 @@ async fn response_completed_does_not_wait_for_pending_request_measurements() {
         None,
         api_stream,
         test_session_telemetry(),
-        InferenceTraceAttempt::disabled(),
         test_model_provider(),
         Some(pending_test_attempt(
             identity,
@@ -5641,7 +5582,7 @@ async fn response_completed_does_not_wait_for_pending_request_measurements() {
         .try_recv()
         .expect("history is published before completion");
     assert_eq!(response.response_id, "response-id");
-    assert_eq!(response.items_added, vec![output]);
+    assert_eq!(response.items_added.as_ref(), &[output]);
     assert!(
         tokio::time::timeout(Duration::from_millis(250), stream.next())
             .await
@@ -5651,168 +5592,7 @@ async fn response_completed_does_not_wait_for_pending_request_measurements() {
     measurement_gate.notify_one();
 }
 
-#[tokio::test(flavor = "current_thread")]
-async fn completed_response_trace_write_keeps_runtime_responsive() -> anyhow::Result<()> {
-    struct BlockingPayload {
-        locked: std::sync::mpsc::Sender<()>,
-        release: std::sync::mpsc::Receiver<()>,
-    }
 
-    impl serde::Serialize for BlockingPayload {
-        fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-            self.locked.send(()).map_err(serde::ser::Error::custom)?;
-            self.release
-                .recv_timeout(Duration::from_secs(10))
-                .map_err(serde::ser::Error::custom)?;
-            serializer.serialize_str("writer contention")
-        }
-    }
-
-    let temp = TempDir::new()?;
-    let (attempt, writer) = started_inference_attempt_with_writer(&temp)?;
-    let (locked_tx, locked_rx) = std::sync::mpsc::channel();
-    let (release_tx, release_rx) = std::sync::mpsc::channel();
-    // Hold the real writer lock from another thread. Its serializer runs under
-    // that lock, so terminal trace persistence cannot finish until release.
-    let writer_thread = std::thread::spawn(move || {
-        writer.write_json_payload(
-            codex_rollout_trace::RawPayloadKind::ProtocolEvent,
-            &BlockingPayload {
-                locked: locked_tx,
-                release: release_rx,
-            },
-        )
-    });
-    locked_rx.recv_timeout(Duration::from_secs(10))?;
-
-    let (runtime_progress_tx, runtime_progress_rx) = std::sync::mpsc::channel();
-    let release_thread = std::thread::spawn(move || {
-        // This timeout also releases a broken synchronous mapper, so the
-        // regression fails an assertion instead of deadlocking the test.
-        let progressed = runtime_progress_rx
-            .recv_timeout(Duration::from_secs(5))
-            .is_ok();
-        let _ = release_tx.send(());
-        progressed
-    });
-    let (terminal_seen_tx, terminal_seen_rx) = tokio::sync::oneshot::channel();
-    let mut terminal_seen_tx = Some(terminal_seen_tx);
-    let api_stream = futures::stream::iter([
-        Ok(ResponseEvent::OutputItemDone(output_message("1", "answer"))),
-        Ok(ResponseEvent::Completed {
-            response_id: "response-traced".to_string(),
-            token_usage: None,
-            end_turn: Some(true),
-        }),
-    ])
-    .inspect(move |event| {
-        if matches!(event, Ok(ResponseEvent::Completed { .. })) {
-            let _ = terminal_seen_tx
-                .take()
-                .expect("one terminal event")
-                .send(());
-        }
-    });
-    let (mut stream, _) = super::map_response_events(
-        Some("request-traced".to_string()),
-        api_stream,
-        test_session_telemetry(),
-        attempt,
-        test_model_provider(),
-        None,
-        /*stream_throughput*/ None,
-    );
-    terminal_seen_rx.await?;
-    assert!(matches!(
-        stream.next().await.transpose()?,
-        Some(ResponseEvent::OutputItemDone(_))
-    ));
-    assert!(matches!(
-        tokio::time::timeout(Duration::from_secs(1), stream.next()).await.expect("provider completion must bypass the blocked trace writer").transpose()?,
-        Some(ResponseEvent::Completed { response_id, .. }) if response_id == "response-traced"
-    ));
-    assert!(stream.next().await.is_none());
-    let _ = runtime_progress_tx.send(());
-    assert!(
-        release_thread.join().expect("release thread"),
-        "trace writes must let the current-thread runtime progress while the writer is busy"
-    );
-    writer_thread.join().expect("writer thread")?;
-
-    let rollout = tokio::time::timeout(Duration::from_secs(2), async {
-        loop {
-            let rollout = replay_bundle(temp.path())?;
-            if rollout
-                .inference_calls
-                .values()
-                .any(|call| call.execution.status == ExecutionStatus::Completed)
-            {
-                break anyhow::Ok(rollout);
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await??;
-    let inference = rollout
-        .inference_calls
-        .values()
-        .next()
-        .expect("traced inference");
-    assert_eq!(inference.execution.status, ExecutionStatus::Completed);
-    assert_eq!(inference.response_id.as_deref(), Some("response-traced"));
-    assert_eq!(inference.response_item_ids.len(), 1);
-    assert_eq!(rollout.raw_payloads.len(), 2);
-    Ok(())
-}
-
-#[tokio::test]
-async fn dropped_response_stream_traces_cancelled_partial_output() -> anyhow::Result<()> {
-    let temp = TempDir::new()?;
-    let attempt = started_inference_attempt(&temp)?;
-
-    // The provider has produced one complete output item, but no terminal
-    // response.completed event. The harness has enough information to keep this
-    // item in history, so the trace should preserve it when the stream is
-    // abandoned.
-    let item = output_message("1", "partial answer");
-    let api_stream = futures::stream::iter([Ok(ResponseEvent::OutputItemDone(item))])
-        .chain(futures::stream::pending());
-    let (mut stream, _) = super::map_response_events(
-        /*upstream_request_id*/ None,
-        api_stream,
-        test_session_telemetry(),
-        attempt,
-        test_model_provider(),
-        None,
-        /*stream_throughput*/ None,
-    );
-
-    let observed = stream
-        .next()
-        .await
-        .expect("mapped stream should yield output item")?;
-    assert!(matches!(observed, ResponseEvent::OutputItemDone(_)));
-
-    // Dropping the consumer is how turn interruption/preemption stops polling
-    // the provider stream. The mapper task observes that drop asynchronously
-    // and records cancellation using the output items it has already seen.
-    drop(stream);
-
-    // Cancellation is recorded by the mapper task after Drop wakes it, so the
-    // replay may need a short wait before the terminal event appears on disk.
-    let rollout = replay_until_cancelled(&temp).await?;
-    let inference = rollout
-        .inference_calls
-        .values()
-        .next()
-        .expect("inference should be reduced");
-
-    assert_eq!(inference.execution.status, ExecutionStatus::Cancelled);
-    assert_eq!(inference.response_item_ids.len(), 1);
-    assert_eq!(rollout.raw_payloads.len(), 2);
-
-    Ok(())
-}
 
 #[tokio::test]
 async fn response_stream_records_last_model_feedback_ids() {
@@ -5833,7 +5613,6 @@ async fn response_stream_records_last_model_feedback_ids() {
         Some("req-123".to_string()),
         api_stream,
         test_session_telemetry(),
-        InferenceTraceAttempt::disabled(),
         test_model_provider(),
         None,
         /*stream_throughput*/ None,
@@ -5945,57 +5724,6 @@ async fn bedrock_unauthorized_error_uses_provider_mapping() {
     );
 }
 
-#[tokio::test]
-async fn dropped_backpressured_response_stream_traces_cancelled_partial_output()
--> anyhow::Result<()> {
-    let temp = TempDir::new()?;
-    let attempt = started_inference_attempt(&temp)?;
-    let backpressured_item_yielded = Arc::new(Notify::new());
-    let mut events = VecDeque::new();
-    for _ in 0..super::RESPONSE_STREAM_CHANNEL_CAPACITY {
-        events.push_back(ResponseEvent::Created);
-    }
-    events.push_back(ResponseEvent::OutputItemDone(output_message(
-        "1",
-        "partial answer",
-    )));
-    let api_stream = NotifyAfterEventStream {
-        events,
-        yielded: 0,
-        notify_after: super::RESPONSE_STREAM_CHANNEL_CAPACITY + 1,
-        notify: Arc::clone(&backpressured_item_yielded),
-    };
-
-    let (stream, _) = super::map_response_events(
-        /*upstream_request_id*/ None,
-        api_stream,
-        test_session_telemetry(),
-        attempt,
-        test_model_provider(),
-        None,
-        /*stream_throughput*/ None,
-    );
-
-    // Fill the mapper channel with non-terminal events, then yield one output
-    // item. The mapper has observed that item and is blocked trying to send it
-    // downstream, so dropping the consumer covers the send-failure path rather
-    // than the `consumer_dropped` select branch.
-    backpressured_item_yielded.notified().await;
-    drop(stream);
-
-    let rollout = replay_until_cancelled(&temp).await?;
-    let inference = rollout
-        .inference_calls
-        .values()
-        .next()
-        .expect("inference should be reduced");
-
-    assert_eq!(inference.execution.status, ExecutionStatus::Cancelled);
-    assert_eq!(inference.response_item_ids.len(), 1);
-    assert_eq!(rollout.raw_payloads.len(), 2);
-
-    Ok(())
-}
 
 #[test]
 fn auth_request_telemetry_context_tracks_attached_auth_and_retry_phase() {
@@ -6156,7 +5884,6 @@ async fn audit_reports_17_19_stream_has_exactly_one_terminal_outcome() {
             None,
             futures::stream::iter(events),
             test_session_telemetry(),
-            InferenceTraceAttempt::disabled(),
             test_model_provider(),
             None,
             /*stream_throughput*/ None,
@@ -6198,7 +5925,7 @@ fn preparation_retains_response_history_until_dispatch_or_invalidation() {
     sender
         .send(LastResponse {
             response_id: "prior".into(),
-            items_added: vec![],
+            items_added: vec![].into(),
         })
         .unwrap();
     let request = history_test_request(vec![
@@ -6241,17 +5968,17 @@ async fn cache_diagnostics_survive_provider_resets() {
             let baseline = measurements
                 .compare_after_predecessor(None, None, Some("same-cache"), Default::default())
                 .await;
-            *session.prompt_context_baseline.lock().unwrap() = baseline.clone();
-            *session.latest_measurement_attempt.lock().unwrap() = Some("previous".into());
+            session.prompt_context_measurements.lock().unwrap().baseline = baseline.clone();
+            session.prompt_context_measurements.lock().unwrap().latest_attempt = Some("previous".into());
             let (sender, receiver) = tokio::sync::oneshot::channel();
             if pending {
-                session.measurement_predecessor = Some(receiver);
+                session.prompt_context_measurements.lock().unwrap().predecessor = Some(receiver);
             }
             session.remember_request_history(&previous, [1; 32]);
             session.websocket_session.last_request = Some(previous);
             session.websocket_session.last_response = Some(Arc::new(LastResponse {
                 response_id: "old-response".into(),
-                items_added: vec![],
+                items_added: vec![].into(),
             }));
             let current = history_test_request(vec![
                 history_test_item("stable", None),
@@ -6278,16 +6005,20 @@ async fn cache_diagnostics_survive_provider_resets() {
             assert!(session.websocket_session.last_response.is_none());
             assert_eq!(
                 session
-                    .latest_measurement_attempt
+                    .prompt_context_measurements
                     .lock()
                     .unwrap()
+                    .latest_attempt
                     .as_deref(),
                 Some("previous")
             );
             if pending {
                 sender.send(baseline).expect("late predecessor retained");
             }
-            let initial = session.prompt_context_baseline.lock().unwrap().clone();
+            let (predecessor, initial) = {
+                let mut measurements = session.prompt_context_measurements.lock().unwrap();
+                (measurements.predecessor.take(), measurements.baseline.clone())
+            };
             let mut replay = ModelRequestMeasurements::for_responses_request(
                 &current,
                 &PromptProvenanceSidecar::default(),
@@ -6296,7 +6027,7 @@ async fn cache_diagnostics_survive_provider_resets() {
             .unwrap();
             replay
                 .compare_after_predecessor(
-                    session.measurement_predecessor.take(),
+                    predecessor,
                     initial,
                     Some("same-cache"),
                     Default::default(),
@@ -6470,6 +6201,129 @@ async fn diagnostics_compare_with_the_dispatched_predecessor_even_when_it_finish
 }
 
 #[tokio::test]
+async fn cross_turn_diagnostics_wait_for_the_pending_dispatched_predecessor() {
+    let client = test_model_client(SessionSource::Cli);
+    let first_session = client.new_session();
+    let second_session = client.new_session();
+    let owner = Arc::clone(&first_session.prompt_context_measurements);
+    assert!(Arc::ptr_eq(
+        &owner,
+        &second_session.prompt_context_measurements
+    ));
+    let first_dispatch = owner.lock().unwrap().begin("first".into());
+    let second_dispatch = second_session
+        .prompt_context_measurements
+        .lock()
+        .unwrap()
+        .begin("second".into());
+    // Completed provider responses may release both turn owners before either
+    // diagnostic task publishes. Dispatch identity and the chain must survive.
+    drop(first_session);
+    drop(second_session);
+    let first_request = history_test_request(vec![history_test_item("stable", None)]);
+    let second_request = history_test_request(vec![
+        history_test_item("stable", None),
+        history_test_item("appended", None),
+    ]);
+    let mut first = ModelRequestMeasurements::for_responses_request(
+        &first_request,
+        &PromptProvenanceSidecar::default(),
+        "",
+    )
+    .unwrap();
+    let mut second = ModelRequestMeasurements::for_responses_request(
+        &second_request,
+        &PromptProvenanceSidecar::default(),
+        "",
+    )
+    .unwrap();
+    let second_owner = Arc::clone(&owner);
+    let next = async move {
+        second_dispatch
+            .compare_and_publish(
+                &second_owner,
+                &mut second,
+                Some("same-cache"),
+                Default::default(),
+            )
+            .await;
+        second
+    };
+    futures::pin_mut!(next);
+    assert!(futures::poll!(&mut next).is_pending());
+    first_dispatch
+        .compare_and_publish(&owner, &mut first, Some("same-cache"), Default::default())
+        .await;
+    // The late older request feeds its successor, but cannot publish globally.
+    assert!(owner.lock().unwrap().baseline.is_none());
+    let second = next.await;
+    assert!(second.prompt_context_baseline_compared);
+    assert_eq!(second.history_divergence.unwrap().prefix_items_reused, 1);
+    assert_eq!(
+        owner.lock().unwrap().baseline.as_ref().unwrap().input_item_digests.len(),
+        2
+    );
+
+    let third_session = client.new_session();
+    let third_dispatch = third_session
+        .prompt_context_measurements
+        .lock()
+        .unwrap()
+        .begin("third".into());
+    let mut third = ModelRequestMeasurements::for_responses_request(
+        &second_request,
+        &PromptProvenanceSidecar::default(),
+        "",
+    )
+    .unwrap();
+    third_dispatch
+        .compare_and_publish(&owner, &mut third, Some("same-cache"), Default::default())
+        .await;
+    assert!(third.fixed_prefix_reuse_eligible);
+    assert_eq!(third.history_divergence.unwrap().prefix_items_reused, 2);
+}
+
+#[tokio::test]
+async fn abandoned_diagnostics_do_not_restore_an_older_cross_turn_baseline() {
+    let client = test_model_client(SessionSource::Cli);
+    let session = client.new_session();
+    let request = history_test_request(vec![history_test_item("old baseline", None)]);
+    let mut previous = ModelRequestMeasurements::for_responses_request(
+        &request,
+        &PromptProvenanceSidecar::default(),
+        "",
+    )
+    .unwrap();
+    let owner = Arc::clone(&session.prompt_context_measurements);
+    let baseline = previous
+        .compare_after_predecessor(None, None, Some("same-cache"), Default::default())
+        .await;
+    owner.lock().unwrap().baseline = baseline;
+    let abandoned = owner.lock().unwrap().begin("abandoned".into());
+    drop(session);
+    let next_session = client.new_session();
+    let next_dispatch = next_session
+        .prompt_context_measurements
+        .lock()
+        .unwrap()
+        .begin("next".into());
+    // Both cancellation and diagnostic-admission failure drop the dispatch ticket.
+    drop(abandoned);
+    let mut next = ModelRequestMeasurements::for_responses_request(
+        &request,
+        &PromptProvenanceSidecar::default(),
+        "",
+    )
+    .unwrap();
+    next_dispatch
+        .compare_and_publish(&owner, &mut next, Some("same-cache"), Default::default())
+        .await;
+    assert!(!next.prompt_context_baseline_compared);
+    assert!(!next.fixed_prefix_reuse_eligible);
+    assert_eq!(owner.lock().unwrap().latest_attempt.as_deref(), Some("next"));
+}
+
+#[tokio::test]
 async fn failed_stream_releases_consumer_and_freezes_clock_while_diagnostics_are_pending() {
     let gate = Arc::new(Notify::new());
     let identity = new_attempt_identity(&new_sampling_request_id());
@@ -6497,7 +6351,6 @@ async fn failed_stream_releases_consumer_and_freezes_clock_while_diagnostics_are
         None,
         futures::stream::iter([Err(ApiError::Stream("failed transport".into()))]),
         test_session_telemetry(),
-        InferenceTraceAttempt::disabled(),
         test_model_provider(),
         Some(pending_test_attempt(
             identity,
@@ -6785,7 +6638,6 @@ async fn startup_claim_rebuilds_changed_inputs_and_warmup_never_records_model_di
                 summary,
                 None,
                 &metadata,
-                &InferenceTraceContext::disabled(),
             )
             .await
             .unwrap();
@@ -6815,7 +6667,7 @@ fn websocket_response_cache_shares_output_and_replaces_only_on_completion() {
     sender
         .send(LastResponse {
             response_id: "first".into(),
-            items_added: vec![history_test_item("retained output", None)],
+            items_added: vec![history_test_item("retained output", None)].into(),
         })
         .unwrap();
     let first = session.get_last_response().unwrap();
@@ -6833,7 +6685,7 @@ fn websocket_response_cache_shares_output_and_replaces_only_on_completion() {
     sender
         .send(LastResponse {
             response_id: "second".into(),
-            items_added: Vec::new(),
+            items_added: Vec::new().into(),
         })
         .unwrap();
     let second = session.get_last_response().unwrap();
@@ -6843,7 +6695,7 @@ fn websocket_response_cache_shares_output_and_replaces_only_on_completion() {
     session.invalidate_incremental_history("test reset");
     assert!(session.get_last_response().is_none());
     assert_eq!(
-        first.items_added,
+        first.items_added.as_ref(),
         vec![history_test_item("retained output", None)]
     );
 }
@@ -6860,7 +6712,7 @@ fn websocket_history_lookup_preserves_global_substitution_indices() {
     );
     let response = LastResponse {
         response_id: "response".into(),
-        items_added: vec![output, history_test_item("end", None)],
+        items_added: vec![output, history_test_item("end", None)].into(),
     };
     for previous in [None, Some(request)] {
         session.websocket_session.last_request = previous;
@@ -6870,7 +6722,7 @@ fn websocket_history_lookup_preserves_global_substitution_indices() {
             .as_ref()
             .into_iter()
             .flat_map(|request| request.input.iter())
-            .chain(&response.items_added)
+            .chain(response.items_added.iter())
             .cloned()
             .collect::<Vec<_>>();
         for index in (0..=flat.len()).chain([usize::MAX]) {
@@ -6955,7 +6807,6 @@ async fn inference_stream_preserves_delta_and_large_item_contents_with_or_withou
             None,
             futures::stream::iter(events),
             test_session_telemetry(),
-            InferenceTraceAttempt::disabled(),
             Arc::clone(&provider),
             Some(attempt.into()),
             None,
@@ -7012,7 +6863,7 @@ async fn inference_stream_preserves_delta_and_large_item_contents_with_or_withou
             let response = history.await.unwrap();
             assert_eq!(response.response_id, "response");
             assert_eq!(
-                response.items_added,
+                response.items_added.as_ref(),
                 if scenario == "large_items" {
                     items
                 } else {
@@ -7049,7 +6900,6 @@ async fn inference_stream_preserves_independent_first_output_milestones() {
             upstream_request_id: None,
         },
         test_session_telemetry(),
-        InferenceTraceAttempt::disabled().into(),
         test_model_provider(),
         Some(attempt.into()),
         None,
@@ -7178,7 +7028,6 @@ async fn inference_stream_repeated_deltas_do_not_lock_first_event_timing() {
             upstream_request_id: None,
         },
         test_session_telemetry(),
-        InferenceTraceAttempt::disabled().into(),
         test_model_provider(),
         Some(attempt.into()),
         None,
@@ -7313,7 +7162,6 @@ async fn observed_completion_receipt_survives_closed_receiver_with_gated_diagnos
                 notify: Arc::clone(&observed),
             },
             test_session_telemetry(),
-            InferenceTraceAttempt::disabled(),
             test_model_provider(),
             Some(attempt),
             None,
@@ -7358,124 +7206,8 @@ async fn observed_completion_receipt_survives_closed_receiver_with_gated_diagnos
     }
 }
 
-#[tokio::test]
-async fn setup_attempt_drop_records_local_cancellation_before_a_stream_exists() -> anyhow::Result<()>
-{
-    let temp = TempDir::new()?;
-    let attempt = super::AsyncInferenceTraceAttempt::from(started_inference_attempt(&temp)?);
-    drop(attempt);
-    let rollout = replay_until_cancelled(&temp).await?;
-    let inference = rollout.inference_calls.values().next().unwrap();
-    assert_eq!(
-        inference.observed_terminal_status,
-        Some(ExecutionStatus::Cancelled)
-    );
-    assert!(inference.observed_terminal.is_some());
-    assert!(inference.response_item_ids.is_empty());
-    assert!(inference.usage.is_none());
-    Ok(())
-}
 
-#[tokio::test]
-async fn provider_attempt_dropped_before_its_start_never_closes_an_unknown_call()
--> anyhow::Result<()> {
-    let temp = TempDir::new()?;
-    // The helper's own call is started; the provider attempts below are fresh.
-    let (_started, writer) = started_inference_attempt_with_writer(&temp)?;
-    let context = InferenceTraceContext::enabled(
-        writer,
-        "thread-root".to_string(),
-        "turn-1".to_string(),
-        "gpt-test".to_string(),
-        "test-provider".to_string(),
-    );
-    // Sampling admission can fail or be cancelled before the audited start.
-    drop(super::AsyncInferenceTraceAttempt::unstarted(
-        context.start_attempt(),
-    ));
-    // Drop-time terminals are written asynchronously. Replay rejects a terminal
-    // for a call it never saw start, which would invalidate the whole bundle.
-    for _ in 0..20 {
-        let rollout = replay_bundle(temp.path())?;
-        assert_eq!(rollout.inference_calls.len(), 1);
-        assert!(
-            rollout
-                .inference_calls
-                .values()
-                .all(|call| call.observed_terminal_status.is_none())
-        );
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-    // Once its start is recorded, abandoning the same kind of attempt still closes it.
-    let attempt = super::AsyncInferenceTraceAttempt::unstarted(context.start_attempt());
-    attempt
-        .record_audited_request(
-            &json!({"model": "gpt-test", "input": []}),
-            &new_attempt_identity("sampling"),
-            None::<(&serde_json::Value, &str)>,
-        )
-        .await;
-    drop(attempt);
-    let rollout = tokio::time::timeout(Duration::from_secs(3), async {
-        loop {
-            let rollout = replay_bundle(temp.path())?;
-            if rollout
-                .inference_calls
-                .values()
-                .any(|call| call.observed_terminal_status == Some(ExecutionStatus::Cancelled))
-            {
-                break anyhow::Ok(rollout);
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await??;
-    assert_eq!(rollout.inference_calls.len(), 2);
-    Ok(())
-}
 
-#[tokio::test]
-async fn saturated_trace_detail_queue_retains_the_actual_terminal_outcome() -> anyhow::Result<()> {
-    let temp = TempDir::new()?;
-    let attempt = super::AsyncInferenceTraceAttempt::from(started_inference_attempt(&temp)?);
-    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
-    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
-    attempt
-        .record(false, move |_| {
-            let _ = entered_tx.send(());
-            let _ = release_rx.recv_timeout(Duration::from_secs(2));
-        })
-        .await;
-    entered_rx.await?;
-    for _ in 0..4 {
-        attempt.record(false, |_| {}).await;
-    }
-    attempt.record_failed("observed failure", None, &[]).await;
-    attempt
-        .record_cancelled("duplicate later cancellation", None, &[])
-        .await;
-    drop(attempt);
-    drop(release_tx);
-    let rollout = tokio::time::timeout(Duration::from_secs(3), async {
-        loop {
-            let rollout = replay_bundle(temp.path())?;
-            if rollout
-                .inference_calls
-                .values()
-                .next()
-                .is_some_and(|inference| {
-                    inference.observed_terminal_status == Some(ExecutionStatus::Failed)
-                })
-            {
-                break anyhow::Ok(rollout);
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await??;
-    assert_eq!(rollout.inference_calls.len(), 1);
-    Ok(())
-}
 #[tokio::test]
 async fn decoded_core_queue_stops_a_large_valid_prefix_and_releases_on_drop() {
     struct Dropped(Arc<std::sync::atomic::AtomicBool>);
@@ -7503,7 +7235,6 @@ async fn decoded_core_queue_stops_a_large_valid_prefix_and_releases_on_drop() {
         None,
         upstream,
         test_session_telemetry(),
-        InferenceTraceAttempt::disabled(),
         test_model_provider(),
         None,
         None,
@@ -7542,7 +7273,7 @@ fn audit143_prepare_and_remember_do_not_rehash_unchanged_history() {
     let original = history_test_request(vec![history_test_item(&"x".repeat(1024 * 1024), None)]);
     session.remember_request_history(&original, [1; 32]);
     session.websocket_session.last_request = Some(original.clone());
-    let response = LastResponse { response_id: "response".into(), items_added: Vec::new() };
+    let response = LastResponse { response_id: "response".into(), items_added: Vec::new().into() };
     let delta = history_test_item("next", None);
     let mut request = original.clone();
     let mut input = request.input.to_vec();
@@ -7562,22 +7293,6 @@ fn audit143_prepare_and_remember_do_not_rehash_unchanged_history() {
     assert!(session.get_incremental_items(&changed, Some(&response), false).is_none());
 }
 
-#[tokio::test]
-async fn audit143_trace_admission_loss_is_visible_without_blocking_dispatch() {
-    use codex_rollout_trace::{TraceWriter, RawTraceEventPayload};
-    let temp = tempfile::tempdir().unwrap();
-    let writer = Arc::new(TraceWriter::create(temp.path(), "trace".into(), "rollout".into(), "root".into()).unwrap());
-    let trace = InferenceTraceContext::enabled(Arc::clone(&writer), "root".into(), "turn".into(), "model".into(), "provider".into());
-    // No await lets these workers consume their slots or finish: admission is
-    // deterministic on this current-thread runtime, including slow storage.
-    let attempts = (0..17).map(|_| super::AsyncInferenceTraceAttempt::unstarted(trace.start_attempt())).collect::<Vec<_>>();
-    assert!(attempts.last().unwrap().writes.is_none());
-    writer.append(RawTraceEventPayload::ThreadStarted { thread_id: "root".into(), agent_path: "/root".into(), metadata_payload: None }).unwrap();
-    let replay = codex_rollout_trace::replay_bundle(temp.path()).unwrap();
-    assert!(replay.payload_capture_gap_count.unwrap_or_default() >= 1);
-    assert!(replay.inference_calls.is_empty(), "a gap must not invent an executed request");
-    drop(attempts);
-}
 #[test]
 fn audit150_dispatched_category_hashes_override_equal_prepared_digests() {
     let mut baseline = None;
@@ -7652,7 +7367,7 @@ async fn audit143_quota_wait_uses_dispatched_identity_after_predispatch_account_
     let mut client_session = client.new_session();
     let response = client_session.stream(&Prompt::default(), &test_model_info(),
         &test_session_telemetry(), None, ReasoningSummaryConfig::default(), None,
-        &metadata, &InferenceTraceContext::disabled()).await;
+        &metadata).await;
     let error = match response {
         Err(error) => error,
         Ok(mut response) => loop {
@@ -7970,7 +7685,6 @@ async fn audit143x_model_http_tls_stall_is_bounded_connection_failure() {
     let telemetry = test_session_telemetry();
     let model = test_model_info();
     let prompt = Prompt::default();
-    let trace = InferenceTraceContext::disabled();
     let mut session = client.new_session();
     let stream = session.stream(
         &prompt,
@@ -7980,7 +7694,6 @@ async fn audit143x_model_http_tls_stall_is_bounded_connection_failure() {
         ReasoningSummaryConfig::default(),
         None,
         &metadata,
-        &trace,
     );
     tokio::pin!(stream);
     tokio::select! {

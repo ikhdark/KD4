@@ -1,13 +1,13 @@
 use std::collections::HashSet;
 use std::io;
 use std::sync::Arc;
-use std::sync::Mutex;
 
 use codex_extension_api::LoadUserInstructionsFuture as LoadInstructionsFuture;
 use codex_extension_api::LoadedUserInstructions;
 use codex_extension_api::UserInstructions as Instructions;
 use codex_extension_api::UserInstructionsProvider;
 use codex_utils_absolute_path::AbsolutePathBuf;
+use tokio::sync::Mutex;
 
 const DEFAULT_AGENTS_MD_FILENAME: &str = "AGENTS.md";
 const LOCAL_AGENTS_MD_FILENAME: &str = "AGENTS.override.md";
@@ -38,8 +38,12 @@ impl CodexHomeUserInstructionsProvider {
     }
 
     #[tracing::instrument(name = "instructions.load", skip_all, fields(provider = "global"))]
-    async fn load_from_codex_home(&self) -> LoadedUserInstructions {
+    async fn load_from_codex_home(
+        &self,
+        cached_source: Option<&AbsolutePathBuf>,
+    ) -> (LoadedUserInstructions, bool) {
         let mut warnings = Vec::new();
+        let mut cached_source_failed = false;
         for candidate in [LOCAL_AGENTS_MD_FILENAME, DEFAULT_AGENTS_MD_FILENAME] {
             let path = self.codex_home.join(candidate);
             match tokio::fs::metadata(path.as_path()).await {
@@ -47,6 +51,7 @@ impl CodexHomeUserInstructionsProvider {
                 Ok(_) => {}
                 Err(err) if err.kind() == io::ErrorKind::NotFound => continue,
                 Err(err) => {
+                    cached_source_failed |= cached_source == Some(&path);
                     warnings.push(format!(
                         "Failed to read global AGENTS.md instructions from `{}`: {err}",
                         path.display()
@@ -58,6 +63,7 @@ impl CodexHomeUserInstructionsProvider {
                 Ok(data) => data,
                 Err(err) if err.kind() == io::ErrorKind::NotFound => continue,
                 Err(err) => {
+                    cached_source_failed |= cached_source == Some(&path);
                     warnings.push(format!(
                         "Failed to read global AGENTS.md instructions from `{}`: {err}",
                         path.display()
@@ -68,31 +74,43 @@ impl CodexHomeUserInstructionsProvider {
             let contents = String::from_utf8_lossy(&data);
             let trimmed = contents.trim();
             if !trimmed.is_empty() {
-                return LoadedUserInstructions {
-                    instructions: Some(Instructions {
-                        text: trimmed.to_string(),
-                        source: path,
-                    }),
-                    warnings,
-                };
+                return (
+                    LoadedUserInstructions {
+                        instructions: Some(Instructions {
+                            text: trimmed.to_string(),
+                            source: path,
+                        }),
+                        warnings,
+                    },
+                    cached_source_failed,
+                );
             }
         }
-        LoadedUserInstructions {
-            instructions: None,
-            warnings,
-        }
+        (
+            LoadedUserInstructions {
+                instructions: None,
+                warnings,
+            },
+            cached_source_failed,
+        )
     }
 }
 
 impl UserInstructionsProvider for CodexHomeUserInstructionsProvider {
     fn load_user_instructions(&self) -> LoadInstructionsFuture<'_> {
         Box::pin(async move {
-            let mut loaded = self.load_from_codex_home().await;
-            let mut state = self
-                .state
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if loaded.instructions.is_some() || loaded.warnings.is_empty() {
+            // Serialize observations as well as commits, so an older read cannot
+            // restore instructions after another clone has observed their removal.
+            let mut state = self.state.lock().await;
+            let (mut loaded, cached_source_failed) = self
+                .load_from_codex_home(
+                    state
+                        .last_successful_instructions
+                        .as_ref()
+                        .map(|instructions| &instructions.source),
+                )
+                .await;
+            if loaded.instructions.is_some() || !cached_source_failed {
                 state
                     .last_successful_instructions
                     .clone_from(&loaded.instructions);

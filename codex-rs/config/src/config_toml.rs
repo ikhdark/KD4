@@ -45,6 +45,7 @@ use codex_protocol::models::PermissionProfile;
 use codex_protocol::openai_models::ReasoningEffort;
 use codex_protocol::permissions::NetworkSandboxPolicy;
 use codex_protocol::protocol::AskForApproval;
+use codex_protocol::validation::ValidationMode;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_absolute_path::normalize_for_native_workdir;
 use codex_utils_absolute_path::normalize_for_path_comparison;
@@ -94,8 +95,13 @@ pub fn canonicalize_chatgpt_base_url(value: &str) -> String {
         url.set_path(&path);
     }
 
-    let mut canonical = url.to_string().trim_end_matches('/').to_string();
+    let mut canonical = url.to_string();
+    if url.path() == "/" && url.query().is_none() && url.fragment().is_none() {
+        canonical.pop();
+    }
     if !is_backend_client_chatgpt_host
+        && url.username().is_empty()
+        && url.password().is_none()
         && (canonical.starts_with("https://chatgpt.com")
             || canonical.starts_with("https://chat.openai.com"))
     {
@@ -363,6 +369,12 @@ pub struct ConfigToml {
 
     /// Token budget applied when storing tool/function outputs in the context manager.
     pub tool_output_token_limit: Option<usize>,
+
+    /// Default validation execution policy. Defaults to `benchmark` (targeted compilation and benchmark-only workloads, not tests).
+    pub validation_mode: Option<ValidationMode>,
+
+    /// Maximum BENCHMARK/FULL validation attempts per root turn, including children. Defaults to 2.
+    pub validation_full_budget: Option<usize>,
 
     /// Whether completed textual tool outputs may be represented by bounded,
     /// exactly retrievable receipts in manually managed prompt history.
@@ -821,13 +833,13 @@ pub(crate) fn normalized_project_lookup_keys(path: &Path) -> Vec<String> {
     }
 }
 
-/// Lowercases a projects trust-map key and drops a Windows verbatim prefix wherever the ordinary
+/// Preserves path case and drops a Windows verbatim prefix wherever the ordinary
 /// spelling names the same location. The canonical key therefore stays in the `C:\...` form users
 /// write, and `\\?\` keys persisted by earlier builds still match.
 pub(crate) fn normalize_project_lookup_key(key: &str) -> String {
     normalize_for_native_workdir(key)
         .to_string_lossy()
-        .to_ascii_lowercase()
+        .into_owned()
 }
 
 pub(crate) struct ProjectLookup<T> {
@@ -841,6 +853,13 @@ impl<T> ProjectLookup<T> {
         keys.sort();
         let mut normalized = BTreeMap::new();
         for key in keys {
+            // Resolve equivalence using the filesystem, not case folding: Windows
+            // can contain both case-insensitive and case-sensitive directories.
+            if let Ok(canonical) = normalize_for_path_comparison(Path::new(&key)) {
+                normalized
+                    .entry(normalize_project_lookup_key(&canonical.to_string_lossy()))
+                    .or_insert_with(|| key.clone());
+            }
             normalized
                 .entry(normalize_project_lookup_key(&key))
                 .or_insert(key);
@@ -1033,7 +1052,7 @@ region = "us-west-2"
     }
 
     #[test]
-    fn project_lookup_precomputes_deterministic_normalized_fallbacks() {
+    fn project_lookup_preserves_case_sensitive_trust_identities() {
         let lookup = ProjectLookup::new(HashMap::from([
             ("C:\\Repo".to_string(), "mixed"),
             ("C:\\REPO".to_string(), "upper"),
@@ -1046,7 +1065,56 @@ region = "us-west-2"
             ("C:\\Repo".to_string(), "mixed"),
             ("C:\\REPO".to_string(), "upper"),
         ]));
-        assert_eq!(fallback.get("c:\\repo"), Some(("C:\\REPO", &"upper")));
+        assert_eq!(fallback.get("c:\\repo"), None);
+        assert_eq!(fallback.get("C:\\Repo"), Some(("C:\\Repo", &"mixed")));
+    }
+
+    #[test]
+    fn project_lookup_resolves_existing_case_aliases_without_folding_distinct_projects() {
+        let temp = tempfile::tempdir().expect("project parent");
+        let upper = temp.path().join("Repo");
+        let lower = temp.path().join("repo");
+        std::fs::create_dir(&upper).expect("upper project");
+        match std::fs::create_dir(&lower) {
+            Ok(()) => {
+                // A case-sensitive parent holds two distinct trust identities.
+                let lookup = ProjectLookup::new(HashMap::from([
+                    (upper.to_string_lossy().into_owned(), "trusted"),
+                    (lower.to_string_lossy().into_owned(), "untrusted"),
+                ]));
+                assert_eq!(
+                    normalized_project_lookup_keys(&lower)
+                        .iter()
+                        .find_map(|key| lookup.get(key))
+                        .map(|(_, value)| *value),
+                    Some("untrusted")
+                );
+                let lookup = ProjectLookup::new(HashMap::from([(
+                    upper.to_string_lossy().into_owned(),
+                    "trusted",
+                )]));
+                assert!(
+                    normalized_project_lookup_keys(&lower)
+                        .iter()
+                        .all(|key| lookup.get(key).is_none())
+                );
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                // Old builds persisted lowercased spelling for the same existing directory.
+                let lookup = ProjectLookup::new(HashMap::from([(
+                    lower.to_string_lossy().into_owned(),
+                    "trusted",
+                )]));
+                assert_eq!(
+                    normalized_project_lookup_keys(&upper)
+                        .iter()
+                        .find_map(|key| lookup.get(key))
+                        .map(|(_, value)| *value),
+                    Some("trusted")
+                );
+            }
+            Err(error) => panic!("create lower project: {error}"),
+        }
     }
 
     #[test]
@@ -1089,6 +1157,25 @@ region = "us-west-2"
             ),
         ] {
             assert_eq!(canonicalize_chatgpt_base_url(configured), expected);
+        }
+    }
+
+    #[test]
+    fn chatgpt_base_url_preserves_non_path_components() {
+        for configured in [
+            "https://proxy.example/backend-api/?route=/tenant/",
+            "https://proxy.example/backend-api/#route/",
+            "https://chatgpt.com@proxy.example/backend-api/",
+            "https://chatgpt.com:secret@proxy.example/backend-api/?route=/tenant/#fragment/",
+        ] {
+            let before = url::Url::parse(configured).unwrap();
+            let after = url::Url::parse(&canonicalize_chatgpt_base_url(configured)).unwrap();
+            assert_eq!(after.username(), before.username());
+            assert_eq!(after.password(), before.password());
+            assert_eq!(after.host_str(), before.host_str());
+            assert_eq!(after.query(), before.query());
+            assert_eq!(after.fragment(), before.fragment());
+            assert_eq!(after.path(), "/backend-api");
         }
     }
 

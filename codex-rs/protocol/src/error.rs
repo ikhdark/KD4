@@ -271,7 +271,6 @@ impl CodexErr {
             | CodexErr::Spawn
             | CodexErr::SessionConfiguredNotFirstEvent
             | CodexErr::UsageLimitReached(_)
-            | CodexErr::ServerOverloaded { .. }
             | CodexErr::CyberPolicy { .. } => false,
             CodexErr::UnexpectedStatus(error) => {
                 error.status == StatusCode::TOO_MANY_REQUESTS || error.status.is_server_error()
@@ -282,6 +281,9 @@ impl CodexErr {
             | CodexErr::RequestTimeout
             | CodexErr::ResponseStreamFailed(_)
             | CodexErr::ConnectionFailed(_)
+            // Capacity failures use the turn owner's bounded, cancellable
+            // backoff instead of immediately ending the turn and its agents.
+            | CodexErr::ServerOverloaded { .. }
             | CodexErr::InternalServerError { .. }
             | CodexErr::InternalAgentDied
             | CodexErr::Io(_)
@@ -725,19 +727,41 @@ impl std::fmt::Display for EnvVarError {
 }
 
 fn bounded_exec_output(output: &ExecToolCallOutput) -> String {
-    let message = if !output.aggregated_output.text.trim().is_empty() {
-        output.aggregated_output.text.clone()
+    let lost = |stream: &crate::exec_output::StreamOutput<String>| {
+        stream.truncated || stream.truncated_after_lines.is_some()
+    };
+    let (parts, truncated) = if !output.aggregated_output.text.trim().is_empty() {
+        (
+            [output.aggregated_output.text.as_str(), "", ""],
+            lost(&output.aggregated_output),
+        )
     } else {
         let stderr = output.stderr.text.trim();
         let stdout = output.stdout.text.trim();
         match (stderr.is_empty(), stdout.is_empty()) {
-            (false, false) => format!("{stderr}\n{stdout}"),
-            (false, true) => output.stderr.text.clone(),
-            (true, false) => output.stdout.text.clone(),
-            (true, true) => String::new(),
+            (false, false) => (
+                [stderr, "\n", stdout],
+                lost(&output.stderr) || lost(&output.stdout),
+            ),
+            (false, true) => ([output.stderr.text.as_str(), "", ""], lost(&output.stderr)),
+            (true, false) => ([output.stdout.text.as_str(), "", ""], lost(&output.stdout)),
+            (true, true) => (
+                ["", "", ""],
+                lost(&output.aggregated_output) || lost(&output.stderr) || lost(&output.stdout),
+            ),
         }
     };
-    TruncationPolicy::Bytes(ERROR_MESSAGE_UI_MAX_BYTES).truncate_text(&message)
+    // Put producer loss before the retained fragment so a later UI head/tail
+    // budget cannot hide it. This is independent of display-time shortening.
+    const LOSS_MARKER: &str = "[output truncated by producer]\n";
+    let budget =
+        ERROR_MESSAGE_UI_MAX_BYTES.saturating_sub(if truncated { LOSS_MARKER.len() } else { 0 });
+    let text = codex_utils_string::truncate_middle_chars_from_parts(&parts, budget);
+    if truncated {
+        format!("{LOSS_MARKER}{text}")
+    } else {
+        text
+    }
 }
 
 pub fn get_error_message_ui(e: &CodexErr) -> String {

@@ -6,6 +6,14 @@ use codex_protocol::dynamic_tools::DynamicToolSpec;
 use std::collections::HashSet;
 
 pub fn validate_dynamic_tools(tools: &[DynamicToolSpec]) -> Result<(), String> {
+    validate_dynamic_tools_with_seen(tools, &mut HashSet::new(), &mut HashSet::new())
+}
+
+fn validate_dynamic_tools_with_seen(
+    tools: &[DynamicToolSpec],
+    seen_tools: &mut HashSet<String>,
+    seen_namespaces: &mut HashSet<String>,
+) -> Result<(), String> {
     const DYNAMIC_TOOL_NAME_MAX_LEN: usize = 128;
     const DYNAMIC_TOOL_NAMESPACE_MAX_LEN: usize = 64;
     const DYNAMIC_TOOL_NAMESPACE_DESCRIPTION_MAX_LEN: usize = 1024;
@@ -56,10 +64,10 @@ pub fn validate_dynamic_tools(tools: &[DynamicToolSpec]) -> Result<(), String> {
         Ok(())
     }
 
-    fn validate_dynamic_tool<'a>(
-        tool: &'a DynamicToolFunctionSpec,
+    fn validate_dynamic_tool(
+        tool: &DynamicToolFunctionSpec,
         namespace: Option<&str>,
-        seen: &mut HashSet<&'a str>,
+        seen: &mut HashSet<String>,
     ) -> Result<(), String> {
         let name = tool.name.trim();
         if name.is_empty() {
@@ -75,7 +83,7 @@ pub fn validate_dynamic_tools(tools: &[DynamicToolSpec]) -> Result<(), String> {
         if name == "mcp" || name.starts_with("mcp__") {
             return Err(format!("dynamic tool name is reserved: {name}"));
         }
-        if !seen.insert(name) {
+        if seen.contains(name) {
             if let Some(namespace) = namespace {
                 return Err(format!(
                     "duplicate dynamic tool name in namespace {namespace}: {name}"
@@ -94,15 +102,14 @@ pub fn validate_dynamic_tools(tools: &[DynamicToolSpec]) -> Result<(), String> {
                 "dynamic tool input schema is not supported for {name}: {err}"
             ));
         }
+        seen.insert(name.to_string());
         Ok(())
     }
 
-    let mut seen_tools = HashSet::new();
-    let mut seen_namespaces = HashSet::new();
     for spec in tools {
         match spec {
             DynamicToolSpec::Function(tool) => {
-                validate_dynamic_tool(tool, /*namespace*/ None, &mut seen_tools)?;
+                validate_dynamic_tool(tool, /*namespace*/ None, seen_tools)?;
             }
             DynamicToolSpec::Namespace(namespace) => {
                 let name = namespace.name.trim();
@@ -135,7 +142,7 @@ pub fn validate_dynamic_tools(tools: &[DynamicToolSpec]) -> Result<(), String> {
                         "dynamic tool namespace collides with a reserved Responses API namespace: {name}",
                     ));
                 }
-                if !seen_namespaces.insert(name) {
+                if seen_namespaces.contains(name) {
                     return Err(format!("duplicate dynamic tool namespace: {name}"));
                 }
                 if namespace.tools.is_empty() {
@@ -148,10 +155,27 @@ pub fn validate_dynamic_tools(tools: &[DynamicToolSpec]) -> Result<(), String> {
                     let DynamicToolNamespaceTool::Function(tool) = tool;
                     validate_dynamic_tool(tool, Some(name), &mut seen_namespace_tools)?;
                 }
+                seen_namespaces.insert(name.to_string());
             }
         }
     }
     Ok(())
+}
+
+/// Incremental admission for restored descriptors. Rejected descriptors reserve
+/// no names, and already accepted schemas are never parsed again.
+#[derive(Default)]
+pub struct DynamicToolRegistrationValidator {
+    tools: HashSet<String>,
+    namespaces: HashSet<String>,
+}
+
+impl DynamicToolRegistrationValidator {
+    pub fn validate(&mut self, tool: &DynamicToolSpec) -> Result<(), String> {
+        validate_dynamic_tools_with_seen(
+            std::slice::from_ref(tool), &mut self.tools, &mut self.namespaces,
+        )
+    }
 }
 
 pub fn parse_dynamic_tool(

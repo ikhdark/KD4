@@ -80,6 +80,49 @@ fn empty_notification_opt_outs_skip_lock_acquisition() {
 }
 
 #[tokio::test]
+async fn broadcast_filters_before_cloning_and_moves_to_last_eligible_recipient() {
+    for eligible in 0..=2 {
+        let mut readers = Vec::new();
+        let mut connections = HashMap::new();
+        for index in 0..16 {
+            let (writer, reader) = mpsc::channel(1);
+            readers.push(reader);
+            connections.insert(ConnectionId(index), OutboundConnectionState::new(
+                writer,
+                Arc::new(AtomicBool::new(true)),
+                Arc::new(AtomicBool::new(true)),
+                Arc::new(OutboundNotificationOptOuts::new(if index < eligible {
+                    HashSet::new()
+                } else {
+                    HashSet::from(["configWarning".to_string()])
+                })),
+                Some(CancellationToken::new()),
+                CancellationToken::new(),
+            ));
+        }
+        let message = config_warning(&"large payload".repeat(64 * 1024));
+        let OutgoingMessage::AppServerNotification(ServerNotification::ConfigWarning(warning)) = &message
+        else { panic!("config warning"); };
+        let original = warning.summary.as_ptr();
+        let envelope = OutgoingEnvelope::Broadcast { message };
+        assert_eq!(target_connection_ids(&connections, &envelope).len(), eligible as usize);
+        route_outgoing_envelope(&mut connections, envelope).await;
+        let mut moved = 0;
+        for (index, reader) in readers.iter_mut().enumerate() {
+            if index < eligible as usize {
+                let queued = reader.try_recv().expect("eligible recipient");
+                let OutgoingMessage::AppServerNotification(ServerNotification::ConfigWarning(warning)) = queued.message
+                else { panic!("config warning"); };
+                moved += usize::from(warning.summary.as_ptr() == original);
+            } else {
+                assert!(matches!(reader.try_recv(), Err(mpsc::error::TryRecvError::Empty)));
+            }
+        }
+        assert_eq!(moved, usize::from(eligible > 0), "one original, clones only for the remaining eligible clients");
+    }
+}
+
+#[tokio::test]
 async fn envelope_target_selection_preserves_the_only_delivery_path_difference() {
     let initialized_connection_id = ConnectionId(1);
     let uninitialized_connection_id = ConnectionId(2);
@@ -927,6 +970,32 @@ async fn dropping_router_state_closes_registered_websocket_connection() {
             .is_none()
     );
 }
+#[tokio::test]
+async fn stdio_byte_credit_follows_the_retained_encoding_past_delivery_handoff() {
+    let shutdown = CancellationToken::new();
+    let (writer, mut reader) = mpsc::channel(1);
+    let mut connections = HashMap::from([(
+        ConnectionId(1),
+        registered_stdio_connection(ConnectionId(1), writer, shutdown.clone()),
+    )]);
+    route_outgoing_envelope(&mut connections, OutgoingEnvelope::ToConnection {
+        connection_id: ConnectionId(1),
+        message: config_warning("\"escaped\n雪"),
+        write_complete_tx: None,
+    }).await;
+    let queued = next_delivered(&mut reader, "encoded stdio frame").await;
+    let retained = queued.encoded_json.as_ref().expect("router retains the wire representation");
+    let expected = serde_json::to_vec(&queued.message).unwrap();
+    assert_eq!(retained.bytes, expected);
+    let bytes = retained.bytes.len();
+    let budget = connections.get(&ConnectionId(1)).unwrap().stdio_delivery.as_ref().unwrap().bytes.clone();
+    assert_eq!(budget.available_permits(), STDIO_DELIVERY_BYTES - bytes,
+        "writer queue capacity must not release encoded-byte admission");
+    drop(queued);
+    assert_eq!(budget.available_permits(), STDIO_DELIVERY_BYTES);
+    shutdown.cancel();
+}
+
 #[tokio::test]
 async fn unread_stdio_does_not_block_a_healthy_remote_writer() {
     let shutdown = CancellationToken::new();

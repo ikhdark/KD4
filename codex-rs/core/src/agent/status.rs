@@ -13,7 +13,7 @@ pub(crate) fn agent_status_from_event(msg: &EventMsg) -> Option<AgentStatus> {
     match msg {
         EventMsg::TurnStarted(_) => Some(AgentStatus::Running),
         EventMsg::TurnComplete(ev) => {
-            let mut status = if let Some(error) = ev.error.as_ref() {
+            let status = if let Some(error) = ev.error.as_ref() {
                 AgentStatus::Errored(error.message.clone())
             } else if let Some(stop_cause) = ev.timing.as_ref().and_then(|timing| timing.stop_cause)
             {
@@ -30,14 +30,6 @@ pub(crate) fn agent_status_from_event(msg: &EventMsg) -> Option<AgentStatus> {
                     None => AgentStatus::Completed(ev.last_agent_message.clone()),
                 }
             };
-            if let Some(summary) = ev
-                .timing
-                .as_ref()
-                .and_then(|timing| timing.completion_assessment.as_ref())
-                .and_then(|assessment| assessment.bounded_summary(&ev.turn_id))
-            {
-                append_host_observation(&mut status, &summary);
-            }
             Some(status)
         }
         EventMsg::TurnAborted(ev) => match ev.reason {
@@ -75,9 +67,6 @@ pub(crate) fn agent_status_from_task(
     observed_status: Option<(codex_agent_task_store::AttemptId, &AgentStatus)>,
 ) -> Option<AgentStatus> {
     let mut status = agent_status_from_task_inner(task, observed_status)?;
-    if let Some(summary) = completion_diagnostics_from_task(task) {
-        append_host_observation(&mut status, &summary);
-    }
     let current_observation =
         observed_status.filter(|(attempt, _)| *attempt == task.current_attempt.attempt_id);
     let cause = match current_observation {
@@ -157,37 +146,9 @@ pub(crate) fn completion_diagnostics_from_task(task: &AgentTask) -> Option<Strin
     (!summaries.is_empty()).then(|| summaries.join("\n\n"))
 }
 
-fn append_host_observation(status: &mut AgentStatus, summary: &str) {
-    let message = match status {
-        // Host observations must not manufacture an authored final response:
-        // the missing-receipt path distinguishes Completed(None) from Some.
-        AgentStatus::Completed(Some(message)) => message,
-        AgentStatus::CompletedWithSurface {
-            last_agent_message: message,
-            ..
-        } => message.get_or_insert_with(String::new),
-        AgentStatus::Stopped {
-            last_agent_message: Some(message),
-            ..
-        } => message,
-        AgentStatus::Errored(message) => message,
-        _ => return,
-    };
-    // Only presentation deduplication: no prose is parsed into host authority.
-    if !message.starts_with(summary) {
-        // Put known host facts before potentially long authored prose so the
-        // bounded notification cannot discard them merely because prose is long.
-        *message = if message.is_empty() {
-            summary.to_string()
-        } else {
-            format!("{summary}\n\n{message}")
-        };
-    }
-}
-
 /// The current attempt's terminal host observation, selected exactly as in
-/// `completion_diagnostics_from_task`. The live terminal status, and a legacy
-/// receipt sealed from it, already start with this text.
+/// `completion_diagnostics_from_task`. Older terminal statuses and receipts may
+/// carry this text as a prefix.
 fn terminal_host_observation_summary(task: &AgentTask) -> Option<&str> {
     task.observations
         .iter()
@@ -204,8 +165,7 @@ fn terminal_host_observation_summary(task: &AgentTask) -> Option<&str> {
         .filter(|summary| !summary.is_empty() && *summary != NO_COMPLETION_DIAGNOSTICS)
 }
 
-/// Removes only an exact leading copy of the host observation (as written by
-/// `append_host_observation`); `agent_status_from_task` prepends it once.
+/// Removes only an exact leading copy of a legacy host observation.
 fn without_host_observation<'a>(message: &'a str, summary: Option<&str>) -> &'a str {
     match summary.and_then(|summary| message.strip_prefix(summary)) {
         Some("") => "",
@@ -222,41 +182,16 @@ fn agent_status_from_task_inner(
     if receipt.attempt_id != task.current_attempt.attempt_id {
         return None;
     }
-    // The live status, and a receipt sealed from it, already start with the
-    // terminal host observation; `agent_status_from_task` prepends it once.
+    // Strip legacy host decorations without altering the authored report.
     let host_observation = terminal_host_observation_summary(task);
     let receipt_summary = without_host_observation(&receipt.summary, host_observation);
     let plain_message = matches!(
         task.assignment.admission_origin,
         AssignmentAdmissionOrigin::LegacyMessage { .. }
     );
-    let failures = task
-        .gates
-        .iter()
-        .filter(|gate| {
-            matches!(
-                gate.status,
-                codex_agent_task_store::GateStatus::Failed
-                    | codex_agent_task_store::GateStatus::ChangesRequested
-                    | codex_agent_task_store::GateStatus::Violated
-            )
-        })
-        .map(|gate| format!("{:?}: {:?}: {}", gate.kind, gate.status, gate.reason))
-        .collect::<Vec<_>>()
-        .join("; ");
     let needs_main = task.current_attempt.state == codex_agent_task_store::AttemptState::NeedsMain;
-    if receipt.status == AgentStatusClaim::Completed
-        && (needs_main || (!plain_message && !failures.is_empty()))
-    {
-        let acceptance = if needs_main {
-            "needs_main"
-        } else {
-            "blocked by gates"
-        };
-        return Some(AgentStatus::Errored(format!(
-            "Agent execution completed; acceptance {acceptance}. {failures}\n\nAgent-reported result (not verification evidence): {}",
-            receipt_summary
-        )));
+    if receipt.status == AgentStatusClaim::Completed && needs_main {
+        return Some(AgentStatus::Errored(format!("Agent needs main: {receipt_summary}")));
     }
     let observed_status = observed_status
         .filter(|(attempt_id, _)| {
@@ -289,23 +224,6 @@ fn agent_status_from_task_inner(
         ) => without_host_observation(message, host_observation),
         _ => receipt_summary,
     };
-    if !plain_message
-        && receipt.status == AgentStatusClaim::Completed
-        && !task.workspace_status.pending_gates.is_empty()
-    {
-        // Execution finished; acceptance is still owned by the durable gates.
-        // Do not surface a typed result or turn pending review into a failure.
-        return Some(AgentStatus::Completed(Some(format!(
-            "Agent execution completed; durable typed task has pending gates: {}\n\nAgent-reported result (not verification evidence): {reported_message}\n\nResolve the gates on assignment {}; do not rerun the agent merely to recover this report.",
-            task.workspace_status
-                .pending_gates
-                .iter()
-                .map(|gate| format!("{gate:?}").to_ascii_lowercase())
-                .collect::<Vec<_>>()
-                .join(", "),
-            task.assignment.assignment_id,
-        ))));
-    }
     match receipt.status {
         AgentStatusClaim::Completed
             if matches!(
@@ -323,22 +241,7 @@ fn agent_status_from_task_inner(
             }
             status
         }
-        AgentStatusClaim::Completed if plain_message => {
-            let evidence_note = if receipt.risks.is_empty() {
-                ""
-            } else {
-                "\nUnresolved risks are retained in the task record."
-            };
-            Some(AgentStatus::Completed(Some(format!(
-                "Agent-reported result (behavior unverified): {}{evidence_note}",
-                receipt_summary
-            ))))
-        }
-        AgentStatusClaim::Completed => Some(AgentStatus::Completed(Some(format!(
-            "{}\n\nAgent-reported summary (not verification evidence): {}",
-            task.completion_evidence_summary(),
-            reported_message
-        )))),
+        AgentStatusClaim::Completed => Some(AgentStatus::Completed(Some(reported_message.to_string()))),
         AgentStatusClaim::NeedsMain | AgentStatusClaim::Blocked => {
             Some(receipt_error_status(receipt, receipt_summary))
         }
@@ -424,7 +327,7 @@ mod tests {
         assert_eq!(summary, "validation failed\n\ndelivery failed");
         assert!(
             matches!(agent_status_from_task(&task, None), Some(AgentStatus::Completed(Some(text)))
-            if text.starts_with(&summary) && !text.contains("wrong attempt"))
+            if text == "durable summary")
         );
         task.observations.push(observation(
             task.current_attempt.attempt_id,
@@ -558,10 +461,7 @@ mod tests {
     }
 
     #[test]
-    fn host_completion_diagnostics_survive_plain_and_surfaced_statuses() {
-        let mut no_report = AgentStatus::Completed(None);
-        append_host_observation(&mut no_report, "host-only evidence");
-        assert_eq!(no_report, AgentStatus::Completed(None));
+    fn host_completion_diagnostics_do_not_decorate_plain_and_surfaced_statuses() {
         for surfaced in [false, true] {
             let event = TurnCompleteEvent {
                 turn_id: "diagnostic-turn".into(),
@@ -599,13 +499,11 @@ mod tests {
                 } => message,
                 _ => panic!("completion lifecycle must be unchanged"),
             };
-            assert!(text.contains("check-alpha failed"));
-            assert!(text.contains("check-beta awaits terminal evidence"));
-            assert!(text.contains("diagnostic-turn"));
+            assert_eq!(text, "done");
             task.workspace_status.pending_gates = vec![codex_agent_task_store::GateKind::Review];
-            assert!(
-                matches!(agent_status_from_task(&task, Some((task.current_attempt.attempt_id, &status))),
-                Some(AgentStatus::Completed(Some(message))) if message.contains("pending gates") && message.contains("check-alpha"))
+            assert_eq!(
+                agent_status_from_task(&task, Some((task.current_attempt.attempt_id, &status))),
+                Some(status.clone())
             );
             assert!(
                 matches!(agent_status_from_task(&task, Some((AttemptId::new(), &status))),
@@ -781,12 +679,9 @@ mod tests {
         else {
             panic!("sealed completed task must produce a parent notification");
         };
-        assert!(message.contains("behavior unverified"));
-        assert!(message.contains("Running Desktop build: not established"));
-        assert!(message.starts_with("Recorded task status: Completed."));
-        assert!(
-            message
-                .contains("Agent-reported summary (not verification evidence): Everything passed")
+        assert_eq!(
+            message,
+            "Everything passed and Desktop is running the new build"
         );
         for (status, label) in [
             (AgentStatusClaim::NeedsMain, "needs_main"),
@@ -825,7 +720,7 @@ mod tests {
         assert_eq!(
             agent_status_from_task(&task, None),
             Some(AgentStatus::Completed(Some(
-                "Agent-reported result (behavior unverified): durable summary".to_string()
+                "durable summary".to_string()
             )))
         );
         for failed_followup in [
@@ -852,7 +747,7 @@ mod tests {
     fn pending_gate_preserves_execution_completion_without_claiming_acceptance() {
         assert!(matches!(
             agent_status_from_task(&typed_task_with_receipt(AgentStatusClaim::Completed, true), None),
-            Some(AgentStatus::Completed(Some(message))) if message.contains("pending gates")
+            Some(AgentStatus::Completed(Some(message))) if message == "durable summary"
         ));
         assert!(matches!(
             agent_status_from_task(&typed_task_with_receipt(AgentStatusClaim::Failed, true), None),
@@ -910,9 +805,7 @@ mod tests {
         else {
             panic!("cleared gates allow completion");
         };
-        assert!(message.contains("Detailed findings and coverage."));
-        assert!(message.contains("not verification evidence"));
-        assert!(message.contains("Running Desktop build: not established"));
+        assert_eq!(message, "Detailed findings and coverage.");
 
         task.workspace_status.pending_gates = vec![codex_agent_task_store::GateKind::Review];
         let Some(AgentStatus::Completed(Some(message))) =
@@ -920,10 +813,7 @@ mod tests {
         else {
             panic!("report delivery must not clear pending gates");
         };
-        assert!(message.contains("pending gates: review"));
-        assert!(message.contains("Detailed findings and coverage."));
-        assert!(message.contains("not verification evidence"));
-        assert!(message.contains(&task.assignment.assignment_id.to_string()));
+        assert_eq!(message, "Detailed findings and coverage.");
 
         let Some(AgentStatus::Completed(Some(stale))) =
             agent_status_from_task(&task, Some((AttemptId::new(), &observed)))
@@ -935,7 +825,7 @@ mod tests {
     }
 
     #[test]
-    fn typed_surface_requires_current_attempt_and_cleared_gates() {
+    fn typed_surface_requires_current_attempt_without_attached_gate_summary() {
         let mut task = typed_task_with_receipt(AgentStatusClaim::Completed, false);
         let observed = AgentStatus::CompletedWithSurface {
             last_agent_message: None,
@@ -956,13 +846,14 @@ mod tests {
         ));
         task.workspace_status =
             typed_task_with_receipt(AgentStatusClaim::Completed, true).workspace_status;
-        assert!(
-            matches!(agent_status_from_task(&task, Some((attempt_id, &observed))), Some(AgentStatus::Completed(Some(message))) if message.contains("pending gates"))
+        assert_eq!(
+            agent_status_from_task(&task, Some((attempt_id, &observed))),
+            Some(observed)
         );
     }
 
     #[test]
-    fn audit149x_terminal_host_observation_is_reported_once_in_projected_completions() {
+    fn terminal_host_observation_is_not_attached_to_projected_completions() {
         let assessment = codex_protocol::protocol::TurnCompletionAssessment {
             verification_gaps: vec!["final workspace not verified".into()],
             ..Default::default()
@@ -987,7 +878,7 @@ mod tests {
         let AgentStatus::Completed(Some(live_message)) = live.clone() else {
             panic!("the live completion keeps its report");
         };
-        assert!(live_message.starts_with(&summary));
+        assert_eq!(live_message, "authored report");
         // The session records the same text as the attempt's terminal observation.
         let observation = |task: &AgentTask| codex_agent_task_store::RuntimeObservation {
             execution_stop_cause: None,
@@ -1000,7 +891,6 @@ mod tests {
             call_id: Some("thread:child-turn".into()),
             created_at: chrono::Utc::now(),
         };
-        let occurrences = |text: &str| text.matches(summary.as_str()).count();
 
         let mut typed = typed_task_with_receipt(AgentStatusClaim::Completed, false);
         let recorded = observation(&typed);
@@ -1011,11 +901,7 @@ mod tests {
         else {
             panic!("typed completion keeps its lifecycle");
         };
-        assert_eq!(occurrences(message.as_str()), 1, "{message}");
-        assert!(message.starts_with(&summary));
-        assert!(
-            message.contains("Agent-reported summary (not verification evidence): authored report")
-        );
+        assert_eq!(message, "authored report");
 
         typed.workspace_status.pending_gates = vec![codex_agent_task_store::GateKind::Review];
         let Some(AgentStatus::Completed(Some(message))) =
@@ -1023,46 +909,39 @@ mod tests {
         else {
             panic!("pending gates keep execution completion");
         };
-        assert_eq!(occurrences(message.as_str()), 1, "{message}");
-        assert!(
-            message.contains("Agent-reported result (not verification evidence): authored report")
-        );
+        assert_eq!(message, "authored report");
 
-        // A plain-message receipt sealed from the live status carries the same prefix.
+        // Older plain-message receipts may still carry the host prefix.
         let mut plain = typed_task_with_receipt(AgentStatusClaim::Completed, false);
         plain.assignment.admission_origin = AssignmentAdmissionOrigin::LegacyMessage {
             parent_assignment_id: None,
         };
-        plain.receipt.as_mut().unwrap().summary = live_message.clone();
+        plain.receipt.as_mut().unwrap().summary = format!("{summary}\n\n{live_message}");
         let recorded = observation(&plain);
         plain.observations.push(recorded);
         let Some(AgentStatus::Completed(Some(message))) = agent_status_from_task(&plain, None)
         else {
             panic!("plain completion keeps its lifecycle");
         };
-        assert_eq!(occurrences(message.as_str()), 1, "{message}");
-        assert!(message.contains("Agent-reported result (behavior unverified): authored report"));
+        assert_eq!(message, "authored report");
 
         // Negative controls: without the durable observation the live report is
         // kept verbatim, and text that only begins like the observation is not cut.
         let unrecorded = typed_task_with_receipt(AgentStatusClaim::Completed, false);
+        let live = AgentStatus::Completed(Some(format!("{summary}\n\n{live_message}")));
         let Some(AgentStatus::Completed(Some(message))) = agent_status_from_task(
             &unrecorded,
             Some((unrecorded.current_attempt.attempt_id, &live)),
         ) else {
             panic!("typed completion keeps its lifecycle");
         };
-        assert!(message.contains(&format!(
-            "Agent-reported summary (not verification evidence): {live_message}"
-        )));
+        assert_eq!(message, format!("{summary}\n\n{live_message}"));
         plain.receipt.as_mut().unwrap().summary =
             format!("{summary} continued without a separator");
         let Some(AgentStatus::Completed(Some(message))) = agent_status_from_task(&plain, None)
         else {
             panic!("plain completion keeps its lifecycle");
         };
-        assert!(message.contains(&format!(
-            "Agent-reported result (behavior unverified): {summary} continued without a separator"
-        )));
+        assert_eq!(message, format!("{summary} continued without a separator"));
     }
 }

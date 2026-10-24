@@ -28,6 +28,212 @@ pub(crate) fn recovery_completion() -> ServerNotification {
 }
 
 #[tokio::test]
+async fn failed_history_preserves_top_level_and_nested_authoritative_receipts() {
+    use codex_protocol::protocol::AcceptedFinalMessage;
+    use codex_protocol::protocol::AcceptedFinalMessageOrigin;
+    use codex_protocol::protocol::SurfacedToolResult;
+    use codex_protocol::protocol::TurnFinalAnswer;
+    use codex_protocol::protocol::TurnTiming;
+
+    for nested in [false, true] {
+        for surfaced in [false, true] {
+            for text in [Some("accepted answer\n"), Some(""), None] {
+                let mut notification = recovery_completion();
+                let ServerNotification::TurnCompleted(payload) = &mut notification else {
+                    unreachable!()
+                };
+                if surfaced {
+                    let result = Some(SurfacedToolResult {
+                        adapter: "owner".into(),
+                        value: serde_json::json!({"answer": 42}),
+                        canonical_message: text.map(str::to_string),
+                    });
+                    if nested {
+                        payload.turn.surfaced_result = result;
+                    } else {
+                        payload.surfaced_result = result;
+                    }
+                } else {
+                    let timing = Some(TurnTiming {
+                        final_answer: Some(TurnFinalAnswer {
+                            tail: None,
+                            message: text.map(|text| AcceptedFinalMessage {
+                                item_id: "accepted".into(),
+                                text: text.into(),
+                                origin: AcceptedFinalMessageOrigin::LegacyUnphased,
+                                completion_attempt_id: "turn:1".into(),
+                            }),
+                        }),
+                        ..Default::default()
+                    });
+                    if nested {
+                        payload.turn.timing = timing;
+                    } else {
+                        payload.timing = timing;
+                    }
+                }
+                let reads = std::cell::Cell::new(0);
+                assert_eq!(
+                    prepare_server_notification(
+                        false,
+                        "thread-1",
+                        "turn-1",
+                        false,
+                        &mut notification,
+                        async |_| {
+                            reads.set(reads.get() + 1);
+                            Err("history unavailable".into())
+                        },
+                    )
+                    .await,
+                    Ok(true)
+                );
+                assert_eq!(reads.get(), 1);
+                let dir = tempdir().unwrap();
+                let path = dir.path().join("answer.txt");
+                std::fs::write(&path, "stale answer").unwrap();
+                let mut processor = EventProcessorWithJsonOutput::new(Some(path.clone()));
+                processor.collect_thread_events(notification);
+                assert_eq!(processor.final_message(), text);
+                processor.print_final_output().unwrap();
+                assert_eq!(
+                    std::fs::read_to_string(path).unwrap(),
+                    text.unwrap_or_default()
+                );
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn pending_history_read_observes_second_interrupt_without_restarting() {
+    let mut notification = recovery_completion();
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let reads = std::cell::Cell::new(0);
+    let requests = std::cell::Cell::new(0);
+    let (cancelled_tx, cancelled_rx) = tokio::sync::oneshot::channel::<()>();
+    let preparation = prepare_server_notification(
+        false,
+        "thread-1",
+        "turn-1",
+        false,
+        &mut notification,
+        async |_| {
+            let _cancelled_on_drop = cancelled_tx;
+            reads.set(reads.get() + 1);
+            tx.send(()).unwrap();
+            tx.send(()).unwrap();
+            std::future::pending().await
+        },
+    );
+    let error = tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        ExecInterrupts::default().wait_for(preparation, &mut rx, || {
+            requests.set(requests.get() + 1);
+            Box::pin(std::future::pending()) as PendingInterrupt
+        }),
+    )
+    .await
+    .expect("a second Ctrl-C must not wait for history")
+    .unwrap_err();
+    assert!(error.contains("second interrupt"));
+    assert_eq!(reads.get(), 1);
+    assert_eq!(requests.get(), 1);
+    assert!(
+        cancelled_rx.await.is_err(),
+        "forced shutdown must drop the history wait"
+    );
+}
+
+#[tokio::test]
+async fn pending_history_read_observes_armed_interrupt_deadline() {
+    let mut notification = recovery_completion();
+    let (_tx, mut rx) = mpsc::unbounded_channel();
+    let reads = std::cell::Cell::new(0);
+    let (cancelled_tx, cancelled_rx) = tokio::sync::oneshot::channel::<()>();
+    let mut interrupts = ExecInterrupts {
+        requested: true,
+        deadline: Some(tokio::time::Instant::now() + std::time::Duration::from_millis(20)),
+        pending: Some(Box::pin(std::future::pending())),
+        ..Default::default()
+    };
+    let preparation = prepare_server_notification(
+        false,
+        "thread-1",
+        "turn-1",
+        false,
+        &mut notification,
+        async |_| {
+            let _cancelled_on_drop = cancelled_tx;
+            reads.set(reads.get() + 1);
+            std::future::pending().await
+        },
+    );
+    let error = tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        interrupts.wait_for(preparation, &mut rx, || panic!("already interrupted")),
+    )
+    .await
+    .expect("armed deadline must not wait for history")
+    .unwrap_err();
+    assert!(error.contains("deadline expired"));
+    assert_eq!(reads.get(), 1);
+    assert!(
+        cancelled_rx.await.is_err(),
+        "deadline expiry must drop the history wait"
+    );
+}
+
+#[tokio::test]
+async fn resume_last_skips_unreadable_spawned_candidates_outside_cwd() {
+    let dir = tempdir().unwrap();
+    let cwd = dir.path().join("local");
+    let mut damaged = recovery_thread_fixture();
+    damaged.cwd = AbsolutePathBuf::from_absolute_path(dir.path().join("elsewhere")).unwrap();
+    damaged.path = Some(dir.path().join("missing.jsonl"));
+    damaged.source = codex_app_server_protocol::SessionSource::SubAgent(
+        codex_protocol::protocol::SubAgentSource::ThreadSpawn {
+            parent_thread_id: ThreadId::new(),
+            depth: 1,
+            agent_nickname: None,
+            agent_role: None,
+            agent_path: None,
+        },
+    );
+    let mut healthy = recovery_thread_fixture();
+    healthy.id = "healthy".into();
+    healthy.cwd = AbsolutePathBuf::from_absolute_path(&cwd).unwrap();
+    let mut cwd_filtered = false;
+    let mut ineligible_filtered = false;
+    assert_eq!(
+        last_resumable_thread_in_page(
+            vec![damaged.clone(), healthy],
+            &cwd,
+            false,
+            &mut cwd_filtered,
+            &mut ineligible_filtered,
+        )
+        .await
+        .unwrap(),
+        Some("healthy".into())
+    );
+    assert!(cwd_filtered);
+    assert!(!ineligible_filtered);
+    assert!(
+        last_resumable_thread_in_page(
+            vec![damaged],
+            &cwd,
+            true,
+            &mut cwd_filtered,
+            &mut ineligible_filtered,
+        )
+        .await
+        .is_err(),
+        "--all must still validate eligible-directory candidates"
+    );
+}
+
+#[tokio::test]
 async fn progress_notifications_reach_jsonl_only_for_the_primary_turn() {
     use codex_app_server_protocol::CommandExecutionOutputDeltaNotification;
     use codex_app_server_protocol::ItemStartedNotification;

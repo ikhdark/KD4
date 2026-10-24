@@ -273,6 +273,7 @@ async fn create_ready_async_managed_client_with_resources(
         cancel_token: CancellationToken::new(),
         approval_incarnation: AsyncManagedClient::next_approval_incarnation(),
         manager_owners: Arc::new(AtomicUsize::new(1)),
+        manager_lease: Arc::new(std::sync::Mutex::new(None)),
     }
 }
 
@@ -310,17 +311,58 @@ async fn ready_server_resources_capability_is_aggregated_to_one_boolean() {
 async fn manager_lease_keeps_an_adopted_client_live_until_the_final_release() {
     let client = create_ready_async_managed_client(Vec::new()).await;
     let cancel_token = client.cancel_token.clone();
-    client.retain_for_manager();
+    let adopted = client.retain_for_manager().expect("live owner can be retained");
 
     client.release_manager_without_shutdown();
     assert!(!cancel_token.is_cancelled());
     assert_eq!(client.manager_owners.load(Ordering::Acquire), 1);
 
     client.release_manager_without_shutdown();
+    assert!(!cancel_token.is_cancelled());
+    assert_eq!(client.manager_owners.load(Ordering::Acquire), 1);
+    adopted.release_manager_without_shutdown();
     assert!(cancel_token.is_cancelled());
-    assert_eq!(client.manager_owners.load(Ordering::Acquire), 0);
     client.release_manager_without_shutdown();
     assert_eq!(client.manager_owners.load(Ordering::Acquire), 0);
+    assert!(client.retain_for_manager().is_none(), "zero owners cannot be resurrected");
+}
+
+#[tokio::test]
+async fn forced_old_manager_shutdown_cannot_release_a_replacement_lease() {
+    let old = create_ready_async_managed_client(Vec::new()).await;
+    let replacement = old.retain_for_manager().unwrap();
+    old.shutdown().await.unwrap();
+    old.force_shutdown().await;
+    assert_eq!(replacement.manager_owners.load(Ordering::Acquire), 1);
+    assert!(!replacement.cancel_token.is_cancelled());
+    replacement.release_manager_without_shutdown();
+    assert_eq!(old.manager_owners.load(Ordering::Acquire), 0);
+    assert!(old.retain_for_manager().is_none());
+}
+
+#[tokio::test]
+async fn resource_only_activity_retries_failed_startup_without_tool_listing() {
+    for operation in 0..5 {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let observed = attempts.clone();
+        let recovered = create_test_managed_client(Vec::new()).await;
+        let factory = Arc::new(move || {
+            observed.fetch_add(1, Ordering::SeqCst);
+            futures::future::ready(Ok(recovered.clone())).boxed().shared()
+        });
+        let manager = create_test_manager_with_failed_apps_startup(Vec::new(), factory).await;
+        match operation {
+            0 => { let _ = manager.list_resources(CODEX_APPS_MCP_SERVER_NAME, None).await; }
+            1 => { let _ = manager.list_all_resources(|_| true).await; }
+            2 => { let _ = manager.list_resource_pages(|_| true).await; }
+            3 => { let _ = manager.list_all_resource_templates(|_| true).await; }
+            _ => { let _ = manager.list_resource_templates(CODEX_APPS_MCP_SERVER_NAME, None).await; }
+        }
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while attempts.load(Ordering::SeqCst) == 0 { tokio::task::yield_now().await; }
+        }).await.unwrap();
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    }
 }
 
 #[tokio::test]
@@ -379,6 +421,7 @@ async fn only_ready_unchanged_non_chatgpt_clients_are_reusable() {
             cancel_token: CancellationToken::new(),
             approval_incarnation: AsyncManagedClient::next_approval_incarnation(),
             manager_owners: Arc::new(AtomicUsize::new(1)),
+            manager_lease: Arc::new(std::sync::Mutex::new(None)),
         },
     );
     assert!(manager.reusable_client("stdio", &original).await.is_none());
@@ -435,6 +478,19 @@ async fn refresh_adopts_an_unchanged_client_without_old_manager_shutdown_cancell
     let mcp_servers = HashMap::from([("stdio".to_string(), server)]);
     let (tx_event, rx_event) = async_channel::unbounded();
     drop(rx_event);
+
+    // Constructing a candidate is not a committed policy transition. Even a
+    // successful but discarded candidate must not mutate the serving manager.
+    let candidate_policy = Constrained::allow_any(AskForApproval::Never);
+    let candidate = McpConnectionManager::new(
+        &HashMap::new(), OAuthCredentialsStoreMode::default(), AuthKeyringBackendKind::default(),
+        HashMap::new(), &candidate_policy, "candidate".into(), tx_event.clone(), CancellationToken::new(),
+        PermissionProfile::default(), runtime_context.clone(), codex_home.path().to_path_buf(),
+        CodexAppsToolsCache::default(), cache_key.clone(), true, ElicitationCapability::default(), false,
+        ToolPluginProvenance::default(), None, None, None, ElicitationRequestRouter::default(), Some(&previous),
+    ).await;
+    drop(candidate);
+    assert_eq!(*previous.elicitation_requests.approval_policy.lock().unwrap(), AskForApproval::OnRequest);
 
     let refreshed = McpConnectionManager::new(
         &mcp_servers,
@@ -996,6 +1052,7 @@ async fn create_test_manager_with_failed_apps_startup(
             cancel_token: CancellationToken::new(),
             approval_incarnation: AsyncManagedClient::next_approval_incarnation(),
             manager_owners: Arc::new(AtomicUsize::new(1)),
+            manager_lease: Arc::new(std::sync::Mutex::new(None)),
         },
     );
     manager
@@ -1101,6 +1158,26 @@ fn tool_with_model_visible_input_schema_leaves_tools_without_file_params_unchang
     let tool = tool_with_model_visible_input_schema(&original_tool);
 
     assert_eq!(tool, original_tool);
+}
+
+#[test]
+fn file_schema_projection_preserves_nullable_arrays_and_composed_branches() {
+    let mut tool = create_test_tool("files", "upload").tool;
+    tool.input_schema = Arc::new(serde_json::from_value(serde_json::json!({
+        "type": "object", "required": ["file"],
+        "properties": {"file": {"anyOf": [
+            {"type": "array", "minItems": 1, "items": {"type": "object", "properties": {"uri": {"type": "string"}}, "required": ["uri"]}},
+            {"type": "null"}
+        ]}}
+    })).unwrap());
+    tool.meta = Some(MetaObject(serde_json::from_value(serde_json::json!({"openai/fileParams": ["file"]})).unwrap()));
+    let projected = tool_with_model_visible_input_schema(&tool);
+    let schema = serde_json::to_value(projected.input_schema).unwrap();
+    assert_eq!(schema["required"], serde_json::json!(["file"]));
+    assert_eq!(schema["properties"]["file"]["anyOf"][0]["type"], "array");
+    assert_eq!(schema["properties"]["file"]["anyOf"][0]["items"]["type"], "string");
+    assert_eq!(schema["properties"]["file"]["anyOf"][0]["minItems"], 1);
+    assert_eq!(schema["properties"]["file"]["anyOf"][1]["type"], "null");
 }
 
 #[test]
@@ -1418,6 +1495,79 @@ async fn shared_elicitation_router_targets_the_exact_pending_request() {
     assert_eq!(outstanding.load(std::sync::atomic::Ordering::SeqCst), 0);
 }
 
+#[tokio::test]
+async fn elicitation_public_tokens_preserve_distinct_native_request_ids() {
+    let manager = ElicitationRequestManager::new(
+        AskForApproval::OnRequest,
+        PermissionProfile::default(),
+        None,
+        ElicitationRequestRouter::default(),
+    );
+    let (tx_event, rx_event) = async_channel::unbounded();
+    let sender = manager.make_sender("server".to_string(), tx_event);
+    let native_ids = [
+        NumberOrString::Number(9_007_199_254_740_991),
+        NumberOrString::Number(9_007_199_254_740_992),
+        NumberOrString::Number(9_007_199_254_740_993),
+        NumberOrString::Number(-9_007_199_254_740_991),
+        NumberOrString::Number(-9_007_199_254_740_992),
+        NumberOrString::Number(-9_007_199_254_740_993),
+        NumberOrString::Number(i64::MIN),
+        NumberOrString::Number(i64::MAX),
+        NumberOrString::Number(42),
+        NumberOrString::String("42".into()),
+    ];
+    let mut pending = Vec::new();
+    let mut public_ids = HashSet::new();
+    for (index, native_id) in native_ids.into_iter().enumerate() {
+        let task = tokio::spawn(sender(
+            native_id,
+            codex_rmcp_client::Elicitation::Mcp(ElicitRequestParams::FormElicitationParams {
+                meta: None,
+                message: format!("request {index}"),
+                requested_schema: rmcp::model::ElicitationSchema::builder().build().unwrap(),
+            }),
+        ));
+        let event = rx_event.recv().await.expect("elicitation event");
+        // This is the event wire representation sent to clients, not the native
+        // MCP request ID. JSON string tokens remain exact in JavaScript too.
+        let wire = serde_json::to_string(&event).expect("serialize event");
+        let event: Event = serde_json::from_str(&wire).expect("deserialize event");
+        let EventMsg::ElicitationRequest(request) = event.msg else {
+            panic!("expected elicitation request");
+        };
+        let codex_protocol::mcp::RequestId::String(public_id) = request.id else {
+            panic!("native integer IDs must not cross the client JSON boundary");
+        };
+        assert!(
+            public_ids.insert(public_id.clone()),
+            "distinct pending requests need distinct public tokens"
+        );
+        pending.push((index, public_id, task));
+    }
+    // Reverse completion proves responses target each exact future rather than
+    // depending on source ID text, insertion order, or floating-point identity.
+    for (index, public_id, task) in pending.into_iter().rev() {
+        let response = ElicitationResponse {
+            action: ElicitationAction::Accept,
+            content: Some(serde_json::json!({"request": index})),
+            meta: None,
+        };
+        manager
+            .resolve(
+                "server".to_string(),
+                NumberOrString::String(public_id.into()),
+                response.clone(),
+            )
+            .await
+            .expect("resolve exact public token");
+        assert_eq!(
+            task.await.expect("request task").expect("request response"),
+            response
+        );
+    }
+}
+
 #[test]
 fn test_normalize_tools_short_non_duplicated_names() {
     let tools = vec![
@@ -1698,6 +1848,17 @@ fn codex_apps_env_bearer_token_bypasses_shared_tools_cache() {
     ));
 }
 
+#[test]
+fn literal_and_unknown_auth_headers_bypass_account_shared_tools_cache() {
+    let mut config = crate::codex_apps_mcp_server_config("https://chatgpt.com", None, None);
+    assert!(cache_transport_has_only_account_auth(&config));
+    for name in ["Authorization", "authorization", "X-Api-Key", "x-workspace-route"] {
+        let McpServerTransportConfig::StreamableHttp { http_headers, .. } = &mut config.transport else { panic!("HTTP fixture") };
+        *http_headers = Some(HashMap::from([(name.into(), "private-credential".into())]));
+        assert!(!cache_transport_has_only_account_auth(&config), "{name}");
+    }
+}
+
 #[tokio::test]
 async fn list_all_tools_uses_shared_codex_apps_cache_while_client_is_pending() {
     let codex_home = tempdir().expect("tempdir");
@@ -1735,6 +1896,7 @@ async fn list_all_tools_uses_shared_codex_apps_cache_while_client_is_pending() {
             cancel_token: CancellationToken::new(),
             approval_incarnation: AsyncManagedClient::next_approval_incarnation(),
             manager_owners: Arc::new(AtomicUsize::new(1)),
+            manager_lease: Arc::new(std::sync::Mutex::new(None)),
         },
     );
 
@@ -1777,6 +1939,7 @@ async fn list_available_server_infos_uses_cache_while_client_is_pending() {
             cancel_token: CancellationToken::new(),
             approval_incarnation: AsyncManagedClient::next_approval_incarnation(),
             manager_owners: Arc::new(AtomicUsize::new(1)),
+            manager_lease: Arc::new(std::sync::Mutex::new(None)),
         },
     );
 
@@ -1880,6 +2043,7 @@ async fn list_all_tools_skips_pending_clients_without_cached_tools() {
             cancel_token: CancellationToken::new(),
             approval_incarnation: AsyncManagedClient::next_approval_incarnation(),
             manager_owners: Arc::new(AtomicUsize::new(1)),
+            manager_lease: Arc::new(std::sync::Mutex::new(None)),
         },
     );
 
@@ -1927,6 +2091,7 @@ async fn shutdown_cancels_pending_startup_without_blocking_tool_listing() {
             cancel_token,
             approval_incarnation: AsyncManagedClient::next_approval_incarnation(),
             manager_owners: Arc::new(AtomicUsize::new(1)),
+            manager_lease: Arc::new(std::sync::Mutex::new(None)),
         },
     );
     let manager = Arc::new(manager);
@@ -1977,6 +2142,7 @@ async fn shutdown_continues_after_caller_is_aborted() {
             cancel_token: CancellationToken::new(),
             approval_incarnation: AsyncManagedClient::next_approval_incarnation(),
             manager_owners: Arc::new(AtomicUsize::new(1)),
+            manager_lease: Arc::new(std::sync::Mutex::new(None)),
         },
     );
     let manager = Arc::new(manager);
@@ -2033,6 +2199,7 @@ async fn list_all_tools_does_not_block_when_shared_codex_apps_cache_is_empty() {
             cancel_token: CancellationToken::new(),
             approval_incarnation: AsyncManagedClient::next_approval_incarnation(),
             manager_owners: Arc::new(AtomicUsize::new(1)),
+            manager_lease: Arc::new(std::sync::Mutex::new(None)),
         },
     );
 
@@ -2087,6 +2254,7 @@ async fn list_all_tools_uses_shared_codex_apps_cache_when_client_startup_fails()
             cancel_token: CancellationToken::new(),
             approval_incarnation: AsyncManagedClient::next_approval_incarnation(),
             manager_owners: Arc::new(AtomicUsize::new(1)),
+            manager_lease: Arc::new(std::sync::Mutex::new(None)),
         },
     );
 

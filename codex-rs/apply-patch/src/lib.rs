@@ -1,7 +1,7 @@
 #[cfg(test)]
 mod foreign_path_tests;
 #[cfg(test)]
-mod audit147_regressions;
+mod verified_patch_conflict_tests;
 #[cfg(test)]
 mod verified_rebase_regressions;
 mod invocation;
@@ -32,6 +32,7 @@ pub use parser::Hunk;
 pub use parser::ParseError;
 use parser::ParseError::*;
 pub use parser::UpdateFileChunk;
+pub use parser::UpdateLineKind;
 pub use parser::parse_patch;
 use serde::Serialize;
 use sha2::Digest;
@@ -629,7 +630,7 @@ async fn apply_hunks_with_verified_action(
             }
             ensure_rebased_updates_keep_their_sites(hunks, cwd, &previous_updates, &prepared, action)?;
         }
-        apply_hunks_to_files(hunks, cwd, fs, sandbox, &mut delta, prepared, &destinations, is_cancelled).await
+        apply_hunks_to_files(hunks, cwd, fs, sandbox, &mut delta, prepared, &destinations, is_cancelled, verified.is_some()).await
     }
     .await;
     match result {
@@ -820,6 +821,7 @@ async fn apply_hunks_to_files(
     mut prepared: Vec<Option<AppliedPatch>>,
     destinations: &HashMap<PathUri, Option<String>>,
     is_cancelled: &(dyn Fn() -> bool + Sync),
+    verified_sites: bool,
 ) -> anyhow::Result<()> {
     let previous_updates =
         invocation::validate_mutation_endpoints(hunks, cwd, fs, sandbox).await?;
@@ -854,6 +856,9 @@ async fn apply_hunks_to_files(
         if source == previous.original_contents {
             continue;
         }
+        anyhow::ensure!(!verified_sites,
+            "source changed after verified edit-site preparation; refusing to reselect an update in {}",
+            path.inferred_native_path_string());
         let Hunk::UpdateFile { chunks, .. } = hunk else {
             anyhow::bail!(
                 "source changed during patch preparation: {}",
@@ -1019,6 +1024,9 @@ async fn apply_hunks_to_files(
                 // This comparison read is the pre-write source check. Only a
                 // re-derived update needs another read to confirm its snapshot.
                 if fs.read_file_text(&path_uri, sandbox).await? != update.original_contents {
+                    anyhow::ensure!(!verified_sites,
+                        "source changed after verified edit-site preparation; refusing to reselect an update in {}",
+                        path_uri.inferred_native_path_string());
                     update = derive_new_contents_from_chunks(
                         &path_uri,
                         chunks,
@@ -1853,6 +1861,40 @@ fn compute_replacements(
         chunks, &std::cell::OnceCell::new())
 }
 
+fn chunk_edit_operations(chunk: &UpdateFileChunk, pattern: &[String]) -> Result<Vec<similar::DiffOp>, ApplyPatchError> {
+    use parser::UpdateLineKind;
+    if chunk.line_kinds.is_empty() {
+        return Ok(similar::capture_diff_slices(similar::Algorithm::RawMyers, pattern, &chunk.new_lines));
+    }
+    let (mut old, mut new) = (0, 0);
+    let mut group: Option<(usize, usize)> = None;
+    let mut operations = Vec::new();
+    for kind in chunk.line_kinds.iter().copied().chain(std::iter::once(UpdateLineKind::Context)) {
+        match kind {
+            UpdateLineKind::Context => {
+                if let Some((old_index, new_index)) = group.take() {
+                    let (old_len, new_len) = (old - old_index, new - new_index);
+                    if old > pattern.len() || new > chunk.new_lines.len() {
+                        return Err(ApplyPatchError::ComputeReplacements("invalid patch line provenance".into()));
+                    }
+                    operations.push(match (old_len, new_len) {
+                        (0, _) => similar::DiffOp::Insert { old_index, new_index, new_len },
+                        (_, 0) => similar::DiffOp::Delete { old_index, old_len, new_index },
+                        _ => similar::DiffOp::Replace { old_index, old_len, new_index, new_len },
+                    });
+                }
+                old += 1; new += 1;
+            }
+            UpdateLineKind::Add => { group.get_or_insert((old, new)); new += 1; }
+            UpdateLineKind::Remove => { group.get_or_insert((old, new)); old += 1; }
+        }
+    }
+    if old != chunk.old_lines.len() + 1 || new != chunk.new_lines.len() + 1 {
+        return Err(ApplyPatchError::ComputeReplacements("invalid patch line provenance".into()));
+    }
+    Ok(operations)
+}
+
 fn compute_replacements_with_hash(
     original_lines: &[String],
     original_contents: &str,
@@ -2346,9 +2388,7 @@ impl<'a> ChunkMatcher<'a> {
         } else {
             let start_idx = site.start;
             let new_slice: &[String] = &chunk.new_lines;
-            for operation in
-                similar::capture_diff_slices(similar::Algorithm::RawMyers, pattern, new_slice)
-            {
+            for operation in chunk_edit_operations(chunk, pattern)? {
                 // Context identifies the location; preserve its original bytes even
                 // when it matched only after whitespace or Unicode normalization.
                 if matches!(operation, similar::DiffOp::Equal { .. }) {
@@ -3680,6 +3720,7 @@ mod tests {
                             old_lines: vec![format!("source {i} λ")],
                             new_lines: vec![format!("replacement {i} 漢")],
                             is_end_of_file: false,
+                            line_kinds: Vec::new(),
                         })
                         .collect::<Vec<_>>();
                     SOURCE_GUARD_HASH_CALLS.with(|calls| calls.set(0));
@@ -3710,6 +3751,7 @@ mod tests {
             old_lines: vec!["first".into()],
             new_lines: vec!["changed".into()],
             is_end_of_file: false,
+            line_kinds: Vec::new(),
         };
         SOURCE_GUARD_HASH_CALLS.with(|calls| calls.set(0));
         assert_eq!(
@@ -3857,6 +3899,7 @@ mod tests {
                 old_lines: old,
                 new_lines: vec!["replacement".into()],
                 is_end_of_file: false,
+                line_kinds: Vec::new(),
             };
             let error =
                 compute_replacements(&lines, original, &path, "fixture.rs", Some(1), &[chunk])
@@ -4318,6 +4361,7 @@ mod tests {
                 old_lines: old.iter().map(ToString::to_string).collect(),
                 new_lines: new.iter().map(ToString::to_string).collect(),
                 is_end_of_file: false,
+                line_kinds: Vec::new(),
             };
             match new_contents_from_chunks(&path, original, &[chunk], Some(1)).unwrap_err() {
                 ApplyPatchError::PatchContextMismatch(mismatch) => mismatch,
@@ -4404,6 +4448,7 @@ mod tests {
             old_lines: expected,
             new_lines: vec![],
             is_end_of_file: false,
+            line_kinds: Vec::new(),
         };
         let (start, end, excerpt) =
             bounded_patch_mismatch_excerpt(&lines, &chunk).expect("located mismatch");
@@ -4734,6 +4779,7 @@ mod tests {
             old_lines: vec!["anchor".to_string(), "stale".to_string()],
             new_lines: vec!["anchor".to_string(), "new".to_string()],
             is_end_of_file: false,
+            line_kinds: Vec::new(),
         };
 
         assert_eq!(bounded_patch_mismatch_excerpt(&lines, &chunk), None);
@@ -4764,6 +4810,7 @@ mod tests {
             ],
             new_lines: vec![],
             is_end_of_file: false,
+            line_kinds: Vec::new(),
         };
 
         let (start, end, excerpt) =
@@ -4790,6 +4837,7 @@ mod tests {
                 old_lines: expected,
                 new_lines: vec![],
                 is_end_of_file: false,
+                line_kinds: Vec::new(),
             };
             let (start, end, excerpt) = bounded_patch_mismatch_excerpt(&lines, &chunk).unwrap();
             assert!(start <= changed + 1 && end > changed);
@@ -4808,12 +4856,14 @@ mod tests {
                 old_lines: vec!["fn target() {".into(), "missing();".into()],
                 new_lines: vec![],
                 is_end_of_file: false,
+                line_kinds: Vec::new(),
             },
             UpdateFileChunk {
                 change_context: Some("fn target() {".into()),
                 old_lines: vec!["missing();".into()],
                 new_lines: vec![],
                 is_end_of_file: false,
+                line_kinds: Vec::new(),
             },
         ] {
             let (_, _, excerpt) = bounded_patch_mismatch_excerpt(&lines, &chunk)
@@ -4833,6 +4883,7 @@ mod tests {
             old_lines: vec!["missing".to_string()],
             new_lines: vec![],
             is_end_of_file: false,
+            line_kinds: Vec::new(),
         };
         assert!(bounded_patch_mismatch_excerpt(&lines, &chunk).is_none());
         let error = patch_context_mismatch(
@@ -4880,6 +4931,7 @@ mod tests {
             old_lines: vec!["unique-anchor".to_string(), "stale-tail".to_string()],
             new_lines: vec!["unique-anchor".to_string(), "fixed-tail".to_string()],
             is_end_of_file: false,
+            line_kinds: Vec::new(),
         };
 
         let (start, end, excerpt) =

@@ -30,6 +30,19 @@ use codex_plugin::PluginId;
 use codex_plugin::PluginTelemetryMetadata;
 use codex_protocol::auth::AuthMode as DomainAuthMode;
 use codex_rmcp_client::perform_oauth_login_silent;
+use futures::StreamExt;
+
+const PLUGIN_OAUTH_DISCOVERY_CONCURRENCY: usize = 8;
+
+async fn join_plugin_listing_reads<L, R, E>(
+    local: impl std::future::Future<Output = Result<L, E>>,
+    remote: impl std::future::Future<Output = Result<R, E>>,
+) -> Result<(L, R), E> {
+    // A local failure remains prompt and authoritative. A remote error must
+    // wait for local success, but its I/O can run while local work is pending.
+    let (local, remote) = tokio::try_join!(local, async { Ok::<_, E>(remote.await) })?;
+    Ok((local, remote?))
+}
 
 #[derive(Clone)]
 pub(crate) struct PluginRequestProcessor {
@@ -175,6 +188,18 @@ fn share_context_for_source(
             }),
         MarketplacePluginSource::Git { .. } | MarketplacePluginSource::Npm { .. } => None,
     }
+}
+
+async fn load_share_context_for_source(
+    config: &Config,
+    source: &MarketplacePluginSource,
+) -> Result<Option<PluginShareContext>, JSONRPCErrorError> {
+    if !matches!(source, MarketplacePluginSource::Local { .. }) {
+        // Git/npm reads do not depend on the local-path mapping or its errors.
+        return Ok(None);
+    }
+    let mappings = load_shared_plugin_ids_by_local_path(config).await?;
+    Ok(share_context_for_source(source, &mappings))
 }
 
 fn convert_configured_marketplace_plugin_to_plugin_summary(
@@ -657,7 +682,8 @@ impl PluginRequestProcessor {
                 auth.as_ref(),
             )
             .await;
-        let (mut data, marketplace_load_errors) = if include_local {
+        let local = async {
+            let outcome = if include_local {
             let config_for_marketplace_listing = plugins_input.clone();
             let plugins_manager_for_marketplace_listing = plugins_manager.clone();
             let roots_for_marketplace_listing = roots.clone();
@@ -725,7 +751,11 @@ impl PluginRequestProcessor {
         } else {
             (Vec::new(), Vec::new())
         };
+            Ok::<_, JSONRPCErrorError>(outcome)
+        };
 
+        let remote = async {
+        let mut data = Vec::new();
         // TODO(remote plugins): Remove this once remote plugins are ready and vertical plugins are
         // served directly from the normal remote catalog.
         if include_vertical && !config.features.enabled(Feature::RemotePlugin) {
@@ -813,6 +843,12 @@ impl PluginRequestProcessor {
                 }
             }
         }
+        Ok::<_, JSONRPCErrorError>(data)
+        };
+        let ((mut data, marketplace_load_errors), remote_data) =
+            join_plugin_listing_reads(local, remote).await?;
+        data.extend(remote_data);
+
         if include_local
             || include_created_by_me_remote
             || include_shared_with_me
@@ -829,10 +865,14 @@ impl PluginRequestProcessor {
             );
         }
 
-        let featured_plugin_ids = if data.iter().any(|marketplace| {
+        let needs_featured_ids = data.iter().any(|marketplace| {
             marketplace.name == OPENAI_CURATED_MARKETPLACE_NAME
                 || marketplace.name == REMOTE_GLOBAL_MARKETPLACE_NAME
-        }) {
+        });
+        let featured = async {
+            if !needs_featured_ids {
+                return Vec::new();
+            }
             match plugins_manager
                 .featured_plugin_ids_for_config(&plugins_input, auth.as_ref())
                 .await
@@ -846,17 +886,16 @@ impl PluginRequestProcessor {
                     Vec::new()
                 }
             }
-        } else {
-            Vec::new()
         };
 
-        hydrate_remote_plugin_local_versions(
+        let versions = hydrate_remote_plugin_local_versions(
             config.codex_home.as_path(),
             data.iter_mut()
                 .flat_map(|marketplace| &mut marketplace.plugins)
                 .collect(),
-        )
-        .await?;
+        );
+        let (featured_plugin_ids, versions) = tokio::join!(featured, versions);
+        versions?;
         Ok(PluginListResponse {
             marketplaces: data,
             marketplace_load_errors,
@@ -1105,13 +1144,8 @@ impl PluginRequestProcessor {
                     .read_plugin_for_config(&plugins_input, &request)
                     .await
                     .map_err(|err| Self::marketplace_error(err, "read plugin details"))?;
-                let shared_plugin_ids_by_local_path =
-                    load_shared_plugin_ids_by_local_path(&config).await?;
-                let share_context = share_context_for_source(
-                    &outcome.plugin.source,
-                    &shared_plugin_ids_by_local_path,
-                );
-                let share_context = match share_context {
+                let share_context = load_share_context_for_source(&config, &outcome.plugin.source).await?;
+                let sharing = async { match share_context {
                     Some(context) => {
                         let remote_plugin_service_config = RemotePluginServiceConfig::new(
                             config.chatgpt_base_url.clone(),
@@ -1158,13 +1192,13 @@ impl PluginRequestProcessor {
                         }
                     }
                     None => None,
-                };
-                let app_summaries = load_plugin_app_summaries(
+                }};
+                let apps = load_plugin_app_summaries(
                     &config,
                     &outcome.plugin.apps,
                     &outcome.plugin.app_category_by_id,
-                )
-                .await;
+                );
+                let (share_context, app_summaries) = tokio::join!(sharing, apps);
                 let visible_skills = outcome
                     .plugin
                     .skills
@@ -1904,49 +1938,35 @@ impl PluginRequestProcessor {
             ),
         );
 
+        // Preserve diagnostics, but do not load response-only fallbacks when
+        // accessibility has already established that the result must be empty.
+        if let Err(err) = &all_connectors_result {
+            warn!(plugin = plugin_id, "failed to load app metadata after plugin install: {err:#}");
+        }
+        let accessible_connectors = match accessible_connectors_result {
+            Ok(status) if status.codex_apps_ready => status.connectors,
+            result => {
+                if let Err(err) = result {
+                    warn!(plugin = plugin_id, "failed to load accessible apps after plugin install: {err:#}");
+                }
+                warn!(plugin = plugin_id, "codex_apps MCP not ready after plugin install; skipping appsNeedingAuth check");
+                return Vec::new();
+            }
+        };
         let all_connectors = match all_connectors_result {
             Ok(connectors) => connectors,
-            Err(err) => {
-                warn!(
-                    plugin = plugin_id,
-                    "failed to load app metadata after plugin install: {err:#}"
-                );
+            Err(_) => {
                 connectors::list_cached_all_connectors(config, &[])
                     .await
                     .unwrap_or_default()
             }
         };
         let all_connectors = connectors::connectors_for_plugin_apps(all_connectors, plugin_apps);
-        let (accessible_connectors, codex_apps_ready) = match accessible_connectors_result {
-            Ok(status) => (status.connectors, status.codex_apps_ready),
-            Err(err) => {
-                warn!(
-                    plugin = plugin_id,
-                    "failed to load accessible apps after plugin install: {err:#}"
-                );
-                (
-                    connectors::list_cached_accessible_connectors_from_mcp_tools_with_mcp_manager(
-                        config,
-                        mcp_manager.as_ref(),
-                    )
-                    .await
-                    .unwrap_or_default(),
-                    false,
-                )
-            }
-        };
-        if !codex_apps_ready {
-            warn!(
-                plugin = plugin_id,
-                "codex_apps MCP not ready after plugin install; skipping appsNeedingAuth check"
-            );
-        }
-
         plugin_apps_needing_auth(
             &all_connectors,
             &accessible_connectors,
             plugin_apps,
-            codex_apps_ready,
+            true,
         )
     }
 
@@ -1955,8 +1975,15 @@ impl PluginRequestProcessor {
         config: &Config,
         plugin_mcp_servers: HashMap<String, McpServerConfig>,
     ) {
-        for (name, server) in plugin_mcp_servers {
-            let oauth_config = match oauth_login_support(&server.transport).await {
+        let discoveries = futures::stream::iter(plugin_mcp_servers)
+            .map(|(name, server)| async move {
+                let support = oauth_login_support(&server.transport).await;
+                (name, server, support)
+            })
+            .buffered(PLUGIN_OAUTH_DISCOVERY_CONCURRENCY);
+        tokio::pin!(discoveries);
+        while let Some((name, server, support)) = discoveries.next().await {
+            let oauth_config = match support {
                 McpOAuthLoginSupport::Supported(config) => config,
                 McpOAuthLoginSupport::Unsupported => continue,
                 McpOAuthLoginSupport::Unknown(err) => {
@@ -2223,13 +2250,19 @@ async fn load_plugin_app_summaries(
     };
 
     let plugin_connectors = connectors::connectors_for_plugin_apps(connectors, plugin_apps);
+    let app_category_by_id = app_category_by_id
+        .iter()
+        .filter_map(|(id, category)| {
+            codex_connectors::canonical_connector_id(id).map(|id| (id, category))
+        })
+        .collect::<HashMap<_, _>>();
 
     plugin_connectors
         .into_iter()
         .map(|connector| {
             let category = app_category_by_id
-                .get(&connector.id)
-                .cloned()
+                .get(connector.id.as_str())
+                .map(|category| (*category).clone())
                 .or_else(|| connector.category());
             AppSummary {
                 id: connector.id,
@@ -2245,7 +2278,10 @@ async fn load_plugin_app_summaries(
 fn plugin_app_category_by_id_from_value(value: &serde_json::Value) -> HashMap<String, String> {
     codex_core_plugins::loader::plugin_app_declarations_from_value(value)
         .into_iter()
-        .filter_map(|app| app.category.map(|category| (app.connector_id.0, category)))
+        .filter_map(|app| {
+            let id = codex_connectors::canonical_connector_id(&app.connector_id.0)?.to_string();
+            app.category.map(|category| (id, category))
+        })
         .collect()
 }
 
@@ -2261,18 +2297,19 @@ fn plugin_apps_needing_auth(
 
     let accessible_ids = accessible_connectors
         .iter()
-        .map(|connector| connector.id.as_str())
+        .filter_map(|connector| codex_connectors::canonical_connector_id(&connector.id))
         .collect::<HashSet<_>>();
     let plugin_app_ids = plugin_apps
         .iter()
-        .map(|connector_id| connector_id.0.as_str())
+        .filter_map(|connector_id| codex_connectors::canonical_connector_id(&connector_id.0))
         .collect::<HashSet<_>>();
 
     all_connectors
         .iter()
         .filter(|connector| {
-            plugin_app_ids.contains(connector.id.as_str())
-                && !accessible_ids.contains(connector.id.as_str())
+            codex_connectors::canonical_connector_id(&connector.id).is_some_and(|id| {
+                plugin_app_ids.contains(id) && !accessible_ids.contains(id)
+            })
         })
         .cloned()
         .map(|connector| {

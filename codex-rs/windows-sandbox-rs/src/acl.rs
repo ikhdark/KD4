@@ -261,7 +261,9 @@ unsafe fn path_mask_allows_with_scope(
     // keeps the DACL live through the mask check and is freed only afterward.
     unsafe {
         let (p_dacl, sd) = fetch_dacl_handle(path)?;
-        let has = dacl_mask_allows_with_scope(p_dacl, psids, desired_mask, require_all_bits, scope);
+        // A null DACL grants unrestricted access, unlike an empty DACL.
+        let has = p_dacl.is_null()
+            || dacl_mask_allows_with_scope(p_dacl, psids, desired_mask, require_all_bits, scope);
         if !sd.is_null() {
             LocalFree(sd as HLOCAL);
         }
@@ -337,6 +339,14 @@ unsafe fn dacl_has_write_deny_for_sid_with_coverage(
 }
 
 pub unsafe fn dacl_has_read_deny_for_sid(p_dacl: *mut ACL, psid: *mut c_void) -> bool {
+    dacl_has_read_deny_with_scope(p_dacl, psid, false)
+}
+
+pub(crate) unsafe fn dacl_has_any_read_deny_for_sid(p_dacl: *mut ACL, psid: *mut c_void) -> bool {
+    dacl_has_read_deny_with_scope(p_dacl, psid, true)
+}
+
+unsafe fn dacl_has_read_deny_with_scope(p_dacl: *mut ACL, psid: *mut c_void, include_inherit_only: bool) -> bool {
     if p_dacl.is_null() {
         return false;
     }
@@ -361,7 +371,7 @@ pub unsafe fn dacl_has_read_deny_for_sid(p_dacl: *mut ACL, psid: *mut c_void) ->
         if hdr.AceType != ACCESS_DENIED_ACE_TYPE {
             continue; // ACCESS_DENIED_ACE_TYPE
         }
-        if (hdr.AceFlags & INHERIT_ONLY_ACE) != 0 {
+        if !include_inherit_only && (hdr.AceFlags & INHERIT_ONLY_ACE) != 0 {
             continue;
         }
         let ace = &*(p_ace as *const ACCESS_DENIED_ACE);
@@ -717,14 +727,57 @@ impl DenyAceKind {
         }
     }
 
-    unsafe fn already_present(self, p_dacl: *mut ACL, psid: *mut c_void) -> bool {
-        match self {
-            Self::Read => dacl_has_read_deny_for_sid(p_dacl, psid),
-            // A partial write deny is useful diagnostic evidence, but does not
-            // establish the full boundary installed by add_deny_write_ace.
-            Self::Write => dacl_has_write_deny_for_sid_with_coverage(p_dacl, psid, true),
+    unsafe fn already_present(self, p_dacl: *mut ACL, psid: *mut c_void, recursive: bool) -> bool {
+        let required = match self {
+            Self::Read => FILE_GENERIC_READ,
+            Self::Write => FILE_GENERIC_WRITE | DELETE | FILE_DELETE_CHILD,
+        };
+        dacl_has_complete_deny(p_dacl, psid, required, recursive)
+    }
+}
+
+/// Check current-object and recursive descendant coverage independently. A
+/// directory-only ACE, or NO_PROPAGATE ACE, cannot establish a subtree boundary.
+unsafe fn dacl_has_complete_deny(
+    dacl: *mut ACL,
+    sid: *mut c_void,
+    required: u32,
+    recursive: bool,
+) -> bool {
+    if dacl.is_null() {
+        return false;
+    }
+    let mapping = GENERIC_MAPPING {
+        GenericRead: FILE_GENERIC_READ,
+        GenericWrite: FILE_GENERIC_WRITE,
+        GenericExecute: FILE_GENERIC_EXECUTE,
+        GenericAll: FILE_ALL_ACCESS,
+    };
+    let (mut current, mut files, mut directories) = (0, 0, 0);
+    for index in 0..u32::from((*dacl).AceCount) {
+        let mut entry = std::ptr::null_mut();
+        if GetAce(dacl, index, &mut entry) == 0 {
+            return false;
+        }
+        let ace = &*entry.cast::<ACCESS_DENIED_ACE>();
+        if ace.Header.AceType != ACCESS_DENIED_ACE_TYPE
+            || EqualSid(std::ptr::addr_of!(ace.SidStart).cast_mut().cast(), sid) == 0
+        {
+            continue;
+        }
+        let flags = ace.Header.AceFlags;
+        let mut mask = ace.Mask;
+        MapGenericMask(&mut mask, &mapping);
+        if flags & INHERIT_ONLY_ACE == 0 {
+            current |= mask;
+        }
+        if flags & 0x04 == 0 { // NO_PROPAGATE_INHERIT_ACE
+            if u32::from(flags) & OBJECT_INHERIT_ACE != 0 { files |= mask; }
+            if u32::from(flags) & CONTAINER_INHERIT_ACE != 0 { directories |= mask; }
         }
     }
+    current & required == required
+        && (!recursive || (files & required == required && directories & required == required))
 }
 
 unsafe fn set_deny_entries_in_acl(
@@ -778,7 +831,12 @@ unsafe fn add_deny_ace(path: &Path, psid: *mut c_void, kind: DenyAceKind) -> Res
             return Err(std::io::Error::from_raw_os_error(code as i32))
                 .with_context(|| format!("GetNamedSecurityInfoW failed for {}", path.display()));
         }
-        if kind.already_present(p_dacl, psid) {
+        if p_dacl.is_null() {
+            // SetEntriesInAcl(null, deny) would replace unrestricted host
+            // access with a deny-only ACL. Refuse admission without mutating it.
+            return Err(anyhow!("cannot safely install sandbox deny on null DACL: {}", path.display()));
+        }
+        if kind.already_present(p_dacl, psid, path.is_dir()) {
             return Ok(false);
         }
         let trustee = TRUSTEE_W {

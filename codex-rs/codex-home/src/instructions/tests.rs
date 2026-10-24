@@ -190,6 +190,62 @@ async fn failed_refresh_retains_last_success_until_recovery_or_removal() {
 }
 
 #[tokio::test]
+async fn removed_override_is_not_restored_when_default_read_fails() {
+    assert_unavailable_override_is_not_restored(None).await;
+}
+
+#[tokio::test]
+async fn empty_override_is_not_restored_when_default_read_fails() {
+    assert_unavailable_override_is_not_restored(Some(" \n\t")).await;
+}
+
+async fn assert_unavailable_override_is_not_restored(replacement: Option<&str>) {
+    let home = TempDir::new().expect("temp dir");
+    let provider = provider(&home);
+    let override_path = home.path().join(LOCAL_AGENTS_MD_FILENAME);
+    fs::write(&override_path, "old override").expect("write override");
+    assert!(
+        provider
+            .load_user_instructions()
+            .await
+            .instructions
+            .is_some()
+    );
+    if let Some(contents) = replacement {
+        fs::write(&override_path, contents).expect("empty override");
+    } else {
+        fs::remove_file(&override_path).expect("remove override");
+    }
+    create_symlink_loop(&home.path().join(DEFAULT_AGENTS_MD_FILENAME));
+    let refreshed = provider.load_user_instructions().await;
+    assert_eq!(refreshed.instructions, None);
+    assert_eq!(refreshed.warnings.len(), 1);
+    assert_eq!(
+        provider.clone().load_user_instructions().await,
+        LoadedUserInstructions::default()
+    );
+}
+
+#[tokio::test]
+async fn cancelled_refresh_releases_serialized_provider() {
+    let home = TempDir::new().expect("temp dir");
+    let provider = provider(&home);
+    fs::write(home.path().join(DEFAULT_AGENTS_MD_FILENAME), "current").expect("write default");
+    let held_state = provider.state.lock().await;
+    let clone = provider.clone();
+    let blocked = tokio::spawn(async move { clone.load_user_instructions().await });
+    tokio::task::yield_now().await;
+    assert!(!blocked.is_finished());
+    blocked.abort();
+    assert!(blocked.await.expect_err("cancelled refresh").is_cancelled());
+    drop(held_state);
+    assert_eq!(
+        provider.load_user_instructions().await,
+        expected(&home, DEFAULT_AGENTS_MD_FILENAME, "current", Vec::new())
+    );
+}
+
+#[tokio::test]
 async fn invalid_utf8_is_lossy() {
     let home = TempDir::new().expect("temp dir");
     let path = home.path().join(DEFAULT_AGENTS_MD_FILENAME);

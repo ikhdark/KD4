@@ -16,7 +16,6 @@ use codex_agent_task_store::CapabilityProfile;
 use codex_agent_task_store::CriterionStatus;
 use codex_agent_task_store::GateKind;
 use codex_agent_task_store::GateStatus;
-use codex_agent_task_store::ValidationCallStatus;
 use codex_otel::SessionTelemetry;
 use std::collections::BTreeMap;
 use std::time::Duration;
@@ -40,7 +39,6 @@ const SUBTREE_SCOPE_TAG: &str = "scope";
 const TASK_INFERENCE_CALLS_METRIC: &str = "codex.multi_agent.task.inference_calls";
 const TASK_CONCURRENCY_UTILIZATION_METRIC: &str =
     "codex.multi_agent.task.concurrency_utilization.basis_points";
-const TASK_FIRST_PASS_VALIDATION_METRIC: &str = "codex.multi_agent.task.first_pass_validation";
 const TASK_ACCEPTANCE_CLOSURE_METRIC: &str =
     "codex.multi_agent.task.acceptance_closure.basis_points";
 const TASK_DUPLICATE_WORK_METRIC: &str = "codex.multi_agent.task.duplicate_work";
@@ -56,7 +54,6 @@ const TASK_TERMINAL_STATE_METRIC: &str = "codex.multi_agent.task.terminal_state"
 const ROLE_TAG: &str = "role";
 const CAPABILITY_TAG: &str = "capability";
 const OUTCOME_TAG: &str = "outcome";
-const SUCCEEDED_TAG: &str = "succeeded";
 const PHASE_TAG: &str = "phase";
 const DISPOSITION_TAG: &str = "disposition";
 
@@ -319,7 +316,6 @@ pub(crate) struct TaskMetricInput {
     pub role_usage: Vec<RoleUsage>,
     #[cfg(test)]
     pub concurrency: Vec<ConcurrencySlice>,
-    pub first_pass_validation_succeeded: bool,
     pub acceptance_total: u32,
     pub acceptance_first_pass_closed: Option<u32>,
     pub acceptance_final_closed: u32,
@@ -343,7 +339,6 @@ pub(crate) struct TaskMetrics {
     pub total_usage: UsageTotals,
     pub usage_by_role: BTreeMap<RoleCapability, UsageTotals>,
     pub concurrency_utilization_basis_points: u16,
-    pub first_pass_validation_succeeded: bool,
     pub acceptance_total: u32,
     pub acceptance_first_pass_closed: Option<u32>,
     pub acceptance_final_closed: u32,
@@ -361,7 +356,6 @@ pub(crate) struct TaskMetrics {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct TaskMetricTerminalInput {
-    pub first_pass_validation_succeeded: bool,
     pub acceptance_total: u32,
     pub acceptance_first_pass_closed: Option<u32>,
     pub acceptance_final_closed: u32,
@@ -452,7 +446,6 @@ impl TaskMetrics {
                 active_time.as_nanos(),
                 capacity_time.as_nanos(),
             ),
-            first_pass_validation_succeeded: input.first_pass_validation_succeeded,
             acceptance_total: input.acceptance_total,
             acceptance_first_pass_closed: input.acceptance_first_pass_closed,
             acceptance_final_closed: input.acceptance_final_closed,
@@ -530,14 +523,6 @@ impl TaskMetrics {
             );
         }
 
-        session_telemetry.counter(
-            TASK_FIRST_PASS_VALIDATION_METRIC,
-            1,
-            &[(
-                SUCCEEDED_TAG,
-                bool_tag(self.first_pass_validation_succeeded),
-            )],
-        );
         if let Some(closure) = self.first_pass_acceptance_basis_points {
             session_telemetry.histogram(
                 TASK_ACCEPTANCE_CLOSURE_METRIC,
@@ -708,7 +693,6 @@ impl TaskMetricRecorder {
                 role_usage,
                 #[cfg(test)]
                 concurrency: Vec::new(),
-                first_pass_validation_succeeded: terminal.first_pass_validation_succeeded,
                 acceptance_total: terminal.acceptance_total,
                 acceptance_first_pass_closed: terminal.acceptance_first_pass_closed,
                 acceptance_final_closed: terminal.acceptance_final_closed,
@@ -963,31 +947,6 @@ fn terminal_input(task: &AgentTask) -> TaskMetricTerminalInput {
     // Earlier attempt criterion results are not present in this snapshot.
     let acceptance_first_pass_closed =
         (task.current_attempt.ordinal == 0).then_some(acceptance_final_closed);
-    let first_pass_validation_succeeded = task.current_attempt.ordinal == 0
-        && receipt.is_some_and(|receipt| {
-            receipt.status == AgentStatusClaim::Completed
-                && !receipt.validation_call_ids.is_empty()
-                && receipt.validation_call_ids.iter().all(|call_id| {
-                    task.validation_calls.iter().any(|call| {
-                        call.call_id == *call_id
-                            && call.status == ValidationCallStatus::Succeeded
-                            && call.evidence.end_epoch == Some(receipt.evidence_epoch)
-                            && call
-                                .evidence
-                                .validation_result
-                                .clone()
-                                .and_then(|value| {
-                                    serde_json::from_value::<
-                                        codex_protocol::validation::ValidationResult,
-                                    >(value)
-                                    .ok()
-                                })
-                                .is_some_and(|result| {
-                                    result.call_id == call.call_id && result.status.is_success()
-                                })
-                    })
-                })
-        });
 
     let mut reviewer_findings = FindingTotals::default();
     for gate in task
@@ -1043,7 +1002,6 @@ fn terminal_input(task: &AgentTask) -> TaskMetricTerminalInput {
     ));
 
     TaskMetricTerminalInput {
-        first_pass_validation_succeeded,
         acceptance_total,
         acceptance_first_pass_closed,
         acceptance_final_closed,

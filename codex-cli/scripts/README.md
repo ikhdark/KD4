@@ -8,7 +8,6 @@ example, to stage the CLI, responses proxy, and SDK packages for version `0.6.0`
   --release-version 0.6.0 \
   --workflow-url "https://github.com/ikhdark/KD4/actions/runs/$RUN_ID" \
   --package codex \
-  --package codex-responses-api-proxy \
   --package codex-sdk
 ```
 

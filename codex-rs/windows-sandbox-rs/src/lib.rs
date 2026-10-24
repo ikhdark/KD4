@@ -255,6 +255,9 @@ mod unified_exec;
 
 mod wrapper;
 
+#[cfg(test)]
+mod audit20261023_tests;
+
 pub(crate) use elevated::ipc_framed;
 
 pub(crate) use elevated::runner_client;
@@ -303,6 +306,7 @@ pub use deny_read_acl::plan_deny_read_acl_paths;
 pub use deny_read_resolver::resolve_windows_deny_read_paths;
 
 pub use deny_read_state::sync_persistent_deny_read_acls;
+pub use deny_read_state::sync_shared_principal_deny_read_acls;
 
 pub use desktop::LaunchDesktop;
 

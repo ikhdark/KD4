@@ -17,8 +17,8 @@ pub(super) const MISSING_TOOL_RESULT: &str = "Result unavailable. Execution outc
 const SYNTHETIC_OUTPUT_ID_NAMESPACE: Uuid = Uuid::from_u128(0x90d38d3e_6a5b_4d52_bfe2_2f1e634bfac4);
 
 #[cfg(test)]
-#[path = "assembly_audit_tests.rs"]
-mod assembly_audit_tests;
+#[path = "assembly_normalization_tests.rs"]
+mod assembly_normalization_tests;
 
 pub(crate) fn ensure_call_outputs_present(items: &mut Vec<ResponseItem>) {
     let missing_outputs_to_insert = collect_missing_call_outputs(items, true);
@@ -285,7 +285,7 @@ pub(crate) fn strip_images_when_unsupported(
                 }
             }
             ResponseItem::ImageGenerationCall { result, .. } => {
-                if !result.is_empty() {
+                if result.as_ref().is_some_and(|result| !result.is_empty()) {
                     image_omissions.push((
                         index,
                         ResponseItem::Message {
@@ -299,7 +299,7 @@ pub(crate) fn strip_images_when_unsupported(
                         },
                     ));
                 }
-                result.clear();
+                *result = None;
             }
             _ => {}
         }

@@ -17,7 +17,6 @@ pub use codex_tools::FunctionCallError;
 pub use codex_tools::JsonToolOutput;
 pub use codex_tools::NoopTurnItemEmitter;
 pub use codex_tools::ResponsesApiTool;
-pub use codex_tools::TaskAcceptance;
 pub use codex_tools::ToolCall;
 pub use codex_tools::ToolEnvironment;
 pub use codex_tools::ToolExecutor;

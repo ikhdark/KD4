@@ -243,6 +243,36 @@ fn retry_after_supports_delta_seconds_and_http_dates() {
     assert_eq!(parse_retry_after(&headers, now), Some(retry_at));
 }
 
+#[tokio::test]
+async fn failure_headers_survive_held_open_diagnostics() {
+    for (response, status, kind) in [
+        (&b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 500\r\n\r\n{\"remote_control_token\":\"secret"[..], StatusCode::UNAUTHORIZED, ErrorKind::PermissionDenied),
+        (&b"HTTP/1.1 404 Not Found\r\nContent-Length: 500\r\n\r\n{"[..], StatusCode::NOT_FOUND, ErrorKind::NotFound),
+        (&b"HTTP/1.1 429 Too Many Requests\r\nRetry-After: 120\r\nContent-Length: 500\r\n\r\n{"[..], StatusCode::TOO_MANY_REQUESTS, ErrorKind::Other),
+        (&b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 500\r\n\r\n{"[..], StatusCode::BAD_GATEWAY, ErrorKind::Other),
+    ] {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/refresh", listener.local_addr().unwrap());
+        let (done_tx, done_rx) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            stream.write_all(response).await.unwrap();
+            let _ = done_rx.await;
+        });
+        let client = create_client_without_request_logging().unwrap();
+        let err = tokio::time::timeout(Duration::from_secs(2), send_remote_control_server_request::<_, serde_json::Value>(
+            &client, &url, &auth(), "installation", &json!({}), "refresh", "server refresh", Duration::from_secs(30),
+        )).await.expect("diagnostics must not consume request budget").unwrap_err();
+        assert_eq!(err.kind(), kind);
+        let metadata = remote_control_server_request_error(&err).unwrap();
+        assert_eq!(metadata.status, Some(status));
+        assert_eq!(metadata.retry_at.is_some(), status == StatusCode::TOO_MANY_REQUESTS);
+        assert!(!err.to_string().contains("secret"));
+        let _ = done_tx.send(());
+        server.await.unwrap();
+    }
+}
+
 #[test]
 fn invalid_or_expired_retry_after_uses_bounded_fallback() {
     let now =
@@ -262,8 +292,7 @@ fn invalid_or_expired_retry_after_uses_bounded_fallback() {
     );
     assert_eq!(parse_retry_after(&headers, now), None);
 
-    let expired_while_reading_body = Some(now + time::Duration::seconds(1));
-    for retry_at in [None, expired_while_reading_body] {
+    for retry_at in [None] {
         let deferred_at = now + time::Duration::seconds(2);
         let (delay, next_refresh_at) = refresh_deferral(retry_at, deferred_at);
         assert!(
@@ -276,6 +305,16 @@ fn invalid_or_expired_retry_after_uses_bounded_fallback() {
             deferred_at + time::Duration::seconds(delay.as_secs() as i64)
         );
     }
+}
+
+#[test]
+fn retry_after_consumed_during_body_does_not_restart_cooldown() {
+    let received_at = OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap();
+    let retry_at = received_at + time::Duration::seconds(1);
+    assert_eq!(
+        refresh_deferral(Some(retry_at), received_at + time::Duration::seconds(2)),
+        (Duration::ZERO, retry_at)
+    );
 }
 
 #[test]

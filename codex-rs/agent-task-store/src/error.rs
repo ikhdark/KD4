@@ -2,7 +2,6 @@ use crate::AdmissionRejectionReason;
 use crate::AssignmentId;
 use crate::AttemptId;
 use crate::DependencyBlocker;
-use crate::MissingEvidenceObligation;
 
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
@@ -48,6 +47,8 @@ pub enum StoreError {
     GateWaiverRequired { gate: String },
     #[error("gate {gate} cannot be waived")]
     GateNotWaivable { gate: String },
+    #[error("gate {gate} has no pending gate to waive")]
+    GateNotPending { gate: String },
     #[error("gate {gate} is already sealed")]
     GateAlreadySealed { gate: String },
     #[error("receipt criterion results do not match the assignment: {0}")]
@@ -58,10 +59,6 @@ pub enum StoreError {
     ValidationCallImmutable(String),
     #[error("receipt references validation calls with incompatible status: {call_ids:?}")]
     ValidationCallStatusInvalid { call_ids: Vec<String> },
-    #[error("completed receipt is missing required evidence: {obligations:?}")]
-    RequiredEvidenceMissing {
-        obligations: Vec<MissingEvidenceObligation>,
-    },
     #[error("observation limit must be between 0 and 100, got {0}")]
     InvalidObservationLimit(usize),
     #[error("wake watermark {0} does not belong to this root session")]

@@ -6,6 +6,44 @@ use wiremock::ResponseTemplate;
 use wiremock::matchers::method;
 use wiremock::matchers::path;
 
+#[tokio::test]
+async fn workspace_dot_segments_are_rejected_without_network_work() {
+    let (_home, mut config, _) = workspace_config().await;
+    let server = MockServer::start().await;
+    config.chatgpt_base_url = server.uri();
+    for id in [".", ".."] {
+        let auth = CodexAuth::from_external_chatgpt_tokens("e30.e30.signature", id, Some("enterprise")).unwrap();
+        assert!(codex_plugins_enabled_for_workspace(&config, Some(&auth), None).await.is_err());
+        assert!(codex_plugins_enabled_for_workspace_or_default(&config, Some(&auth), None).await);
+    }
+    assert!(server.received_requests().await.unwrap().is_empty());
+}
+
+#[test]
+fn active_refresh_outcomes_are_key_scoped_bounded_and_cancellation_safe() {
+    let cache = WorkspaceSettingsCache::default();
+    let key = |id: &str| WorkspaceSettingsCacheKey { chatgpt_base_url: "https://example.test".into(), account_id: id.into() };
+    let a = cache.active_refresh(&key("a")).unwrap();
+    let a_waiter = cache.active_refresh(&key("a")).unwrap();
+    let b = cache.active_refresh(&key("b")).unwrap();
+    *a.try_lock().unwrap() = Some(Err("a failed".into()));
+    *b.try_lock().unwrap() = Some(Ok(false));
+    assert_eq!(a_waiter.try_lock().unwrap().as_ref(), Some(&Err("a failed".into())));
+    drop(a);
+    drop(a_waiter);
+    assert!(cache.active_refresh(&key("a")).unwrap().try_lock().unwrap().is_none());
+    // An abandoned fetch leaves None and releases its async mutex for a waiter.
+    let cancelled = cache.active_refresh(&key("cancelled")).unwrap();
+    let waiter = cache.active_refresh(&key("cancelled")).unwrap();
+    drop(cancelled.try_lock().unwrap());
+    drop(cancelled);
+    assert!(waiter.try_lock().unwrap().is_none());
+    let retained: Vec<_> = (0..MAX_ACTIVE_REFRESH_KEYS).filter_map(|i| cache.active_refresh(&key(&i.to_string()))).collect();
+    assert!(cache.active_refresh(&key("overflow")).is_none());
+    drop(retained);
+    assert!(cache.active_refresh(&key("overflow")).is_some());
+}
+
 async fn workspace_config() -> (tempfile::TempDir, Config, CodexAuth) {
     let home = tempfile::tempdir().expect("Codex home");
     let config = ConfigBuilder::default()
@@ -78,6 +116,33 @@ async fn concurrent_waiters_share_a_failed_refresh_but_later_calls_retry() {
             .is_err()
     );
     server.verify().await;
+}
+
+#[tokio::test]
+async fn interleaved_workspace_keys_do_not_erase_waiting_callers_failures() {
+    for b_status in [200, 503] {
+        let (_home, mut config, a) = workspace_config().await;
+        let b = CodexAuth::from_external_chatgpt_tokens("e30.e30.signature", "account-b", Some("enterprise")).unwrap();
+        let server = MockServer::start().await;
+        config.chatgpt_base_url = server.uri();
+        Mock::given(path("/accounts/account-a/settings"))
+            .respond_with(ResponseTemplate::new(503).set_delay(Duration::from_millis(50)))
+            .expect(2).mount(&server).await;
+        Mock::given(path("/accounts/account-b/settings"))
+            .respond_with(ResponseTemplate::new(b_status).set_body_json(serde_json::json!({"beta_settings": {}})))
+            .expect(1).mount(&server).await;
+        let cache = WorkspaceSettingsCache::default();
+        let (a1, _, a2) = tokio::join!(
+            codex_plugins_enabled_for_workspace(&config, Some(&a), Some(&cache)),
+            codex_plugins_enabled_for_workspace(&config, Some(&b), Some(&cache)),
+            codex_plugins_enabled_for_workspace(&config, Some(&a), Some(&cache)),
+        );
+        assert_eq!(a1.unwrap_err().to_string(), a2.unwrap_err().to_string());
+        assert_eq!(server.received_requests().await.unwrap().iter()
+            .filter(|request| request.url.path() == "/accounts/account-a/settings").count(), 1);
+        assert!(codex_plugins_enabled_for_workspace(&config, Some(&a), Some(&cache)).await.is_err());
+        server.verify().await;
+    }
 }
 
 #[tokio::test]

@@ -183,7 +183,10 @@ impl ProjectRequestProcessor {
         params: ProjectUpdateParams,
     ) -> Result<Option<ClientResponsePayload>, JSONRPCErrorError> {
         let name = params.name.map(validate_name).transpose()?;
-        let roots = params.roots.map(validate_roots).transpose()?;
+        let roots = match params.roots {
+            Some(roots) => Some(validate_roots_off_thread(roots).await?),
+            None => None,
+        };
         let updated = self
             .thread_store
             .update_project(StoreUpdateProjectParams {
@@ -260,11 +263,13 @@ impl ProjectRequestProcessor {
     ) -> Result<(Project, bool, Vec<String>), JSONRPCErrorError> {
         let idempotency_key = validate_idempotency_key(idempotency_key)?;
         let thread_ids = validate_thread_ids(thread_ids)?;
+        let name = validate_name(name)?;
+        let roots = validate_roots_off_thread(roots).await?;
         let created = self
             .thread_store
             .create_project(StoreCreateProjectParams {
-                name: validate_name(name)?,
-                roots: validate_roots(roots)?,
+                name,
+                roots,
                 metadata: metadata.unwrap_or_default(),
                 thread_ids: thread_ids.clone(),
                 idempotency_key,
@@ -360,6 +365,17 @@ fn validate_roots(roots: Vec<ProjectRoot>) -> Result<Vec<StoredProjectRoot>, JSO
         .collect()
 }
 
+async fn validate_roots_off_thread(
+    roots: Vec<ProjectRoot>,
+) -> Result<Vec<StoredProjectRoot>, JSONRPCErrorError> {
+    if roots.is_empty() {
+        return Ok(Vec::new());
+    }
+    tokio::task::spawn_blocking(move || validate_roots(roots))
+        .await
+        .map_err(|error| internal_error(format!("project root validation worker failed: {error}")))?
+}
+
 fn validate_thread_ids(thread_ids: Vec<String>) -> Result<Vec<String>, JSONRPCErrorError> {
     let mut seen = HashSet::new();
     for thread_id in &thread_ids {
@@ -408,5 +424,22 @@ fn project_store_error(operation: &'static str, error: ThreadStoreError) -> JSON
             invalid_params(message)
         }
         error => internal_error(format!("failed to run {operation}: {error}")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn off_thread_roots_preserve_order_duplicates_and_nonexistent_paths() {
+        let home = tempfile::tempdir().unwrap();
+        let root = |name: &str| ProjectRoot {
+            path: codex_utils_absolute_path::AbsolutePathBuf::from_absolute_path(home.path().join(name)).unwrap(),
+        };
+        let roots = validate_roots_off_thread(vec![root("missing-b"), root("missing-a")]).await.unwrap();
+        assert_eq!(roots.iter().map(|root| root.path.clone()).collect::<Vec<_>>(), vec![home.path().join("missing-b").display().to_string(), home.path().join("missing-a").display().to_string()]);
+        assert!(validate_roots_off_thread(vec![root("same"), root("same")]).await.unwrap_err().message.contains("duplicate project root"));
+        assert!(validate_roots_off_thread(Vec::new()).await.unwrap().is_empty());
     }
 }

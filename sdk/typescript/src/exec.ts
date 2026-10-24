@@ -345,6 +345,8 @@ export class CodexExec {
 
 class StderrTail {
   private bytes = Buffer.alloc(0);
+  private start = 0;
+  private length = 0;
   private truncated = false;
 
   append(data: unknown): void {
@@ -357,30 +359,49 @@ class StderrTail {
     if (chunk.length === 0) {
       return;
     }
+    if (this.bytes.length === 0) {
+      this.bytes = Buffer.allocUnsafe(STDERR_TAIL_MAX_BYTES);
+    }
 
     if (chunk.length >= STDERR_TAIL_MAX_BYTES) {
-      this.truncated ||= this.bytes.length > 0 || chunk.length > STDERR_TAIL_MAX_BYTES;
-      this.bytes = Buffer.from(chunk.subarray(chunk.length - STDERR_TAIL_MAX_BYTES));
+      this.truncated ||= this.length > 0 || chunk.length > STDERR_TAIL_MAX_BYTES;
+      chunk.copy(this.bytes, 0, chunk.length - STDERR_TAIL_MAX_BYTES);
+      this.start = 0;
+      this.length = STDERR_TAIL_MAX_BYTES;
       return;
     }
 
-    const overflow = this.bytes.length + chunk.length - STDERR_TAIL_MAX_BYTES;
+    const end = (this.start + this.length) % STDERR_TAIL_MAX_BYTES;
+    const firstLength = Math.min(chunk.length, STDERR_TAIL_MAX_BYTES - end);
+    chunk.copy(this.bytes, end, 0, firstLength);
+    if (firstLength < chunk.length) {
+      chunk.copy(this.bytes, 0, firstLength);
+    }
+
+    const overflow = this.length + chunk.length - STDERR_TAIL_MAX_BYTES;
     if (overflow > 0) {
       this.truncated = true;
-      this.bytes = Buffer.concat([this.bytes.subarray(overflow), chunk], STDERR_TAIL_MAX_BYTES);
-    } else {
-      this.bytes = Buffer.concat([this.bytes, chunk]);
+      this.start = (this.start + overflow) % STDERR_TAIL_MAX_BYTES;
     }
+    this.length = Math.min(this.length + chunk.length, STDERR_TAIL_MAX_BYTES);
   }
 
   render(): string {
+    const end = this.start + this.length;
+    const bytes =
+      end <= STDERR_TAIL_MAX_BYTES
+        ? this.bytes.subarray(this.start, end)
+        : Buffer.concat(
+            [this.bytes.subarray(this.start), this.bytes.subarray(0, end - STDERR_TAIL_MAX_BYTES)],
+            this.length,
+          );
     let start = 0;
     if (this.truncated) {
-      while (start < Math.min(3, this.bytes.length) && (this.bytes[start]! & 0xc0) === 0x80) {
+      while (start < Math.min(3, bytes.length) && (bytes[start]! & 0xc0) === 0x80) {
         start += 1;
       }
     }
-    const text = this.bytes.subarray(start).toString("utf8");
+    const text = bytes.subarray(start).toString("utf8");
     return this.truncated ? STDERR_TRUNCATION_MARKER + text : text;
   }
 }

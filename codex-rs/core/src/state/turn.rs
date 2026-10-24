@@ -296,11 +296,31 @@ impl TurnTerminalCoordinator {
     }
 
     pub(crate) fn try_claim(self: &Arc<Self>) -> Option<TurnTerminalPermit> {
+        self.try_claim_with_worker_state(false)
+    }
+
+    /// A stopped worker cannot finish a still-pending interrupt persistence
+    /// barrier. Resolve that abandoned barrier as failed while atomically
+    /// claiming finalization, without changing an established durable result.
+    pub(crate) fn try_claim_after_worker_finished(self: &Arc<Self>) -> Option<TurnTerminalPermit> {
+        self.try_claim_with_worker_state(true)
+    }
+
+    fn try_claim_with_worker_state(
+        self: &Arc<Self>,
+        worker_finished: bool,
+    ) -> Option<TurnTerminalPermit> {
         let _decision = self
             .terminal_decision_gate
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let interrupt_fence = self.interrupt_fence_state();
+        let mut interrupt_fence = self.interrupt_fence_state();
+        if worker_finished && interrupt_fence == InterruptFenceState::PendingPersistence {
+            interrupt_fence = InterruptFenceState::PersistenceFailed;
+            self.interrupt_fence_state
+                .store(interrupt_fence as u8, Ordering::Release);
+            self.interrupt_resolution_notify.notify_waiters();
+        }
         if interrupt_fence.is_fenced() && !interrupt_fence.terminal_ready() {
             return None;
         }

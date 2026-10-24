@@ -391,7 +391,6 @@ pub(crate) fn spawn_exit_watcher(
     source: ToolCallSource,
     tracker: Option<SharedTurnDiffTracker>,
     tool_dispatch_timing: Option<Arc<ToolDispatchTiming>>,
-    network_approval: Option<crate::tools::network_approval::DeferredNetworkApproval>,
     tty: bool,
     classified_search: bool,
     validation_started_at: Option<Instant>,
@@ -444,15 +443,6 @@ pub(crate) fn spawn_exit_watcher(
             turn_ref
                 .turn_timing_state
                 .record_background_tool_process_exit(&call_id, timing.snapshot(exit_observed_at));
-        }
-        if let Err(message) =
-            super::process_manager::finish_deferred_network_approval_after_process_exit_for_session(
-                Some(&session_ref),
-                network_approval,
-            )
-            .await
-        {
-            let _ = process.fail_and_terminate(message).await;
         }
         let failure_message = process.failure_message();
         let exit_code = process.exit_code();

@@ -23,7 +23,6 @@ clap = { workspace = true, features = ["derive", "env"] }
 clap_complete = { workspace = true }
 codex-app-server = { workspace = true }
 codex-app-server-protocol = { workspace = true }
-codex-app-server-test-client = { workspace = true }
 codex-arg0 = { workspace = true }
 codex-api = { workspace = true }
 codex-chatgpt = { workspace = true }
@@ -46,10 +45,8 @@ codex-models-manager = { workspace = true }
 codex-plugin = { workspace = true }
 codex-process-hardening = { workspace = true }
 codex-protocol = { workspace = true }
-codex-responses-api-proxy = { workspace = true }
 codex-rmcp-client = { workspace = true }
 codex-rollout = { workspace = true }
-codex-rollout-trace = { workspace = true }
 codex-state = { workspace = true }
 codex-stdio-to-uds = { workspace = true }
 codex-terminal-detection = { workspace = true }

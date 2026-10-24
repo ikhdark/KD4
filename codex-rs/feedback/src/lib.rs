@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::collections::VecDeque;
 use std::collections::btree_map::Entry;
@@ -397,6 +398,33 @@ pub struct FeedbackAttachment {
     pub buffer: Vec<u8>,
 }
 
+struct FeedbackUploadAttachment<'a> {
+    buffer: Cow<'a, [u8]>,
+    filename: Cow<'a, str>,
+    content_type: Option<Cow<'a, str>>,
+}
+
+impl FeedbackUploadAttachment<'_> {
+    fn to_writer(&self, mut writer: impl Write) -> io::Result<()> {
+        use sentry::protocol::Value;
+
+        // Match Sentry's attachment headers without requiring an owned payload copy.
+        writeln!(
+            writer,
+            r#"{{"type":"attachment","length":{},"filename":{},"attachment_type":"event.attachment","content_type":{}}}"#,
+            self.buffer.len(),
+            Value::from(self.filename.as_ref()),
+            Value::from(
+                self.content_type
+                    .as_deref()
+                    .unwrap_or("application/octet-stream")
+            ),
+        )?;
+        writer.write_all(self.buffer.as_ref())?;
+        writeln!(writer)
+    }
+}
+
 /// Inputs that control one feedback upload to Sentry.
 ///
 /// The caller is responsible for applying any user-consent gate before setting
@@ -520,7 +548,7 @@ impl FeedbackSnapshot {
                 ..Default::default()
             }]);
         }
-        let (attachments, omitted) = self.feedback_attachments(
+        let (attachments, omitted) = self.feedback_attachment_payloads(
             options.include_logs,
             options.extra_attachments,
             options.extra_attachment_paths,
@@ -534,15 +562,20 @@ impl FeedbackSnapshot {
         }
         envelope.add_item(EnvelopeItem::Event(Box::new(event)));
 
-        let mut body_capacity = ENVELOPE_OVERHEAD_BYTES;
-        for attachment in attachments {
-            body_capacity += attachment.buffer.len();
-            envelope.add_item(EnvelopeItem::Attachment(attachment));
-        }
+        let body_capacity = ENVELOPE_OVERHEAD_BYTES
+            + attachments
+                .iter()
+                .map(|attachment| attachment.buffer.len())
+                .sum::<usize>();
         let mut body = Vec::with_capacity(body_capacity);
         envelope
             .to_writer(&mut body)
             .map_err(|err| anyhow!("failed to encode feedback envelope: {err}"))?;
+        for attachment in attachments {
+            attachment
+                .to_writer(&mut body)
+                .map_err(|err| anyhow!("failed to encode feedback envelope: {err}"))?;
+        }
         Ok(body)
     }
 
@@ -595,7 +628,7 @@ impl FeedbackSnapshot {
         tags
     }
 
-    /// Returns the attachments to upload and a description of each one that was skipped.
+    #[cfg(test)]
     fn feedback_attachments(
         &self,
         include_logs: bool,
@@ -603,7 +636,32 @@ impl FeedbackSnapshot {
         extra_attachment_paths: &[FeedbackAttachmentPath],
         logs_override: Option<Vec<u8>>,
     ) -> (Vec<sentry::protocol::Attachment>, Vec<String>) {
-        use sentry::protocol::Attachment;
+        let (attachments, omitted) = self.feedback_attachment_payloads(
+            include_logs,
+            extra_attachments,
+            extra_attachment_paths,
+            logs_override,
+        );
+        let attachments = attachments
+            .into_iter()
+            .map(|attachment| sentry::protocol::Attachment {
+                buffer: attachment.buffer.into_owned(),
+                filename: attachment.filename.into_owned(),
+                content_type: attachment.content_type.map(Cow::into_owned),
+                ty: None,
+            })
+            .collect();
+        (attachments, omitted)
+    }
+
+    /// Borrows captured payloads and owns newly read ones, in upload order.
+    fn feedback_attachment_payloads<'a>(
+        &'a self,
+        include_logs: bool,
+        extra_attachments: &'a [FeedbackAttachment],
+        extra_attachment_paths: &[FeedbackAttachmentPath],
+        logs_override: Option<Vec<u8>>,
+    ) -> (Vec<FeedbackUploadAttachment<'a>>, Vec<String>) {
 
         let mut attachments = Vec::new();
         let mut omitted = Vec::new();
@@ -613,11 +671,13 @@ impl FeedbackSnapshot {
             let logs = logs_override.as_deref().unwrap_or(&self.bytes);
             if reserve_attachment_bytes("codex-logs.log", logs.len(), &mut remaining, &mut omitted)
             {
-                attachments.push(Attachment {
-                    buffer: logs_override.unwrap_or_else(|| self.bytes.clone()),
-                    filename: String::from("codex-logs.log"),
-                    content_type: Some("text/plain".to_string()),
-                    ty: None,
+                attachments.push(FeedbackUploadAttachment {
+                    buffer: logs_override.map_or_else(
+                        || Cow::Borrowed(self.bytes.as_slice()),
+                        Cow::Owned,
+                    ),
+                    filename: Cow::Borrowed("codex-logs.log"),
+                    content_type: Some(Cow::Borrowed("text/plain")),
                 });
             }
         }
@@ -633,11 +693,10 @@ impl FeedbackSnapshot {
                         &mut omitted,
                     )
                 })
-                .map(|attachment| Attachment {
-                    buffer: attachment.buffer.clone(),
-                    filename: attachment.filename.clone(),
-                    content_type: attachment.content_type.clone(),
-                    ty: None,
+                .map(|attachment| FeedbackUploadAttachment {
+                    buffer: Cow::Borrowed(attachment.buffer.as_slice()),
+                    filename: Cow::Borrowed(attachment.filename.as_str()),
+                    content_type: attachment.content_type.as_deref().map(Cow::Borrowed),
                 }),
         );
 
@@ -649,11 +708,10 @@ impl FeedbackSnapshot {
                 &mut omitted,
             )
         {
-            attachments.push(Attachment {
-                buffer: text.into_bytes(),
-                filename: FEEDBACK_DIAGNOSTICS_ATTACHMENT_FILENAME.to_string(),
-                content_type: Some("text/plain".to_string()),
-                ty: None,
+            attachments.push(FeedbackUploadAttachment {
+                buffer: Cow::Owned(text.into_bytes()),
+                filename: Cow::Borrowed(FEEDBACK_DIAGNOSTICS_ATTACHMENT_FILENAME),
+                content_type: Some(Cow::Borrowed("text/plain")),
             });
         }
 
@@ -713,11 +771,10 @@ impl FeedbackSnapshot {
                     .essence_str()
                     .to_string(),
             };
-            attachments.push(Attachment {
-                buffer: data,
-                filename,
-                content_type: Some(content_type),
-                ty: None,
+            attachments.push(FeedbackUploadAttachment {
+                buffer: Cow::Owned(data),
+                filename: Cow::Owned(filename),
+                content_type: Some(Cow::Owned(content_type)),
             });
         }
 

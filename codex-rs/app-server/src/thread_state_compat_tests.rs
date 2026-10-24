@@ -47,7 +47,7 @@ fn live_and_seeded_rollback_remove_user_work_and_all_trailing_maintenance() {
         );
         assert_ne!(state.turn_index_history_generation(), previous_generation);
         let page = state
-            .indexed_turns_page(None, 10, SortDirection::Asc)
+            .indexed_turns_page(None, 10, SortDirection::Asc, TurnItemsView::Full)
             .unwrap()
             .unwrap();
         assert_eq!(
@@ -59,7 +59,7 @@ fn live_and_seeded_rollback_remove_user_work_and_all_trailing_maintenance() {
         );
         assert!(
             state
-                .indexed_turns_page(Some(("user-2", false)), 10, SortDirection::Asc)
+                .indexed_turns_page(Some(("user-2", false)), 10, SortDirection::Asc, TurnItemsView::Full)
                 .is_err()
         );
     }
@@ -101,7 +101,7 @@ fn live_raw_input_uses_envelope_ownership_without_rendering_or_resurrecting_item
         &EventMsg::ThreadRolledBack(ThreadRolledBackEvent { num_turns: 1 }),
     );
     let page = state
-        .indexed_turns_page(None, 10, SortDirection::Asc)
+        .indexed_turns_page(None, 10, SortDirection::Asc, TurnItemsView::Full)
         .unwrap()
         .unwrap();
     assert_eq!(

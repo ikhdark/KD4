@@ -135,6 +135,7 @@ async fn handle_get_agent_task(
         session,
         step_context,
         payload,
+        call_id,
         ..
     } = invocation;
     let turn = Arc::clone(&step_context.turn);
@@ -170,7 +171,8 @@ async fn handle_get_agent_task(
                 .await
                 .map_err(|error| task_store_error(GET_AGENT_TASK_TOOL, error))?
         };
-        let current = caller.current_attempt.attempt_id == binding.attempt_id;
+        let current = caller.current_attempt.attempt_id == binding.attempt_id
+            && caller.assignment.root_session_id == binding.root_session_id;
         let immediate_child = matches!(task.assignment.admission_origin,
             AssignmentAdmissionOrigin::LegacyMessage { parent_assignment_id: Some(parent) }
             if parent == binding.assignment_id)
@@ -182,21 +184,72 @@ async fn handle_get_agent_task(
             )));
         }
     }
-    let cold_review_context = if caller_binding
+    let (cold_review_context, receipt_handoffs) = if caller_binding
         .as_ref()
         .is_some_and(|binding| binding.assignment_id == assignment_id)
     {
         build_evaluation_context(session.as_ref(), turn.config.cwd.as_path(), &task).await?
     } else {
-        None
+        (None, Vec::new())
     };
+    if let Some(binding) = &caller_binding
+        && !receipt_handoffs.is_empty()
+    {
+        // Handoff acquisition can span several reads. Do not publish it for a
+        // turn whose assignment was rebound to a correction in the meantime.
+        let store = coordinator.store().ok_or_else(|| {
+            FunctionCallError::RespondToModel(format!(
+                "{GET_AGENT_TASK_TOOL}: the typed task store is unavailable"
+            ))
+        })?;
+        let authorization = store
+            .get_agent_task_authorization(binding.assignment_id)
+            .await
+            .map_err(|error| task_store_error(GET_AGENT_TASK_TOOL, error))?;
+        if authorization.root_session_id != binding.root_session_id
+            || authorization.current_attempt.attempt_id != binding.attempt_id
+        {
+            return Err(FunctionCallError::RespondToModel(format!(
+                "{GET_AGENT_TASK_TOOL}: receipt handoff requires the caller's current bound attempt"
+            )));
+        }
+    }
     coordinator
-        .maybe_emit_terminal_metrics(assignment_id, &turn.session_telemetry)
-        .await;
-    Ok(boxed_tool_output(GetAgentTaskResult {
+        .emit_terminal_metrics_from_snapshot(&task, &turn.session_telemetry);
+    let mut result = GetAgentTaskResult {
         task,
         cold_review_context,
-    }))
+        receipt_handoffs,
+        handoff_recovery: None,
+    };
+    if !result.receipt_handoffs.is_empty() {
+        let full = serde_json::to_value(&result).map_err(|error| {
+            FunctionCallError::RespondToModel(format!("{GET_AGENT_TASK_TOOL}: cannot serialize evidence handoff: {error}"))
+        })?;
+        let canonical = codex_tools::CanonicalToolResult::json(full);
+        // Optional evidence uses the ordinary snapshot owner. Requiring generic
+        // canonical delivery would oblige Code Mode to read the entire handoff.
+        let artifact = crate::tools::command_output_artifact::create_canonical_output_artifact(
+            &turn.config.codex_home, &session.thread_id.to_string(), &canonical,
+        ).await;
+        let artifact_id = artifact.artifact_id().filter(|_| {
+            artifact.complete && artifact.retained_bytes == canonical.exact_bytes
+                && artifact.unavailable_ranges.is_empty()
+        }).ok_or_else(|| FunctionCallError::RespondToModel(format!(
+            "{GET_AGENT_TASK_TOOL}: complete evidence handoff could not be retained; retry this read"
+        )))?;
+        session.register_tool_artifact_origin(
+            artifact_id.clone(), call_id, canonical.exact_bytes, canonical.sha256.clone(),
+        ).await;
+        result.handoff_recovery = Some(json!({
+            "artifact_id": artifact_id,
+            "canonical_sha256": canonical.sha256,
+            "canonical_bytes": canonical.exact_bytes,
+            "tool": "read_tool_output",
+            "selector_kind": "json_pointer",
+        }));
+    }
+    Ok(boxed_tool_output(result))
 }
 
 async fn handle_submit_agent_receipt(
@@ -235,20 +288,8 @@ async fn handle_submit_agent_receipt(
         ))
     })?;
     let draft = args.into_receipt_draft(&task)?;
-    let review_reason = if draft.status == AgentStatusClaim::Completed {
-        derive_review_reason(turn.config.cwd.as_path(), &task, &draft).await?
-    } else {
-        None
-    };
-    let receipt = match review_reason {
-        Some(review_reason) => {
-            store
-                .submit_agent_receipt_with_review(binding.attempt_id, draft, review_reason)
-                .await
-        }
-        None => store.submit_agent_receipt(binding.attempt_id, draft).await,
-    }
-    .map_err(|error| task_store_error(SUBMIT_AGENT_RECEIPT_TOOL, error))?;
+    let receipt = store.submit_agent_receipt(binding.attempt_id, draft).await
+        .map_err(|error| task_store_error(SUBMIT_AGENT_RECEIPT_TOOL, error))?;
     coordinator.mark_task_inactive(binding.assignment_id);
     coordinator
         .maybe_emit_terminal_metrics(binding.assignment_id, &turn.session_telemetry)
@@ -263,135 +304,51 @@ struct ParsedRiskHints {
     domains: Vec<RiskDomain>,
 }
 
-async fn derive_review_reason(
-    cwd: &Path,
-    task: &AgentTask,
-    draft: &ReceiptDraft,
-) -> Result<Option<String>, FunctionCallError> {
-    if draft.status != AgentStatusClaim::Completed {
-        return Ok(None);
-    }
 
-    let cwd = cwd.to_path_buf();
-    let risk_hints = parse_risk_hints(&task.assignment.risk_hints);
-    let successful_validation_ids = task
-        .validation_calls
-        .iter()
-        .filter(|call| is_successful_focused_validation(call))
-        .map(|call| call.call_id.as_str())
-        .collect::<BTreeSet<_>>();
-    let focused_validation_succeeded = !draft.validation_call_ids.is_empty()
-        && draft
-            .validation_call_ids
-            .iter()
-            .all(|call_id| successful_validation_ids.contains(call_id.as_str()));
-    let changed_paths = draft
-        .declared_changes
-        .iter()
-        .map(|change| change.path.clone())
-        .collect::<Vec<_>>();
-    let has_declared_changes = !changed_paths.is_empty();
-    let touched_contracts = if !has_declared_changes {
-        Vec::new()
-    } else {
-        risk_hints.contracts.clone()
-    };
-    let assignment = task.assignment.clone();
-    let derived = tokio::task::spawn_blocking(move || {
-        let repo_root = get_git_repo_root(&cwd).unwrap_or(cwd);
-        derive_risk_policy(
-            &assignment,
-            &repo_root,
-            RiskPolicyInput {
-                changed_paths: &changed_paths,
-                configured_high_risk_paths: &risk_hints.high_risk_paths,
-                touched_contracts: &touched_contracts,
-                configured_high_risk_contracts: &risk_hints.contracts,
-                cross_owner_scope: false,
-                named_domains: &risk_hints.domains,
-                non_generated_changed_files: changed_paths.len().try_into().unwrap_or(u32::MAX),
-                non_generated_changed_lines: 0, // No automatic diff or snapshot collection.
-                focused_validation_succeeded,
-                ownership_conflict: false,
-                drift: false,
-            },
-        )
-    })
-    .await
-    .map_err(|error| {
-        FunctionCallError::RespondToModel(format!(
-            "{SUBMIT_AGENT_RECEIPT_TOOL}: risk evidence worker failed: {error}"
-        ))
-    })?
-    .map_err(|error| {
-        FunctionCallError::RespondToModel(format!(
-            "{SUBMIT_AGENT_RECEIPT_TOOL}: risk evidence is invalid: {error}"
-        ))
-    })?;
-    // Inspection has no changed behavior to validate. Keep authority checks above,
-    // and let receipt submission enforce explicit evidence obligations and gates.
-    // An empty diff is insufficient: reverted/generated/detection-only writes must
-    // still take the normal risk path, as must every explicit risk hint.
-    if task.assignment.role == AgentRole::Explorer
-        && task.assignment.write_scope.is_empty()
-        && task.assignment.risk_hints.is_empty()
-        && draft.declared_changes.is_empty()
-    {
-        return Ok(None);
-    }
-    if has_declared_changes {
-        return Ok(Some("cold review required: declared changes have no automatic change snapshots; inspect the changes independently".to_string()));
-    }
-    Ok(derived.decision.review_required.then(|| {
-        format!(
-            "cold review required: {}",
-            derived.decision.reasons.join("; ")
-        )
-    }))
-}
-
-fn is_successful_focused_validation(call: &ValidationCall) -> bool {
-    call.status == ValidationCallStatus::Succeeded
-        && call.evidence.end_epoch.is_some()
-        && call
-            .evidence
-            .validation_result
-            .clone()
-            .and_then(|value| serde_json::from_value::<ValidationResult>(value).ok())
-            .is_some_and(|result| result.call_id == call.call_id && result.status.is_success())
-}
 
 async fn build_evaluation_context(
     session: &crate::session::session::Session,
     cwd: &Path,
     task: &AgentTask,
-) -> Result<Option<ColdReviewContext>, FunctionCallError> {
+) -> Result<(Option<ColdReviewContext>, Vec<TaskReceiptHandoff>), FunctionCallError> {
     let (role_name, relation_kind) = match task.assignment.role {
         AgentRole::Reviewer => ("reviewer", RelationKind::Review),
         AgentRole::Verifier => ("verifier", RelationKind::Verification),
-        _ => return Ok(None),
+        AgentRole::Integrator => ("integrator", RelationKind::Integration),
+        _ => return Ok((None, Vec::new())),
     };
     let relation = task.assignment.relation.as_ref().ok_or_else(|| {
         FunctionCallError::RespondToModel(format!(
             "{GET_AGENT_TASK_TOOL}: {role_name} assignment is missing its evaluation target"
         ))
     })?;
-    if relation.kind != relation_kind || relation.target_assignment_ids.len() != 1 {
+    if relation.kind != relation_kind
+        || relation.target_assignment_ids.is_empty()
+        || (task.assignment.role != AgentRole::Integrator
+            && relation.target_assignment_ids.len() != 1)
+        || relation.target_assignment_ids.iter().any(|target| {
+            !task.assignment.dependencies.contains(target)
+        })
+    {
         return Err(FunctionCallError::RespondToModel(format!(
             "{GET_AGENT_TASK_TOOL}: {role_name} assignment has an invalid evaluation relation"
         )));
     }
-    let target_assignment_id = relation.target_assignment_ids[0];
-    let coordinator = session.services.agent_control.task_coordinator();
-    let store = coordinator.store().ok_or_else(|| {
-        FunctionCallError::RespondToModel(format!(
-            "{GET_AGENT_TASK_TOOL}: the typed task store is unavailable"
-        ))
-    })?;
-    let target = store
-        .get_agent_task(target_assignment_id, Some(0))
-        .await
-        .map_err(|error| task_store_error(GET_AGENT_TASK_TOOL, error))?;
+    if task.assignment.role == AgentRole::Integrator {
+        let mut handoffs = Vec::with_capacity(task.assignment.dependencies.len());
+        for dependency in &task.assignment.dependencies {
+            let target = load_receipt_handoff_target(session, task, *dependency).await?;
+            handoffs.push(build_receipt_handoff(task, &target)?);
+        }
+        return Ok((None, handoffs));
+    }
+    let target = load_receipt_handoff_target(
+        session,
+        task,
+        relation.target_assignment_ids[0],
+    )
+    .await?;
+    let handoff = build_receipt_handoff(task, &target)?;
     let target_receipt_scope = crate::agent::task_capabilities::cold_review_receipt_scope(&target)
         .map_err(|error| {
             FunctionCallError::RespondToModel(format!(
@@ -463,12 +420,94 @@ async fn build_evaluation_context(
     })?
     .map(|mut context| {
         context.target_receipt_scope = target_receipt_scope;
-        Some(context)
+        (Some(context), vec![handoff])
     })
     .map_err(|error| {
         FunctionCallError::RespondToModel(format!(
             "{GET_AGENT_TASK_TOOL}: cold-review evidence is invalid: {error}"
         ))
+    })
+}
+
+async fn load_receipt_handoff_target(
+    session: &crate::session::session::Session,
+    task: &AgentTask,
+    target_assignment_id: AssignmentId,
+) -> Result<AgentTask, FunctionCallError> {
+    // The caller cannot supply a target ID: only the current bound assignment's
+    // admitted dependencies authorize this closed handoff, never a sibling read.
+    if !task.assignment.dependencies.contains(&target_assignment_id) {
+        return Err(FunctionCallError::RespondToModel(format!(
+            "{GET_AGENT_TASK_TOOL}: receipt handoff target is not an assigned dependency"
+        )));
+    }
+    let target = session
+        .services
+        .agent_control
+        .task_coordinator()
+        .get_agent_task(target_assignment_id, Some(0))
+        .await
+        .map_err(|error| task_store_error(GET_AGENT_TASK_TOOL, error))?;
+    if target.assignment.root_session_id != task.assignment.root_session_id
+        || target.assignment.repository_id != task.assignment.repository_id
+        || target.current_attempt.assignment_id != target_assignment_id
+    {
+        return Err(FunctionCallError::RespondToModel(format!(
+            "{GET_AGENT_TASK_TOOL}: receipt handoff target is outside the bound task's root or repository"
+        )));
+    }
+    Ok(target)
+}
+
+fn build_receipt_handoff(
+    task: &AgentTask,
+    target: &AgentTask,
+) -> Result<TaskReceiptHandoff, FunctionCallError> {
+    let mut evidence_call_ids = BTreeSet::new();
+    if let Some(receipt) = &target.receipt {
+        if receipt.assignment_id != target.assignment.assignment_id
+            || receipt.attempt_id != target.current_attempt.attempt_id
+            || !target.current_attempt.state.is_terminal()
+            || target.current_attempt.sealed_at != Some(receipt.sealed_at)
+        {
+            return Err(FunctionCallError::RespondToModel(format!(
+                "{GET_AGENT_TASK_TOOL}: receipt handoff does not match the target's current sealed attempt"
+            )));
+        }
+        evidence_call_ids.extend(receipt.validation_call_ids.iter().cloned());
+        evidence_call_ids.extend(receipt.criterion_results.iter().filter_map(|result| {
+            result.evidence_ref.as_ref().map(|reference| reference.call_id.clone())
+        }));
+    }
+    let validation_calls = target.validation_calls.iter()
+        .filter(|call| evidence_call_ids.contains(&call.call_id))
+        .cloned()
+        .collect::<Vec<_>>();
+    if validation_calls.iter().any(|call| call.attempt_id != target.current_attempt.attempt_id) {
+        return Err(FunctionCallError::RespondToModel(format!(
+            "{GET_AGENT_TASK_TOOL}: receipt evidence belongs to another target attempt"
+        )));
+    }
+    let unavailable_evidence_call_ids = evidence_call_ids.into_iter()
+        .filter(|id| !validation_calls.iter().any(|call| &call.call_id == id))
+        .collect();
+    let admitted_dependency = task.dependency_admissions.iter()
+        .find(|admission| admission.assignment_id == target.assignment.assignment_id)
+        .cloned();
+    Ok(TaskReceiptHandoff {
+        assignment_id: target.assignment.assignment_id,
+        role: target.assignment.role,
+        workspace_id: target.assignment.workspace_id.clone(),
+        current_attempt: target.current_attempt.clone(),
+        effective_contract: target.assignment.effective_contract(target.current_attempt.amendment.as_ref()),
+        admitted_attempt_is_current: admitted_dependency.as_ref()
+            .map(|admission| admission.attempt_id == target.current_attempt.attempt_id),
+        admitted_dependency,
+        receipt: target.receipt.clone(),
+        validation_calls,
+        unavailable_evidence_call_ids,
+        gates: target.gates.clone(),
+        evidence_scope: "Current-attempt sealed receipt and its referenced captured evidence at this read, not an admission-time snapshot or proof of current workspace freshness. Receipt prose and declared changes are worker reports, not independently verified facts. No receipt means evidence is unavailable, not an empty result.",
     })
 }
 
@@ -734,14 +773,7 @@ fn require_root(
 }
 
 fn task_store_error(tool_name: &'static str, error: StoreError) -> FunctionCallError {
-    let detail = match error {
-        StoreError::RequiredEvidenceMissing { obligations } => serde_json::json!({
-            "kind": "required_evidence_missing",
-            "obligations": obligations,
-        })
-        .to_string(),
-        error => task_store_error_detail(tool_name, error),
-    };
+    let detail = task_store_error_detail(tool_name, error);
     FunctionCallError::RespondToModel(format!("{tool_name}: {detail}"))
 }
 
@@ -978,6 +1010,32 @@ struct AbandonAgentTaskArgs {
 struct GetAgentTaskResult {
     task: AgentTask,
     cold_review_context: Option<ColdReviewContext>,
+    receipt_handoffs: Vec<TaskReceiptHandoff>,
+    handoff_recovery: Option<JsonValue>,
+}
+
+/// Closed task-to-task evidence transfer: no observations, tool history, or transcript.
+#[derive(Debug, Serialize)]
+struct TaskReceiptHandoff {
+    assignment_id: AssignmentId,
+    role: AgentRole,
+    workspace_id: String,
+    current_attempt: Attempt,
+    effective_contract: codex_agent_task_store::EffectiveTaskContract,
+    admitted_dependency: Option<codex_agent_task_store::DependencyAdmission>,
+    admitted_attempt_is_current: Option<bool>,
+    receipt: Option<AgentReceipt>,
+    validation_calls: Vec<ValidationCall>,
+    unavailable_evidence_call_ids: Vec<String>,
+    gates: Vec<AgentGate>,
+    evidence_scope: &'static str,
+}
+
+#[derive(Serialize)]
+struct ColdReviewContextWithReceipt<'a> {
+    #[serde(flatten)]
+    context: &'a ColdReviewContext,
+    target_receipt_handoff: Option<&'a TaskReceiptHandoff>,
 }
 
 impl Serialize for GetAgentTaskResult {
@@ -985,15 +1043,19 @@ impl Serialize for GetAgentTaskResult {
         use serde::ser::SerializeStruct;
         let mut value = serializer.serialize_struct(
             "GetAgentTaskResult",
-            2 + usize::from(self.cold_review_context.is_some()),
+            1 + usize::from(self.cold_review_context.is_some())
+                + usize::from(self.task.assignment.role == AgentRole::Integrator
+                    && !self.receipt_handoffs.is_empty()),
         )?;
         value.serialize_field("task", &self.task)?;
-        value.serialize_field(
-            "completion_evidence",
-            &self.task.completion_evidence_summary(),
-        )?;
         if let Some(context) = &self.cold_review_context {
-            value.serialize_field("cold_review_context", context)?;
+            value.serialize_field("cold_review_context", &ColdReviewContextWithReceipt {
+                context,
+                target_receipt_handoff: self.receipt_handoffs.first(),
+            })?;
+        }
+        if self.task.assignment.role == AgentRole::Integrator && !self.receipt_handoffs.is_empty() {
+            value.serialize_field("dependency_receipt_handoffs", &self.receipt_handoffs)?;
         }
         value.end()
     }
@@ -1063,7 +1125,6 @@ fn bounded_receipt_projection_with_proof_limit(
         "status": receipt.status,
         "evidence_epoch": receipt.evidence_epoch,
         "sealed_at": receipt.sealed_at,
-        "proof_references": proof_references,
         "changed_paths": changed_paths,
         "criterion_counts": {
             "total": receipt.criterion_results.len(),
@@ -1125,37 +1186,9 @@ fn bounded_prose_to(value: Option<&str>, limit: usize) -> Option<String> {
     Some(format!("{}...", &value[..end]))
 }
 
-fn required_evidence_is_satisfied(task: &AgentTask, requirement: &str) -> bool {
-    task.validation_calls.iter().any(|call| {
-        task.receipt
-            .as_ref()
-            .is_some_and(|receipt| receipt.validation_call_ids.contains(&call.call_id))
-            && call.command_summary == requirement
-            && call.verified_evidence_kind().is_some()
-    })
-}
 
 fn task_projection(result: &GetAgentTaskResult) -> JsonValue {
     let task = &result.task;
-    let proof_references = task
-        .validation_calls
-        .iter()
-        .filter_map(|call| {
-            if call.call_id.len() > MAX_PROJECTED_EXACT_STRING_BYTES {
-                return None;
-            }
-            Some(json!({
-                "call_id": call.call_id,
-                "status": call.status,
-                "retained_output_ref": call.evidence.retained_output_ref.as_deref().filter(|value| value.len() <= MAX_PROJECTED_EXACT_STRING_BYTES),
-            }))
-        })
-        .take(MAX_PROJECTED_VALIDATION_CALLS)
-        .collect::<Vec<_>>();
-    let omitted_validation_calls = task
-        .validation_calls
-        .len()
-        .saturating_sub(proof_references.len());
     let recent_observation_start = task
         .observations
         .len()
@@ -1199,11 +1232,6 @@ fn task_projection(result: &GetAgentTaskResult) -> JsonValue {
             Some(json!({
                 "id": criterion.id,
                 "status": status,
-                "verification": task.criterion_assessments.iter().find(|assessment| assessment.criterion_id == criterion.id),
-                "evidence_policy": criterion.evidence_policy.as_ref().map(|policy| json!({
-                    "kind": policy.kind, "freshness": policy.freshness,
-                    "required_evidence": bounded_detail(policy.required_evidence.as_deref()),
-                })),
                 "text": bounded_detail(Some(&criterion.text)),
             }))
         })
@@ -1213,26 +1241,6 @@ fn task_projection(result: &GetAgentTaskResult) -> JsonValue {
         .iter()
         .filter(|criterion| !task.criterion_is_satisfied(&criterion.id))
         .count();
-    let unresolved_required_evidence = task
-        .assignment
-        .required_evidence
-        .iter()
-        .enumerate()
-        .filter(|(_, requirement)| !required_evidence_is_satisfied(task, requirement))
-        .map(|(ordinal, requirement)| {
-            json!({
-                "ordinal": ordinal + 1,
-                "requirement": bounded_detail(Some(requirement)),
-            })
-        })
-        .take(MAX_PROJECTED_OBLIGATIONS_PER_KIND)
-        .collect::<Vec<_>>();
-    let unresolved_required_evidence_total = task
-        .assignment
-        .required_evidence
-        .iter()
-        .filter(|requirement| !required_evidence_is_satisfied(task, requirement))
-        .count();
     let omitted_observations = task
         .observations
         .len()
@@ -1240,13 +1248,6 @@ fn task_projection(result: &GetAgentTaskResult) -> JsonValue {
     let omitted_acceptance_criteria = criteria.len().saturating_sub(unresolved_criteria.len());
     let omitted_unresolved_criteria =
         unresolved_criteria_total.saturating_sub(unresolved_criteria.len());
-    let omitted_required_evidence = task
-        .assignment
-        .required_evidence
-        .len()
-        .saturating_sub(unresolved_required_evidence.len());
-    let omitted_unresolved_required_evidence =
-        unresolved_required_evidence_total.saturating_sub(unresolved_required_evidence.len());
     let target_scope = result.cold_review_context.as_ref().map(|context| {
         context.target_receipt_scope.as_ref().map(|scope| {
             let paths = scope.declared_paths.iter()
@@ -1261,13 +1262,64 @@ fn task_projection(result: &GetAgentTaskResult) -> JsonValue {
             })
         })
     });
+    let handoffs = result.receipt_handoffs.iter().enumerate()
+        .take(MAX_PROJECTED_OBLIGATIONS_PER_KIND)
+        .map(|(index, handoff)| {
+            let pointer = if result.cold_review_context.is_some() {
+                "/cold_review_context/target_receipt_handoff".to_string()
+            } else {
+                format!("/dependency_receipt_handoffs/{index}")
+            };
+            json!({
+                "assignment_id": handoff.assignment_id,
+                "attempt_id": handoff.current_attempt.attempt_id,
+                "attempt_state": handoff.current_attempt.state,
+                "admitted_attempt_is_current": handoff.admitted_attempt_is_current,
+                "receipt": handoff.receipt.as_ref().map(|receipt| json!({
+                    "status": receipt.status,
+                    "sealed_at": receipt.sealed_at,
+                    "summary": bounded_detail(Some(&receipt.summary)),
+                    "criterion_count": receipt.criterion_results.len(),
+                    "changed_path_count": receipt.declared_changes.len(),
+                    "blocker_count": receipt.blockers.len(),
+                    "risk_count": receipt.risks.len(),
+                })),
+                "captured_evidence_count": handoff.validation_calls.len(),
+                "unavailable_evidence_count": handoff.unavailable_evidence_call_ids.len(),
+                "contract_recovery_json_pointer": format!("{pointer}/effective_contract"),
+                "receipt_recovery_json_pointer": handoff.receipt.as_ref().map(|_| format!("{pointer}/receipt")),
+                "evidence_recovery_json_pointer": format!("{pointer}/validation_calls"),
+                "recovery_json_pointer": pointer,
+            })
+        }).collect::<Vec<_>>();
     json!({
+        "canonical_recovery": result.handoff_recovery,
         "target_receipt_scope": target_scope,
+        "receipt_handoffs": {
+            "count": result.receipt_handoffs.len(),
+            "policy": "Assigned target/dependency summaries, not verified proof. A null receipt means unavailable. Recover only the contract, receipt fields or captured evidence needed for the decision with read_tool_output JSON pointers. No direct target/sibling access; workspace freshness is unverified.",
+            "summaries": handoffs,
+            "omitted_summaries": result.receipt_handoffs.len().saturating_sub(handoffs.len()),
+            "context_recovery_json_pointers": result.cold_review_context.as_ref().map(|_| [
+                "/cold_review_context/effective_contract",
+                "/cold_review_context/applicable_instructions",
+                "/cold_review_context/attempt_specific_diff",
+                "/cold_review_context/observed_writes",
+                "/cold_review_context/relevant_contracts",
+                "/cold_review_context/nearest_tests",
+            ]),
+            "recovery_json_pointer": if result.cold_review_context.is_some() {
+                Some("/cold_review_context/target_receipt_handoff")
+            } else if task.assignment.role == AgentRole::Integrator && !result.receipt_handoffs.is_empty() {
+                Some("/dependency_receipt_handoffs")
+            } else {
+                None
+            },
+        },
         "assignment_id": task.assignment.assignment_id,
         "attempt_id": task.current_attempt.attempt_id,
         "role": task.assignment.role,
         "attempt_state": task.current_attempt.state,
-        "completion_evidence": task.completion_evidence_summary(),
         "dependency_provenance": {
             "policy": "pin_at_admission; not a current-acceptance or filesystem-freshness claim",
             "captured": task.dependency_admissions.len(),
@@ -1285,13 +1337,16 @@ fn task_projection(result: &GetAgentTaskResult) -> JsonValue {
         })).collect::<Vec<_>>(),
         "unresolved_obligations": {
             "acceptance_criteria": unresolved_criteria,
-            "required_evidence": unresolved_required_evidence,
+        },
+        "source_inspection_assessments": {
+            "scope": "Explicit source policies only; acquisition and hash applicability, not semantic correctness or other criterion-policy verification.",
+            "satisfied": task.criterion_assessments.iter().filter(|assessment| assessment.satisfied).count(),
+            "unsatisfied": task.criterion_assessments.iter().filter(|assessment| !assessment.satisfied).count(),
+            "recovery_json_pointer": "/task/criterion_assessments",
         },
         "recent_observations": recent_observations,
         "receipt": task.receipt.as_ref().map(|receipt| bounded_receipt_projection_with_proof_limit(receipt, 0)),
-        "proof_references": proof_references,
         "workspace": {
-            "freshness": "criterion_policy_assessed; unknown without a current input binding",
             "last_progress_at": task.workspace_status.last_progress_at,
             "lease_state": task.workspace_status.lease_state,
             "next_required_action": bounded_prose(task.workspace_status.next_required_action.as_deref()),
@@ -1300,11 +1355,8 @@ fn task_projection(result: &GetAgentTaskResult) -> JsonValue {
             "observations": omitted_observations,
             "acceptance_criteria": omitted_acceptance_criteria,
             "unresolved_acceptance_criteria": omitted_unresolved_criteria,
-            "required_evidence": omitted_required_evidence,
-            "unresolved_required_evidence": omitted_unresolved_required_evidence,
             "read_scope": task.assignment.read_scope.len(),
             "write_scope": task.assignment.write_scope.len(),
-            "proof_references": omitted_validation_calls,
         },
     })
 }
@@ -1420,6 +1472,23 @@ fn task_projection_json_pointers(
 ) -> Vec<codex_tools::ToolOutputProjectionJsonPointer> {
     let task = &result.task;
     let mut selectors = Vec::new();
+    if !task.criterion_assessments.is_empty() {
+        push_predetermined_json_pointer(&mut selectors, "task:source-inspection-assessments", "/task/criterion_assessments");
+    }
+    if result.cold_review_context.is_some() {
+        push_predetermined_json_pointer(
+            &mut selectors,
+            "task:target-receipt-handoff",
+            "/cold_review_context/target_receipt_handoff",
+        );
+    }
+    if task.assignment.role == AgentRole::Integrator && !result.receipt_handoffs.is_empty() {
+        push_predetermined_json_pointer(
+            &mut selectors,
+            "task:dependency-receipt-handoffs",
+            "/dependency_receipt_handoffs",
+        );
+    }
     for index in 0..task.dependency_admissions.len() {
         push_predetermined_json_pointer(
             &mut selectors,
@@ -1489,18 +1558,14 @@ fn task_projection_json_pointers(
             }
         }
     }
-    let mut retained_unresolved_evidence = 0_usize;
+    // Recovery selectors expose the requested contract without grading its proof.
     for (index, requirement) in task.assignment.required_evidence.iter().enumerate() {
-        if !required_evidence_is_satisfied(task, requirement) {
-            let retained_inline = retained_unresolved_evidence < MAX_PROJECTED_OBLIGATIONS_PER_KIND;
-            retained_unresolved_evidence = retained_unresolved_evidence.saturating_add(1);
-            if !retained_inline || requirement.len() > MAX_PROJECTED_DETAIL_BYTES {
-                push_predetermined_json_pointer(
-                    &mut selectors,
-                    format!("task:required-evidence:{index}"),
-                    format!("/task/assignment/required_evidence/{index}"),
-                );
-            }
+        if index >= MAX_PROJECTED_OBLIGATIONS_PER_KIND || requirement.len() > MAX_PROJECTED_DETAIL_BYTES {
+            push_predetermined_json_pointer(
+                &mut selectors,
+                format!("task:required-evidence:{index}"),
+                format!("/task/assignment/required_evidence/{index}"),
+            );
         }
     }
     for (id, pointer) in [
@@ -1699,29 +1764,57 @@ impl ToolOutput for GetAgentTaskResult {
         tool_output_json_text(self, GET_AGENT_TASK_TOOL)
     }
 
+    fn log_output_stats(&self) -> Option<(usize, usize)> {
+        let bytes = self.handoff_recovery.as_ref()?.get("canonical_bytes")?.as_u64()?;
+        // The retained handoff and log preview serialize the same fields as
+        // compact, single-line JSON. Recovery metadata is not serialized there.
+        Some((usize::try_from(bytes).ok()?, 1))
+    }
+
     fn success_for_logging(&self) -> bool {
         true
     }
 
     fn projection_metadata(&self) -> Option<codex_tools::ToolOutputProjectionMetadata> {
+        let projection = task_projection(self);
+        if !self.receipt_handoffs.is_empty() {
+            // Full evaluation evidence lives in handoff_recovery's artifact;
+            // do not automatically drain it back into the summary response.
+            return bounded_task_projection_metadata(
+                &projection,
+                projection.clone(),
+                Vec::new(),
+            );
+        }
         bounded_task_projection_metadata(
             self,
-            task_projection(self),
+            projection,
             task_projection_json_pointers(self),
         )
     }
 
     fn canonical_result(&self, _payload: &ToolPayload) -> Option<codex_tools::CanonicalToolResult> {
+        if !self.receipt_handoffs.is_empty() {
+            return Some(codex_tools::CanonicalToolResult::json(task_projection(self)));
+        }
         serde_json::to_value(self)
             .ok()
             .map(codex_tools::CanonicalToolResult::json)
     }
 
     fn to_response_item(&self, call_id: &str, payload: &ToolPayload) -> ResponseInputItem {
+        if !self.receipt_handoffs.is_empty() {
+            return tool_output_response_item(
+                call_id, payload, &task_projection(self), Some(true), GET_AGENT_TASK_TOOL,
+            );
+        }
         tool_output_response_item(call_id, payload, self, Some(true), GET_AGENT_TASK_TOOL)
     }
 
     fn code_mode_result(&self, _payload: &ToolPayload) -> JsonValue {
+        if !self.receipt_handoffs.is_empty() {
+            return task_projection(self);
+        }
         tool_output_code_mode_result(self, GET_AGENT_TASK_TOOL)
     }
 }
@@ -1771,15 +1864,20 @@ impl_json_output!(AbandonAgentTaskResult, ABANDON_AGENT_TASK_TOOL);
 fn get_agent_task_spec() -> ToolSpec {
     function_spec(
         GET_AGENT_TASK_TOOL,
-        "Read a durable typed-agent assignment, its current attempt, gates, receipt, captured \
-         validation calls, and recent observations. A bound reviewer or verifier also receives \
-         isolated evidence for its target, including current-attempt worker-declared paths (not verified mutations or freshness). Missing receipt scope is unavailable, not an empty change list; oversized manifests have exact artifact recovery. Non-root callers may also read their immediate children's durable receipts, not siblings or unrelated tasks. observation_limit defaults to 20 and is capped at 100.",
+        "Read a durable task's current attempt, gates, receipt, evidence and recent observations. \
+         Bound Reviewers, Verifiers and Integrators use their OWN assignment_id for compact \
+         target/dependency handoffs. Recover only needed contract, receipt or evidence fields \
+         with read_tool_output using canonical_recovery.artifact_id and the supplied JSON pointers. \
+         Summaries and worker declarations are not proof or workspace-freshness claims; null \
+         receipts mean unavailable. Current attempts are separate from pinned admission provenance. \
+         Handoffs include no transcripts and grant no direct target/dependency/sibling access. \
+         Non-root callers may also read their immediate compatibility children's tasks.",
         object_schema(
             [
                 (
                     "assignment_id",
                     JsonSchema::string(Some(
-                        "UUIDv7 assignment identifier returned by spawn_agent.".to_string(),
+                        "UUIDv7 assignment identifier from spawn_agent; use your own ID for evaluation handoffs.".to_string(),
                     )),
                 ),
                 (
@@ -2215,19 +2313,6 @@ mod projection_tests {
         super::super::store_error_tests::assert_error_reporting(GET_AGENT_TASK_TOOL, |error| {
             task_store_error(GET_AGENT_TASK_TOOL, error)
         });
-        let FunctionCallError::RespondToModel(detail) = task_store_error(
-            SUBMIT_AGENT_RECEIPT_TOOL,
-            StoreError::RequiredEvidenceMissing {
-                obligations: Vec::new(),
-            },
-        ) else {
-            panic!("missing evidence must remain a tool response");
-        };
-        let payload = detail.strip_prefix("submit_agent_receipt: ").unwrap();
-        assert_eq!(
-            serde_json::from_str::<JsonValue>(payload).unwrap(),
-            json!({"kind": "required_evidence_missing", "obligations": []})
-        );
     }
 
     #[test]
@@ -2535,6 +2620,8 @@ mod projection_tests {
                 observations,
             },
             cold_review_context: None,
+            receipt_handoffs: Vec::new(),
+            handoff_recovery: None,
         };
         let metadata = bounded_task_projection_metadata(
             &result,
@@ -2569,7 +2656,7 @@ mod projection_tests {
             projection["completion_evidence"]
                 .as_str()
                 .expect("completion evidence remains inline")
-                .contains("criterion-closed: reported complete; behavior unverified")
+                .contains("criterion-closed: reported complete")
         );
         assert_eq!(projection["unresolved_gates"].as_array().unwrap().len(), 1);
         assert_eq!(projection["unresolved_gates"][0]["kind"], "review");
@@ -2694,284 +2781,3 @@ mod projection_tests {
     }
 }
 
-#[cfg(test)]
-mod review_policy_tests {
-    use super::*;
-    use codex_agent_task_store::AgentTaskBindingDraft;
-    use codex_agent_task_store::AssignmentAdmissionOrigin;
-    use codex_agent_task_store::AssignmentDraft;
-    use codex_agent_task_store::CapabilityProfile;
-    use codex_agent_task_store::LocalAgentTaskStore;
-    use codex_agent_task_store::WorkspaceStrategy;
-
-    #[tokio::test]
-    async fn nested_parent_can_read_durable_child_but_not_sibling() {
-        let (session, mut turn) = crate::session::tests::make_session_and_context().await;
-        let session = Arc::new(session);
-        let home = tempfile::tempdir().unwrap();
-        let repo = tempfile::tempdir().unwrap();
-        let coordinator = session.services.agent_control.task_coordinator();
-        coordinator
-            .initialize(
-                codex_state::StateRuntime::init(home.path().into(), "test".into())
-                    .await
-                    .unwrap(),
-                "root".into(),
-            )
-            .await
-            .unwrap();
-        let draft = |parent_assignment_id| AssignmentDraft {
-            root_session_id: "root".into(),
-            admission_origin: AssignmentAdmissionOrigin::LegacyMessage {
-                parent_assignment_id,
-            },
-            role: AgentRole::Explorer,
-            capability_profile: CapabilityProfile::ReadSearch,
-            objective: "report".into(),
-            acceptance_criteria: vec![AcceptanceCriterion {
-                evidence_policy: None,
-                id: "report".into(),
-                text: "report".into(),
-            }],
-            read_scope: vec![],
-            write_scope: vec![],
-            stop_condition: "report".into(),
-            dependencies: vec![],
-            risk_hints: vec![],
-            required_evidence: vec![],
-            prohibited_changes: vec![],
-            contract_claims: vec![],
-            workspace_strategy: WorkspaceStrategy::Shared,
-            relation: None,
-            architecture_contract_ref: None,
-        };
-        let (parent, attempt) = coordinator
-            .create_assignment(repo.path(), draft(None))
-            .await
-            .unwrap();
-        let path = codex_protocol::AgentPath::root()
-            .join("coordinator")
-            .unwrap();
-        let binding = coordinator
-            .bind_agent_task(AgentTaskBindingDraft {
-                assignment_id: parent.assignment_id,
-                attempt_id: attempt.attempt_id,
-                agent_path: path.to_string(),
-                task_name: "coordinator".into(),
-                thread_id: Some(session.thread_id.to_string()),
-            })
-            .await
-            .unwrap();
-        turn.session_source =
-            SessionSource::SubAgent(codex_protocol::protocol::SubAgentSource::ThreadSpawn {
-                parent_thread_id: ThreadId::new(),
-                depth: 1,
-                agent_path: Some(path),
-                agent_nickname: None,
-                agent_role: None,
-            });
-        turn.agent_task_binding.set(Some(binding)).unwrap();
-        let (child, child_attempt) = coordinator
-            .create_assignment(repo.path(), draft(Some(parent.assignment_id)))
-            .await
-            .unwrap();
-        coordinator
-            .store()
-            .unwrap()
-            .record_legacy_agent_outcome(
-                child_attempt.attempt_id,
-                AgentStatusClaim::Completed,
-                "durable nested result".into(),
-            )
-            .await
-            .unwrap();
-        let (sibling, _) = coordinator
-            .create_assignment(repo.path(), draft(None))
-            .await
-            .unwrap();
-        let (grandchild, _) = coordinator
-            .create_assignment(repo.path(), draft(Some(child.assignment_id)))
-            .await
-            .unwrap();
-        let step = crate::session::step_context::StepContext::for_test(Arc::new(turn));
-        // No live child exists: every read must recover the stored record.
-        for (id, allowed) in [
-            (parent.assignment_id, true),
-            (child.assignment_id, true),
-            (sibling.assignment_id, false),
-            (grandchild.assignment_id, false),
-        ] {
-            let result = handle_get_agent_task(ToolInvocation {
-                session: Arc::clone(&session),
-                step_context: Arc::clone(&step),
-                cancellation_token: tokio_util::sync::CancellationToken::new(),
-                tracker: Arc::new(tokio::sync::Mutex::new(
-                    crate::turn_diff_tracker::TurnDiffTracker::new(),
-                )),
-                call_id: "read-child".into(),
-                tool_name: ToolName::plain(GET_AGENT_TASK_TOOL),
-                source: crate::tools::context::ToolCallSource::Direct,
-                payload: ToolPayload::Function {
-                    arguments: json!({"assignment_id":id}).to_string(),
-                },
-            })
-            .await;
-            assert_eq!(result.is_ok(), allowed, "lineage access for {id}");
-        }
-    }
-
-    #[tokio::test]
-    async fn mutation_free_explorer_avoids_implicit_validation_but_keeps_safety_gates() {
-        let home = tempfile::tempdir().unwrap();
-        let repo = tempfile::tempdir().unwrap();
-        let state =
-            codex_state::StateRuntime::init(home.path().to_path_buf(), "test-provider".to_string())
-                .await
-                .unwrap();
-        let store = LocalAgentTaskStore::initialize(&state).await.unwrap();
-        let (assignment, attempt) = store
-            .create_assignment(
-                repo.path(),
-                AssignmentDraft {
-                    root_session_id: "explorer-policy".to_string(),
-                    admission_origin: AssignmentAdmissionOrigin::Typed,
-                    role: AgentRole::Explorer,
-                    capability_profile: CapabilityProfile::ReadSearch,
-                    objective: "inspect the owning path".to_string(),
-                    acceptance_criteria: vec![AcceptanceCriterion {
-                        evidence_policy: None,
-                        id: "coverage".to_string(),
-                        text: "report inspected coverage".to_string(),
-                    }],
-                    read_scope: Vec::new(),
-                    write_scope: Vec::new(),
-                    stop_condition: "report findings".to_string(),
-                    dependencies: Vec::new(),
-                    risk_hints: Vec::new(),
-                    required_evidence: Vec::new(),
-                    prohibited_changes: Vec::new(),
-                    contract_claims: Vec::new(),
-                    workspace_strategy: WorkspaceStrategy::Shared,
-                    relation: None,
-                    architecture_contract_ref: None,
-                },
-            )
-            .await
-            .unwrap();
-        let task = store
-            .get_agent_task(assignment.assignment_id, Some(0))
-            .await
-            .unwrap();
-        let draft = ReceiptDraft {
-            status: AgentStatusClaim::Completed,
-            summary: "inspection complete; behavior unverified".to_string(),
-            criterion_results: vec![CriterionResult {
-                criterion_id: "coverage".to_string(),
-                status: CriterionStatus::Passed,
-                evidence: Some("source inspected".to_string()),
-                evidence_ref: None,
-            }],
-            declared_changes: Vec::new(),
-            validation_call_ids: Vec::new(),
-            blockers: Vec::new(),
-            risks: Vec::new(),
-            next_action: None,
-            architecture_contract: None,
-        };
-        assert_eq!(
-            derive_review_reason(repo.path(), &task, &draft)
-                .await
-                .unwrap(),
-            None
-        );
-        let other_repo = tempfile::tempdir().unwrap();
-        assert!(
-            derive_review_reason(other_repo.path(), &task, &draft)
-                .await
-                .is_err()
-        );
-
-        for role in [
-            AgentRole::Worker,
-            AgentRole::Reviewer,
-            AgentRole::Verifier,
-            AgentRole::Integrator,
-        ] {
-            let mut other = task.clone();
-            other.assignment.role = role;
-            other.assignment.capability_profile = role.capability_profile();
-            assert!(
-                derive_review_reason(repo.path(), &other, &draft)
-                    .await
-                    .unwrap()
-                    .is_some()
-            );
-        }
-        let mut explicit_risk = task.clone();
-        explicit_risk
-            .assignment
-            .risk_hints
-            .push("concurrency".to_string());
-        assert!(
-            derive_review_reason(repo.path(), &explicit_risk, &draft)
-                .await
-                .unwrap()
-                .unwrap()
-                .contains("concurrency risk")
-        );
-        let mut write_scope = task.clone();
-        write_scope.assignment.write_scope.push(RepoScope {
-            path: "src".to_string(),
-            recursive: true,
-        });
-        assert!(
-            derive_review_reason(repo.path(), &write_scope, &draft)
-                .await
-                .unwrap()
-                .is_some()
-        );
-        let mut declared = draft.clone();
-        declared.declared_changes.push(DeclaredChange {
-            path: "src/lib.rs".to_string(),
-            summary: "changed".to_string(),
-        });
-        assert!(
-            derive_review_reason(repo.path(), &task, &declared)
-                .await
-                .unwrap()
-                .is_some()
-        );
-
-        store
-            .set_agent_gate(
-                TaskActor::Root,
-                assignment.assignment_id,
-                attempt.attempt_id,
-                GateKind::Review,
-                GateStatus::Pending,
-                "explicit independent review".to_string(),
-            )
-            .await
-            .unwrap();
-        store
-            .submit_agent_receipt(attempt.attempt_id, draft)
-            .await
-            .unwrap();
-        let sealed = store
-            .get_agent_task(assignment.assignment_id, Some(0))
-            .await
-            .unwrap();
-        assert_eq!(
-            sealed.workspace_status.pending_gates,
-            vec![GateKind::Review]
-        );
-        assert!(sealed.validation_calls.is_empty());
-        assert!(
-            sealed
-                .completion_evidence_summary()
-                .contains("behavior unverified")
-        );
-        store.close().await;
-        state.close().await;
-    }
-}

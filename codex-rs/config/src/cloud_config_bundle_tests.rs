@@ -10,6 +10,51 @@ use std::sync::atomic::Ordering;
 use tempfile::tempdir;
 
 #[tokio::test]
+async fn scoped_rejection_cannot_evict_a_newer_successful_candidate() {
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let loader = CloudConfigBundleLoader::retryable({
+        let attempts = Arc::clone(&attempts);
+        move || {
+            attempts.fetch_add(1, Ordering::SeqCst);
+            async { Ok(Some(CloudConfigBundle::default())) }
+        }
+    });
+    let stale_load = loader.for_load();
+    let stale_validation = stale_load.clone();
+    stale_load.get().await.unwrap();
+    let rejected_load = loader.for_load();
+    rejected_load.get().await.unwrap();
+    rejected_load.reject_loaded_candidate();
+    let current_load = loader.for_load();
+    current_load.get().await.unwrap();
+    // Validation for generation 0 resumes only after generation 1 was fetched.
+    stale_validation.reject_loaded_candidate();
+    loader.get().await.unwrap();
+    assert_eq!(attempts.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn load_scope_rejects_the_generation_acquired_after_scope_creation() {
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let loader = CloudConfigBundleLoader::retryable({
+        let attempts = Arc::clone(&attempts);
+        move || {
+            attempts.fetch_add(1, Ordering::SeqCst);
+            async { Ok(None) }
+        }
+    });
+    let delayed_load = loader.for_load();
+    let first_load = loader.for_load();
+    first_load.get().await.unwrap();
+    first_load.reject_loaded_candidate();
+    // Scope creation is not acquisition: this load now receives generation 1.
+    delayed_load.get().await.unwrap();
+    delayed_load.reject_loaded_candidate();
+    loader.get().await.unwrap();
+    assert_eq!(attempts.load(Ordering::SeqCst), 3);
+}
+
+#[tokio::test]
 async fn shared_future_runs_once() {
     let counter = Arc::new(AtomicUsize::new(0));
     let counter_clone = Arc::clone(&counter);

@@ -242,6 +242,8 @@ pub(crate) fn prompt_is_rejected_by_policy(
 
 #[derive(Debug, Error)]
 pub enum ExecPolicyError {
+    #[error("network rules require the removed managed network proxy; refusing to run without enforcement")]
+    UnsupportedNetworkRules,
     #[error("failed to read rules files from {dir}: {source}")]
     ReadDir {
         dir: PathBuf,
@@ -739,11 +741,14 @@ pub async fn load_exec_policy(config_stack: &ConfigLayerStack) -> Result<Policy,
     tracing::debug!("loaded rules from {} files", policy_paths.len());
     tracing::trace!(rules = ?policy, "exec policy rules loaded");
 
-    let Some(requirements_policy) = config_stack.requirements().exec_policy.as_deref() else {
-        return Ok(policy);
+    let policy = match config_stack.requirements().exec_policy.as_deref() {
+        Some(requirements_policy) => policy.merge_overlay(requirements_policy.as_ref()),
+        None => policy,
     };
-
-    Ok(policy.merge_overlay(requirements_policy.as_ref()))
+    if !policy.network_rules().is_empty() {
+        return Err(ExecPolicyError::UnsupportedNetworkRules);
+    }
+    Ok(policy)
 }
 
 /// If a command is not matched by any execpolicy rule, derive a [`Decision`].

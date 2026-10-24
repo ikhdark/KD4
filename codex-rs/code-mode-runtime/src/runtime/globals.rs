@@ -38,7 +38,7 @@ pub(super) fn install_globals(scope: &mut v8::PinScope<'_, '_>) -> Result<(), St
         .get_slot::<RuntimeState>()
         .map(|state| Arc::clone(&state.enabled_tools))
         .unwrap_or_default();
-    let tools = build_tools_object(scope, &enabled_tools.tools)?;
+    let tools = build_tools_object(scope, &enabled_tools)?;
     let all_tool_names = build_all_tool_names_value(scope, &enabled_tools)?;
     let resolve_tool = helper_function(scope, "resolve_tool", resolve_tool_callback)?;
     let clear_timeout = helper_function(scope, "clearTimeout", clear_timeout_callback)?;
@@ -125,11 +125,12 @@ fn install_tool_aliases<'s>(
         if *alias != EXEC_COMMAND_GLOBAL_NAME && enabled_tools.index_of(alias).is_some() {
             continue;
         }
-        let function = match exec_command_index {
-            Some(index) => tool_function(scope, index)?,
-            None => helper_function(scope, alias, missing_exec_alias_callback)?,
-        };
-        set_global(scope, global, alias, function.into())?;
+        if let Some(index) = exec_command_index {
+            install_tool_property(scope, global, alias, index)?;
+        } else {
+            let function = helper_function(scope, alias, missing_exec_alias_callback)?;
+            set_global(scope, global, alias, function.into())?;
+        }
     }
     Ok(())
 }
@@ -246,58 +247,23 @@ fn resolve_tool_callback(
 
 fn build_tools_object<'s>(
     scope: &mut v8::PinScope<'s, '_>,
-    enabled_tools: &[EnabledToolMetadata],
+    catalog: &EnabledToolCatalog,
 ) -> Result<v8::Local<'s, v8::Object>, String> {
     let tools = v8::Object::new(scope);
+    let enabled_tools = &catalog.tools;
 
     for (tool_index, tool) in enabled_tools.iter().enumerate() {
-        let name = v8::String::new(scope, &tool.global_name)
-            .ok_or_else(|| "failed to allocate tool name".to_string())?;
-        let function = tool_function(scope, tool_index)?;
-        tools.create_data_property(scope, name.into(), function.into());
+        install_tool_property(scope, tools, &tool.global_name, tool_index)?;
         let presentation = scope.get_slot::<RuntimeState>()
             .map(|state| state.enabled_tools.presentation_name(tool_index).to_owned());
         if let Some(presentation) = presentation
             && !presentation.contains('.') && presentation != tool.global_name
         {
-            let alias = v8::String::new(scope, &presentation)
-                .ok_or_else(|| "failed to allocate short tool alias".to_string())?;
-            tools.create_data_property(scope, alias.into(), function.into());
+            install_tool_property(scope, tools, &presentation, tool_index)?;
         }
     }
-    // Canonical identifiers carry collision-resistant suffixes. Namespace
-    // access must use registered identity, not reverse-engineer that suffix.
-    // Keep legacy two-part aliases, but reject collisions before installing any.
-    let mut aliases = std::collections::BTreeMap::new();
-    for (index, tool) in enabled_tools.iter().enumerate() {
-        let legacy = tool
-            .global_name
-            .split_once("__")
-            .filter(|(_, member)| !member.contains("__"));
-        let registered = tool
-            .tool_name
-            .namespace
-            .as_deref()
-            .map(|namespace| (namespace, tool.tool_name.name.as_str()));
-        for (namespace, member) in legacy.into_iter().chain(registered) {
-            if namespace.is_empty() || member.is_empty() {
-                continue;
-            }
-            aliases
-                .entry((namespace, member))
-                .and_modify(|owner| {
-                    if *owner != Some(index) {
-                        *owner = None;
-                    }
-                })
-                .or_insert(Some(index));
-        }
-    }
-    for ((namespace, member), owner) in aliases {
-        let Some(index) = owner else {
-            continue;
-        };
-        let tool = &enabled_tools[index];
+    // The catalog also uses this admitted set when rewriting declarations.
+    for ((namespace, member), index) in &catalog.namespace_aliases {
         // Namespace aliases never shadow a canonical top-level callable.
         let namespace_key = v8::String::new(scope, namespace)
             .ok_or_else(|| "failed to allocate tool namespace".to_string())?;
@@ -318,14 +284,7 @@ fn build_tools_object<'s>(
             tools.create_data_property(scope, namespace_key.into(), namespace.into());
             namespace
         };
-        let member = v8::String::new(scope, member)
-            .ok_or_else(|| "failed to allocate tool member".to_string())?;
-        let name = v8::String::new(scope, &tool.global_name)
-            .ok_or_else(|| "failed to allocate tool name".to_string())?;
-        let function = tools
-            .get(scope, name.into())
-            .ok_or_else(|| "failed to read tool function".to_string())?;
-        namespace.create_data_property(scope, member.into(), function);
+        install_tool_property(scope, namespace, member, *index)?;
     }
     Ok(tools)
 }
@@ -350,6 +309,10 @@ fn shared_description<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     description: &str,
 ) -> Result<v8::Local<'s, v8::String>, String> {
+    #[cfg(test)]
+    if let Some(state) = scope.get_slot_mut::<RuntimeState>() {
+        state.description_materializations += 1;
+    }
     // Internalization shares description storage between callable metadata and
     // the optional discovery array within this cell's isolate.
     v8::String::new_from_utf8(
@@ -432,6 +395,46 @@ where
         .ok_or_else(|| "failed to create helper function".to_string())
 }
 
+fn install_tool_property<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    object: v8::Local<'s, v8::Object>,
+    name: &str,
+    index: usize,
+) -> Result<(), String> {
+    let key = v8::String::new(scope, name)
+        .ok_or_else(|| "failed to allocate tool name".to_string())?;
+    let index = u32::try_from(index).map_err(|_| "tool callback index exceeds u32".to_string())?;
+    let data = v8::Integer::new_from_unsigned(scope, index);
+    if object.set_lazy_data_property_with_data(
+        scope,
+        key.into(),
+        tool_property_callback,
+        data.into(),
+        v8::PropertyAttribute::NONE,
+        v8::SideEffectType::HasSideEffect,
+        v8::SideEffectType::HasSideEffect,
+    ) != Some(true) {
+        return Err("failed to install lazy tool callable".to_string());
+    }
+    Ok(())
+}
+
+fn tool_property_callback(
+    scope: &mut v8::PinScope<'_, '_>,
+    _key: v8::Local<v8::Name>,
+    args: v8::PropertyCallbackArguments,
+    mut retval: v8::ReturnValue<v8::Value>,
+) {
+    let Some(index) = args.data().uint32_value(scope) else {
+        throw_type_error(scope, "missing tool index");
+        return;
+    };
+    match tool_function(scope, index as usize) {
+        Ok(function) => retval.set(function.into()),
+        Err(error) => throw_type_error(scope, &error),
+    }
+}
+
 fn tool_function<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     tool_index: usize,
@@ -449,7 +452,7 @@ fn tool_function<'s>(
         .get_slot::<RuntimeState>()
         .map(|state| Arc::clone(&state.enabled_tools))
         .ok_or_else(|| "missing enabled tools".to_string())?;
-    let tool = enabled_tools
+    enabled_tools
         .get(tool_index)
         .ok_or_else(|| "missing enabled tool".to_string())?;
     let index =
@@ -466,9 +469,22 @@ fn tool_function<'s>(
         .ok_or_else(|| "failed to allocate tool name".to_string())?;
     function.set_name(name);
     set_global(scope, metadata, "name", name.into())?;
-    let description = shared_description(scope, &tool.description)?;
-    set_global(scope, metadata, "description", description.into())?;
-    set_global(scope, function.into(), "description", description.into())?;
+    let description_key = v8::String::new(scope, "description")
+        .ok_or_else(|| "failed to allocate description key".to_string())?;
+    for object in [metadata, function.into()] {
+        if object.set_lazy_data_property_with_data(
+            scope,
+            description_key.into(),
+            tool_description_callback,
+            data.into(),
+            v8::PropertyAttribute::NONE,
+            v8::SideEffectType::HasSideEffect,
+            v8::SideEffectType::HasSideEffect,
+        ) != Some(true)
+        {
+            return Err("failed to install lazy tool description".into());
+        }
+    }
     // Keep JSON discovery receipts compatible while allowing direct invocation.
     let to_json = v8::FunctionTemplate::builder(tool_metadata_callback)
         .data(metadata.into())
@@ -491,6 +507,29 @@ fn tool_metadata_callback(
     mut retval: v8::ReturnValue<v8::Value>,
 ) {
     retval.set(args.data());
+}
+
+fn tool_description_callback(
+    scope: &mut v8::PinScope<'_, '_>,
+    _key: v8::Local<v8::Name>,
+    args: v8::PropertyCallbackArguments,
+    mut retval: v8::ReturnValue<v8::Value>,
+) {
+    let index = args.data().uint32_value(scope).map(|index| index as usize);
+    let catalog = scope
+        .get_slot::<RuntimeState>()
+        .map(|state| Arc::clone(&state.enabled_tools));
+    let Some(tool) = catalog
+        .as_ref()
+        .and_then(|catalog| index.and_then(|index| catalog.get(index)))
+    else {
+        throw_type_error(scope, "missing tool description");
+        return;
+    };
+    match shared_description(scope, &tool.description) {
+        Ok(description) => retval.set(description.into()),
+        Err(error) => throw_type_error(scope, &error),
+    }
 }
 
 fn set_global<'s>(

@@ -72,7 +72,6 @@ fn legacy_command_exec_config(
         config.permissions.permission_profile(),
         codex_protocol::models::PermissionProfile::Disabled
     ) {
-        config.permissions.network = None;
     }
     Ok(config)
 }
@@ -309,9 +308,6 @@ impl CommandExecRequestProcessor {
         };
         let (
             effective_permission_profile,
-            network_proxy_spec,
-            network_proxy_permission_profile,
-            managed_network_requirements_enabled,
             windows_sandbox_workspace_roots,
         ) = if let Some(permission_profile) = permission_profile {
             let config = permission_profile_command_exec_config(
@@ -323,9 +319,6 @@ impl CommandExecRequestProcessor {
             .await?;
             (
                 config.permissions.effective_permission_profile(),
-                config.permissions.network.clone(),
-                config.permissions.permission_profile().clone(),
-                config.managed_network_requirements_enabled(),
                 config.effective_workspace_roots(),
             )
         } else if let Some(policy) = sandbox_policy.map(|policy| policy.to_core()) {
@@ -333,40 +326,13 @@ impl CommandExecRequestProcessor {
                 .map_err(|err| invalid_request(format!("invalid sandbox policy: {err}")))?;
             (
                 config.permissions.effective_permission_profile(),
-                config.permissions.network.clone(),
-                config.permissions.permission_profile().clone(),
-                config.managed_network_requirements_enabled(),
                 config.effective_workspace_roots(),
             )
         } else {
             (
                 self.config.permissions.effective_permission_profile(),
-                self.config.permissions.network.clone(),
-                self.config.permissions.permission_profile().clone(),
-                self.config.managed_network_requirements_enabled(),
                 self.config.effective_workspace_roots(),
             )
-        };
-        let started_network_proxy = match network_proxy_spec.as_ref() {
-            Some(spec) => match spec
-                .start_proxy(
-                    &self.config.codex_home,
-                    &network_proxy_permission_profile,
-                    /*policy_decider*/ None,
-                    /*blocked_request_observer*/ None,
-                    managed_network_requirements_enabled,
-                    NetworkProxyAuditMetadata::default(),
-                )
-                .await
-            {
-                Ok(started) => Some(started),
-                Err(err) => {
-                    return Err(internal_error(format!(
-                        "failed to start managed network proxy: {err}"
-                    )));
-                }
-            },
-            None => None,
         };
         let exec_params = ExecParams {
             command,
@@ -375,10 +341,6 @@ impl CommandExecRequestProcessor {
             expiration,
             capture_policy,
             env,
-            network: started_network_proxy
-                .as_ref()
-                .map(codex_core::config::StartedNetworkProxy::proxy),
-            network_environment_id: None,
             sandbox_permissions: SandboxPermissions::UseDefault,
             windows_sandbox_level,
             windows_sandbox_private_desktop: self
@@ -391,7 +353,6 @@ impl CommandExecRequestProcessor {
 
         let outgoing = self.outgoing.clone();
         let request_for_task = request.clone();
-        let started_network_proxy_for_task = started_network_proxy;
 
         let exec_request = codex_core::exec::build_exec_request_async(
             exec_params,
@@ -408,7 +369,6 @@ impl CommandExecRequestProcessor {
                     request_id: request_for_task,
                     process_id,
                     exec_request,
-                    started_network_proxy: started_network_proxy_for_task,
                     tty,
                     stream_stdin,
                     stream_stdout_stderr,
@@ -510,68 +470,4 @@ mod tests {
 
     // The sandboxed launch itself is covered once by the integration suite;
     // which profile and proxy a request selects is decided here, before it.
-    #[tokio::test]
-    async fn command_exec_permission_profile_selects_that_profile_and_only_its_network_proxy() {
-        let temp_dir = TempDir::new().expect("create temp dir");
-        let cwd = temp_dir.path().join("cwd");
-        std::fs::create_dir_all(&cwd).expect("create cwd");
-        std::fs::write(
-            temp_dir.path().join("config.toml"),
-            r#"default_permissions = "networked"
-
-[features]
-network_proxy = true
-
-[permissions.networked.filesystem]
-":root" = "read"
-
-[permissions.networked.network]
-enabled = true
-proxy_url = "http://127.0.0.1:0"
-enable_socks5 = false
-"#,
-        )
-        .expect("write config");
-        let config_manager =
-            ConfigManager::without_managed_config_for_tests(temp_dir.path().to_path_buf());
-        let base_config = config_manager
-            .load_latest_config(Some(cwd.clone()))
-            .await
-            .expect("load base config");
-        assert!(
-            base_config.permissions.network.is_some(),
-            "the default profile brings a network proxy"
-        );
-        let cwd = AbsolutePathBuf::from_absolute_path(cwd).expect("absolute cwd");
-
-        let networked = permission_profile_command_exec_config(
-            &config_manager,
-            &base_config.cwd,
-            &cwd,
-            "networked".to_string(),
-        )
-        .await
-        .expect("the networked profile is accepted");
-        assert!(networked.permissions.network.is_some());
-
-        let read_only = permission_profile_command_exec_config(
-            &config_manager,
-            &base_config.cwd,
-            &cwd,
-            codex_protocol::models::BUILT_IN_PERMISSION_PROFILE_READ_ONLY.to_string(),
-        )
-        .await
-        .expect("the built-in read-only profile is accepted");
-        assert!(
-            read_only.permissions.network.is_none(),
-            "an explicit profile must not reuse the default profile's proxy"
-        );
-        assert_eq!(read_only.cwd, cwd);
-        assert!(
-            !read_only
-                .permissions
-                .file_system_sandbox_policy()
-                .can_write_path_with_cwd(cwd.as_path(), cwd.as_path())
-        );
-    }
 }

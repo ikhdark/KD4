@@ -146,7 +146,7 @@ impl HttpClient {
                 method = %method,
                 url = %url,
                 status = %response.status(),
-                headers = ?response.headers(),
+                headers = ?diagnostic_response_headers(response.headers()),
                 version = ?response.version(),
                 "Request completed"
             );
@@ -311,7 +311,7 @@ impl RequestBuilder {
                         method = %self.method,
                         url = %url,
                         status = %response.status(),
-                        headers = ?response.headers(),
+                        headers = ?diagnostic_response_headers(response.headers()),
                         version = ?response.version(),
                         "Request completed"
                     );
@@ -336,6 +336,20 @@ impl RequestBuilder {
             }
         }
     }
+}
+
+fn diagnostic_response_headers(headers: &HeaderMap) -> HeaderMap {
+    let mut redacted = HeaderMap::new();
+    for (name, value) in headers {
+        if matches!(
+            name.as_str(),
+            "content-type" | "content-length" | "x-request-id" | "request-id"
+        ) && value.as_bytes().len() <= 256
+        {
+            redacted.append(name, value.clone());
+        }
+    }
+    redacted
 }
 
 pub(crate) fn apply_default_headers(headers: &mut HeaderMap, defaults: &HeaderMap) {
@@ -385,6 +399,26 @@ mod tests {
     use tracing::trace_span;
     use tracing_subscriber::layer::SubscriberExt;
     use tracing_subscriber::util::SubscriberInitExt;
+
+    #[test]
+    fn response_diagnostics_redact_all_cookie_values_without_changing_response() {
+        let mut headers = HeaderMap::new();
+        headers.append(
+            "set-cookie",
+            HeaderValue::from_static("session=first-secret"),
+        );
+        headers.append(
+            "set-cookie",
+            HeaderValue::from_static("session=second-secret"),
+        );
+        headers.insert("x-request-id", HeaderValue::from_static("visible-id"));
+        let diagnostic = format!("{:?}", diagnostic_response_headers(&headers));
+        assert!(!diagnostic.contains("first-secret"));
+        assert!(!diagnostic.contains("second-secret"));
+        assert!(diagnostic.contains("visible-id"));
+        assert_eq!(headers.get_all("set-cookie").iter().count(), 2);
+        assert!(!headers["set-cookie"].is_sensitive());
+    }
 
     #[test]
     fn request_builder_debug_redacts_url_and_headers() {

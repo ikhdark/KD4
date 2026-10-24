@@ -68,7 +68,7 @@ pub(super) fn run(
         ),
     ];
     let mut client = CodexClient::spawn_stdio_with_env(codex_bin, &overrides, &child_environment)?;
-    wait_until_capture_is_ready(&capture_path)?;
+    wait_until_capture_is_ready(&capture_path, &mut client)?;
     let expected =
         client.with_operation_deadline(Instant::now() + PLUGIN_READY_TIMEOUT, |client| {
             client.initialize()?;
@@ -349,8 +349,17 @@ pub(super) fn prepare_capture_file(path: &Path) -> Result<()> {
     Ok(())
 }
 
-pub(super) fn wait_until_capture_is_ready(path: &Path) -> Result<()> {
-    let deadline = Instant::now() + CAPTURE_READY_TIMEOUT;
+pub(super) fn wait_until_capture_is_ready(path: &Path, client: &mut CodexClient) -> Result<()> {
+    wait_until_capture_is_ready_until(path, Instant::now() + CAPTURE_READY_TIMEOUT, || {
+        client.child_exit_status()
+    })
+}
+
+fn wait_until_capture_is_ready_until(
+    path: &Path,
+    deadline: Instant,
+    mut child_exit_status: impl FnMut() -> Result<Option<std::process::ExitStatus>>,
+) -> Result<()> {
     loop {
         match fs::metadata(path) {
             Ok(_) => return Ok(()),
@@ -359,6 +368,12 @@ pub(super) fn wait_until_capture_is_ready(path: &Path) -> Result<()> {
                 return Err(err)
                     .with_context(|| format!("inspect capture file {}", path.display()));
             }
+        }
+        if let Some(status) = child_exit_status()? {
+            bail!(
+                "app-server exited before analytics capture became ready at {}: {status}",
+                path.display()
+            );
         }
         if Instant::now() >= deadline {
             bail!(
@@ -527,6 +542,52 @@ impl Drop for TemporaryConfigFile {
 #[cfg(test)]
 mod deadline_tests {
     use super::*;
+
+    #[test]
+    fn capture_readiness_observes_exit_live_deadline_success_and_io_errors() {
+        use std::os::windows::process::ExitStatusExt;
+        let temp = tempfile::tempdir().unwrap();
+        let capture = temp.path().join("capture.jsonl");
+        let started = Instant::now();
+        let error =
+            wait_until_capture_is_ready_until(&capture, started + Duration::from_secs(5), || {
+                Ok(Some(std::process::ExitStatus::from_raw(19)))
+            })
+            .unwrap_err();
+        assert!(error.to_string().contains("19"), "{error:#}");
+        assert!(started.elapsed() < Duration::from_secs(1));
+        let mut polls = 0;
+        wait_until_capture_is_ready_until(
+            &capture,
+            Instant::now() + Duration::from_secs(1),
+            || {
+                polls += 1;
+                fs::write(&capture, "")?;
+                Ok(None)
+            },
+        )
+        .unwrap();
+        assert_eq!(polls, 1);
+        fs::remove_file(&capture).unwrap();
+        let error = wait_until_capture_is_ready_until(
+            &capture,
+            Instant::now() + Duration::from_millis(20),
+            || Ok(None),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("did not become ready"));
+        fs::write(&capture, "not a directory").unwrap();
+        let error = wait_until_capture_is_ready_until(
+            &capture.join("child"),
+            Instant::now() + Duration::from_secs(5),
+            || panic!("filesystem errors precede liveness polling"),
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("inspect capture file"),
+            "{error:#}"
+        );
+    }
 
     #[test]
     fn smoke_deadline_bounds_nested_turn_rpc_and_forbids_expired_retry() {

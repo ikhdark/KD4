@@ -4,6 +4,13 @@ use chrono::Utc;
 use sqlx::Row;
 use sqlx::sqlite::SqliteRow;
 
+/// One successful lease admission. Each reacquisition creates a new identity.
+#[derive(Debug, Clone)]
+pub struct BackfillClaim {
+    pub(crate) token: String,
+    pub last_watermark: Option<String>,
+}
+
 /// Persisted lifecycle state for rollout metadata backfill.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BackfillState {

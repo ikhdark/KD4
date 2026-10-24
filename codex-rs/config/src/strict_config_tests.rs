@@ -187,6 +187,67 @@ collapsed = true"#;
 }
 
 #[test]
+fn strict_config_rejects_unknown_flattened_app_tool_and_tui_fields() {
+    let path = Path::new("/tmp/config.toml");
+    for (contents, field) in [
+        ("[apps.demo]\nenabld = false\n", "apps.demo.enabld"),
+        (
+            "[apps.demo]\ndestructive_enabld = false\n",
+            "apps.demo.destructive_enabld",
+        ),
+        (
+            "[apps.demo.tools.\"write_file\"]\nenabld = false\n",
+            "apps.demo.tools.write_file.enabld",
+        ),
+        (
+            "[apps.demo.tools.\"write_file\"]\napproval_mod = 'prompt'\n",
+            "apps.demo.tools.write_file.approval_mod",
+        ),
+        ("[tui]\nanimatons = false\n", "tui.animatons"),
+    ] {
+        let _: ConfigToml = toml::from_str(contents).expect("ordinary parsing remains permissive");
+        let error = config_error_from_ignored_toml_fields::<ConfigToml>(path, contents)
+            .expect("strict unknown field error");
+        assert_eq!(
+            error.message,
+            format!("unknown configuration field `{field}`")
+        );
+        assert_eq!(
+            ignored_toml_value_field::<ConfigToml>(toml::from_str(contents).unwrap()),
+            Some(field.to_string())
+        );
+    }
+}
+
+#[test]
+fn strict_config_accepts_dynamic_app_names_and_flattened_notification_fields() {
+    let contents = r#"
+[apps."arbitrary.app/id"]
+enabled = false
+destructive_enabled = false
+[apps."arbitrary.app/id".tools."arbitrary/tool"]
+enabled = false
+[tui]
+notifications = true
+notification_method = "bel"
+notification_condition = "always"
+animations = false
+"#;
+    assert_eq!(
+        config_error_from_ignored_toml_fields::<ConfigToml>("config.toml", contents),
+        None
+    );
+}
+
+#[test]
+fn strict_helpers_validate_standalone_flattened_owner_types() {
+    let app = "[demo]\nenabld = false\n";
+    assert!(config_error_from_ignored_toml_fields::<crate::types::AppsConfigToml>("config.toml", app).unwrap().message.contains("demo.enabld"));
+    let tui = "animatons = false\n";
+    assert!(config_error_from_ignored_toml_fields::<crate::types::Tui>("config.toml", tui).unwrap().message.contains("animatons"));
+}
+
+#[test]
 fn strict_config_keeps_first_unknown_but_finishes_type_validation() {
     let path = Path::new("/tmp/config.toml");
     let contents = "first_unknown = true\nsecond_unknown = false\n";

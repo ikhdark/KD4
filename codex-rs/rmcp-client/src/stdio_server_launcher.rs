@@ -522,7 +522,7 @@ impl ExecutorStdioServerLauncher {
             .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err))?;
         let program_name = program.to_string_lossy().into_owned();
         let envs = create_env_overlay_for_remote_mcp_server(env, &env_vars);
-        let remote_env_vars = remote_mcp_env_var_names(&env_vars);
+        let remote_env_vars = remote_mcp_env_var_names(&env_vars).map_err(io::Error::other)?;
         // The executor protocol carries argv/env as UTF-8 strings. Local stdio can
         // accept arbitrary OsString values because it calls the OS directly; remote
         // stdio must reject non-Unicode command, argument, or environment data

@@ -91,6 +91,7 @@ impl StateRuntime {
         params: &AgentJobCreateParams,
         items: &[AgentJobItemCreateParams],
     ) -> anyhow::Result<AgentJob> {
+        anyhow::ensure!(self.agent_job_runner_registered, "non-owning state runtime cannot own agent jobs");
         let now = Utc::now().timestamp();
         let input_headers_json = serde_json::to_string(&params.input_headers)?;
         let output_schema_json = params

@@ -4318,6 +4318,10 @@ async fn list_threads_filters_and_projects_latest_persisted_cwd() -> std::io::Re
             multi_agent_version: None,
             multi_agent_mode: None,
             effort: None,
+            validation_mode: None,
+            validation_full_budget: None,
+            validation_root_turn: None,
+            validation_attempts: Vec::new(),
             context_provenance: None,
         }),
     };

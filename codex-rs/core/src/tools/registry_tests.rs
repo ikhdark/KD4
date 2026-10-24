@@ -3,33 +3,113 @@ use crate::session::step_context::StepContext;
 use codex_protocol::models::ResponseItem;
 use pretty_assertions::assert_eq;
 
+#[test]
+fn audit144_preflight_hints_follow_escaped_empty_and_numeric_object_keys() {
+    for key in ["config/path", "config~path", "0", ""] {
+        let shape = serde_json::json!({"type":"object","properties":{"path":{"type":"string"}},"required":["path"],"additionalProperties":false});
+        let mut properties = serde_json::Map::new();
+        properties.insert(key.to_string(), shape);
+        let encoded = key.replace('~', "~0").replace('/', "~1");
+        if encoded != key {
+            properties.insert(encoded,serde_json::json!({"type":"object","properties":{"mode":{"type":"string"}},"required":["mode"]}));
+        }
+        let schema = serde_json::json!({"type":"object","properties":properties});
+        let name = ToolName::plain("pointer_fixture");
+        let spec = ToolSpec::Function(codex_tools::ResponsesApiTool {
+            name: name.name.clone(),
+            description: "pointer".into(),
+            strict: false,
+            defer_loading: None,
+            parameters: serde_json::from_value(schema).unwrap(),
+            output_schema: None,
+        });
+        let preflight = CodeModeArgumentPreflight::default();
+        for (body, valid) in [
+            (serde_json::json!({"legacy":"x"}), false),
+            (serde_json::json!({"path":"ok"}), true),
+        ] {
+            let payload = ToolPayload::Function {
+                arguments: serde_json::json!({(key):body}).to_string(),
+            };
+            let parsed = ParsedFunctionArguments::from_payload(&payload);
+            let result = preflight.validate(&name, &spec, &payload, parsed.as_ref(), false);
+            if valid {
+                assert!(result.is_ok(), "{key:?}: {result:?}");
+            } else {
+                let error = result.unwrap_err();
+                assert!(
+                    error.contains("accepted properties: path")
+                        && error.contains("required: path"),
+                    "{key:?}: {error}"
+                );
+                assert!(!error.contains("accepted properties: mode"), "{error}");
+            }
+        }
+    }
+}
+
 #[tokio::test]
 async fn full_untyped_no_recovery_projection_fits_once_and_is_equivalent() {
     let home = tempfile::tempdir().unwrap();
     let text = "unchanged source\n".repeat(32);
     let canonical = CanonicalToolResult::bytes(text.as_bytes().to_vec());
     let output = crate::tools::context::FunctionToolOutput::from_content(
-        vec![FunctionCallOutputContentItem::InputText { text: text.clone() }], Some(true));
-    let original_response = output.to_response_item("fixture", &ToolPayload::Function { arguments: "{}".into() });
+        vec![FunctionCallOutputContentItem::InputText { text: text.clone() }],
+        Some(true),
+    );
+    let original_response = output.to_response_item(
+        "fixture",
+        &ToolPayload::Function {
+            arguments: "{}".into(),
+        },
+    );
     let input = ModelProjectionInput {
-        fragments: vec![], spillable_text: text.clone(), outcome: ToolOutputOutcome::Success,
-        essential_inline: serde_json::json!({"exit_code": 0}), origin_call_id: "fixture".into(),
-        selection_facts: ProjectionSelectionFacts { mode: "all", available_fragments: 0,
-            selected_fragments: 0, exact_duplicates_removed: 0, selected_ids: vec![],
-            omitted_inline_ids: vec![], partial_ids: vec![] },
-        applied_token_limit: 4096, projected_text: text.clone(), preserved_content: vec![],
-        codex_home: home.path().into(), thread_id: "fixture".into(), tool_name: "fixture".into(),
-        original_output_sha256: canonical.sha256.clone(), original_output_tokens: canonical.approximate_tokens,
-        original_output_text: text.clone(), invocation_sha256: None, semantic_class: "fixture".into(),
-        source_dependencies: Default::default(), projection_eligible: true, projection_truncated: false,
-        canonical_artifact_required: true, predetermined_ranges: vec![], predetermined_json_pointers: vec![],
-        canonical, original_response, materialization: ProjectionMaterialization::CanonicalArtifact,
+        fragments: vec![],
+        spillable_text: text.clone(),
+        outcome: ToolOutputOutcome::Success,
+        essential_inline: serde_json::json!({"exit_code": 0}),
+        origin_call_id: "fixture".into(),
+        selection_facts: ProjectionSelectionFacts {
+            mode: "all",
+            available_fragments: 0,
+            selected_fragments: 0,
+            exact_duplicates_removed: 0,
+            selected_ids: vec![],
+            omitted_inline_ids: vec![],
+            partial_ids: vec![],
+        },
+        applied_token_limit: 4096,
+        projected_text: text.clone(),
+        preserved_content: vec![],
+        codex_home: home.path().into(),
+        thread_id: "fixture".into(),
+        tool_name: "fixture".into(),
+        original_output_sha256: canonical.sha256.clone(),
+        original_output_tokens: canonical.approximate_tokens,
+        original_output_text: text.clone(),
+        invocation_sha256: None,
+        semantic_class: "fixture".into(),
+        source_dependencies: Default::default(),
+        projection_eligible: true,
+        projection_truncated: false,
+        canonical_artifact_required: true,
+        predetermined_ranges: vec![],
+        predetermined_json_pointers: vec![],
+        canonical,
+        original_response,
+        materialization: ProjectionMaterialization::CanonicalArtifact,
     };
     PROJECTION_FIT_CALLS.with(|count| count.set(0));
     let projection = project_model_output(input).await.unwrap();
     PROJECTION_FIT_CALLS.with(|count| assert_eq!(count.get(), 1));
     assert!(projection.bounded.rendered().ends_with(&text));
-    let second = serialize_projection_fragments(projection.bounded.envelope().unwrap().clone(), &text, &[], 4096).unwrap();
+    let second = serialize_projection_fragments(
+        projection.bounded.envelope().unwrap().clone(),
+        &text,
+        &[],
+        4096,
+    )
+    .unwrap();
     assert_eq!(projection.bounded.rendered(), second.rendered());
 }
 
@@ -808,75 +888,35 @@ fn preflight_rejection_names_the_accepted_shape() {
     assert!(error.contains("required: path"), "{error}");
 }
 
-/// Map-valued arguments carry their entry schema in `additionalProperties`.
-///
-/// Session 0472 sent `update_plan` an acceptance criterion with an undeclared
-/// `evidence_policy` key and got back only "Additional properties are not
-/// allowed ('evidence_policy' was unexpected)". Acceptance IDs are map keys,
-/// and the shape lookup followed only declared `properties`, so the keys an
-/// acceptance entry does accept were never named.
+/// Map-valued arguments must report their entry schema, including numeric map keys.
 #[test]
 fn preflight_rejection_names_the_accepted_shape_of_map_entries() {
-    let spec = crate::tools::handlers::plan_spec::create_update_plan_tool();
-    let ToolSpec::Function(tool) = &spec else {
-        panic!("update_plan should be a function tool");
-    };
-    // The expected keys come from the tool's own entry schema.
-    let schema = serde_json::to_value(&tool.parameters).unwrap();
-    let entry = &schema["properties"]["acceptance"]["additionalProperties"];
-    let accepted = entry["properties"]
-        .as_object()
-        .expect("acceptance entries declare their keys")
-        .keys()
-        .map(String::as_str)
-        .collect::<Vec<_>>()
-        .join(", ");
-    let required = entry["required"]
-        .as_array()
-        .expect("acceptance entries declare required keys")
-        .iter()
-        .filter_map(Value::as_str)
-        .collect::<Vec<_>>()
-        .join(", ");
-    assert!(accepted.contains("blocker"), "{accepted}");
-    assert!(!accepted.contains("evidence_policy"), "{accepted}");
-    let name = ToolName::plain("update_plan");
-    // The recorded ID, and a numeric ID, which is also a map key.
-    for id in ["requested_subagent_execution", "1"] {
-        // The recorded call's shape (0472 L584), with long strings shortened.
-        let mut arguments = serde_json::json!({
-            "expected_revision": "a25652f9bbead6d6f631db35d2cd7f1b4fc806d78e59b22e359a337c8ae3b2c0",
-            "plan": [
-                {"step": "Read the full audit and classify every finding.", "status": "completed"},
-                {"step": "Implement supported source fixes locally.", "status": "completed", "continues": ["f4d9981aab2519fa"]},
-                {"step": "Inspect completed changes and report results.", "status": "completed"},
-                {"step": "Use the requested subagents: blocked until the task store is repaired.", "status": "pending", "continues": ["f4d9981aab2519fa"]}
-            ],
-            "acceptance_reviewed_revision": "e384416f131b113eeef0dee4e6256268eabb52792295e40e3da86e3c1bb09df8",
-            "acceptance": {},
-            "explanation": "Requested subagent execution remains pending on the external blocker."
-        });
-        arguments["acceptance"][id] = serde_json::json!({
-            "text": "Carry out the user's explicitly requested subagent work, without running tests.",
-            "origin": {"turn_id": "01a164f1-12b9-76e9-a124-a648049faafe", "sha256": "355edd8979ed62ba3730f15da80e1672275a8d642ae185ea4e45868a570b4426"},
-            "requirement": {"kind": "validation", "environment_id": "local", "path": "codex-rs/core/src/tools/handlers/multi_agents_v2/spawn.rs", "test_execution": false},
-            "evidence_policy": {"kind": "report_only"},
-            "blocker": "External host-runtime dependency: every agents.spawn_agent call failed."
-        });
+    use codex_tools::JsonSchema;
+    let spec = ToolSpec::Function(codex_tools::ResponsesApiTool {
+        name: "map_tool".into(),
+        description: "Map fixture".into(),
+        strict: false,
+        defer_loading: None,
+        parameters: JsonSchema::object(std::collections::BTreeMap::from([
+            ("entries".into(), JsonSchema::object(std::collections::BTreeMap::new(), None, Some(
+                JsonSchema::object(std::collections::BTreeMap::from([
+                    ("label".into(), JsonSchema::string(None)),
+                ]), Some(vec!["label".into()]), Some(false.into())).into()
+            )))
+        ]), Some(vec!["entries".into()]), Some(false.into())),
+        output_schema: None,
+    });
+    for id in ["requested_entry", "1"] {
         let payload = ToolPayload::Function {
-            arguments: arguments.to_string(),
+            arguments: serde_json::json!({"entries": {id: {"label": "entry", "unexpected": true}}}).to_string(),
         };
         let parsed = ParsedFunctionArguments::from_payload(&payload);
         let error = CodeModeArgumentPreflight::default()
-            .validate(&name, &spec, &payload, parsed.as_ref(), false)
-            .expect_err("an undeclared acceptance key must be rejected before dispatch");
-        // The recorded diagnosis is preserved and now followed by the remedy.
-        assert!(
-            error.contains(&format!(
-                "$/acceptance/{id}: Additional properties are not allowed ('evidence_policy' was unexpected) (accepted properties: {accepted}; required: {required})"
-            )),
-            "{error}"
-        );
+            .validate(&ToolName::plain("map_tool"), &spec, &payload, parsed.as_ref(), false)
+            .expect_err("undeclared entry keys must be rejected");
+        assert!(error.contains(&format!(
+            "$/entries/{id}: Additional properties are not allowed ('unexpected' was unexpected) (accepted properties: label; required: label)"
+        )), "{error}");
     }
 }
 
@@ -3008,6 +3048,7 @@ fn post_tool_feedback_wrapper_preserves_original_control_metadata() {
         }))),
         model_visible: FunctionToolOutput::from_text("hook feedback".to_string(), Some(false)),
         context_error: None,
+        accounting_error: None,
     };
 
     let metadata = wrapped.projection_metadata().expect("wrapper metadata");
@@ -3035,6 +3076,7 @@ fn failed_post_context_publication_retains_native_success_and_stop_cause() {
             Some(true),
         ),
         context_error: Some("context publication failed; stop continuation".into()),
+        accounting_error: None,
     };
     let payload = ToolPayload::Function {
         arguments: "{}".into(),
@@ -3991,6 +4033,39 @@ struct ToolLifecycleRecorder {
     records: Arc<std::sync::Mutex<Vec<RecordedToolLifecycle>>>,
 }
 
+struct FinishPanicProbe {
+    required: bool,
+    panic_on_create: bool,
+    panic_on_poll: bool,
+    panic_start: bool,
+    calls: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl codex_extension_api::ToolLifecycleContributor for FinishPanicProbe {
+    fn requires_finish_before_completion(&self) -> bool {
+        self.required
+    }
+
+    fn on_tool_start<'a>(
+        &'a self,
+        _: codex_extension_api::ToolStartInput<'a>,
+    ) -> codex_extension_api::ToolLifecycleFuture<'a> {
+        assert!(!self.panic_start, "start failure");
+        Box::pin(async {})
+    }
+
+    fn on_tool_finish<'a>(
+        &'a self,
+        _: codex_extension_api::ToolFinishInput<'a>,
+    ) -> codex_extension_api::ToolLifecycleFuture<'a> {
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        assert!(!self.panic_on_create, "finish construction failure");
+        Box::pin(async move {
+            assert!(!self.panic_on_poll, "finish polling failure");
+        })
+    }
+}
+
 impl codex_extension_api::ToolLifecycleContributor for ToolLifecycleRecorder {
     fn on_tool_start<'a>(
         &'a self,
@@ -4130,7 +4205,6 @@ async fn spawn_agent_function_tools_use_agent_matcher_alias() {
 
     let hook_payloads = [
         codex_tools::ToolName::plain("spawn_agent"),
-        codex_tools::ToolName::namespaced(MULTI_AGENT_V1_NAMESPACE, "spawn_agent"),
     ]
     .into_iter()
     .map(|tool_name| {
@@ -4150,10 +4224,6 @@ async fn spawn_agent_function_tools_use_agent_matcher_alias() {
     assert_eq!(
         hook_payloads,
         vec![
-            Some(PreToolUsePayload {
-                tool_name: HookToolName::spawn_agent(),
-                tool_input: serde_json::json!({ "message": "inspect this repo" }),
-            }),
             Some(PreToolUsePayload {
                 tool_name: HookToolName::spawn_agent(),
                 tool_input: serde_json::json!({ "message": "inspect this repo" }),
@@ -4211,6 +4281,7 @@ fn post_tool_feedback_survives_code_mode_projection() {
             )),
             model_visible,
             context_error: None,
+            accounting_error: None,
         }),
         model_projection: None,
         source_dependencies: None,
@@ -4246,6 +4317,7 @@ fn post_tool_feedback_survives_code_mode_projection() {
                 original: Box::new(codex_tools::JsonToolOutput::new(original.clone())),
                 model_visible,
                 context_error: None,
+                accounting_error: None,
             }),
             model_projection: None,
             source_dependencies: None,
@@ -4417,6 +4489,130 @@ async fn dispatch_notifies_tool_lifecycle_contributors() -> anyhow::Result<()> {
         .collect::<Vec<_>>();
     assert_eq!(expected, actual);
 
+    Ok(())
+}
+
+#[tokio::test]
+async fn required_finish_panics_preserve_result_and_optional_observers_remain_best_effort()
+-> anyhow::Result<()> {
+    for required in [false, true] {
+        for panic_on_create in [false, true] {
+            for failed_handler in [false, true] {
+                let (mut session, turn) = crate::session::tests::make_session_and_context().await;
+                let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                let mut builder =
+                    codex_extension_api::ExtensionRegistryBuilder::<crate::config::Config>::new();
+                for panics in [true, false] {
+                    builder.tool_lifecycle_contributor(Arc::new(FinishPanicProbe {
+                        required,
+                        panic_on_create: panics && panic_on_create,
+                        panic_on_poll: panics && !panic_on_create,
+                        panic_start: false,
+                        calls: Arc::clone(&calls),
+                    }));
+                }
+                session.services.extensions = Arc::new(builder.build());
+                let name = ToolName::plain("accounting_probe");
+                let registry = ToolRegistry::from_tools([Arc::new(LifecycleTestHandler {
+                    tool_name: name.clone(),
+                    result: if failed_handler {
+                        LifecycleTestResult::Err
+                    } else {
+                        LifecycleTestResult::RequiredArtifact
+                    },
+                })
+                    as Arc<dyn CoreToolRuntime>]);
+                let state = admitted_tool_dispatch_state();
+                let result = registry
+                    .dispatch_any_with_terminal_outcome(
+                        test_invocation(Arc::new(session), Arc::new(turn), "finish-probe", name),
+                        Arc::clone(&state),
+                    )
+                    .await;
+                assert_eq!(
+                    calls.load(std::sync::atomic::Ordering::SeqCst),
+                    2,
+                    "one panic must not skip later finish contributors"
+                );
+                assert!(state.is_terminal());
+                assert_eq!(state.accounting_is_unconfirmed(), required);
+                assert_eq!(
+                    state.try_abort(),
+                    crate::tools::context::ToolDispatchAbort::AlreadyTerminal
+                );
+                if failed_handler {
+                    let error = match result {
+                        Ok(_) => panic!("handler failed"),
+                        Err(error) => error.to_string(),
+                    };
+                    assert!(error.contains("handler failed"));
+                    assert_eq!(error.contains("accounting is unconfirmed"), required);
+                } else {
+                    let result = result?;
+                    assert_eq!(result.success_for_logging(), !required);
+                    assert!(result.canonical_delivery_artifact().is_some());
+                    let response = result.response();
+                    let text = consolidated_history_output_text(&response);
+                    assert!(text.contains("fully received result"));
+                    assert_eq!(text.contains("accounting is unconfirmed"), required);
+                    if required {
+                        assert!(result.code_mode_failure_is_error());
+                        assert!(
+                            result.sampling_request_signal().unwrap()["required_accounting_error"]
+                                .is_string()
+                        );
+                    }
+                    let expected =
+                        FunctionToolOutput::from_text("fully received result".into(), Some(true))
+                            .code_mode_result(&result.payload);
+                    assert_eq!(result.result.code_mode_result(&result.payload), expected);
+                    let consumed = consolidated_history_output_text(&result.into_response());
+                    assert_eq!(consumed.contains("accounting is unconfirmed"), required);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn required_finish_failure_after_start_rejection_never_claims_completion()
+-> anyhow::Result<()> {
+    let (mut session, turn) = crate::session::tests::make_session_and_context().await;
+    let mut builder = codex_extension_api::ExtensionRegistryBuilder::<crate::config::Config>::new();
+    builder.tool_lifecycle_contributor(Arc::new(FinishPanicProbe {
+        required: true,
+        panic_on_create: true,
+        panic_on_poll: false,
+        panic_start: true,
+        calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+    }));
+    session.services.extensions = Arc::new(builder.build());
+    let name = ToolName::plain("rejected_accounting_probe");
+    let registry = ToolRegistry::from_tools([Arc::new(LifecycleTestHandler {
+        tool_name: name.clone(),
+        result: LifecycleTestResult::Ok { success: true },
+    }) as Arc<dyn CoreToolRuntime>]);
+    let state = admitted_tool_dispatch_state();
+    let error = match registry
+        .dispatch_any_with_terminal_outcome(
+            test_invocation(
+                Arc::new(session),
+                Arc::new(turn),
+                "rejected-finish-probe",
+                name,
+            ),
+            Arc::clone(&state),
+        )
+        .await
+    {
+        Ok(_) => panic!("start rejected"),
+        Err(error) => error.to_string(),
+    };
+    assert!(!state.handler_started());
+    assert!(state.accounting_is_unconfirmed());
+    assert!(error.contains("start callback panicked"));
+    assert!(error.contains("accounting is unconfirmed"));
     Ok(())
 }
 
@@ -5641,6 +5837,7 @@ fn continuity_delivery_status_survives_output_wrappers_and_serialization() {
         original: unavailable,
         model_visible: FunctionToolOutput::from_text("hook feedback".into(), Some(true)),
         context_error: None,
+        accounting_error: None,
     };
     assert!(wrapped.model_delivery_unavailable());
     assert!(wrapped.success_for_logging());
@@ -5726,21 +5923,64 @@ fn audit150_repair_hints_follow_pointer_keys_arrays_and_local_refs() {
         "properties":{"a/b":entry,"a~b":entry,"0":entry,"ref":{"$ref":"#/$defs/entry"},
             "array":{"type":"array","items":entry}}});
     let spec = ToolSpec::Function(codex_tools::ResponsesApiTool {
-        name:"repair".into(), description:"repair hints".into(), strict:false, defer_loading:None,
-        parameters:serde_json::from_value(schema.clone()).unwrap(), output_schema:None,
+        name: "repair".into(),
+        description: "repair hints".into(),
+        strict: false,
+        defer_loading: None,
+        parameters: serde_json::from_value(schema.clone()).unwrap(),
+        output_schema: None,
     });
     let preflight = CodeModeArgumentPreflight::default();
     for key in ["a/b", "a~b", "0", "ref", "array"] {
-        let value = if key == "array" { serde_json::json!([{ "bad":7 }]) } else { serde_json::json!({"bad":7}) };
-        let payload = ToolPayload::Function { arguments:serde_json::json!({(key):value}).to_string() };
+        let value = if key == "array" {
+            serde_json::json!([{ "bad":7 }])
+        } else {
+            serde_json::json!({"bad":7})
+        };
+        let payload = ToolPayload::Function {
+            arguments: serde_json::json!({(key):value}).to_string(),
+        };
         let parsed = ParsedFunctionArguments::from_payload(&payload);
-        let error = preflight.validate(&ToolName::plain("repair"), &spec, &payload, parsed.as_ref(), false).unwrap_err();
-        assert!(error.contains("accepted properties: good"), "{key}: {error}");
-        let value = if key == "array" { serde_json::json!([{"good":"yes"}]) } else { serde_json::json!({"good":"yes"}) };
-        let payload = ToolPayload::Function { arguments:serde_json::json!({(key):value}).to_string() };
+        let error = preflight
+            .validate(
+                &ToolName::plain("repair"),
+                &spec,
+                &payload,
+                parsed.as_ref(),
+                false,
+            )
+            .unwrap_err();
+        assert!(
+            error.contains("accepted properties: good"),
+            "{key}: {error}"
+        );
+        let value = if key == "array" {
+            serde_json::json!([{"good":"yes"}])
+        } else {
+            serde_json::json!({"good":"yes"})
+        };
+        let payload = ToolPayload::Function {
+            arguments: serde_json::json!({(key):value}).to_string(),
+        };
         let parsed = ParsedFunctionArguments::from_payload(&payload);
-        assert!(preflight.validate(&ToolName::plain("repair"), &spec, &payload, parsed.as_ref(), false).is_ok());
+        assert!(
+            preflight
+                .validate(
+                    &ToolName::plain("repair"),
+                    &spec,
+                    &payload,
+                    parsed.as_ref(),
+                    false
+                )
+                .is_ok()
+        );
     }
     assert!(schema_at(&serde_json::json!({"$ref":"#"}), "").is_none());
-    assert!(schema_at(&serde_json::json!({"oneOf":[entry, {"type":"string"}]}), "/unknown").is_none());
+    assert!(
+        schema_at(
+            &serde_json::json!({"oneOf":[entry, {"type":"string"}]}),
+            "/unknown"
+        )
+        .is_none()
+    );
 }

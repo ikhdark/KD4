@@ -302,6 +302,7 @@ struct RunProcessParams {
     output_bytes_cap: Option<usize>,
     connection_cancellation: CancellationToken,
     terminal_cleanup: Option<ProcessTerminalCleanup>,
+    response_enqueued: Option<oneshot::Receiver<()>>,
 }
 
 struct ProcessTerminalCleanup {
@@ -319,6 +320,7 @@ struct SpawnProcessOutputParams {
     stream_output: bool,
     output_bytes_cap: Option<usize>,
     connection_cancellation: CancellationToken,
+    response_ready: CancellationToken,
 }
 
 #[derive(Default)]
@@ -422,7 +424,6 @@ impl ProcessExecRequestProcessor {
         let (response_enqueued_tx, response_enqueued_rx) = oneshot::channel();
         tokio::spawn(async move {
             let _run_owner = run_owner;
-            let _ = response_enqueued_rx.await;
             run_process(RunProcessParams {
                 outgoing,
                 request_id,
@@ -439,6 +440,7 @@ impl ProcessExecRequestProcessor {
                     sessions,
                     process_key,
                 }),
+                response_enqueued: Some(response_enqueued_rx),
             })
             .await;
         });
@@ -569,7 +571,7 @@ impl ProcessExecRequestProcessor {
             controls
         };
 
-        for control in controls {
+        futures::future::join_all(controls.into_iter().map(|control| async move {
             let _ = control
                 .control_tx
                 .send(ProcessControlRequest {
@@ -577,7 +579,7 @@ impl ProcessExecRequestProcessor {
                     response_tx: None,
                 })
                 .await;
-        }
+        })).await;
     }
 
     async fn send_control(
@@ -626,7 +628,20 @@ async fn run_process(params: RunProcessParams) {
         output_bytes_cap,
         connection_cancellation,
         terminal_cleanup,
+        response_enqueued,
     } = params;
+    let response_ready = CancellationToken::new();
+    if response_enqueued.is_none() {
+        response_ready.cancel();
+    }
+    let response_barrier = async {
+        match response_enqueued {
+            Some(response) => response.await.is_ok(),
+            None => true,
+        }
+    };
+    tokio::pin!(response_barrier);
+    let mut response_processed = false;
     let mut control_rx = control_rx;
     let mut control_open = true;
     let mut connection_cancelled = false;
@@ -659,6 +674,7 @@ async fn run_process(params: RunProcessParams) {
         stream_output: stream_stdout_stderr,
         output_bytes_cap,
         connection_cancellation: connection_cancellation.clone(),
+        response_ready: response_ready.clone(),
     });
     let stderr_handle = collect_spawn_process_output(SpawnProcessOutputParams {
         connection_id: request_id.connection_id,
@@ -670,10 +686,19 @@ async fn run_process(params: RunProcessParams) {
         stream_output: stream_stdout_stderr,
         output_bytes_cap,
         connection_cancellation: connection_cancellation.clone(),
+        response_ready: response_ready.clone(),
     });
 
     let exit_code = loop {
         tokio::select! {
+            delivered = &mut response_barrier, if !response_processed => {
+                response_processed = true;
+                if delivered {
+                    response_ready.cancel();
+                } else {
+                    connection_cancellation.cancel();
+                }
+            }
             _ = connection_cancellation.cancelled(), if !connection_cancelled => {
                 connection_cancelled = true;
                 if let Err(error) = session.request_terminate() {
@@ -736,6 +761,18 @@ async fn run_process(params: RunProcessParams) {
     let stderr = stderr_handle.await.unwrap_or_default();
     timeout_handle.abort();
 
+    // Supervision and capped pipe draining must not wait for response delivery.
+    // Only notification publication is ordered behind the spawn response.
+    if !response_processed {
+        let delivered = tokio::select! {
+            delivered = &mut response_barrier => delivered,
+            _ = connection_cancellation.cancelled() => false,
+        };
+        if !delivered {
+            connection_cancellation.cancel();
+        }
+    }
+
     // Keep the client handle reserved until the terminal is accepted or its
     // connection explicitly fails; a successor must not overtake this result.
     let delivered = outgoing
@@ -787,6 +824,7 @@ fn collect_spawn_process_output(
         mut stream_output,
         output_bytes_cap,
         connection_cancellation,
+        response_ready,
     } = params;
     tokio::spawn(async move {
         let mut buffer: Vec<u8> = Vec::new();
@@ -822,7 +860,7 @@ fn collect_spawn_process_output(
                 if capped_chunk.is_empty() && !cap_reached {
                     continue;
                 }
-                if !outgoing.try_send_server_notification_to_connection(
+                if !response_ready.is_cancelled() || !outgoing.try_send_server_notification_to_connection(
                     connection_id,
                     ServerNotification::ProcessOutputDelta(ProcessOutputDeltaNotification {
                         process_handle: process_handle.clone(),
@@ -980,6 +1018,7 @@ mod tests {
             output_bytes_cap: Some(1024),
             connection_cancellation: CancellationToken::new(),
             terminal_cleanup: None,
+            response_enqueued: None,
         })
         .await;
         assert!(
@@ -987,6 +1026,82 @@ mod tests {
             "a forgotten terminal must not leave a live connection"
         );
         assert!(!initialized.load(Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn connection_cleanup_admits_ready_kills_before_full_channels() {
+        let (outgoing_tx, _outgoing_rx) = mpsc::channel(1);
+        let processor = ProcessExecRequestProcessor::new(
+            Arc::new(OutgoingMessageSender::new(outgoing_tx, codex_analytics::AnalyticsEventsClient::disabled())),
+            Arc::new(EnvironmentManager::default_for_tests()),
+        );
+        let mut receivers = HashMap::new();
+        for (connection_id, handle) in [(ConnectionId(1), "a"), (ConnectionId(1), "b"), (ConnectionId(2), "foreign")] {
+            let (control_tx, control_rx) = mpsc::channel(1);
+            let (write_tx, _write_rx) = mpsc::channel(1);
+            processor.sessions.lock().await.insert(ConnectionProcessHandle { connection_id, process_handle: handle.into() }, ProcessSession { control_tx, write_tx, write_slots: Arc::new(Semaphore::new(1)) });
+            receivers.insert(handle.to_string(), control_rx);
+        }
+        let blocked = {
+            let sessions = processor.sessions.lock().await;
+            let key = sessions.keys().find(|key| key.connection_id == ConnectionId(1)).unwrap();
+            sessions[key].control_tx.try_send(ProcessControlRequest { control: ProcessControl::Kill, response_tx: None }).unwrap_or_else(|_| panic!("fill control channel"));
+            key.process_handle.clone()
+        };
+        let ready = if blocked == "a" { "b" } else { "a" };
+        let owner = processor.clone();
+        let cleanup = tokio::spawn(async move { owner.close_connection_processes(ConnectionId(1)).await });
+        assert!(matches!(timeout(Duration::from_secs(2), receivers.get_mut(ready).unwrap().recv()).await.unwrap().unwrap().control, ProcessControl::Kill));
+        assert!(!cleanup.is_finished(), "cleanup still owns the blocked admission");
+        receivers.get_mut(&blocked).unwrap().recv().await.unwrap();
+        timeout(Duration::from_secs(2), cleanup).await.unwrap().unwrap();
+        assert_eq!(processor.sessions.lock().await.len(), 1);
+        assert!(receivers.get_mut("foreign").unwrap().try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn spawn_response_barrier_does_not_block_supervision_or_capped_collection() {
+        let (writer_tx, _writer_rx) = mpsc::channel(1);
+        let (stdout_tx, stdout_rx) = tokio::sync::broadcast::channel(2);
+        let (stderr_tx, stderr_rx) = tokio::sync::broadcast::channel(1);
+        stdout_tx.send(b"abcdef".to_vec()).unwrap();
+        drop(stdout_tx);
+        drop(stderr_tx);
+        let (exit_tx, exit_rx) = oneshot::channel();
+        let terminated = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&terminated);
+        let spawned = spawn_from_driver(ProcessDriver { writer_tx, stdout_rx: stdout_rx.into(), stderr_rx: Some(stderr_rx.into()), exit_rx, terminator: Some(Box::new(move || { flag.store(true, Ordering::SeqCst); Ok(()) })), writer_handle: None, resizer: None });
+        let (control_tx, control_rx) = mpsc::channel(1);
+        let (_write_tx, write_rx) = mpsc::channel(1);
+        let (outgoing_tx, mut outgoing_rx) = mpsc::channel(4);
+        let (response_tx, response_rx) = oneshot::channel();
+        let owner = tokio::spawn(run_process(RunProcessParams {
+            outgoing: Arc::new(OutgoingMessageSender::new(outgoing_tx, codex_analytics::AnalyticsEventsClient::disabled())),
+            request_id: ConnectionRequestId { connection_id: ConnectionId(42), request_id: codex_app_server_protocol::RequestId::Integer(1) }, process_handle: "barrier".into(), spawned, control_rx, write_rx,
+            stream_stdin: false, stream_stdout_stderr: true, expiration: ExecExpiration::Cancellation(CancellationToken::new()), output_bytes_cap: Some(3), connection_cancellation: CancellationToken::new(), terminal_cleanup: None, response_enqueued: Some(response_rx),
+        }));
+        let (ack_tx, ack_rx) = oneshot::channel();
+        control_tx.send(ProcessControlRequest { control: ProcessControl::Kill, response_tx: Some(ack_tx) }).await.unwrap_or_else(|_| panic!("send kill"));
+        timeout(Duration::from_secs(2), ack_rx).await.unwrap().unwrap().unwrap();
+        assert!(terminated.load(Ordering::SeqCst));
+        assert!(outgoing_rx.try_recv().is_err(), "no notification may precede spawn response");
+        exit_tx.send(0).unwrap();
+        response_tx.send(()).unwrap();
+        timeout(Duration::from_secs(2), owner).await.unwrap().unwrap();
+        let mut bytes = Vec::new();
+        while let Ok(envelope) = outgoing_rx.try_recv() {
+            if let OutgoingEnvelope::ToConnection { message: OutgoingMessage::AppServerNotification(notification), .. } = envelope {
+                match notification {
+                    ServerNotification::ProcessOutputDelta(delta) => bytes.extend(STANDARD.decode(delta.delta_base64).unwrap()),
+                    ServerNotification::ProcessExited(exit) => {
+                        if let Some(base64) = exit.stdout_base64 { bytes.extend(STANDARD.decode(base64).unwrap()); }
+                        assert!(exit.stdout_cap_reached);
+                    }
+                    _ => panic!("unexpected notification"),
+                }
+            }
+        }
+        assert_eq!(bytes, b"abc");
     }
 
     #[tokio::test(start_paused = true)]
@@ -1020,6 +1135,8 @@ mod tests {
             if cancelled {
                 connection_cancellation.cancel();
             }
+            let response_ready = CancellationToken::new();
+            response_ready.cancel();
             let started = tokio::time::Instant::now();
             let capture = collect_spawn_process_output(SpawnProcessOutputParams {
                 connection_id: ConnectionId(42),
@@ -1031,6 +1148,7 @@ mod tests {
                 stream_output: true,
                 output_bytes_cap: Some(OUTPUT_CHUNK_SIZE_HINT + "€!".len()),
                 connection_cancellation,
+                response_ready,
             })
             .await
             .unwrap();
@@ -1104,6 +1222,11 @@ mod tests {
                     stream_output: true,
                     output_bytes_cap: None,
                     connection_cancellation: CancellationToken::new(),
+                    response_ready: {
+                        let ready = CancellationToken::new();
+                        ready.cancel();
+                        ready
+                    },
                 });
                 output_tx.send(bytes[..split].to_vec()).await.unwrap();
                 let OutgoingEnvelope::ToConnection {
@@ -1161,6 +1284,7 @@ mod tests {
                 stream_output: false,
                 output_bytes_cap: None,
                 connection_cancellation: CancellationToken::new(),
+                response_ready: CancellationToken::new(),
             });
             let slot = output_tx.reserve().await.unwrap();
             drop(slot); // The prefix was collected before expiry/EOF.
@@ -1271,6 +1395,7 @@ mod tests {
             output_bytes_cap: Some(DEFAULT_OUTPUT_BYTES_CAP),
             connection_cancellation: CancellationToken::new(),
             terminal_cleanup: None,
+            response_enqueued: None,
         }));
 
         let (write_response_tx, mut write_response_rx) = oneshot::channel();

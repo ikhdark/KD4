@@ -15,6 +15,7 @@ use codex_protocol::config_types::Verbosity;
 use codex_protocol::config_types::WebSearchMode;
 use codex_protocol::openai_models::ReasoningEffort;
 use codex_protocol::protocol::AskForApproval;
+use codex_protocol::validation::ValidationMode;
 
 /// Collection of common configuration options that a user can define as a unit
 /// in `config.toml`.
@@ -34,6 +35,8 @@ pub struct ConfigProfile {
     pub plan_mode_reasoning_effort: Option<ReasoningEffort>,
     pub model_reasoning_summary: Option<ReasoningSummary>,
     pub model_verbosity: Option<Verbosity>,
+    pub validation_mode: Option<ValidationMode>,
+    pub validation_full_budget: Option<usize>,
     /// Optional path to a JSON model catalog (applied on startup only).
     pub model_catalog_json: Option<AbsolutePathBuf>,
     pub personality: Option<Personality>,

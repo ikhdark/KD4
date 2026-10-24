@@ -6,7 +6,7 @@ use serde_json::Value;
 use super::RuntimeState;
 use super::value::json_to_v8;
 
-const PROJECTOR: &str = r#"((isProxy, boxedKind) => {
+const PROJECTOR: &str = r#"((isProxy, boxedKind, projectTool) => {
   const stringify = JSON.stringify;
   const parse = JSON.parse;
   const rawJSON = JSON.rawJSON;
@@ -16,6 +16,9 @@ const PROJECTOR: &str = r#"((isProxy, boxedKind) => {
   const isArray = Array.isArray;
   const charCodeAt = Function.prototype.call.bind(String.prototype.charCodeAt);
   const NativeError = Error;
+  const displayReplacer = (_key, item) =>
+    typeof item === 'bigint' ? {$bigint: item.toString()} : item;
+  const displayStringify = value => stringify(value, displayReplacer);
   const toBigInt = BigInt;
   const isSafeInteger = Number.isSafeInteger;
   // Unsafe integer JSON lexemes require at least 16 decimal digits. A cheap
@@ -24,14 +27,46 @@ const PROJECTOR: &str = r#"((isProxy, boxedKind) => {
   // false positive and retain the exact-integer path.
   const possibleUnsafeInteger = RegExp.prototype.exec.bind(/[0-9]{16}/);
   const integerLexeme = RegExp.prototype.exec.bind(/^-?[0-9]+$/);
+  const parseExact = value => possibleUnsafeInteger(value) === null ? parse(value) :
+    parse(value, (_key, item, context) =>
+      typeof item === 'number' && !isSafeInteger(item) &&
+      integerLexeme(context.source) !== null ? toBigInt(context.source) : item);
   const keys = Object.getOwnPropertyNames;
   const descriptor = Object.getOwnPropertyDescriptor;
   const prototype = Object.getPrototypeOf;
   const objectPrototype = Object.prototype;
   const arrayPrototype = Array.prototype;
   const projections = new WeakMap();
-  const get = projections.get.bind(projections);
+  const lookup = projections.get.bind(projections);
   const set = projections.set.bind(projections);
+  const get = value => {
+    const entry = lookup(value);
+    if (!entry || entry.disabled) return undefined;
+    if (!entry.lazy && !entry.recipeRoot) return entry;
+    const root = entry.recipeRoot || entry;
+    if (root.lazy) {
+      root.projected = projectTool(root.serialized, root.namespace, root.toolName);
+      root.disabled = root.projected === undefined;
+      if (!root.disabled) root.original = parseExact(root.serialized);
+      root.lazy = false;
+      delete root.serialized;
+    }
+    if (root.disabled) { entry.disabled = true; return undefined; }
+    if (entry.recipeRoot) {
+      let original = root.original, projected = root.projected;
+      for (const key of entry.path) {
+        original = original?.[key];
+        projected = projected?.[key];
+      }
+      if (projected === undefined) { entry.disabled = true; return undefined; }
+      entry.original = original;
+      entry.projected = projected;
+      entry.rootOriginal = root.original;
+      delete entry.recipeRoot;
+      delete entry.path;
+    }
+    return entry;
+  };
   // Canonical helper evidence is not a diagnostic preview. Clone data
   // descriptors without invoking user code, retaining every node and control
   // field. Storage's existing byte admission rejects an oversized snapshot
@@ -188,10 +223,20 @@ const PROJECTOR: &str = r#"((isProxy, boxedKind) => {
     const entry = get(value);
     return !entry?.root || inert(entry.root, seen, depth + 1);
   }
-  // The captured native serializer exactly detects escaping of primitive strings.
-  // Regex lookarounds were slower in the narrow ASCII probe. This also avoids
-  // script-overridable RegExp methods without changing Unicode semantics.
-  const escapes = text => stringify(text).length !== text.length + 2;
+  // Native escaping won a narrow ASCII probe; this predicate instead avoids
+  // allocating that full escaped copy. Match JSON's lone-surrogate rules.
+  const escapes = text => {
+    for (let i = 0; i < text.length; ++i) {
+      const cp = charCodeAt(text, i);
+      if (cp < 32 || cp === 34 || cp === 92) return true;
+      if (cp >= 0xd800 && cp <= 0xdfff) {
+        const next = charCodeAt(text, i + 1);
+        if (cp > 0xdbff || !(next >= 0xdc00 && next <= 0xdfff)) return true;
+        ++i;
+      }
+    }
+    return false;
+  };
   const stringIndexOf = Function.prototype.call.bind(String.prototype.indexOf);
   const stringSlice = Function.prototype.call.bind(String.prototype.slice);
   const stringCodePointAt = Function.prototype.call.bind(String.prototype.codePointAt);
@@ -200,6 +245,40 @@ const PROJECTOR: &str = r#"((isProxy, boxedKind) => {
     while ((offset = stringIndexOf(text, '\n', offset + 1)) !== -1) ++count;
     return count;
   };
+  const utf8Size = text => {
+    let size = 0;
+    for (let i = 0; i < text.length; ++i) {
+      const cp = stringCodePointAt(text, i);
+      size += cp < 0x80 ? 1 : cp < 0x800 ? 2 : cp < 0x10000 ? 3 : 4;
+      if (cp > 0xffff) ++i;
+    }
+    return size;
+  };
+  function displaySize(value, utf8 = false) {
+    let stringSize = 0;
+    // Keep native traversal, user serializers and BigInt display conversion.
+    // Count primitive string contents, leaving only empty strings in the
+    // temporary JSON skeleton instead of materializing escaped source bodies.
+    const skeleton = stringify(value, (key, item) => {
+      item = displayReplacer(key, item);
+      if (typeof item !== 'string') return item;
+      for (let i = 0; i < item.length; ++i) {
+        const cp = charCodeAt(item, i);
+        if (cp === 34 || cp === 92) stringSize += 2;
+        else if (cp < 32)
+          stringSize += cp === 8 || cp === 9 || cp === 10 || cp === 12 || cp === 13 ? 2 : 6;
+        else if (cp >= 0xd800 && cp <= 0xdfff) {
+          const next = charCodeAt(item, i + 1);
+          if (cp <= 0xdbff && next >= 0xdc00 && next <= 0xdfff) {
+            stringSize += utf8 ? 4 : 2;
+            ++i;
+          } else stringSize += 6;
+        } else stringSize += utf8 ? cp < 0x80 ? 1 : cp < 0x800 ? 2 : 3 : 1;
+      }
+      return '';
+    });
+    return stringSize + (utf8 ? utf8Size(skeleton) : skeleton.length);
+  }
   // Shared hydration is scoped to its parent response. A selected row may not
   // contain the earlier body, so resolve it from the retained immutable parent.
   function standaloneFragment(fragment, source, cache) {
@@ -286,18 +365,9 @@ const PROJECTOR: &str = r#"((isProxy, boxedKind) => {
     // Include all attribution and conservative batch body-index overhead. Raw
     // bodies contribute the same UTF-8 bytes in both forms; escaped JSON and
     // added framing differ only in their surrounding representation.
-    const bytes = text => {
-      let size = 0;
-      for (let i = 0; i < text.length; ++i) {
-        const cp = stringCodePointAt(text, i);
-        size += cp < 0x80 ? 1 : cp < 0x800 ? 2 : cp < 0x10000 ? 3 : 4;
-        if (cp > 0xffff) ++i;
-      }
-      return size;
-    };
-    const framedLength = bytes(stringify(raw.envelope)) + raw.texts.reduce((size, body) =>
-      size + bytes(stringify({body: Number.MAX_SAFE_INTEGER, ...body.source})) + 11 + bytes(body.text), 0);
-    return framedLength < bytes(stringify(projected)) ? raw : undefined;
+    const framedLength = displaySize(raw.envelope, true) + raw.texts.reduce((size, body) =>
+      size + displaySize({body: Number.MAX_SAFE_INTEGER, ...body.source}, true) + 11 + utf8Size(body.text), 0);
+    return framedLength < displaySize(projected, true) ? raw : undefined;
   }
   function rawText(projected, fragment, source = projected) {
     if (fragment) {
@@ -366,9 +436,9 @@ const PROJECTOR: &str = r#"((isProxy, boxedKind) => {
       const envelope = {...projected, content};
       // Short MCP messages should not grow just to acquire a frame. Budget
       // conservatively for body indices when this result is nested in a batch.
-      const framedLength = stringify(envelope).length + texts.reduce((size, body) =>
-        size + stringify({body: Number.MAX_SAFE_INTEGER, ...body.source}).length + 11 + body.text.length, 0);
-      if (framedLength >= stringify(projected).length) return undefined;
+      const framedLength = displaySize(envelope) + texts.reduce((size, body) =>
+        size + displaySize({body: Number.MAX_SAFE_INTEGER, ...body.source}) + 11 + body.text.length, 0);
+      if (framedLength >= displaySize(projected)) return undefined;
       return {envelope, texts};
     }
     return undefined;
@@ -438,6 +508,27 @@ const PROJECTOR: &str = r#"((isProxy, boxedKind) => {
     };
   }
   return function project(value, original, projected, sourceFragments) {
+    if (arguments.length === 5) {
+      // Retain the transport string as an immutable mutation baseline. The
+      // extra object graphs and display projection exist only when observed.
+      const root = {lazy: true, serialized: original, namespace: projected,
+        toolName: sourceFragments, sourceFragments: arguments[4]};
+      set(value, root);
+      if (root.sourceFragments && Array.isArray(value.results)) {
+        const rows = (values, path) => {
+          set(values, {recipeRoot: root, path, fragment: 'rows', root: value});
+          values.forEach((row, i) => {
+            if (row === null || typeof row !== 'object') return;
+            const rowPath = [...path, i];
+            set(row, {recipeRoot: root, path: rowPath, fragment: 'row', root: value});
+            if (row.selector?.kind === 'search' && Array.isArray(row.value?.hydrated_ranges))
+              rows(row.value.hydrated_ranges, [...rowPath, 'value', 'hydrated_ranges']);
+          });
+        };
+        rows(value.results, ['results']);
+      }
+      return;
+    }
     // Only the native store/load callbacks can export/import this metadata.
     // Keep a small edit recipe, not a second copy of source text. Arbitrary
     // lookalike JSON never gains tool provenance.
@@ -491,9 +582,13 @@ const PROJECTOR: &str = r#"((isProxy, boxedKind) => {
           if (edit.remove) delete parent[key];
           else Object.defineProperty(parent, key, {value: edit.value, enumerable: true, writable: true, configurable: true});
         }
-        if (record.fragment) set(target, {original: clone(target), projected: display,
-          fragment: record.fragment, rootOriginal: record.source});
-        else project(target, clone(target), display, record.sourceFragments);
+        if (record.fragment) {
+          // Reuse native source registration, including selectable descendants.
+          // The private envelope also guards mutations of the restored parent.
+          const root = {...record.source, results: record.fragment === 'rows' ? target : [target]};
+          const shown = {...record.source, results: record.fragment === 'rows' ? display : [display]};
+          project(root, clone(root), shown, true);
+        } else project(target, clone(target), display, record.sourceFragments);
       }
       return;
     }
@@ -501,24 +596,50 @@ const PROJECTOR: &str = r#"((isProxy, boxedKind) => {
     // script-overridable JSON methods. BigInt never silently becomes Number.
     if (arguments.length === 2 || (arguments.length === 3 && original === 'canonical')) {
       if (original === 'helper_evidence') {
-        // Only used after full uncaught-helper serialization fails or exceeds
-        // the cell error limit. Give every settled node its own small budget;
-        // an oversized sibling must not hide later statuses and handles.
+        // Reserve exact controls globally, recursively, before optional body
+        // previews. A coordinating node must not divide its leaves' allowance.
+        let remaining = 1024 * 1024, items = 0;
+        const active = new Set();
+        const body = new Set(['output', 'stdout', 'stderr', 'text', 'content', 'body', 'stack']);
+        const controls = new Set(['status', 'results', 'reason', 'value', 'evidence',
+          'receipt', 'recovery', 'continuation', 'artifact_id', 'session_id',
+          'session_capabilities', 'incarnation', 'terminal', 'observations']);
+        const exact = (item, depth = 0) => {
+          if (++items > 16384 || depth >= 64 || remaining < 32) return {details_omitted:true};
+          if (item === null || typeof item !== 'object') {
+            const size = typeof item === 'string' ? stringify(item).length * 3 : 32;
+            if (size > remaining) return {details_omitted:true};
+            remaining -= size;
+            return typeof item === 'bigint' ? {$bigint:item.toString()} : item;
+          }
+          if (isProxy(item) || active.has(item)) return {details_omitted:true};
+          active.add(item);
+          try {
+            const result = Object.create(null);
+            const names = keys(item).filter(key => key !== 'length' && !body.has(key));
+            names.sort((a,b) => Number(!controls.has(a)) - Number(!controls.has(b)));
+            for (const key of names) {
+              if (key.length > 512 || remaining < key.length * 6 + 32) { result.details_omitted = true; continue; }
+              remaining -= key.length * 6 + 8;
+              const field = descriptor(item, key);
+              result[key] = field && 'value' in field ? exact(field.value, depth + 1) : '[accessor omitted]';
+            }
+            if (keys(item).some(key => body.has(key))) result.body_omitted = true;
+            return result;
+          } finally { active.delete(item); }
+        };
         const names = value !== null && typeof value === 'object' ? keys(value) : [];
         const entries = names.filter(name => name !== 'length').slice(0, 256).map(name => {
           const field = descriptor(value, name);
-          return {key: name.length > 512 ? name.slice(0, 512) + '[truncated]' : name,
-            value: field && 'value' in field ? errorProjection(field.value, 2048, true) : '[accessor omitted]'};
+          return {key: name.length > 512 ? '[node identity omitted]' : name,
+            value: field && 'value' in field ? exact(field.value) : '[accessor omitted]'};
         });
         return stringify({bounded_helper_evidence: true, entries,
           omitted_entries: Math.max(0, names.filter(name => name !== 'length').length - entries.length)},
           (_key, item) => typeof item === 'bigint' ? {$bigint:item.toString()} : item);
       }
       if (original === 'parse') {
-        if (typeof value === 'string' && possibleUnsafeInteger(value) === null) return parse(value);
-        return parse(value, (_key, item, context) =>
-          typeof item === 'number' && !isSafeInteger(item) &&
-          integerLexeme(context.source) !== null ? toBigInt(context.source) : item);
+        return parseExact(value);
       }
       const previous = canonicalSerialization;
       if (original === 'canonical') canonicalSerialization = true;
@@ -559,8 +680,7 @@ const PROJECTOR: &str = r#"((isProxy, boxedKind) => {
     const direct = value !== null && typeof value === 'object' ? get(value) : undefined;
     if (direct && !direct.root && typeof direct.projected?.output === 'string' &&
         !escapes(direct.projected.output) && inert(value, new Set()) && same(value, direct.original)) {
-      return stringify(direct.projected, (_key, item) =>
-        typeof item === 'bigint' ? {$bigint:item.toString()} : item);
+      return displayStringify(direct.projected);
     }
     const texts = [];
     // Both caches die with this serialization. No cross-call provenance,
@@ -606,7 +726,7 @@ const PROJECTOR: &str = r#"((isProxy, boxedKind) => {
       return roots.get(entry.root);
     };
     const rendered = stringify(value, (_key, item) => {
-      if (typeof item === 'bigint') return { $bigint: item.toString() };
+      if (typeof item === 'bigint') return displayReplacer(_key, item);
       if (item instanceof NativeError) return errorProjection(item);
       const entry = item !== null && typeof item === 'object' ? get(item) : undefined;
       if (!entry) return item;
@@ -649,10 +769,35 @@ const PROJECTOR: &str = r#"((isProxy, boxedKind) => {
       return raw.envelope;
     });
     return texts.length ? rendered + '\n' + texts.map((body, index) =>
-      '[source ' + stringify({body: index + 1, ...body.source, same_as_body: body.same_as_body}) + ']\n' +
+      '[source ' + displayStringify({body: index + 1, ...body.source, same_as_body: body.same_as_body}) + ']\n' +
         (body.same_as_body === undefined ? body.text : '')).join('\n') : rendered;
   };
 })"#;
+
+fn project_tool_callback(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments,
+    mut retval: v8::ReturnValue<v8::Value>,
+) {
+    let serialized = args.get(0).to_rust_string_lossy(scope);
+    let raw = match serde_json::from_str::<Value>(&serialized) {
+        Ok(raw) => raw,
+        Err(error) => {
+            super::value::throw_type_error(scope, &format!("invalid projection source: {error}"));
+            return;
+        }
+    };
+    let namespace = (!args.get(1).is_null_or_undefined())
+        .then(|| args.get(1).to_rust_string_lossy(scope));
+    let name = args.get(2).to_rust_string_lossy(scope);
+    let tool = codex_protocol::ToolName::new(namespace, name);
+    if let Some(projected) = codex_code_mode_protocol::model_visible_tool_result(&tool, &raw) {
+        match json_to_v8(scope, &projected) {
+            Some(projected) => retval.set(projected),
+            None => super::value::throw_type_error(scope, "failed to materialize output projection"),
+        }
+    }
+}
 
 fn is_proxy_callback(
     _scope: &mut v8::PinScope<'_, '_>,
@@ -693,9 +838,11 @@ pub(super) fn prepare(
         .ok_or_else(|| "failed to install proxy guard".to_string())?;
     let boxed_kind = v8::Function::new(scope, boxed_value_kind_callback)
         .ok_or_else(|| "failed to install JSON wrapper brand checks".to_string())?;
+    let project_tool = v8::Function::new(scope, project_tool_callback)
+        .ok_or_else(|| "failed to install lazy output projection".to_string())?;
     let receiver = v8::undefined(scope).into();
     let function = factory
-        .call(scope, receiver, &[is_proxy.into(), boxed_kind.into()])
+        .call(scope, receiver, &[is_proxy.into(), boxed_kind.into(), project_tool.into()])
         .and_then(|value| v8::Local::<v8::Function>::try_from(value).ok())
         .ok_or_else(|| "failed to initialize output projector".to_string())?;
     Ok(v8::Global::new(scope, function))
@@ -713,6 +860,43 @@ pub(super) fn install(scope: &mut v8::PinScope<'_, '_>) -> Result<(), String> {
         state.output_projector = Some(function);
     }
     Ok(())
+}
+
+pub(super) fn tool_result_to_v8<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    raw: &Value,
+    tool: &codex_protocol::ToolName,
+) -> Result<v8::Local<'s, v8::Value>, String> {
+    let serialized = serde_json::to_string(raw).map_err(|error| error.to_string())?;
+    let json = v8::String::new(scope, &serialized)
+        .ok_or_else(|| "failed to allocate tool response".to_string())?;
+    let value = json_codec(scope, json.into(), "parse")
+        .ok_or_else(|| "failed to parse tool response".to_string())?;
+    // Keep this eligibility list aligned with model_visible_tool_result. Other
+    // tools need no display recipe or retained transport snapshot at all.
+    if !raw.is_object() || (tool.namespace.is_none() && !tool.name.starts_with("mcp__")
+        && !matches!(tool.name.as_str(), "update_plan" | "apply_patch" | "read_file"
+            | "read_tool_output" | "exec_command" | "write_stdin"))
+    {
+        return Ok(value);
+    }
+    let namespace: v8::Local<v8::Value> = match tool.namespace.as_deref() {
+        Some(namespace) => v8::String::new(scope, namespace)
+            .ok_or_else(|| "failed to allocate projection namespace".to_string())?.into(),
+        None => v8::null(scope).into(),
+    };
+    let name = v8::String::new(scope, &tool.name)
+        .ok_or_else(|| "failed to allocate projection tool name".to_string())?;
+    let fragments = v8::Boolean::new(scope, tool.namespace.is_none()
+        && matches!(tool.name.as_str(), "read_file" | "read_tool_output"));
+    let function = scope.get_slot::<RuntimeState>()
+        .and_then(|state| state.output_projector.as_ref())
+        .map(|function| v8::Local::new(scope, function))
+        .ok_or_else(|| "output projector unavailable".to_string())?;
+    let receiver = v8::undefined(scope).into();
+    function.call(scope, receiver, &[value, json.into(), namespace, name.into(), fragments.into()])
+        .ok_or_else(|| "failed to register lazy output projection".to_string())?;
+    Ok(value)
 }
 
 pub(super) fn register(
@@ -1337,6 +1521,19 @@ mod tests {
             serde_json::from_str::<Value>(&changed[0]).unwrap()["results"][0]["text"],
             "changed"
         );
+
+        let shared = json!({"artifact_id":"fragment-artifact", "canonical_sha256":"sha", "complete":true,
+            "results":[{"selector":{"kind":"search","query":"alpha"},"status":"ok",
+                "value":{"hydrated_ranges":[{"canonical_range":{"start":0,"end":13},"text":"alpha\nβ😀\n"}]}},
+                {"selector":{"kind":"search","query":"β"},"status":"ok",
+                "value":{"hydrated_ranges":[{"canonical_range":{"start":0,"end":13},"shared":true}]}}]});
+        let (_, saved, _) = cell("const r=await tools.read_file({}); store('rows',r.results); store('row',r.results[1]);", HashMap::new(), &shared, MAX_BUFFERED_OUTPUT_BYTES).await;
+        let (selected, _, loss) = cell("text(load('rows')[1]); text(load('row').value.hydrated_ranges[0]);", saved, &shared, MAX_BUFFERED_OUTPUT_BYTES).await;
+        assert!(!loss);
+        for selected in selected {
+            assert!(selected.contains("fragment-artifact"), "{selected}");
+            assert!(selected.contains("alpha\nβ😀\n"), "{selected}");
+        }
     }
 
     #[tokio::test]
@@ -1729,11 +1926,12 @@ mod tests {
         .unwrap();
         command_envelope.as_object_mut().unwrap().remove("output");
         command_envelope["output_lines"] = json!(lines);
-        // Recovered source keeps its CRLF bytes and quotes unescaped too.
+        // Use enough escaping to amortize the source label: tiny results stay
+        // inline under the no-growth rule. Recovery still preserves CRLF bytes.
         let recovery = json!({"artifact_id":"retained", "complete":true,
-            "results":[{"status":"ok", "text":"fn a() {\r\n    \"x\"\r\n}"}]});
+            "results":[{"status":"ok", "text":source}]});
         let recovery_envelope = json!({"artifact_id":"retained", "complete":true,
-            "results":[{"status":"ok", "text_lines":3}]});
+            "results":[{"status":"ok", "text_lines":lines}]});
         let search = json!({"artifact_id":"search-evidence", "complete":false,
             "results":[{"selector":{"kind":"search","query":"fn a"}, "status":"ok",
                 "continuation":{"kind":"search","query":"fn a","start_byte":source.len()},
@@ -1758,7 +1956,7 @@ mod tests {
                 "read_tool_output",
                 recovery,
                 recovery_envelope,
-                "fn a() {\r\n    \"x\"\r\n}",
+                source.as_str(),
             ),
             (
                 "search",
@@ -1957,7 +2155,7 @@ mod tests {
 
     #[tokio::test]
     async fn verified10_selected_shared_evidence_and_safe_annotations() {
-        let source = "λ\r\nunique evidence\n".repeat(32);
+        let source = "\"λ\\path\"\r\nunique evidence\n".repeat(128);
         let search = json!({"artifact_id":"snapshot", "source_sha256":"revision", "results":[
             {"selector":{"kind":"search"},"status":"ok","value":{"hydrated_ranges":[
                 {"canonical_range":{"start":0,"end":source.len()},"text":source}]}},

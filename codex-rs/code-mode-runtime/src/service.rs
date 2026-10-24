@@ -22,7 +22,6 @@ use codex_code_mode_protocol::StartedCell;
 use codex_code_mode_protocol::WaitOutcome;
 use codex_code_mode_protocol::WaitRequest;
 use serde_json::Value as JsonValue;
-use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 
 use crate::session_runtime as runtime;
@@ -85,16 +84,14 @@ impl InProcessCodeModeSession {
             .map_err(|error| error.to_string())?;
         let cell_id = protocol_cell_id(&started.cell_id);
         let response_cell_id = cell_id.clone();
-        let (response_tx, response_rx) = oneshot::channel();
-        tokio::spawn(async move {
-            let response = started
+        let response = Box::pin(async move {
+            started
                 .initial_event()
                 .await
                 .map_err(|error| error.to_string())
-                .and_then(|event| runtime_response(&response_cell_id, event));
-            let _ = response_tx.send(response);
+                .and_then(|event| runtime_response(&response_cell_id, event))
         });
-        Ok(StartedCell::from_result_receiver(cell_id, response_rx))
+        Ok(StartedCell::from_result_future(cell_id, response))
     }
 
     pub async fn wait(&self, request: WaitRequest) -> Result<WaitOutcome, String> {

@@ -731,6 +731,20 @@ fn system_proxy_cache_is_bounded() {
 
 #[test]
 fn parses_static_winhttp_proxy_entries_for_target_scheme() {
+    for input in [
+        "default-proxy:8080;https=secure-proxy:8443",
+        "https=secure-proxy:8443;default-proxy:8080",
+        "default-proxy:8080 HTTPS=secure-proxy:8443",
+    ] {
+        assert_eq!(
+            parse_static_proxy_list(input, "https"),
+            ParsedProxyListDecision::Proxy("http://secure-proxy:8443".into())
+        );
+    }
+    assert_eq!(
+        parse_static_proxy_list("http=web-proxy:8080", "https"),
+        ParsedProxyListDecision::Direct
+    );
     assert_eq!(
         parse_proxy_list("http=web-proxy:8080;https=secure-proxy:8443", "https"),
         ParsedProxyListDecision::Proxy("http://secure-proxy:8443".to_string())

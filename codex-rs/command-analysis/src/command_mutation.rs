@@ -287,9 +287,15 @@ fn is_direct_file_read_command(command: &[String], unwrapped: &[String]) -> bool
     if !program.eq_ignore_ascii_case("cmd") {
         return false;
     }
-    !command
-        .iter()
-        .any(|token| token.contains(['>', '<', '&', '|', ';', '`', '$']))
+    // AutoRun and environment/delayed expansion can execute commands not
+    // present in the literal `type` script. Only the plain /d form is proven.
+    command
+        .get(1)
+        .is_some_and(|arg| arg.eq_ignore_ascii_case("/d"))
+        && command
+            .get(2)
+            .is_some_and(|arg| arg.eq_ignore_ascii_case("/c"))
+        && simple_wrapped_script_argv(command).is_some()
 }
 
 fn is_read_only_powershell_command(command: &[String]) -> bool {
@@ -554,7 +560,6 @@ fn is_read_only_git_subcommand(subcommand: &str) -> bool {
             | "grep"
             | "log"
             | "ls-files"
-            | "ls-remote"
             | "ls-tree"
             | "name-rev"
             | "rev-parse"
@@ -603,7 +608,9 @@ fn mutating_command_paths(command: &[String], cwd: Option<&Path>) -> Option<BTre
             let operands = simple_path_operands(args)?;
             (operands.len() >= 2).then(|| operands.into_iter().skip(1).collect())?
         }
-        "rustfmt" if !args.iter().any(|arg| arg == "--check") => rustfmt_path_operands(args)?,
+        // rustfmt can recursively rewrite out-of-line modules, including ones
+        // discovered through configuration. Its argv is not an exact write set.
+        "rustfmt" => return None,
         "prettier" if !args.iter().any(|arg| arg == "--check") => simple_path_operands(args)?,
         _ => return None,
     };
@@ -638,6 +645,11 @@ fn simple_wrapped_script_argv(command: &[String]) -> Option<Vec<String>> {
     let [script] = &command[position.saturating_add(1)..] else {
         return None;
     };
+    if command_basename(&program) == "cmd"
+        && (position != 2 || !command[1].eq_ignore_ascii_case("/d"))
+    {
+        return None;
+    }
     if script.contains([
         '\'', '"', '`', '$', '*', '?', '[', ']', '{', '}', '(', ')', '|', '&', ';', '<', '>', '@',
         '#', ',', '%', '~', '!', '^', '\n', '\r',
@@ -651,27 +663,6 @@ fn simple_wrapped_script_argv(command: &[String]) -> Option<Vec<String>> {
         .collect::<Vec<_>>();
     // A nested wrapper is not one plain command.
     (!argv.is_empty() && simple_wrapped_script_argv(&argv).is_none()).then_some(argv)
-}
-
-/// rustfmt operands, skipping the options whose separate value is not a path
-/// it rewrites. Any other option keeps the conservative unknown-path result.
-fn rustfmt_path_operands(args: &[String]) -> Option<Vec<String>> {
-    let mut operands = Vec::new();
-    let mut args = args.iter();
-    while let Some(arg) = args.next() {
-        let name = arg.split_once('=').map_or(arg.as_str(), |(name, _)| name);
-        match name {
-            "--edition" | "--style-edition" | "--config" | "--config-path" | "--color" => {
-                if !arg.contains('=') {
-                    args.next()?;
-                }
-            }
-            "--skip-children" | "--unstable-features" | "-q" | "--quiet" | "-v" | "--verbose" => {}
-            option if option.starts_with('-') => return None,
-            path => operands.push(path.to_string()),
-        }
-    }
-    Some(operands)
 }
 
 fn simple_path_operands(args: &[String]) -> Option<Vec<String>> {
@@ -702,18 +693,14 @@ fn simple_path_operands(args: &[String]) -> Option<Vec<String>> {
 }
 
 fn normalized_command_tokens(command: &[String]) -> Vec<String> {
-    command
+    // Structured argv already owns its boundaries. Split only a proven plain
+    // shell script, never filenames such as `a --check b.rs`.
+    let script = simple_wrapped_script_argv(command);
+    script
+        .as_deref()
+        .unwrap_or(command)
         .iter()
-        .flat_map(|token| token.split_whitespace())
-        .map(|part| {
-            part.trim_matches(|ch: char| {
-                matches!(
-                    ch,
-                    '"' | '\'' | '`' | '(' | ')' | '[' | ']' | '{' | '}' | ';' | '&' | '|'
-                )
-            })
-            .to_ascii_lowercase()
-        })
+        .map(|part| part.to_ascii_lowercase())
         .filter(|token| !token.is_empty())
         .collect()
 }
@@ -815,5 +802,51 @@ mod configured_git_helper_tests {
             // Dependency scoping must accept every spelling approval admits.
             assert!(command_is_read_only_git(&argv(&args)), "{args:?}");
         }
+    }
+}
+
+#[cfg(test)]
+mod audit04_mutation_regressions {
+    use super::*;
+
+    fn argv(args: &[&str]) -> Vec<String> {
+        args.iter().map(|arg| (*arg).to_owned()).collect()
+    }
+
+    #[test]
+    fn formatter_filenames_never_manufacture_check_options_or_exact_write_sets() {
+        for filename in ["src/a --check b.rs", "src/a=b.rs", "src/lib.rs"] {
+            assert_eq!(
+                command_mutation(&argv(&["rustfmt", filename]), Some(Path::new("/repo"))),
+                CommandMutation::KnownMutation { paths: None },
+                "{filename}",
+            );
+        }
+        assert_eq!(
+            command_mutation(&argv(&["rustfmt", "--check", "src/lib.rs"]), None),
+            CommandMutation::ReadOnly,
+        );
+    }
+
+    #[test]
+    fn cmd_type_requires_disabled_autorun_and_no_expansion() {
+        for args in [
+            vec!["cmd", "/d", "/c", "type %P%"],
+            vec!["cmd", "/d", "/c", "type !P!"],
+            vec!["cmd", "/c", "type README.txt"],
+        ] {
+            assert_eq!(command_mutation(&argv(&args), None), CommandMutation::Uncertain);
+        }
+        assert_eq!(
+            command_mutation(&argv(&["cmd", "/d", "/c", "type README.txt"]), None),
+            CommandMutation::ReadOnly,
+        );
+    }
+
+    #[test]
+    fn remote_helper_transports_are_not_certified_read_only() {
+        let command = argv(&["git", "ls-remote", "audit::address"]);
+        assert!(!command_is_read_only_git(&command));
+        assert_eq!(command_mutation(&command, None), CommandMutation::Uncertain);
     }
 }

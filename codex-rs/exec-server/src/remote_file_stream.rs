@@ -25,7 +25,6 @@ struct FileReadRegistration {
     client: ExecServerClient,
     rpc_client: Arc<RpcClient>,
     handle_id: String,
-    runtime: Option<tokio::runtime::Handle>,
     cleanup_slot: Option<tokio::sync::OwnedSemaphorePermit>,
 }
 
@@ -45,7 +44,6 @@ pub(super) async fn open(
         client,
         rpc_client,
         handle_id: Uuid::new_v4().simple().to_string(),
-        runtime: tokio::runtime::Handle::try_current().ok(),
         cleanup_slot: Some(cleanup_slot),
     };
     let _: FsOpenResponse = registration
@@ -123,24 +121,30 @@ impl Drop for FileReadRegistration {
         let cleanup_slot = self.cleanup_slot.take();
         let rpc_client = Arc::clone(&self.rpc_client);
         let handle_id = self.handle_id.clone();
-        let runtime = self
-            .runtime
-            .clone()
-            .or_else(|| tokio::runtime::Handle::try_current().ok());
-        if let Some(runtime) = runtime {
-            runtime.spawn(async move {
+        let runtime = rpc_client.cleanup_runtime();
+        let deadline = tokio::time::Instant::now() + crate::client::PROCESS_TERMINATION_TIMEOUT;
+        // Prearm before spawn so a stopped runtime dropping an unpolled future
+        // still closes the exact originating transport.
+        let fallback = CloseFallback(Some(Arc::clone(&rpc_client)));
+        runtime.spawn(async move {
+                let mut fallback = fallback;
                 let _cleanup_slot = cleanup_slot;
                 let _: Result<FsCloseResponse, _> = ExecServerClient::call_for_cleanup_on_before(
                     &rpc_client,
                     FS_CLOSE_METHOD,
                     &FsCloseParams { handle_id },
-                    tokio::time::Instant::now() + crate::client::PROCESS_TERMINATION_TIMEOUT,
+                    deadline,
                 )
                 .await;
-            });
-        } else {
-            // No executor can own the deferred close; never leave its transport live.
-            rpc_client.request_transport_close();
-        }
+                fallback.0 = None; // The cleanup helper closes transport on failure.
+        });
+    }
+}
+
+struct CloseFallback(Option<Arc<RpcClient>>);
+
+impl Drop for CloseFallback {
+    fn drop(&mut self) {
+        if let Some(rpc) = self.0.take() { rpc.request_transport_close(); }
     }
 }

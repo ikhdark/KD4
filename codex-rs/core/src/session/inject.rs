@@ -187,36 +187,17 @@ impl Session {
                 input,
             ));
         }
-        let still_reserved = {
-            let active_turn = self.active_turn.lock().await;
-            active_turn.as_ref().is_some_and(|active_turn| {
-                active_turn.task.is_none() && Arc::ptr_eq(&active_turn.turn_state, &turn_state)
-            })
-        };
-        if !still_reserved {
-            self.clear_reserved_idle_turn(&turn_state).await;
-            return Err(TryStartTurnIfIdleError::new(
-                TryStartTurnIfIdleRejectionReason::Busy,
-                input,
-            ));
-        }
-
         let pending_input = input
             .iter()
             .cloned()
             .map(TurnInput::ResponseItem)
             .collect::<Vec<_>>();
-        if self
-            .input_queue
-            .extend_pending_input_for_turn_state(turn_state.as_ref(), &pending_input)
+        if let Err(reason) = self
+            .admit_reserved_idle_input(&turn_state, &pending_input)
             .await
-            .is_err()
         {
             self.clear_reserved_idle_turn(&turn_state).await;
-            return Err(TryStartTurnIfIdleError::new(
-                TryStartTurnIfIdleRejectionReason::PendingInputLimitExceeded,
-                input,
-            ));
+            return Err(TryStartTurnIfIdleError::new(reason, input));
         }
         let start_result = self
             .start_task_with_admission(
@@ -234,6 +215,28 @@ impl Session {
         }
         startup_guard.disarm();
         Ok(())
+    }
+
+    async fn admit_reserved_idle_input(
+        &self,
+        turn_state: &Arc<tokio::sync::Mutex<TurnState>>,
+        input: &[TurnInput],
+    ) -> Result<(), TryStartTurnIfIdleRejectionReason> {
+        // Interrupt recovery takes this same lock before draining a taskless
+        // reservation. Keep identity validation and input admission atomic so
+        // accepted input cannot be inserted into an already-detached state.
+        let active = self.active_turn.lock().await;
+        if !active.as_ref().is_some_and(|turn| {
+            turn.task.is_none()
+                && turn.terminal.is_none()
+                && Arc::ptr_eq(&turn.turn_state, turn_state)
+        }) {
+            return Err(TryStartTurnIfIdleRejectionReason::Busy);
+        }
+        self.input_queue
+            .extend_pending_input_for_turn_state(turn_state.as_ref(), input)
+            .await
+            .map_err(|_| TryStartTurnIfIdleRejectionReason::PendingInputLimitExceeded)
     }
 
     async fn clear_reserved_idle_turn(
@@ -319,6 +322,69 @@ mod tests {
             phase: None,
             internal_chat_message_metadata_passthrough: None,
         }
+    }
+
+    #[tokio::test]
+    async fn idle_input_admission_holds_reservation_through_interrupt_recovery() {
+        let (session, _) = crate::session::tests::make_session_and_context().await;
+        let session = Arc::new(session);
+        let active = ActiveTurn::default();
+        let turn_state = Arc::clone(&active.turn_state);
+        *session.active_turn.lock().await = Some(active);
+        let input = vec![TurnInput::ResponseItem(objective_update_item())];
+
+        let state = turn_state.lock().await;
+        let mut admission = Box::pin(session.admit_reserved_idle_input(&turn_state, &input));
+        assert!(futures::poll!(&mut admission).is_pending());
+        assert!(
+            session.active_turn.try_lock().is_err(),
+            "input admission must retain the validated reservation while its queue is blocked"
+        );
+        let mut interrupt = Box::pin(session.request_task_interrupt());
+        assert!(futures::poll!(&mut interrupt).is_pending());
+        drop(state);
+
+        admission.await.expect("admit input into its reserved state");
+        interrupt.await;
+        assert!(session.active_turn.lock().await.is_none());
+        assert_eq!(
+            session
+                .input_queue
+                .get_pending_input(&session.active_turn)
+                .await,
+            input,
+            "interruption must recover accepted input rather than detach it"
+        );
+    }
+
+    #[tokio::test]
+    async fn idle_input_admission_rejects_an_already_detached_reservation() {
+        let (session, _) = crate::session::tests::make_session_and_context().await;
+        let retired = ActiveTurn::default();
+        let current = ActiveTurn::default();
+        let current_state = Arc::clone(&current.turn_state);
+        *session.active_turn.lock().await = Some(current);
+        let input = vec![TurnInput::ResponseItem(objective_update_item())];
+        assert_eq!(
+            session
+                .admit_reserved_idle_input(&retired.turn_state, &input)
+                .await,
+            Err(TryStartTurnIfIdleRejectionReason::Busy)
+        );
+        assert!(
+            session
+                .input_queue
+                .take_pending_input_for_turn_state(&retired.turn_state)
+                .await
+                .is_empty()
+        );
+        assert!(
+            session
+                .input_queue
+                .take_pending_input_for_turn_state(&current_state)
+                .await
+                .is_empty()
+        );
     }
 
     #[tokio::test]

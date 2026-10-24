@@ -4,7 +4,6 @@ use codex_protocol::protocol::SubAgentSource;
 
 #[tokio::test]
 async fn audit115_accepted_batch_preserves_correction_through_plan_handler() {
-    use crate::context::ContextualUserFragment;
     use crate::tools::registry::ToolExecutor;
     for textless in [false, true] {
         let (session, turn, _events) =
@@ -55,28 +54,17 @@ async fn audit115_accepted_batch_preserves_correction_through_plan_handler() {
         )
         .await
         .unwrap();
-        let state = session.services.plan_store.task_state(false).await;
-        let body = state.body();
-        let value: serde_json::Value =
-            serde_json::from_str(body.lines().find(|line| line.starts_with('{')).unwrap()).unwrap();
-        assert_eq!(
-            value["accepted_input_refs"].as_array().unwrap().len(),
-            if textless { 1 } else { 2 }
-        );
+        assert!(serde_json::to_string(session.clone_history().await.raw_items()).unwrap().contains(correction));
         let snapshot = session
             .services
             .plan_store
             .execution_snapshot()
             .await
             .unwrap();
-        let deploy = crate::plan_store::plan_step_id("Deploy");
         crate::tools::handlers::PlanHandler
             .handle(invoke(serde_json::json!({
                 "expected_revision":snapshot.revision,
                 "plan":[{"step":"Review","status":"pending"}],
-                "superseded":[{"step_id":deploy,"reason":"User cancelled deployment"}],
-                "scope_change_instructions":{deploy:correction},
-                "scope_change_reviewed_revision":value["scope_input_revision"],
             })))
             .await
             .unwrap();
@@ -95,23 +83,15 @@ async fn audit115_accepted_batch_preserves_correction_through_plan_handler() {
 }
 
 #[test]
-fn audit115_ordinary_final_reconciles_plan_debt_without_extra_complete_generation() -> Result<()> {
+fn ordinary_final_preserves_plan_debt_without_reopening_the_model() -> Result<()> {
     run_turn_multi_thread_test_with_stack("audit115-final", || async {
         crate::test_harness::require_network!();
         for pending in [false, true] {
             let server = responses::start_mock_server().await;
-            let mut sequence = vec![responses::sse(vec![
+            let sequence = vec![responses::sse(vec![
                 responses::ev_assistant_message("premature", "done"),
                 responses::ev_completed("first"),
             ])];
-            if pending {
-                sequence.push(responses::sse(vec![responses::ev_function_call("close-plan", "update_plan",
-                    &serde_json::json!({"set":[{"step_id":crate::plan_store::plan_step_id("Required wiring"),"status":"completed"}]}).to_string()), responses::ev_completed("reconcile")]));
-                sequence.push(responses::sse(vec![
-                    responses::ev_assistant_message("accepted", "wiring complete"),
-                    responses::ev_completed("last"),
-                ]));
-            }
             let requests = responses::mount_sse_sequence(&server, sequence).await;
             // Mailbox recording belongs to an admitted active task. Calling
             // run_turn on the bare session fixture aborts before model dispatch.
@@ -143,11 +123,16 @@ fn audit115_ordinary_final_reconciles_plan_debt_without_extra_complete_generatio
             )
             .await??;
             assert!(result.error.is_none(), "{result:?}");
-            assert_eq!(requests.requests().len(), if pending { 3 } else { 1 });
+            assert_eq!(requests.requests().len(), 1);
             assert_eq!(
                 result.last_agent_message.as_deref(),
-                Some(if pending { "wiring complete" } else { "done" })
+                Some("done")
             );
+            if pending {
+                let snapshot = session.services.plan_store.execution_snapshot().await.unwrap();
+                assert_eq!(snapshot.obligations.unresolved.len(), 1,
+                    "delivery must not silently discharge unfinished work");
+            }
             assert!(
                 result
                     .timing
@@ -2302,118 +2287,9 @@ fn audit_reports_17_19_retry_preserves_accepted_history_and_retry_limit() -> Res
     })
 }
 
-#[test]
-fn continuation_prefetch_returns_before_capture_and_overlaps_step_context() -> Result<()> {
-    run_turn_multi_thread_test_with_stack(
-        "continuation_prefetch_returns_before_capture_and_overlaps_step_context",
-        continuation_prefetch_returns_before_capture_and_overlaps_step_context_impl,
-    )
-}
 
-async fn continuation_prefetch_returns_before_capture_and_overlaps_step_context_impl() -> Result<()>
-{
-    crate::test_harness::require_network!();
-    let server = responses::start_mock_server().await;
-    let mut completed = responses::ev_completed("prefetch");
-    completed["response"]["end_turn"] = serde_json::json!(false);
-    let requests = responses::mount_sse_once(&server, responses::sse(vec![completed])).await;
-    let home = tempfile::tempdir()?;
-    let provider = non_openai_model_provider(&server);
-    let (session, turn, _events) =
-        crate::session::tests::make_session_and_context_with_auth_config_home_and_rx(
-            CodexAuth::from_api_key("test key"),
-            Vec::new(),
-            home.path(),
-            move |config| config.model_provider = provider,
-        )
-        .await;
-    let cancellation = CancellationToken::new();
-    let step = session.capture_step_context(Arc::clone(&turn)).await?;
-    let router = built_tools(&session, &step, &[], &cancellation).await?;
-    assert!(step.set_tool_router(router).is_ok(), "first router");
-    let tracker = Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new()));
-    let runtime = ToolCallRuntime::new(Arc::clone(&session), step, Arc::clone(&tracker));
-    session
-        .record_conversation_items(
-            &turn,
-            &[
-                ResponseItem::FunctionCall {
-                    id: None,
-                    name: "read_file".to_string(),
-                    namespace: None,
-                    arguments: r#"{"path":"source.rs"}"#.to_string(),
-                    call_id: "workspace-read".to_string(),
-                    internal_chat_message_metadata_passthrough: None,
-                },
-                ResponseItem::FunctionCallOutput {
-                    id: None,
-                    call_id: "workspace-read".to_string(),
-                    output: FunctionCallOutputPayload::from_text("source".to_string()),
-                    internal_chat_message_metadata_passthrough: None,
-                },
-            ],
-        )
-        .await?;
-    assert!(
-        session
-            .clone_history()
-            .await
-            .requires_workspace_evidence_validation()
-    );
-    let metadata = turn.turn_metadata_state.to_responses_metadata(
-        session.installation_id.clone(),
-        session.current_window_id().await,
-        CodexResponsesRequestKind::Turn,
-    );
-    let mut client = session.services.model_client.new_session();
-    let cache = &session.services.git_workspace;
-    let pause = cache.pause_next_workspace_evidence_capture();
-    let captures_before = cache.workspace_evidence_capture_count();
-    let result = tokio::time::timeout(
-        Duration::from_secs(10),
-        try_run_sampling_request(
-            runtime,
-            Arc::clone(&session),
-            Arc::clone(&turn),
-            Arc::new(ExtensionData::new(turn.sub_id.clone())),
-            &mut client,
-            &metadata,
-            tracker,
-            &Prompt::default(),
-            &ModelGenerationId {
-                turn_id: turn.sub_id.clone(),
-                ordinal: 0,
-            },
-            &mut None,
-            Arc::new(Mutex::new(None)),
-            cancellation,
-            &mut SamplingAttemptProgress::default(),
-        ),
-    )
-    .await
-    .expect("sampling must return without joining the paused capture")?;
-    assert!(result.needs_follow_up);
-    assert!(result.prefetched_workspace_identity.is_none());
-    let (_, handle) = result
-        .continuation_workspace_prefetch
-        .expect("owned pending capture");
-    tokio::time::timeout(Duration::from_secs(10), pause.wait_until_started()).await?;
-    tokio::time::timeout(
-        Duration::from_secs(10),
-        session.capture_step_context(Arc::clone(&turn)),
-    )
-    .await
-    .expect("next step context must proceed while the workspace capture is paused")?;
-    assert!(!handle.is_finished());
-    pause.release();
-    tokio::time::timeout(Duration::from_secs(10), handle).await??;
-    assert_eq!(
-        cache.workspace_evidence_capture_count(),
-        captures_before + 1
-    );
-    requests.single_request();
-    Ok(())
-}
+
+
 
 #[test]
 fn kd4_latency_continuation_prefetch_rejects_stale_or_steered_state() {
@@ -2590,431 +2466,11 @@ async fn kd4_latency_continuation_prefetch_preserves_workspace_evidence_read() {
     assert_eq!(git_workspace.workspace_evidence_capture_count(), 1);
 }
 
-#[tokio::test]
-async fn workspace_evidence_coalesces_mutating_calls_at_generation_boundary() {
-    let codex_home = tempfile::tempdir().expect("create isolated session home");
-    let workspace = tempfile::tempdir().expect("create isolated generation workspace");
-    let git_init = tokio::process::Command::new("git")
-        .args(["init", "--quiet"])
-        .current_dir(workspace.path())
-        .status()
-        .await
-        .expect("run git init for generation workspace");
-    assert!(git_init.success(), "initialize generation Git workspace");
-    let repo_root = dunce::canonicalize(workspace.path()).expect("canonical generation workspace");
-    tokio::fs::create_dir(repo_root.join("workspace-evidence-test"))
-        .await
-        .expect("create source fixture directory");
-    for name in [
-        "dependency-a.rs",
-        "dependency-b.rs",
-        "mutation-b.rs",
-        "later-disjoint.rs",
-    ] {
-        tokio::fs::write(
-            repo_root.join("workspace-evidence-test").join(name),
-            format!("original {name}\n"),
-        )
-        .await
-        .expect("write actual initial workspace files");
-    }
-    let (mut session, turn_context, _rx_event) =
-        crate::session::tests::make_session_and_context_with_auth_config_home_and_rx(
-            CodexAuth::from_api_key("Test API Key"),
-            Vec::new(),
-            codex_home.path(),
-            |config| {
-                config.cwd = codex_utils_absolute_path::AbsolutePathBuf::from_absolute_path(
-                    repo_root.clone(),
-                )
-                .expect("the fixture cwd must be absolute");
-            },
-        )
-        .await;
-    // This scenario reports every real mutation through the host path boundary.
-    // Retain its normal watcher epoch and journal without also receiving delayed
-    // native directory/rescan events during the authoritative Git subprocesses.
-    Arc::get_mut(&mut session)
-        .expect("unique generation fixture session")
-        .services
-        .git_workspace = crate::git_workspace::GitWorkspaceCache::with_noop_watcher_for_tests();
-    let tracker = Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new()));
-    let batch = Arc::new(crate::tools::parallel::WorkspaceEvidenceGenerationBatch::new());
-    let dependency_paths = [
-        repo_root.join("workspace-evidence-test/dependency-a.rs"),
-        repo_root.join("workspace-evidence-test/dependency-b.rs"),
-    ];
-    let classifications = dependency_paths.clone().map(|dependency_path| {
-        crate::tool_history::WorkspaceCallClassification {
-            observes_workspace: true,
-            source_scope_complete: true,
-            workspace_cwd: turn_context.config.cwd.clone().to_path_buf(),
-            source_dependencies: std::collections::BTreeSet::from([
-                crate::tool_history::SourceDependencyV1::new(&dependency_path, false),
-            ]),
-        }
-    });
-    let mutation_paths = [
-        dependency_paths[0].clone(),
-        repo_root.join("workspace-evidence-test/mutation-b.rs"),
-    ];
-    let call_ids = ["generation-mutation-a", "generation-mutation-b"];
-    let calls = call_ids.map(|call_id| ResponseItem::FunctionCall {
-        id: None,
-        name: "exec_command".to_string(),
-        namespace: None,
-        arguments: format!(r#"{{"cmd":"mutate {call_id}"}}"#),
-        call_id: call_id.to_string(),
-        internal_chat_message_metadata_passthrough: None,
-    });
-    let responses = call_ids.map(|call_id| ResponseInputItem::FunctionCallOutput {
-        call_id: call_id.to_string(),
-        output: FunctionCallOutputPayload::from_text(format!("completed {call_id}")),
-    });
-    let outputs = responses.clone().map(ResponseItem::from);
-    session
-        .record_conversation_items(
-            &turn_context,
-            &[
-                calls[0].clone(),
-                calls[1].clone(),
-                outputs[0].clone(),
-                outputs[1].clone(),
-            ],
-        )
-        .await
-        .unwrap();
 
-    for (index, (call_id, response)) in call_ids.iter().zip(&responses).enumerate() {
-        let classification = &classifications[index];
-        assert!(batch.register_call(call_id));
-        tracker
-            .lock()
-            .await
-            .activate_workspace_evidence_generation_batch(&batch);
-        let mut source_path_observations = Vec::new();
-        for dependency in &classification.source_dependencies {
-            if let Some(observation) = session
-                .services
-                .git_workspace
-                .begin_source_path_change_observation(
-                    &repo_root,
-                    Path::new(&dependency.path),
-                    dependency.recursive,
-                )
-                .await
-            {
-                source_path_observations.push(observation);
-            }
-        }
-        assert_eq!(source_path_observations.len(), 1);
-        assert!(
-            session
-                .services
-                .git_workspace
-                .source_path_change_observation_is_current(&source_path_observations[0])
-        );
-        tokio::fs::write(&mutation_paths[index], format!("mutated by {call_id}\n"))
-            .await
-            .expect("perform the workspace mutation represented by this call");
-        session
-            .services
-            .git_workspace
-            .note_host_workspace_mutation_paths(
-                &repo_root,
-                &[mutation_paths[index].to_string_lossy().into_owned()],
-            )
-            .await;
-        assert_eq!(
-            session
-                .services
-                .git_workspace
-                .source_path_change_observation_is_current(&source_path_observations[0]),
-            index != 0,
-            "only the dependency changed by its batched call should lose its pre-tool proof",
-        );
-        tracker.lock().await.record_unknown_mutation();
-        assert!(batch.record_mutation(
-            call_id,
-            turn_context.config.cwd.clone().to_path_buf(),
-            Some(std::collections::BTreeSet::from([
-                mutation_paths[index].clone(),
-            ])),
-            /*observe_command_ledger*/ false,
-        ));
-        assert!(batch.queue_mutating_response_for_test(
-            response,
-            classification,
-            source_path_observations,
-        ));
-    }
 
-    let captures_before = session
-        .services
-        .git_workspace
-        .workspace_evidence_capture_count();
-    let flush = batch
-        .flush(&session, &turn_context, &tracker)
-        .await
-        .expect("generation evidence must be durable");
-    let final_identity = flush
-        .prefetched_workspace_identity
-        .expect("the generation flush should capture the primary workspace")
-        .expect("the primary workspace should have a Git identity");
-    assert!(
-        !final_identity.unavailable,
-        "the isolated fixture must provide a successful authoritative Git capture",
-    );
-    assert_eq!(
-        final_identity.repository_root.as_deref(),
-        Some(repo_root.to_string_lossy().as_ref()),
-    );
 
-    assert_eq!(flush.authoritative_capture_count, 1);
-    assert_eq!(
-        flush.registered_call_ids,
-        vec![call_ids[0].to_string(), call_ids[1].to_string()],
-    );
-    assert_eq!(
-        session
-            .services
-            .git_workspace
-            .workspace_evidence_capture_count()
-            - captures_before,
-        1,
-    );
 
-    let history = session.clone_history().await;
-    let tool_history = history.tool_history_state();
-    for call_id in call_ids {
-        assert_eq!(
-            tool_history.workspace_evidence_revision_for_test(call_id),
-            Some(Some(final_identity.clone())),
-        );
-    }
 
-    let captures_before_continuation = session
-        .services
-        .git_workspace
-        .workspace_evidence_capture_count();
-    let prepared = prepare_sampling_prompt_with_workspace_identity(
-        history,
-        &turn_context,
-        Some(&final_identity),
-        session.services.git_workspace.as_ref(),
-    );
-    assert_eq!(
-        session
-            .services
-            .git_workspace
-            .workspace_evidence_capture_count(),
-        captures_before_continuation,
-    );
-    for call_id in call_ids {
-        let output = prepared
-            .items()
-            .iter()
-            .find_map(|item| match item {
-                ResponseItem::FunctionCallOutput {
-                    call_id: item_call_id,
-                    output,
-                    ..
-                } if item_call_id == call_id => output.text_content(),
-                _ => None,
-            })
-            .expect("the current batched output should remain in the projected history");
-        assert_eq!(output, format!("completed {call_id}"));
-    }
-
-    let later_path = repo_root.join("workspace-evidence-test/later-disjoint.rs");
-    tokio::fs::write(&later_path, b"later disjoint mutation\n")
-        .await
-        .expect("perform a later mutation outside both source dependencies");
-    session
-        .services
-        .git_workspace
-        .note_host_workspace_mutation_paths(
-            &repo_root,
-            &[later_path.to_string_lossy().into_owned()],
-        )
-        .await;
-    let later_identity = session
-        .services
-        .git_workspace
-        .workspace_evidence_identity(&repo_root)
-        .await
-        .expect("the later workspace must still have a Git identity");
-    assert!(
-        !later_identity.unavailable,
-        "the later capture must succeed"
-    );
-    assert_ne!(
-        later_identity, final_identity,
-        "the real later mutation must change the workspace identity"
-    );
-    let later_prepared = prepare_sampling_prompt_with_workspace_identity(
-        session.clone_history().await,
-        &turn_context,
-        Some(&later_identity),
-        session.services.git_workspace.as_ref(),
-    );
-    let stale_output = later_prepared
-        .items()
-        .iter()
-        .find_map(|item| match item {
-            ResponseItem::FunctionCallOutput {
-                call_id, output, ..
-            } if call_id == call_ids[0] => output.text_content(),
-            _ => None,
-        })
-        .expect("the changed dependency output should remain in the projected history");
-    assert_eq!(stale_output, format!("completed {}", call_ids[0]));
-    assert!(later_prepared.items().iter().any(|item| match item {
-        ResponseItem::Message { role, content, .. } if role == "developer" => {
-            let text = serde_json::to_string(content).unwrap();
-            text.contains("stale_workspace_evidence") && text.contains(call_ids[0])
-        }
-        _ => false,
-    }));
-    let disjoint_output = later_prepared
-        .items()
-        .iter()
-        .find_map(|item| match item {
-            ResponseItem::FunctionCallOutput {
-                call_id, output, ..
-            } if call_id == call_ids[1] => output.text_content(),
-            _ => None,
-        })
-        .expect("the disjoint dependency output should remain in the projected history");
-    assert_eq!(disjoint_output, format!("completed {}", call_ids[1]));
-}
-
-#[tokio::test]
-async fn workspace_evidence_flushes_distinct_repositories_concurrently() {
-    let (session, turn_context) = crate::session::tests::make_session_and_context().await;
-    let tracker = Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new()));
-    let batch = Arc::new(crate::tools::parallel::WorkspaceEvidenceGenerationBatch::new());
-    let second_workspace = tempfile::tempdir().expect("create second workspace");
-    let git_init = std::process::Command::new("git")
-        .args(["init", "--quiet"])
-        .current_dir(second_workspace.path())
-        .status()
-        .expect("run git init for second workspace");
-    assert!(git_init.success(), "initialize second Git workspace");
-
-    for (call_id, cwd) in [
-        (
-            "primary-repository-mutation",
-            turn_context.config.cwd.as_path(),
-        ),
-        ("second-repository-mutation", second_workspace.path()),
-    ] {
-        assert!(batch.register_call(call_id));
-        assert!(batch.record_mutation(
-            call_id,
-            cwd.to_path_buf(),
-            None,
-            /* observe_command_ledger */ false,
-        ));
-    }
-
-    let captures_before = session
-        .services
-        .git_workspace
-        .workspace_evidence_capture_count();
-    let pause = session
-        .services
-        .git_workspace
-        .pause_next_workspace_evidence_capture();
-    let flush = batch.flush(&session, &turn_context, &tracker);
-    tokio::pin!(flush);
-    tokio::select! {
-        started = tokio::time::timeout(Duration::from_secs(10), pause.wait_until_started()) => {
-            started.expect("the first authoritative capture should start");
-        }
-        _ = &mut flush => {
-            panic!("flush completed before the paused capture was released");
-        }
-    }
-
-    tokio::select! {
-        result = tokio::time::timeout(Duration::from_secs(10), async {
-            while session.services.git_workspace.workspace_evidence_capture_count()
-                - captures_before < 2
-            {
-                tokio::task::yield_now().await;
-            }
-        }) => result.expect("both repository captures start while the first is paused"),
-        _ = &mut flush => panic!("flush completed before the paused capture was released"),
-    }
-    assert_eq!(
-        session
-            .services
-            .git_workspace
-            .workspace_evidence_capture_count()
-            - captures_before,
-        2,
-        "a paused repository capture must not prevent another repository capture from starting",
-    );
-    pause.release();
-    let completed = flush.await.expect("generation evidence must be durable");
-    assert_eq!(completed.authoritative_capture_count, 2);
-}
-
-#[tokio::test]
-async fn workspace_evidence_flush_preserves_authoritative_non_git_identity() {
-    let (session, mut turn_context) = crate::session::tests::make_session_and_context().await;
-    let non_git_workspace = tempfile::tempdir().expect("create non-Git workspace");
-    assert!(codex_git_utils::get_git_repo_root(non_git_workspace.path()).is_none());
-    let mut config = (*turn_context.config).clone();
-    config.cwd = non_git_workspace
-        .path()
-        .to_path_buf()
-        .try_into()
-        .expect("temporary workspace path should be absolute");
-    turn_context.config = Arc::new(config);
-
-    let tracker = Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new()));
-    let batch = Arc::new(crate::tools::parallel::WorkspaceEvidenceGenerationBatch::new());
-    let call_id = "non-git-mutation";
-    let classification = crate::tool_history::WorkspaceCallClassification {
-        observes_workspace: true,
-        source_scope_complete: false,
-        workspace_cwd: turn_context.config.cwd.clone().to_path_buf(),
-        source_dependencies: std::collections::BTreeSet::new(),
-    };
-    let response = ResponseInputItem::FunctionCallOutput {
-        call_id: call_id.to_string(),
-        output: FunctionCallOutputPayload::from_text("completed non-Git mutation".to_string()),
-    };
-
-    assert!(batch.register_call(call_id));
-    tracker
-        .lock()
-        .await
-        .activate_workspace_evidence_generation_batch(&batch);
-    tracker.lock().await.record_unknown_mutation();
-    assert!(batch.record_mutation(
-        call_id,
-        classification.workspace_cwd.clone(),
-        None,
-        /*observe_command_ledger*/ false,
-    ));
-    assert!(batch.queue_mutating_response_for_test(&response, &classification, Vec::new(),));
-
-    let flush = batch
-        .flush(&session, &turn_context, &tracker)
-        .await
-        .expect("generation evidence must be durable");
-
-    assert_eq!(
-        flush.prefetched_workspace_identity,
-        Some(None),
-        "an authoritative non-Git capture must not look like a missing primary capture",
-    );
-    assert_eq!(flush.authoritative_capture_count, 1);
-    assert_eq!(flush.registered_call_ids, vec![call_id.to_string()]);
-}
 
 #[test]
 fn tool_relay_reconciliation_advances_without_watchdog() {
@@ -3446,149 +2902,9 @@ fn completion_pending_input_stays_in_the_sampling_loop_when_capacity_remains() {
     );
 }
 
-#[tokio::test]
-async fn batching_advisory_is_delivered_once_without_loop_or_generation_accounting() {
-    let (session, turn_context) = crate::session::tests::make_session_and_context().await;
-    let mut control = TurnExecutionControl::new();
-    for generation in 0..3 {
-        let baselines = control.baselines(0);
-        let collector = control.collector(&baselines);
-        let id = format!("short-{generation}");
-        let call = collector.register_deterministic_tool_call(
-            &codex_tools::ToolName::plain("exec_command"),
-            &codex_tools::ToolPayload::Function {
-                arguments: serde_json::json!({"cmd": format!("inspect-{generation}")}).to_string(),
-            },
-            &id,
-        );
-        collector.record_response_result(
-            call.ordinal,
-            codex_tools::ToolOutputOutcomeContext::new(codex_tools::ToolOutputOutcome::Success),
-            Some(crate::tools::context::semantic_evidence_sampling_signal(
-                serde_json::json!(crate::tools::context::successful_command_evidence(
-                    id.as_bytes(),
-                    None
-                )),
-            )),
-            &codex_protocol::models::ResponseInputItem::FunctionCallOutput {
-                call_id: id.clone(),
-                output: codex_protocol::models::FunctionCallOutputPayload::from_text(id),
-            },
-            false,
-        );
-        collector.record_child_runtime(100);
-        control.observe_progress(
-            &baselines,
-            &collector,
-            &SamplingRequestSettledState {
-                mutation_revision: 0,
-                attributed_mutation_revision: 0,
-                tool_exposure_revision: 0,
-            },
-        );
-    }
-    let before = session.clone_history().await;
-    record_soft_convergence_directive(&session, &turn_context, &mut control, false)
-        .await
-        .unwrap();
-    assert_eq!(
-        session.clone_history().await.raw_items(),
-        before.raw_items()
-    );
-    record_soft_convergence_directive(&session, &turn_context, &mut control, true)
-        .await
-        .unwrap();
-    record_soft_convergence_directive(&session, &turn_context, &mut control, true)
-        .await
-        .unwrap();
-    let after = session.clone_history().await;
-    assert_eq!(after.raw_items().len(), before.raw_items().len() + 1);
-    assert!(
-        matches!(after.raw_items().last(), Some(ResponseItem::Message { role, content, .. })
-        if role == "developer" && content.iter().any(|item| matches!(item,
-            ContentItem::InputText { text } if text.contains("Execution-efficiency advisory:") && text.contains("expires when that task ends"))))
-    );
-    let counters = turn_context
-        .turn_timing_state
-        .complete_snapshot()
-        .protocol_timing()
-        .counters;
-    assert_eq!(counters.logical_generation_count, 0);
-    assert_eq!(counters.no_progress_directive_count, 0);
-    assert_eq!(counters.proven_loop_activation_count, 0);
-}
 
 #[tokio::test]
-async fn soft_convergence_records_one_instruction_without_requesting_a_generation() {
-    let (session, turn_context) = crate::session::tests::make_session_and_context().await;
-    tokio::time::pause();
-    let mut control = TurnExecutionControl::new();
-    let before = session.clone_history().await;
-    record_soft_convergence_directive(&session, &turn_context, &mut control, true)
-        .await
-        .unwrap();
-    assert_eq!(
-        session.clone_history().await.raw_items(),
-        before.raw_items()
-    );
-    tokio::time::advance(Duration::from_secs(120)).await;
-    record_soft_convergence_directive(&session, &turn_context, &mut control, false)
-        .await
-        .unwrap();
-    assert_eq!(
-        session.clone_history().await.raw_items(),
-        before.raw_items()
-    );
-    // Elapsed time alone does not qualify a continuation: the directive waits
-    // for generations that completed without new evidence or mutations.
-    record_soft_convergence_directive(&session, &turn_context, &mut control, true)
-        .await
-        .unwrap();
-    assert_eq!(
-        session.clone_history().await.raw_items(),
-        before.raw_items()
-    );
-    for _ in 0..crate::session::turn_execution::SOFT_CONVERGENCE_NO_PROGRESS_GENERATIONS {
-        let baselines = control.baselines(0);
-        assert!(!control.observe_budget_progress(
-            &baselines,
-            &SamplingRequestSignalCollector::default(),
-            &SamplingRequestSettledState {
-                mutation_revision: 0,
-                attributed_mutation_revision: 0,
-                tool_exposure_revision: 0,
-            },
-        ));
-    }
-    record_soft_convergence_directive(&session, &turn_context, &mut control, true)
-        .await
-        .unwrap();
-    record_soft_convergence_directive(&session, &turn_context, &mut control, true)
-        .await
-        .unwrap();
-    let history = session.clone_history().await;
-    assert_eq!(history.raw_items().len(), before.raw_items().len() + 1);
-    assert!(
-        matches!(history.raw_items().last(), Some(ResponseItem::Message { role, content, .. })
-        if role == "developer" && content.iter().any(|item| matches!(item,
-            ContentItem::InputText { text }
-                if text.contains("Soft convergence intervention:")
-                    && text.contains("complete required implementation or validation")
-                    && text.contains("does not interrupt an in-flight request"))))
-    );
-    assert_eq!(
-        turn_context
-            .turn_timing_state
-            .complete_snapshot()
-            .protocol_timing()
-            .counters
-            .logical_generation_count,
-        0
-    );
-}
-
-#[tokio::test]
-async fn enforced_convergence_warns_once_and_advisories_do_not_warn() {
+async fn convergence_telemetry_does_not_inject_model_advice() {
     let (session, turn_context, events) =
         crate::session::tests::make_session_and_context_with_rx().await;
     let mut control = TurnExecutionControl::new();
@@ -3627,9 +2943,7 @@ async fn enforced_convergence_warns_once_and_advisories_do_not_warn() {
     )
     .await
     .unwrap();
-    assert_eq!(session.clone_history().await.raw_items().iter().filter(|item| {
-        matches!(item, ResponseItem::Message { content, .. } if content.iter().any(|part| matches!(part, ContentItem::InputText { text } if text.ends_with("\nTry a different method."))))
-    }).count(), 1, "separate decisions must not accumulate identical advice");
+    assert!(session.clone_history().await.raw_items().is_empty());
     let mut next_turn = TurnExecutionControl::new();
     repeated_advisory.directive = Some("Try a different method.".to_string());
     record_convergence_decision(
@@ -3640,21 +2954,14 @@ async fn enforced_convergence_warns_once_and_advisories_do_not_warn() {
     )
     .await
     .unwrap();
-    assert_eq!(session.clone_history().await.raw_items().iter().filter(|item| {
-        matches!(item, ResponseItem::Message { content, .. } if content.iter().any(|part| matches!(part, ContentItem::InputText { text } if text.ends_with("\nTry a different method."))))
-    }).count(), 2, "a later turn must receive its own warning");
+    assert!(session.clone_history().await.raw_items().is_empty());
     let mut warnings = Vec::new();
     while let Ok(event) = events.try_recv() {
         if let EventMsg::Warning(warning) = event.msg {
             warnings.push(warning.message);
         }
     }
-    assert_eq!(
-        warnings,
-        vec![
-            "A repeated action/result cycle was detected. Existing results will be reused where possible; other actions remain available to complete the task."
-        ]
-    );
+    assert!(warnings.is_empty());
 }
 
 #[test]
@@ -4116,122 +3423,36 @@ async fn root_scope_phrases_preserve_requests_without_injecting_notices() {
 }
 
 #[tokio::test]
-async fn accepted_user_messages_remain_citeable_across_input_packing() {
-    use crate::context::ContextualUserFragment;
-    use sha2::Digest;
-
-    let texts = [
-        "Do not implement; audit only.",
-        "Include exact source line references.",
-    ];
+async fn accepted_user_messages_survive_input_packing_without_proof_journal() {
+    let texts = ["Do not implement; audit only.", "Include exact source line references."];
     for initial_input in [true, false] {
         for separate_messages in [true, false] {
-            for use_reference in [true, false] {
-                let (session, turn, _events) =
-                    crate::session::tests::make_session_and_context_with_rx().await;
-                let store = &session.services.plan_store;
-                store
-                    .update_tool(
-                        serde_json::from_value(serde_json::json!({
-                            "plan": [{"step": "Implement the repair", "status": "pending"}]
-                        }))
-                        .unwrap(),
-                    )
-                    .await
-                    .unwrap();
-                let parts = texts.map(|text| UserInput::Text {
-                    text: text.to_owned(),
-                    text_elements: Vec::new(),
-                });
-                let input = if separate_messages {
-                    parts
-                        .into_iter()
-                        .map(|part| TurnInput::UserInput {
-                            content: vec![part],
-                            client_id: None,
-                        })
-                        .collect::<Vec<_>>()
-                } else {
-                    vec![TurnInput::UserInput {
-                        content: parts.to_vec(),
-                        client_id: None,
-                    }]
-                };
-                if initial_input {
-                    record_inspected_inputs(&session, &turn, &input)
-                        .await
-                        .unwrap();
-                } else {
-                    let outcome = run_hooks_and_record_inputs_detailed(&session, &turn, input)
-                        .await
-                        .unwrap();
-                    assert!(outcome.accepted_context_input);
-                    assert!(!outcome.should_stop);
-                }
-                let state = store.task_state(false).await;
-                let body = state.body();
-                let state: serde_json::Value =
-                    serde_json::from_str(body.lines().find(|line| line.starts_with('{')).unwrap())
-                        .unwrap();
-                let refs = texts.map(|text| {
-                    serde_json::json!({
-                        "turn_id": turn.sub_id,
-                        "sha256": hex::encode(sha2::Sha256::digest(text.as_bytes())),
-                    })
-                });
-                let accepted = state["accepted_input_refs"].as_array().unwrap();
-                assert_eq!(accepted.len(), 2);
-                for reference in &refs {
-                    assert!(accepted.contains(reference));
-                }
-                let step_id = state["step_ids"][0].as_str().unwrap();
-                let before = store.snapshot_with_lineage().await;
-                let mut args = serde_json::json!({
-                    "expected_revision": state["revision"], "plan": [],
-                    "superseded": [{"step_id": step_id, "reason": "User requested audit only"}],
-                    "scope_change_reviewed_revision": state["scope_input_revision"],
-                });
-                args[if use_reference {
-                    "scope_change_refs"
-                } else {
-                    "scope_change_instructions"
-                }] = if use_reference {
-                    serde_json::json!({step_id: refs[0]})
-                } else {
-                    serde_json::json!({step_id: texts[0]})
-                };
-                let mut forged = args.clone();
-                forged["scope_change_refs"] = serde_json::json!({step_id: {
-                    "turn_id": "foreign", "sha256": refs[0]["sha256"],
-                }});
-                assert!(
-                    store
-                        .update_tool(serde_json::from_value(forged).unwrap())
-                        .await
-                        .is_err()
-                );
-                assert_eq!(store.snapshot_with_lineage().await, before);
-                store
-                    .update_tool(serde_json::from_value(args).unwrap())
-                    .await
-                    .unwrap();
-                assert!(
-                    store
-                        .snapshot_with_lineage()
-                        .await
-                        .unwrap()
-                        .0
-                        .plan
-                        .is_empty()
-                );
+            let (session, turn, _events) = crate::session::tests::make_session_and_context_with_rx().await;
+            let parts = texts.map(|text| UserInput::Text { text: text.into(), text_elements: Vec::new() });
+            let input = if separate_messages {
+                parts.into_iter().map(|part| TurnInput::UserInput { content: vec![part], client_id: None }).collect()
+            } else {
+                vec![TurnInput::UserInput { content: parts.to_vec(), client_id: None }]
+            };
+            if initial_input {
+                record_inspected_inputs(&session, &turn, &input).await.unwrap();
+            } else {
+                let outcome = run_hooks_and_record_inputs_detailed(&session, &turn, input).await.unwrap();
+                assert!(outcome.accepted_context_input);
+                assert!(!outcome.should_stop);
             }
+            let history = session.clone_history().await;
+            let text = serde_json::to_string(history.raw_items()).unwrap();
+            for original in texts {
+                assert_eq!(text.matches(original).count(), 1);
+            }
+            assert!(!text.contains("accepted_input_refs"));
         }
     }
 }
 
 #[tokio::test]
 async fn rejected_broad_sibling_cannot_supply_scope_or_root_notice() {
-    use crate::context::ContextualUserFragment;
     use codex_config::ConfigLayerEntry;
     use codex_config::ConfigLayerSource;
     use codex_config::ConfigLayerStack;
@@ -4307,11 +3528,6 @@ async fn rejected_broad_sibling_cannot_supply_scope_or_root_notice() {
     assert!(rendered.contains("Fix this one typo."));
     assert!(!rendered.contains("Perform a comprehensive audit."));
     assert!(!rendered.contains("<exhaustive_scope_feasibility>"));
-    let state = store.task_state(false).await;
-    let body = state.body();
-    let state: serde_json::Value =
-        serde_json::from_str(body.lines().find(|line| line.starts_with('{')).unwrap()).unwrap();
-    assert_eq!(state["accepted_input_refs"].as_array().unwrap().len(), 1);
 }
 
 #[tokio::test]
@@ -4356,11 +3572,16 @@ async fn spawned_agent_notice_preserves_budget_without_a_scope_classifier() {
     );
     assert!(!child.contains("Continue reading through compactions"));
     for _ in 0..2 {
-        record_sampling_notices(&session, &turn, false, None)
+        record_sampling_notices(&session, &turn, true, None)
             .await
             .unwrap();
     }
+    for marker in ["tool_search_sources", "mcp_catalog_availability", "mcp_catalog_notice"] {
+        assert!(!record_context_notice_if_changed(&session, &turn, marker, "catalog").await.unwrap());
+    }
     let rendered = serde_json::to_string(session.clone_history().await.raw_items()).unwrap();
+    assert!(!rendered.contains("tool_search_sources"));
+    assert!(!rendered.contains("mcp_catalog"));
     assert_eq!(
         rendered.matches("<exhaustive_scope_feasibility>").count(),
         1
@@ -5782,239 +5003,7 @@ fn first_turn_dispatch_reports_disabled_startup_prewarm() -> Result<()> {
     )
 }
 
-#[test]
-fn ordinary_exec_validation_repair_and_inflight_source_freshness() -> Result<()> {
-    run_turn_multi_thread_test_with_stack(
-        "ordinary_exec_validation_repair_and_inflight_source_freshness",
-        || async {
-            let server = responses::start_mock_server().await;
-            // Build products and synchronization gates are not source evidence.
-            // Keep them outside the recursively observed workspace.
-            let scratch = tempfile::tempdir()?;
-            let ready = scratch.path().join("ready");
-            let release = scratch.path().join("release");
-            let command = serde_json::json!({
-                "program":"cargo", "args":["test","--offline","-p","freshness_fixture","--target-dir",scratch.path().join("target"),"validates_current_source"],
-                "yield_time_ms":300000, "max_output_tokens":2000,
-            })
-            .to_string();
-            let patch = |before| {
-                format!(
-                    "*** Begin Patch\n*** Update File: src/lib.rs\n@@\n-fn value() -> u8 {{ {before} }}\n+fn value() -> u8 {{ 2 }}\n*** End Patch"
-                )
-            };
-            let requests = responses::mount_sse_sequence(
-                &server,
-                vec![
-                    responses::sse(vec![
-                        responses::ev_function_call("validation-failed", "exec_command", &command),
-                        responses::ev_completed("failed"),
-                    ]),
-                    responses::sse(vec![
-                        responses::ev_apply_patch_custom_tool_call("repair-initial", &patch(1)),
-                        responses::ev_completed("repair"),
-                    ]),
-                    responses::sse(vec![
-                        responses::ev_function_call("validation-stale", "exec_command", &command),
-                        responses::ev_completed("stale-pass"),
-                    ]),
-                    responses::sse(vec![
-                        responses::ev_apply_patch_custom_tool_call("repair-race", &patch(3)),
-                        responses::ev_completed("repair-race"),
-                    ]),
-                    responses::sse(vec![
-                        responses::ev_function_call("validation-current", "exec_command", &command),
-                        responses::ev_completed("current-pass"),
-                    ]),
-                    responses::sse(vec![
-                        responses::ev_assistant_message("answer", "Current repair passed."),
-                        responses::ev_completed("done"),
-                    ]),
-                ],
-            )
-            .await;
-            let test = test_codex()
-                .with_config(|config| {
-                    config.features.enable(Feature::Kd4Runtime).unwrap();
-                    config.features.enable(Feature::UnifiedExec).unwrap();
-                    config.features.disable(Feature::CodeModeHost).unwrap();
-                    config.model_auto_compact_token_limit = Some(i64::MAX);
-                })
-                .build(&server)
-                .await?;
-            fs::create_dir_all(test.workspace_path("src"))?;
-            fs::write(
-                test.workspace_path("Cargo.toml"),
-                "[package]\nname = \"freshness_fixture\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[workspace]\n",
-            )?;
-            fs::write(
-                test.workspace_path(".gitignore"),
-                "/target\n/ready\n/release\n",
-            )?;
-            let source = concat!(
-                "fn value() -> u8 { 1 }\n",
-                "#[test] fn validates_current_source() {\n",
-                "    assert_eq!(value(), 2);\n",
-                "    std::fs::write(\"ready\", \"running\").unwrap();\n",
-                "    let start = std::time::Instant::now();\n",
-                "    while !std::path::Path::new(\"release\").exists() {\n",
-                "        assert!(start.elapsed().as_secs() < 20);\n",
-                "        std::thread::sleep(std::time::Duration::from_millis(10));\n",
-                "    }\n}\n",
-            );
-            let source = source
-                .replace("\"ready\"", &format!("{:?}", ready.to_string_lossy()))
-                .replace("\"release\"", &format!("{:?}", release.to_string_lossy()));
-            fs::write(test.workspace_path("src/lib.rs"), source)?;
-            for args in [
-                vec!["init", "--quiet"],
-                vec!["add", "."],
-                vec![
-                    "-c",
-                    "user.name=Fixture",
-                    "-c",
-                    "user.email=fixture@example.invalid",
-                    "-c",
-                    "commit.gpgsign=false",
-                    "commit",
-                    "--quiet",
-                    "-m",
-                    "fixture",
-                ],
-            ] {
-                assert!(
-                    std::process::Command::new("git")
-                        .args(["-c", "core.autocrlf=false"])
-                        .args(args)
-                        .current_dir(test.cwd_path())
-                        .status()?
-                        .success()
-                );
-            }
-            let cwd = test.cwd_path().to_owned();
-            let mutation = tokio::spawn(async move {
-                tokio::time::timeout(Duration::from_secs(30), async {
-                    while !ready.exists() {
-                        tokio::time::sleep(Duration::from_millis(10)).await;
-                    }
-                })
-                .await
-                .expect("the repaired Cargo test must be running before mutation");
-                let path = cwd.join("src/lib.rs");
-                let before = fs::read_to_string(&path).unwrap();
-                assert!(before.contains("fn value() -> u8 { 2 }"));
-                fs::write(
-                    path,
-                    before.replace("fn value() -> u8 { 2 }", "fn value() -> u8 { 3 }"),
-                )
-                .unwrap();
-                fs::write(release, "release").unwrap();
-            });
-            let completion = test
-                .submit_turn_and_capture_completion(
-                    "Run the tiny Cargo test, repair failures, and establish a current pass.",
-                )
-                .await;
-            mutation.await?;
-            let completion = completion?;
-            assert!(completion.error.is_none(), "{completion:?}");
-            let sent = requests.requests();
-            assert_eq!(sent.len(), 6);
-            let output = |index: usize, id: &str| -> serde_json::Value {
-                serde_json::from_str(&sent[index].function_call_output_text(id).unwrap()).unwrap()
-            };
-            let notices_for = |index: usize, id: &str| {
-                sent[index]
-                    .message_input_texts("developer")
-                    .into_iter()
-                    .filter(|text| text.starts_with("<workspace_evidence_invalidation>\n"))
-                    .flat_map(|text| {
-                        let batch = text
-                            .lines()
-                            .find_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
-                            .expect("structured workspace freshness notice");
-                        crate::tool_history::expand_workspace_notices(batch)
-                    })
-                    .filter(|notice| notice["call_id"] == id)
-                    .collect::<Vec<_>>()
-            };
-            assert_ne!(output(1, "validation-failed")["exit_code"], 0);
-            assert_eq!(output(3, "validation-stale")["exit_code"], 0);
-            let stale_notices = notices_for(3, "validation-stale");
-            assert!(
-                stale_notices.iter().any(|notice| {
-                    notice["workspace_evidence_freshness"] == "changed"
-                        && notice["valid_for_current_workspace"] == false
-                        && notice["source_scope"]["dependencies"]
-                            .as_array()
-                            .is_some_and(|paths| {
-                                paths.iter().any(|path| path["freshness"] == "changed")
-                            })
-                }),
-                "a pass for the pre-mutation source must not prove the changed checkout"
-            );
-            assert_eq!(output(5, "validation-current")["exit_code"], 0);
-            // Cargo's manifest graph is recorded input attribution, not a
-            // complete compiler/build-script/runtime dependency scope. A fresh
-            // run must clear the known mutation without claiming full freshness.
-            let current_notices = notices_for(5, "validation-current");
-            assert!(
-                !current_notices.is_empty(),
-                "incomplete Cargo scope must remain explicit"
-            );
-            for notice in current_notices {
-                assert_eq!(
-                    notice["reason_code"], "workspace_freshness_unverified",
-                    "{notice}"
-                );
-                assert_eq!(
-                    notice["workspace_evidence_freshness"], "unknown",
-                    "{notice}"
-                );
-                assert_eq!(
-                    notice["historical_authenticity"], "authenticated",
-                    "{notice}"
-                );
-                assert_eq!(notice["valid_for_current_workspace"], false, "{notice}");
-                assert_eq!(
-                    notice["source_scope"]["source_scope_complete"], false,
-                    "{notice}"
-                );
-                let paths = notice["source_scope"]["dependencies"].as_array().unwrap();
-                assert!(
-                    !paths.is_empty(),
-                    "recorded dependency observations must survive"
-                );
-                // Notices never claim checked-current bytes: an unchanged
-                // dependency is `unknown`, and only an observed change is
-                // `changed`. The fresh run must leave no changed dependency.
-                assert!(
-                    paths.iter().all(|path| path["freshness"] == "unknown"),
-                    "{notice}"
-                );
-            }
-            assert!(
-                fs::read_to_string(test.workspace_path("src/lib.rs"))?
-                    .contains("fn value() -> u8 { 2 }")
-            );
-            for request in &sent {
-                let manifest = request.body_json()["tools"].to_string();
-                for retired in [
-                    "validation_snapshot",
-                    "validation_run",
-                    "validation_status",
-                    "workspace_transaction",
-                ] {
-                    assert!(
-                        !manifest.contains(retired),
-                        "retired tool exposed: {retired}"
-                    );
-                }
-            }
-            Ok(())
-        },
-    )
-}
+
 
 #[test]
 fn generation_budget_renews_on_reentry_input_and_persists_terminal_directive() -> Result<()> {
@@ -11522,7 +10511,7 @@ fn audit_stop_hook_alternating_feedback_stops_when_a_repair_repeats() -> Result<
 }
 
 #[test]
-fn source_changing_finalizer_validates_final_state_without_replay() -> Result<()> {
+fn source_changing_finalizer_reports_unverified_state_without_validation_replay() -> Result<()> {
     run_turn_multi_thread_test_with_stack("post_validation_finalizer_boundary", || async {
         crate::test_harness::require_network!();
         let server = responses::start_mock_server().await;
@@ -11544,13 +10533,9 @@ fn source_changing_finalizer_validates_final_state_without_replay() -> Result<()
                     responses::ev_completed("done"),
                 ]),
                 responses::sse(vec![
-                    responses::ev_function_call("revalidate", "exec_command", &command),
-                    responses::ev_completed("revalidated"),
-                ]),
-                responses::sse(vec![
                     responses::ev_assistant_message(
                         "limitation",
-                        "The final-state validation failed; the final workspace is not verified.",
+                        "The finalizer changed the workspace; the final state is unverified.",
                     ),
                     responses::ev_completed("final"),
                 ]),
@@ -11589,7 +10574,7 @@ fn source_changing_finalizer_validates_final_state_without_replay() -> Result<()
                 final_output_json_schema: None,
                 responsesapi_client_metadata: None,
                 additional_context: Default::default(),
-                // This test exercises final-state validation and a mutating finalizer.
+                // This test exercises a mutating finalizer without automatic revalidation.
                 // Permit the local test command explicitly on hosts without a sandbox
                 // backend; sandbox refusal has its own focused coverage.
                 thread_settings: ThreadSettingsOverrides {
@@ -11615,8 +10600,12 @@ fn source_changing_finalizer_validates_final_state_without_replay() -> Result<()
                     EventMsg::Warning(warning) => boundary_reported |= warning.message.contains("validation check(s) failed"),
                     EventMsg::TurnComplete(completion) => {
                         assert!(completion.error.is_none(), "{completion:?}");
-                        assert_eq!(completion.last_agent_message.as_deref(), Some("The final-state validation failed; the final workspace is not verified."));
-                        assert!(!completion.timing.unwrap().completion_assessment.unwrap().failed_checks.is_empty());
+                        assert_eq!(completion.last_agent_message.as_deref(), Some("The finalizer changed the workspace; the final state is unverified."));
+                        let assessment = completion.timing.unwrap().completion_assessment.unwrap();
+                        assert!(assessment.failed_checks.is_empty());
+                        assert!(!assessment.verification_gaps.is_empty());
+                        assert!(assessment.validation_uncertainty.as_ref()
+                            .is_none_or(|uncertainty| uncertainty.failed_checks.is_empty()));
                         break;
                     }
                     EventMsg::TurnAborted(event) => panic!("unexpected abort: {event:?}"),
@@ -11624,7 +10613,7 @@ fn source_changing_finalizer_validates_final_state_without_replay() -> Result<()
                 }
             }
         }).await.unwrap_or_else(|error| panic!("validation and finalizer complete: {error}; requests={}; events={observed_events:?}", requests.requests().len()));
-        assert!(boundary_reported);
+        assert!(!boundary_reported, "failed checks no longer synthesize completion warnings");
         assert_eq!(
             fs::read_to_string(test.workspace_path("source.txt"))?,
             "changed"
@@ -11634,19 +10623,15 @@ fn source_changing_finalizer_validates_final_state_without_replay() -> Result<()
             "1"
         );
         let sent = requests.requests();
-        assert_eq!(sent.len(), 4);
+        assert_eq!(sent.len(), 3);
         assert!(
             sent[1]
                 .function_call_output_text("validate")
                 .unwrap()
                 .contains("OK")
         );
-        assert!(
-            sent[3]
-                .function_call_output_text("revalidate")
-                .unwrap()
-                .contains("FAILED")
-        );
+        assert!(sent[2].body_json()["tools"].as_array().unwrap().is_empty());
+        assert!(sent.iter().all(|request| request.function_call_output_text("revalidate").is_none()));
         Ok(())
     })
 }
@@ -11659,7 +10644,7 @@ fn audit115_observed_preexisting_failure_is_reported_without_repair() -> Result<
 }
 
 #[test]
-fn audit115_failure_after_source_change_keeps_bounded_repair() -> Result<()> {
+fn validation_failure_after_source_change_does_not_reopen_the_model() -> Result<()> {
     run_turn_multi_thread_test_with_stack("audit115_failure_after_source_change", || {
         audit115_failing_validation_turn(/*changes_sources*/ true)
     })
@@ -11667,7 +10652,7 @@ fn audit115_failure_after_source_change_keeps_bounded_repair() -> Result<()> {
 
 /// One turn runs a check that already fails before the turn starts. Observing
 /// and reporting it is the result; after this turn's own source change the
-/// same failure is owned work with one bounded repair (audit 115).
+/// same failure remains reportable without reopening the model.
 async fn audit115_failing_validation_turn(changes_sources: bool) -> Result<()> {
     crate::test_harness::require_network!();
     let server = responses::start_mock_server().await;
@@ -11692,8 +10677,8 @@ async fn audit115_failing_validation_turn(changes_sources: bool) -> Result<()> {
         responses::ev_function_call("validate", "exec_command", &command),
         responses::ev_completed("validated"),
     ]));
-    // An owned failure gets one bounded repair; the unchanged report ends it.
-    let reports = if changes_sources { 2 } else { 1 };
+    // A final report ends either case; failures stay in the assessment.
+    let reports = 1;
     for attempt in 0..reports {
         sequence.push(responses::sse(vec![
             responses::ev_assistant_message(&format!("report-{attempt}"), report),
@@ -11742,48 +10727,13 @@ async fn audit115_failing_validation_turn(changes_sources: bool) -> Result<()> {
                 .collect::<Vec<_>>()
         })
         .collect::<Vec<_>>();
-    if changes_sources {
-        assert_eq!(sent.len(), 4, "{completion:?}");
-        let early = sent[2].message_input_texts("developer").into_iter()
-            .filter(|text| text.contains("Known completion blockers before sampling"))
-            .collect::<Vec<_>>();
-        assert_eq!(early.len(), 1, "owned failures must be visible before the first report");
-        assert!(early[0].contains("Resolve current failed validation"));
-        assert!(early[0].contains("does not authorize tests"));
-        assert!(
-            repairs[..3].iter().all(std::vec::Vec::is_empty),
-            "{repairs:?}"
-        );
-        assert!(
-            repairs[3].len() == 1 && repairs[3][0].contains("Resolve current failed validation"),
-            "{repairs:?}"
-        );
-        let error = completion
-            .error
-            .as_ref()
-            .context("an owned failure is not accepted as task success")?;
-        assert!(
-            error
-                .message
-                .contains("Known current work remains unresolved"),
-            "{completion:?}"
-        );
-    } else {
-        assert!(completion.error.is_none(), "{completion:?}");
-        assert_eq!(sent.len(), 2, "no repair request: {repairs:?}");
-        assert!(sent.iter().all(|request| !request.message_input_texts("developer").iter()
-            .any(|text| text.contains("Known completion blockers before sampling"))),
-            "a no-source-change report must not acquire an early validation-repair instruction");
-        let assessment = completion
-            .timing
-            .as_ref()
-            .and_then(|timing| timing.completion_assessment.as_ref())
-            .context("completion assessment")?;
-        assert!(
-            !assessment.failed_checks.is_empty(),
-            "the observed failure stays reported: {assessment:?}"
-        );
-    }
+    assert!(completion.error.is_none(), "{completion:?}");
+    assert_eq!(sent.len(), if changes_sources { 3 } else { 2 });
+    assert!(repairs.iter().all(Vec::is_empty), "{repairs:?}");
+    let assessment = completion.timing.as_ref()
+        .and_then(|timing| timing.completion_assessment.as_ref())
+        .context("completion assessment")?;
+    assert_eq!(assessment.validation_uncertainty.as_ref().unwrap().failed_checks.len(), 1);
     Ok(())
 }
 
@@ -11795,7 +10745,7 @@ fn non_git_validation_rerun_after_fix_ends_without_repair() -> Result<()> {
 }
 
 #[test]
-fn non_git_validation_rerun_that_writes_the_tree_keeps_bounded_repair() -> Result<()> {
+fn non_git_validation_rerun_that_writes_the_tree_reports_stale_evidence() -> Result<()> {
     run_turn_multi_thread_test_with_stack("non_git_validation_rerun_writes_tree", || {
         non_git_validation_rerun_turn(/*rerun_writes_tree*/ true)
     })
@@ -11804,7 +10754,7 @@ fn non_git_validation_rerun_that_writes_the_tree_keeps_bounded_repair() -> Resul
 /// Outside any Git repository, a failing check, this turn's fix and a passing
 /// rerun that left the bounded workspace tree unchanged end without a repair.
 /// A rerun that writes into the tree does not prove the final sources, so the
-/// earlier failure stays owned work with one bounded repair.
+/// earlier failure remains reported, without an automatic repair.
 async fn non_git_validation_rerun_turn(rerun_writes_tree: bool) -> Result<()> {
     crate::test_harness::require_network!();
     let server = responses::start_mock_server().await;
@@ -11832,9 +10782,8 @@ async fn non_git_validation_rerun_turn(rerun_writes_tree: bool) -> Result<()> {
             responses::ev_completed("revalidated"),
         ]),
     ];
-    // A stale pass leaves the failure as owned work: one bounded repair, and
-    // the unchanged report ends it.
-    let reports = if rerun_writes_tree { 2 } else { 1 };
+    // Result freshness affects evidence, not the number of model turns.
+    let reports = 1;
     for attempt in 0..reports {
         sequence.push(responses::sse(vec![
             responses::ev_assistant_message(&format!("report-{attempt}"), report),
@@ -11903,34 +10852,17 @@ async fn non_git_validation_rerun_turn(rerun_writes_tree: bool) -> Result<()> {
                 .collect::<Vec<_>>()
         })
         .collect::<Vec<_>>();
+    assert!(completion.error.is_none(), "{completion:?}");
+    assert_eq!(sent.len(), 4);
+    assert!(repairs.iter().all(Vec::is_empty), "{repairs:?}");
     if rerun_writes_tree {
         assert!(test.workspace_path("generated.py").exists());
-        assert_eq!(sent.len(), 5, "{completion:?}");
-        assert!(repairs[..4].iter().all(Vec::is_empty), "{repairs:?}");
-        assert!(
-            repairs[4].len() == 1 && repairs[4][0].contains("Resolve current failed validation"),
-            "{repairs:?}"
-        );
-        let error = completion
-            .error
-            .as_ref()
-            .context("a stale pass does not clear the owned failure")?;
-        assert!(
-            error
-                .message
-                .contains("Known current work remains unresolved"),
-            "{completion:?}"
-        );
-    } else {
-        assert!(completion.error.is_none(), "{completion:?}");
-        assert_eq!(sent.len(), 4, "no repair request: {repairs:?}");
-        let failed_checks = completion
-            .timing
-            .as_ref()
+        let assessment = completion.timing.as_ref()
             .and_then(|timing| timing.completion_assessment.as_ref())
-            .map(|assessment| assessment.failed_checks.clone())
-            .unwrap_or_default();
-        assert!(failed_checks.is_empty(), "{failed_checks:?}");
+            .context("stale passing run remains unverified")?;
+        assert!(!assessment.verification_gaps.is_empty()
+            || assessment.validation_uncertainty.as_ref().is_some_and(|uncertainty|
+                !uncertainty.failed_checks.is_empty()));
     }
     Ok(())
 }
@@ -12563,16 +11495,7 @@ fn accepted_final_identity_is_scoped_to_the_accepted_completion_attempt() -> Res
                 tracker
                     .lock()
                     .await
-                    .record_exec_command_end_with_mutation_at(
-                        &[],
-                        0,
-                        false,
-                        "local",
-                        None,
-                        crate::turn_diff_tracker::CommandMutation::KnownMutation {
-                            paths: Some(std::collections::BTreeSet::from([changed_path.clone()])),
-                        },
-                    );
+                    .record_unknown_mutation();
             }
             let report = run_completion_stop_hook(
                 session,
@@ -12607,16 +11530,7 @@ fn accepted_final_identity_is_scoped_to_the_accepted_completion_attempt() -> Res
             tracker
                 .lock()
                 .await
-                .record_exec_command_end_with_mutation_at(
-                    &[],
-                    0,
-                    false,
-                    "local",
-                    None,
-                    crate::turn_diff_tracker::CommandMutation::KnownMutation {
-                        paths: Some(std::collections::BTreeSet::from([changed_path])),
-                    },
-                );
+                .record_unknown_mutation();
             assert!(
                 !receipt
                     .covers_only_hook_effect(0, tracker.lock().await.current_mutation_revision(),),

@@ -13,6 +13,9 @@ use tokio::io::BufReader;
 pub const MAX_FRAME_BYTES: usize = 64 * 1024 * 1024;
 
 const LENGTH_PREFIX_BYTES: usize = size_of::<u32>();
+const BLOCKING_DECODE_THRESHOLD: usize = 64 * 1024;
+static DECODE_BYTES: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(MAX_FRAME_BYTES * 2);
+static DECODE_JOBS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(4);
 
 // serde_json's default decoder rejects the 128th container. Count the complete
 // serialized frame (including envelopes and RawValue), not just tool arguments.
@@ -198,7 +201,7 @@ where
     /// A JSON decoding error occurs after the complete frame has been consumed.
     pub async fn read<T>(&mut self) -> io::Result<Option<T>>
     where
-        T: DeserializeOwned,
+        T: DeserializeOwned + Send + 'static,
     {
         let mut length_bytes = [0_u8; size_of::<u32>()];
         if self.reader.read(&mut length_bytes[..1]).await? == 0 {
@@ -214,14 +217,29 @@ where
             ));
         }
 
+        // Reserve before allocating, and transfer both permits to the worker:
+        // cancelling this observer cannot admit replacement work ahead of it.
+        let admission = if length >= BLOCKING_DECODE_THRESHOLD {
+            let bytes = DECODE_BYTES.acquire_many(length as u32).await.map_err(io::Error::other)?;
+            let job = DECODE_JOBS.acquire().await.map_err(io::Error::other)?;
+            Some((bytes, job))
+        } else {
+            None
+        };
         let mut payload = vec![0; length];
         self.reader.read_exact(&mut payload).await?;
-        serde_json::from_slice(&payload).map(Some).map_err(|err| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("failed to decode code-mode IPC frame: {err}"),
-            )
-        })
+        let decode = move || {
+            let _admission = admission;
+            serde_json::from_slice(&payload).map(Some).map_err(|err| {
+                io::Error::new(io::ErrorKind::InvalidData,
+                    format!("failed to decode code-mode IPC frame: {err}"))
+            })
+        };
+        if length >= BLOCKING_DECODE_THRESHOLD {
+            tokio::task::spawn_blocking(decode).await.map_err(io::Error::other)?
+        } else {
+            decode()
+        }
     }
 }
 

@@ -87,7 +87,7 @@ fn rollout_preview_prefers_plain_user_messages() -> Result<()> {
             "role": "user",
             "content": [{
                 "type": "input_text",
-                "text": format!("<prior context> {USER_MESSAGE_BEGIN}Count to 5"),
+                "text": format!("# Context from my IDE setup:\n\n## Open tabs:\n- lib.rs\n\n{USER_MESSAGE_BEGIN}\nCount to 5"),
             }],
         }),
     ];
@@ -99,6 +99,19 @@ fn rollout_preview_prefers_plain_user_messages() -> Result<()> {
     assert_eq!(
         super::super::thread_processor::preview_from_rollout_items(&items),
         "Count to 5"
+    );
+
+    let literal_message = format!("<prior context> {USER_MESSAGE_BEGIN}Count to 5");
+    let literal_item = serde_json::from_value(json!({
+        "type": "message",
+        "role": "user",
+        "content": [{ "type": "input_text", "text": literal_message }],
+    }))?;
+    assert_eq!(
+        super::super::thread_processor::preview_from_rollout_items(&[RolloutItem::ResponseItem(
+            literal_item
+        ),]),
+        literal_message,
     );
 
     Ok(())

@@ -6,6 +6,59 @@ use super::*;
 use crate::protocol::ExecOutputStream;
 use crate::protocol::ProcessOutputChunk;
 
+#[tokio::test]
+async fn trailing_recovery_gap_flushes_buffered_output_exit_and_close() {
+    let state = SessionState::new(true);
+    state.ordered_events.lock().unwrap().last_published_seq = 4;
+    let mut events = state.subscribe_events();
+    let output = ProcessOutputChunk { seq: 6, stream: ExecOutputStream::Stdout, chunk: b"retained".to_vec().into() };
+    state.publish_ordered_event(ExecProcessEvent::Output(output.clone())).unwrap();
+    state.publish_ordered_event(ExecProcessEvent::Exited { seq: 7, exit_code: 17, sandbox_denied: Some(true) }).unwrap();
+    state.publish_ordered_event(ExecProcessEvent::Closed { seq: 8, sandbox_denied: Some(true) }).unwrap();
+    assert!(state.recover_events(ReadResponse {
+        chunks: Vec::new(), next_seq: 6, exited: false, exit_code: None, closed: false,
+        failure: None, output_gap: Some(crate::protocol::ProcessOutputGap { through_seq: 5, exit_seq: None }), sandbox_denied: false,
+    }).unwrap());
+    for expected in [
+        ExecProcessEvent::OutputGap { through_seq: 5 },
+        ExecProcessEvent::Output(output),
+        ExecProcessEvent::Exited { seq: 7, exit_code: 17, sandbox_denied: Some(true) },
+        ExecProcessEvent::Closed { seq: 8, sandbox_denied: Some(true) },
+    ] {
+        assert_eq!(tokio::time::timeout(Duration::from_secs(1), events.recv()).await.unwrap(), Ok(expected));
+    }
+    let ordered = state.ordered_events.lock().unwrap();
+    assert_eq!(ordered.last_published_seq, 8);
+    assert!(ordered.pending.is_empty());
+    assert_eq!(ordered.pending_bytes, 0);
+}
+
+#[test]
+fn buffered_and_polled_exit_facts_survive_transport_failure() {
+    for polled in [false, true] {
+        let state = SessionState::new(true);
+        if polled {
+            state.observe_read_facts(&ReadResponse {
+                chunks: Vec::new(), next_seq: 5, exited: true, exit_code: Some(17), closed: false,
+                failure: None, output_gap: None, sandbox_denied: true,
+            });
+        } else {
+            state.publish_ordered_event(ExecProcessEvent::Exited { seq: 3, exit_code: 17, sandbox_denied: Some(true) }).unwrap();
+        }
+        state.set_failure("transport lost".into());
+        let response = state.failed_response().unwrap();
+        assert!(response.exited);
+        assert_eq!(response.exit_code, Some(17));
+        assert!(response.sandbox_denied);
+    }
+    let state = SessionState::new(true);
+    state.set_failure("transport lost".into());
+    let response = state.failed_response().unwrap();
+    assert!(!response.exited);
+    assert_eq!(response.exit_code, None);
+    assert!(!response.sandbox_denied);
+}
+
 fn registry_error(status: http::StatusCode, code: Option<&str>) -> ExecServerError {
     ExecServerError::EnvironmentRegistryHttp {
         status,

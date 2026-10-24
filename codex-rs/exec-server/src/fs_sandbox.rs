@@ -66,7 +66,8 @@ impl FileSystemSandboxRunner {
         let runner = self.clone();
         let sandbox = sandbox.clone();
         let (command, request_json) = tokio::task::spawn_blocking(move || {
-            let command = runner.prepare_command(&sandbox)?;
+            let capture_lock = prepare_capture_lock(&request)?;
+            let command = runner.prepare_command(&sandbox, capture_lock)?;
             let request_json = serde_json::to_vec(&request).map_err(json_error)?;
             Ok::<_, JSONRPCErrorError>((command, request_json))
         })
@@ -80,6 +81,7 @@ impl FileSystemSandboxRunner {
     fn prepare_command(
         &self,
         sandbox: &FileSystemSandboxContext,
+        capture_lock: Option<AbsolutePathBuf>,
     ) -> Result<SandboxExecRequest, JSONRPCErrorError> {
         let cwd = sandbox_cwd(sandbox)?;
         let native_permissions: PermissionProfile =
@@ -87,7 +89,8 @@ impl FileSystemSandboxRunner {
                 invalid_request(format!("invalid sandbox permission path URI: {err}"))
             })?;
         let mut file_system_policy = native_permissions.file_system_sandbox_policy();
-        let helper_read_roots = helper_read_roots(&self.runtime_paths);
+        let mut helper_read_roots = helper_read_roots(&self.runtime_paths);
+        helper_read_roots.extend(capture_lock);
         add_helper_runtime_permissions(
             &mut file_system_policy,
             &helper_read_roots,
@@ -128,7 +131,6 @@ impl FileSystemSandboxRunner {
             args: vec![CODEX_FS_HELPER_ARG1.to_string()],
             cwd: cwd.uri.clone(),
             env: self.helper_env.clone(),
-            managed_network: None,
             additional_permissions: None,
         };
         let native_workspace_roots = sandbox_context
@@ -149,9 +151,6 @@ impl FileSystemSandboxRunner {
                 command,
                 permissions: permission_profile,
                 sandbox,
-                enforce_managed_network: false,
-                environment_id: None,
-                network: None,
                 sandbox_policy_cwd: &cwd.uri,
                 windows_sandbox_level: sandbox_context.windows_sandbox_level,
                 windows_sandbox_private_desktop: sandbox_context.windows_sandbox_private_desktop,
@@ -167,6 +166,33 @@ impl FileSystemSandboxRunner {
         };
         transformed.map_err(|err| invalid_request(format!("failed to prepare fs sandbox: {err}")))
     }
+}
+
+fn prepare_capture_lock(
+    request: &FsHelperRequest,
+) -> Result<Option<AbsolutePathBuf>, JSONRPCErrorError> {
+    // Source I/O stays in the sandbox. The parent initializes only the empty,
+    // temp-side coordination file so the helper never needs write permissions
+    // outside its policy, including on a path's very first read or mutation.
+    let path = match request {
+        FsHelperRequest::ReadFile(params) => &params.path,
+        FsHelperRequest::ReadFileCapped { path, .. } => path,
+        FsHelperRequest::ReadFileBounded(params)
+        | FsHelperRequest::ReadFileBoundedWithSource(params) => &params.path,
+        FsHelperRequest::GetMetadata(params) => &params.path,
+        FsHelperRequest::MutateFileIfMatches(params) => &params.path,
+        _ => return Ok(None),
+    };
+    let path = path.to_abs_path().map_err(crate::fs_helper::map_fs_error)?;
+    let lock = match codex_file_system::prepare_patch_capture(path.as_path()) {
+        Ok(lock) => lock,
+        // Preserve the operation's ordinary missing-parent result in the helper.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(crate::fs_helper::map_fs_error(error)),
+    };
+    AbsolutePathBuf::from_absolute_path(lock)
+        .map(Some)
+        .map_err(|error| internal_error(error.to_string()))
 }
 
 fn sandbox_cwd(sandbox: &FileSystemSandboxContext) -> Result<SandboxCwd, JSONRPCErrorError> {

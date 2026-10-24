@@ -26,10 +26,9 @@ use crate::tools::context::ToolInvocation;
 use crate::tools::context::ToolPayload;
 use crate::tools::context::boxed_tool_output;
 use crate::tools::handlers::command_preflight::preflight_invocation_for_kd4_runtime;
-use crate::tools::handlers::command_search::classify_rg_search_with_repository;
+use crate::tools::handlers::command_search::rg_search_no_match_eligible;
 use crate::tools::handlers::command_shape::CommandInvocation;
 use crate::tools::handlers::parse_arguments_with_base_path;
-use crate::tools::handlers::resolve_search_repository_root;
 use crate::tools::handlers::resolve_workdir_base_path;
 use crate::tools::handlers::rewrite_function_command_invocation;
 use crate::tools::hook_names::HookToolName;
@@ -191,8 +190,6 @@ impl ShellCommandHandler {
                 .into(),
             capture_policy: ExecCapturePolicy::ShellTool,
             env,
-            network: turn_context.network.clone(),
-            network_environment_id: Some(turn_environment.environment_id.clone()),
             sandbox_permissions: params.sandbox_permissions.unwrap_or_default(),
             windows_sandbox_level: turn_context.windows_sandbox_level,
             windows_sandbox_private_desktop: turn_context
@@ -357,6 +354,16 @@ impl ShellCommandHandler {
         } else {
             Some(original_safety_shell.shell_type)
         };
+        let (mut policy_classification, mut policy_selection) =
+            crate::validation::analyze_validation_policy_with_shell(
+                &original_invocation, original_shell_type,
+                (!turn_environment.environment.is_remote()).then_some(cwd.as_path()),
+            ).await;
+        if let Some(refusal) = crate::validation_task::mode_refusal(
+            &turn, policy_classification, params.validation.is_some(),
+        ) {
+            return Ok(boxed_tool_output(refusal));
+        }
         let preflight = preflight_invocation_for_kd4_runtime(
             turn.config.features.enabled(Feature::Kd4Runtime),
             false,
@@ -372,21 +379,22 @@ impl ShellCommandHandler {
             ))
         })?;
         let command_repaired = preflight.repaired();
-        let full_suite = if turn.config.features.enabled(Feature::Kd4Runtime) {
-            crate::tools::handlers::command_preflight::check_full_suite_command(
-                &original_safety_command,
-                original_shell_type,
-                (!turn_environment.environment.is_remote()).then_some(cwd.as_path()),
-            )
-            .await
-            .map_err(FunctionCallError::RespondToModel)?
-        } else {
-            false
-        };
         let repair_notice = preflight.model_notice();
         let validation_invocations = preflight.validation_invocations;
         let command_invocation = preflight.invocation;
         let invocation_changed = command_invocation != original_invocation;
+        if invocation_changed {
+            (policy_classification, policy_selection) =
+                crate::validation::analyze_validation_policy_with_shell(
+                    &command_invocation, original_shell_type,
+                    (!turn_environment.environment.is_remote()).then_some(cwd.as_path()),
+                ).await;
+            if let Some(refusal) = crate::validation_task::mode_refusal(
+                &turn, policy_classification, params.validation.is_some(),
+            ) {
+                return Ok(boxed_tool_output(refusal));
+            }
+        }
         let validation = crate::validation::resolve_command_validation_with_shell(
             &command_invocation,
             original_shell_type,
@@ -398,7 +406,7 @@ impl ShellCommandHandler {
             || matches!(
                 classify_validation_invocations(&validation_invocations),
                 ValidationClassification::Validation { .. }
-            );
+            ) || policy_classification.is_validation();
         let hook_command = command_invocation.display_command();
         maybe_emit_implicit_skill_invocation(session.as_ref(), turn.as_ref(), &hook_command, &cwd)
             .await;
@@ -449,10 +457,8 @@ impl ShellCommandHandler {
             effective_stall_timeout_ms(timeout_ms, params.stall_timeout_ms)
         };
         let runtime_context = format!(
-            "shell={shell_type:?};login={use_login_shell};capture={:?};network_environment={:?};network={:?};stall_timeout_ms={:?}",
+            "shell={shell_type:?};login={use_login_shell};capture={:?};stall_timeout_ms={:?}",
             exec_params.capture_policy,
-            exec_params.network_environment_id,
-            exec_params.network,
             stall_timeout_ms,
         );
         let environment_hash = validation_environment_hash(&exec_params.env);
@@ -475,7 +481,7 @@ impl ShellCommandHandler {
             let attempt_key = CommandAttemptKey::new(
                 tool_name.name.as_str(),
                 &turn_environment.environment_id,
-                validation_cwd,
+                validation_cwd.clone(),
                 &exec_params.command,
             )
             .with_environment_fingerprint(&environment_hash)
@@ -486,52 +492,28 @@ impl ShellCommandHandler {
             .with_repository_epoch(repository_epoch)
             .with_workspace_identity(workspace_identity.as_deref());
             let search_command = safety_command.clone();
-            let search_cwd = exec_params.cwd.clone();
-            let search = crate::tools::run_blocking_command_analysis(move || {
-                classify_rg_search_with_repository(
-                    &search_command,
-                    shell_type,
-                    search_cwd.as_path(),
-                    || resolve_search_repository_root(search_cwd.as_path()),
-                )
-            })
-            .await
-            .map_err(|error| {
+            let eligible = crate::tools::run_blocking_command_analysis(move || {
+                rg_search_no_match_eligible(&search_command, shell_type)
+            }).await.map_err(|error| {
                 FunctionCallError::RespondToModel(format!("command search worker failed: {error}"))
-            })?
-            .map_err(FunctionCallError::RespondToModel)?;
-            // Shell resolution may select aliases, functions or a replacement
-            // executable. Source scope alone cannot authorize a cached miss.
-            let attempt_key = match search {
-                Some((repository, search)) => attempt_key.with_search_narrowing(
-                    &turn.sub_id,
-                    repository.to_string_lossy().as_ref(),
-                    Some(search),
-                ),
-                None => attempt_key,
-            }
-            .with_search_environment(&exec_params.env);
-            session
-                .services
-                .command_execution
-                .admit_search_narrowing(&attempt_key)
-                .await
-                .map_err(FunctionCallError::RespondToModel)?;
+            })?;
+            let attempt_key = attempt_key
+                .with_search_no_match_eligibility(eligible)
+                .with_search_environment(&exec_params.env);
             Some(attempt_key)
         } else {
             None
         };
-        // Prelaunch rejections release this reservation; possible execution does not.
-        if full_suite {
-            turn.full_suite_budget.refresh_owned_nonexecution().await;
-        }
-        let _suite_permit = turn
-            .full_suite_budget
-            .reserve(
-                full_suite,
-                crate::validation_task::reservation_owner(&session, &turn, &call_id),
-            )
-            .map_err(FunctionCallError::RespondToModel)?;
+        let _suite_permit = match crate::validation_task::reserve_policy(
+            &session, &turn, &call_id, policy_classification,
+            validation_launch,
+            policy_selection,
+            &format!("{validation_cwd}:{environment_hash}"),
+            workspace_identity.as_deref(),
+        ).await {
+            Ok(permit) => permit,
+            Err(refusal) => return Ok(boxed_tool_output(refusal)),
+        };
         let run_args = RunExecLikeArgs {
             max_output_tokens: params.max_output_tokens,
             validation,

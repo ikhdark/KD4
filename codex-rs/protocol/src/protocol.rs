@@ -120,10 +120,24 @@ pub const USER_MESSAGE_BEGIN: &str = "## My request for Codex:";
 
 /// Removes the model-context prefix from a user message before displaying it.
 pub fn strip_user_message_prefix(text: &str) -> &str {
-    match text.find(USER_MESSAGE_BEGIN) {
-        Some(idx) => text[idx + USER_MESSAGE_BEGIN.len()..].trim(),
-        None => text.trim(),
+    let text = text.trim();
+    if let Some(request) = text.strip_prefix(USER_MESSAGE_BEGIN) {
+        return request.trim();
     }
+    // Desktop/IDE wrappers put the request header on its own line after a
+    // recognized context preamble. A quoted marker in ordinary prose is data.
+    if text.starts_with("# Context from my IDE setup:")
+        || text.starts_with("# Files mentioned by the user:")
+    {
+        for (offset, _) in text.match_indices(USER_MESSAGE_BEGIN) {
+            if text[..offset].ends_with('\n')
+                && let Some(request) = text[offset..].strip_prefix(USER_MESSAGE_BEGIN)
+            {
+                return request.trim();
+            }
+        }
+    }
+    text
 }
 
 // TODO(anp): Replace `TurnEnvironmentSelection` with `PathUri` once path URIs carry environment
@@ -1074,7 +1088,7 @@ pub enum EventMsg {
     /// Ack the client's configure message.
     SessionConfigured(SessionConfiguredEvent),
 
-    /// Updated long-running goal metadata for the thread.
+    /// Legacy goal metadata, retained only to decode existing rollouts.
     ThreadGoalUpdated(ThreadGoalUpdatedEvent),
 
     /// Incremental MCP startup progress updates.
@@ -3469,9 +3483,6 @@ pub struct TurnTimingCounters {
     /// Total wall-clock nanoseconds spent in validation commands that executed.
     #[serde(default)]
     pub executed_validation_duration_ns: u64,
-    /// Validation tool outputs intentionally suppressed by admission policy.
-    #[serde(default)]
-    pub suppressed_validation_output_count: u32,
     /// Ready startup prewarms observed by the first model request.
     #[serde(default)]
     pub ready_startup_prewarm_count: u32,
@@ -4181,7 +4192,10 @@ impl TokenUsage {
         }
 
         let effective_window = context_window - BASELINE_TOKENS;
-        let used = (self.tokens_in_context_window() - BASELINE_TOKENS).max(0);
+        let used = self
+            .tokens_in_context_window()
+            .saturating_sub(BASELINE_TOKENS)
+            .max(0);
         let remaining = (effective_window - used).max(0);
         ((remaining as f64 / effective_window as f64) * 100.0)
             .clamp(0.0, 100.0)
@@ -4427,7 +4441,7 @@ pub struct McpToolCallEndEvent {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub plugin_id: Option<String>,
-    #[ts(type = "string")]
+    #[ts(type = "{ secs: number, nanos: number }")]
     pub duration: Duration,
     /// Result of the tool call. Note this could be an error.
     pub result: Result<CallToolResult, String>,
@@ -4455,7 +4469,7 @@ pub struct DynamicToolCallResponseEvent {
     /// Optional error text when the tool call failed before producing a response.
     pub error: Option<String>,
     /// The duration of the dynamic tool call.
-    #[ts(type = "string")]
+    #[ts(type = "{ secs: number, nanos: number }")]
     pub duration: Duration,
 }
 
@@ -4492,7 +4506,10 @@ pub struct ImageGenerationEndEvent {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub revised_prompt: Option<String>,
-    pub result: String,
+    pub result: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub error: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub saved_path: Option<AbsolutePathBuf>,
@@ -4631,7 +4648,7 @@ impl InitialHistory {
             InitialHistory::Forked(items) => {
                 multi_agent_version_from_items(items, /*thread_id*/ None)
             }
-        }
+        }.map(MultiAgentVersion::runtime_version)
     }
 
     pub fn get_history_mode(&self, default_history_mode: ThreadHistoryMode) -> ThreadHistoryMode {
@@ -5025,8 +5042,29 @@ fn multi_agent_version_from_items(
 #[ts(rename_all = "snake_case")]
 pub enum MultiAgentVersion {
     Disabled,
+    /// Historical wire value only; live sessions use V2.
     V1,
     V2,
+}
+
+impl MultiAgentVersion {
+    /// Preserve old rollout decoding without restoring the retired V1 runtime.
+    pub fn runtime_version(self) -> Self {
+        match self {
+            Self::V1 => Self::V2,
+            version => version,
+        }
+    }
+}
+
+#[test]
+fn legacy_multi_agent_metadata_uses_v2_at_runtime() {
+    let legacy: MultiAgentVersion = serde_json::from_str(r#""v1""#).expect("legacy metadata");
+    assert_eq!(legacy, MultiAgentVersion::V1);
+    assert_eq!(legacy.runtime_version(), MultiAgentVersion::V2);
+    assert_eq!(serde_json::to_string(&legacy).unwrap(), r#""v1""#);
+    assert_eq!(MultiAgentVersion::Disabled.runtime_version(), MultiAgentVersion::Disabled);
+    assert_eq!(MultiAgentVersion::V2.runtime_version(), MultiAgentVersion::V2);
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema, TS)]
@@ -5432,6 +5470,17 @@ pub struct TurnContextItem {
     /// Effective model-visible mode used as the durable context-diff baseline.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub multi_agent_mode: Option<MultiAgentMode>,
+    /// Authoritative validation policy. Legacy contexts inherit configured defaults.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub validation_mode: Option<crate::validation::ValidationMode>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub validation_full_budget: Option<usize>,
+    /// Root thread and turn whose validation attempts this context shares.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub validation_root_turn: Option<(String, String)>,
+    /// Settled admission identities, retained across compaction and recovery.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub validation_attempts: Vec<(String, String)>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effort: Option<ReasoningEffortConfig>,
     /// Durable proof that this baseline was transmitted and accepted by the
@@ -5864,7 +5913,7 @@ pub struct ExecCommandEndEvent {
     /// The observed command exit code; null when the platform did not supply one.
     pub exit_code: Option<i32>,
     /// The duration of the command execution.
-    #[ts(type = "string")]
+    #[ts(type = "{ secs: number, nanos: number }")]
     pub duration: Duration,
     /// Formatted output from the command, as seen by the model.
     pub formatted_output: String,
@@ -6137,17 +6186,11 @@ pub struct SkillMetadata {
 
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, TS, PartialEq, Eq)]
 pub struct SkillInterface {
-    #[ts(optional)]
     pub display_name: Option<String>,
-    #[ts(optional)]
     pub short_description: Option<String>,
-    #[ts(optional)]
     pub icon_small: Option<AbsolutePathBuf>,
-    #[ts(optional)]
     pub icon_large: Option<AbsolutePathBuf>,
-    #[ts(optional)]
     pub brand_color: Option<String>,
-    #[ts(optional)]
     pub default_prompt: Option<String>,
 }
 
@@ -6176,11 +6219,6 @@ pub struct SkillToolDependency {
     pub url: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, TS, PartialEq, Eq)]
-pub struct SessionNetworkProxyRuntime {
-    pub http_addr: String,
-    pub socks_addr: String,
-}
 
 #[derive(Debug, Clone, Serialize, JsonSchema, TS)]
 pub struct SessionConfiguredEvent {
@@ -6232,10 +6270,6 @@ pub struct SessionConfiguredEvent {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub initial_messages: Option<Vec<EventMsg>>,
 
-    /// Runtime proxy bind addresses, when the managed proxy was started for this session.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[ts(optional)]
-    pub network_proxy: Option<SessionNetworkProxyRuntime>,
 
     /// Path in which the rollout is stored. Can be `None` for ephemeral threads
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -6272,7 +6306,6 @@ impl<'de> Deserialize<'de> for SessionConfiguredEvent {
             cwd: AbsolutePathBuf,
             reasoning_effort: Option<ReasoningEffortConfig>,
             initial_messages: Option<Vec<EventMsg>>,
-            network_proxy: Option<SessionNetworkProxyRuntime>,
             rollout_path: Option<PathBuf>,
         }
 
@@ -6304,7 +6337,6 @@ impl<'de> Deserialize<'de> for SessionConfiguredEvent {
             cwd: wire.cwd,
             reasoning_effort: wire.reasoning_effort,
             initial_messages: wire.initial_messages,
-            network_proxy: wire.network_proxy,
             rollout_path: wire.rollout_path,
         })
     }
@@ -6322,58 +6354,9 @@ pub enum ThreadGoalStatus {
     Complete,
 }
 
-impl ThreadGoalStatus {
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Active => "active",
-            Self::Paused => "paused",
-            Self::Blocked => "blocked",
-            Self::UsageLimited => "usage_limited",
-            Self::BudgetLimited => "budget_limited",
-            Self::Complete => "complete",
-        }
-    }
 
-    pub const fn is_active(self) -> bool {
-        matches!(self, Self::Active)
-    }
 
-    pub const fn is_terminal(self) -> bool {
-        matches!(self, Self::BudgetLimited | Self::Complete)
-    }
-}
 
-impl TryFrom<&str> for ThreadGoalStatus {
-    type Error = String;
-
-    fn try_from(value: &str) -> Result<Self, Self::Error> {
-        match value {
-            "active" => Ok(Self::Active),
-            "paused" => Ok(Self::Paused),
-            "blocked" => Ok(Self::Blocked),
-            "usage_limited" => Ok(Self::UsageLimited),
-            "budget_limited" => Ok(Self::BudgetLimited),
-            "complete" => Ok(Self::Complete),
-            other => Err(format!("unknown thread goal status `{other}`")),
-        }
-    }
-}
-
-pub const MAX_THREAD_GOAL_OBJECTIVE_CHARS: usize = 4_000;
-
-pub fn validate_thread_goal_objective(value: &str) -> Result<(), String> {
-    if value.is_empty() {
-        return Err("goal objective must not be empty".to_string());
-    }
-    if value.len() > MAX_THREAD_GOAL_OBJECTIVE_CHARS
-        && value.chars().nth(MAX_THREAD_GOAL_OBJECTIVE_CHARS).is_some()
-    {
-        return Err(format!(
-            "goal objective must be at most {MAX_THREAD_GOAL_OBJECTIVE_CHARS} characters"
-        ));
-    }
-    Ok(())
-}
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
 #[serde(rename_all = "camelCase")]
@@ -6774,6 +6757,218 @@ mod tests {
     use tempfile::TempDir;
 
     #[test]
+    fn internal_code_cell_legacy_projection_keeps_only_passive_completion() {
+        let mut item = DynamicToolCallItem {
+            id: "code-mode-cell:cell-1".to_string(),
+            namespace: Some("codex.internal".to_string()),
+            tool: "code_mode_cell".to_string(),
+            arguments: json!({"cell_id":"cell-1"}),
+            status: DynamicToolCallStatus::InProgress,
+            content_items: None,
+            success: None,
+            error: None,
+            duration: None,
+        };
+        let started = ItemStartedEvent {
+            thread_id: ThreadId::new(),
+            turn_id: "turn-1".to_string(),
+            started_at_ms: 10,
+            item: TurnItem::DynamicToolCall(item.clone()),
+        };
+        assert!(started.as_legacy_events(false).is_empty());
+        item.status = DynamicToolCallStatus::Failed;
+        item.success = Some(false);
+        item.error = Some("TypeError".to_string());
+        let completed = ItemCompletedEvent {
+            thread_id: started.thread_id,
+            turn_id: "turn-1".to_string(),
+            completed_at_ms: 20,
+            item: TurnItem::DynamicToolCall(item),
+        };
+        assert!(matches!(completed.as_legacy_events(false).as_slice(),
+            [EventMsg::DynamicToolCallResponse(event)] if event.error.as_deref() == Some("TypeError")));
+        let mut ordinary = started;
+        let TurnItem::DynamicToolCall(item) = &mut ordinary.item else {
+            panic!("dynamic")
+        };
+        item.namespace = Some("apps".to_string());
+        assert!(matches!(
+            ordinary.as_legacy_events(false).as_slice(),
+            [EventMsg::DynamicToolCallRequest(_)]
+        ));
+    }
+
+    #[test]
+    fn user_message_previews_preserve_literal_request_markers() {
+        for message in [
+            "Explain this marker: ## My request for Codex: and its role.",
+            "Explain this marker: ## My request for Codex:",
+            "<prior context> ## My request for Codex:Count to 5",
+            "Plain preamble\n## My request for Codex:\nstill literal text",
+        ] {
+            let event = UserMessageEvent {
+                message: message.to_string(),
+                ..Default::default()
+            };
+            assert_eq!(strip_user_message_prefix(message), message);
+            assert_eq!(user_message_preview(&event).as_deref(), Some(message));
+        }
+        for message in [
+            "## My request for Codex: fix the parser",
+            "# Context from my IDE setup:\n\n## Open tabs:\n- lib.rs\n\n## My request for Codex:\nfix the parser",
+            "# Files mentioned by the user:\n\n## lib.rs: src/lib.rs\n\n## My request for Codex:\nfix the parser",
+        ] {
+            let event = UserMessageEvent {
+                message: message.to_string(),
+                ..Default::default()
+            };
+            assert_eq!(strip_user_message_prefix(message), "fix the parser");
+            assert_eq!(
+                user_message_preview(&event).as_deref(),
+                Some("fix the parser")
+            );
+        }
+    }
+
+    #[test]
+    fn remaining_context_handles_extreme_token_totals() {
+        for (total_tokens, expected) in [
+            (i64::MIN, 100),
+            (-1, 100),
+            (0, 100),
+            (BASELINE_TOKENS, 100),
+            (70_000, 50),
+            (128_000, 0),
+            (i64::MAX, 0),
+        ] {
+            let usage = TokenUsage {
+                total_tokens,
+                ..Default::default()
+            };
+            assert_eq!(usage.percent_of_context_window_remaining(128_000), expected);
+            for context_window in [i64::MIN, 0, BASELINE_TOKENS] {
+                assert_eq!(usage.percent_of_context_window_remaining(context_window), 0);
+            }
+            assert!((0..=100).contains(&usage.percent_of_context_window_remaining(i64::MAX)));
+        }
+    }
+
+    #[test]
+    fn event_duration_types_match_serde_wire_objects() -> Result<()> {
+        fn check<T: Serialize + TS>(event: T) -> Result<()> {
+            assert_eq!(
+                serde_json::to_value(event)?["duration"],
+                json!({"secs": 0, "nanos": 42_000_000})
+            );
+            assert!(T::decl().contains("duration: { secs: number, nanos: number }"));
+            Ok(())
+        }
+        let duration = Duration::from_millis(42);
+        check(McpToolCallEndEvent {
+            call_id: "mcp-1".to_string(),
+            invocation: McpInvocation {
+                server: "server".to_string(),
+                tool: "tool".to_string(),
+                arguments: None,
+            },
+            connector_id: None,
+            mcp_app_resource_uri: None,
+            link_id: None,
+            app_name: None,
+            template_id: None,
+            action_name: None,
+            plugin_id: None,
+            duration,
+            result: Err("failed".to_string()),
+        })?;
+        check(DynamicToolCallResponseEvent {
+            call_id: "dynamic-1".to_string(),
+            turn_id: "turn-1".to_string(),
+            completed_at_ms: 0,
+            namespace: None,
+            tool: "tool".to_string(),
+            arguments: json!({}),
+            content_items: Vec::new(),
+            success: true,
+            error: None,
+            duration,
+        })?;
+        check(ExecCommandEndEvent {
+            environment: None,
+            call_id: "exec-1".to_string(),
+            output_metadata: None,
+            process_id: None,
+            turn_id: "turn-1".to_string(),
+            completed_at_ms: 0,
+            command: Vec::new(),
+            cwd: test_path_buf("/tmp").abs().into(),
+            parsed_cmd: Vec::new(),
+            source: ExecCommandSource::Agent,
+            interaction_input: None,
+            stdout: String::new(),
+            stderr: String::new(),
+            aggregated_output: String::new(),
+            exit_code: Some(0),
+            duration,
+            formatted_output: String::new(),
+            status: ExecCommandStatus::Completed,
+        })?;
+        Ok(())
+    }
+
+    #[test]
+    fn skill_interface_types_accept_null_and_present_wire_values() -> Result<()> {
+        let absent = SkillInterface {
+            display_name: None,
+            short_description: None,
+            icon_small: None,
+            icon_large: None,
+            brand_color: None,
+            default_prompt: None,
+        };
+        assert_eq!(
+            serde_json::to_value(absent)?,
+            json!({
+                "display_name": null, "short_description": null, "icon_small": null,
+                "icon_large": null, "brand_color": null, "default_prompt": null,
+            })
+        );
+        let declaration = SkillInterface::decl();
+        for (field, value_type) in [
+            ("display_name", String::name()),
+            ("short_description", String::name()),
+            ("icon_small", AbsolutePathBuf::name()),
+            ("icon_large", AbsolutePathBuf::name()),
+            ("brand_color", String::name()),
+            ("default_prompt", String::name()),
+        ] {
+            assert!(
+                declaration.contains(&format!("{field}: {value_type} | null")),
+                "{declaration}"
+            );
+        }
+        let icon = test_path_buf("/tmp/icon.png").abs();
+        let present = SkillInterface {
+            display_name: Some("Example".to_string()),
+            short_description: Some("Description".to_string()),
+            icon_small: Some(icon.clone()),
+            icon_large: Some(icon.clone()),
+            brand_color: Some("#abcdef".to_string()),
+            default_prompt: Some("Help".to_string()),
+        };
+        let encoded = serde_json::to_value(&present)?;
+        assert_eq!(
+            encoded,
+            json!({
+                "display_name": "Example", "short_description": "Description", "icon_small": icon,
+                "icon_large": icon, "brand_color": "#abcdef", "default_prompt": "Help",
+            })
+        );
+        assert_eq!(serde_json::from_value::<SkillInterface>(encoded)?, present);
+        Ok(())
+    }
+
+    #[test]
     fn truncation_policy_config_clamps_nonpositive_limits_before_truncating() -> Result<()> {
         for limit in [i64::MIN, -1, 0] {
             for (mode, expected_policy, expected_text) in [
@@ -6865,7 +7060,6 @@ mod tests {
             "internallyDrainedWaitCount",
             "residualDeterministicGenerationCount",
             "ownerDrainedContinuationCount",
-            "suppressedValidationOutputCount",
             "readyStartupPrewarmCount",
             "noProgressDirectiveCount",
             "provenLoopActivationCount",
@@ -6929,7 +7123,6 @@ mod tests {
             None
         );
         assert_eq!(decoded.counters.owner_drained_continuation_count, 0);
-        assert_eq!(decoded.counters.suppressed_validation_output_count, 0);
         assert_eq!(decoded.counters.ready_startup_prewarm_count, 0);
         assert_eq!(decoded.counters.no_progress_directive_count, 0);
         assert_eq!(decoded.counters.proven_loop_activation_count, 0);
@@ -7011,11 +7204,6 @@ mod tests {
     fn consolidated_thread_value_types_preserve_their_contracts() -> Result<()> {
         assert_eq!(ThreadSortKey::default(), ThreadSortKey::CreatedAt);
         assert_eq!(SortDirection::default(), SortDirection::Desc);
-        assert_eq!(ThreadGoalStatus::UsageLimited.as_str(), "usage_limited");
-        assert_eq!(
-            ThreadGoalStatus::try_from("budget_limited"),
-            Ok(ThreadGoalStatus::BudgetLimited)
-        );
         assert_eq!(
             serde_json::to_value(ThreadGoalStatus::UsageLimited)?,
             json!("usageLimited")
@@ -7701,7 +7889,8 @@ mod tests {
                 id: "ig-1".into(),
                 status: "in_progress".into(),
                 revised_prompt: None,
-                result: String::new(),
+                result: None,
+                error: None,
                 saved_path: None,
                 provider_usage: None,
             }),
@@ -7811,7 +8000,8 @@ mod tests {
                 id: "ig-1".into(),
                 status: "completed".into(),
                 revised_prompt: Some("A tiny blue square".into()),
-                result: "Zm9v".into(),
+                result: Some("Zm9v".into()),
+                error: None,
                 saved_path: Some(test_path_buf("/tmp/ig-1.png").abs()),
                 provider_usage: None,
             }),
@@ -7825,7 +8015,8 @@ mod tests {
                 assert_eq!(event.call_id, "ig-1");
                 assert_eq!(event.status, "completed");
                 assert_eq!(event.revised_prompt.as_deref(), Some("A tiny blue square"));
-                assert_eq!(event.result, "Zm9v");
+                assert_eq!(event.result.as_deref(), Some("Zm9v"));
+                assert!(event.error.is_none());
                 assert_eq!(
                     event.saved_path.as_ref().map(AbsolutePathBuf::as_path),
                     Some(test_path_buf("/tmp/ig-1.png").as_path())
@@ -8789,6 +8980,10 @@ mod tests {
             multi_agent_version: None,
             multi_agent_mode: None,
             effort: None,
+            validation_mode: None,
+            validation_full_budget: None,
+            validation_root_turn: None,
+            validation_attempts: Vec::new(),
             context_provenance: None,
         };
 
@@ -8843,7 +9038,6 @@ mod tests {
                 cwd: test_path_buf("/home/user/project").abs(),
                 reasoning_effort: Some(ReasoningEffortConfig::default()),
                 initial_messages: None,
-                network_proxy: None,
                 rollout_path: Some(rollout_file.path().to_path_buf()),
             }),
         };

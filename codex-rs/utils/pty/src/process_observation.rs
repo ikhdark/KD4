@@ -130,15 +130,18 @@ impl ObservedProcess {
             return;
         };
         if let Some(context) = ProcessObservationContext::current() {
-            if let Ok(mut details) = context.recorder.details.try_lock()
-                && details.1.len() < DETAIL_LIMIT
-            {
-                if !details
+            if let Ok(mut details) = context.recorder.details.try_lock() {
+                if details
                     .1
                     .iter()
                     .any(|reference| reference.instance_id == self.instance_id)
                 {
+                    return;
+                }
+                if details.1.len() < DETAIL_LIMIT {
                     details.1.push((**creation).clone());
+                } else {
+                    context.recorder.dropped.fetch_add(1, Ordering::Relaxed);
                 }
             } else {
                 context.recorder.dropped.fetch_add(1, Ordering::Relaxed);
@@ -283,6 +286,28 @@ mod tests {
                         .contains("root_reaped")
                 );
                 drop(child.session);
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn repeated_reference_at_capacity_does_not_drop_details() {
+        let observations: Vec<_> = (0..=DETAIL_LIMIT)
+            .map(|_| observe_process_start("shared", ProcessRole::AuxiliaryRoot, None, None))
+            .collect();
+        let recorder = Arc::new(ProcessStartRecorder::default());
+        ProcessObservationContext::new(Arc::clone(&recorder), "references".into())
+            .scope(async {
+                for observation in &observations[..DETAIL_LIMIT] {
+                    observation.reference();
+                }
+                observations[0].reference();
+                observations[DETAIL_LIMIT - 1].reference();
+                let snapshot = recorder.snapshot();
+                assert_eq!(snapshot.shared_instance_references.len(), DETAIL_LIMIT);
+                assert_eq!(snapshot.dropped_details, 0);
+                observations[DETAIL_LIMIT].reference();
+                assert_eq!(recorder.snapshot().dropped_details, 1);
             })
             .await;
     }

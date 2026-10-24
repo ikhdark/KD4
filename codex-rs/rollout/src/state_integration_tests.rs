@@ -54,8 +54,7 @@ async fn try_init_waits_for_concurrent_startup_backfill() -> anyhow::Result<()> 
     let runtime =
         codex_state::StateRuntime::init(home.path().to_path_buf(), "test-provider".to_string())
             .await?;
-    let claimed = runtime.try_claim_backfill(/*lease_seconds*/ 60).await?;
-    assert!(claimed);
+    let claimed = runtime.claim_backfill(/*lease_seconds*/ 60).await?.expect("claim");
 
     // Completion is observed by the next database poll; a short interval keeps
     // the production wait bound without spending the one-second cadence.
@@ -75,7 +74,7 @@ async fn try_init_waits_for_concurrent_startup_backfill() -> anyhow::Result<()> 
         "init must keep waiting while another worker's backfill is running"
     );
     runtime
-        .mark_backfill_complete(/*last_watermark*/ None)
+        .complete_backfill_claim(&claimed, /*last_watermark*/ None)
         .await?;
     let initialized = init.await?;
     assert_eq!(

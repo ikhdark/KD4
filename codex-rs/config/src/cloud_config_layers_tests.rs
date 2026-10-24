@@ -102,9 +102,53 @@ review_model = "system-review"
 model = "user"
 model_provider = "cloud-high"
 review_model = "cloud-low-review"
+config_version = 1
 "#,
         )
     );
+}
+
+#[test]
+fn cloud_fragments_apply_local_migrations_and_reject_future_versions() {
+    let raw = r#"
+experimental_use_unified_exec_tool = false
+model_supports_reasoning_summaries = true
+[features]
+experimental_windows_sandbox = true
+search_tool = true
+"#;
+    for strict in [false, true] {
+        let layers = cloud_config_layers_from_fragments_impl(
+            [fragment("legacy", "Legacy cloud", raw)],
+            &base_dir(),
+            strict,
+        )
+        .expect("cloud migration precedes validation");
+        let config = &layers[0].config;
+        assert_eq!(config["config_version"].as_integer(), Some(1));
+        assert_eq!(config["features"]["unified_exec"].as_bool(), Some(false));
+        assert_eq!(config["windows"]["sandbox"].as_str(), Some("unelevated"));
+        assert!(config.get("experimental_use_unified_exec_tool").is_none());
+        assert!(config.get("model_supports_reasoning_summaries").is_none());
+        assert!(
+            config["features"]
+                .get("experimental_windows_sandbox")
+                .is_none()
+        );
+        assert!(config["features"].get("search_tool").is_none());
+        assert_eq!(layers[0].raw_toml(), Some(raw));
+        let err = cloud_config_layers_from_fragments_impl(
+            [fragment("future", "Future cloud", "config_version = 999")],
+            &base_dir(),
+            strict,
+        )
+        .expect_err("unsupported versions must not depend on delivery source");
+        assert!(
+            matches!(err, CloudConfigLayerError::Invalid { fragment, message }
+            if fragment.id == "future" && message.contains("unsupported config_version 999")
+                && message.contains("Future cloud (future)"))
+        );
+    }
 }
 
 #[test]

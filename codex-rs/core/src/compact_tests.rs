@@ -585,7 +585,9 @@ async fn retained_active_plan_omits_retired_history_without_mutating_owner() {
     let item = retained_plan_context(&session).await.unwrap().unwrap();
     let text = serde_json::to_string(&item).unwrap();
     assert!(!text.contains("historical detail"));
-    assert!(text.contains("unresolved recovery work"));
+    assert!(!text.contains("unresolved recovery work"));
+    assert!(text.contains("current_plan"));
+    assert!(text.contains("current"));
     assert_eq!(
         session.services.plan_store.snapshot_with_lineage().await,
         before
@@ -3997,32 +3999,6 @@ async fn local_compaction_request_records_usage_and_completion_in_turn_timing() 
             },
         )
         .await;
-    let trace_root = tempfile::tempdir()?;
-    Arc::get_mut(&mut session)
-        .expect("test session is uniquely owned")
-        .services
-        .rollout_thread_trace =
-        codex_rollout_trace::ThreadTraceContext::start_root_in_root_for_test(
-            trace_root.path(),
-            codex_rollout_trace::ThreadStartedTraceMetadata {
-                thread_id: session.thread_id.to_string(),
-                agent_path: "/root".into(),
-                task_name: None,
-                nickname: None,
-                agent_role: None,
-                session_source: turn.session_source.clone(),
-                cwd: turn.config.cwd.to_path_buf(),
-                rollout_path: None,
-                model: turn.model_info.slug.clone(),
-                provider_name: turn.provider.info().name.clone(),
-                approval_policy: "never".into(),
-                sandbox_policy: "read_only".into(),
-            },
-        )?;
-    session
-        .services
-        .rollout_thread_trace
-        .record_codex_turn_started(turn.sub_id.as_str());
     let metadata = turn.turn_metadata_state.to_responses_metadata(
         session.installation_id.clone(),
         session.current_window_id().await,
@@ -4094,54 +4070,6 @@ async fn local_compaction_request_records_usage_and_completion_in_turn_timing() 
     );
     assert_eq!(timing.counters.model_request_count, 1);
     assert_eq!(timing.milestones.first_visible_output_ms, None);
-    let bundle = std::fs::read_dir(trace_root.path())?
-        .next()
-        .unwrap()?
-        .path();
-    let trace = tokio::time::timeout(std::time::Duration::from_secs(5), async {
-        loop {
-            if let Ok(trace) = codex_rollout_trace::replay_bundle(&bundle)
-                && trace.inference_calls.len() == 1
-                && trace
-                    .inference_calls
-                    .values()
-                    .all(|call| call.usage.is_some())
-            {
-                break trace;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .expect("local compaction trace terminal must persist");
-    assert!(
-        trace.compaction_requests.is_empty(),
-        "one canonical inference receipt, not two trace owners"
-    );
-    let usage = trace
-        .inference_calls
-        .values()
-        .next()
-        .unwrap()
-        .usage
-        .as_ref()
-        .unwrap();
-    assert_eq!(usage.total_tokens, Some(1234));
-    assert_eq!(usage.input_tokens, 1234);
-    let captures = std::fs::read_dir(bundle.join("payloads"))?
-        .map(|entry| {
-            Ok(serde_json::from_slice::<serde_json::Value>(
-                &std::fs::read(entry?.path())?,
-            )?)
-        })
-        .collect::<anyhow::Result<Vec<_>>>()?;
-    assert_eq!(
-        captures
-            .iter()
-            .filter(|capture| capture["_codex"]["settings"]["request_kind"] == "local_compaction")
-            .count(),
-        1
-    );
     Ok(())
 }
 #[test]

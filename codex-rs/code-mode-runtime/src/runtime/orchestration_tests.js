@@ -1295,7 +1295,10 @@ try {
 
     globalThis.ALL_TOOL_NAMES = ["exec_command", "write_stdin"];
     let polls = 0;
-    reply = () => live("", 77);
+    const searchLive = (stdout = "", stderr = "") => ({
+      ...live(stdout, 77), stdout, stderr, streams_complete: true,
+    });
+    reply = () => searchLive();
     tools.write_stdin = async (request) => {
       ++polls;
       check(request.session_id === 77 && request.incarnation === "creation-a",
@@ -1307,6 +1310,32 @@ try {
     tools.write_stdin = async () => exited("ok.rs\u00001\n", 2, "partial error");
     check(!(await search_files("x")).complete,
       "drained rg error became complete");
+    for (const code of [0, 1, 2]) {
+      reply = () => searchLive("early.rs\u00001\nmid", "early warning\n");
+      const packets = [searchLive("dle.rs\u00002\n"), exited("", code, "late warning\n")];
+      tools.write_stdin = async () => packets.shift();
+      const gathered = await search_files("x");
+      check(gathered.match_count === 3 && gathered.file_count === 2 &&
+        gathered.files[0].path === "early.rs" && gathered.files[1].path === "middle.rs" &&
+        gathered.complete === (code !== 2) &&
+        gathered.errors.join("|") === "early warning|late warning",
+        "search discarded early/split count records or diagnostics");
+    }
+    const event = JSON.stringify({type:"match", data:{path:{text:"split.rs"},
+      line_number:1, lines:{text:"needle\n"}, submatches:[]}}) + "\n";
+    reply = () => searchLive(event.slice(0, 13));
+    const pieces = [searchLive(event.slice(13)), exited("")];
+    tools.write_stdin = async () => pieces.shift();
+    const splitJson = await search_files("needle", {lines:true});
+    check(splitJson.complete && splitJson.match_count === 1 &&
+      splitJson.files[0].path === "split.rs", "search discarded split JSON events");
+    for (const lines of [false, true]) {
+      reply = () => ({...searchLive(), streams_complete:false});
+      tools.write_stdin = async () => exited(lines ? event : "last.rs\u00001\n");
+      check((await rejected(() => search_files("x", {lines}))).message.includes("exact capture"),
+        "search hid an earlier capture loss");
+    }
+    reply = () => searchLive();
     tools.write_stdin = async () => ({...live("", 77), error: "steering"});
     check((await rejected(() => search_files("x"))).evidence.cause.evidence.terminal.error === "steering",
       "search swallowed an observation boundary");

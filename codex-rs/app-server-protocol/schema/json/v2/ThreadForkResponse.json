@@ -600,6 +600,48 @@
       ],
       "type": "object"
     },
+    "FileChangeEffect": {
+      "properties": {
+        "after": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "before": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "path": {
+          "$ref": "#/definitions/PathUri"
+        }
+      },
+      "required": [
+        "path"
+      ],
+      "type": "object"
+    },
+    "FileChangeEffects": {
+      "description": "Ordered committed endpoint receipts. `exact=false` means additional effects may be unknown; an empty list then is not proof that nothing changed.",
+      "properties": {
+        "changes": {
+          "items": {
+            "$ref": "#/definitions/FileChangeEffect"
+          },
+          "type": "array"
+        },
+        "exact": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "changes",
+        "exact"
+      ],
+      "type": "object"
+    },
     "FileSystemAccessMode": {
       "description": "Access mode for a filesystem entry.\n\nWhen two equally specific entries target the same path, we compare these by conflict precedence rather than by capability breadth: `deny` beats `write`, and `write` beats `read`.",
       "oneOf": [
@@ -808,48 +850,6 @@
           "type": "object"
         }
       ]
-    },
-    "FileChangeEffect": {
-      "properties": {
-        "after": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "before": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "path": {
-          "$ref": "#/definitions/PathUri"
-        }
-      },
-      "required": [
-        "path"
-      ],
-      "type": "object"
-    },
-    "FileChangeEffects": {
-      "description": "Ordered committed endpoint receipts. `exact=false` means additional effects may be unknown; an empty list then is not proof that nothing changed.",
-      "properties": {
-        "changes": {
-          "items": {
-            "$ref": "#/definitions/FileChangeEffect"
-          },
-          "type": "array"
-        },
-        "exact": {
-          "type": "boolean"
-        }
-      },
-      "required": [
-        "changes",
-        "exact"
-      ],
-      "type": "object"
     },
     "FileUpdateChange": {
       "properties": {
@@ -2557,6 +2557,7 @@
         },
         {
           "properties": {
+            "error": true,
             "id": {
               "type": "string"
             },
@@ -2572,7 +2573,10 @@
               "description": "Separate image-model receipt; never add these tokens to text inference."
             },
             "result": {
-              "type": "string"
+              "type": [
+                "string",
+                "null"
+              ]
             },
             "revisedPrompt": {
               "type": [
@@ -2603,7 +2607,6 @@
           },
           "required": [
             "id",
-            "result",
             "status",
             "type"
           ],
@@ -3440,7 +3443,7 @@
         },
         "mutation_revision": {
           "format": "uint64",
-          "minimum": 0,
+          "minimum": 0.0,
           "type": "integer"
         },
         "plan_revision": {
@@ -3454,7 +3457,7 @@
         },
         "schema_version": {
           "format": "uint32",
-          "minimum": 0,
+          "minimum": 0.0,
           "type": "integer"
         },
         "terminal_action": {
@@ -4142,13 +4145,6 @@
         "suppressedDeterministicContinuationCount": {
           "default": 0,
           "description": "Authoritative number of model boundaries suppressed by accepted deterministic-continuation receipts. A receipt whose `suppressed_continuation_count` is N contributes N, not one. Invalid, rejected, and zero-count receipts contribute nothing. This counter is independent of `generations_by_disposition`.",
-          "format": "uint32",
-          "minimum": 0.0,
-          "type": "integer"
-        },
-        "suppressedValidationOutputCount": {
-          "default": 0,
-          "description": "Validation tool outputs intentionally suppressed by admission policy.",
           "format": "uint32",
           "minimum": 0.0,
           "type": "integer"

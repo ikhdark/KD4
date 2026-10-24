@@ -88,29 +88,33 @@ impl FeedbackRequestProcessor {
         let snapshot = self.feedback.snapshot(conversation_id);
         let thread_id = snapshot.thread_id.clone();
         let prepare_logs = async {
-            let (feedback_thread_ids, sqlite_feedback_logs) = if include_logs {
-                if let Some(log_db) = self.log_db.as_ref()
-                    && let Err(err) = log_db.flush().await
-                {
-                    tracing::warn!(%err, "failed to flush SQLite logs");
-                }
-                let state_db_ctx = self.state_db.clone();
-                let feedback_thread_ids = match conversation_id {
-                    Some(conversation_id) => match self
-                        .thread_manager
-                        .list_agent_subtree_thread_ids(conversation_id)
-                        .await
+            let feedback_thread_ids = if include_logs {
+                let flush = async {
+                    if let Some(log_db) = self.log_db.as_ref()
+                        && let Err(err) = log_db.flush().await
                     {
-                        Ok(thread_ids) => thread_ids,
-                        Err(err) => {
-                            warn!(
-                                "failed to list feedback subtree for thread_id={conversation_id}: {err}"
-                            );
-                            vec![conversation_id]
-                        }
-                    },
-                    None => Vec::new(),
+                        tracing::warn!(%err, "failed to flush SQLite logs");
+                    }
                 };
+                let discover = async {
+                    match conversation_id {
+                        Some(conversation_id) => match self
+                            .thread_manager
+                            .list_agent_subtree_thread_ids(conversation_id)
+                            .await
+                        {
+                            Ok(thread_ids) => thread_ids,
+                            Err(err) => {
+                                warn!(
+                                    "failed to list feedback subtree for thread_id={conversation_id}: {err}"
+                                );
+                                vec![conversation_id]
+                            }
+                        },
+                        None => Vec::new(),
+                    }
+                };
+                let (_, feedback_thread_ids) = tokio::join!(flush, discover);
                 let mut feedback_thread_ids = feedback_thread_ids;
                 let original_len = feedback_thread_ids.len();
                 if let Some(conversation_id) = conversation_id {
@@ -122,6 +126,12 @@ impl FeedbackRequestProcessor {
                         );
                     }
                 }
+                feedback_thread_ids
+            } else {
+                Vec::new()
+            };
+            let query_logs = async {
+                let state_db_ctx = self.state_db.clone();
                 let sqlite_feedback_logs = if let Some(state_db_ctx) = state_db_ctx.as_ref()
                     && !feedback_thread_ids.is_empty()
                 {
@@ -150,66 +160,68 @@ impl FeedbackRequestProcessor {
                 } else {
                     None
                 };
-                (feedback_thread_ids, sqlite_feedback_logs)
-            } else {
-                (Vec::new(), None)
+                sqlite_feedback_logs
             };
-
-            let mut attachment_paths = Vec::new();
-            let mut seen_attachment_paths = HashSet::new();
-            if include_logs {
-                let rollout_paths = futures::stream::iter(feedback_thread_ids)
-                    .map(|feedback_thread_id| async move {
-                        (
-                            feedback_thread_id,
-                            self.thread_manager
-                                .resolve_existing_rollout_path(
-                                    feedback_thread_id,
-                                    /*include_archived*/ true,
-                                )
-                                .await,
-                        )
-                    })
-                    .buffered(MAX_FEEDBACK_TREE_THREADS);
-                futures::pin_mut!(rollout_paths);
-                while let Some((feedback_thread_id, result)) = rollout_paths.next().await {
-                    let rollout_path = match result {
-                        Ok(Some(path)) => path,
-                        Ok(None) => continue,
-                        Err(err) => {
-                            warn!(
-                                "failed to resolve rollout path for thread_id={feedback_thread_id}: {err}"
-                            );
-                            continue;
+            let prepare_attachments = async {
+                let mut attachment_paths = Vec::new();
+                let mut seen_attachment_paths = HashSet::new();
+                if include_logs {
+                    let rollout_paths = futures::stream::iter(feedback_thread_ids.iter().copied())
+                        .map(|feedback_thread_id| async move {
+                            (
+                                feedback_thread_id,
+                                self.thread_manager
+                                    .resolve_existing_rollout_path(
+                                        feedback_thread_id,
+                                        /*include_archived*/ true,
+                                    )
+                                    .await,
+                            )
+                        })
+                        .buffered(MAX_FEEDBACK_TREE_THREADS);
+                    futures::pin_mut!(rollout_paths);
+                    while let Some((feedback_thread_id, result)) = rollout_paths.next().await {
+                        let rollout_path = match result {
+                            Ok(Some(path)) => path,
+                            Ok(None) => continue,
+                            Err(err) => {
+                                warn!(
+                                    "failed to resolve rollout path for thread_id={feedback_thread_id}: {err}"
+                                );
+                                continue;
+                            }
+                        };
+                        if seen_attachment_paths.insert(rollout_path.clone()) {
+                            attachment_paths.push(FeedbackAttachmentPath {
+                                path: rollout_path,
+                                hydrate_rollout: true,
+                                attachment_filename_override: None,
+                            });
                         }
-                    };
-                    if seen_attachment_paths.insert(rollout_path.clone()) {
-                        attachment_paths.push(FeedbackAttachmentPath {
-                            path: rollout_path,
-                            hydrate_rollout: true,
-                            attachment_filename_override: None,
-                        });
+                    }
+                    if let Some(sandbox_log_attachment) =
+                        windows_sandbox_log_attachment(&self.config.codex_home)
+                        && seen_attachment_paths.insert(sandbox_log_attachment.path.clone())
+                    {
+                        attachment_paths.push(sandbox_log_attachment);
                     }
                 }
-                if let Some(sandbox_log_attachment) =
-                    windows_sandbox_log_attachment(&self.config.codex_home)
-                    && seen_attachment_paths.insert(sandbox_log_attachment.path.clone())
-                {
-                    attachment_paths.push(sandbox_log_attachment);
-                }
-            }
-            if let Some(extra_log_files) = extra_log_files {
-                for extra_log_file in extra_log_files {
-                    if seen_attachment_paths.insert(extra_log_file.clone()) {
-                        attachment_paths.push(FeedbackAttachmentPath {
-                            path: extra_log_file,
-                            hydrate_rollout: false,
-                            attachment_filename_override: None,
-                        });
+                if let Some(extra_log_files) = extra_log_files {
+                    for extra_log_file in extra_log_files {
+                        if seen_attachment_paths.insert(extra_log_file.clone()) {
+                            attachment_paths.push(FeedbackAttachmentPath {
+                                path: extra_log_file,
+                                hydrate_rollout: false,
+                                attachment_filename_override: None,
+                            });
+                        }
                     }
                 }
-            }
 
+                attachment_paths
+            };
+            let (attachment_paths, sqlite_feedback_logs) =
+                tokio::join!(prepare_attachments, query_logs);
             (attachment_paths, sqlite_feedback_logs)
         };
         let prepare_doctor = async {

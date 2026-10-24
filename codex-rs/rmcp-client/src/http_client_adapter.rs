@@ -179,7 +179,7 @@ impl StreamableHttpClient for StreamableHttpClientAdapter {
             ));
         }
         if response.status == StatusCode::UNAUTHORIZED.as_u16()
-            && let Some(header) = response_header(&response.headers, WWW_AUTHENTICATE)
+            && let Some(header) = response_auth_challenge(&response.headers)
         {
             return Err(StreamableHttpError::AuthRequired(AuthRequiredError::new(
                 header,
@@ -439,6 +439,18 @@ impl StreamableHttpClient for StreamableHttpClientAdapter {
                 StreamableHttpClientAdapterError::SessionExpired404,
             ));
         }
+        if response.status == StatusCode::UNAUTHORIZED.as_u16()
+            && let Some(challenge) = response_auth_challenge(&response.headers)
+        {
+            return Err(StreamableHttpError::AuthRequired(AuthRequiredError::new(challenge)));
+        }
+        if response.status == StatusCode::FORBIDDEN.as_u16()
+            && let Some(challenge) = insufficient_scope_challenge(&response.headers)
+        {
+            return Err(StreamableHttpError::InsufficientScope(InsufficientScopeError::new(
+                challenge.www_authenticate_header, challenge.required_scope,
+            )));
+        }
         if !status_is_success(response.status) {
             return Err(unexpected_http_status_error(
                 response.status,
@@ -595,6 +607,14 @@ fn response_header(headers: &[HttpHeader], name: impl AsRef<str>) -> Option<Stri
         .iter()
         .find(|header| header.name.eq_ignore_ascii_case(name))
         .map(|header| header.value.clone())
+}
+
+fn response_auth_challenge(headers: &[HttpHeader]) -> Option<String> {
+    let values = headers.iter()
+        .filter(|header| header.name.eq_ignore_ascii_case(WWW_AUTHENTICATE.as_str()))
+        .map(|header| header.value.as_str())
+        .collect::<Vec<_>>();
+    (!values.is_empty()).then(|| values.join(", "))
 }
 
 fn status_is_success(status: u16) -> bool {
@@ -756,6 +776,42 @@ mod tests {
                 expected
             );
         }
+    }
+
+    #[tokio::test]
+    async fn audit20261023_post_and_get_preserve_all_authentication_challenges() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = Router::new().route("/{case}", any(|axum::extract::Path(case): axum::extract::Path<String>| async move {
+            let unauthorized = case.starts_with("401");
+            let mut response = axum::response::Response::new(Body::empty());
+            *response.status_mut() = if unauthorized { StatusCode::UNAUTHORIZED } else { StatusCode::FORBIDDEN };
+            let basic = HeaderValue::from_static("Basic realm=\"legacy, server\"");
+            let bearer = HeaderValue::from_static("Bearer resource_metadata=\"https://example.test/metadata\", error=\"insufficient_scope\", scope=\"updated\"");
+            let values = if case.ends_with("basic-first") { [basic, bearer] } else { [bearer, basic] };
+            for value in values { response.headers_mut().append(WWW_AUTHENTICATE, value); }
+            response
+        }));
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap(); });
+        let adapter = StreamableHttpClientAdapter::new(Arc::new(codex_exec_server::ReqwestHttpClient), HeaderMap::new(), None);
+        for case in ["401-basic-first", "401-bearer-first", "403-basic-first", "403-bearer-first"] {
+            let check = |error: StreamableHttpError<StreamableHttpClientAdapterError>| {
+                if case.starts_with("401") {
+                    let challenge = error.auth_challenge().expect("401 must reach reactive authentication");
+                    assert!(challenge.contains("Basic realm=\"legacy, server\""));
+                    assert!(challenge.contains("resource_metadata=\"https://example.test/metadata\""));
+                } else {
+                    assert!(matches!(error, StreamableHttpError::InsufficientScope(_)));
+                }
+            };
+            match adapter.get_stream(format!("http://{address}/{case}").into(), None, None, Some("expired-but-not-locally-expired".into()), HashMap::new()).await {
+                Err(error) => check(error), Ok(_) => panic!("GET must fail with an auth challenge"),
+            }
+            match adapter.post_message(format!("http://{address}/{case}").into(), serde_json::from_value(serde_json::json!({"jsonrpc":"2.0","id":1,"method":"tools/list"})).unwrap(), None, Some("expired-but-not-locally-expired".into()), HashMap::new()).await {
+                Err(error) => check(error), Ok(_) => panic!("POST must fail with an auth challenge"),
+            }
+        }
+        server.abort();
     }
 
     #[tokio::test]

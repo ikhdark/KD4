@@ -2,6 +2,9 @@ use std::env;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
+use std::process::Output;
+use std::time::Duration;
+use std::time::Instant;
 
 use std::process::Stdio;
 
@@ -73,10 +76,14 @@ fn build_windows_serve_preflight_command(
     Ok(command)
 }
 
-pub(super) fn preflight_serve_restart(codex_bin: &Path, config_overrides: &[String]) -> Result<()> {
+pub(super) fn preflight_serve_restart(
+    codex_bin: &Path,
+    config_overrides: &[String],
+    deadline: Instant,
+) -> Result<()> {
     {
-        let status = build_windows_serve_preflight_command(codex_bin, config_overrides)?
-            .status()
+        let status = run_helper_until(&mut build_windows_serve_preflight_command(codex_bin, config_overrides)?, deadline, false)
+            .map(|output| output.status)
             .with_context(|| {
                 format!(
                     "failed to launch `{}` for app-server restart preflight; existing listeners were not changed",
@@ -106,13 +113,13 @@ pub(super) fn start_prepared_serve<T>(
     spawn()
 }
 
-pub(super) fn listener_pids_on_port(port: u16) -> Result<Vec<u32>> {
-    let output = Command::new("netstat")
-        .arg("-ano")
-        .arg("-p")
-        .arg("tcp")
-        .output()
-        .with_context(|| format!("failed to run netstat for port {port}"))?;
+pub(super) fn listener_pids_on_port(port: u16, deadline: Instant) -> Result<Vec<u32>> {
+    let output = run_helper_until(
+        Command::new("netstat").arg("-ano").arg("-p").arg("tcp"),
+        deadline,
+        true,
+    )
+    .with_context(|| format!("failed to run netstat for port {port}"))?;
     if !output.status.success() {
         bail!(
             "netstat failed for port {port}: {}; {}",
@@ -157,22 +164,146 @@ fn sorted_unique_pids(pids: impl IntoIterator<Item = u32>) -> Vec<u32> {
     pids
 }
 
-pub(super) fn terminate_process(pid: u32, force: bool) -> Result<std::process::ExitStatus> {
+pub(super) fn terminate_process(
+    pid: u32,
+    force: bool,
+    deadline: Instant,
+) -> Result<std::process::ExitStatus> {
     let mut command = Command::new("taskkill");
     command.arg("/PID").arg(pid.to_string()).arg("/T");
     if force {
         command.arg("/F");
     }
-    command.status().with_context(|| {
-        format!(
-            "failed to {} pid {pid}",
-            if force {
-                "force terminate"
-            } else {
-                "terminate"
-            }
-        )
+    run_helper_until(&mut command, deadline, false)
+        .map(|output| output.status)
+        .with_context(|| {
+            format!(
+                "failed to {} pid {pid}",
+                if force {
+                    "force terminate"
+                } else {
+                    "terminate"
+                }
+            )
+        })
+}
+
+fn run_helper_until(command: &mut Command, deadline: Instant, capture: bool) -> Result<Output> {
+    use std::os::windows::process::CommandExt;
+    if Instant::now() >= deadline {
+        bail!("restart operation deadline expired before launching helper");
+    }
+    let mut child = command
+        .stdin(Stdio::null())
+        .stdout(if capture {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
+        .stderr(if capture {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
+        .creation_flags(0x0800_0000)
+        .spawn()
+        .context("launch restart helper")?;
+    if !capture {
+        return Ok(Output {
+            status: wait_helper_until(&mut child, deadline)?,
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+        });
+    }
+    let read_output = |reader: Box<dyn std::io::Read + Send>| {
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        std::thread::spawn(move || {
+            use std::io::Read;
+            let mut bytes = Vec::new();
+            let result = reader
+                .take(8 * 1024 * 1024 + 1)
+                .read_to_end(&mut bytes)
+                .and_then(|_| {
+                    if bytes.len() > 8 * 1024 * 1024 {
+                        Err(std::io::Error::other("restart helper output exceeds 8 MiB"))
+                    } else {
+                        Ok(bytes)
+                    }
+                });
+            let _ = sender.send(result);
+        });
+        receiver
+    };
+    // Drain while the helper runs, not after waiting for it to exit. Detached
+    // readers cannot extend the budget if a descendant retains an output pipe.
+    let stdout = read_output(Box::new(
+        child.stdout.take().context("helper stdout unavailable")?,
+    ));
+    let stderr = read_output(Box::new(
+        child.stderr.take().context("helper stderr unavailable")?,
+    ));
+    let status = wait_helper_until(&mut child, deadline)?;
+    let read = |receiver: std::sync::mpsc::Receiver<std::io::Result<Vec<u8>>>| -> Result<Vec<u8>> {
+        receiver
+            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            .context("restart operation deadline expired draining helper output")?
+            .context("read restart helper output")
+    };
+    Ok(Output {
+        status,
+        stdout: read(stdout)?,
+        stderr: read(stderr)?,
     })
+}
+
+fn wait_helper_until(
+    child: &mut std::process::Child,
+    deadline: Instant,
+) -> Result<std::process::ExitStatus> {
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return Ok(status),
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(
+                Duration::from_millis(10).min(deadline.saturating_duration_since(Instant::now())),
+            ),
+            result => {
+                if let Err(error) = child.kill()
+                    && child
+                        .try_wait()
+                        .context("inspect helper after failed termination")?
+                        .is_none()
+                {
+                    return Err(error).context("terminate expired restart helper");
+                }
+                child.wait().context("reap stopped restart helper")?;
+                if let Err(error) = result {
+                    return Err(error).context("inspect restart helper");
+                }
+                bail!(
+                    "restart operation deadline expired; helper pid {} was terminated and reaped",
+                    child.id()
+                );
+            }
+        }
+    }
+}
+
+pub(super) fn listeners_after_grace(
+    mut inspect: impl FnMut() -> Result<Vec<u32>>,
+    grace_deadline: Instant,
+    operation_deadline: Instant,
+    mut wait: impl FnMut(Duration),
+) -> Result<Vec<u32>> {
+    let remaining = inspect()?;
+    if remaining.is_empty() {
+        return Ok(remaining);
+    }
+    let until = grace_deadline.min(operation_deadline);
+    wait(until.saturating_duration_since(Instant::now()));
+    if Instant::now() >= operation_deadline {
+        bail!("restart operation deadline expired waiting for listeners");
+    }
+    inspect()
 }
 
 pub(super) fn powershell_quote(input: &str) -> String {
@@ -184,6 +315,108 @@ mod tests {
     use super::*;
     use pretty_assertions::assert_eq;
     use std::cell::RefCell;
+
+    #[test]
+    fn listener_grace_skips_wait_after_immediate_exit_and_rechecks_survivors() {
+        let waits = RefCell::new(Vec::new());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        assert!(
+            listeners_after_grace(
+                || Ok(vec![]),
+                deadline,
+                deadline,
+                |wait| waits.borrow_mut().push(wait)
+            )
+            .unwrap()
+            .is_empty()
+        );
+        assert!(waits.borrow().is_empty());
+        for final_pids in [vec![], vec![7]] {
+            let mut polls = 0;
+            let result = listeners_after_grace(
+                || {
+                    polls += 1;
+                    Ok(if polls == 1 {
+                        vec![7]
+                    } else {
+                        final_pids.clone()
+                    })
+                },
+                Instant::now() + Duration::from_millis(300),
+                deadline,
+                |wait| waits.borrow_mut().push(wait),
+            )
+            .unwrap();
+            assert_eq!(polls, 2);
+            assert_eq!(result, final_pids);
+        }
+        assert_eq!(waits.borrow().len(), 2);
+        assert!(
+            waits
+                .borrow()
+                .iter()
+                .all(|wait| *wait <= Duration::from_millis(300))
+        );
+    }
+
+    #[test]
+    fn restart_helper_timeout_terminates_reaps_and_preserves_shared_deadline() {
+        use std::io::BufRead;
+        use std::os::windows::process::CommandExt;
+        let mut child = Command::new("powershell.exe")
+            .args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "[Console]::WriteLine('ready'); Start-Sleep -Seconds 60",
+            ])
+            .creation_flags(0x0800_0000)
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut ready = String::new();
+        std::io::BufReader::new(child.stdout.take().unwrap())
+            .read_line(&mut ready)
+            .unwrap();
+        assert_eq!(ready.trim(), "ready");
+        let deadline = Instant::now() + Duration::from_millis(150);
+        let error = wait_helper_until(&mut child, deadline).unwrap_err();
+        assert!(error.to_string().contains("deadline expired"), "{error:#}");
+        assert!(
+            child.try_wait().unwrap().is_some(),
+            "owned helper was reaped"
+        );
+        let error = run_helper_until(
+            &mut Command::new("must-not-launch-after-expiry"),
+            deadline,
+            false,
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("deadline expired before launching"),
+            "{error:#}"
+        );
+        let calls = RefCell::new(Vec::new());
+        let result = start_prepared_serve(
+            true,
+            || preflight_serve_restart(Path::new("must-not-launch"), &[], deadline),
+            || {
+                calls.borrow_mut().push("kill");
+                Ok(())
+            },
+            || {
+                calls.borrow_mut().push("spawn");
+                Ok(())
+            },
+        );
+        assert!(result.is_err());
+        assert!(
+            calls.borrow().is_empty(),
+            "expired preflight cannot mutate listeners"
+        );
+    }
 
     #[test]
     fn runtime_dir_uses_the_platform_temp_directory() {

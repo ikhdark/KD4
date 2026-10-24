@@ -79,10 +79,10 @@ pub(crate) async fn chatgpt_get_request_with_timeout<T: DeserializeOwned>(
                 Ok(None) | Err(_) => break,
             }
         }
-        let truncated = body.len() == MAX_ERROR_BODY_BYTES;
+        let read_limit_reached = body.len() == MAX_ERROR_BODY_BYTES;
         let mut body = String::from_utf8_lossy(&body).into_owned();
-        if truncated {
-            body.push_str(" [truncated]");
+        if read_limit_reached {
+            body.push_str(" [body read limit reached]");
         }
         anyhow::bail!("Request failed with status {status}: {body}")
     }
@@ -148,7 +148,7 @@ mod tests {
         assert_eq!(
             error.to_string(),
             format!(
-                "Request failed with status 503 Service Unavailable: {} [truncated]",
+                "Request failed with status 503 Service Unavailable: {} [body read limit reached]",
                 "x".repeat(MAX_ERROR_BODY_BYTES)
             )
         );
@@ -193,6 +193,20 @@ mod tests {
                 .expect("large successful response");
         assert_eq!(response, expected);
         server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn exact_and_over_limit_errors_report_only_the_observed_limit() {
+        let server = MockServer::start().await;
+        let pool = create_client_pool(HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault), ClientRouteClass::Api);
+        let auth = CodexAuth::create_dummy_chatgpt_auth_for_testing();
+        for extra in [0, 1] {
+            server.reset().await;
+            Mock::given(method("GET")).respond_with(ResponseTemplate::new(503)
+                .set_body_string("x".repeat(MAX_ERROR_BODY_BYTES + extra))).mount(&server).await;
+            let error = chatgpt_get_request::<serde_json::Value>(&server.uri(), &auth, &pool, "/test".into()).await.unwrap_err();
+            assert_eq!(error.to_string(), format!("Request failed with status 503 Service Unavailable: {} [body read limit reached]", "x".repeat(MAX_ERROR_BODY_BYTES)));
+        }
     }
 
     #[tokio::test]

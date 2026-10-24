@@ -4,8 +4,6 @@ use crate::unified_exec::async_watcher::omitted_output_marker;
 use crate::unified_exec::async_watcher::resolve_aggregated_output;
 use crate::unified_exec::clamp_yield_time;
 use crate::unified_exec::clamp_yield_time_for_readiness;
-use codex_network_proxy::ManagedNetworkSandboxContext;
-use codex_network_proxy::PROXY_ENV_KEYS;
 use codex_protocol::config_types::EnvironmentVariablePattern;
 use codex_utils_output_truncation::DEFAULT_DIAGNOSTIC_OUTPUT_TOKENS;
 use codex_utils_output_truncation::DEFAULT_FAILURE_OUTPUT_TOKENS;
@@ -15,6 +13,141 @@ use codex_utils_output_truncation::resolve_output_limits;
 use pretty_assertions::assert_eq;
 use tokio::time::Duration;
 use tokio::time::Instant;
+
+#[tokio::test]
+async fn packet_terminal_refresh_is_ready_only_and_incarnation_bound() {
+    let (session, turn) = crate::session::tests::make_session_and_context().await;
+    let session = Arc::new(session);
+    let manager = &session.services.unified_exec_manager;
+    let (incarnation, terminal) = manager.pending_packet_terminal_for_test(&session, &turn, 41).await;
+    let refresh = |incarnation| manager.try_finish_for_packet(
+        41, incarnation, codex_utils_output_truncation::TruncationPolicy::Tokens(1024), Some(1024),
+    );
+    assert!(refresh(incarnation).is_none(), "exit does not prove terminal bookkeeping finished");
+    terminal.send_replace(Some(Ok(())));
+    assert!(refresh(Uuid::new_v4()).is_none(), "a stale handle cannot observe another incarnation");
+    let store = manager.process_store.lock().await;
+    assert!(refresh(incarnation).is_none(), "busy owners are never awaited");
+    let process = Arc::clone(&store.processes[&41].process);
+    drop(store);
+    let handles = process.output_handles();
+    handles.output_closed.store(false, Ordering::Release);
+    assert!(refresh(incarnation).is_none(), "a terminal receipt cannot discard a still-open output stream");
+    handles.output_closed.store(true, Ordering::Release);
+    let interaction = process.interaction_lock().try_lock_owned().unwrap();
+    assert!(refresh(incarnation).is_none());
+    drop(interaction);
+    let output = handles.output_buffer.lock().await;
+    assert!(refresh(incarnation).is_none(), "a missed snapshot must not consume output");
+    drop(output);
+    let result = refresh(incarnation).expect("all terminal owners are ready");
+    assert_eq!(result.raw_output, b"late output");
+    assert_eq!(result.process_output.as_ref().unwrap().stdout, b"late output");
+    assert_eq!(result.process_id, None);
+    assert!(result.process_exited);
+    assert!(!manager.process_store.lock().await.processes.contains_key(&41));
+    assert_eq!(refresh(incarnation).unwrap().raw_output, b"late output", "retirement retains replay evidence");
+    let (replacement, _terminal) = manager.pending_packet_terminal_for_test(&session, &turn, 41).await;
+    assert_ne!(replacement, incarnation);
+    assert!(refresh(incarnation).is_none(), "recycled ID never binds a prior completion");
+    manager.process_store.lock().await.remove(41);
+    assert!(refresh(replacement).is_none(), "failed replacement retirement cannot replay the older owner's result");
+}
+
+#[tokio::test]
+async fn cancelled_startup_retains_exited_root_with_inherited_open_output_until_cleanup() {
+    use crate::unified_exec::process_tests::TerminationControl;
+    use crate::unified_exec::process_tests::remote_process_with_termination_control;
+
+    for termination_fails in [false, true] {
+        let (session, turn) = crate::session::tests::make_session_and_context().await;
+        let session = Arc::new(session);
+        let turn = Arc::new(turn);
+        let manager = &session.services.unified_exec_manager;
+        let mut reservation = manager.reserve_process_id().await;
+        manager.reserve_process_capacity(&mut reservation).await.unwrap();
+        let process_id = reservation.process_id();
+        let context = UnifiedExecContext::new(
+            Arc::clone(&session),
+            Arc::clone(&turn),
+            "cancelled-inherited-output".to_string(),
+        );
+        let mut registration = PendingProcessRegistration::new(
+            Arc::clone(&manager.process_store),
+            &context,
+            crate::tools::command_execution::CommandAttemptKey::new(
+                "exec_command", "remote", ".", &[],
+            ),
+            process_id,
+        );
+        reservation.transfer_to_store();
+        let control = Arc::new(TerminationControl::new());
+        let process = remote_process_with_termination_control(
+            codex_exec_server::WriteStatus::Accepted,
+            termination_fails.then(|| "reader cleanup refused".to_string()),
+            Some(Arc::clone(&control)),
+        )
+        .await;
+        registration.pending_spawns().register(Arc::clone(&process));
+
+        // Model Exited without Closed: the root has exited, but a descendant
+        // still owns its pipe. No primary process or streaming watcher has
+        // been attached while the constructor's sandbox check is awaiting EOF.
+        process.signal_exit_for_test(Some(7));
+        let mut startup_check = Box::pin(process.check_for_sandbox_denial());
+        assert!(futures::poll!(&mut startup_check).is_pending());
+        drop(startup_check);
+        let payload = registration.cleanup_payload();
+        assert!(payload.primary_process.is_none());
+        assert!(payload.processes[0].requires_confirmed_termination);
+        drop(payload);
+
+        let mut cleanup = Box::pin(registration.cleanup());
+        assert!(futures::poll!(&mut cleanup).is_pending());
+        assert!(!control.completed.load(Ordering::Acquire));
+        assert!(!process.output_is_closed());
+        {
+            let store = manager.process_store.lock().await;
+            assert!(store.reserved_process_ids.contains(&process_id));
+            assert!(store.reserved_process_slots.contains(&process_id));
+        }
+        control.allowed.send_replace(true);
+        let result = cleanup.await;
+        assert_eq!(process.exit_code(), Some(7), "cleanup preserves the root's observed exit");
+
+        if termination_fails {
+            let error = result.expect_err("reader custody was not released");
+            assert!(error.contains("process termination was not confirmed"));
+            assert!(error.contains("reader cleanup refused"));
+            assert!(!registration.committed);
+            assert!(!process.output_is_closed());
+            drop(registration);
+            // Shutdown retries the retained exact payload, not a fresh root
+            // observation that would incorrectly discard its open readers.
+            manager.terminate_all_processes().await;
+            let owners = manager.pending_cleanup_owners.lock().unwrap();
+            assert!(owners.iter().any(|owner| owner.process_id == process_id));
+            drop(owners);
+            let store = manager.process_store.lock().await;
+            assert!(store.reserved_process_ids.contains(&process_id));
+            assert!(store.reserved_process_slots.contains(&process_id));
+        } else {
+            result.expect("reader cleanup acknowledged");
+            assert!(registration.committed);
+            assert!(control.completed.load(Ordering::Acquire));
+            tokio::time::timeout(Duration::from_secs(1), async {
+                while !process.output_is_closed() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("confirmed cleanup wakes the detached remote output worker");
+            let store = manager.process_store.lock().await;
+            assert!(!store.reserved_process_ids.contains(&process_id));
+            assert!(!store.reserved_process_slots.contains(&process_id));
+        }
+    }
+}
 
 #[tokio::test]
 #[expect(
@@ -59,7 +192,6 @@ async fn fallback_cleanup_worker_does_not_serialize_independent_custody() {
                 requires_confirmed_termination: true,
             }],
             primary_process: None,
-            network_approval: None,
         })
     };
     let first = make(1, Arc::downgrade(&blocked_store), first_process);
@@ -123,8 +255,6 @@ async fn verified_validation_reuse_preserves_live_owner_and_rejects_retired_iden
     process.set_validation(Some(crate::validation::CommandValidation {
         execution_context: None,
         declared: None,
-        receipt_runner: None,
-        admission_runner: None,
         classification: crate::validation::classify_validation(
             &crate::tools::handlers::command_shape::CommandInvocation::Argv {
                 program: "cargo".into(),
@@ -188,43 +318,6 @@ async fn verified_validation_reuse_preserves_live_owner_and_rejects_retired_iden
     process.terminate_confirmed().await.unwrap();
 }
 
-#[tokio::test]
-async fn validation_workspace_lease_survives_observer_and_releases_at_process_exit() {
-    let workspace = tempfile::tempdir().unwrap();
-    let independent = tempfile::tempdir().unwrap();
-    let permit =
-        crate::workspace_operation_gate::acquire_workspace_operation(workspace.path()).await;
-    let registration = PendingSpawnRegistration::default().with_workspace_operation(permit);
-    let process = crate::unified_exec::process_tests::remote_process(
-        codex_exec_server::WriteStatus::Accepted,
-        None,
-    )
-    .await;
-    registration.register(Arc::clone(&process));
-    drop(registration);
-    assert!(
-        tokio::time::timeout(
-            Duration::from_millis(20),
-            crate::workspace_operation_gate::acquire_workspace_operation(workspace.path()),
-        )
-        .await
-        .is_err()
-    );
-    let _independent = tokio::time::timeout(
-        Duration::from_secs(1),
-        crate::workspace_operation_gate::acquire_workspace_operation(independent.path()),
-    )
-    .await
-    .unwrap();
-    process.signal_exit_for_test(Some(0));
-    // Retaining the process to drain its output must not retain build admission.
-    let _released = tokio::time::timeout(
-        Duration::from_secs(1),
-        crate::workspace_operation_gate::acquire_workspace_operation(workspace.path()),
-    )
-    .await
-    .unwrap();
-}
 
 #[tokio::test(start_paused = true)]
 #[expect(
@@ -1014,7 +1107,6 @@ async fn saturated_admission_rejects_before_marker_command_can_start() {
             .primary()
             .cloned()
             .expect("primary environment"),
-        network: None,
         tty: false,
         sandbox_permissions: crate::sandboxing::SandboxPermissions::UseDefault,
         additional_permissions: None,
@@ -2046,10 +2138,6 @@ fn exec_server_request_for_env_test() -> ExecRequest {
         codex_protocol::permissions::FileSystemSandboxPolicy::unrestricted();
     let network_sandbox_policy = codex_protocol::permissions::NetworkSandboxPolicy::Restricted;
     let permission_profile = codex_protocol::models::PermissionProfile::Disabled;
-    let managed_network = ManagedNetworkSandboxContext {
-        loopback_ports: vec![43123],
-        allow_local_binding: false,
-    };
     ExecRequest {
         command: vec!["bash".to_string(), "-lc".to_string(), "true".to_string()],
         codex_home: cwd.clone(),
@@ -2090,8 +2178,6 @@ fn exec_server_request_for_env_test() -> ExecRequest {
                 ),
             ]),
         }),
-        network: None,
-        network_environment_id: None,
         expiration: crate::exec::ExecExpiration::DefaultTimeout,
         capture_policy: crate::exec::ExecCapturePolicy::ShellTool,
         sandbox: codex_sandboxing::SandboxType::None,
@@ -2106,50 +2192,13 @@ fn exec_server_request_for_env_test() -> ExecRequest {
         windows_sandbox_additional_read_roots: Vec::new(),
         arg0: None,
         exec_server_sandbox: None,
-        exec_server_enforce_managed_network: true,
-        exec_server_managed_network: Some(managed_network),
     }
 }
 
-#[tokio::test]
-async fn windows_sandbox_launch_with_managed_proxy_uses_elevated_backend() -> anyhow::Result<()> {
-    let (_session, turn) = crate::session::tests::make_session_and_context().await;
-    let proxy = network_completion_proxy(&turn).await?;
-    let mut request = exec_server_request_for_env_test();
-    request.sandbox = codex_sandboxing::SandboxType::WindowsRestrictedToken;
-    request.windows_sandbox_level =
-        codex_protocol::config_types::WindowsSandboxLevel::RestrictedToken;
-    let cwd = request.windows_sandbox_workspace_roots[0].clone();
-    let snapshot = cwd.join("shell-snapshot.ps1");
-    request.windows_sandbox_additional_read_roots = vec![snapshot.clone()];
-
-    let unproxied = windows_sandbox_session_request(&request, cwd.as_path(), /*tty*/ false);
-    assert!(
-        !codex_windows_sandbox::windows_sandbox_uses_elevated_backend(
-            unproxied.windows_sandbox_level,
-            unproxied.proxy_enforced,
-        )
-    );
-
-    // The restricted-token backend has no firewall identity, so a managed proxy
-    // must select the elevated backend even at the unelevated level.
-    request.network = Some(proxy.proxy());
-    let proxied = windows_sandbox_session_request(&request, cwd.as_path(), /*tty*/ false);
-    assert!(proxied.proxy_enforced);
-    assert!(
-        codex_windows_sandbox::windows_sandbox_uses_elevated_backend(
-            proxied.windows_sandbox_level,
-            proxied.proxy_enforced,
-        )
-    );
-    assert_eq!(proxied.additional_read_roots, [snapshot]);
-    Ok(())
-}
 
 #[tokio::test]
 async fn exec_server_params_use_path_uri_and_env_policy_overlay_contract() {
     let mut request = exec_server_request_for_env_test();
-    let managed_network = request.exec_server_managed_network.clone().unwrap();
     let permission_profile = request.permission_profile.clone();
 
     let params =
@@ -2159,8 +2208,8 @@ async fn exec_server_params_use_path_uri_and_env_policy_overlay_contract() {
 
     assert_eq!(params.process_id.as_str(), "123");
     assert_eq!(params.cwd, request.cwd);
-    assert!(params.enforce_managed_network);
-    assert_eq!(params.managed_network, Some(managed_network));
+    assert!(!params.enforce_managed_network);
+    assert_eq!(params.managed_network, None);
     assert!(params.env_policy.is_some());
     assert_eq!(
         params.env,
@@ -2190,105 +2239,6 @@ async fn exec_server_params_use_path_uri_and_env_policy_overlay_contract() {
     assert_ne!(first.process_id, second.process_id);
 }
 
-/// A disabled managed proxy prepares no route and grants no sandbox loopback port. The executor
-/// rebuilds the environment from the policy and its own process environment before applying the
-/// overlay, which cannot remove variables, so the policy itself must keep inherited and configured
-/// proxy routes out: the executor's Windows sandbox firewall allows the loopback ports they name.
-#[tokio::test]
-async fn exec_server_params_without_managed_proxy_route_keep_executor_proxy_routes_out() {
-    let routed = exec_server_request_for_env_test();
-    let routed_policy = routed
-        .exec_server_env_config
-        .as_ref()
-        .unwrap()
-        .policy
-        .clone();
-    let routed_params =
-        exec_server_params_for_request(/*process_id*/ 123, &routed, /*tty*/ false)
-            .await
-            .unwrap();
-    // A published route reaches the executor through the overlay; the policy is forwarded as is.
-    assert_eq!(routed_params.env_policy, Some(routed_policy));
-
-    let is_proxy_key = |key: &str| {
-        PROXY_ENV_KEYS
-            .iter()
-            .any(|proxy_key| proxy_key.eq_ignore_ascii_case(key))
-    };
-    let mut request = exec_server_request_for_env_test();
-    request.env.retain(|key, _| !is_proxy_key(key.as_str()));
-    request.exec_server_managed_network = Some(ManagedNetworkSandboxContext::default());
-    let env_config = request.exec_server_env_config.as_mut().unwrap();
-    env_config.policy.inherit = ShellEnvironmentPolicyInherit::All;
-    env_config.policy.r#set = HashMap::from([
-        (
-            "https_proxy".to_string(),
-            "http://127.0.0.1:3128".to_string(),
-        ),
-        ("KEEP_SET".to_string(), "set-value".to_string()),
-    ]);
-
-    let params =
-        exec_server_params_for_request(/*process_id*/ 124, &request, /*tty*/ false)
-            .await
-            .unwrap();
-
-    // Mirrors the executor's `child_env` in exec-server/src/local_process.rs, on an executor whose
-    // own process environment carries proxy routing.
-    let env_policy = params.env_policy.as_ref().expect("executor env policy");
-    let executor_policy = ShellEnvironmentPolicy {
-        inherit: env_policy.inherit.clone(),
-        ignore_default_excludes: env_policy.ignore_default_excludes,
-        exclude: env_policy
-            .exclude
-            .iter()
-            .map(|pattern| EnvironmentVariablePattern::new_case_insensitive(pattern))
-            .collect(),
-        r#set: env_policy.r#set.clone(),
-        include_only: env_policy
-            .include_only
-            .iter()
-            .map(|pattern| EnvironmentVariablePattern::new_case_insensitive(pattern))
-            .collect(),
-        use_profile: false,
-    };
-    let mut executor_env = codex_protocol::shell_environment::create_env_from_vars(
-        [
-            (
-                "HTTP_PROXY".to_string(),
-                "http://127.0.0.1:8888".to_string(),
-            ),
-            (
-                "All_Proxy".to_string(),
-                "socks5h://127.0.0.1:1080".to_string(),
-            ),
-            (
-                "CODEX_NETWORK_ALLOW_LOCAL_BINDING".to_string(),
-                "1".to_string(),
-            ),
-            ("KEEP_INHERITED".to_string(), "inherited-value".to_string()),
-        ],
-        &executor_policy,
-        /*thread_id*/ None,
-    );
-    codex_protocol::shell_environment::apply_env_overlay(&mut executor_env, params.env.clone());
-
-    let mut proxy_routes = executor_env
-        .keys()
-        .filter(|key| is_proxy_key(key.as_str()))
-        .cloned()
-        .collect::<Vec<_>>();
-    proxy_routes.sort();
-    assert_eq!(proxy_routes, Vec::<String>::new());
-    assert_eq!(
-        executor_env.get("KEEP_INHERITED").map(String::as_str),
-        Some("inherited-value")
-    );
-    assert_eq!(
-        executor_env.get("KEEP_SET").map(String::as_str),
-        Some("set-value")
-    );
-}
 
 #[test]
 fn remote_ca_environment_waits_for_worker_and_preserves_peer_hash_contract() {
@@ -2418,7 +2368,7 @@ fn remote_ca_environment_waits_for_worker_and_preserves_peer_hash_contract() {
             assert_eq!(params.env_policy, Some(request.exec_server_env_config.as_ref().unwrap().policy.clone()));
             assert_eq!(params.argv, request.command);
             assert_eq!(params.cwd, request.cwd);
-            assert_eq!(params.managed_network, request.exec_server_managed_network);
+            assert_eq!(params.managed_network, None);
             assert!(manager.process_store.lock().await.processes.is_empty(), "rejected peer start must not publish a local process owner");
         }
         assert_eq!(std::fs::read(&bundle).unwrap(), b"tampered bytes under the same generated filename");
@@ -2606,7 +2556,6 @@ async fn assert_remote_startup_failure_closes_command(cancel_during_registration
             turn.cwd().clone().into(),
             None,
         ),
-        network: None,
         tty: false,
         sandbox_permissions: crate::sandboxing::SandboxPermissions::UseDefault,
         additional_permissions: None,
@@ -2956,7 +2905,6 @@ async fn remote_startup_cleanup_failure_retains_native_child_until_session_shutd
             turn.cwd().clone().into(),
             None,
         ),
-        network: None,
         tty: false,
         sandbox_permissions: crate::sandboxing::SandboxPermissions::UseDefault,
         additional_permissions: None,
@@ -3153,440 +3101,22 @@ fn executor_readiness_is_scoped_to_environment() {
     assert!(!manager.mark_executor_ready("environment-b"));
 }
 
-#[tokio::test]
-async fn network_denial_fallback_message_names_sandbox_network_proxy() {
-    let message = network_denial_message_for_session(/*session*/ None, /*deferred*/ None).await;
 
-    assert_eq!(
-        message,
-        "Network access was denied by the Codex sandbox network proxy."
-    );
-}
 
-#[tokio::test(start_paused = true)]
-async fn late_network_denial_grace_observes_cancellation_after_exit() {
-    let cancellation = CancellationToken::new();
-    let cancellation_for_task = cancellation.clone();
-    let started_at = Instant::now();
-    tokio::spawn(async move {
-        tokio::time::sleep(Duration::from_millis(10)).await;
-        cancellation_for_task.cancel();
-    });
 
-    assert!(wait_for_late_network_denial(Some(cancellation)).await);
-    assert_eq!(Instant::now() - started_at, Duration::from_millis(10));
-}
 
-async fn network_completion_proxy(
-    turn: &crate::session::turn_context::TurnContext,
-) -> anyhow::Result<crate::config::StartedNetworkProxy> {
-    crate::config::NetworkProxySpec::from_config_and_constraints(
-        codex_network_proxy::NetworkProxyConfig {
-            enabled: true,
-            proxy_url: "http://127.0.0.1:0".to_string(),
-            enable_socks5: false,
-            allow_local_binding: true,
-            allow_upstream_proxy: false,
-            ..Default::default()
-        },
-        None,
-        &turn.permission_profile(),
-    )?
-    .start_proxy(
-        turn.config.codex_home.as_path(),
-        &turn.permission_profile(),
-        None,
-        None,
-        true,
-        codex_network_proxy::NetworkProxyAuditMetadata::default(),
-    )
-    .await
-    .map_err(Into::into)
-}
 
-async fn network_completion_registration(
-    session: &crate::session::session::Session,
-    turn: &crate::session::turn_context::TurnContext,
-    proxy: &NetworkProxy,
-) -> DeferredNetworkApproval {
-    use crate::tools::network_approval::NetworkApprovalMode;
-    use crate::tools::network_approval::NetworkApprovalSpec;
-    crate::tools::network_approval::begin_network_approval(
-        session,
-        true,
-        Some(NetworkApprovalSpec {
-            network: Some(proxy.clone()),
-            mode: NetworkApprovalMode::Deferred,
-            cwd: turn.cwd().clone().into(),
-            command: "network-completion-fixture".to_string(),
-            environment_id: "local".to_string(),
-            approval_scope_id: "local".to_string(),
-        }),
-    )
-    .await
-    .expect("normal network registration")
-    .expect("active approval")
-    .into_deferred()
-    .expect("deferred approval owner")
-}
 
-async fn deny_network_completion(
-    session: &crate::session::session::Session,
-    deferred: &DeferredNetworkApproval,
-) {
-    let mut blocked =
-        codex_network_proxy::BlockedRequest::new(codex_network_proxy::BlockedRequestArgs {
-            host: "completion-denied.example".to_string(),
-            reason: "not_allowed".to_string(),
-            client: None,
-            method: None,
-            mode: None,
-            protocol: "http".to_string(),
-            decision: Some("deny".to_string()),
-            source: Some("decider".to_string()),
-            port: Some(80),
-        });
-    blocked.execution_id = Some(deferred.registration_id().to_string());
-    session
-        .services
-        .network_approval
-        .record_blocked_request(blocked)
-        .await;
-}
 
-#[tokio::test]
-async fn deferred_network_completion_preserves_initial_grace_and_late_denial() -> anyhow::Result<()>
-{
-    let (session, turn, _events) = crate::session::tests::make_session_and_context_with_rx().await;
-    let proxy = network_completion_proxy(&turn).await?;
-    let allowed = network_completion_registration(&session, &turn, &proxy.proxy()).await;
-    let denied = network_completion_registration(&session, &turn, &proxy.proxy()).await;
-    tokio::time::pause();
-    let started = Instant::now();
-    let mut first = Box::pin(
-        finish_deferred_network_approval_after_process_exit_for_session(
-            Some(&session),
-            Some(allowed),
-        ),
-    );
-    assert!(futures::poll!(&mut first).is_pending());
-    tokio::time::advance(Duration::from_millis(99)).await;
-    assert!(
-        futures::poll!(&mut first).is_pending(),
-        "first completion must retain the denial grace"
-    );
-    tokio::time::advance(Duration::from_millis(1)).await;
-    first.await.map_err(anyhow::Error::msg)?;
-    // The grace is a minimum, not an exact wakeup deadline: Tokio's timer
-    // resolution may round the sleep up even with the clock paused.
-    assert!(started.elapsed() >= Duration::from_millis(100));
-
-    let mut late = Box::pin(
-        finish_deferred_network_approval_after_process_exit_for_session(
-            Some(&session),
-            Some(denied.clone()),
-        ),
-    );
-    assert!(futures::poll!(&mut late).is_pending());
-    tokio::time::advance(Duration::from_millis(10)).await;
-    deny_network_completion(&session, &denied).await;
-    assert!(
-        late.await
-            .unwrap_err()
-            .contains("completion-denied.example")
-    );
-    tokio::time::resume();
-    Ok(())
-}
-
-#[tokio::test]
-async fn deferred_network_completion_concurrent_waiters_and_cancelled_initializer()
--> anyhow::Result<()> {
-    let (session, turn, _events) = crate::session::tests::make_session_and_context_with_rx().await;
-    let proxy = network_completion_proxy(&turn).await?;
-    let deferred = network_completion_registration(&session, &turn, &proxy.proxy()).await;
-    tokio::time::pause();
-    let mut cancelled = Box::pin(
-        finish_deferred_network_approval_after_process_exit_for_session(
-            Some(&session),
-            Some(deferred.clone()),
-        ),
-    );
-    assert!(futures::poll!(&mut cancelled).is_pending());
-    tokio::time::advance(Duration::from_millis(20)).await;
-    drop(cancelled);
-
-    let mut first = Box::pin(
-        finish_deferred_network_approval_after_process_exit_for_session(
-            Some(&session),
-            Some(deferred.clone()),
-        ),
-    );
-    let mut second = Box::pin(
-        finish_deferred_network_approval_after_process_exit_for_session(
-            Some(&session),
-            Some(deferred.clone()),
-        ),
-    );
-    assert!(futures::poll!(&mut first).is_pending());
-    assert!(futures::poll!(&mut second).is_pending());
-    tokio::time::advance(Duration::from_millis(10)).await;
-    deny_network_completion(&session, &deferred).await;
-    let (first, second) = tokio::join!(first, second);
-    let first = first.expect_err("surviving initializer must still see late denial");
-    assert!(first.contains("completion-denied.example"));
-    assert_eq!(
-        second.unwrap_err(),
-        first,
-        "both concurrent consumers retain the same denial"
-    );
-    tokio::time::resume();
-    Ok(())
-}
-
-#[tokio::test]
-async fn deferred_network_completion_replays_cached_denial() -> anyhow::Result<()> {
-    let (session, turn, _events) = crate::session::tests::make_session_and_context_with_rx().await;
-    let proxy = network_completion_proxy(&turn).await?;
-    let deferred = network_completion_registration(&session, &turn, &proxy.proxy()).await;
-    deny_network_completion(&session, &deferred).await;
-    let first = finish_deferred_network_approval_after_process_exit_for_session(
-        Some(&session),
-        Some(deferred.clone()),
-    )
-    .await
-    .unwrap_err();
-    let second = finish_deferred_network_approval_after_process_exit_for_session(
-        Some(&session),
-        Some(deferred),
-    )
-    .await
-    .unwrap_err();
-    assert!(first.contains("completion-denied.example"));
-    assert_eq!(
-        second, first,
-        "retiring the registration must not erase its cached denial"
-    );
-    Ok(())
-}
 
 // Start an actual quiet process through the local pipe owner, then use normal
 // manager registration, streaming and exit-watcher finalization. Only launch
 // policy/preflight is outside this final-poll workload; no model/provider runs.
-async fn network_completion_finished_process(
-    session: &Arc<crate::session::session::Session>,
-    turn: &Arc<crate::session::turn_context::TurnContext>,
-    deferred: Option<DeferredNetworkApproval>,
-) -> anyhow::Result<u32> {
-    let command: Vec<String> = if cfg!(windows) {
-        vec!["cmd.exe", "/d", "/c", "exit 0"]
-    } else {
-        vec!["sh", "-c", "exit 0"]
-    }
-    .into_iter()
-    .map(str::to_string)
-    .collect();
-    let manager = &session.services.unified_exec_manager;
-    let mut reservation = manager.reserve_process_id().await;
-    manager.reserve_process_capacity(&mut reservation).await?;
-    let process_id = reservation.process_id();
-    let context = UnifiedExecContext::new(
-        Arc::clone(session),
-        Arc::clone(turn),
-        format!("network-completion-{process_id}"),
-    );
-    let cwd: PathUri = turn.cwd().clone().into();
-    let attempt = crate::tools::command_execution::CommandAttemptKey::new(
-        "exec_command",
-        "local",
-        cwd.to_string(),
-        &command,
-    );
-    let mut registration = PendingProcessRegistration::new(
-        Arc::clone(&manager.process_store),
-        &context,
-        attempt.clone(),
-        process_id,
-    );
-    let started = Instant::now();
-    let spawned = codex_utils_pty::spawn_pipe_process_no_stdin(
-        &command[0],
-        &command[1..],
-        turn.cwd().as_path(),
-        &std::env::vars().collect(),
-        &None,
-    )
-    .await?;
-    let process = UnifiedExecProcess::from_spawned(
-        spawned,
-        codex_sandboxing::SandboxType::None,
-        Box::new(crate::unified_exec::NoopSpawnLifecycle),
-        None,
-        &registration.pending_spawns(),
-    )
-    .await?;
-    registration.attach_process(Arc::clone(&process), deferred.clone());
-    let transcript = Arc::new(tokio::sync::Mutex::new(HeadTailBuffer::default()));
-    ToolEmitter::unified_exec(
-        &command,
-        cwd.clone(),
-        ExecCommandSource::UnifiedExecStartup,
-        Some(process_id.to_string()),
-        "local".to_string(),
-    )
-    .begin(ToolEventCtx::new(
-        session.as_ref(),
-        turn.as_ref(),
-        &context.call_id,
-        None,
-    ))
-    .await?;
-    start_streaming_output(&process, &context, Arc::clone(&transcript))?;
-    manager
-        .store_process(
-            Arc::clone(&process),
-            &context,
-            &command,
-            command.join(" "),
-            cwd,
-            "local".to_string(),
-            started,
-            process_id,
-            &mut reservation,
-            false,
-            attempt,
-            crate::tools::command_output_artifact::RawOutputArtifact::unavailable(
-                "quiet benchmark",
-            ),
-            deferred,
-            transcript,
-            Arc::new(AtomicBool::new(false)),
-            &mut registration,
-            false,
-            None,
-        )
-        .await?;
-    tokio::time::timeout(Duration::from_secs(10), process.wait_for_terminal_completion())
-        .await.map_err(|error| anyhow::anyhow!(
-            "terminal completion timed out: {error}; exited={}, output_closed={}, output_drained={}, terminal_ready={}, exit_code={:?}, failure={:?}",
-            process.has_exited(), process.output_is_closed(),
-            process.output_drained_token().is_cancelled(), process.terminal_completion_is_ready(),
-            process.exit_code(), process.failure_message(),
-        ))?.map_err(anyhow::Error::msg)?;
-    assert!(process.has_exited());
-    assert!(process.output_is_closed());
-    assert_eq!(process.exit_code(), Some(0));
-    Ok(process_id)
-}
 
-#[ignore = "latency benchmark"]
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[expect(
-    clippy::print_stderr,
-    reason = "ignored benchmark emits raw monotonic timings for paired comparison"
-)]
-async fn deferred_network_completion_latency_benchmark() -> anyhow::Result<()> {
-    let (session, turn, _events) = crate::session::tests::make_session_and_context_with_rx().await;
-    let proxy = network_completion_proxy(&turn).await?;
-    let executable = std::env::current_exe()?;
-    let epoch = std::time::Instant::now();
-    let mut samples: std::collections::BTreeMap<&str, Vec<u64>> = std::collections::BTreeMap::new();
-    for sample in 0..20 {
-        let deferred = network_completion_registration(&session, &turn, &proxy.proxy()).await;
-        for phase in ["initial_grace", "cached_helper"] {
-            let started = std::time::Instant::now();
-            finish_deferred_network_approval_after_process_exit_for_session(
-                Some(&session),
-                Some(deferred.clone()),
-            )
-            .await
-            .map_err(anyhow::Error::msg)?;
-            let elapsed_ns = u64::try_from(started.elapsed().as_nanos())?;
-            samples.entry(phase).or_default().push(elapsed_ns);
-            eprintln!(
-                "{}",
-                serde_json::json!({
-                    "benchmark": "deferred_network_completion", "executable": executable,
-                    "sample": sample, "phase": phase,
-                    "start_ns": u64::try_from(started.duration_since(epoch).as_nanos())?,
-                    "elapsed_ns": elapsed_ns,
-                })
-            );
-        }
-    }
-    for (phase, mut values) in samples {
-        values.sort_unstable();
-        let percentile = |percent: usize| values[(values.len() * percent).div_ceil(100) - 1];
-        eprintln!(
-            "{}",
-            serde_json::json!({
-                "benchmark": "deferred_network_completion", "executable": executable,
-                "phase": phase, "samples": values.len(), "percentile_method": "nearest_rank",
-                "p50_ns": percentile(50), "p90_ns": percentile(90), "p95_ns": percentile(95),
-            })
-        );
-    }
-    assert!(session.list_background_terminals().await.is_empty());
-    Ok(())
-}
 
 // A single real-process pair checks whether the helper mechanism is actually
 // on the final-poll path. Repeated spawn/finalization is not part of that timing
 // and must not dominate the separate 20-sample helper benchmark.
-#[ignore = "latency benchmark"]
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[expect(
-    clippy::print_stderr,
-    reason = "ignored benchmark emits raw monotonic timings for paired comparison"
-)]
-async fn deferred_network_completion_final_poll_benchmark() -> anyhow::Result<()> {
-    let (session, turn, _events) = crate::session::tests::make_session_and_context_with_rx().await;
-    let proxy = network_completion_proxy(&turn).await?;
-    let executable = std::env::current_exe()?;
-    let epoch = std::time::Instant::now();
-    for with_network in [false, true] {
-        let deferred = if with_network {
-            Some(network_completion_registration(&session, &turn, &proxy.proxy()).await)
-        } else {
-            None
-        };
-        let process_id = network_completion_finished_process(&session, &turn, deferred).await?;
-        let started = std::time::Instant::now();
-        let response = session
-            .services
-            .unified_exec_manager
-            .write_stdin(WriteStdinRequest {
-                process_id,
-                input: "",
-                yield_time_ms: 5_000,
-                max_output_tokens: None,
-                truncation_policy: codex_utils_output_truncation::TruncationPolicy::Bytes(1_000),
-                nested_deadline: None,
-            })
-            .await?;
-        let elapsed_ns = u64::try_from(started.elapsed().as_nanos())?;
-        assert_eq!(response.exit_code, Some(0));
-        assert!(response.process_exited);
-        assert!(response.process_id.is_none());
-        assert!(response.raw_output.is_empty());
-        let phase = if with_network {
-            "final_poll_network"
-        } else {
-            "final_poll_no_network"
-        };
-        eprintln!(
-            "{}",
-            serde_json::json!({
-                "benchmark": "deferred_network_completion", "executable": executable,
-                "sample": 0, "phase": phase,
-                "start_ns": u64::try_from(started.duration_since(epoch).as_nanos())?,
-                "elapsed_ns": elapsed_ns,
-            })
-        );
-    }
-    assert!(session.list_background_terminals().await.is_empty());
-    Ok(())
-}
 
 #[tokio::test]
 async fn failed_initial_end_for_unstored_process_uses_fallback_output() {
@@ -3636,7 +3166,6 @@ async fn failed_initial_end_for_unstored_process_uses_fallback_output() {
             .primary()
             .cloned()
             .expect("primary environment"),
-        network: None,
         tty: true,
         sandbox_permissions: crate::sandboxing::SandboxPermissions::UseDefault,
         additional_permissions: None,
@@ -3975,7 +3504,7 @@ fn check_pending_remote_exec_drop(entered_shutdown: bool) {
                 turn_environment: crate::session::turn_context::TurnEnvironment::new(
                     "remote".to_string(), remote, turn.cwd().clone().into(), None,
                 ),
-                network: None, tty: false,
+                tty: false,
                 sandbox_permissions: crate::sandboxing::SandboxPermissions::UseDefault,
                 additional_permissions: None, additional_permissions_uri: None,
                 additional_permissions_preapproved: false, justification: None, prefix_rule: None,
@@ -4214,7 +3743,7 @@ fn remote_start_cancellation_terminates_native_child_before_start_response() {
                 turn_environment: crate::session::turn_context::TurnEnvironment::new(
                     "remote".to_string(), remote, turn.cwd().clone().into(), None,
                 ),
-                network: None, tty: false,
+                tty: false,
                 sandbox_permissions: crate::sandboxing::SandboxPermissions::UseDefault,
                 additional_permissions: None, additional_permissions_uri: None,
                 additional_permissions_preapproved: false, justification: None, prefix_rule: None,
@@ -4831,7 +4360,7 @@ fn remote_commit_retirement_yields_and_cancellation_cleans_registered_child() {
                 turn_environment: crate::session::turn_context::TurnEnvironment::new(
                     "remote".to_string(), remote, turn.cwd().clone().into(), None,
                 ),
-                network: None, tty: false,
+                tty: false,
                 sandbox_permissions: crate::sandboxing::SandboxPermissions::UseDefault,
                 additional_permissions: None, additional_permissions_uri: None,
                 additional_permissions_preapproved: false, justification: None, prefix_rule: None,

@@ -27,7 +27,6 @@ pub use codex_extension_items::image_generation::ImageGenerationUsage;
 pub use codex_extension_items::image_generation::ImageTokenDetails;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_path_uri::PathUri;
-use quick_xml::de::from_str as from_xml_str;
 use quick_xml::se::to_string as to_xml_string;
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -118,7 +117,7 @@ pub struct HookPromptFragment {
 }
 
 #[derive(Debug, Deserialize, Serialize)]
-#[serde(rename = "hook_prompt")]
+#[serde(rename = "hook_prompt", deny_unknown_fields)]
 struct HookPromptXml {
     #[serde(rename = "@hook_run_id")]
     hook_run_id: String,
@@ -399,7 +398,10 @@ pub struct ImageGenerationItem {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub revised_prompt: Option<String>,
-    pub result: String,
+    pub result: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub error: Option<serde_json::Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub saved_path: Option<AbsolutePathBuf>,
@@ -720,9 +722,10 @@ pub fn parse_hook_prompt_message(
 
 pub fn parse_hook_prompt_fragment(text: &str) -> Option<HookPromptFragment> {
     let trimmed = text.trim();
+    let mut deserializer = quick_xml::de::Deserializer::from_str(trimmed);
     let HookPromptRoot::HookPrompt(HookPromptXml { text, hook_run_id }) =
-        from_xml_str::<HookPromptRoot>(trimmed).ok()?;
-    if hook_run_id.trim().is_empty() {
+        HookPromptRoot::deserialize(&mut deserializer).ok()?;
+    if !deserializer.is_empty() || hook_run_id.trim().is_empty() {
         return None;
     }
 
@@ -824,6 +827,23 @@ mod tests {
             text: r#"<hook_prompt hook_run_id="hook-run-1">Hook text.</hook_prompt>"#.to_string(),
         };
         assert!(parse_hook_prompt_message(None, &[valid, wrong_root]).is_none());
+    }
+
+    #[test]
+    fn hook_prompt_requires_one_complete_allowed_envelope() {
+        let valid = r#"<hook_prompt hook_run_id="hook-run-1">Hook &amp; text.</hook_prompt>"#;
+        let fragment =
+            parse_hook_prompt_fragment(&format!(" \n{valid}\t ")).expect("whole envelope");
+        assert_eq!(fragment.text, "Hook & text.");
+        for text in [
+            format!("{valid}<other>must not disappear</other>"),
+            format!("{valid} trailing user text"),
+            r#"<hook_prompt hook_run_id="hook-run-1"><other>text</other></hook_prompt>"#
+                .to_string(),
+        ] {
+            assert!(parse_hook_prompt_fragment(&text).is_none(), "{text}");
+            assert!(parse_hook_prompt_message(None, &[ContentItem::InputText { text }]).is_none());
+        }
     }
 
     #[test]

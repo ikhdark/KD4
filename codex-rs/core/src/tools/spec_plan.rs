@@ -1,5 +1,6 @@
-use crate::agent::exceeds_thread_spawn_depth_limit;
-use crate::agent::next_thread_spawn_depth;
+
+use std::collections::HashMap;
+
 use crate::agent::task_capabilities::TypedToolClass;
 use crate::session::step_context::StepContext;
 use crate::session::turn_context::TurnContext;
@@ -39,12 +40,12 @@ use crate::tools::handlers::agent_jobs::ReportAgentJobResultHandler;
 use crate::tools::handlers::agent_jobs::SpawnAgentsOnCsvHandler;
 use crate::tools::handlers::allows_inline_sandbox_approval;
 use crate::tools::handlers::extension_tools::ExtensionToolAdapter;
-use crate::tools::handlers::multi_agents::CloseAgentHandler;
-use crate::tools::handlers::multi_agents::ResumeAgentHandler;
-use crate::tools::handlers::multi_agents::SendInputHandler;
-use crate::tools::handlers::multi_agents::SpawnAgentHandler;
-use crate::tools::handlers::multi_agents::WaitAgentHandler;
-use crate::tools::handlers::multi_agents_spec::MULTI_AGENT_V1_NAMESPACE;
+
+
+
+
+
+
 use crate::tools::handlers::multi_agents_spec::SpawnAgentToolOptions;
 use crate::tools::handlers::multi_agents_spec::WaitAgentTimeoutOptions;
 use crate::tools::handlers::multi_agents_v2::AbandonAgentTaskHandler;
@@ -70,9 +71,6 @@ use crate::tools::router::ToolRouter;
 use crate::tools::router::ToolRouterParams;
 use codex_context_fragments::ModelContextBudget;
 use codex_features::Feature;
-use codex_features::MULTI_AGENT_DEFAULT_WAIT_TIMEOUT_MS;
-use codex_features::MULTI_AGENT_MAX_WAIT_TIMEOUT_MS;
-use codex_features::MULTI_AGENT_MIN_WAIT_TIMEOUT_MS;
 use codex_login::AuthManager;
 use codex_mcp::ToolInfo;
 use codex_protocol::config_types::WebSearchMode;
@@ -581,9 +579,6 @@ fn namespace_tools_enabled(turn_context: &TurnContext) -> bool {
     turn_context.provider.capabilities().namespace_tools
 }
 
-fn multi_agent_v2_enabled(turn_context: &TurnContext) -> bool {
-    turn_context.multi_agent_version == MultiAgentVersion::V2
-}
 
 fn collab_tools_enabled(turn_context: &TurnContext) -> bool {
     // Bulk workers carry a report tag rather than structured ThreadSpawn
@@ -591,14 +586,7 @@ fn collab_tools_enabled(turn_context: &TurnContext) -> bool {
     if matches!(&turn_context.session_source, SessionSource::SubAgent(SubAgentSource::Other(label)) if label.starts_with("agent_job:")) {
         return false;
     }
-    match turn_context.multi_agent_version {
-        MultiAgentVersion::Disabled => false,
-        MultiAgentVersion::V1 => !exceeds_thread_spawn_depth_limit(
-            next_thread_spawn_depth(&turn_context.session_source),
-            turn_context.config.agent_max_depth,
-        ),
-        MultiAgentVersion::V2 => true,
-    }
+    turn_context.multi_agent_version != MultiAgentVersion::Disabled
 }
 
 pub(crate) fn active_collaboration_namespace(
@@ -611,11 +599,10 @@ pub(crate) fn active_collaboration_namespace(
 
     match turn_context.multi_agent_version {
         MultiAgentVersion::Disabled => None,
-        MultiAgentVersion::V1 => Some(MULTI_AGENT_V1_NAMESPACE),
-        MultiAgentVersion::V2 if namespace_tools_enabled(turn_context) => {
+        MultiAgentVersion::V1 | MultiAgentVersion::V2 if namespace_tools_enabled(turn_context) => {
             turn_context.config.multi_agent_v2.tool_namespace.as_deref()
         }
-        MultiAgentVersion::V2 => None,
+        MultiAgentVersion::V1 | MultiAgentVersion::V2 => None,
     }
 }
 
@@ -677,18 +664,10 @@ fn standalone_image_generation_model_visible(turn_context: &TurnContext) -> bool
 }
 
 fn wait_agent_timeout_options(turn_context: &TurnContext) -> WaitAgentTimeoutOptions {
-    if multi_agent_v2_enabled(turn_context) {
-        return WaitAgentTimeoutOptions {
-            default_timeout_ms: turn_context.config.multi_agent_v2.default_wait_timeout_ms,
-            min_timeout_ms: turn_context.config.multi_agent_v2.min_wait_timeout_ms,
-            max_timeout_ms: turn_context.config.multi_agent_v2.max_wait_timeout_ms,
-        };
-    }
-
     WaitAgentTimeoutOptions {
-        default_timeout_ms: MULTI_AGENT_DEFAULT_WAIT_TIMEOUT_MS,
-        min_timeout_ms: MULTI_AGENT_MIN_WAIT_TIMEOUT_MS,
-        max_timeout_ms: MULTI_AGENT_MAX_WAIT_TIMEOUT_MS,
+        default_timeout_ms: turn_context.config.multi_agent_v2.default_wait_timeout_ms,
+        min_timeout_ms: turn_context.config.multi_agent_v2.min_wait_timeout_ms,
+        max_timeout_ms: turn_context.config.multi_agent_v2.max_wait_timeout_ms,
     }
 }
 
@@ -737,6 +716,7 @@ fn build_code_mode_executors(
     let mut has_nested_apply_patch = false;
     let mut has_nested_list_files = false;
     let mut lazy_builtin_tool_names = Vec::new();
+    let mut canonical_input_schemas = HashMap::new();
     let deferred_tools_guidance_enabled = search_tool_enabled(turn_context);
     for executor in executors {
         let exposure = executor.exposure();
@@ -750,10 +730,14 @@ fn build_code_mode_executors(
         }
 
         if is_excluded_from_code_mode(turn_context, executor.tool_name()) {
+            direct_only_tool_names.push(executor.tool_name().to_string());
             continue;
         }
 
         let mut spec = executor.spec().clone();
+        if let Some(schema) = executor.runtime().code_mode_input_schema() {
+            canonical_input_schemas.insert(executor.tool_name().clone(), schema);
+        }
         has_nested_apply_patch |= executor.tool_name() == &ToolName::plain("apply_patch");
         has_nested_list_files |= executor.authorization_class() != TypedToolClass::DynamicExternal
             && executor.tool_name() == &ToolName::plain("list_files");
@@ -792,7 +776,6 @@ fn build_code_mode_executors(
                         | "apply_patch"
                         | "read_file"
                         | "read_tool_output"
-                        | "tool_search"
                         | "update_plan"
                 )
                 && let Some(mut definition) = codex_tools::code_mode_tool_definition_for_spec(&spec)
@@ -818,15 +801,8 @@ fn build_code_mode_executors(
                 // the full contract, and the handlers still decode these fields.
                 let withdrawn: &[&str] = match &*definition.name {
                     "read_file" => &["file_path", "offset", "limit"],
-                    "update_plan" => &[
-                        "scope_change_instructions",
-                        "scope_change_refs",
-                        "superseded",
-                        "workflow",
-                    ],
                     _ => &[],
                 };
-                let mut trimmed_plan_contract = false;
                 if let Some(schema) = definition
                     .input_schema
                     .as_mut()
@@ -845,10 +821,6 @@ fn build_code_mode_executors(
                         schema.remove("oneOf");
                         schema.insert("required".to_string(), serde_json::json!(["path"]));
                     }
-                    trimmed_plan_contract = &*definition.name == "update_plan";
-                }
-                if trimmed_plan_contract {
-                    definition.description = format!("{}\nRarely needed fields (superseded, scope_change_instructions, scope_change_refs, workflow) are omitted here; use resolve_tool(\"update_plan\") before retiring scope or linking task-coordinator assignments.", definition.description).into();
                 }
                 if definition.name == "apply_patch" {
                     definition.description = format!("{}\nNested apply_patch is available: await tools.apply_patch(patchText). Result: {{success, text, changes, changes_exact, environment_id, diagnostics, retry?}}; check success before continuing.", definition.description).into();
@@ -900,7 +872,7 @@ fn build_code_mode_executors(
                 .join(", ")
         ));
     }
-    let mut result: Vec<Arc<dyn CoreToolRuntime>> = vec![Arc::new(CodeModeExecuteHandler::new(
+    let mut result: Vec<Arc<dyn CoreToolRuntime>> = vec![Arc::new(CodeModeExecuteHandler::new_with_input_schemas(
         create_code_mode_tool(
             tool_mode == ToolMode::CodeModeOnly,
             has_deferred_tools,
@@ -909,6 +881,7 @@ fn build_code_mode_executors(
         ),
         code_mode_nested_tool_specs,
         deferred_code_mode_nested_tool_specs,
+        &canonical_input_schemas,
     )?)];
     result.push(Arc::new(CodeModeWaitHandler));
     Ok(result)
@@ -1110,7 +1083,7 @@ fn primary_environment_supports_exec_command(step_context: &StepContext) -> bool
         turn_context.network_sandbox_policy(),
         SandboxablePreference::Auto,
         turn_context.windows_sandbox_level,
-        turn_context.network.is_some(),
+        false,
     ) == SandboxType::None
 }
 
@@ -1244,7 +1217,10 @@ fn add_core_utility_tools(context: &CoreToolPlanContext<'_>, planned_tools: &mut
     }
 
     // Mode restrictions belong in dispatch, not in the cached tool schema.
-    planned_tools.add_with_authorization_class(PlanHandler, TypedToolClass::OwnTask);
+    planned_tools.add_with_authorization_class(
+        PlanHandler,
+        TypedToolClass::OwnTask,
+    );
 
     if features.enabled(Feature::DeferredExecutor)
         && !context.step_context.environments.starting.is_empty()
@@ -1386,161 +1362,111 @@ fn add_collaboration_tools(context: &CoreToolPlanContext<'_>, planned_tools: &mu
     }
     let agent_surface_stage = context.exposure_identity.agent_surface_stage;
     if agent_surface_stage != AgentSurfaceStage::Prohibited && collab_tools_enabled(turn_context) {
-        if multi_agent_v2_enabled(turn_context) {
-            let exposure = if search_tool_enabled(turn_context) {
-                ToolExposure::Deferred
-            } else if turn_context.config.multi_agent_v2.non_code_mode_only {
-                ToolExposure::DirectModelOnly
-            } else {
-                ToolExposure::Direct
-            };
-            let tool_namespace = active_collaboration_namespace(turn_context, agent_surface_stage);
-            let agent_type_description = agent_type_description(turn_context);
-            if can_spawn
-                && context
-                    .step_context
-                    .environments
-                    .primary()
-                    .is_some_and(|environment| !environment.environment.is_remote())
-            {
-                planned_tools.add_arc_with_exposure_and_authorization_class(
-                    multi_agent_v2_handler(
-                        SpawnAgentHandlerV2::new(SpawnAgentToolOptions {
-                            available_models: turn_context.available_models.clone(),
-                            agent_type_description,
-                            hide_agent_type_model_reasoning: turn_context
-                                .config
-                                .multi_agent_v2
-                                .hide_spawn_agent_metadata,
-                            usage_hint_text: turn_context
-                                .config
-                                .multi_agent_v2
-                                .usage_hint_text
-                                .clone(),
-                        }),
-                        tool_namespace,
-                    ),
-                    exposure,
-                    TypedToolClass::RootTaskControl,
-                );
-            }
-            // A code-mode cell keeps its initial catalog after spawning. Keep
-            // lifecycle tools callable so it can collect the new children in
-            // the same cell instead of requiring another model request.
-            let nested_lifecycle =
-                nested_agent_lifecycle_enabled(turn_context, exposure, tool_namespace);
-            if agent_surface_stage == AgentSurfaceStage::SpawnOnly && !nested_lifecycle {
-                return;
-            }
-            planned_tools.add_arc_with_exposure_and_authorization_class(
-                multi_agent_v2_handler(SendMessageHandlerV2, tool_namespace),
-                exposure,
-                TypedToolClass::AgentCommunication,
-            );
-            planned_tools.add_arc_with_exposure_and_authorization_class(
-                multi_agent_v2_handler(FollowupTaskHandlerV2, tool_namespace),
-                exposure,
-                TypedToolClass::RootTaskControl,
-            );
+        let exposure = if search_tool_enabled(turn_context) {
+            ToolExposure::Deferred
+        } else if turn_context.config.multi_agent_v2.non_code_mode_only {
+            ToolExposure::DirectModelOnly
+        } else {
+            ToolExposure::Direct
+        };
+        let tool_namespace = active_collaboration_namespace(turn_context, agent_surface_stage);
+        let agent_type_description = agent_type_description(turn_context);
+        if can_spawn
+            && context
+                .step_context
+                .environments
+                .primary()
+                .is_some_and(|environment| !environment.environment.is_remote())
+        {
             planned_tools.add_arc_with_exposure_and_authorization_class(
                 multi_agent_v2_handler(
-                    WaitAgentHandlerV2::new(context.wait_agent_timeouts),
+                    SpawnAgentHandlerV2::new(SpawnAgentToolOptions {
+                        available_models: turn_context.available_models.clone(),
+                        agent_type_description,
+                        hide_agent_type_model_reasoning: turn_context
+                            .config
+                            .multi_agent_v2
+                            .hide_spawn_agent_metadata,
+                        usage_hint_text: turn_context
+                            .config
+                            .multi_agent_v2
+                            .usage_hint_text
+                            .clone(),
+                    }),
                     tool_namespace,
                 ),
                 exposure,
-                TypedToolClass::AgentCommunication,
-            );
-            planned_tools.add_arc_with_exposure_and_authorization_class(
-                multi_agent_v2_handler(InterruptAgentHandler, tool_namespace),
-                exposure,
                 TypedToolClass::RootTaskControl,
             );
+        }
+        // A code-mode cell keeps its initial catalog after spawning. Keep
+        // lifecycle tools callable so it can collect the new children in
+        // the same cell instead of requiring another model request.
+        let nested_lifecycle =
+            nested_agent_lifecycle_enabled(turn_context, exposure, tool_namespace);
+        if agent_surface_stage == AgentSurfaceStage::SpawnOnly && !nested_lifecycle {
+            return;
+        }
+        planned_tools.add_arc_with_exposure_and_authorization_class(
+            multi_agent_v2_handler(SendMessageHandlerV2, tool_namespace),
+            exposure,
+            TypedToolClass::AgentCommunication,
+        );
+        planned_tools.add_arc_with_exposure_and_authorization_class(
+            multi_agent_v2_handler(FollowupTaskHandlerV2, tool_namespace),
+            exposure,
+            TypedToolClass::RootTaskControl,
+        );
+        planned_tools.add_arc_with_exposure_and_authorization_class(
+            multi_agent_v2_handler(
+                WaitAgentHandlerV2::new(context.wait_agent_timeouts),
+                tool_namespace,
+            ),
+            exposure,
+            TypedToolClass::AgentCommunication,
+        );
+        planned_tools.add_arc_with_exposure_and_authorization_class(
+            multi_agent_v2_handler(InterruptAgentHandler, tool_namespace),
+            exposure,
+            TypedToolClass::RootTaskControl,
+        );
+        planned_tools.add_arc_with_exposure_and_authorization_class(
+            multi_agent_v2_handler(ListAgentsHandlerV2, tool_namespace),
+            exposure,
+            TypedToolClass::AgentCommunication,
+        );
+        if agent_surface_stage != AgentSurfaceStage::TypedAdministration {
+            return;
+        }
+        planned_tools.add_arc_with_exposure_and_authorization_class(
+            multi_agent_v2_handler(GetAgentTaskHandler, tool_namespace),
+            exposure,
+            TypedToolClass::OwnTask,
+        );
+        planned_tools.add_arc_with_exposure_and_authorization_class(
+            multi_agent_v2_handler(SetAgentGateHandler, tool_namespace),
+            exposure,
+            TypedToolClass::OwnTask,
+        );
+        if turn_context.session_source.is_non_root_agent() {
             planned_tools.add_arc_with_exposure_and_authorization_class(
-                multi_agent_v2_handler(ListAgentsHandlerV2, tool_namespace),
-                exposure,
-                TypedToolClass::AgentCommunication,
-            );
-            if agent_surface_stage != AgentSurfaceStage::TypedAdministration {
-                return;
-            }
-            planned_tools.add_arc_with_exposure_and_authorization_class(
-                multi_agent_v2_handler(GetAgentTaskHandler, tool_namespace),
+                multi_agent_v2_handler(SubmitAgentReceiptHandler, tool_namespace),
                 exposure,
                 TypedToolClass::OwnTask,
             );
-            planned_tools.add_arc_with_exposure_and_authorization_class(
-                multi_agent_v2_handler(SetAgentGateHandler, tool_namespace),
-                exposure,
-                TypedToolClass::OwnTask,
-            );
-            if turn_context.session_source.is_non_root_agent() {
-                planned_tools.add_arc_with_exposure_and_authorization_class(
-                    multi_agent_v2_handler(SubmitAgentReceiptHandler, tool_namespace),
-                    exposure,
-                    TypedToolClass::OwnTask,
-                );
-            } else {
-                planned_tools.add_arc_with_exposure_and_authorization_class(
-                    multi_agent_v2_handler(AmendAgentTaskHandler, tool_namespace),
-                    exposure,
-                    TypedToolClass::RootTaskControl,
-                );
-                planned_tools.add_arc_with_exposure_and_authorization_class(
-                    multi_agent_v2_handler(WaiveAgentGateHandler, tool_namespace),
-                    exposure,
-                    TypedToolClass::RootTaskControl,
-                );
-                planned_tools.add_arc_with_exposure_and_authorization_class(
-                    multi_agent_v2_handler(AbandonAgentTaskHandler, tool_namespace),
-                    exposure,
-                    TypedToolClass::RootTaskControl,
-                );
-            }
         } else {
-            let agent_type_description = agent_type_description(turn_context);
-            let exposure = if search_tool_enabled(turn_context) {
-                ToolExposure::Deferred
-            } else {
-                ToolExposure::Direct
-            };
-            if can_spawn {
-                planned_tools.add_with_exposure_and_authorization_class(
-                    SpawnAgentHandler::new(SpawnAgentToolOptions {
-                        available_models: turn_context.available_models.clone(),
-                        agent_type_description,
-                        hide_agent_type_model_reasoning: false,
-                        usage_hint_text: turn_context.config.multi_agent_v2.usage_hint_text.clone(),
-                    }),
-                    exposure,
-                    TypedToolClass::RootTaskControl,
-                );
-            }
-            if agent_surface_stage == AgentSurfaceStage::SpawnOnly
-                && !nested_agent_lifecycle_enabled(
-                    turn_context,
-                    exposure,
-                    Some(MULTI_AGENT_V1_NAMESPACE),
-                )
-            {
-                return;
-            }
-            planned_tools.add_with_exposure_and_authorization_class(
-                SendInputHandler,
+            planned_tools.add_arc_with_exposure_and_authorization_class(
+                multi_agent_v2_handler(AmendAgentTaskHandler, tool_namespace),
                 exposure,
                 TypedToolClass::RootTaskControl,
             );
-            planned_tools.add_with_exposure_and_authorization_class(
-                ResumeAgentHandler,
+            planned_tools.add_arc_with_exposure_and_authorization_class(
+                multi_agent_v2_handler(WaiveAgentGateHandler, tool_namespace),
                 exposure,
                 TypedToolClass::RootTaskControl,
             );
-            planned_tools.add_with_exposure_and_authorization_class(
-                WaitAgentHandler::new(context.wait_agent_timeouts),
-                exposure,
-                TypedToolClass::AgentCommunication,
-            );
-            planned_tools.add_with_exposure_and_authorization_class(
-                CloseAgentHandler,
+            planned_tools.add_arc_with_exposure_and_authorization_class(
+                multi_agent_v2_handler(AbandonAgentTaskHandler, tool_namespace),
                 exposure,
                 TypedToolClass::RootTaskControl,
             );

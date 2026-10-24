@@ -1,1 +1,1 @@
-"""Repository maintenance commands and their tests."""
+"""Parallel repository formatting."""

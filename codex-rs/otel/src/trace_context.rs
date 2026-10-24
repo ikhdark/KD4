@@ -140,7 +140,7 @@ pub(crate) fn context_from_trace_headers(
         headers.insert("tracestate".to_string(), tracestate.to_string());
     }
 
-    let context = TraceContextPropagator::new().extract(&headers);
+    let context = TraceContextPropagator::new().extract_with_context(&Context::new(), &headers);
     if !context.span().span_context().is_valid() {
         return None;
     }
@@ -390,6 +390,37 @@ mod tests {
     use tracing::trace_span;
     use tracing_subscriber::layer::SubscriberExt;
     use tracing_subscriber::util::SubscriberInitExt;
+
+    #[test]
+    fn incoming_traceparent_is_independent_of_attached_context() {
+        use opentelemetry::Context;
+        use opentelemetry::trace::{SpanContext, TraceFlags, TraceState};
+        for remote in [false, true] {
+            let ambient = SpanContext::new(
+                TraceId::from_hex("0000000000000000000000000000000a").unwrap(),
+                SpanId::from_hex("000000000000000b").unwrap(),
+                TraceFlags::SAMPLED,
+                remote,
+                TraceState::default(),
+            );
+            let _guard = Context::new().with_remote_span_context(ambient).attach();
+            for parent in [None, Some(""), Some("not-a-traceparent")] {
+                for state in [None, Some("vendor=value")] {
+                    assert!(context_from_trace_headers(parent, state).is_none());
+                }
+            }
+            let context = context_from_trace_headers(
+                Some("00-00000000000000000000000000000001-0000000000000002-01"),
+                None,
+            )
+            .unwrap();
+            assert_eq!(
+                context.span().span_context().trace_id(),
+                TraceId::from_hex("00000000000000000000000000000001").unwrap()
+            );
+            assert!(context.span().span_context().is_remote());
+        }
+    }
 
     #[test]
     fn parses_valid_w3c_trace_context() {

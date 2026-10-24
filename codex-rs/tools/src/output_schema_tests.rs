@@ -45,6 +45,10 @@ fn materialized_and_lazy_schemas_compare_in_both_directions() {
     for structured_content in [None, Some(Arc::default()), Some(Arc::new(populated))] {
         let lazy = ToolOutputSchema::from_mcp_output_schema(structured_content);
         let materialized = ToolOutputSchema::from(lazy.to_value());
+        assert_eq!(
+            lazy.search_field_names().collect::<Vec<_>>(),
+            materialized.search_field_names().collect::<Vec<_>>()
+        );
         assert_eq!(materialized, lazy);
         assert_eq!(lazy, materialized);
 

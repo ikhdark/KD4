@@ -114,30 +114,11 @@ pub(crate) struct OutboundConnectionState {
 }
 
 struct StdioDelivery {
-    sender: mpsc::Sender<(QueuedOutgoingMessage, tokio::sync::OwnedSemaphorePermit)>,
+    sender: mpsc::Sender<QueuedOutgoingMessage>,
     bytes: Arc<tokio::sync::Semaphore>,
 }
 
 const STDIO_DELIVERY_BYTES: usize = 16 * 1024 * 1024;
-
-fn stdio_message_bytes(message: &OutgoingMessage) -> Option<u32> {
-    struct Counter(usize);
-    impl std::io::Write for Counter {
-        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-            self.0 = self.0.saturating_add(bytes.len());
-            if self.0 > STDIO_DELIVERY_BYTES {
-                return Err(std::io::Error::other("stdio delivery byte budget exceeded"));
-            }
-            Ok(bytes.len())
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-    let mut counter = Counter(0);
-    serde_json::to_writer(&mut counter, message).ok()?;
-    Some(counter.0.max(1) as u32)
-}
 
 impl OutboundConnectionState {
     pub(crate) fn new(
@@ -227,13 +208,14 @@ async fn send_message_to_connection(
     connection_id: ConnectionId,
     message: OutgoingMessage,
     write_complete_tx: Option<OutgoingWriteReceipt>,
+    notification_prechecked: bool,
 ) -> bool {
     let Some(connection_state) = connections.get_mut(&connection_id) else {
         warn!("dropping message for disconnected connection: {connection_id:?}");
         return false;
     };
     let message = filter_outgoing_message_for_connection(connection_state, message);
-    if should_skip_notification_for_connection(connection_state, &message) {
+    if !notification_prechecked && should_skip_notification_for_connection(connection_state, &message) {
         if let Some(receipt) = write_complete_tx
             && let Some(filtered) = receipt.filtered
         {
@@ -243,8 +225,9 @@ async fn send_message_to_connection(
     }
 
     let writer = connection_state.writer.clone();
-    let queued_message = QueuedOutgoingMessage {
+    let mut queued_message = QueuedOutgoingMessage {
         message,
+        encoded_json: None,
         write_complete_tx: write_complete_tx.map(|receipt| receipt.writer),
     };
     if connection_state.can_disconnect() {
@@ -261,15 +244,17 @@ async fn send_message_to_connection(
             }
         }
     } else {
-        // The per-stdio owner may wait on its physical writer; the global
-        // router never does. Count and bytes both bound this additional stage.
-        if connection_state.transport_shutdown.is_cancelled() {
+        // The per-stdio owner absorbs bursts without waiting on the physical
+        // writer. When its bounded staging budget fills, backpressure must reach
+        // producers instead of cancelling the shared server shutdown token.
+        let shutdown = connection_state.transport_shutdown.clone();
+        if shutdown.is_cancelled() {
             return disconnect_connection(connections, connection_id);
         }
         let delivery = connection_state.stdio_delivery.get_or_insert_with(|| {
             let (sender, mut receiver) =
-                mpsc::channel::<(QueuedOutgoingMessage, tokio::sync::OwnedSemaphorePermit)>(128);
-            let shutdown = connection_state.transport_shutdown.clone();
+                mpsc::channel::<QueuedOutgoingMessage>(128);
+            let shutdown = shutdown.clone();
             tokio::spawn(async move {
                 loop {
                     let next = tokio::select! {
@@ -277,7 +262,7 @@ async fn send_message_to_connection(
                         _ = shutdown.cancelled() => break,
                         next = receiver.recv() => next,
                     };
-                    let Some((message, credit)) = next else {
+                    let Some(message) = next else {
                         break;
                     };
                     tokio::select! {
@@ -287,7 +272,6 @@ async fn send_message_to_connection(
                             if result.is_err() { shutdown.cancel(); break; }
                         }
                     }
-                    drop(credit);
                 }
             });
             StdioDelivery {
@@ -295,15 +279,36 @@ async fn send_message_to_connection(
                 bytes: Arc::new(tokio::sync::Semaphore::new(STDIO_DELIVERY_BYTES)),
             }
         });
-        let credit = stdio_message_bytes(&queued_message.message)
-            .and_then(|bytes| delivery.bytes.clone().try_acquire_many_owned(bytes).ok());
-        if let Some(credit) = credit
-            && delivery.sender.try_send((queued_message, credit)).is_ok()
-        {
+        let bytes = match queued_message.encode_json(STDIO_DELIVERY_BYTES) {
+            Ok(bytes) => bytes.max(1) as u32,
+            Err(error) => {
+                warn!(?connection_id, %error, "failed to encode bounded stdio output");
+                return disconnect_connection(connections, connection_id);
+            }
+        };
+        // Both admission waits remain interruptible. Credits stay attached to
+        // the frame until its physical write completes, preserving the byte cap.
+        let credit = tokio::select! {
+            biased;
+            _ = shutdown.cancelled() => None,
+            result = delivery.bytes.clone().acquire_many_owned(bytes) => result.ok(),
+        };
+        let Some(credit) = credit else {
+            return disconnect_connection(connections, connection_id);
+        };
+        if let Some(encoded) = &mut queued_message.encoded_json {
+            encoded.delivery_credit = Some(credit);
+        }
+        let sent = tokio::select! {
+            biased;
+            _ = shutdown.cancelled() => false,
+            result = delivery.sender.send(queued_message) => result.is_ok(),
+        };
+        if sent {
             return false;
         }
-        // Required output cannot be silently dropped. Stdio retains its
-        // existing process-lifetime failure policy when its owned budget ends.
+        // A closed writer or explicit shutdown still retires the connection;
+        // temporary count/byte saturation does not.
         disconnect_connection(connections, connection_id)
     }
 }
@@ -336,6 +341,7 @@ pub(crate) async fn route_outgoing_envelope(
     connections: &mut HashMap<ConnectionId, OutboundConnectionState>,
     envelope: OutgoingEnvelope,
 ) {
+    let notification_prechecked = matches!(&envelope, OutgoingEnvelope::Broadcast { .. });
     let target_connection_ids = target_connection_ids(connections, &envelope);
     let (message, mut write_complete_tx) = match envelope {
         OutgoingEnvelope::ToConnection {
@@ -368,6 +374,7 @@ pub(crate) async fn route_outgoing_envelope(
             connection_id,
             outgoing,
             write_complete_tx.take(),
+            notification_prechecked,
         )
         .await;
     }
@@ -379,12 +386,14 @@ fn target_connection_ids(
 ) -> Vec<ConnectionId> {
     match envelope {
         OutgoingEnvelope::ToConnection { connection_id, .. } => vec![*connection_id],
-        OutgoingEnvelope::Broadcast { .. } => connections
+        OutgoingEnvelope::Broadcast { message } => connections
             .iter()
             .filter_map(|(connection_id, connection_state)| {
-                connection_state
-                    .initialized
-                    .load(Ordering::Acquire)
+                // Snapshot notification eligibility once, before cloning the
+                // payload. Later mutable opt-out/capability updates apply to
+                // subsequent envelopes, not a second check of this one.
+                (connection_state.initialized.load(Ordering::Acquire)
+                    && !should_skip_notification_for_connection(connection_state, message))
                     .then_some(*connection_id)
             })
             .collect(),

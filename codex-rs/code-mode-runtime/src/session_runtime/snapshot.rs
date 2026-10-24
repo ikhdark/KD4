@@ -62,7 +62,7 @@ pub(super) struct StagedSnapshot {
 // Immutable terminal payloads belong to this snapshot owner. Staging another
 // cell shares their wire bytes rather than cloning and serializing every old
 // receipt again. Publication still atomically replaces one complete snapshot.
-struct CompletedSnapshotEvent {
+pub(super) struct CompletedSnapshotEvent {
     event: CellEvent,
     serialized: Arc<serde_json::value::RawValue>,
     bytes: usize,
@@ -70,10 +70,18 @@ struct CompletedSnapshotEvent {
 }
 
 impl CompletedSnapshotEvent {
+    pub(super) fn read(&self) -> CellEvent {
+        self.event.clone()
+    }
+
+    pub(super) fn completion(&self) -> Option<bool> {
+        super::terminal_completion(&self.event)
+    }
+
     fn new(event: CellEvent, completion_order: u64) -> Result<Arc<Self>, String> {
         let serialized =
             serde_json::value::to_raw_value(&event).map_err(|error| error.to_string())?;
-        let bytes = super::cell_event_bytes(&event);
+        let bytes = super::cell_event_bytes_with_encoded_len(&event, serialized.get().len());
         Ok(Arc::new(Self {
             event,
             serialized: Arc::from(serialized),
@@ -139,7 +147,10 @@ impl DurableState {
                 if bytes.len() > MAX_SNAPSHOT_BYTES {
                     return Err("named-state snapshot exceeds its byte limit".into());
                 }
-                let snapshot: Snapshot<Value> =
+                // Raw payloads do not spend their standalone recursion budget
+                // on the snapshot envelope. Decode each value below using the
+                // same bounded parser as store(), never disable depth checks.
+                let snapshot: Snapshot<Box<serde_json::value::RawValue>> =
                     serde_json::from_slice(&bytes).map_err(|error| {
                         format!("named-state snapshot is invalid; no cell started: {error}")
                     })?;
@@ -194,11 +205,14 @@ impl DurableState {
             .values
             .into_iter()
             .map(|(key, value)| {
+                let value = serde_json::from_str(value.get()).map_err(|error| {
+                    format!("named-state snapshot value {key:?} is invalid; no cell started: {error}")
+                })?;
                 let stored = StoredValue::new(&key, value)
                     .with_presentation(snapshot.presentations.get(&key).cloned());
-                (key, stored)
+                Ok((key, stored))
             })
-            .collect::<HashMap<_, _>>();
+            .collect::<Result<HashMap<_, _>, String>>()?;
         values.extend(initial_values);
         if !stored_values_with_writes_within_limits(&HashMap::new(), &values) {
             return Err("named-state snapshot exceeds the session storage limit".into());
@@ -249,7 +263,9 @@ impl DurableState {
         Ok((state, values))
     }
 
-    pub(super) fn completed_cells(&self) -> Vec<(String, CellEvent)> {
+    pub(super) fn completed_cells_for_replay(
+        &self,
+    ) -> Vec<(String, Arc<CompletedSnapshotEvent>, usize)> {
         let cells = self
             .completed_cells
             .lock()
@@ -258,16 +274,36 @@ impl DurableState {
         ordered.sort_by_key(|(_, event)| event.completion_order);
         ordered
             .into_iter()
-            .map(|(id, event)| (id.clone(), event.event.clone()))
+            .map(|(id, event)| (id.clone(), Arc::clone(event), event.bytes))
             .collect()
     }
 
+    #[cfg(test)]
+    pub(super) fn completed_cells(&self) -> Vec<(String, CellEvent)> {
+        self.completed_cells_for_replay()
+            .into_iter()
+            .map(|(id, event, _)| (id, event.read()))
+            .collect()
+    }
+
+    #[cfg(test)]
     pub(super) fn completed_cell(&self, cell_id: &str) -> Option<CellEvent> {
         self.completed_cells
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(cell_id)
             .map(|event| event.event.clone())
+    }
+
+    pub(super) fn completed_cell_for_replay(
+        &self,
+        cell_id: &str,
+    ) -> Option<(Arc<CompletedSnapshotEvent>, usize)> {
+        self.completed_cells
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(cell_id)
+            .map(|event| (Arc::clone(event), event.bytes))
     }
 
     /// Serialize and synchronize off the async runtime, before entering the
@@ -436,5 +472,45 @@ mod audit63_retirement_tests {
         std::fs::write(home.path().join("tool-history/thread.retired"), b"retired").unwrap();
         assert!(DurableState::open(path.clone()).is_err());
         assert!(!path.exists());
+    }
+}
+
+#[cfg(test)]
+mod deep_payload_tests {
+    use super::*;
+
+    #[test]
+    fn standalone_depth_boundaries_survive_snapshot_publication_and_reopening() {
+        for depth in [125, 126, 127] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("state.json");
+            let (state, _) = DurableState::open(path.clone()).unwrap();
+            let json = format!("{}0{}", "[".repeat(depth), "]".repeat(depth));
+            let deep: Value = serde_json::from_str(&json).unwrap();
+            let event = CellEvent::Completed {
+                content_items: Vec::new(), error_text: None, output_loss: None,
+            };
+            let staged = state.stage("deep-call".into(), HashMap::from([
+                ("deep".into(), StoredValue::new("deep", deep.clone())),
+                ("kept".into(), StoredValue::new("kept", Value::Bool(true))),
+            ]), "1".into(), event.clone()).unwrap();
+            state.publish(staged).unwrap();
+            drop(state);
+            let (restored, values) = DurableState::open(path).unwrap();
+            assert_eq!(values["deep"].value.as_ref(), &deep, "depth {depth}");
+            assert_eq!(values["kept"].value.as_ref(), &Value::Bool(true));
+            assert_eq!(restored.completed_cell("1"), Some(event));
+        }
+    }
+
+    #[test]
+    fn overdeep_external_payload_is_rejected_without_replacing_snapshot() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("state.json");
+        let bytes = format!(r#"{{"version":7,"revision":1,"completed_call_id":"","values":{{"deep":{}0{}}},"completed_cells":{{}}}}"#,
+            "[".repeat(128), "]".repeat(128));
+        std::fs::write(&path, &bytes).unwrap();
+        assert!(DurableState::open(path.clone()).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), bytes.as_bytes());
     }
 }

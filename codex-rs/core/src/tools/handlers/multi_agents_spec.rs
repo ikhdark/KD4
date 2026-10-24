@@ -3,8 +3,6 @@ use codex_features::MULTI_AGENT_MAX_WAIT_TIMEOUT_MS;
 use codex_features::MULTI_AGENT_MIN_WAIT_TIMEOUT_MS;
 use codex_protocol::openai_models::ModelPreset;
 use codex_tools::JsonSchema;
-use codex_tools::ResponsesApiNamespace;
-use codex_tools::ResponsesApiNamespaceTool;
 use codex_tools::ResponsesApiTool;
 use codex_tools::ToolSpec;
 use serde_json::Value;
@@ -15,12 +13,9 @@ use std::sync::Arc;
 use super::multi_agents_common::DEFAULT_SPAWN_AGENT_MODEL;
 use super::multi_agents_common::DEFAULT_SPAWN_AGENT_REASONING_EFFORT;
 
-pub const MULTI_AGENT_V1_NAMESPACE: &str = "multi_agent_v1";
-const MULTI_AGENT_V1_NAMESPACE_DESCRIPTION: &str = "Tools for spawning and managing sub-agents.";
 
 const SPAWN_AGENT_SERVICE_TIER_OVERRIDE_DESCRIPTION: &str =
     "Service tier override for the new agent. Omit unless explicitly requested.";
-const SPAWN_AGENT_V1_FULL_HISTORY_OVERRIDE_GUIDANCE: &str = "Full-history forks (`fork_context=true`) do not accept per-call `agent_type`, `model`, or `reasoning_effort` overrides; keep `fork_context` false or omit it when using those fields.";
 const SPAWN_AGENT_V2_FULL_HISTORY_OVERRIDE_GUIDANCE: &str = "Full-history forks (`fork_turns=\"all\"`) are disabled by default and do not accept per-call `agent_type`, `model`, or `reasoning_effort` overrides when enabled; set `fork_turns` to `none` or an integer from 1 through 5 when using those fields.";
 const MAX_MODEL_OVERRIDES_IN_SPAWN_AGENT_DESCRIPTION: usize = 5;
 const MAX_REASONING_EFFORT_CHARS_IN_SPAWN_AGENT_DESCRIPTION: usize = 64;
@@ -70,52 +65,6 @@ impl Default for WaitAgentTimeoutOptions {
     }
 }
 
-pub fn create_spawn_agent_tool_v1(options: SpawnAgentToolOptions) -> ToolSpec {
-    let available_models_description = (!options.hide_agent_type_model_reasoning)
-        .then(|| spawn_agent_models_description(&options.available_models));
-    let default_model_guidance =
-        (!options.hide_agent_type_model_reasoning).then(spawn_agent_default_guidance);
-    let full_history_override_guidance = (!options.hide_agent_type_model_reasoning)
-        .then_some(SPAWN_AGENT_V1_FULL_HISTORY_OVERRIDE_GUIDANCE);
-    let return_value_description =
-        "Returns the spawned agent id plus the user-facing nickname when available.";
-    let mut properties = spawn_agent_common_properties_v1(
-        &options.agent_type_description,
-        full_history_override_guidance,
-    );
-    if options.hide_agent_type_model_reasoning {
-        hide_spawn_agent_metadata_options(&mut properties);
-    }
-
-    ToolSpec::Namespace(ResponsesApiNamespace {
-        name: MULTI_AGENT_V1_NAMESPACE.to_string(),
-        description: MULTI_AGENT_V1_NAMESPACE_DESCRIPTION.to_string(),
-        tools: vec![ResponsesApiNamespaceTool::Function(ResponsesApiTool {
-            name: "spawn_agent".to_string(),
-            description: spawn_agent_tool_description(
-                available_models_description.as_deref(),
-                default_model_guidance.as_deref(),
-                return_value_description,
-                options.usage_hint_text,
-            ),
-            strict: false,
-            defer_loading: None,
-            parameters: JsonSchema {
-                one_of: Some(
-                    ["message", "items"]
-                        .into_iter()
-                        .map(|field| JsonSchema {
-                            required: Some(vec![field.to_string()]),
-                            ..JsonSchema::object(BTreeMap::new(), None, None)
-                        })
-                        .collect(),
-                ),
-                ..JsonSchema::object(properties, /*required*/ None, Some(false.into()))
-            },
-            output_schema: Some(spawn_agent_output_schema_v1().into()),
-        })],
-    })
-}
 
 pub fn create_spawn_agent_tool_v2(options: SpawnAgentToolOptions) -> ToolSpec {
     let available_models_description = (!options.hide_agent_type_model_reasoning)
@@ -140,17 +89,23 @@ pub fn create_spawn_agent_tool_v2(options: SpawnAgentToolOptions) -> ToolSpec {
     properties.insert("assignment".to_string(), typed_assignment_schema());
     properties.insert(
         "task_name".to_string(),
-        JsonSchema::string(Some(
-            "Task name for the new agent. Use lowercase letters, digits, and underscores."
-                .to_string(),
-        )),
+        JsonSchema {
+            // ECMAScript `$` alone also admits a final newline. Require the
+            // absolute end explicitly and retain AgentPath's reserved name.
+            pattern: Some(r"^(?!root$)[a-z0-9_]+$(?![\s\S])".to_string()),
+            min_length: Some(1),
+            ..JsonSchema::string(Some(
+                "Task name for the new agent. Use lowercase letters, digits, and underscores; `root` is reserved."
+                    .to_string(),
+            ))
+        },
     );
     // Other agent APIs name this task text `prompt` or `instructions`. Rejecting
     // those spellings failed whole exec cells, so they are published aliases.
     for alias in &SPAWN_AGENT_V2_MESSAGE_FIELDS[1..] {
         properties.insert(
             (*alias).to_string(),
-            JsonSchema::string(Some("Alias for `message`.".to_string())),
+            JsonSchema::string(Some("Alias for `message`.".to_string())).with_encrypted(),
         );
     }
 
@@ -199,49 +154,6 @@ pub fn create_spawn_agent_tool_v2(options: SpawnAgentToolOptions) -> ToolSpec {
     })
 }
 
-pub fn create_send_input_tool_v1() -> ToolSpec {
-    let properties = BTreeMap::from([
-        (
-            "target".to_string(),
-            JsonSchema::string(Some("Agent id to message (from spawn_agent).".to_string())),
-        ),
-        (
-            "message".to_string(),
-            JsonSchema::string(Some(
-                "Legacy plain-text message to send to the agent. Use either message or items."
-                    .to_string(),
-            )),
-        ),
-        ("items".to_string(), create_collab_input_items_schema()),
-        (
-            "interrupt".to_string(),
-            JsonSchema::boolean(Some(
-                "True interrupts the current task and handles this message immediately; false or omitted queues it."
-                    .to_string(),
-            )),
-        ),
-    ]);
-
-    ToolSpec::Namespace(ResponsesApiNamespace {
-        name: MULTI_AGENT_V1_NAMESPACE.to_string(),
-        description: MULTI_AGENT_V1_NAMESPACE_DESCRIPTION.to_string(),
-        tools: vec![ResponsesApiNamespaceTool::Function(ResponsesApiTool {
-            name: "send_input".to_string(),
-            description: "Send a message to an existing agent. Use interrupt=true to redirect work immediately. You should reuse the agent by send_input if you believe your assigned task is highly dependent on the context of a previous task."
-                .to_string(),
-            strict: false,
-            defer_loading: None,
-            parameters: JsonSchema {
-                one_of: Some(["message", "items"].into_iter().map(|field| JsonSchema {
-                    required: Some(vec![field.to_string()]),
-                    ..JsonSchema::object(BTreeMap::new(), None, None)
-                }).collect()),
-                ..JsonSchema::object(properties, Some(vec!["target".to_string()]), Some(false.into()))
-            },
-            output_schema: Some(send_input_output_schema().into()),
-        })],
-    })
-}
 
 pub fn create_send_message_tool() -> ToolSpec {
     let properties = BTreeMap::from([
@@ -278,7 +190,7 @@ pub fn create_send_message_tool() -> ToolSpec {
 
     ToolSpec::Function(ResponsesApiTool {
         name: "send_message".to_string(),
-        description: "Queue an informational update for an existing agent, or the same update for explicit targets. Delivered promptly without starting a new turn. Do not request acknowledgment just to confirm receipt. Use followup_task for new assignments, corrections requiring action, or urgent work that must start."
+        description: "Queue information for a child or peer, or the same information for explicit targets, without starting a new turn. Sub-agents cannot message ancestors: finish with one final answer including any blockers; the host reports the terminal outcome automatically. Do not send progress updates or request acknowledgment. Use followup_task for new assignments, corrections requiring action, or urgent work that must start."
             .to_string(),
         strict: false,
         defer_loading: None,
@@ -329,43 +241,7 @@ pub fn create_followup_task_tool() -> ToolSpec {
     })
 }
 
-pub fn create_resume_agent_tool() -> ToolSpec {
-    let properties = BTreeMap::from([(
-        "id".to_string(),
-        JsonSchema::string(Some("Agent id to resume.".to_string())),
-    )]);
 
-    ToolSpec::Namespace(ResponsesApiNamespace {
-        name: MULTI_AGENT_V1_NAMESPACE.to_string(),
-        description: MULTI_AGENT_V1_NAMESPACE_DESCRIPTION.to_string(),
-        tools: vec![ResponsesApiNamespaceTool::Function(ResponsesApiTool {
-            name: "resume_agent".to_string(),
-            description:
-                "Resume a previously closed agent by id so it can receive send_input and wait_agent calls."
-                    .to_string(),
-            strict: false,
-            defer_loading: None,
-            parameters: JsonSchema::object(properties, Some(vec!["id".to_string()]), Some(false.into())),
-            output_schema: Some(resume_agent_output_schema().into()),
-        })],
-    })
-}
-
-pub fn create_wait_agent_tool_v1(options: WaitAgentTimeoutOptions) -> ToolSpec {
-    ToolSpec::Namespace(ResponsesApiNamespace {
-        name: MULTI_AGENT_V1_NAMESPACE.to_string(),
-        description: MULTI_AGENT_V1_NAMESPACE_DESCRIPTION.to_string(),
-        tools: vec![ResponsesApiNamespaceTool::Function(ResponsesApiTool {
-            name: "wait_agent".to_string(),
-            description: "Wait for agents to reach a final status. Completed statuses may include the agent's final message. Timeout or interruption preserves statuses observed before the wait ended. Once the agent reaches a final status, a notification message will be received containing the same completed status."
-                .to_string(),
-            strict: false,
-            defer_loading: None,
-            parameters: wait_agent_tool_parameters_v1(options),
-            output_schema: Some(wait_output_schema_v1().into()),
-        })],
-    })
-}
 
 pub fn create_wait_agent_tool_v2(options: WaitAgentTimeoutOptions) -> ToolSpec {
     ToolSpec::Function(ResponsesApiTool {
@@ -406,27 +282,6 @@ pub fn create_list_agents_tool() -> ToolSpec {
     })
 }
 
-pub fn create_close_agent_tool_v1() -> ToolSpec {
-    let properties = BTreeMap::from([(
-        "target".to_string(),
-        JsonSchema::string(Some("Agent id to close (from spawn_agent).".to_string())),
-    )]);
-
-    ToolSpec::Namespace(ResponsesApiNamespace {
-        name: MULTI_AGENT_V1_NAMESPACE.to_string(),
-        description: MULTI_AGENT_V1_NAMESPACE_DESCRIPTION.to_string(),
-        tools: vec![ResponsesApiNamespaceTool::Function(ResponsesApiTool {
-            name: "close_agent".to_string(),
-            description: "Close an agent and any open descendants when they are no longer needed, and return the target agent's previous status before shutdown was requested. Completed agents remain open and count toward the concurrency limit until closed. Don't keep agents open for too long if they are not needed anymore.".to_string(),
-            strict: false,
-            defer_loading: None,
-            parameters: JsonSchema::object(properties, Some(vec!["target".to_string()]), Some(false.into())),
-            output_schema: Some(agent_previous_status_output_schema(
-                "The agent status observed before shutdown was requested.",
-            ).into()),
-        })],
-    })
-}
 
 pub fn create_interrupt_agent_tool_v2() -> ToolSpec {
     let properties = BTreeMap::from([(
@@ -506,23 +361,6 @@ fn agent_status_output_schema() -> Value {
     })
 }
 
-fn spawn_agent_output_schema_v1() -> Value {
-    json!({
-        "type": "object",
-        "properties": {
-            "agent_id": {
-                "type": "string",
-                "description": "Thread identifier for the spawned agent."
-            },
-            "nickname": {
-                "type": ["string", "null"],
-                "description": "User-facing nickname for the spawned agent when available."
-            }
-        },
-        "required": ["agent_id", "nickname"],
-        "additionalProperties": false
-    })
-}
 
 pub(super) fn spawn_agent_output_schema_v2(hide_agent_metadata: bool) -> Value {
     let integration_plan = json!({
@@ -562,19 +400,6 @@ pub(super) fn spawn_agent_output_schema_v2(hide_agent_metadata: bool) -> Value {
     json!({"oneOf": [spawned, reused]})
 }
 
-fn send_input_output_schema() -> Value {
-    json!({
-        "type": "object",
-        "properties": {
-            "submission_id": {
-                "type": "string",
-                "description": "Identifier for the queued input submission."
-            }
-        },
-        "required": ["submission_id"],
-        "additionalProperties": false
-    })
-}
 
 fn list_agents_output_schema() -> Value {
     json!({
@@ -629,39 +454,7 @@ fn list_agents_output_schema() -> Value {
     })
 }
 
-fn resume_agent_output_schema() -> Value {
-    json!({
-        "type": "object",
-        "properties": {
-            "status": agent_status_output_schema()
-        },
-        "required": ["status"],
-        "additionalProperties": false
-    })
-}
 
-fn wait_output_schema_v1() -> Value {
-    json!({
-        "type": "object",
-        "properties": {
-            "status": {
-                "type": "object",
-                "description": "Final statuses keyed by canonical task path when available, otherwise agent id.",
-                "additionalProperties": agent_status_output_schema()
-            },
-            "timed_out": {
-                "type": "boolean",
-                "description": "Whether the deadline arrived before the requested wait condition was met. Observed final statuses are retained."
-            },
-            "interruption": {
-                "type": "string",
-                "description": "Why observation yielded early. Target work remains independent of this interruption."
-            }
-        },
-        "required": ["status", "timed_out"],
-        "additionalProperties": false
-    })
-}
 
 fn wait_output_schema_v2() -> Value {
     json!({
@@ -728,108 +521,7 @@ fn agent_previous_status_output_schema(previous_status_description: &str) -> Val
     })
 }
 
-fn create_collab_input_items_schema() -> JsonSchema {
-    let properties = BTreeMap::from([
-        (
-            "type".to_string(),
-            JsonSchema::string(Some(
-                "Input item type: text, image, local_image, skill, or mention.".to_string(),
-            )),
-        ),
-        (
-            "text".to_string(),
-            JsonSchema::string(Some("Text content when type is text.".to_string())),
-        ),
-        (
-            "image_url".to_string(),
-            JsonSchema::string(Some("Image URL when type is image.".to_string())),
-        ),
-        (
-            "path".to_string(),
-            JsonSchema::string(Some(
-                "Path when type is local_image/skill, or structured mention target such as app://<connector-id> or plugin://<plugin-name>@<marketplace-name> when type is mention."
-                    .to_string(),
-            )),
-        ),
-        (
-            "name".to_string(),
-            JsonSchema::string(Some("Display name when type is skill or mention.".to_string())),
-        ),
-    ]);
 
-    // The decoder is the tagged UserInput enum. Keep the advertised item kinds
-    // and fields, but require each variant's actual payload before execution.
-    let variants = [
-        ("text", vec!["type", "text"]),
-        ("image", vec!["type", "image_url"]),
-        ("local_image", vec!["type", "path"]),
-        ("skill", vec!["type", "name", "path"]),
-        ("mention", vec!["type", "name", "path"]),
-    ]
-    .into_iter()
-    .map(|(kind, required)| {
-        let mut properties = properties.clone();
-        properties.insert(
-            "type".to_string(),
-            JsonSchema::string_enum(vec![json!(kind)], None),
-        );
-        JsonSchema::object(
-            properties,
-            Some(required.into_iter().map(str::to_string).collect()),
-            Some(false.into()),
-        )
-    })
-    .collect();
-    let mut schema = JsonSchema::array(JsonSchema::any_of(variants, None), Some(
-            "Structured input items. Use this to pass explicit mentions (for example app:// connector paths)."
-                .to_string(),
-        ));
-    schema.min_items = Some(1);
-    schema
-}
-
-fn spawn_agent_common_properties_v1(
-    agent_type_description: &str,
-    full_history_override_guidance: Option<&str>,
-) -> BTreeMap<String, JsonSchema> {
-    let full_history_override_guidance = full_history_override_guidance
-        .map(|guidance| format!(" {guidance}"))
-        .unwrap_or_default();
-    BTreeMap::from([
-        (
-            "message".to_string(),
-            JsonSchema::string(Some(
-                "Initial plain-text task for the new agent. Use either message or items."
-                    .to_string(),
-            )),
-        ),
-        ("items".to_string(), create_collab_input_items_schema()),
-        (
-            "agent_type".to_string(),
-            JsonSchema::string(Some(agent_type_description.to_string())),
-        ),
-        (
-            "fork_context".to_string(),
-            JsonSchema::boolean(Some(format!(
-                "True forks the current thread history into the new agent; false or omitted starts with only the initial prompt.{full_history_override_guidance}"
-            ))),
-        ),
-        (
-            "model".to_string(),
-            JsonSchema::string(Some(spawn_agent_model_override_description())),
-        ),
-        (
-            "reasoning_effort".to_string(),
-            JsonSchema::string(Some(spawn_agent_reasoning_override_description())),
-        ),
-        (
-            "service_tier".to_string(),
-            JsonSchema::string(Some(
-                SPAWN_AGENT_SERVICE_TIER_OVERRIDE_DESCRIPTION.to_string(),
-            )),
-        ),
-    ])
-}
 
 fn spawn_agent_common_properties_v2(
     agent_type_description: &str,
@@ -890,7 +582,7 @@ fn task_name_alias_schema() -> JsonSchema {
 pub(crate) fn criterion_evidence_policy_schema() -> JsonSchema {
     JsonSchema::object(BTreeMap::from([
         ("kind".into(), JsonSchema::string_enum(vec![json!("report_only"), json!("source_inspection"), json!("validation_execution")], Some("Declared assurance, not inferred coverage. Omission of the entire policy leaves a legacy claim unverified.".into()))),
-        ("required_evidence".into(), JsonSchema::string(Some("Exact immutable required_evidence entry applicable to this criterion; required except for report_only. Shared observations are allowed only when the declared contract covers each criterion.".into()))),
+        ("required_evidence".into(), JsonSchema::string(Some("Exact assignment required_evidence entry supporting this criterion; required for inspection/execution, omitted for report_only.".into()))),
         ("freshness".into(), JsonSchema::string_enum(vec![json!("current"), json!("historical")], Some("Defaults to current. Current source acquisition is rehashed. Current validation_execution is rejected at assignment/amendment admission because trusted execution input binding is unavailable; another passing run cannot satisfy it. Choose historical only for an explicitly historical execution requirement, never to weaken a current-correctness requirement.".into()))),
     ]), Some(vec!["kind".into()]), Some(false.into()))
 }
@@ -1041,13 +733,13 @@ fn typed_assignment_schema() -> JsonSchema {
         BTreeMap::from([
             (
                 "objective".to_string(),
-                JsonSchema::string(Some("Concrete objective for the new agent.".to_string())),
+                JsonSchema::string(Some("Concrete objective; for audits/reviews, include the task type and category inclusions/exclusions.".to_string())),
             ),
             (
                 "acceptance_criteria".to_string(),
                 JsonSchema::array(
                     criterion,
-                    Some("Evidence-backed outcomes required for completion.".to_string()),
+                    Some("Observable outcomes required for completion; for audits/reviews, include the assigned detection criteria.".to_string()),
                 ),
             ),
             (
@@ -1087,11 +779,11 @@ fn typed_assignment_schema() -> JsonSchema {
             ),
             (
                 "required_evidence".to_string(),
-                string_array("Exact host observations required for completion: inspect:<normalized repository-relative file> for full native source acquisition, or exact resolved command argv (JSON array or shell-quoted argv) for native validation execution. Listing, busy, zero-test, failed and cancelled runs are not successful execution evidence. Criterion evidence_policy separately governs applicability and freshness."),
+                string_array("Completion evidence: inspect:<normalized repository-relative file> for a complete native source read, or exact resolved command argv (JSON array or shell-quoted) for native validation. Listing, busy, zero-test, failed and cancelled runs do not count. See criterion evidence_policy for applicability and freshness."),
             ),
             (
                 "prohibited_changes".to_string(),
-                string_array("Changes explicitly outside this assignment."),
+                string_array("User and assignment restrictions on edits and execution."),
             ),
             (
                 "contract_claims".to_string(),
@@ -1147,76 +839,9 @@ fn hide_spawn_agent_metadata_options(properties: &mut BTreeMap<String, JsonSchem
     properties.remove("service_tier");
 }
 
-fn spawn_agent_tool_description(
-    available_models_description: Option<&str>,
-    default_model_guidance: Option<&str>,
-    return_value_description: &str,
-    usage_hint_text: Option<String>,
-) -> String {
-    let agent_role_guidance = available_models_description.unwrap_or_default();
-    let default_model_guidance = default_model_guidance.unwrap_or_default();
 
-    let tool_description = format!(
-        r#"
-        {agent_role_guidance}
-        Spawn a sub-agent for a well-scoped task. {return_value_description} {default_model_guidance}"#
-    );
-
-    if let Some(usage_hint_text) = usage_hint_text {
-        return format!(
-            r#"
-        {tool_description}
-{usage_hint_text}"#
-        );
-    }
-    let agent_role_usage_hint = available_models_description
-        .map(|_| {
-            "Agent-role guidance below only helps choose which agent to use after spawning is already authorized; it never authorizes spawning by itself."
-        })
-        .unwrap_or_default();
-    format!(
-        r#"
-        {tool_description}
-This spawn_agent tool provides access to sub-agents that use the built-in model and reasoning defaults unless explicitly overridden. Do not set the `model` or `reasoning_effort` field unless the user explicitly asks for a different setting or there is a clear task-specific reason. You should follow the rules and guidelines below to use this tool.
-
-Do not spawn sub-agents unless the user or applicable AGENTS.md/skill instructions explicitly ask for sub-agents, delegation, or parallel agent work.
-Requests for depth, thoroughness, research, investigation, or detailed codebase analysis do not count as permission to spawn.
-{agent_role_usage_hint}
-
-### When to delegate vs. do the subtask yourself
-- First, quickly analyze the overall user task and form a succinct high-level plan. Identify which tasks are immediate blockers on the critical path, and which tasks are sidecar tasks that are needed but can run in parallel without blocking the next local step. As part of that plan, explicitly decide what immediate task you should do locally right now. Do this planning step before delegating to agents so you do not hand off the immediate blocking task to a submodel and then waste time waiting on it.
-- Use a subagent when a subtask is easy enough for it to handle and can run in parallel with your local work. Prefer delegating concrete, bounded sidecar tasks that materially advance the main task without blocking your immediate next local step.
-- Do not delegate urgent blocking work when your immediate next step depends on that result. If the very next action is blocked on that task, the main rollout should usually do it locally to keep the critical path moving.
-- Keep work local when the subtask is too difficult to delegate well and when it is tightly coupled, urgent, or likely to block your immediate next step.
-
-### Designing delegated subtasks
-- Subtasks must be concrete, well-defined, and self-contained.
-- Delegated subtasks must materially advance the main task.
-- Do not duplicate work between the main rollout and delegated subtasks.
-- Avoid issuing multiple delegate calls on the same unresolved thread unless the new delegated task is genuinely different and necessary.
-- Narrow the delegated ask to the concrete output you need next.
-- For coding tasks, prefer delegating concrete code-change worker subtasks over read-only explorer analysis when the subagent can make a bounded patch in a clear write scope.
-- Sub-agents share the parent's workspace. When delegating coding work, instruct the submodel to preserve others' changes and list the file paths it changed in the final answer.
-- For code-edit subtasks, describe intended write sets and call out known overlap so agents can reconcile shared changes.
-
-### After you delegate
-- Call wait_agent very sparingly. Only call wait_agent when you need the result immediately for the next critical-path step and you are blocked until it returns.
-- Do not redo delegated subagent tasks yourself; focus on integrating results or tackling useful parallel work.
-- While the subagent is running in the background, do meaningful work immediately and communicate before touching the same contract surface.
-- Do not repeatedly wait by reflex.
-- When a delegated coding task returns, review the agent's changes in the shared workspace, then refine them as needed.
-- Read every returned report in full, recovering omitted portions from retained output. Account for every substantive finding, including read-only reviews: implement and verify it, reject it with evidence, identify it as outside the user's scope, or keep it unresolved with a next action or blocker. Investigate unresolved in-scope findings before finalizing; partial fixes or an honest disclaimer do not discharge obtainable work. Respect review-only/no-write scope and do not blindly implement recommendations.
-
-- When implementation is authorized, implement verified, applicable, in-scope suggestions and validate the resulting behavior through affected consumers. Do not stop at acknowledging them, listing them in a plan, or describing future work; do not ask for renewed permission to perform already-authorized changes. If current behavior already satisfies a suggestion, record the evidence instead of making unnecessary edits.
-
-### Parallel delegation patterns
-- Run multiple independent information-seeking subtasks in parallel when you have distinct questions that can be answered independently.
-- Split implementation into clear codebase slices; overlapping scopes are admitted but should be explicit and reconciled against the latest shared state.
-- Delegate verification only when it can run in parallel with ongoing implementation and is likely to catch a concrete risk before final integration.
-- The key is to find opportunities to spawn multiple independent subtasks in parallel within the same round, while ensuring each subtask is well-defined, self-contained, and materially advances the main task."#
-    )
-}
-
+// Keep tool/assignment mechanics here; audit policy belongs to the base instructions,
+// and role/coordination guidance belongs to config/mod.rs. See AGENTS.md for ownership.
 fn spawn_agent_tool_description_v2(
     available_models_description: Option<&str>,
     default_model_guidance: Option<&str>,
@@ -1236,10 +861,9 @@ Registered leaf names take precedence over compact UUIDs; use a hyphenated UUID 
 The spawned agent receives a durable task binding.
 {default_model_guidance}
 Only call this tool for a concrete, bounded subtask that can run independently alongside useful local work; otherwise continue locally.
-Before delegating, identify useful work to do locally. Keep immediately blocking work local, give each agent a clear scope, and avoid duplicating delegated work. Review and integrate returned changes before treating the subtask as complete.
-Size each assignment to fit about two context windows of reading (roughly 2 MB of text). A spawned agent that fills more stops and reports its unread files or ranges; split larger scopes across agents or follow-up assignments.
-Read every returned report in full, recovering omitted portions from retained output. Account for every substantive finding, including read-only reviews: implement and verify it, reject it with evidence, identify it as outside the user's scope, or keep it unresolved with a next action or blocker. Investigate unresolved in-scope findings before finalizing; partial fixes or an honest disclaimer do not discharge obtainable work. Respect review-only/no-write scope and do not blindly implement recommendations.
-When implementation is authorized, implement verified, applicable, in-scope suggestions and validate the resulting behavior through affected consumers. Do not stop at acknowledging them, listing them in a plan, or describing future work; do not ask for renewed permission to perform already-authorized changes. If current behavior already satisfies a suggestion, record the evidence instead of making unnecessary edits.
+Apply the base instructions for audit/review scope, verification, validation, and completion, and the team guidance for ownership and coordination.
+Size assignments to fit the worker's actual context capacity, reserving room for reasoning, evidence, and reporting. Partition by cohesive subsystems and execution paths rather than raw file size alone.
+Legacy `message` assignments must include the task type, category inclusions/exclusions, detection criteria, and user restrictions; typed assignments use the fields below.
 Launch authorized independent assignments in the same batch rather than awaiting each spawn in a loop. In exec, use Promise.allSettled for a bounded batch and retain every success and failure before proceeding; a failed sibling does not authorize respawning successful agents.
 Sequence only real dependencies or shared-resource conflicts. Do not add a model round merely to acknowledge a completed agent; integrate its result with the next substantive step or final response.
 It will be able to send you and other running agents messages, and its final answer will be provided to you when it finishes.
@@ -1323,45 +947,6 @@ fn spawn_agent_models_description(models: &[ModelPreset]) -> String {
     )
 }
 
-fn wait_agent_tool_parameters_v1(options: WaitAgentTimeoutOptions) -> JsonSchema {
-    let properties = BTreeMap::from([
-        (
-            "targets".to_string(),
-            JsonSchema::array(
-                JsonSchema::string(/*description*/ None),
-                Some(
-                    "Agent ids to wait on. Pass multiple ids to wait for whichever finishes first."
-                        .to_string(),
-                ),
-            ),
-        ),
-        (
-            "timeout_ms".to_string(),
-            JsonSchema {
-                ..JsonSchema::integer(Some(format!(
-                    "Explicit caller deadline in milliseconds. Omit to wait without a caller deadline until the requested target condition or input activity. Values below {} use that normal wait; values above {} are capped. Completed targets return immediately.",
-                    options.min_timeout_ms, options.max_timeout_ms,
-                )))
-            },
-        ),
-        (
-            "return_when".to_string(),
-            JsonSchema::string_enum(
-                vec![json!("first"), json!("all")],
-                Some(
-                    "Return after the first target finishes or after all targets finish. Defaults to `first`."
-                        .to_string(),
-                ),
-            ),
-        ),
-    ]);
-
-    JsonSchema::object(
-        properties,
-        Some(vec!["targets".to_string()]),
-        Some(false.into()),
-    )
-}
 
 fn wait_agent_tool_parameters_v2(options: WaitAgentTimeoutOptions) -> JsonSchema {
     let properties = BTreeMap::from([

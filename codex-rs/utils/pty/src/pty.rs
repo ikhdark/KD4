@@ -241,8 +241,13 @@ pub async fn spawn_process_with_inherited_fds(
         // Setup owns admission even if the observing caller is cancelled while
         // the Windows loader is still running. An unclaimed result drops its
         // ProcessHandle; the detached waiter retains the charge until exit.
+        let observation_context = crate::process_observation::ProcessObservationContext::current();
         tokio::spawn(async move {
-            spawn_process_portable(&program, &args, &cwd, &env, &arg0, size).await
+            let setup = spawn_process_portable(&program, &args, &cwd, &env, &arg0, size);
+            match observation_context {
+                Some(context) => context.scope(setup).await,
+                None => setup.await,
+            }
         })
         .await?
     }
@@ -601,25 +606,13 @@ async fn write_unix_pty_stdin(
     while let Some(bytes) = input.recv().await {
         write_unix_pty_bytes(&writer, &bytes).await?;
     }
-    // Inspect mode only after accepted bytes have reached the terminal, never
-    // guess a Ctrl-D byte for a raw or custom-configured line discipline.
-    let mut mode = std::mem::MaybeUninit::<libc::termios>::uninit();
-    // SAFETY: the writer owns the fd and mode is writable termios storage.
-    if unsafe { libc::tcgetattr(writer.as_raw_fd(), mode.as_mut_ptr()) } == -1 {
-        return Err(std::io::Error::last_os_error());
-    }
-    // SAFETY: tcgetattr initialized mode on success.
-    let mode = unsafe { mode.assume_init() };
-    let eof = mode.c_cc[libc::VEOF];
-    // SAFETY: fpathconf reads the configuration of this live terminal fd.
-    let disabled = unsafe { libc::fpathconf(writer.as_raw_fd(), libc::_PC_VDISABLE) };
-    if mode.c_lflag & libc::ICANON == 0 || disabled < 0 || i64::from(eof) == disabled as i64 {
-        return Err(std::io::Error::new(
-            ErrorKind::Unsupported,
-            "terminal EOF requires canonical input with VEOF enabled; raw terminal input cannot be half-closed",
-        ));
-    }
-    write_unix_pty_bytes(&writer, &[eof, eof]).await
+    // Canonical state can contain pending literal-next input or change in the
+    // child after any termios snapshot. Injected VEOF can be data or a signal,
+    // never proof of a pipe-like half-close. Drain accepted input without it.
+    Err(std::io::Error::new(
+        ErrorKind::Unsupported,
+        "terminal input cannot be half-closed reliably; use pipe stdin for EOF",
+    ))
 }
 
 #[cfg(unix)]
@@ -688,6 +681,77 @@ fn configure_owned_pty_files<T>(
 
 #[cfg(test)]
 mod pty_fd_tests {
+    #[cfg(windows)]
+    async fn assert_public_pty_observation(execution_id: &str) {
+        use crate::process_observation::{ProcessObservationContext, ProcessStartRecorder};
+        let recorder = std::sync::Arc::new(ProcessStartRecorder::default());
+        ProcessObservationContext::new(std::sync::Arc::clone(&recorder), execution_id.into())
+            .scope(async {
+                let cwd = std::env::current_dir().unwrap();
+                let env = std::env::vars().collect();
+                assert!(
+                    super::spawn_process(
+                        "codex-nonexistent-observation-pty.exe",
+                        &[],
+                        &cwd,
+                        &env,
+                        &None,
+                        super::TerminalSize::default()
+                    )
+                    .await
+                    .is_err()
+                );
+                assert_eq!(recorder.snapshot().requested_root_starts_observed, 0);
+                let child = super::spawn_process(
+                    "cmd.exe",
+                    &["/D".into(), "/C".into(), "exit /b 7".into()],
+                    &cwd,
+                    &env,
+                    &None,
+                    super::TerminalSize::default(),
+                )
+                .await
+                .unwrap();
+                assert_eq!(
+                    tokio::time::timeout(std::time::Duration::from_secs(5), child.exit_rx)
+                        .await
+                        .unwrap()
+                        .unwrap(),
+                    7
+                );
+                let snapshot = recorder.snapshot();
+                assert_eq!(snapshot.requested_root_starts_observed, 1);
+                assert_eq!(snapshot.auxiliary_root_starts_observed, 0);
+                assert_eq!(snapshot.roots.len(), 1);
+                assert_eq!(
+                    snapshot.roots[0].execution_id.as_deref(),
+                    Some(execution_id)
+                );
+                assert_eq!(snapshot.roots[0].producer, "unified_conpty");
+                assert!(snapshot.roots[0].os_pid.is_some());
+                child.session.finish();
+            })
+            .await;
+    }
+
+    #[cfg(windows)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn public_pty_preserves_observation_on_current_thread_runtime() {
+        tokio::join!(
+            assert_public_pty_observation("pty-current-a"),
+            assert_public_pty_observation("pty-current-b")
+        );
+    }
+
+    #[cfg(windows)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn public_pty_preserves_observation_on_multithread_runtime() {
+        tokio::join!(
+            assert_public_pty_observation("pty-multi-a"),
+            assert_public_pty_observation("pty-multi-b")
+        );
+    }
+
     #[tokio::test]
     async fn aborting_backpressured_reader_releases_native_owner() {
         struct Reader(Option<tokio::sync::oneshot::Sender<()>>);

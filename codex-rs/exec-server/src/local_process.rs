@@ -81,7 +81,7 @@ const EXITED_PROCESS_RETENTION: Duration = Duration::from_secs(30);
 struct RetainedOutputChunk {
     seq: u64,
     stream: ExecOutputStream,
-    chunk: Vec<u8>,
+    chunk: Arc<Vec<u8>>,
 }
 
 struct RunningProcess {
@@ -611,7 +611,7 @@ impl LocalProcess {
         let deadline = tokio::time::Instant::now() + wait;
 
         loop {
-            let (response, output_notify) = {
+            let (mut response, output_notify, chunks) = {
                 let process_map = self.inner.processes.lock().await;
                 let process = process_map.get(&params.process_id).ok_or_else(|| {
                     invalid_request(format!("unknown process id {}", params.process_id))
@@ -647,11 +647,7 @@ impl LocalProcess {
                         break;
                     }
                     total_bytes += chunk_len;
-                    chunks.push(ProcessOutputChunk {
-                        seq: retained.seq,
-                        stream: retained.stream,
-                        chunk: retained.chunk.clone().into(),
-                    });
+                    chunks.push(retained.clone());
                     next_seq = retained.seq + 1;
                     if total_bytes >= max_bytes {
                         break;
@@ -662,7 +658,7 @@ impl LocalProcess {
                 }
                 (
                     ReadResponse {
-                        chunks,
+                        chunks: Vec::new(),
                         next_seq,
                         exited: process.exit_code.is_some(),
                         exit_code: process.exit_code,
@@ -679,8 +675,16 @@ impl LocalProcess {
                     // Register before releasing the state lock: notify_waiters does
                     // not retain a permit for a future created after the update.
                     Arc::clone(&process.output_notify).notified_owned(),
+                    chunks,
                 )
             };
+            // Retain an immutable sequence-consistent snapshot under the map
+            // lock; copy payload bytes only after unrelated process controls can run.
+            response.chunks = chunks.into_iter().map(|retained| ProcessOutputChunk {
+                seq: retained.seq,
+                stream: retained.stream,
+                chunk: retained.chunk.as_ref().clone().into(),
+            }).collect();
 
             // Exercise updates between snapshotting and polling the waiter in tests.
             #[cfg(test)]
@@ -1147,7 +1151,9 @@ async fn stream_output(
     output_notify: Arc<Notify>,
 ) {
     while let Some(chunk) = receiver.recv().await {
-        let notification = {
+        let event_chunk = chunk.clone();
+        let chunk = Arc::new(chunk);
+        {
             let mut processes = inner.processes.lock().await;
             let Some(entry) = processes.get_mut(&process_id) else {
                 break;
@@ -1176,20 +1182,13 @@ async fn stream_output(
             let output = ProcessOutputChunk {
                 seq,
                 stream,
-                chunk: chunk.into(),
+                chunk: event_chunk.into(),
             };
             process
                 .events
-                .publish(ExecProcessEvent::Output(output.clone()));
-            ExecOutputDeltaNotification {
-                process_id: process_id.clone(),
-                seq,
-                stream,
-                chunk: output.chunk,
-            }
-        };
+                .publish(ExecProcessEvent::Output(output));
+        }
         output_notify.notify_waiters();
-        let _ = notification;
     }
 
     finish_output_stream(process_id, stream, inner).await;
@@ -1471,17 +1470,14 @@ async fn forward_process_notifications(
                     // The output replay is byte-bounded. Root exit is retained
                     // separately because later output can evict it from the
                     // event-count-bounded live log. Restore both in seq order.
-                    let mut replay = process.output.iter().rev()
+                    let retained = process.output.iter().rev()
                         .filter(|chunk| chunk.seq > last_seq.max(process.last_evicted_seq))
                         .take(PROCESS_EVENT_CHANNEL_CAPACITY)
-                        .map(|chunk| (chunk.seq, ExecProcessEvent::Output(ProcessOutputChunk {
-                            seq: chunk.seq,
-                            stream: chunk.stream,
-                            chunk: chunk.chunk.clone().into(),
-                        })))
+                        .cloned()
                         .collect::<Vec<_>>();
-                    let notification_gap = replay.iter().map(|(seq, _)| seq.saturating_sub(1))
+                    let notification_gap = retained.iter().map(|chunk| chunk.seq.saturating_sub(1))
                         .min().unwrap_or(0).max(process.last_evicted_seq);
+                    let mut replay = Vec::new();
                     // A retained exit can be the sequence immediately before
                     // the replay suffix. Do not advance the gap cursor over it:
                     // the normal duplicate fence would then discard the exit.
@@ -1515,6 +1511,13 @@ async fn forward_process_notifications(
                     } else if let Some(failure) = &process.failure {
                         replay.push((process.next_seq, ExecProcessEvent::Failed(failure.clone())));
                     }
+                    drop(processes);
+                    replay.extend(retained.into_iter().map(|chunk| (chunk.seq,
+                        ExecProcessEvent::Output(ProcessOutputChunk {
+                            seq: chunk.seq,
+                            stream: chunk.stream,
+                            chunk: chunk.chunk.as_ref().clone().into(),
+                        }))));
                     replay.sort_by_key(|(seq, _)| *seq);
                     pending.extend(replay.into_iter().map(|(_, event)| event));
                     continue;
@@ -1525,6 +1528,14 @@ async fn forward_process_notifications(
         let seq = event.seq();
         if seq.is_some_and(|seq| seq <= last_seq) { continue; }
         let terminal = matches!(&event, ExecProcessEvent::Closed { .. } | ExecProcessEvent::Failed(_));
+        let Some(owner) = inner.upgrade() else { return; };
+        let notifications = notification_sender(&owner);
+        drop(owner);
+        let Some(notifications) = notifications else {
+            if let Some(seq) = seq { last_seq = seq; }
+            if terminal { return; }
+            continue;
+        };
         let (method, params) = match event {
             ExecProcessEvent::Output(chunk) => (crate::protocol::EXEC_OUTPUT_DELTA_METHOD,
                 serde_json::to_value(ExecOutputDeltaNotification { process_id: process_id.clone(),
@@ -1538,11 +1549,8 @@ async fn forward_process_notifications(
             ExecProcessEvent::Failed(message) => (crate::protocol::EXEC_FAILED_METHOD,
                 serde_json::to_value(crate::protocol::ExecFailedNotification { process_id: process_id.clone(), message })),
         };
-        let Some(owner) = inner.upgrade() else { return; };
-        let notifications = notification_sender(&owner);
-        drop(owner);
         let Ok(params) = params else { return; };
-        if let Some(notifications) = notifications {
+        {
             let result = tokio::select! {
                 biased;
                 _ = shutdown.cancelled() => return,

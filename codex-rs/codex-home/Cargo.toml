@@ -13,7 +13,7 @@ workspace = true
 [dependencies]
 codex-extension-api = { workspace = true }
 codex-utils-absolute-path = { workspace = true }
-tokio = { workspace = true, features = ["fs"] }
+tokio = { workspace = true, features = ["fs", "sync"] }
 tracing = { workspace = true }
 
 [dev-dependencies]

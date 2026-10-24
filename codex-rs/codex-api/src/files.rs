@@ -41,6 +41,8 @@ pub struct UploadedOpenAiFile {
 
 #[derive(Debug, thiserror::Error)]
 pub enum OpenAiFileError {
+    #[error("OpenAI file base URL must be an absolute HTTP(S) URL")]
+    InvalidBaseUrl,
     #[error("failed to authenticate OpenAI file request to {url}: {source}")]
     Auth {
         url: String,
@@ -134,11 +136,10 @@ pub async fn delete_openai_file_with_pool(
     http_clients: &RouteAwareClientPool,
     file_id: &str,
 ) -> Result<(), OpenAiFileError> {
-    let encoded_file_id = percent_encode_path_segment(file_id);
-    let delete_url = format!("{}/files/{encoded_file_id}", base_url.trim_end_matches('/'));
-    let response = authorized_request(http_clients, auth, Method::DELETE, &delete_url)?
-        .send()
-        .await
+    let delete_url = file_endpoint_url(base_url, Some(file_id), false)?;
+    let request = authorized_request(http_clients, auth,
+        codex_client::Request::new(Method::DELETE, delete_url.clone())).await?;
+    let response = codex_http_client::with_dispatch_guard(auth.dispatch_guard(), request.send()).await
         .map_err(|source| request_error(&delete_url, source))?;
     let status = response.status();
     if status.is_success() || status == StatusCode::NOT_FOUND {
@@ -163,6 +164,24 @@ fn percent_encode_path_segment(value: &str) -> String {
         }
     }
     encoded
+}
+
+fn file_endpoint_url(base_url: &str, file_id: Option<&str>, uploaded: bool) -> Result<String, OpenAiFileError> {
+    let mut url = url::Url::parse(base_url).map_err(|_| OpenAiFileError::InvalidBaseUrl)?;
+    if !matches!(url.scheme(), "http" | "https") || url.cannot_be_a_base() {
+        return Err(OpenAiFileError::InvalidBaseUrl);
+    }
+    let mut path = format!("{}/files", url.path().trim_end_matches('/'));
+    if let Some(file_id) = file_id {
+        if matches!(file_id, "." | "..") {
+            return Err(OpenAiFileError::UploadFailed { file_id: file_id.into(), message: "invalid dot-segment file ID".into() });
+        }
+        path.push('/');
+        path.push_str(&percent_encode_path_segment(file_id));
+    }
+    if uploaded { path.push_str("/uploaded"); }
+    url.set_path(&path);
+    Ok(url.to_string())
 }
 
 pub async fn upload_openai_file(
@@ -222,15 +241,15 @@ async fn upload_openai_file_with_pool_and_finalize_timeout(
         });
     }
 
-    let create_url = format!("{}/files", base_url.trim_end_matches('/'));
-    let create_response = authorized_request(http_clients, auth, Method::POST, &create_url)?
-        .json(&serde_json::json!({
+    let create_url = file_endpoint_url(base_url, None, false)?;
+    let create_request = codex_client::Request::new(Method::POST, create_url.clone())
+        .with_json(&serde_json::json!({
             "file_name": file_name.as_str(),
             "file_size": file_size_bytes,
             "use_case": OPENAI_FILE_USE_CASE,
-        }))
-        .send()
-        .await
+        }));
+    let create_request = authorized_request(http_clients, auth, create_request).await?;
+    let create_response = codex_http_client::with_dispatch_guard(auth.dispatch_guard(), create_request.send()).await
         .map_err(|source| request_error(&create_url, source))?;
     let create_status = create_response.status();
     let create_body = create_response.text().await;
@@ -268,11 +287,7 @@ async fn upload_openai_file_with_pool_and_finalize_timeout(
             });
         }
 
-        let finalize_url = format!(
-            "{}/files/{}/uploaded",
-            base_url.trim_end_matches('/'),
-            percent_encode_path_segment(&create_payload.file_id),
-        );
+        let finalize_url = file_endpoint_url(base_url, Some(&create_payload.file_id), true)?;
         let finalize_deadline = Instant::now() + finalize_timeout;
         loop {
             let remaining = finalize_deadline
@@ -281,11 +296,11 @@ async fn upload_openai_file_with_pool_and_finalize_timeout(
                     file_id: create_payload.file_id.clone(),
                 })?;
             let finalize_attempt = async {
-                let response = authorized_request(http_clients, auth, Method::POST, &finalize_url)?
-                    .timeout(remaining)
-                    .json(&serde_json::json!({}))
-                    .send()
-                    .await
+                let mut request = codex_client::Request::new(Method::POST, finalize_url.clone())
+                    .with_json(&serde_json::json!({}));
+                request.timeout = Some(remaining);
+                let request = authorized_request(http_clients, auth, request).await?;
+                let response = codex_http_client::with_dispatch_guard(auth.dispatch_guard(), request.send()).await
                     .map_err(|source| request_error(&finalize_url, source))?;
                 let status = response.status();
                 let body = response.text().await;
@@ -386,23 +401,27 @@ fn openai_file_upload_timeout(file_size_bytes: u64) -> Duration {
     ))
 }
 
-fn authorized_request(
+async fn authorized_request(
     http_clients: &RouteAwareClientPool,
     auth: &dyn AuthProvider,
-    method: Method,
-    url: &str,
+    mut request: codex_client::Request,
 ) -> Result<RouteAwareRequestBuilder, OpenAiFileError> {
-    let mut headers = http::HeaderMap::new();
-    auth.try_add_auth_headers(&mut headers)
+    let url = diagnostic_url(&request.url);
+    request.timeout = Some(request.timeout.unwrap_or(OPENAI_FILE_REQUEST_TIMEOUT));
+    let request = request.into_prepared()
+        .map_err(|message| OpenAiFileError::Auth { url: url.clone(), source: AuthError::Build(message) })?;
+    let request = auth.apply_auth(request).await
         .map_err(|source| OpenAiFileError::Auth {
-            url: diagnostic_url(url),
+            url: url.clone(),
             source,
         })?;
-
-    Ok(http_clients
-        .request(method, url)
-        .timeout(OPENAI_FILE_REQUEST_TIMEOUT)
-        .headers(headers))
+    let prepared = request.prepare_body_for_send()
+        .map_err(|message| OpenAiFileError::Auth { url, source: AuthError::Build(message) })?;
+    let mut builder = http_clients.request(request.method.clone(), &request.url)
+        .headers(prepared.headers.clone())
+        .timeout(request.timeout.unwrap_or(OPENAI_FILE_REQUEST_TIMEOUT));
+    if request.body.is_some() { builder = builder.body(prepared.body_bytes()); }
+    Ok(builder)
 }
 
 pub fn openai_file_http_client_pool(
@@ -476,6 +495,65 @@ mod tests {
 
     fn base_url_for(server: &MockServer) -> String {
         format!("{}/backend-api", server.uri())
+    }
+
+    #[test]
+    fn file_endpoints_preserve_base_query_and_fragment_and_encode_one_id() {
+        for suffix in ["?route=test", "#client", "?route=test#client"] {
+            let base = format!("https://example.test/prefix/{suffix}");
+            for (id, uploaded, expected) in [(None, false, "/prefix/files"),
+                (Some("file/a?#"), false, "/prefix/files/file%2Fa%3F%23"),
+                (Some("file/a?#"), true, "/prefix/files/file%2Fa%3F%23/uploaded")] {
+                let url = url::Url::parse(&file_endpoint_url(&base, id, uploaded).unwrap()).unwrap();
+                assert_eq!(url.path(), expected);
+                assert_eq!(url.query(), suffix.contains('?').then_some("route=test"));
+                assert_eq!(url.fragment(), suffix.contains('#').then_some("client"));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn complete_control_request_auth_can_replace_or_reject_every_operation() {
+        struct FullAuth { base: String, reject: bool }
+        impl AuthProvider for FullAuth {
+            fn add_auth_headers(&self, _: &mut http::HeaderMap) {
+                panic!("complete-request auth owns this operation");
+            }
+            fn apply_auth(&self, request: codex_client::Request) -> crate::auth::AuthProviderFuture<'_> {
+                Box::pin(async move {
+                    if self.reject { return Err(AuthError::Build("rejected".into())); }
+                    let original = url::Url::parse(&request.url).unwrap();
+                    let suffix = original.path().strip_prefix("/backend-api").unwrap();
+                    if request.method == Method::POST {
+                        let body: serde_json::Value = serde_json::from_slice(&request.prepare_body_for_send().unwrap().body_bytes()).unwrap();
+                        assert!(body.is_object(), "auth sees the complete control body");
+                    }
+                    Ok(codex_client::Request::new(request.method, format!("{}/signed{suffix}", self.base))
+                        .with_json(&serde_json::json!({"signed": true})))
+                })
+            }
+        }
+        let server = MockServer::start().await;
+        let pool = openai_file_http_client_pool(&default_http_client_factory());
+        for (method, id, uploaded) in [(Method::POST, None, false),
+            (Method::POST, Some("file"), true), (Method::DELETE, Some("file"), false)] {
+            let url = file_endpoint_url(&base_url_for(&server), id, uploaded).unwrap();
+            let mut request = codex_client::Request::new(method.clone(), url);
+            if method == Method::POST { request = request.with_json(&serde_json::json!({"original": true})); }
+            let rejected = FullAuth { base: server.uri(), reject: true };
+            assert!(authorized_request(&pool, &rejected, request.clone()).await.is_err());
+            assert!(server.received_requests().await.unwrap().is_empty());
+            let auth = FullAuth { base: server.uri(), reject: false };
+            let prepared = authorized_request(&pool, &auth, request).await.unwrap();
+            let _ = prepared.send().await.unwrap();
+            let sent = server.received_requests().await.unwrap();
+            assert_eq!(sent.len(), 1);
+            let expected = if uploaded { "/signed/files/file/uploaded" } else if id.is_some() { "/signed/files/file" } else { "/signed/files" };
+            assert_eq!(sent[0].url.path(), expected);
+            assert_eq!(sent[0].method, method);
+            assert_eq!(sent[0].body, br#"{"signed":true}"#);
+            server.reset().await;
+        }
     }
 
     struct ScriptedAuth {

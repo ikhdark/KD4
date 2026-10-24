@@ -100,7 +100,6 @@ pub(crate) async fn run_codex_thread_interactive(
         user_shell_override: None,
         inherited_environments: Some(parent_ctx.environments.clone()),
         inherited_exec_policy: Some(Arc::clone(&parent_session.services.exec_policy)),
-        parent_rollout_thread_trace: codex_rollout_trace::ThreadTraceContext::disabled(),
         parent_trace: None,
         environment_selections: parent_ctx.environments.to_selections(),
         thread_extension_init: codex_extension_api::ExtensionDataInit::default(),

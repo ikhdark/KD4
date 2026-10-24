@@ -20,7 +20,7 @@ mod update_thread_metadata;
 pub use delete_thread::StagedThreadDelete;
 
 #[cfg(test)]
-mod audit34_tests;
+mod lifecycle_reconciliation_tests;
 #[cfg(test)]
 mod test_support;
 

@@ -670,6 +670,59 @@ fn parses_agent_message() {
 }
 
 #[test]
+fn refusal_message_is_visible_and_retains_typed_history() {
+    let item: ResponseItem = serde_json::from_value(serde_json::json!({
+        "type": "message", "id": "msg_refusal", "role": "assistant",
+        "content": [{"type": "refusal", "refusal": "I cannot help.\n理由"}]
+    }))
+    .unwrap();
+    let Some(TurnItem::AgentMessage(message)) = parse_turn_item(&item) else {
+        panic!("refusal is an ordinary assistant outcome");
+    };
+    assert!(
+        matches!(message.content.as_slice(), [AgentMessageContent::Text { text }]
+        if text == "I cannot help.\n理由")
+    );
+    assert_eq!(
+        serde_json::to_value(&item).unwrap()["content"][0]["type"],
+        "refusal"
+    );
+    let events = message.as_legacy_events();
+    let [codex_protocol::protocol::EventMsg::AgentMessage(event)] = events.as_slice() else {
+        panic!("visible legacy assistant outcome");
+    };
+    assert_eq!(event.message, "I cannot help.\n理由");
+}
+
+#[test]
+fn image_generation_lifecycle_preserves_unavailable_results_and_failures() {
+    for status in ["in_progress", "generating", "failed", "completed"] {
+        let error =
+            serde_json::json!({"type": "image_generation_error", "message": "Generation failed"});
+        let result = (status == "completed").then_some("Zm9v");
+        let item: ResponseItem = serde_json::from_value(serde_json::json!({
+            "type": "image_generation_call", "id": "ig_lifecycle", "status": status,
+            "result": result, "error": (status == "failed").then_some(&error),
+        }))
+        .unwrap();
+        let Some(TurnItem::ImageGeneration(image)) = parse_turn_item(&item) else {
+            panic!("image lifecycle item");
+        };
+        assert_eq!(image.status, status);
+        assert_eq!(image.result.as_deref(), result);
+        assert_eq!(image.error, (status == "failed").then_some(error));
+        assert!(image.saved_path.is_none());
+        let codex_protocol::protocol::EventMsg::ImageGenerationEnd(event) = image.as_legacy_event()
+        else {
+            panic!("legacy image event");
+        };
+        assert_eq!(event.result, image.result);
+        assert_eq!(event.error, image.error);
+        assert!(event.saved_path.is_none());
+    }
+}
+
+#[test]
 fn parses_reasoning_summary_and_raw_content() {
     let item = ResponseItem::Reasoning {
         id: Some(ResponseItemId::with_suffix("rs", "1")),

@@ -86,6 +86,14 @@ impl StartedCell {
         }
     }
 
+    /// Keeps observation custody in the returned handle, without a forwarding task.
+    pub fn from_result_future(
+        cell_id: CellId,
+        initial_response: CodeModeSessionResultFuture<'static, RuntimeResponse>,
+    ) -> Self {
+        Self { cell_id, initial_response }
+    }
+
     /// An error reports response-delivery or runtime failure, not proof that the
     /// cell never ran. Do not replay side-effecting work based on this error alone.
     pub async fn initial_response(self) -> Result<RuntimeResponse, String> {

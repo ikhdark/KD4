@@ -38,7 +38,7 @@ fn status_arguments(step: &str, status: StepStatus) -> String {
 }
 
 #[tokio::test]
-async fn audit32_plan_tool_refreshes_next_prompt_without_deferred_executor() {
+async fn plan_tool_does_not_reinject_the_checklist_in_the_next_prompt() {
     for deferred in [false, true] {
         for source in [
             ToolCallSource::Direct,
@@ -123,8 +123,8 @@ async fn audit32_plan_tool_refreshes_next_prompt_without_deferred_executor() {
                     .unwrap()
                     .revision;
                 let prompt = serde_json::to_string(&prompt).unwrap();
-                assert!(prompt.contains(&revision), "deferred={deferred}: {prompt}");
-                assert!(prompt.contains("required current task"));
+                assert!(!prompt.contains(&revision), "deferred={deferred}: {prompt}");
+                assert!(!prompt.contains("required current task"));
                 // Desired state is not a delivered baseline until an exact
                 // physical request accepts the prepared update.
                 session
@@ -310,72 +310,9 @@ async fn plan_publication_is_ordered_and_cancelled_waiter_cannot_publish() {
     assert_eq!(statuses, vec![StepStatus::Pending, StepStatus::Completed]);
 }
 
-#[tokio::test]
-async fn plan_scope_change_uses_accepted_user_input_not_context_text() {
-    use crate::session::TurnInput;
-    use codex_protocol::models::ContentItem;
-    use codex_protocol::models::ResponseItem;
-    let (session, turn, _events) = make_session_and_context_with_rx().await;
-    let original = plan_update_args("Deploy", StepStatus::Pending);
-    session.services.plan_store.update(original.clone()).await;
-    let id = crate::plan_store::plan_step_id("Deploy");
-    let instruction = "Do not deploy; review only.";
-    let input = TurnInput::ResponseItem(ResponseItem::Message {
-        id: None,
-        role: "user".into(),
-        content: vec![ContentItem::InputText {
-            text: instruction.into(),
-        }],
-        phase: None,
-        internal_chat_message_metadata_passthrough: None,
-    });
-    crate::hook_runtime::record_pending_input(&session, &turn, input, Vec::new())
-        .await
-        .unwrap();
-    let args = serde_json::json!({"expected_revision":crate::plan_store::plan_revision(Some(&original)),
-        "plan":[],"superseded":[{"step_id":id,"reason":"User cancelled deployment"}],
-        "scope_change_instructions":{(id):instruction}});
-    let invoke = || ToolInvocation {
-        session: Arc::clone(&session),
-        step_context: StepContext::for_test(Arc::clone(&turn)),
-        cancellation_token: CancellationToken::new(),
-        tracker: Arc::new(Mutex::new(TurnDiffTracker::new())),
-        call_id: "user-grounded-supersession".into(),
-        tool_name: ToolName::plain("update_plan"),
-        source: ToolCallSource::Direct,
-        payload: ToolPayload::Function {
-            arguments: args.to_string(),
-        },
-    };
-    assert!(PlanHandler.handle(invoke()).await.is_err());
-    crate::hook_runtime::record_pending_input(
-        &session,
-        &turn,
-        TurnInput::UserInput {
-            content: vec![codex_protocol::user_input::UserInput::Text {
-                text: instruction.into(),
-                text_elements: vec![],
-            }],
-            client_id: None,
-        },
-        Vec::new(),
-    )
-    .await
-    .unwrap();
-    let result = PlanHandler
-        .handle(invoke())
-        .await
-        .unwrap()
-        .code_mode_result(&ToolPayload::Function {
-            arguments: args.to_string(),
-        });
-    assert_plan_output_schema(&result);
-    assert_eq!(result["obligations"]["superseded"], 1);
-    assert_eq!(result["completion_authority"], "checklist_only");
-}
 
 #[tokio::test]
-async fn plan_active_response_is_bounded_while_durable_history_is_complete() {
+async fn plan_snapshots_do_not_accumulate_retired_checklist_rows() {
     let store = crate::plan_store::PlanStore::default();
     for index in 0..40 {
         let args = serde_json::json!({"expected_revision":store.execution_snapshot().await.map(|snapshot|snapshot.revision),
@@ -393,11 +330,14 @@ async fn plan_active_response_is_bounded_while_durable_history_is_complete() {
     };
     let active = output.response_result();
     let durable = output.durable_response();
+    let decoded: crate::plan_store::PlanToolResponse = serde_json::from_value(active.clone()).unwrap();
+    assert!(decoded.lineage.requirements.is_empty());
+    assert!(decoded.lineage.step_requirements.is_empty());
     assert_plan_output_schema(&active);
-    assert_plan_output_schema(&durable);
-    assert_eq!(active["lineage_complete"], false);
+    assert!(crate::plan_store::plan_snapshot_from_item(&crate::plan_store::plan_snapshot_item(&durable)).is_some());
+    assert!(active.get("lineage_complete").is_none());
     assert_eq!(durable["lineage_complete"], true);
-    assert!(active.to_string().len() * 3 < durable.to_string().len());
+    assert!(!durable.to_string().contains("finished 0"));
     assert_eq!(active["revision"], durable["revision"]);
     let restored: crate::plan_store::PlanToolResponse = serde_json::from_value(durable).unwrap();
     store
@@ -411,90 +351,10 @@ async fn plan_active_response_is_bounded_while_durable_history_is_complete() {
             .1
             .requirements
             .len(),
-        40
+        0
     );
 }
 
-#[tokio::test]
-async fn restored_orphans_can_be_reattached_or_superseded_through_the_tool() {
-    for supersede in [false, true] {
-        let (session, turn, _events) = make_session_and_context_with_rx().await;
-        let plan = plan_update_args("current", StepStatus::Completed);
-        let mut lineage = crate::plan_store::PlanLineage::default();
-        lineage.requirements.insert(
-            "orphan".into(),
-            crate::plan_store::PlanRequirement {
-                text: "original remaining work".into(),
-                status: StepStatus::Pending,
-                superseded_reason: None,
-            },
-        );
-        session
-            .services
-            .plan_store
-            .restore_with_lineage(Some(plan), Some(lineage))
-            .await;
-        let revision = session
-            .services
-            .plan_store
-            .execution_snapshot()
-            .await
-            .unwrap()
-            .revision;
-        let mut args = serde_json::json!({
-            "expected_revision": revision,
-            "plan": [{"step": "current", "status": "completed"}],
-        });
-        if supersede {
-            args["superseded"] =
-                serde_json::json!([{"step_id": "orphan", "reason": "User removed this scope"}]);
-        } else {
-            args["plan"][0]["step"] = serde_json::json!("original remaining work");
-            args["plan"][0]["continues"] = serde_json::json!(["orphan"]);
-        }
-        let payload = ToolPayload::Function {
-            arguments: args.to_string(),
-        };
-        let result = PlanHandler
-            .handle(ToolInvocation {
-                session: Arc::clone(&session),
-                step_context: StepContext::for_test(turn),
-                cancellation_token: CancellationToken::new(),
-                tracker: Arc::new(Mutex::new(TurnDiffTracker::new())),
-                call_id: format!("resolve-orphan-{supersede}"),
-                tool_name: ToolName::plain("update_plan"),
-                source: ToolCallSource::Direct,
-                payload: payload.clone(),
-            })
-            .await
-            .unwrap();
-        let output = result.code_mode_result(&payload);
-        assert_plan_output_schema(&output);
-        // A proposed supersession is not a verified user instruction.
-        assert_eq!(
-            output["obligations"]["unresolved"],
-            if supersede {
-                serde_json::json!(["orphan"])
-            } else {
-                serde_json::json!([])
-            }
-        );
-        assert_eq!(output["completion_authority"], "checklist_only");
-        let (_, lineage) = session
-            .services
-            .plan_store
-            .snapshot_with_lineage()
-            .await
-            .unwrap();
-        assert_eq!(
-            lineage.requirements["orphan"].superseded_reason.is_some(),
-            supersede
-        );
-        if !supersede {
-            assert_eq!(lineage.requirements["orphan"].status, StepStatus::Completed);
-        }
-    }
-}
 
 #[tokio::test]
 async fn published_noop_skips_durable_write_and_event_but_restore_requires_publication() {
@@ -829,12 +689,9 @@ fn unchanged_plan_output_remains_compact() {
         crate::plan_store::plan_revision(Some(&output.current_plan))
     );
     assert_eq!(response["completion_authority"], "checklist_only");
-    assert_eq!(
-        response["obligations"],
-        serde_json::json!({"completed":0,"superseded":0,"unresolved":[]})
-    );
-    assert_eq!(response["lineage_complete"], false);
-    assert_eq!(response.as_object().expect("object response").len(), 9);
+    assert!(response.get("obligations").is_none());
+    assert!(response.get("lineage_complete").is_none());
+    assert_eq!(response.as_object().expect("object response").len(), 7);
     assert_eq!(output.code_mode_result(&payload), response);
 }
 
@@ -845,13 +702,7 @@ fn update_plan_schema_is_the_simple_checklist_contract() {
         tool["parameters"]["properties"]["plan"]["description"]
             .as_str()
             .unwrap()
-            .contains("replacing the previous plan. Preserve the user's acceptance criteria")
-    );
-    assert!(
-        tool["parameters"]["properties"]["explanation"]["description"]
-            .as_str()
-            .unwrap()
-            .contains("Do not mark unfinished work completed")
+            .contains("Rows may be renamed or removed")
     );
     let properties = tool["parameters"]["properties"]
         .as_object()
@@ -866,21 +717,7 @@ fn update_plan_schema_is_the_simple_checklist_contract() {
 
     assert_eq!(
         properties.keys().map(String::as_str).collect::<Vec<_>>(),
-        vec![
-            "acceptance",
-            "acceptance_reviewed_revision",
-            "expected_revision",
-            "expected_step_revisions",
-            "explanation",
-            "plan",
-            "resolve",
-            "scope_change_instructions",
-            "scope_change_refs",
-            "scope_change_reviewed_revision",
-            "set",
-            "superseded",
-            "workflow"
-        ]
+        vec!["expected_revision", "explanation", "plan", "set"]
     );
     assert_eq!(
         item_properties
@@ -906,13 +743,7 @@ fn update_plan_schema_is_the_simple_checklist_contract() {
             "plan_requirement_ids": ["known-step"], "blocker": "Provider unavailable"
         }}
     });
-    assert!(validator.is_valid(&linked_blocker));
-    let mut invalid_link = linked_blocker.clone();
-    invalid_link["acceptance"]["provider-access"]["plan_requirement_ids"] = serde_json::json!([7]);
-    assert!(!validator.is_valid(&invalid_link));
-    invalid_link["acceptance"]["provider-access"]["plan_requirement_ids"] =
-        serde_json::json!(vec!["known-step"; 129]);
-    assert!(!validator.is_valid(&invalid_link));
+    assert!(!validator.is_valid(&linked_blocker));
     assert!(validator.is_valid(&serde_json::json!({"plan": []})));
     assert!(validator.is_valid(&serde_json::json!({"expected_revision": "revision", "set": [{"index": 0, "status": "completed"}]})));
     assert!(
@@ -922,8 +753,6 @@ fn update_plan_schema_is_the_simple_checklist_contract() {
     );
     assert!(validator.is_valid(&serde_json::json!({
         "plan": [{"step": "narrower", "status": "pending", "continues": ["old-id"]}],
-        "superseded": [{"step_id": "dropped-id", "reason": "cancelled by the user"}],
-        "scope_change_refs": {"dropped-id": {"turn_id": "turn", "sha256": "input-hash"}},
     })));
     for invalid in [
         serde_json::json!({"plan": [], "scope_change_refs": {"id": {"turn_id": "turn"}}}),
@@ -1102,7 +931,7 @@ async fn update_plan_rejects_unknown_arguments_at_runtime() {
 }
 
 #[tokio::test]
-async fn plan_revision_must_carry_or_supersede_each_removed_unfinished_step() {
+async fn plan_revision_can_replace_unfinished_rows_without_obligations() {
     let (session, turn, events) = make_session_and_context_with_rx().await;
     let initial = UpdatePlanArgs {
         explanation: None,
@@ -1127,7 +956,7 @@ async fn plan_revision_must_carry_or_supersede_each_removed_unfinished_step() {
         "explanation": "Only review core.",
         "plan": [{"step": "Review core warnings", "status": "in_progress"}],
     });
-    let rejected = PlanHandler
+    let replaced = PlanHandler
         .handle(ToolInvocation {
             session: Arc::clone(&session),
             step_context: StepContext::for_test(Arc::clone(&turn)),
@@ -1141,111 +970,21 @@ async fn plan_revision_must_carry_or_supersede_each_removed_unfinished_step() {
             },
         })
         .await;
-    assert!(
-        matches!(rejected, Err(FunctionCallError::RespondToModel(ref message)) if message.contains("Unaccounted"))
-    );
-    assert_eq!(
-        session.services.plan_store.current_for_test().await,
-        Some(initial)
-    );
+    let replaced = replaced.unwrap().code_mode_result(&ToolPayload::Function {
+        arguments: narrowed.to_string(),
+    });
+    assert_plan_output_schema(&replaced);
+    assert!(replaced.get("obligations").is_none());
+    assert_eq!(replaced["current_plan"]["plan"], narrowed["plan"]);
+    let mut published = false;
     while let Ok(event) = events.try_recv() {
-        assert!(!matches!(event.msg, EventMsg::PlanUpdate(_)));
+        published |= matches!(event.msg, EventMsg::PlanUpdate(_));
     }
-
-    let payload = ToolPayload::Function {
-        arguments: serde_json::json!({
-            "expected_revision": crate::plan_store::plan_revision(
-                session.services.plan_store.snapshot().await.as_ref()),
-            "plan": [{
-                "step": "Review core warnings",
-                "status": "in_progress",
-                "continues": [crate::plan_store::plan_step_id("Review every warning")],
-            }],
-            "superseded": [{
-                "step_id": crate::plan_store::plan_step_id("Fix warnings"),
-                "reason": "The user will fix them separately.",
-            }],
-        })
-        .to_string(),
-    };
-    let accepted = PlanHandler
-        .handle(ToolInvocation {
-            session: Arc::clone(&session),
-            step_context: StepContext::for_test(turn),
-            cancellation_token: CancellationToken::new(),
-            tracker: Arc::new(Mutex::new(TurnDiffTracker::new())),
-            call_id: "accounted-revision".to_string(),
-            tool_name: ToolName::plain("update_plan"),
-            source: ToolCallSource::Direct,
-            payload: payload.clone(),
-        })
-        .await
-        .expect("accounted revision");
-    let output = accepted.code_mode_result(&payload);
-    assert_plan_output_schema(&output);
-    assert_eq!(output["effect"], "structural_revision");
-    assert_eq!(
-        output["current_plan"]["explanation"],
-        "Proposed supersession (unverified) \"Fix warnings\": The user will fix them separately."
-    );
-    assert_eq!(
-        accepted.sampling_request_signal().unwrap()["plan"],
-        output["current_plan"]
-    );
-    let review_id = crate::plan_store::plan_step_id("Review every warning");
-    let fix_id = crate::plan_store::plan_step_id("Fix warnings");
-    let renamed_id = crate::plan_store::plan_step_id("Review core warnings");
-    assert_eq!(
-        output["lineage"]["requirements"][&review_id]["text"],
-        "Review every warning"
-    );
-    assert_eq!(output["lineage"]["step_identities"][&renamed_id], review_id);
-    let mut carried = vec![review_id.clone(), renamed_id];
-    carried.sort();
-    assert_eq!(
-        output["lineage"]["step_requirements"][&review_id],
-        serde_json::json!(carried)
-    );
-    assert_eq!(
-        output["lineage"]["requirements"][&fix_id]["superseded_reason"],
-        "The user will fix them separately."
-    );
-    let completed = session
-        .services
-        .plan_store
-        .update_tool(
-            serde_json::from_value(serde_json::json!({
-                "expected_revision": output["revision"],
-                "explanation": "Review complete.",
-                "set": [{"step_id": review_id, "status": "completed"}],
-            }))
-            .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(
-        completed.lineage.requirements[&review_id].status,
-        StepStatus::InProgress
-    );
-    let summary = completed.lineage.obligation_summary(&completed.current);
-    assert_eq!(
-        summary.completed, 1,
-        "the descendant is complete, not its original scope"
-    );
-    assert_eq!(summary.superseded, 0);
-    assert!(summary.unresolved.contains(&review_id));
-    assert!(summary.unresolved.contains(&fix_id));
-    assert_eq!(
-        completed.lineage.requirements[&fix_id].status,
-        StepStatus::Pending
-    );
-    assert_eq!(
-        completed.lineage.requirements[&fix_id]
-            .superseded_reason
-            .as_deref(),
-        Some("The user will fix them separately."),
-        "replacing the explanation must not erase a superseded requirement"
-    );
+    assert!(published);
+    let (_, lineage) = session.services.plan_store.snapshot_with_lineage().await.unwrap();
+    assert!(lineage.requirements.is_empty());
+    assert!(lineage.step_requirements.is_empty());
+    assert_eq!(lineage.obligation_summary(&session.services.plan_store.snapshot().await.unwrap()).unresolved.len(), 1);
 }
 
 #[tokio::test]
@@ -1719,138 +1458,4 @@ async fn cancellation_after_plan_commit_boundary_waits_for_session_update() {
         .await
         .expect("plan should commit before cancellation response");
     assert_eq!(stored.plan, plan_update.plan);
-}
-
-#[tokio::test]
-async fn audit149x_workflow_links_assignments_from_the_shared_root_session_not_the_caller_thread()
--> anyhow::Result<()> {
-    let temp = tempfile::tempdir()?;
-    let repo = temp.path().join("repo");
-    std::fs::create_dir_all(&repo)?;
-    std::fs::write(repo.join("tracked.txt"), "workflow link fixture\n")?;
-    let step = "Delegate the inspection";
-    let step_id = crate::plan_store::plan_step_id(step);
-    for (scope, linked) in [
-        ("shared-root", true),
-        ("caller-thread", false),
-        ("foreign-root", false),
-    ] {
-        // Like every spawned agent, the fixture's shared tree session differs
-        // from its own thread.
-        let (session, turn, _events) = make_session_and_context_with_rx().await;
-        let shared_root = session.services.agent_control.session_id().to_string();
-        assert_ne!(shared_root, session.thread_id.to_string());
-        let assignment_root = match scope {
-            "shared-root" => shared_root,
-            "caller-thread" => session.thread_id.to_string(),
-            _ => "foreign-root".to_string(),
-        };
-        let coordinator = session.services.agent_control.task_coordinator();
-        coordinator
-            .initialize(
-                codex_state::StateRuntime::init(
-                    temp.path().join(format!("task-home-{scope}")),
-                    "test-provider".into(),
-                )
-                .await?,
-                assignment_root.clone(),
-            )
-            .await?;
-        let (assignment, _attempt) = coordinator
-            .create_assignment(
-                &repo,
-                codex_agent_task_store::AssignmentDraft {
-                    root_session_id: assignment_root,
-                    admission_origin: codex_agent_task_store::AssignmentAdmissionOrigin::Typed,
-                    role: codex_agent_task_store::AgentRole::Worker,
-                    capability_profile:
-                        codex_agent_task_store::CapabilityProfile::ScopedSourceWrite,
-                    objective: "inspect the linked source".into(),
-                    acceptance_criteria: vec![codex_agent_task_store::AcceptanceCriterion {
-                        evidence_policy: None,
-                        id: "inspect".into(),
-                        text: "inspect tracked.txt".into(),
-                    }],
-                    read_scope: vec![codex_agent_task_store::RepoScope {
-                        path: "tracked.txt".into(),
-                        recursive: false,
-                    }],
-                    write_scope: vec![codex_agent_task_store::RepoScope {
-                        path: "tracked.txt".into(),
-                        recursive: false,
-                    }],
-                    stop_condition: "inspection recorded".into(),
-                    dependencies: Vec::new(),
-                    risk_hints: Vec::new(),
-                    required_evidence: vec!["inspect:tracked.txt".into()],
-                    prohibited_changes: Vec::new(),
-                    contract_claims: Vec::new(),
-                    workspace_strategy: codex_agent_task_store::WorkspaceStrategy::Shared,
-                    relation: None,
-                    architecture_contract_ref: None,
-                },
-            )
-            .await?;
-        PlanHandler
-            .handle(ToolInvocation {
-                session: Arc::clone(&session),
-                step_context: StepContext::for_test(Arc::clone(&turn)),
-                cancellation_token: CancellationToken::new(),
-                tracker: Arc::new(Mutex::new(TurnDiffTracker::new())),
-                call_id: format!("audit149x-plan-{scope}"),
-                tool_name: ToolName::plain("update_plan"),
-                source: ToolCallSource::Direct,
-                payload: ToolPayload::Function {
-                    arguments: plan_arguments(step, StepStatus::Pending),
-                },
-            })
-            .await
-            .expect("the checklist step is created");
-        let result = PlanHandler
-            .handle(ToolInvocation {
-                session: Arc::clone(&session),
-                step_context: StepContext::for_test(Arc::clone(&turn)),
-                cancellation_token: CancellationToken::new(),
-                tracker: Arc::new(Mutex::new(TurnDiffTracker::new())),
-                call_id: format!("audit149x-link-{scope}"),
-                tool_name: ToolName::plain("update_plan"),
-                source: ToolCallSource::Direct,
-                payload: ToolPayload::Function {
-                    arguments: serde_json::json!({
-                        "set": [{"step_id": step_id.clone(), "status": StepStatus::InProgress}],
-                        "workflow": {step_id.clone(): assignment.assignment_id},
-                    })
-                    .to_string(),
-                },
-            })
-            .await;
-        let (_, lineage) = session
-            .services
-            .plan_store
-            .snapshot_with_lineage()
-            .await
-            .expect("the checklist exists");
-        if linked {
-            assert!(result.is_ok(), "{scope}: {:?}", result.err());
-            assert_eq!(
-                lineage.workflow.get(&step_id).map(|node| node.assignment_id),
-                Some(assignment.assignment_id),
-                "{scope}"
-            );
-        } else {
-            assert!(
-                matches!(
-                    result,
-                    Err(FunctionCallError::RespondToModel(message))
-                        if message.contains("must belong to this root session")
-                ),
-                "{scope}"
-            );
-            assert!(
-                lineage.workflow.is_empty(),
-                "{scope}: a rejected link must not change the workflow"
-            );
-        }
-    }
-    Ok(())
 }

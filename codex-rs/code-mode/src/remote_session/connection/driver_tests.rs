@@ -2021,7 +2021,7 @@ async fn pending_shutdown_retains_the_connection_and_fences_execution_until_sett
 }
 #[tokio::test(start_paused = true)]
 async fn abandoned_cleanup_deadline_retires_only_unacknowledged_control() {
-    for acknowledge in [false, true] {
+    for acknowledgement in [None, Some(true), Some(false)] {
         let mut harness = DriverHarness::start();
         let session = remote_session();
         let _cleanup = harness
@@ -2077,19 +2077,19 @@ async fn abandoned_cleanup_deadline_retires_only_unacknowledged_control() {
             }))
             .await
             .unwrap();
-        if acknowledge {
+        if let Some(success) = acknowledgement {
             harness
                 .event_tx
                 .send(DriverEvent::HostMessage(HostToClient::Response {
                     id: RequestId::new(3),
-                    result: WireResult::Ok {
+                    result: if success { WireResult::Ok {
                         value: HostResponse::WaitCompleted {
                             outcome: WireWaitOutcome::LiveCell(WireRuntimeResponse::Terminated {
                                 cell_id: CellId::new("1".into()).into(),
                                 content_items: Vec::new(),
                             }),
                         },
-                    },
+                    }} else { WireResult::Err { message: "cleanup failed".into() } },
                 }))
                 .await
                 .unwrap();
@@ -2097,8 +2097,213 @@ async fn abandoned_cleanup_deadline_retires_only_unacknowledged_control() {
         }
         tokio::time::advance(super::super::TERMINATE_TIMEOUT * 2).await;
         tokio::task::yield_now().await;
-        assert_eq!(harness.alive.load(Ordering::Acquire), acknowledge);
+        assert_eq!(harness.alive.load(Ordering::Acquire), acknowledgement == Some(true));
         harness.cancellation.cancel();
         (&mut harness.driver_task).await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn cancellation_before_delegate_first_poll_never_enters_callback() {
+    use super::delegate_runtime::DelegateRuntime;
+    use super::session_registry::{CellOwner, DelegateTarget};
+    for stop in 0..3 {
+        for invoke in [false, true] {
+        let (events, mut rx) = mpsc::channel(4);
+        let mut runtime = DelegateRuntime::new(events);
+        let delegate = Arc::new(RecordingDelegate::default());
+        let session = remote_session();
+        let cell_id = CellId::new("1".into());
+        let id = DelegateRequestId::new(1);
+        let request = if invoke {
+            DelegateRequest::InvokeTool { invocation: WireNestedToolCall {
+                cell_id: cell_id.clone().into(), parent_tool_call_id: None,
+                runtime_tool_call_id: "never-start".into(),
+                tool_name: ToolName::plain("revoked").into(),
+                tool_kind: codex_code_mode_protocol::CodeModeToolKind::Function.into(),
+                input: None, deadline_shared_monotonic_nanos: None,
+                remaining_ms_at_send: None, buffered_output_bytes: 0,
+            }}
+        } else { DelegateRequest::Notify {
+            call_id: "never-start".into(), cell_id: cell_id.clone().into(), text: "revoked".into(),
+        }};
+        runtime.start(id, DelegateTarget {
+            session_id: session.id.clone(), cell_id: cell_id.clone(), delegate: delegate.clone(),
+        }, request).unwrap();
+        match stop {
+            0 => runtime.cancel(id, None),
+            1 => {
+                let effects = runtime.close_cell(CellOwner { session_id: session.id, cell_id: cell_id.clone(), delegate: delegate.clone() });
+                for owner in effects.closed_cells {
+                    super::notify_cell_closed(&owner.delegate, &owner.cell_id);
+                }
+                assert_eq!(*delegate.closed_cells.lock().unwrap(), vec![cell_id]);
+            }
+            _ => runtime.fail_all(Vec::new()),
+        }
+        tokio::task::yield_now().await;
+        assert_eq!(delegate.notifications.load(Ordering::Acquire), 0);
+        assert_eq!(delegate.invocations.load(Ordering::Acquire), 0);
+        assert!(matches!(rx.try_recv(), Err(mpsc::error::TryRecvError::Empty)));
+        }
+    }
+}
+
+#[tokio::test]
+async fn new_request_burst_reserves_existing_delegate_progress() {
+    let mut harness = DriverHarness::start();
+    let session = remote_session();
+    harness.open(session.clone(), Arc::new(RecordingDelegate::default())).await;
+    let _cell = harness.start_cell(session.clone(), 2, "1").await;
+    let mut replies = Vec::new();
+    let cancellation = CancellationToken::new();
+    for index in 0..codex_code_mode_protocol::host::MAX_IN_FLIGHT_REQUESTS + 2 {
+        let (response_tx, response_rx) = oneshot::channel();
+        harness.command_tx.send(DriverCommand::Wait {
+            session: session.clone(),
+            request: WaitRequest { cell_id: CellId::new("1".into()), yield_time_ms: 1, recovery: None },
+            caller_cancellation: if index == 0 { cancellation.clone() } else { CancellationToken::new() }, response_tx,
+        }).await.unwrap();
+        replies.push((index, response_rx));
+    }
+    let (_, excess) = replies.pop().unwrap();
+    assert!(excess.await.unwrap().unwrap_err().contains("capacity reached"));
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    harness.command_tx.send(DriverCommand::ShutdownSession {
+        session: session.clone(), response_tx: shutdown_tx,
+    }).await.unwrap();
+    assert_eq!(shutdown_rx.await.unwrap(), Err(codex_code_mode_protocol::host::SESSION_SHUTDOWN_PENDING.into()));
+    cancellation.cancel();
+    harness.event_tx.send(DriverEvent::HostMessage(HostToClient::DelegateRequest {
+        id: DelegateRequestId::new(99), session_id: session.id,
+        request: DelegateRequest::Notify { call_id: "progress".into(), cell_id: CellId::new("1".into()).into(), text: "progress".into() },
+    })).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(1), async {
+        // One initial response already occupies admission. The remaining
+        // ordinary waits, one cancellation, and one delegate response all fit.
+        while harness.outgoing_rx.len() < codex_code_mode_protocol::host::MAX_IN_FLIGHT_REQUESTS + 1 {
+            tokio::task::yield_now().await;
+        }
+    }).await.unwrap();
+    assert!(harness.alive.load(Ordering::Acquire));
+}
+
+// A tiny process writes exactly the already-encoded stdout bytes, then exits.
+// No host helper build or handshake is needed to exercise supervisor retirement.
+fn exiting_response_host(bytes: &[u8]) -> tokio::process::Command {
+    #[cfg(windows)]
+    {
+        let bytes = bytes.iter().map(u8::to_string).collect::<Vec<_>>().join(",");
+        let mut command = tokio::process::Command::new("powershell.exe");
+        command.args(["-NoProfile", "-NonInteractive", "-Command", &format!(
+            "$bytes=[byte[]]@({bytes});$out=[Console]::OpenStandardOutput();$out.Write($bytes,0,$bytes.Length);$out.Flush()"
+        )]);
+        command.creation_flags(0x0800_0000);
+        command
+    }
+    #[cfg(not(windows))]
+    {
+        let bytes = bytes.iter().map(|byte| format!("\\{byte:03o}")).collect::<String>();
+        let mut command = tokio::process::Command::new("/bin/sh");
+        command.args(["-c", &format!("printf '%b' '{bytes}'")]);
+        command
+    }
+}
+
+#[tokio::test]
+async fn supervisor_preserves_final_and_initial_responses_before_eof_or_truncation() {
+    use codex_code_mode_protocol::host::EncodedFrame;
+    use super::super::ConnectionSupervisor;
+
+    for child_first in [false, true] {
+        for truncated in [false, true] {
+            let (command_tx, command_rx) = mpsc::channel(16);
+            let (event_tx, event_rx) = mpsc::channel(16);
+            let (outgoing_tx, _outgoing_rx) = mpsc::channel::<EncodedFrame>(super::super::OUTGOING_FRAME_CAPACITY);
+            let cancellation = CancellationToken::new();
+            let alive = Arc::new(AtomicBool::new(true));
+            let failure = Arc::new(StdMutex::new(None));
+            let (mut driver, _claims) = ConnectionDriver::new(command_rx, event_rx, event_tx.clone(), outgoing_tx, DriverLifecycle {
+                alive: alive.clone(), failure: failure.clone(), cancellation: cancellation.clone(),
+            });
+            let session = remote_session();
+            let (open_tx, open_rx) = oneshot::channel();
+            assert!(driver.handle_command(DriverCommand::OpenSession {
+                session: session.clone(), delegate: Arc::new(RecordingDelegate::default()),
+                cleanup: SessionCleanup::new(), caller_cancellation: CancellationToken::new(), response_tx: open_tx,
+            }));
+            assert!(driver.handle_event(DriverEvent::HostMessage(HostToClient::Response {
+                id: RequestId::new(1), result: WireResult::Ok { value: HostResponse::SessionReady { session_id: session.id.clone() } },
+            })));
+            open_rx.await.unwrap().unwrap();
+            let (execute_tx, execute_rx) = oneshot::channel();
+            assert!(driver.handle_command(DriverCommand::Execute {
+                session: session.clone(), request: ExecuteRequest {
+                    state_path: None, tool_call_id: "final".into(), enabled_tools: Vec::new().into(), source: "text('done')".into(),
+                    yield_time_ms: Some(1), max_output_tokens: None, default_tool_timeout_ms: None,
+                }, caller_cancellation: CancellationToken::new(), response_tx: execute_tx,
+            }));
+            assert!(driver.handle_event(DriverEvent::HostMessage(HostToClient::Response {
+                id: RequestId::new(2), result: WireResult::Ok { value: HostResponse::ExecutionStarted { cell_id: CellId::new("1".into()).into() } },
+            })));
+            let delivered = execute_rx.await.unwrap().unwrap();
+            driver.requests.claim_execute(delivered.request_id);
+            let (wait_tx, wait_rx) = oneshot::channel();
+            assert!(driver.handle_command(DriverCommand::Wait {
+                session, request: WaitRequest { cell_id: CellId::new("1".into()), yield_time_ms: 1, recovery: None },
+                caller_cancellation: CancellationToken::new(), response_tx: wait_tx,
+            }));
+            let terminal = || WireRuntimeResponse::Terminated { cell_id: CellId::new("1".into()).into(), content_items: Vec::new() };
+            let mut bytes = Vec::new();
+            {
+                let mut writer = FramedWriter::new(&mut bytes);
+                writer.write(&HostToClient::InitialResponse { id: RequestId::new(2), result: WireResult::Ok { value: terminal() } }).await.unwrap();
+                writer.write(&HostToClient::Response { id: RequestId::new(3), result: WireResult::Ok { value: HostResponse::WaitCompleted { outcome: WireWaitOutcome::LiveCell(terminal()) } } }).await.unwrap();
+            }
+            if truncated { bytes.extend_from_slice(&[1, 0]); }
+            let managed = Arc::new(codex_utils_pty::ManagedRootProcess::reserve_with_reclaim().await.unwrap());
+            let mut child = exiting_response_host(&bytes).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::null()).kill_on_drop(true).spawn().unwrap();
+            managed.attach(child.id().unwrap()).unwrap();
+            let stdout = child.stdout.take().unwrap();
+            if child_first { child.wait().await.unwrap(); }
+            let (release_reader, reader_gate) = oneshot::channel();
+            let reader_events = event_tx.clone();
+            let reader_cancellation = cancellation.clone();
+            let reader_task = tokio::spawn(async move {
+                reader_gate.await.unwrap();
+                super::super::drive_reader(FramedReader::new(stdout), reader_events, reader_cancellation).await
+            });
+            let (release_driver, driver_gate) = oneshot::channel();
+            let driver_task = tokio::spawn(async move { driver_gate.await.unwrap(); driver.run().await; });
+            let mut release_reader = Some(release_reader);
+            let mut release_driver = Some(release_driver);
+            if child_first {
+                release_driver.take().unwrap().send(()).unwrap();
+            } else {
+                release_reader.take().unwrap().send(()).unwrap();
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    while !reader_task.is_finished() { tokio::task::yield_now().await; }
+                }).await.unwrap();
+            }
+            let writer_cancellation = cancellation.clone();
+            let supervisor = tokio::spawn(ConnectionSupervisor {
+                child, managed, event_tx, cancellation: cancellation.clone(), alive: alive.clone(), failure,
+                driver_task, reader_task, writer_task: tokio::spawn(async move {
+                    writer_cancellation.cancelled().await;
+                    Ok(())
+                }),
+            }.run());
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while alive.load(Ordering::Acquire) { tokio::task::yield_now().await; }
+            }).await.unwrap();
+            if let Some(release) = release_reader { release.send(()).unwrap(); }
+            if let Some(release) = release_driver { release.send(()).unwrap(); }
+            tokio::time::timeout(Duration::from_secs(5), supervisor).await.unwrap().unwrap();
+            assert!(matches!(delivered.started.initial_response().await.unwrap(), codex_code_mode_protocol::RuntimeResponse::Terminated { .. }));
+            assert!(matches!(wait_rx.await.unwrap().unwrap(), codex_code_mode_protocol::WaitOutcome::LiveCell(codex_code_mode_protocol::RuntimeResponse::Terminated { .. })));
+            assert!(!alive.load(Ordering::Acquire));
+            assert!(cancellation.is_cancelled());
+            drop(command_tx);
+        }
     }
 }

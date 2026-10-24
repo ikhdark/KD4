@@ -118,6 +118,88 @@ fn read_only_sandbox_for_cwd(cwd: std::path::PathBuf) -> Result<FileSystemSandbo
     )?)
 }
 
+#[test_case(FileSystemImplementation::Local ; "local")]
+#[test_case(FileSystemImplementation::Remote ; "remote")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn file_system_read_only_capture_admission(
+    implementation: FileSystemImplementation,
+) -> Result<()> {
+    let context = create_file_system_context(implementation).await?;
+    let tmp = tempfile::TempDir::new()?;
+    let path = tmp.path().join("source.txt");
+    std::fs::write(&path, b"source bytes")?;
+    let uri = PathUri::from_host_native_path(&path)?;
+    let sandbox = crate::support::read_only_sandbox(tmp.path().to_path_buf());
+    let started = std::time::Instant::now();
+    assert_eq!(
+        context
+            .file_system
+            .read_file_bounded(&uri, 1024, Some(&sandbox))
+            .await?,
+        Some(b"source bytes".to_vec()),
+    );
+    let (bytes, source) = context
+        .file_system
+        .read_file_bounded_with_source(&uri, 1024, Some(&sandbox))
+        .await?
+        .expect("read-only source inspection must acquire the file");
+    assert_eq!(bytes, b"source bytes");
+    assert_eq!(
+        std::fs::canonicalize(source.expect("opened source identity"))?,
+        std::fs::canonicalize(&path)?,
+    );
+    assert!(
+        context
+            .file_system
+            .get_metadata(&uri, Some(&sandbox))
+            .await?
+            .is_file
+    );
+    // A stalled writer must remain an immediate, explicit transient failure,
+    // never a missing-file observation or a wait on that writer.
+    let writer = codex_file_system::try_acquire_patch_capture(&path)?;
+    let contended = std::time::Instant::now();
+    let error = context
+        .file_system
+        .read_file_bounded(&uri, 1024, Some(&sandbox))
+        .await
+        .expect_err("captured source must not be readable");
+    assert!(
+        error
+            .to_string()
+            .contains("native patch capture is in progress"),
+        "{error}"
+    );
+    assert!(contended.elapsed() < std::time::Duration::from_secs(10));
+    drop(writer);
+    assert_eq!(
+        context
+            .file_system
+            .read_file_bounded(&uri, 1024, Some(&sandbox))
+            .await?,
+        Some(b"source bytes".to_vec()),
+    );
+    let blocked = tmp.path().join("blocked.txt");
+    assert!(
+        context
+            .file_system
+            .write_file(
+                &PathUri::from_host_native_path(&blocked)?,
+                b"blocked".to_vec(),
+                Some(&sandbox),
+            )
+            .await
+            .is_err()
+    );
+    assert!(!blocked.exists());
+    assert_eq!(std::fs::read_dir(tmp.path())?.count(), 1);
+    eprintln!(
+        "read-only native capture workload ({implementation}): {:?}",
+        started.elapsed()
+    );
+    Ok(())
+}
+
 fn is_unsupported_restricted_token_host<T>(result: &std::io::Result<T>) -> bool {
     result.as_ref().err().is_some_and(|err| {
         let message = err.to_string();

@@ -270,7 +270,7 @@ where
     let headers = response.headers().clone();
     let status = response.status();
     let retry_at = parse_retry_after(&headers, OffsetDateTime::now_utc());
-    let body = super::enroll::read_remote_control_response_body(response)
+    let body = super::enroll::read_remote_control_response_body_for_status(response)
         .await
         .map_err(|err| {
             let timed_out = err.kind() == ErrorKind::TimedOut;
@@ -348,10 +348,10 @@ fn refresh_deferral(
     retry_at: Option<OffsetDateTime>,
     now: OffsetDateTime,
 ) -> (Duration, OffsetDateTime) {
-    if let Some(retry_at) = retry_at
-        && let Ok(delay) = Duration::try_from(retry_at - now)
-        && !delay.is_zero()
-    {
+    if let Some(retry_at) = retry_at {
+        // A deadline accepted at headers stays accepted even if diagnostics
+        // consumed its remaining delay. Only an absent/invalid header uses jitter.
+        let delay = Duration::try_from(retry_at - now).unwrap_or(Duration::ZERO);
         return (delay, retry_at);
     }
     let delay = remote_control_server_token_refresh_backoff();

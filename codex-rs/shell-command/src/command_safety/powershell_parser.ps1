@@ -1,3 +1,12 @@
+# Snapshot stock semantic variables before parser-local bindings are introduced.
+$script:kd4ReservedBindingNames = @{}
+foreach ($variable in @(Microsoft.PowerShell.Utility\Get-Variable)) {
+    $script:kd4ReservedBindingNames[$variable.Name.ToLowerInvariant()] = $true
+}
+foreach ($name in @('lastexitcode', 'matches', 'foreach', 'switch', 'psitem', '_')) {
+    $script:kd4ReservedBindingNames[$name] = $true
+}
+
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 
@@ -27,6 +36,17 @@ $utf8 = [System.Text.UTF8Encoding]::new($false)
 $stdin = [System.IO.StreamReader]::new([Console]::OpenStandardInput(), $utf8, $false)
 $stdout = [System.IO.StreamWriter]::new([Console]::OpenStandardOutput(), $utf8)
 $stdout.AutoFlush = $true
+
+function Test-OrdinaryLocalBinding {
+    param($variable)
+    if ($variable -isnot [System.Management.Automation.Language.VariableExpressionAst] -or
+        $variable.Splatted -or -not $variable.VariablePath.IsUnscopedVariable) { return $false }
+    $name = $variable.VariablePath.UserPath
+    if ([string]::IsNullOrEmpty($name) -or $name -notmatch '^[A-Za-z_][A-Za-z0-9_]*$') { return $false }
+    $key = $name.ToLowerInvariant()
+    return -not $key.StartsWith('ps') -and -not $key.EndsWith('preference') -and
+        -not $script:kd4ReservedBindingNames.ContainsKey($key)
+}
 
 function Invoke-ParseRequest {
     param($RequestId, $Source, $Resolution)
@@ -87,6 +107,20 @@ function Invoke-ParseRequest {
     }
 
     # Only accept AST shapes we can flatten into a list of argv-like command words.
+    # Preference/automatic/scoped writes can change later command arguments
+    # without an explicit variable-writing parameter on the intervening command.
+    foreach ($write in $ast.FindAll({
+        param($node)
+        $node -is [System.Management.Automation.Language.AssignmentStatementAst] -or
+        $node -is [System.Management.Automation.Language.ForEachStatementAst]
+    }, $true)) {
+        $target = if ($write -is [System.Management.Automation.Language.ForEachStatementAst]) {
+            $write.Variable
+        } else { $write.Left }
+        if (-not (Test-OrdinaryLocalBinding $target)) {
+            return @{ id = $RequestId; status = 'unsupported' }
+        }
+    }
     # Anything more dynamic than that becomes "unsupported" instead of being guessed at.
     $commands = [System.Collections.ArrayList]::new()
     $localConstants = @{}
@@ -810,6 +844,8 @@ function Add-CommandsFromPipelineAst {
             return $false
         }
         $null = $commands.Add($words)
+        # A command can update automatic state or variables via host defaults.
+        $localConstants.Clear()
     }
 
     return $true

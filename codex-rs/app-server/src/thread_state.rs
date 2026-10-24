@@ -4,11 +4,11 @@ use crate::outgoing_message::ConnectionRequestId;
 mod active_stream_replay;
 use codex_app_server_protocol::RequestId;
 use codex_app_server_protocol::SortDirection;
-use codex_app_server_protocol::ThreadGoal;
 use codex_app_server_protocol::ThreadHistoryBuilder;
 use codex_app_server_protocol::ThreadHistoryChangeSet;
 use codex_app_server_protocol::ThreadHistoryItemChange;
 use codex_app_server_protocol::ThreadHistoryTurnChange;
+use codex_app_server_protocol::ThreadItem;
 use codex_app_server_protocol::ThreadSettings;
 use codex_app_server_protocol::Turn;
 use codex_app_server_protocol::TurnError;
@@ -131,8 +131,6 @@ pub(crate) struct PendingThreadResumeRequest {
     pub(crate) config_snapshot: ThreadConfigSnapshot,
     pub(crate) instruction_sources: Vec<LegacyAppPathString>,
     pub(crate) thread_summary: codex_app_server_protocol::Thread,
-    pub(crate) emit_thread_goal_update: bool,
-    pub(crate) thread_goal_state_db: Option<StateDbHandle>,
     pub(crate) include_turns: bool,
     pub(crate) initial_turns_page:
         Option<codex_app_server_protocol::ThreadResumeInitialTurnsPageParams>,
@@ -144,17 +142,6 @@ pub(crate) struct PendingThreadResumeRequest {
 pub(crate) enum ThreadListenerCommand {
     // SendThreadResumeResponse is used to resume an already running thread by sending the thread's history to the client and atomically subscribing for new updates.
     SendThreadResumeResponse(Box<PendingThreadResumeRequest>),
-    // EmitThreadGoalUpdated is used to order goal updates with running-thread resume responses and goal clears.
-    EmitThreadGoalUpdated {
-        turn_id: Option<String>,
-        goal: ThreadGoal,
-    },
-    // EmitThreadGoalCleared is used to order app-server goal clears with running-thread resume responses.
-    EmitThreadGoalCleared,
-    // EmitThreadGoalSnapshot is used to read and emit the latest goal state in the listener order.
-    EmitThreadGoalSnapshot {
-        state_db: StateDbHandle,
-    },
     // ResolveServerRequest is used to notify the client that the request has been resolved.
     // It is executed in the thread listener's context to ensure that the resolved notification is ordered with regard to the request itself.
     ResolveServerRequest {
@@ -393,6 +380,7 @@ impl ThreadTurnIndex {
         anchor: Option<(&str, bool)>,
         page_size: usize,
         sort_direction: SortDirection,
+        items_view: TurnItemsView,
     ) -> Result<Option<IndexedTurnPage>, ()> {
         if !self.initialized {
             return Ok(None);
@@ -411,7 +399,11 @@ impl ThreadTurnIndex {
         );
         let indexes = ordered_indexes(start, end, sort_direction);
         let mut turns_iter = indexes.filter_map(|index| self.turns.get(&self.order[index]));
-        let turns = turns_iter.by_ref().take(page_size).cloned().collect();
+        let turns = turns_iter
+            .by_ref()
+            .take(page_size)
+            .map(|turn| clone_turn_with_items_view(turn, items_view))
+            .collect();
         let more_turns_available = turns_iter.next().is_some();
         Ok(Some(IndexedTurnPage {
             turns,
@@ -545,6 +537,43 @@ impl ThreadTurnIndex {
                 self.item_order.push(key);
             }
         }
+    }
+}
+
+pub(crate) fn turn_summary_item_indices(items: &[ThreadItem]) -> (Option<usize>, Option<usize>) {
+    let user = items
+        .iter()
+        .position(|item| matches!(item, ThreadItem::UserMessage { .. }));
+    let agent = items
+        .iter()
+        .rposition(|item| matches!(item, ThreadItem::AgentMessage { .. }))
+        .filter(|&index| user.is_none_or(|user| items[user].id() != items[index].id()));
+    (user, agent)
+}
+
+pub(crate) fn clone_turn_with_items_view(turn: &Turn, items_view: TurnItemsView) -> Turn {
+    let items = match items_view {
+        TurnItemsView::NotLoaded => Vec::new(),
+        TurnItemsView::Summary => {
+            let (user, agent) = turn_summary_item_indices(&turn.items);
+            user.into_iter()
+                .chain(agent)
+                .map(|index| turn.items[index].clone())
+                .collect()
+        }
+        TurnItemsView::Full => turn.items.clone(),
+    };
+    Turn {
+        id: turn.id.clone(),
+        items,
+        items_view,
+        status: turn.status.clone(),
+        error: turn.error.clone(),
+        started_at: turn.started_at,
+        completed_at: turn.completed_at,
+        duration_ms: turn.duration_ms,
+        timing: turn.timing.clone(),
+        surfaced_result: turn.surfaced_result.clone(),
     }
 }
 
@@ -770,11 +799,13 @@ impl ThreadState {
         anchor: Option<(&str, bool)>,
         page_size: usize,
         sort_direction: SortDirection,
+        items_view: TurnItemsView,
     ) -> Result<Option<IndexedTurnPage>, ()> {
         if self.turn_index_source_partial {
             return Err(());
         }
-        self.turn_index.page(anchor, page_size, sort_direction)
+        self.turn_index
+            .page(anchor, page_size, sort_direction, items_view)
     }
 
     pub(crate) fn indexed_items_page(
@@ -830,7 +861,7 @@ impl ThreadState {
     pub(crate) fn seed_turn_index_from_history(&mut self, items: &[RolloutItem]) {
         self.turn_index_source_partial =
             codex_rollout::ensure_rollout_source_integrity(items).is_err();
-        let live_index = std::mem::take(&mut self.turn_index);
+        let mut live_index = std::mem::take(&mut self.turn_index);
         let mut builder = ThreadHistoryBuilder::new();
         for item in items {
             let changes = builder.handle_rollout_item_with_changes(item);
@@ -852,7 +883,7 @@ impl ThreadState {
             .rollback_eligible_turn_ids
             .extend(live_index.rollback_eligible_turn_ids);
         for turn_id in live_index.order {
-            if let Some(turn) = live_index.turns.get(&turn_id).cloned() {
+            if let Some(turn) = live_index.turns.remove(&turn_id) {
                 self.turn_index.overlay_turn(turn);
             }
         }
@@ -1215,7 +1246,7 @@ mod tests {
         state.seed_turn_index_from_history(&[RolloutItem::ResponseItem(notice)]);
         assert!(
             state
-                .indexed_turns_page(None, 10, SortDirection::Asc)
+                .indexed_turns_page(None, 10, SortDirection::Asc, TurnItemsView::Full)
                 .is_err()
         );
         assert!(
@@ -1229,7 +1260,7 @@ mod tests {
             .unwrap();
         assert!(
             state
-                .indexed_turns_page(None, 10, SortDirection::Asc)
+                .indexed_turns_page(None, 10, SortDirection::Asc, TurnItemsView::Full)
                 .is_ok()
         );
     }
@@ -1800,7 +1831,7 @@ mod tests {
                 assert!(stale_read.is_err());
                 assert!(
                     state
-                        .indexed_turns_page(None, 10, SortDirection::Asc)
+                        .indexed_turns_page(None, 10, SortDirection::Asc, TurnItemsView::Full)
                         .unwrap()
                         .is_none()
                 );
@@ -1812,7 +1843,7 @@ mod tests {
                     .unwrap();
             }
             let turns = state
-                .indexed_turns_page(None, 10, SortDirection::Asc)
+                .indexed_turns_page(None, 10, SortDirection::Asc, TurnItemsView::Full)
                 .unwrap()
                 .unwrap();
             assert_eq!(turns.turns.len(), 1);
@@ -1825,7 +1856,7 @@ mod tests {
             assert_eq!(items.items[0].item.id(), "item-turn-1");
             assert!(
                 state
-                    .indexed_turns_page(Some(("turn-2", false)), 10, SortDirection::Asc)
+                    .indexed_turns_page(Some(("turn-2", false)), 10, SortDirection::Asc, TurnItemsView::Full)
                     .is_err()
             );
             assert!(
@@ -1986,7 +2017,7 @@ mod tests {
             }),
         );
         let turns = state
-            .indexed_turns_page(None, 10, SortDirection::Asc)
+            .indexed_turns_page(None, 10, SortDirection::Asc, TurnItemsView::Full)
             .unwrap()
             .unwrap();
         assert_eq!(
@@ -2016,7 +2047,7 @@ mod tests {
         );
         assert!(
             state
-                .indexed_turns_page(Some(("third", false)), 1, SortDirection::Asc)
+                .indexed_turns_page(Some(("third", false)), 1, SortDirection::Asc, TurnItemsView::Full)
                 .is_err()
         );
         let after_first = state
@@ -2063,7 +2094,7 @@ mod tests {
             }),
         );
         let turns = state
-            .indexed_turns_page(None, 10, SortDirection::Asc)
+            .indexed_turns_page(None, 10, SortDirection::Asc, TurnItemsView::Full)
             .unwrap()
             .unwrap();
         assert_eq!(
@@ -2082,7 +2113,7 @@ mod tests {
         assert_eq!(items.items[0].turn_id, "first");
         assert!(
             state
-                .indexed_turns_page(Some(("second", false)), 1, SortDirection::Asc)
+                .indexed_turns_page(Some(("second", false)), 1, SortDirection::Asc, TurnItemsView::Full)
                 .is_err()
         );
     }
@@ -2170,7 +2201,7 @@ mod tests {
         state.track_current_turn_event("first", &completed);
         assert!(
             state
-                .indexed_turns_page(None, 10, SortDirection::Asc)
+                .indexed_turns_page(None, 10, SortDirection::Asc, TurnItemsView::Full)
                 .unwrap()
                 .unwrap()
                 .turns
@@ -2245,7 +2276,7 @@ mod tests {
         state.track_current_turn_event("first", &end);
         assert!(
             state
-                .indexed_turns_page(None, 10, SortDirection::Asc)
+                .indexed_turns_page(None, 10, SortDirection::Asc, TurnItemsView::Full)
                 .unwrap()
                 .unwrap()
                 .turns
@@ -2349,7 +2380,7 @@ mod tests {
         assert_eq!(page.items[0].turn_id, "first");
         assert_eq!(page.items[0].item, reconciled[0].item);
         let turns = state
-            .indexed_turns_page(None, 10, SortDirection::Asc)
+            .indexed_turns_page(None, 10, SortDirection::Asc, TurnItemsView::Full)
             .unwrap()
             .unwrap();
         assert_eq!(turns.turns[0].status, TurnStatus::Interrupted);
@@ -2394,7 +2425,7 @@ mod tests {
         state.seed_turn_index_from_history(&items);
 
         let newest = state
-            .indexed_turns_page(None, 1, SortDirection::Desc)
+            .indexed_turns_page(None, 1, SortDirection::Desc, TurnItemsView::Full)
             .expect("valid page")
             .expect("initialized index");
         assert_eq!(newest.turns[0].id, "turn-2");
@@ -2405,6 +2436,7 @@ mod tests {
                 Some(("turn-2", /*include_anchor*/ false)),
                 1,
                 SortDirection::Desc,
+                TurnItemsView::Full,
             )
             .expect("valid page")
             .expect("initialized index");

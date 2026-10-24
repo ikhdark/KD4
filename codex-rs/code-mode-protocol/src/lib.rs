@@ -8,6 +8,7 @@ mod session;
 mod shared_clock;
 
 pub use cancellation::CancellationCause;
+pub use cancellation::CancellationCauseCell;
 pub use cancellation::NestedCancellation;
 pub use description::CODE_MODE_PRAGMA_PREFIX;
 pub use description::CodeModeToolKind;

@@ -8,6 +8,7 @@ mod find_up;
 pub use conditional_mutation::FileMutationOutcome;
 pub use conditional_mutation::guard_patch_read;
 pub use conditional_mutation::mutate_file_if_matches;
+pub use conditional_mutation::prepare_patch_capture;
 pub use conditional_mutation::try_acquire_patch_capture;
 pub use confined_file::directory_case_sensitive;
 pub use confined_file::open_confined_file;
@@ -212,8 +213,30 @@ impl WalkFilters {
         }
         Ok(())
     }
+}
 
-    fn includes_file(&self, name: &str) -> bool {
+struct PreparedWalkFilters {
+    include: Vec<Vec<char>>,
+    exclude: Vec<Vec<char>>,
+    exclude_directories: Vec<Vec<char>>,
+}
+
+impl PreparedWalkFilters {
+    fn new(filters: &WalkFilters) -> Self {
+        let prepare = |patterns: &[String]| -> Vec<Vec<char>> {
+            patterns
+                .iter()
+                .map(|pattern| pattern.chars().collect())
+                .collect()
+        };
+        Self {
+            include: prepare(&filters.include),
+            exclude: prepare(&filters.exclude),
+            exclude_directories: prepare(&filters.exclude_directories),
+        }
+    }
+
+    fn includes_file(&self, name: &[char]) -> bool {
         (self.include.is_empty()
             || self
                 .include
@@ -226,9 +249,7 @@ impl WalkFilters {
     }
 }
 
-fn basename_matches(pattern: &str, name: &str) -> bool {
-    let pattern = pattern.chars().collect::<Vec<_>>();
-    let name = name.chars().collect::<Vec<_>>();
+fn basename_matches(pattern: &[char], name: &[char]) -> bool {
     let (mut p, mut n) = (0, 0);
     let mut star = None;
     let mut retry = 0;
@@ -805,6 +826,8 @@ async fn walk_via_directory_reads<F: ExecutorFileSystem + ?Sized>(
     } else {
         (options.max_entries, "entry_limit")
     };
+    let filters = PreparedWalkFilters::new(&options.filters);
+    let mut name_chars = Vec::new();
 
     while let Some((directory, depth)) = queue.pop_front() {
         if entry_count == examination_limit {
@@ -998,15 +1021,18 @@ async fn walk_via_directory_reads<F: ExecutorFileSystem + ?Sized>(
                 }
                 continue;
             }
-            if (kind == WalkEntryKind::File && !options.filters.includes_file(&file_name))
-                || (kind == WalkEntryKind::Directory
-                    && options
-                        .filters
-                        .exclude_directories
-                        .iter()
-                        .any(|pattern| basename_matches(pattern, &file_name)))
-            {
-                continue;
+            if needs_text_match {
+                name_chars.clear();
+                name_chars.extend(file_name.chars());
+                if (kind == WalkEntryKind::File && !filters.includes_file(&name_chars))
+                    || (kind == WalkEntryKind::Directory
+                        && filters
+                            .exclude_directories
+                            .iter()
+                            .any(|pattern| basename_matches(pattern, &name_chars)))
+                {
+                    continue;
+                }
             }
             // Directories that include patterns do not return are still
             // traversed below.

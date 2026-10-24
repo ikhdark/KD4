@@ -490,6 +490,7 @@ pub(crate) struct AsyncManagedClient {
     pub(crate) tool_plugin_provenance: Arc<ToolPluginProvenance>,
     pub(crate) cancel_token: CancellationToken,
     pub(crate) manager_owners: Arc<AtomicUsize>,
+    pub(crate) manager_lease: Arc<std::sync::Mutex<Option<bool>>>,
 }
 
 impl AsyncManagedClient {
@@ -601,19 +602,29 @@ impl AsyncManagedClient {
             tool_plugin_provenance,
             cancel_token,
             manager_owners: Arc::new(AtomicUsize::new(1)),
+            manager_lease: Arc::new(std::sync::Mutex::new(None)),
         }
     }
 
-    pub(crate) fn retain_for_manager(&self) {
-        self.manager_owners.fetch_add(1, Ordering::AcqRel);
+    pub(crate) fn retain_for_manager(&self) -> Option<Self> {
+        self.manager_owners.try_update(Ordering::AcqRel, Ordering::Acquire, |owners| {
+            if owners == 0 || self.cancel_token.is_cancelled() { None } else { owners.checked_add(1) }
+        }).ok()?;
+        let mut retained = self.clone();
+        retained.manager_lease = Arc::new(std::sync::Mutex::new(None));
+        Some(retained)
     }
 
     fn release_manager(&self) -> bool {
-        self.manager_owners
+        let mut lease = self.manager_lease.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(last_owner) = *lease { return last_owner; }
+        let last_owner = self.manager_owners
             .try_update(Ordering::AcqRel, Ordering::Acquire, |owners| {
                 owners.checked_sub(1)
             })
-            .is_ok_and(|previous| previous == 1)
+            .is_ok_and(|previous| previous == 1);
+        *lease = Some(last_owner);
+        last_owner
     }
 
     pub(crate) fn release_manager_without_shutdown(&self) {
@@ -661,7 +672,7 @@ impl AsyncManagedClient {
     }
 
     pub(crate) async fn force_shutdown(&self) {
-        if self.manager_owners.load(Ordering::Acquire) > 0 && !self.release_manager() {
+        if !self.release_manager() {
             return;
         }
         self.cancel_token.cancel();
@@ -875,17 +886,25 @@ where
 
 async fn discover_tools_if_supported<F, Fut>(
     supports_tools: bool,
+    cache_context: Option<&CodexAppsToolsCacheContext>,
+    server_info: &McpServerInfo,
     fetch: F,
 ) -> Result<Vec<ToolInfo>>
 where
     F: FnOnce() -> Fut,
     Fut: Future<Output = Result<Vec<ToolInfo>>>,
 {
-    if supports_tools {
-        fetch().await
+    let ticket = cache_context.map(|context| context.begin_fetch(CodexAppsToolsFetchSource::Startup));
+    let tools = if supports_tools {
+        fetch().await?
     } else {
-        Ok(Vec::new())
-    }
+        Vec::new()
+    };
+    Ok(match (cache_context, ticket) {
+        (Some(context), Some(ticket)) => context.publish_if_newest_accepted(ticket, server_info, tools).await,
+        (None, None) => tools,
+        _ => unreachable!("fetch ticket requires cache context"),
+    })
 }
 
 /// Presents declared Codex Apps file parameters to the model as local-path inputs and adds plugin
@@ -1304,11 +1323,9 @@ async fn start_server_task(
     let server_supports_tools_capability = initialize_result.capabilities.tools.is_some();
     let server_info = mcp_server_info_from_implementation(initialize_result.server_info);
     let server_instructions = initialize_result.instructions;
-    let tools = discover_tools_if_supported(server_supports_tools_capability, || async {
+    let tools = discover_tools_if_supported(server_supports_tools_capability,
+        codex_apps_tools_cache_context.as_ref(), &server_info, || async {
         let list_start = Instant::now();
-        let fetch_ticket = codex_apps_tools_cache_context
-            .as_ref()
-            .map(|cache_context| cache_context.begin_fetch(CodexAppsToolsFetchSource::Startup));
         let tools = list_tools_for_client_uncached(
             &server_name,
             is_codex_apps_mcp_server,
@@ -1318,15 +1335,6 @@ async fn start_server_task(
             server_instructions.as_deref(),
         )
         .await?;
-        let tools = match (codex_apps_tools_cache_context.as_ref(), fetch_ticket) {
-            (Some(cache_context), Some(fetch_ticket)) => {
-                cache_context
-                    .publish_if_newest_accepted(fetch_ticket, &server_info, tools)
-                    .await
-            }
-            (None, None) => tools,
-            _ => unreachable!("Codex Apps fetch ticket requires cache context"),
-        };
         if is_codex_apps_mcp_server {
             emit_duration(
                 MCP_TOOLS_LIST_DURATION_METRIC,
@@ -1334,10 +1342,14 @@ async fn start_server_task(
                 &[("cache", "miss")],
             );
         }
-        Ok(filter_tools(tools, &tool_filter))
+        Ok(tools)
     })
     .await
     .map_err(StartupOutcomeError::from)?;
+    let tools = filter_tools(tools, &tool_filter);
+    if !server_supports_tools_capability {
+        tool_catalog_revision.fetch_add(1, Ordering::AcqRel);
+    }
     let tools = Arc::new(ArcSwap::from_pointee(tools));
 
     if server_supports_tools_capability {
@@ -1901,7 +1913,8 @@ mod tests {
     async fn resource_only_server_skips_tool_discovery() {
         let fetch_count = AtomicUsize::new(0);
 
-        let tools = discover_tools_if_supported(/*supports_tools*/ false, || {
+        let server_info = McpServerInfo { name: "resource-only".into(), title: None, version: "1".into(), description: None, icons: None, website_url: None };
+        let tools = discover_tools_if_supported(/*supports_tools*/ false, None, &server_info, || {
             fetch_count.fetch_add(1, Ordering::Relaxed);
             async { Ok(Vec::new()) }
         })
@@ -1910,6 +1923,26 @@ mod tests {
 
         assert!(tools.is_empty());
         assert_eq!(fetch_count.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn resource_only_startup_publishes_an_empty_authoritative_catalog() {
+        let home = tempfile::tempdir().unwrap();
+        let cache = crate::CodexAppsToolsCache::default();
+        let key = crate::codex_apps_tools_cache_key(None, "https://chatgpt.com", None);
+        let context = cache.context(home.path().to_path_buf(), key.clone()).await;
+        let info = McpServerInfo { name: "resource-only".into(), title: None, version: "1".into(), description: None, icons: None, website_url: None };
+        let ticket = context.begin_fetch(CodexAppsToolsFetchSource::HardRefresh);
+        context.publish_if_newest_accepted(ticket, &info, vec![test_tool_info("obsolete")]).await;
+        let revision = context.content_revision();
+        let tools = discover_tools_if_supported(false, Some(&context), &info,
+            || async { panic!("resource-only handshake must not call tools/list") }).await.unwrap();
+        assert!(tools.is_empty());
+        assert!(context.current_tools().unwrap().is_empty());
+        assert!(context.content_revision() > revision);
+        let fresh_cache = crate::CodexAppsToolsCache::default();
+        let disk = fresh_cache.context(home.path().to_path_buf(), key).await;
+        assert!(disk.current_tools().unwrap().is_empty(), "obsolete disk tools must not survive restart");
     }
 
     #[test]

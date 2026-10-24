@@ -34,6 +34,23 @@ use codex_protocol::user_input::UserInput;
 use super::SessionTask;
 use super::SessionTaskResult;
 
+#[derive(serde::Deserialize)]
+struct CompletedReviewResponse {
+    #[serde(default)]
+    status: Option<String>,
+    #[serde(flatten)]
+    output: ReviewOutputEvent,
+}
+
+#[derive(serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+struct BlockedReviewResponse {
+    status: String,
+    reason: String,
+    unreviewed_scope: Vec<String>,
+    required_action: String,
+}
+
 #[derive(Clone)]
 pub(crate) struct ReviewTask {
     entered_review_mode: EnteredReviewModeItem,
@@ -266,11 +283,21 @@ async fn process_review_events(
                     .as_deref()
                     .and_then(parse_review_output_event);
                 if out.is_none() {
+                    // Keep blocked outcomes machine-readable without treating them as
+                    // successful reviews or changing the persisted completed wire type.
+                    let message = task_complete
+                        .last_agent_message
+                        .as_deref()
+                        .and_then(parse_blocked_review_output)
+                        .and_then(|blocked| serde_json::to_string(&blocked).ok())
+                        .unwrap_or_else(|| {
+                            "Review did not return a valid structured result. Re-run /review; this is not a clean review verdict.".to_string()
+                        });
                     session
                         .send_event(
                             ctx.as_ref(),
                             EventMsg::Error(codex_protocol::protocol::ErrorEvent {
-                                message: "Review did not return a valid structured result. Re-run /review; this is not a clean review verdict.".to_string(),
+                                message,
                                 codex_error_info: None,
                             }),
                         )
@@ -389,23 +416,33 @@ fn namespace_review_item(item: &mut TurnItem, turn_id: &str) {
     }
 }
 
+fn review_output_json(text: &str) -> Option<&str> {
+    let text = text.trim();
+    if let Some(fenced) = text.strip_prefix("```") {
+        let (language, body) = fenced.split_once('\n')?;
+        if !matches!(language.trim(), "" | "json") {
+            return None;
+        }
+        Some(body.strip_suffix("```")?.trim())
+    } else {
+        Some(text)
+    }
+}
+
 /// Parse a ReviewOutputEvent from a text blob returned by the reviewer model.
 /// Accept only results satisfying the review contract. Keep the wire types
 /// compatible with saved reviews; validate new model output at this boundary.
 /// Accept one complete JSON document, optionally enclosed in one Markdown fence.
 /// Examples, wrappers and trailing prose are not authoritative review results.
 fn parse_review_output_event(text: &str) -> Option<ReviewOutputEvent> {
-    let text = text.trim();
-    let json = if let Some(fenced) = text.strip_prefix("```") {
-        let (language, body) = fenced.split_once('\n')?;
-        if !matches!(language.trim(), "" | "json") {
-            return None;
-        }
-        body.strip_suffix("```")?.trim()
-    } else {
-        text
-    };
-    let mut output: ReviewOutputEvent = serde_json::from_str(json).ok()?;
+    let response: CompletedReviewResponse =
+        serde_json::from_str(review_output_json(text)?).ok()?;
+    // A tagged blocked/unknown outcome must not fall through to a completed
+    // verdict merely because it also contains the legacy completed fields.
+    if response.status.is_some() {
+        return None;
+    }
+    let mut output = response.output;
     if !matches!(
         output.overall_correctness.as_str(),
         "patch is correct" | "patch is incorrect"
@@ -446,6 +483,20 @@ fn parse_review_output_event(text: &str) -> Option<ReviewOutputEvent> {
     Some(output)
 }
 
+fn parse_blocked_review_output(text: &str) -> Option<BlockedReviewResponse> {
+    let output: BlockedReviewResponse =
+        serde_json::from_str(review_output_json(text)?).ok()?;
+    (output.status == "blocked"
+        && !output.reason.trim().is_empty()
+        && !output.unreviewed_scope.is_empty()
+        && output
+            .unreviewed_scope
+            .iter()
+            .all(|scope| !scope.trim().is_empty())
+        && !output.required_action.trim().is_empty())
+    .then_some(output)
+}
+
 /// Emits ExitedReviewMode item lifecycle with optional ReviewOutput,
 /// and records the review output back into conversation history.
 pub(crate) async fn exit_review_mode(
@@ -462,7 +513,7 @@ pub(crate) async fn exit_review_mode(
     } else {
         let rendered = render_review_exit_interrupted();
         let assistant_message =
-            "The review produced no result (interrupted, failed, or invalid output). Please re-run /review and wait for it to complete."
+            "The review produced no result (blocked, interrupted, failed, or invalid output). Resolve any reported blocker before re-running /review."
                 .to_string();
         (rendered, assistant_message)
     };

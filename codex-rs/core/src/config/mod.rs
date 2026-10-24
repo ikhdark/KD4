@@ -69,7 +69,6 @@ use codex_features::MULTI_AGENT_MIN_WAIT_TIMEOUT_MS;
 use codex_features::MULTI_AGENT_V2_DEFAULT_MAX_CONCURRENT_THREADS_PER_SESSION;
 use codex_features::MULTI_AGENT_V2_MIN_CONCURRENT_THREADS_PER_SESSION;
 use codex_features::MultiAgentV2ConfigToml;
-use codex_features::NetworkProxyConfigToml;
 use codex_git_utils::resolve_root_git_project_for_trust;
 use codex_http_client::HttpClientFactory;
 use codex_http_client::OutboundProxyPolicy;
@@ -109,6 +108,8 @@ use codex_protocol::permissions::NetworkSandboxPolicy;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::MultiAgentVersion;
 use codex_protocol::protocol::SandboxPolicy;
+use codex_protocol::validation::DEFAULT_VALIDATION_FULL_BUDGET;
+use codex_protocol::validation::ValidationMode;
 pub use codex_thread_store::ExtraConfig;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_absolute_path::AbsolutePathBufGuard;
@@ -129,17 +130,14 @@ use std::sync::Arc;
 
 use crate::config::permissions::BUILT_IN_READ_ONLY_PROFILE;
 use crate::config::permissions::BUILT_IN_WORKSPACE_PROFILE;
-use crate::config::permissions::apply_network_proxy_feature_config;
 use crate::config::permissions::builtin_permission_profile;
 use crate::config::permissions::compile_permission_profile_selection;
 use crate::config::permissions::compile_permission_profile_workspace_roots;
 use crate::config::permissions::default_builtin_permission_profile_name;
-use crate::config::permissions::network_proxy_config_for_profile_selection;
 use crate::config::permissions::validate_user_permission_profile_names;
 use crate::config_lock::config_without_lock_controls;
 use crate::config_lock::lock_layer_from_config;
 use crate::config_lock::read_config_lock_from_path;
-use codex_network_proxy::NetworkProxyConfig;
 use toml::Value as TomlValue;
 use toml_edit::DocumentMut;
 
@@ -147,7 +145,6 @@ pub(crate) mod agent_roles;
 mod auth_keyring;
 pub mod edit;
 mod managed_features;
-mod network_proxy_spec;
 mod otel;
 mod permission_profile_catalog;
 mod permissions;
@@ -158,11 +155,8 @@ pub use codex_config::Constrained;
 pub use codex_config::ConstraintError;
 pub use codex_config::ConstraintResult;
 pub use codex_config::LoaderOverrides;
-pub use codex_network_proxy::NetworkProxyAuditMetadata;
 use codex_sandboxing::compatibility_sandbox_policy_for_permission_profile;
 pub use managed_features::ManagedFeatures;
-pub use network_proxy_spec::NetworkProxySpec;
-pub use network_proxy_spec::StartedNetworkProxy;
 pub use permission_profile_catalog::PermissionProfileCatalogEntry;
 pub use permission_profile_catalog::permission_profile_catalog;
 use permission_profile_catalog::permission_profile_catalog_from_permissions;
@@ -198,13 +192,19 @@ pub(crate) const DEFAULT_AGENT_MAX_THREADS: Option<usize> = Some(6);
 ///
 /// The runtime subtracts `/root` before sizing child residency, so the default
 /// permits up to two concurrently resident child agents.
+// Keep role/coordination guidance here; shared audit policy belongs to
+// protocol/src/prompts/base_instructions/default.md. See AGENTS.md for ownership.
 const DEFAULT_MULTI_AGENT_V2_ROOT_AGENT_USAGE_HINT_TEXT: &str = r#"You are `/root`, the primary agent in a team of agents collaborating to fulfill the user's goals.
 
 At the start of your turn, you are the active agent.
 
 You can delegate bounded work with `spawn_agent`, continue an existing agent with `followup_task`, and communicate with `send_message`. Child agents may delegate within their assignment.
 
-Before parallel edits, describe path and contract surfaces and coordinate overlap. Follow only dependencies demonstrably affected by the requested change; advisory scopes do not prohibit necessary edits, but workers must report broader impact. Prefer clear implementation ownership, separate read-only mapping/adversarial review, and validation against the latest shared snapshot. Agent agreement alone is not proof.
+Before delegating, identify useful work to do locally and keep immediately blocking work local. Before parallel edits, describe path and contract surfaces and coordinate overlap. Follow only dependencies demonstrably affected by the requested change; advisory scopes do not prohibit necessary edits, but workers must report broader impact. Prefer clear implementation ownership, separate read-only mapping/adversarial review, and validation against the latest shared snapshot. Agent agreement alone is not proof.
+
+On an infrastructure startup failure, pause affected fan-out and coordinate one recovery owner; matching failures such as `runner pipe closed before spawn_ready` are a shared-blocker candidate, not separate code findings. Tell affected workers to stop identical retries and recovery probes; interrupt blocked retry loops if needed, not unrelated useful work. Resume affected work only after changed inputs or evidence of recovery. Consolidate duplicate blocker reports while preserving distinct findings and unread coverage.
+
+When delegation and implementation are authorized, assign each bounded fix to a worker end-to-end: diagnosis, implementation, affected-consumer follow-through, and evidence within the permitted validation scope. Root owns integration, not a second serial implementation pass. Read worker reports and inspect the cited evidence and integration-sensitive changes; do not routinely reread every file, repeat the investigation, or rerun adequate checks. Expand inspection only for a concrete overlap, contract risk, contradictory result, or evidence gap. Route corrections back to the owning worker while its assignment is active; if sealed, use a new bounded assignment. Take over only for a concrete blocker or tightly coupled integration change, and make the ownership transfer explicit.
 
 Analysis-channel messages use:
 Message Type: MESSAGE | FINAL_ANSWER
@@ -219,9 +219,17 @@ const DEFAULT_MULTI_AGENT_V2_SUBAGENT_USAGE_HINT_TEXT: &str = r#"You are a worke
 
 Identify the assigned behavior and affected consumers, check overlapping work, and notify your parent before overlapping edits. Separate files do not necessarily mean separate contracts. Reuse current parent evidence and validation; expand only for concrete dependencies or missing/changed evidence. Make necessary edits beyond advisory scope carefully and report broader impact.
 
-Use `spawn_agent` for bounded subtasks, `followup_task` for an existing agent, and `send_message` for coordination. Give children enough scope to identify overlap. Mapping/review agents stay read-only; agent agreement is not correctness proof.
+For an implementation assignment, own the fix end-to-end: establish the cause, make the changes, follow affected consumers, and supply evidence within the permitted validation scope. Resolve in-scope findings rather than handing the parent an implementation to-do list. Report the changed paths and contracts, the evidence supporting each outcome, validation performed or prohibited, and concrete remaining blockers so the parent can integrate without repeating your investigation. Mapping and review assignments do not authorize edits.
 
-In your report, lead with the result, then give only the changed paths, the evidence your parent needs to act, and anything unresolved or unverified. Preserve substantive findings even when you did not implement them; do not present an uninvestigated recommendation as rejected.
+Delegate only within your assignment and permitted role. Mapping/review agents stay read-only.
+
+For an audit/review handoff, report examined mechanisms, unread paths/ranges, and missing consumer evidence; give the parent an exact remaining slice for reassignment.
+
+Use separate internal handoff sections: `Verified findings`, `Verification requests`, and `Blockers`. Apply the base-instruction verification standard. Each verification request carries the unverified candidate, exact evidence references, reproduction procedure, and any execution/access blocker; the parent coordinates an authorized verifier.
+
+If infrastructure prevents repository access, report once to your parent with the exact error, affected path/tool, and unread scope. Do not independently retry the same startup failure, probe another thread's artifacts, or request whole files inline. Leave recovery to the coordinating parent, continue independent work if available.
+
+Lead the internal handoff with the result, relevant paths/contracts, and precise evidence references. Preserve substantive findings even when no implementation was assigned; retain bulky supporting output for targeted recovery rather than repeatedly embedding it.
 
 Your final response is delivered immediately to your parent. Analysis-channel messages use:
 Message Type: NEW_TASK | MESSAGE | FINAL_ANSWER
@@ -234,7 +242,7 @@ Messages may target your full agent path, such as `/root/...`.
 "#;
 const DEFAULT_MULTI_AGENT_V2_TOOL_NAMESPACE: &str = "agents";
 const LEGACY_MULTI_AGENT_V2_TOOL_NAMESPACE: &str = "collaboration";
-const DEFAULT_MULTI_AGENT_V2_SHARED_USAGE_HINT_TEXT: &str = r#"Call `spawn_agent`, `send_message`, `followup_task`, `wait_agent`, `interrupt_agent`, `list_agents`, `get_agent_task`, and `submit_agent_receipt` through their advertised entrypoints. When they are not listed as direct tools they are deferred inside `functions.exec`: `resolve_tool('<namespace>.<name>')` (namespace `agents` by default) returns the callable and its contract without `tool_search`; resolve and call in the same cell.
+const DEFAULT_MULTI_AGENT_V2_SHARED_USAGE_HINT_TEXT: &str = r#"Use advertised agent-tool entrypoints. For deferred tools in `functions.exec`, `resolve_tool('<namespace>.<name>')` (namespace `agents` by default) returns the callable and its contract; resolve and call in the same cell.
 
 All agents share the same working directory and filesystem:
 - edits are visible immediately to every agent;
@@ -243,7 +251,17 @@ All agents share the same working directory and filesystem:
 - overlapping edits require communication and review of the latest shared state;
 - independent reviewer agents remain read-only.
 
-Before claiming completion of delegated work: Read every returned report in full. Recover truncated or omitted portions from retained output instead of rerunning the producer. Account for every substantive finding or recommendation: implemented and verified, rejected with an evidence-based reason, outside the user's scope, or unresolved with a concrete next action or blocker. When implementation is authorized, finish verified in-scope follow-through before finalizing, and do not call a partial integration complete.
+Before filesystem-dependent fan-out, reuse a successful bounded repository read through the workers' intended backend, sandbox, and effective permissions, or perform one. A root read through a different access path is not proof; use one authorized worker as a canary when necessary, and await its read before expanding. This is source inspection, not permission to run validation. Parents at every depth coordinate shared startup failures rather than delegate identical recovery attempts.
+
+Retained artifacts remain thread-owned; sharing a handle does not grant access. Use an explicitly authorized artifact handoff only when an advertised tool supports it. Otherwise the owning thread recovers only the needed selectors and shares bounded evidence with its source path, snapshot/hash when available, and selected ranges. Do not duplicate entire large source files across agents or bypass ownership/provenance checks; if bounded evidence is insufficient and access is still blocked, report the gap.
+
+Apply the base instructions for audit/review scope, evidence, validation, and completion. The parent reconciles assigned slices against the requested inventory and detection criteria, merges examined/unread ranges and mechanisms, and assigns follow-up work for gaps. Reuse available workers or finish remaining slices locally within agent-count limits.
+
+The root owns the consolidated audit/review report and user-facing delivery required by the base instructions. Read-only workers return complete internal handoffs through the required structured-result contract, not competing report files.
+
+Before assigning execution evidence, coordinate the effective validation mode, user restrictions, worker capabilities, owning runner, available budget, and supported evidence route. Check `evidence_policy` support in the tool contract before assignment. Route internal `Verification requests` to an authorized parent/verifier; delegation does not lift execution restrictions.
+
+Use the owning agent's evidence and targeted integration review rather than redoing the worker's investigation; return gaps to the owner and make any ownership transfer explicit.
 "#;
 fn default_multi_agent_v2_usage_hint_text(usage_hint_text: &str, max_concurrency: usize) -> String {
     format!(
@@ -340,8 +358,6 @@ pub struct Permissions {
     /// Thread-scoped runtime workspace roots. Symbolic `:workspace_roots`
     /// entries in the permission profile are materialized against these roots.
     workspace_roots: Vec<AbsolutePathBuf>,
-    /// Effective network configuration applied to all spawned processes.
-    pub network: Option<NetworkProxySpec>,
     /// Whether the model may request a login shell for shell-based tools.
     /// Default to `true`
     ///
@@ -372,7 +388,6 @@ impl Permissions {
                 permission_profile,
             )?,
             workspace_roots: Vec::new(),
-            network: None,
             allow_login_shell: true,
             shell_environment_policy: ShellEnvironmentPolicy::default(),
             windows_sandbox_mode: None,
@@ -559,47 +574,7 @@ impl Permissions {
 // A profile override only inherits the selected profile's proxy/allowlist config
 // when Codex is still responsible for the network policy. `Disabled` means no
 // outer sandbox, so starting the managed proxy would narrow the override.
-fn profile_allows_configured_network_proxy(permission_profile: &PermissionProfile) -> bool {
-    match permission_profile {
-        PermissionProfile::Managed { network, .. } | PermissionProfile::External { network } => {
-            network.is_enabled()
-        }
-        PermissionProfile::Disabled => false,
-    }
-}
 
-fn build_network_proxy_spec(
-    configured_network_proxy_config: NetworkProxyConfig,
-    network_requirements: Option<Sourced<codex_config::NetworkConstraints>>,
-    permission_profile: &PermissionProfile,
-) -> std::io::Result<Option<NetworkProxySpec>> {
-    let (network_requirements, network_requirements_source) = match network_requirements {
-        Some(Sourced { value, source }) => (Some(value), Some(source)),
-        None => (None, None),
-    };
-    let has_network_requirements = network_requirements.is_some();
-    let network = NetworkProxySpec::from_config_and_constraints(
-        configured_network_proxy_config,
-        network_requirements,
-        permission_profile,
-    )
-    .map_err(|err| {
-        if let Some(source) = network_requirements_source.as_ref() {
-            std::io::Error::new(
-                err.kind(),
-                format!("failed to build managed network proxy from {source}: {err}"),
-            )
-        } else {
-            err
-        }
-    })?;
-
-    Ok(if has_network_requirements {
-        Some(network)
-    } else {
-        network.enabled().then_some(network)
-    })
-}
 
 /// Configured thread persistence backend.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -848,6 +823,11 @@ pub struct Config {
 
     /// Token budget applied when storing tool/function outputs in the context manager.
     pub tool_output_token_limit: Option<usize>,
+
+    /// Authoritative default validation execution policy.
+    pub validation_mode: ValidationMode,
+    /// Maximum BENCHMARK/FULL validation attempts in a root turn and its descendants.
+    pub validation_full_budget: usize,
 
     /// Project consumed completed textual tool outputs into retrievable receipts
     /// for manually managed history. Canonical rollout items are never changed.
@@ -1196,13 +1176,13 @@ impl ConfigBuilder {
         self
     }
 
-    pub async fn build(self) -> std::io::Result<Config> {
-        let loader = self.cloud_config_bundle.clone();
-        let generation = loader.candidate_generation();
+    pub async fn build(mut self) -> std::io::Result<Config> {
+        let loader = self.cloud_config_bundle.for_load();
+        self.cloud_config_bundle = loader.clone();
         // Keep the large config-loading future off small runtime thread stacks.
         let result = Box::pin(self.build_inner()).await;
         if result.is_err() {
-            loader.reject_candidate(generation);
+            loader.reject_loaded_candidate();
         }
         loader
             .publish_if_current(|| result)
@@ -1327,10 +1307,10 @@ impl ConfigBuilder {
 
 impl Config {
     pub(crate) fn multi_agent_version_from_features(&self) -> MultiAgentVersion {
-        if self.features.enabled(Feature::MultiAgentV2) {
+        if self.features.enabled(Feature::MultiAgentV2)
+            || self.features.enabled(Feature::Collab)
+        {
             MultiAgentVersion::V2
-        } else if self.features.enabled(Feature::Collab) {
-            MultiAgentVersion::V1
         } else {
             MultiAgentVersion::Disabled
         }
@@ -1351,7 +1331,7 @@ impl Config {
         &self,
         multi_agent_version: MultiAgentVersion,
     ) -> Option<usize> {
-        self.agent_max_threads.or(match multi_agent_version {
+        self.agent_max_threads.or(match multi_agent_version.runtime_version() {
             MultiAgentVersion::V2 => Some(
                 self.multi_agent_v2
                     .max_concurrent_threads_per_session
@@ -2525,12 +2505,6 @@ fn current_time_reminder_toml_config(
     }
 }
 
-fn network_proxy_toml_config(features: Option<&FeaturesToml>) -> Option<&NetworkProxyConfigToml> {
-    match features?.network_proxy.as_ref()? {
-        FeatureToml::Enabled(_) => None,
-        FeatureToml::Config(config) => Some(config),
-    }
-}
 
 /// Resolves configured feature values without constructing a complete [`Config`].
 ///
@@ -2845,7 +2819,6 @@ impl Config {
             &mut startup_warnings,
         )?;
         let respect_system_proxy = features.enabled(Feature::RespectSystemProxy);
-        let enable_network_proxy = features.enabled(Feature::NetworkProxy);
         let configured_windows_sandbox_mode = resolve_windows_sandbox_mode(&cfg);
         // Keep the configured mode separate so a requirement-constrained mode
         // does not look like it was explicitly selected in config.
@@ -2984,7 +2957,6 @@ impl Config {
         };
         dedupe_absolute_paths(&mut workspace_roots);
         let (
-            mut configured_network_proxy_config,
             permission_profile,
             file_system_sandbox_policy,
             mut active_permission_profile,
@@ -2992,30 +2964,7 @@ impl Config {
         ) = if let Some(permission_profile) = permission_profile {
             let (file_system_sandbox_policy, _network_sandbox_policy) =
                 permission_profile.to_runtime_permissions();
-            let configured_network_proxy_config =
-                if profile_allows_configured_network_proxy(&permission_profile)
-                    && profiles_are_active
-                {
-                    // PermissionProfile carries the active network sandbox bit, not the configured
-                    // proxy/allowlist policy. Keep that config so active profiles can round-trip
-                    // without broadening network behavior.
-                    let default_permissions = effective_permission_selection
-                        .selected_profile_id
-                        .unwrap_or_else(|| {
-                            default_builtin_permission_profile_name(
-                                &active_project,
-                                windows_sandbox_level,
-                            )
-                        });
-                    network_proxy_config_for_profile_selection(
-                        effective_permission_selection.profiles.as_ref(),
-                        default_permissions,
-                    )?
-                } else {
-                    NetworkProxyConfig::default()
-                };
             (
-                configured_network_proxy_config,
                 permission_profile,
                 file_system_sandbox_policy,
                 None,
@@ -3032,10 +2981,6 @@ impl Config {
             } else {
                 None
             };
-            let configured_network_proxy_config = network_proxy_config_for_profile_selection(
-                effective_permission_selection.profiles.as_ref(),
-                default_permissions,
-            )?;
             let (mut file_system_sandbox_policy, network_sandbox_policy) =
                 compile_permission_profile_selection(
                     effective_permission_selection.profiles.as_ref(),
@@ -3089,14 +3034,12 @@ impl Config {
                 })
             };
             (
-                configured_network_proxy_config,
                 permission_profile,
                 file_system_sandbox_policy,
                 active_permission_profile,
                 configured_workspace_roots,
             )
         } else {
-            let configured_network_proxy_config = NetworkProxyConfig::default();
             // No named `[permissions]` profile is active, but permissions
             // should still flow through the canonical profile representation.
             // Derive the old `sandbox_mode` defaults as a profile first, then
@@ -3126,22 +3069,12 @@ impl Config {
             let (file_system_sandbox_policy, _network_sandbox_policy) =
                 permission_profile.to_runtime_permissions();
             (
-                configured_network_proxy_config,
                 permission_profile,
                 file_system_sandbox_policy,
                 None,
                 Vec::new(),
             )
         };
-        if enable_network_proxy && permission_profile.network_sandbox_policy().is_enabled() {
-            if let Some(network_proxy) = network_proxy_toml_config(cfg.features.as_ref()) {
-                apply_network_proxy_feature_config(
-                    &mut configured_network_proxy_config,
-                    network_proxy,
-                );
-            }
-            configured_network_proxy_config.enabled = true;
-        }
         let effective_approval_policy_override = approval_policy_override.or(headless_approval_policy);
         let approval_policy_was_explicit =
             effective_approval_policy_override.is_some() || cfg.approval_policy.is_some();
@@ -3481,12 +3414,12 @@ impl Config {
         let mcp_servers = constrain_mcp_servers(cfg.mcp_servers.clone(), mcp_servers.as_ref())
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, format!("{e}")))?;
 
-        let network_permission_profile = constrained_permission_profile.get().clone();
-        let network = build_network_proxy_spec(
-            configured_network_proxy_config,
-            network_requirements,
-            &network_permission_profile,
-        )?;
+        if let Some(requirements) = network_requirements {
+            return Err(std::io::Error::new(
+                ErrorKind::Unsupported,
+                format!("managed network proxy requirements from {} are not supported by this build; refusing to run without enforcement", requirements.source),
+            ));
+        }
         let helper_readable_roots = Vec::new();
         let effective_permission_profile = constrained_permission_profile.value.get().clone();
         let (mut effective_file_system_sandbox_policy, effective_network_sandbox_policy) =
@@ -3541,7 +3474,6 @@ impl Config {
                 approval_policy: constrained_approval_policy.value,
                 permission_profile_state,
                 workspace_roots,
-                network,
                 allow_login_shell,
                 shell_environment_policy,
                 windows_sandbox_mode,
@@ -3594,6 +3526,10 @@ impl Config {
                 })
                 .collect(),
             tool_output_token_limit: cfg.tool_output_token_limit,
+            validation_mode: cfg.validation_mode.unwrap_or_default(),
+            validation_full_budget: cfg
+                .validation_full_budget
+                .unwrap_or(DEFAULT_VALIDATION_FULL_BUDGET),
             completed_tool_history_projection: cfg
                 .completed_tool_history_projection
                 .unwrap_or(true),
@@ -3808,52 +3744,6 @@ impl Config {
             .is_some()
     }
 
-    pub(crate) fn network_proxy_spec_for_active_permission_profile(
-        &self,
-        active_permission_profile: &ActivePermissionProfile,
-        permission_profile: &PermissionProfile,
-    ) -> std::io::Result<Option<NetworkProxySpec>> {
-        let profile_allows_network_proxy =
-            profile_allows_configured_network_proxy(permission_profile);
-        let configured_network_proxy_config = if profile_allows_network_proxy {
-            let cfg: ConfigToml = self
-                .config_layer_stack
-                .effective_config()
-                .try_into()
-                .map_err(|err| {
-                    std::io::Error::new(
-                        ErrorKind::InvalidInput,
-                        format!(
-                            "failed to read effective config for selected permission profile: {err}"
-                        ),
-                    )
-                })?;
-            let mut configured_network_proxy_config = network_proxy_config_for_profile_selection(
-                cfg.permissions.as_ref(),
-                active_permission_profile.id.as_str(),
-            )?;
-            if self.features.enabled(Feature::NetworkProxy)
-                && permission_profile.network_sandbox_policy().is_enabled()
-            {
-                if let Some(network_proxy) = network_proxy_toml_config(cfg.features.as_ref()) {
-                    apply_network_proxy_feature_config(
-                        &mut configured_network_proxy_config,
-                        network_proxy,
-                    );
-                }
-                configured_network_proxy_config.enabled = true;
-            }
-            configured_network_proxy_config
-        } else {
-            NetworkProxyConfig::default()
-        };
-
-        build_network_proxy_spec(
-            configured_network_proxy_config,
-            self.config_layer_stack.requirements().network.clone(),
-            permission_profile,
-        )
-    }
 
     pub fn bundled_skills_enabled(&self) -> bool {
         crate::skills::service::bundled_skills_enabled_from_stack(&self.config_layer_stack)

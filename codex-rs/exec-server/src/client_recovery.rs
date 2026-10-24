@@ -112,6 +112,7 @@ impl SessionState {
     }
 
     fn recover_events(&self, response: ReadResponse) -> Result<bool, ExecServerError> {
+        self.observe_read_facts(&response);
         if response.output_gap.is_some() && response.failure.is_none() {
             return self.recover_output_gap(response);
         }
@@ -411,6 +412,7 @@ impl SessionState {
             });
             ordered.last_published_seq = target;
         }
+        closed |= self.publish_ready(&mut ordered);
         drop(ordered);
         self.note_change(target);
         Ok(closed)

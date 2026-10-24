@@ -125,7 +125,7 @@ pub(crate) fn parse_user_message_content(message: &[ContentItem]) -> UserMessage
                     detail: *detail,
                 });
             }
-            ContentItem::OutputText { text } => {
+            ContentItem::OutputText { text } | ContentItem::Refusal { refusal: text } => {
                 warn!("Output text in user message: {}", text);
             }
         }
@@ -142,7 +142,9 @@ fn parse_agent_message(
     let mut content: Vec<AgentMessageContent> = Vec::new();
     for content_item in message.iter() {
         match content_item {
-            ContentItem::InputText { text } | ContentItem::OutputText { text } => {
+            ContentItem::InputText { text }
+            | ContentItem::OutputText { text }
+            | ContentItem::Refusal { refusal: text } => {
                 content.push(AgentMessageContent::Text { text: text.clone() });
             }
             _ => {
@@ -225,6 +227,7 @@ pub fn parse_turn_item(item: &ResponseItem) -> Option<TurnItem> {
             status,
             revised_prompt,
             result,
+            error,
             ..
         } => Some(TurnItem::ImageGeneration(
             codex_protocol::items::ImageGenerationItem {
@@ -232,6 +235,7 @@ pub fn parse_turn_item(item: &ResponseItem) -> Option<TurnItem> {
                 status: status.clone(),
                 revised_prompt: revised_prompt.clone(),
                 result: result.clone(),
+                error: error.clone(),
                 saved_path: None,
                 provider_usage: None,
             },

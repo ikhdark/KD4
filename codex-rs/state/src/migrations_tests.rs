@@ -344,8 +344,8 @@ async fn recency_repair_accepts_both_checkout_line_endings_without_rewriting_che
         // belong to the original checkout and must remain byte-for-byte intact.
         legacy_row.0 = 39;
 
-        // Match open_sqlite: normalize the pending checksum before repairing
-        // the legacy version, then run this same compatible migrator.
+        // Match open_sqlite: infer the convention for legacy recognition, then
+        // rebuild the per-version overrides after moving the legacy row.
         let compatible = runtime_migrator_for_pool(&pool, &runtime_state_migrator())
             .await
             .expect("infer the checkout convention before legacy repair");
@@ -358,6 +358,9 @@ async fn recency_repair_accepts_both_checkout_line_endings_without_rewriting_che
             "{line_endings:?}"
         );
 
+        let compatible = runtime_migrator_for_pool(&pool, &runtime_state_migrator())
+            .await
+            .expect("recompute the repaired version mapping");
         compatible
             .run(&pool)
             .await
@@ -371,6 +374,10 @@ async fn recency_repair_accepts_both_checkout_line_endings_without_rewriting_che
             .expect("current migration 38 schema")
             .is_some()
         );
+        let reopened = runtime_migrator_for_pool(&pool, &runtime_state_migrator())
+            .await
+            .expect("the repaired history must remain compatible on reopen");
+        reopened.run(&pool).await.expect("reopen repaired history");
     }
 }
 

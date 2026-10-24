@@ -1,1 +1,1 @@
-"""Rust build, validation, and Cargo lane tooling."""
+"""Rust build-cache and Cargo lane tooling."""

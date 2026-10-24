@@ -1,6 +1,7 @@
 use serde_json::Value as JsonValue;
 use std::collections::BTreeMap;
 use std::collections::HashSet;
+use std::io::Write;
 
 use super::metadata::normalize_code_mode_identifier;
 
@@ -572,7 +573,7 @@ fn render_schema(schema: &JsonValue, root: &JsonValue, budget: &mut RenderBudget
                     let object = render_json_schema_object(map, root, budget)?;
                     let array = render_json_schema_array(map, root, budget)?;
                     base = Some(format!(
-                        "string | number | boolean | null | {array} | {object}"
+                        "string | (number | bigint) | boolean | null | {array} | {object}"
                     ));
                 }
             }
@@ -760,7 +761,9 @@ fn render_numeric_schema(map: &serde_json::Map<String, JsonValue>, integer: bool
             .or_else(|| map.get("exclusiveMaximum"))
             .and_then(JsonValue::as_f64)
             .is_some_and(|bound| bound <= 9_007_199_254_740_991.0);
-    let numeric_type = if integer && !safe {
+    // `number` includes integral JSON lexemes too. The lossless decoder uses
+    // BigInt for unsafe integers regardless of the provider's schema label.
+    let numeric_type = if !safe {
         "(number | bigint)"
     } else {
         "number"
@@ -797,7 +800,7 @@ fn render_json_schema_array(
     if maximum.is_some_and(|maximum| maximum < minimum) {
         return Ok("never".to_string());
     }
-    // Draft-07 and 2019-09 apply schema-valued `items` to every element. Their
+    // Draft-06/07 and 2019-09 apply schema-valued `items` to every element. Their
     // unknown `prefixItems` must not turn that constraint into a tail-only rule.
     let legacy_items = root
         .get("$schema")
@@ -805,7 +808,9 @@ fn render_json_schema_array(
         .is_some_and(|dialect| {
             matches!(
                 dialect.trim_end_matches('#'),
-                "http://json-schema.org/draft-07/schema"
+                "http://json-schema.org/draft-06/schema"
+                    | "https://json-schema.org/draft-06/schema"
+                    | "http://json-schema.org/draft-07/schema"
                     | "https://json-schema.org/draft-07/schema"
                     | "http://json-schema.org/draft/2019-09/schema"
                     | "https://json-schema.org/draft/2019-09/schema"
@@ -938,7 +943,7 @@ fn render_json_schema_object(
         {
             budget.spend(description.len())?;
             for description_line in description
-                .lines()
+                .split(['\n', '\r', '\u{2028}', '\u{2029}'])
                 .map(str::trim)
                 .filter(|line| !line.is_empty())
             {
@@ -1003,7 +1008,7 @@ fn render_bounded_literal(value: &JsonValue, budget: &mut RenderBudget) -> Rende
         bytes: Vec::new(),
         limit: budget.bytes,
     };
-    serde_json::to_writer(&mut writer, value).map_err(|_| ())?;
+    write_typescript_literal(value, &mut writer).map_err(|_| ())?;
     budget.spend(writer.bytes.len().max(1))?;
     String::from_utf8(writer.bytes).map_err(|_| ())
 }
@@ -1018,9 +1023,12 @@ fn bound_literal_traversal(value: &JsonValue, budget: &mut RenderBudget) -> Resu
         JsonValue::Array(values) => values
             .iter()
             .try_for_each(|value| bound_literal_traversal(value, budget)),
-        JsonValue::Object(values) => values
-            .values()
-            .try_for_each(|value| bound_literal_traversal(value, budget)),
+        JsonValue::Object(values) => {
+            // Structural TS object types cannot enforce all constant-object
+            // semantics (notably extra keys). Keep the authoritative schema.
+            budget.incomplete = true;
+            values.values().try_for_each(|value| bound_literal_traversal(value, budget))
+        }
         _ => Ok(()),
     };
     budget.depth -= 1;
@@ -1030,6 +1038,33 @@ fn bound_literal_traversal(value: &JsonValue, budget: &mut RenderBudget) -> Resu
 struct BoundedLiteralWriter {
     bytes: Vec<u8>,
     limit: usize,
+}
+
+fn write_typescript_literal(value: &JsonValue, writer: &mut BoundedLiteralWriter) -> std::io::Result<()> {
+    match value {
+        JsonValue::Number(number) if number.as_i64().is_some_and(|number| number.unsigned_abs() > 9_007_199_254_740_991)
+            || number.as_u64().is_some_and(|number| number > 9_007_199_254_740_991) => write!(writer, "{number}n"),
+        JsonValue::Array(values) => {
+            writer.write_all(b"[")?;
+            for (index, value) in values.iter().enumerate() {
+                if index != 0 { writer.write_all(b",")?; }
+                write_typescript_literal(value, writer)?;
+            }
+            writer.write_all(b"]")
+        }
+        JsonValue::Object(values) => {
+            if values.is_empty() { return writer.write_all(b"Record<string, never>"); }
+            writer.write_all(b"{")?;
+            for (index, (key, value)) in values.iter().enumerate() {
+                if index != 0 { writer.write_all(b",")?; }
+                serde_json::to_writer(&mut *writer, key).map_err(std::io::Error::other)?;
+                writer.write_all(b":")?;
+                write_typescript_literal(value, writer)?;
+            }
+            writer.write_all(b"}")
+        }
+        _ => serde_json::to_writer(writer, value).map_err(std::io::Error::other),
+    }
 }
 
 impl std::io::Write for BoundedLiteralWriter {
@@ -1067,6 +1102,43 @@ mod tests {
     use serde_json::json;
 
     #[test]
+    fn literal_projection_preserves_bigints_and_keeps_object_schema_authoritative() {
+        for literal in [json!(9007199254740993_u64), json!(-9007199254740993_i64),
+            json!([9007199254740993_u64]), json!({"value":9007199254740993_u64})] {
+            let rendered = render_json_schema_to_typescript(&json!({"const":literal}));
+            assert!(rendered.contains("9007199254740993n"), "{rendered}");
+        }
+        for literal in [json!({}), json!({"value":{}})] {
+            let (rendered, fragments) = render_json_schema_to_typescript_recording(&json!({"const":literal}));
+            assert!(rendered.contains("Record<string, never>"), "{rendered}");
+            assert!(fragments.incomplete);
+        }
+        let rendered = render_json_schema_to_typescript(&json!({"enum":[9007199254740993_u64, 1]}));
+        assert!(rendered.contains("9007199254740993n"), "{rendered}");
+    }
+
+    #[test]
+    fn property_comments_contain_every_ecmascript_line_terminator() {
+        let rendered = render_json_schema_to_typescript(&json!({"type":"object","properties":{
+            "value":{"type":"string","description":"one\rtwo\u{2028}three\u{2029}four"}
+        }}));
+        for word in ["one","two","three","four"] {
+            assert!(rendered.contains(&format!("// {word}")), "{rendered}");
+        }
+        assert!(!rendered.contains(['\r','\u{2028}','\u{2029}']));
+    }
+
+    #[test]
+    fn draft_six_items_apply_to_all_elements_despite_unknown_prefix_items() {
+        let rendered = render_json_schema_to_typescript(&json!({
+            "$schema":"http://json-schema.org/draft-06/schema#",
+            "type":"array","items":{"type":"string"},"prefixItems":[{"type":"number"}]
+        }));
+        assert!(rendered.contains("string"), "{rendered}");
+        assert!(!rendered.contains("number"), "{rendered}");
+    }
+
+    #[test]
     fn composition_preserves_base_constraints_for_every_union_branch() {
         for keyword in ["anyOf", "oneOf"] {
             assert_eq!(
@@ -1076,7 +1148,7 @@ mod tests {
                     (keyword): [{"required": ["left"]}, {"required": ["right"]}]
                 })),
                 format!(
-                    "({{ id: string; }}) & (string | number | boolean | null | unknown[] | {{ left: unknown; [key: string]: unknown; }} | string | number | boolean | null | unknown[] | {{ right: unknown; [key: string]: unknown; }}){}",
+                    "({{ id: string; }}) & (string | (number | bigint) | boolean | null | unknown[] | {{ left: unknown; [key: string]: unknown; }} | string | (number | bigint) | boolean | null | unknown[] | {{ right: unknown; [key: string]: unknown; }}){}",
                     if keyword == "oneOf" {
                         " /* oneOf: exactly one branch must match */"
                     } else {
@@ -1091,7 +1163,7 @@ mod tests {
                 "type": "integer", "minimum": 1, "const": 2, "enum": [2, 3],
                 "allOf": [{"type": "number", "maximum": 4}]
             })),
-            "((number | bigint) /* integer; minimum: 1 */) & (2) & (2 | 3) & (number /* maximum: 4 */)"
+            "((number | bigint) /* integer; minimum: 1 */) & (2) & (2 | 3) & ((number | bigint) /* maximum: 4 */)"
         );
     }
 
@@ -1100,16 +1172,16 @@ mod tests {
         for (dialect, expected) in [
             (
                 Some("https://json-schema.org/draft/2019-09/schema"),
-                "(number /* minimum: 2 */) & (number)",
+                "((number | bigint) /* minimum: 2 */) & ((number | bigint))",
             ),
             (
                 Some("https://json-schema.org/draft/2020-12/schema"),
-                "(number /* minimum: 2 */) & (number)",
+                "((number | bigint) /* minimum: 2 */) & ((number | bigint))",
             ),
-            (Some("http://json-schema.org/draft-07/schema#"), "number"),
+            (Some("http://json-schema.org/draft-07/schema#"), "(number | bigint)"),
             (
                 None,
-                "number /* $ref siblings not projected: schema dialect unspecified */",
+                "(number | bigint) /* $ref siblings not projected: schema dialect unspecified */",
             ),
         ] {
             let mut schema = json!({
@@ -1208,7 +1280,7 @@ mod tests {
             ),
             (
                 json!({"type": "array", "items": [{"type": "string"}], "additionalItems": {"type": "number"}, "minItems": 1}),
-                "[string, ...Array<number>] /* minItems: 1 */",
+                "[string, ...Array<(number | bigint)>] /* minItems: 1 */",
             ),
             // additionalItems belongs to the legacy tuple spelling and must not
             // close a modern prefixItems tuple whose items keyword is absent.
@@ -1230,15 +1302,15 @@ mod tests {
         for (schema, expected) in [
             (
                 json!({"type": "object", "properties": {"z": {"type": "number"}}, "required": ["z", "a", "a"]}),
-                "{ a: unknown; z: number; }",
+                "{ a: unknown; z: (number | bigint); }",
             ),
             (
                 json!({"type": "object", "properties": {"name": {"type": "string"}}, "required": ["name"], "additionalProperties": {"type": "number"}}),
-                "{ name: string; [key: string]: unknown; /* additional keys: number */ }",
+                "{ name: string; [key: string]: unknown; /* additional keys: (number | bigint) */ }",
             ),
             (
                 json!({"type": "object", "additionalProperties": {"type": "number"}}),
-                "{ [key: string]: number; }",
+                "{ [key: string]: (number | bigint); }",
             ),
             (
                 json!({"type": "object", "required": ["missing"], "additionalProperties": false}),
@@ -1370,7 +1442,24 @@ mod tests {
                 "type": "number",
                 "minimum": 0.5
             })),
-            "number /* minimum: 0.5 */"
+            "(number | bigint) /* minimum: 0.5 */"
         );
+    }
+
+    #[test]
+    fn audit144_numeric_representations_require_two_safe_bounds() {
+        for kind in ["integer", "number"] {
+            for schema in [
+                json!({"type":kind}),
+                json!({"type":kind,"minimum":0}),
+                json!({"type":kind,"maximum":42}),
+                json!({"type":kind,"minimum":-9007199254740992_i64,"maximum":9007199254740992_u64}),
+            ] {
+                assert!(render_json_schema_to_typescript(&schema).contains("number | bigint"));
+            }
+            let safe =
+                json!({"type":kind,"minimum":-9007199254740991_i64,"maximum":9007199254740991_u64});
+            assert!(!render_json_schema_to_typescript(&safe).contains("bigint"));
+        }
     }
 }

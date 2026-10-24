@@ -92,88 +92,7 @@ fn orchestration_correctness_stall_timeout_defaults_and_overrides() {
     assert_eq!(effective_stall_timeout_ms(Some(30_000), Some(30_000)), None);
 }
 
-/// Audit 151: only validation launches take the workspace validation gate.
-#[test]
-fn audit151_workspace_validation_gate_is_scoped_to_validation_launches() {
-    let root = PathBuf::from("repo");
 
-    assert_eq!(
-        super::workspace_operation_root_if_needed(false, root.clone()),
-        None
-    );
-    assert_eq!(
-        super::workspace_operation_root_if_needed(true, root.clone()),
-        Some(root)
-    );
-}
-
-/// Audit 151: while another session's validation holds this workspace, a
-/// legacy non-validation command runs instead of being refused as pending
-/// validation, and a validation launch is still refused before it starts.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn audit151_held_validation_refuses_only_validation_launches() {
-    let python = which::which("python")
-        .or_else(|_| which::which("python3"))
-        .unwrap();
-    let workspace = tempfile::tempdir().unwrap();
-    // Pin the repository root to this workspace rather than an ancestor.
-    std::fs::create_dir(workspace.path().join(".git")).unwrap();
-    let peer = crate::workspace_operation_gate::acquire_workspace_validation(
-        workspace.path(),
-        "cargo test -p peer-session",
-        crate::workspace_operation_gate::ValidationOwner::for_command(
-            codex_protocol::ThreadId::new(),
-            &["cargo".to_string(), "test".to_string()],
-        ),
-    )
-    .await
-    .expect("a peer session holds the workspace validation gate");
-    for (validation, refused) in [(false, false), (true, true)] {
-        let (session, mut turn) = make_session_and_context().await;
-        turn.approval_policy =
-            crate::config::Constrained::allow_any(codex_protocol::protocol::AskForApproval::Never);
-        turn.permission_profile = codex_protocol::models::PermissionProfile::Disabled;
-        let marker = format!("marker-{validation}");
-        let mut arguments = json!({
-            "kind": "argv", "program": python,
-            "args": ["-c", format!("open('{marker}', 'w').write('ran')")],
-            "workdir": workspace.path(),
-        });
-        if validation {
-            arguments["validation"] = json!({"covered_paths": ["src"]});
-        }
-        let payload = ToolPayload::Function {
-            arguments: arguments.to_string(),
-        };
-        let result = ShellCommandHandler::default()
-            .handle(ToolInvocation {
-                session: Arc::new(session),
-                step_context: StepContext::for_test(Arc::new(turn)),
-                cancellation_token: tokio_util::sync::CancellationToken::new(),
-                tracker: Arc::new(Mutex::new(TurnDiffTracker::new())),
-                call_id: format!("audit151-held-validation-{validation}"),
-                tool_name: codex_tools::ToolName::plain("shell_command"),
-                source: ToolCallSource::Direct,
-                payload: payload.clone(),
-            })
-            .await;
-        let text = match &result {
-            Ok(output) => output.code_mode_result(&payload).to_string(),
-            Err(error) => error.to_string(),
-        };
-        assert_eq!(
-            workspace.path().join(&marker).exists(),
-            !refused,
-            "validation={validation}: {text}"
-        );
-        assert_eq!(
-            text.contains("Validation busy"),
-            refused,
-            "validation={validation}: {text}"
-        );
-    }
-    drop(peer);
-}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn validation_commands_preserve_shell_failure_diagnostics() {
@@ -813,11 +732,6 @@ async fn shell_command_handler_to_exec_params_uses_selected_environment() {
         active_permission_profile
             .as_ref()
             .map(|profile| &profile.id)
-    );
-    assert_eq!(exec_params.network, turn_context.network);
-    assert_eq!(
-        exec_params.network_environment_id.as_deref(),
-        Some("selected-environment")
     );
     assert_eq!(exec_params.expiration.timeout_ms(), timeout_ms);
     assert_eq!(exec_params.sandbox_permissions, sandbox_permissions);
@@ -1772,39 +1686,14 @@ fn oversized_validation_diagnostic_projection_is_bounded_and_recoverable() {
 
 /// Runs a known-safe version probe through the production `shell_command` handler on a host
 /// without a sandbox backend. Exec policy allows the probe under a read-only profile there, so the
-/// orchestrator requests a sandbox it cannot provide, with or without managed network.
+/// orchestrator must refuse execution rather than silently run unsandboxed.
 async fn run_version_probe_without_sandbox_backend(
-    managed_network: bool,
 ) -> Result<String, crate::FunctionCallError> {
     let (session, mut turn) = make_session_and_context().await;
     turn.permission_profile = codex_protocol::models::PermissionProfile::read_only();
     turn.windows_sandbox_level = codex_protocol::config_types::WindowsSandboxLevel::Disabled;
     turn.approval_policy =
         crate::config::Constrained::allow_any(codex_protocol::protocol::AskForApproval::Never);
-    let started_proxy = if managed_network {
-        let spec = crate::config::NetworkProxySpec::from_config_and_constraints(
-            codex_network_proxy::NetworkProxyConfig::default(),
-            /*requirements*/ None,
-            &turn.permission_profile(),
-        )
-        .expect("managed network spec");
-        let started_proxy = spec
-            .start_proxy(
-                turn.config.codex_home.as_path(),
-                &turn.permission_profile(),
-                /*policy_decider*/ None,
-                /*blocked_request_observer*/ None,
-                /*enable_network_approval_flow*/ true,
-                crate::config::NetworkProxyAuditMetadata::default(),
-            )
-            .await
-            .expect("start managed network proxy");
-        turn.network = Some(started_proxy.proxy());
-        Some(started_proxy)
-    } else {
-        None
-    };
-    assert_eq!(turn.network.is_some(), managed_network);
     let payload = ToolPayload::Function {
         arguments: json!({"kind": "argv", "program": "rg", "args": ["--version"]}).to_string(),
     };
@@ -1821,30 +1710,14 @@ async fn run_version_probe_without_sandbox_backend(
         })
         .await
         .map(|output| output.code_mode_result(&payload).to_string());
-    drop(started_proxy);
     result
 }
 
-/// Under managed network, `shell_command` must not run a command unsandboxed when this host has no
-/// sandbox backend. Like `build_exec_request` and unified exec, it refuses the launch, and the
-/// model sees the refusal as an execution error.
-#[tokio::test]
-async fn shell_command_refuses_managed_network_launch_when_no_sandbox_is_available() {
-    let error = match run_version_probe_without_sandbox_backend(/*managed_network*/ true).await {
-        Err(crate::FunctionCallError::RespondToModel(error)) => error,
-        Err(error) => panic!("unexpected handler error: {error}"),
-        Ok(output) => panic!("managed network must not run a command without a sandbox: {output}"),
-    };
-    assert_eq!(
-        error,
-        "execution error: requested restrictions require a sandbox, but no sandbox backend is available; refusing to run unsandboxed"
-    );
-}
 
 /// Read-only restrictions still require a sandbox even without a managed proxy.
 #[tokio::test]
 async fn shell_command_without_managed_network_refuses_when_no_sandbox_is_available() {
-    let error = match run_version_probe_without_sandbox_backend(/*managed_network*/ false).await {
+    let error = match run_version_probe_without_sandbox_backend().await {
         Err(crate::FunctionCallError::RespondToModel(error)) => error,
         Err(error) => panic!("unexpected handler error: {error}"),
         Ok(output) => panic!("restricted command must not run without a sandbox: {output}"),

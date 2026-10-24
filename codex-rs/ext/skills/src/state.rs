@@ -77,7 +77,8 @@ impl SkillsThreadState {
 
     /// Returns catalogs for stable selected roots.
     ///
-    /// The first successful catalog for a root remains cached until this thread state is dropped.
+    /// Healthy catalogs remain cached until this thread state is dropped.
+    /// Warning-bearing results retry periodically: warnings can wrap transient I/O failures.
     /// Failures are retained for the current turn, then retried on the next real observation.
     /// Environment availability only controls whether the root is projected into the current
     /// step; it never invalidates the cache. There is intentionally no filesystem watcher or
@@ -339,7 +340,7 @@ impl SkillsThreadState {
             if let Some(cached) = cache.iter().find(|cached| {
                 cached.root == root
                     && cached.binding == binding
-                    && (matches!(cached.catalog.get(), Some(Ok(_)))
+                    && (cached.reusable_success()
                         || cached.turn_id == query.turn_id)
             }) {
                 (Arc::clone(&cached.catalog), cached.discovery_deadline)
@@ -386,7 +387,7 @@ impl SkillsThreadState {
                             .bound_executor_roots
                             .iter()
                             .find(|bound| bound.selected_root() == root)
-                    && (matches!(cached.catalog.get(), Some(Ok(_)))
+                    && (cached.reusable_success()
                         || cached.turn_id == query.turn_id)
             })
             .and_then(|cached| cached.catalog.get().cloned())
@@ -400,6 +401,13 @@ struct CachedExecutorCatalog {
     turn_id: String,
     catalog: Arc<OnceCell<SkillProviderResult<SkillCatalog>>>,
     discovery_deadline: tokio::time::Instant,
+}
+
+impl CachedExecutorCatalog {
+    fn reusable_success(&self) -> bool {
+        matches!(self.catalog.get(), Some(Ok(catalog)) if catalog.warnings.is_empty()
+            || tokio::time::Instant::now() < self.discovery_deadline + std::time::Duration::from_secs(30))
+    }
 }
 
 struct OrchestratorGenerationCache {

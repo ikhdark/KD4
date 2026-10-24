@@ -169,6 +169,7 @@ pub fn require_logon_sandbox_creds(
         deny_write_paths_override,
         proxy_enforced,
         proxy_settings_mode,
+        None,
     )
 }
 
@@ -186,7 +187,9 @@ pub(crate) fn require_logon_sandbox_creds_with_additional_read_roots(
     deny_write_paths_override: &[PathBuf],
     proxy_enforced: bool,
     proxy_settings_mode: crate::WindowsSandboxProxySettingsMode,
+    cancellation: Option<&crate::WindowsSandboxCancellationToken>,
 ) -> Result<SandboxCreds> {
+    crate::setup::check_setup_cancellation(cancellation)?;
     let sandbox_dir = crate::setup::sandbox_dir(codex_home);
     let mut needed_read = read_roots_override
         .map(<[PathBuf]>::to_vec)
@@ -216,9 +219,18 @@ pub(crate) fn require_logon_sandbox_creds_with_additional_read_roots(
                 setup_reason = Some(reason);
                 None
             } else {
-                let selected = select_identity(network_identity, codex_home)?;
+                let selected = match select_identity(network_identity, codex_home) {
+                    Ok(selected) => selected,
+                    Err(_) => {
+                        // Treat undecodable cached credentials like an absent
+                        // identity. Full setup rewrites them once; post-repair
+                        // selection below still propagates failures.
+                        setup_reason = Some("unusable cached sandbox credentials".to_string());
+                        None
+                    }
+                };
                 if selected.is_none() {
-                    setup_reason = Some(
+                    setup_reason.get_or_insert_with(||
                         "sandbox users missing or incompatible with marker version".to_string(),
                     );
                 }
@@ -256,6 +268,7 @@ pub(crate) fn require_logon_sandbox_creds_with_additional_read_roots(
                 deny_write_paths: Some(deny_write_paths_override.to_vec()),
             },
             &desired_offline_proxy_settings,
+            cancellation,
         )?;
         identity = select_identity(network_identity, codex_home)?;
     }
@@ -276,6 +289,7 @@ pub(crate) fn require_logon_sandbox_creds_with_additional_read_roots(
             deny_write_paths: Some(deny_write_paths_override.to_vec()),
         },
         &desired_offline_proxy_settings,
+        cancellation,
     )?;
     let identity = identity.ok_or_else(|| {
         anyhow!(
@@ -326,7 +340,9 @@ pub(crate) fn refresh_logon_sandbox_creds(
     deny_write_paths_override: &[PathBuf],
     proxy_enforced: bool,
     proxy_settings_mode: crate::WindowsSandboxProxySettingsMode,
+    cancellation: Option<&crate::WindowsSandboxCancellationToken>,
 ) -> Result<SandboxCreds> {
+    crate::setup::check_setup_cancellation(cancellation)?;
     remove_sandbox_users_file(codex_home, "sandbox user login failed")?;
     require_logon_sandbox_creds_with_additional_read_roots(
         permissions,
@@ -341,6 +357,7 @@ pub(crate) fn refresh_logon_sandbox_creds(
         deny_write_paths_override,
         proxy_enforced,
         proxy_settings_mode,
+        cancellation,
     )
 }
 

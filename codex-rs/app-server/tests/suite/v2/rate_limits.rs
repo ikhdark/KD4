@@ -101,6 +101,64 @@ async fn get_account_rate_limits_returns_snapshot() -> Result<()> {
 }
 
 #[tokio::test]
+async fn get_account_rate_limits_required_failure_does_not_wait_for_optional_details() -> Result<()>
+{
+    let codex_home = TempDir::new()?;
+    write_chatgpt_auth(
+        codex_home.path(),
+        ChatGptAuthFixture::new("chatgpt-token")
+            .account_id("account-123")
+            .plan_type("pro"),
+        AuthCredentialsStoreMode::File,
+    )?;
+    let server = MockServer::start().await;
+    write_chatgpt_base_url(codex_home.path(), &server.uri())?;
+    Mock::given(method("GET"))
+        .and(path("/api/codex/usage"))
+        .respond_with(
+            ResponseTemplate::new(500)
+                .set_body_string("required usage failed")
+                .set_delay(std::time::Duration::from_millis(200)),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/codex/rate-limit-reset-credits"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({
+                    "credits": [], "available_count": 0, "total_earned_count": 0,
+                }))
+                .set_delay(std::time::Duration::from_secs(7)),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .without_auto_env()
+        .with_env_overrides(&[("OPENAI_API_KEY", None)])
+        .build()
+        .await?;
+    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+    let request = mcp.send_get_account_rate_limits_request().await?;
+    let error = timeout(
+        std::time::Duration::from_secs(2),
+        mcp.read_stream_until_error_message(RequestId::Integer(request)),
+    )
+    .await??;
+    assert_eq!(error.error.code, INTERNAL_ERROR_CODE);
+    assert!(
+        error
+            .error
+            .message
+            .starts_with("failed to fetch codex rate limits:")
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn get_account_rate_limits_returns_pro_max_snapshot() -> Result<()> {
     assert_get_account_rate_limits_returns_snapshot("promax", AccountPlanType::ProMax).await
 }

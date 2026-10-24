@@ -337,7 +337,7 @@ fn parse_literal_word(node: Node<'_>, src: &str) -> Option<String> {
     let text = node.utf8_text(src.as_bytes()).ok()?;
     // These unquoted forms need escape decoding or runtime expansion. Preserve
     // the outer shell invocation rather than claiming their source is exact argv.
-    if text.contains(['\\', '*', '?', '[', ']', '{', '}', '~']) {
+    if text.starts_with('=') || text.contains(['\\', '*', '?', '[', ']', '{', '}', '~']) {
         return None;
     }
     Some(text.to_string())

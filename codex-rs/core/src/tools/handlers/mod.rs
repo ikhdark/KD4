@@ -13,8 +13,6 @@ mod command_windows_corpus_tests;
 mod current_time;
 mod dynamic;
 pub(crate) mod extension_tools;
-#[cfg(test)]
-mod full_suite_dispatch_tests;
 mod list_available_plugins_to_install;
 pub(crate) mod list_available_plugins_to_install_spec;
 mod list_files;
@@ -23,7 +21,6 @@ mod managed_cargo_lane_dispatch_tests;
 pub(crate) mod mcp;
 mod mcp_resource;
 pub(crate) mod mcp_resource_spec;
-pub(crate) mod multi_agents;
 pub(crate) mod multi_agents_common;
 pub(crate) mod multi_agents_spec;
 pub(crate) mod multi_agents_v2;
@@ -49,6 +46,8 @@ pub(crate) mod test_sync_spec;
 mod tool_search;
 pub(crate) mod tool_search_spec;
 pub(crate) mod unified_exec;
+#[cfg(test)]
+mod validation_mode_tests;
 mod view_image;
 pub(crate) mod view_image_spec;
 mod wait_for_environment;
@@ -93,11 +92,11 @@ pub(crate) use read_file::ReadFileHandler;
 pub(crate) use read_file::ReadStatusHandler;
 pub(crate) use read_file::canonical_read_file_arguments;
 pub(crate) use read_file::current_file_fingerprint;
-pub(crate) use read_file::current_file_snapshot;
-pub(crate) use read_file::ReadFileReplayMiss;
-pub(crate) use read_file::scope_read_file_replay_miss;
+
+
+
 pub(crate) use read_file::existing_tests_changed;
-pub(crate) use read_file::reselect_read_file_output;
+
 pub(crate) use read_file::validate_read_file_arguments;
 pub use read_tool_output::ReadToolOutputHandler;
 #[cfg(test)]
@@ -228,22 +227,10 @@ where
     })
 }
 
-pub(crate) fn resolve_search_repository_root(cwd: &Path) -> PathBuf {
-    #[cfg(test)]
-    SEARCH_ROOT_DISCOVERIES
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .push(cwd.to_path_buf());
-    resolve_repository_root(cwd)
-}
-
 pub(crate) fn resolve_repository_root(cwd: &Path) -> PathBuf {
     resolve_repository_root_with(cwd, get_git_repo_root)
 }
 
-// Search classification runs on blocking threads, which task-locals do not reach.
-#[cfg(test)]
-static SEARCH_ROOT_DISCOVERIES: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
 
 fn resolve_repository_root_with(
     cwd: &Path,
@@ -710,7 +697,7 @@ fn uri_permissions_are_preapproved(
 #[cfg(test)]
 mod tests {
     #[tokio::test]
-    async fn ordinary_exec_and_shell_handlers_skip_search_discovery_but_track_mutations() {
+    async fn ordinary_exec_and_shell_handlers_track_mutations_without_search_bookkeeping() {
         use crate::session::step_context::StepContext;
         use crate::tools::context::ToolCallSource;
         use crate::tools::context::ToolInvocation;
@@ -743,14 +730,6 @@ mod tests {
                 source: ToolCallSource::Direct,
                 payload: payload.clone(),
             };
-            let discovered_for_workdir = || {
-                let workdir = temp.path().file_name().unwrap();
-                super::SEARCH_ROOT_DISCOVERIES
-                    .lock()
-                    .unwrap()
-                    .iter()
-                    .any(|cwd| cwd.ends_with(workdir))
-            };
             let output = if shell_handler {
                 super::ShellCommandHandler::default()
                     .handle(invocation)
@@ -761,28 +740,12 @@ mod tests {
                     .await
             }
             .expect("ordinary command executes");
-            assert!(!discovered_for_workdir());
             assert!(
                 output
                     .code_mode_result(&payload)
                     .to_string()
                     .contains("root-discovery-probe")
             );
-            // Control: the handlers' own classification call does reach the probe
-            // for a search command, from the blocking thread it runs on.
-            let search_cwd = temp.path().to_path_buf();
-            crate::tools::run_blocking_command_analysis(move || {
-                super::command_search::classify_rg_search_with_repository(
-                    &["rg".to_string(), "needle".to_string()],
-                    /*shell_type*/ None,
-                    search_cwd.as_path(),
-                    || super::resolve_search_repository_root(search_cwd.as_path()),
-                )
-            })
-            .await
-            .expect("classification task")
-            .expect("search classification");
-            assert!(discovered_for_workdir());
             assert_eq!(
                 std::fs::read_to_string(temp.path().join("mutation-probe")).unwrap(),
                 "observed"

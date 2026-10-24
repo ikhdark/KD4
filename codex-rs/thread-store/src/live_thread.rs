@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
@@ -40,6 +41,7 @@ pub struct LiveThread {
     history_mode: ThreadHistoryMode,
     thread_store: Arc<dyn ThreadStore>,
     metadata_sync: Arc<Mutex<ThreadMetadataSync>>,
+    writer_retired: Arc<std::sync::atomic::AtomicBool>,
     terminal_events: Arc<StdMutex<TerminalEventIndex>>,
     fork_history: Arc<StdMutex<Weak<StoredThreadHistory>>>,
     persistence_telemetry: RolloutPersistenceTelemetry,
@@ -47,6 +49,9 @@ pub struct LiveThread {
 
 struct TerminalEventIndex {
     by_turn_id: HashMap<String, EventMsg>,
+    input_turn_ids: HashSet<String>,
+    current_turn_id: Option<String>,
+    inputs_trusted: bool,
     trusted: bool,
     pending_terminal_appends: usize,
     revision: u64,
@@ -56,6 +61,9 @@ impl TerminalEventIndex {
     fn trusted_empty() -> Self {
         Self {
             by_turn_id: HashMap::new(),
+            input_turn_ids: HashSet::new(),
+            current_turn_id: None,
+            inputs_trusted: true,
             trusted: true,
             pending_terminal_appends: 0,
             revision: 0,
@@ -73,6 +81,29 @@ impl TerminalEventIndex {
             let RolloutItem::EventMsg(event) = item else {
                 continue;
             };
+            match event {
+                EventMsg::TurnStarted(event) => {
+                    self.current_turn_id = Some(event.turn_id.clone());
+                }
+                EventMsg::UserMessage(_) => {
+                    if let Some(turn_id) = &self.current_turn_id {
+                        self.input_turn_ids.insert(turn_id.clone());
+                    }
+                }
+                EventMsg::ItemCompleted(event)
+                    if matches!(&event.item, codex_protocol::items::TurnItem::UserMessage(_)) =>
+                {
+                    self.input_turn_ids.insert(event.turn_id.clone());
+                }
+                EventMsg::ThreadRolledBack(_) => {
+                    // A receipt from a removed prefix is not custody evidence.
+                    // Leave historical rollback reconstruction to the fallback.
+                    self.input_turn_ids.clear();
+                    self.current_turn_id = None;
+                    self.inputs_trusted = false;
+                }
+                _ => {}
+            }
             let Some(turn_id) = terminal_event_turn_id(event) else {
                 continue;
             };
@@ -91,7 +122,9 @@ struct TerminalAppendGuard {
 impl TerminalAppendGuard {
     fn new(index: Arc<StdMutex<TerminalEventIndex>>, items: &[RolloutItem]) -> Self {
         let active = items.iter().any(|item| {
-            matches!(item, RolloutItem::EventMsg(event) if terminal_event_turn_id(event).is_some())
+            matches!(item, RolloutItem::EventMsg(event) if terminal_event_turn_id(event).is_some()
+                || matches!(event, EventMsg::TurnStarted(_) | EventMsg::UserMessage(_) | EventMsg::ThreadRolledBack(_))
+                || matches!(event, EventMsg::ItemCompleted(event) if matches!(&event.item, codex_protocol::items::TurnItem::UserMessage(_))))
         });
         if active {
             let mut terminal_events = index
@@ -212,6 +245,7 @@ impl LiveThread {
             history_mode,
             thread_store,
             metadata_sync: Arc::new(Mutex::new(metadata_sync)),
+            writer_retired: Default::default(),
             terminal_events: Arc::new(StdMutex::new(TerminalEventIndex::trusted_empty())),
             fork_history: Arc::default(),
             persistence_telemetry: RolloutPersistenceTelemetry::new(thread_id),
@@ -237,6 +271,7 @@ impl LiveThread {
             history_mode,
             thread_store,
             metadata_sync: Arc::new(Mutex::new(metadata_sync)),
+            writer_retired: Default::default(),
             terminal_events: Arc::new(StdMutex::new(
                 terminal_events.unwrap_or_else(TerminalEventIndex::trusted_empty),
             )),
@@ -448,14 +483,25 @@ impl LiveThread {
             .await
     }
 
+    pub async fn shutdown(&self) -> ThreadStoreResult<()> {
+        let thread = self.clone();
+        // Keep phase publication with the accepted retirement, even when its
+        // observer is cancelled between writer exit and metadata settlement.
+        tokio::spawn(async move { thread.shutdown_owned().await }).await
+            .map_err(|error| crate::ThreadStoreError::Internal { message: error.to_string() })?
+    }
+
     #[expect(
         clippy::await_holding_invalid_type,
         reason = "Serializes canonical history, metadata commits and recovery across asynchronous store operations"
     )]
-    pub async fn shutdown(&self) -> ThreadStoreResult<()> {
+    async fn shutdown_owned(&self) -> ThreadStoreResult<()> {
         let mut metadata_sync = self.metadata_sync.lock().await;
         self.recover_uncertain_metadata(&mut metadata_sync).await?;
-        self.thread_store.shutdown_thread(self.thread_id).await?;
+        if !self.writer_retired.load(std::sync::atomic::Ordering::Acquire) {
+            self.thread_store.shutdown_thread(self.thread_id).await?;
+            self.writer_retired.store(true, std::sync::atomic::Ordering::Release);
+        }
         let update = metadata_sync.take_pending_update_for_existing_history();
         self.apply_pending_metadata_update(&mut metadata_sync, update)
             .await
@@ -480,6 +526,30 @@ impl LiveThread {
                 include_archived,
             })
             .await
+    }
+
+    /// Proves input custody without materializing history on the trusted live
+    /// path. Serialize the readable persistence barrier with canonical appends;
+    /// an accepted in-memory append alone is never a durable receipt.
+    #[expect(
+        clippy::await_holding_invalid_type,
+        reason = "Binds the input receipt to the successfully flushed canonical prefix"
+    )]
+    pub async fn durable_input_recorded(&self, turn_id: &str) -> ThreadStoreResult<Option<bool>> {
+        let mut metadata_sync = self.metadata_sync.lock().await;
+        self.thread_store.flush_thread(self.thread_id).await?;
+        self.recover_uncertain_metadata(&mut metadata_sync).await?;
+        let update = metadata_sync.take_pending_update_for_existing_history();
+        self.apply_pending_metadata_update(&mut metadata_sync, update).await?;
+        let index = self
+            .terminal_events
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let recorded = index.input_turn_ids.contains(turn_id);
+        Ok((index.trusted
+            && index.pending_terminal_appends == 0
+            && (index.inputs_trusted || recorded))
+            .then_some(recorded))
     }
 
     /// Returns the first terminal event accepted into the canonical stream for `turn_id`.
@@ -588,35 +658,52 @@ impl LiveThread {
         Ok(history)
     }
 
-    #[expect(
-        clippy::await_holding_invalid_type,
-        reason = "Serializes canonical history, metadata commits and recovery across asynchronous store operations"
-    )]
     pub async fn update_metadata(
         &self,
         patch: ThreadMetadataPatch,
         include_archived: bool,
     ) -> ThreadStoreResult<StoredThread> {
-        let mut metadata_sync = self.metadata_sync.lock().await;
-        self.recover_uncertain_metadata(&mut metadata_sync).await?;
-        let update = metadata_sync.take_pending_update();
-        self.apply_pending_metadata_update(&mut metadata_sync, update)
-            .await?;
-        let explicit_patch = patch.clone();
-        *self
-            .fork_history
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Weak::new();
-        let thread = self
-            .thread_store
-            .update_thread_metadata(UpdateThreadMetadataParams {
-                thread_id: self.thread_id,
-                patch,
-                include_archived,
-            })
-            .await?;
-        metadata_sync.record_explicit_update(explicit_patch);
-        Ok(thread)
+        // Waiting for admission stays cancellable. Once admitted, the store mutation and
+        // live observation must share an owner: local compatibility finalizers can still
+        // be pending after SQLite commits, even if the caller stops waiting.
+        let mut metadata_sync = Arc::clone(&self.metadata_sync).lock_owned().await;
+        let live_thread = self.clone();
+        let thread_id = self.thread_id;
+        tokio::spawn(async move {
+            let result: ThreadStoreResult<_> = async {
+                live_thread
+                    .recover_uncertain_metadata(&mut metadata_sync)
+                    .await?;
+                let update = metadata_sync.take_pending_update();
+                live_thread
+                    .apply_pending_metadata_update(&mut metadata_sync, update)
+                    .await?;
+                let explicit_patch = patch.clone();
+                *live_thread
+                    .fork_history
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Weak::new();
+                let thread = live_thread
+                    .thread_store
+                    .update_thread_metadata(UpdateThreadMetadataParams {
+                        thread_id,
+                        patch,
+                        include_archived,
+                    })
+                    .await?;
+                metadata_sync.record_explicit_update(explicit_patch);
+                Ok(thread)
+            }
+            .await;
+            if let Err(error) = &result {
+                warn!(%thread_id, %error, "live metadata update did not settle successfully");
+            }
+            result
+        })
+        .await
+        .map_err(|error| crate::ThreadStoreError::Internal {
+            message: format!("live metadata update owner failed for {thread_id}: {error}"),
+        })?
     }
 
     /// Returns the live local rollout path for legacy local-only callers.
@@ -733,6 +820,97 @@ mod tests {
             time_to_first_token_ms: None,
             timing: None,
         }))
+    }
+
+    fn input_start(turn_id: &str) -> RolloutItem {
+        RolloutItem::EventMsg(EventMsg::TurnStarted(codex_protocol::protocol::TurnStartedEvent {
+            turn_id: turn_id.into(), trace_id: None, started_at: None,
+            model_context_window: None, collaboration_mode_kind: Default::default(),
+        }))
+    }
+
+    fn user_input() -> RolloutItem {
+        RolloutItem::EventMsg(EventMsg::UserMessage(codex_protocol::protocol::UserMessageEvent {
+            message: "input".into(), ..Default::default()
+        }))
+    }
+
+    #[tokio::test]
+    async fn durable_input_receipts_avoid_history_reads_and_reject_uncertain_prefixes() {
+        let store = Arc::new(InMemoryThreadStore::default());
+        let live = LiveThread::create(store.clone(), create_params(ThreadId::new(), PathBuf::new())).await.unwrap();
+        live.append_items_ordered(&[input_start("first")]).await.unwrap();
+        assert_eq!(live.durable_input_recorded("first").await.unwrap(), Some(false));
+        live.append_items_ordered(&[user_input()]).await.unwrap();
+        assert_eq!(live.durable_input_recorded("first").await.unwrap(), Some(true));
+        live.append_items_ordered(&[input_start("second")]).await.unwrap();
+        assert_eq!(live.durable_input_recorded("second").await.unwrap(), Some(false));
+        assert_eq!(live.durable_input_recorded("first").await.unwrap(), Some(true));
+        let calls = store.calls().await;
+        assert_eq!(calls.load_history, 0, "trusted handoffs never materialize growing history");
+        assert_eq!(calls.read_thread, 0);
+        assert_eq!(calls.flush_thread, 4, "every receipt is bound to a successful barrier");
+        live.append_items_ordered(&[RolloutItem::EventMsg(EventMsg::ThreadRolledBack(codex_protocol::protocol::ThreadRolledBackEvent { num_turns: 1 }))]).await.unwrap();
+        assert_eq!(live.durable_input_recorded("first").await.unwrap(), None, "rollback needs authoritative replay");
+        live.append_items_ordered(&[input_start("third"), user_input()]).await.unwrap();
+        assert_eq!(live.durable_input_recorded("third").await.unwrap(), Some(true));
+        drop(TerminalAppendGuard::new(live.terminal_events.clone(), &[user_input()]));
+        assert_eq!(live.durable_input_recorded("third").await.unwrap(), None, "ambiguous append cannot issue receipts");
+    }
+
+    #[tokio::test]
+    #[expect(
+        clippy::await_holding_invalid_type,
+        reason = "Queues append and receipt behind the canonical owner to exercise their admission order"
+    )]
+    async fn durable_input_receipt_serializes_with_an_admitted_append() {
+        let store = Arc::new(InMemoryThreadStore::default());
+        let live = LiveThread::create(store.clone(), create_params(ThreadId::new(), PathBuf::new())).await.unwrap();
+        let items = [input_start("racing"), user_input()];
+        let owner = live.metadata_sync.lock().await;
+        let mut append = Box::pin(live.append_items_ordered(&items));
+        assert!(matches!(std::future::poll_fn(|cx| std::task::Poll::Ready(std::future::Future::poll(append.as_mut(), cx))).await, std::task::Poll::Pending));
+        let mut receipt = Box::pin(live.durable_input_recorded("racing"));
+        assert!(matches!(std::future::poll_fn(|cx| std::task::Poll::Ready(std::future::Future::poll(receipt.as_mut(), cx))).await, std::task::Poll::Pending));
+        assert_eq!(store.calls().await.flush_thread, 0);
+        drop(owner);
+        let (append, receipt) = tokio::join!(append, receipt);
+        append.unwrap();
+        assert_eq!(receipt.unwrap(), Some(true));
+        assert_eq!(store.calls().await.load_history, 0);
+    }
+
+    #[tokio::test]
+    async fn durable_input_receipts_cover_modern_completed_user_items() {
+        let store = Arc::new(InMemoryThreadStore::default());
+        let thread_id = ThreadId::new();
+        let mut params = create_params(thread_id, PathBuf::new());
+        params.history_mode = ThreadHistoryMode::Paginated;
+        let live = LiveThread::create(store, params).await.unwrap();
+        let item = codex_protocol::items::TurnItem::UserMessage(codex_protocol::items::UserMessageItem::new(&[]));
+        live.append_items_ordered(&[RolloutItem::EventMsg(EventMsg::ItemStarted(codex_protocol::protocol::ItemStartedEvent { thread_id, turn_id: "modern".into(), item: item.clone(), started_at_ms: 0 }))]).await.unwrap();
+        assert_eq!(live.durable_input_recorded("modern").await.unwrap(), Some(false));
+        live.append_items_ordered(&[RolloutItem::EventMsg(EventMsg::ItemCompleted(codex_protocol::protocol::ItemCompletedEvent { thread_id, turn_id: "modern".into(), item, completed_at_ms: 0 }))]).await.unwrap();
+        assert_eq!(live.durable_input_recorded("modern").await.unwrap(), Some(true));
+        assert_eq!(live.durable_input_recorded("other").await.unwrap(), Some(false));
+    }
+
+    #[tokio::test]
+    async fn durable_input_receipt_failure_retains_custody_until_flush_recovers() {
+        let home = tempfile::TempDir::new().unwrap();
+        let store = Arc::new(LocalThreadStore::new(LocalThreadStoreConfig {
+            codex_home: home.path().to_path_buf(), sqlite_home: home.path().to_path_buf(), default_model_provider_id: "test-provider".into(),
+        }, None));
+        let thread_id = ThreadId::new();
+        let live = LiveThread::create(store.clone(), create_params(thread_id, home.path().to_path_buf())).await.unwrap();
+        let path = store.live_rollout_path(thread_id).await.unwrap();
+        live.append_items_ordered(&[input_start("turn"), user_input()]).await.unwrap();
+        assert!(!path.exists());
+        std::fs::create_dir_all(&path).unwrap();
+        assert!(live.durable_input_recorded("turn").await.is_err());
+        std::fs::remove_dir(&path).unwrap();
+        assert_eq!(live.durable_input_recorded("turn").await.unwrap(), Some(true));
+        live.shutdown().await.unwrap();
     }
 
     #[tokio::test]
@@ -935,5 +1113,169 @@ mod tests {
                 .expect("lookup")
                 .is_some()
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelled_rename_after_commit_settles_before_live_append_and_barrier() {
+        for fail_name_index in [false, true] {
+            let home = tempfile::TempDir::new().expect("temp dir");
+            let runtime = codex_state::StateRuntime::init(
+                home.path().to_path_buf(),
+                "test-provider".to_string(),
+            )
+            .await
+            .expect("state db");
+            let store = Arc::new(LocalThreadStore::new(
+                LocalThreadStoreConfig {
+                    codex_home: home.path().to_path_buf(),
+                    sqlite_home: home.path().to_path_buf(),
+                    default_model_provider_id: "test-provider".to_string(),
+                },
+                Some(runtime.clone()),
+            ));
+            let thread_id = ThreadId::new();
+            let live = LiveThread::create(
+                store,
+                create_params(thread_id, home.path().to_path_buf()),
+            )
+            .await
+            .expect("create");
+            // Use the compatibility writer's actual lock to hold its finalizer after
+            // the SQLite commit, without relying on sleeps or scheduler ordering.
+            let index_lock = std::fs::File::options()
+                .create(true)
+                .read(true)
+                .write(true)
+                .truncate(false)
+                .open(home.path().join("session_index.jsonl.lock"))
+                .expect("index lock file");
+            index_lock.lock().expect("hold index finalizer");
+            let renaming = live.clone();
+            let rename = tokio::spawn(async move {
+                renaming
+                    .update_metadata(
+                        ThreadMetadataPatch {
+                            name: Some(Some("custom title".to_string())),
+                            ..Default::default()
+                        },
+                        false,
+                    )
+                    .await
+            });
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                loop {
+                    if runtime
+                        .get_thread(thread_id)
+                        .await
+                        .expect("read committed title")
+                        .is_some_and(|metadata| metadata.title == "custom title")
+                    {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("rename commits before compatibility finalizer");
+            assert!(!rename.is_finished(), "name-index finalizer is still blocked");
+            rename.abort();
+            assert!(rename.await.expect_err("cancel observer").is_cancelled());
+            assert!(
+                live.metadata_sync.try_lock().is_err(),
+                "observer cancellation must not release the live metadata owner"
+            );
+
+            let mut flush = Box::pin(live.flush());
+            assert!(matches!(
+                std::future::poll_fn(|cx| std::task::Poll::Ready(std::future::Future::poll(
+                    flush.as_mut(),
+                    cx
+                )))
+                .await,
+                std::task::Poll::Pending
+            ));
+            let items = [RolloutItem::EventMsg(EventMsg::UserMessage(
+                codex_protocol::protocol::UserMessageEvent {
+                    message: "first user message".to_string(),
+                    ..Default::default()
+                },
+            ))];
+            let mut append = Box::pin(live.append_items(&items));
+            assert!(matches!(
+                std::future::poll_fn(|cx| std::task::Poll::Ready(std::future::Future::poll(
+                    append.as_mut(),
+                    cx
+                )))
+                .await,
+                std::task::Poll::Pending
+            ));
+            if fail_name_index {
+                // A committed rename still succeeds when the compatibility write fails.
+                std::fs::create_dir(home.path().join("session_index.jsonl"))
+                    .expect("inject name-index write failure");
+            }
+            drop(index_lock);
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                flush.await.expect("barrier after rename settles");
+                append.await.expect("append after rename settles");
+            })
+            .await
+            .expect("live successors complete");
+            let metadata = runtime
+                .get_thread(thread_id)
+                .await
+                .expect("read sqlite metadata")
+                .expect("sqlite metadata");
+            assert_eq!(metadata.title, "custom title");
+            assert_eq!(
+                metadata.first_user_message.as_deref(),
+                Some("first user message")
+            );
+            if !fail_name_index {
+                assert_eq!(
+                    codex_rollout::find_thread_name_by_id(home.path(), &thread_id)
+                        .await
+                        .expect("compatibility name"),
+                    Some("custom title".to_string())
+                );
+            }
+            live.shutdown().await.expect("shutdown");
+            runtime.close().await;
+        }
+    }
+
+    #[tokio::test]
+    #[expect(
+        clippy::await_holding_invalid_type,
+        reason = "Holds the metadata owner to cancel an explicit update before admission"
+    )]
+    async fn cancelled_rename_before_admission_does_not_start_store_mutation() {
+        let store = Arc::new(InMemoryThreadStore::default());
+        let live = LiveThread::create(
+            store.clone(),
+            create_params(ThreadId::new(), PathBuf::new()),
+        )
+        .await
+        .expect("create");
+        let owner = live.metadata_sync.lock().await;
+        let mut rename = Box::pin(live.update_metadata(
+            ThreadMetadataPatch {
+                name: Some(Some("not admitted".to_string())),
+                ..Default::default()
+            },
+            false,
+        ));
+        assert!(matches!(
+            std::future::poll_fn(|cx| std::task::Poll::Ready(std::future::Future::poll(
+                rename.as_mut(),
+                cx
+            )))
+            .await,
+            std::task::Poll::Pending
+        ));
+        drop(rename);
+        drop(owner);
+        live.flush().await.expect("barrier after cancelled waiter");
+        assert_eq!(store.calls().await.update_thread_metadata, 0);
     }
 }

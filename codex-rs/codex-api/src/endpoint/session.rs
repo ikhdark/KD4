@@ -136,9 +136,17 @@ impl<T: HttpTransport> EndpointSession<T> {
                 }
             },
         )
-        .await?;
+        .await;
 
-        Ok(response)
+        match response {
+            Err(error @ (TransportError::Timeout | TransportError::Network(_))) => {
+                Err(ApiError::ProviderFailure {
+                    code: Some("dispatch_outcome_unknown".into()),
+                    message: format!("Request outcome is unknown after dispatch ({error}); automatic replay was stopped."),
+                })
+            }
+            result => Ok(result?),
+        }
     }
 
     #[instrument(

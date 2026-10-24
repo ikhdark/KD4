@@ -269,7 +269,9 @@ where
     Ok(true)
 }
 
-type RegisteredToolCatalog = (u64, Arc<[codex_code_mode_protocol::ToolDefinition]>);
+// None is a closing-session tombstone: registration cannot recreate a catalog
+// while shutdown is awaiting runtime/storage or cell-route cleanup.
+type RegisteredToolCatalog = Option<(u64, Arc<[codex_code_mode_protocol::ToolDefinition]>)>;
 
 struct HostState {
     catalogs: Mutex<HashMap<SessionId, RegisteredToolCatalog>>,
@@ -306,9 +308,13 @@ impl HostState {
             let resolved = (|| {
                 let mut catalogs = self.catalogs.lock().unwrap_or_else(PoisonError::into_inner);
                 self.session(session_id)?;
+                if matches!(catalogs.get(session_id), Some(None)) {
+                    return Err("code-mode session is closing; no catalog registered".to_string());
+                }
                 if catalog.register {
                     if catalogs
                         .get(session_id)
+                        .and_then(Option::as_ref)
                         .is_some_and(|(revision, _)| catalog.revision <= *revision)
                     {
                         return Err("stale tool catalog registration; no cell started".to_string());
@@ -319,7 +325,7 @@ impl HostState {
                             .map(Into::into)
                             .collect();
                     resolved_tools = Some(Arc::clone(&tools));
-                    catalogs.insert(session_id.clone(), (catalog.revision, tools));
+                    catalogs.insert(session_id.clone(), Some((catalog.revision, tools)));
                 } else {
                     if !request.enabled_tools.is_empty() {
                         return Err(
@@ -329,6 +335,7 @@ impl HostState {
                     }
                     let (_, tools) = catalogs
                         .get(session_id)
+                        .and_then(Option::as_ref)
                         .filter(|(revision, _)| *revision == catalog.revision)
                         .ok_or_else(|| {
                             "unknown or revoked tool catalog revision; no cell started".to_string()
@@ -519,18 +526,21 @@ impl HostState {
                     .unwrap_or_else(PoisonError::into_inner)
                     .get(&session_id)
                     .cloned();
-                self.catalogs
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .remove(&session_id);
+                if session.is_some() {
+                    self.catalogs.lock().unwrap_or_else(PoisonError::into_inner)
+                        .insert(session_id.clone(), None);
+                }
                 let result = match session {
                     Some(session) => match session.shutdown().await {
                         Ok(()) => {
                             self.peer.wait_for_session_cells(&session_id).await;
+                            // Same catalog -> session lock order as registration.
+                            let mut catalogs = self.catalogs.lock().unwrap_or_else(PoisonError::into_inner);
                             self.sessions
                                 .lock()
                                 .unwrap_or_else(PoisonError::into_inner)
                                 .remove(&session_id);
+                            catalogs.remove(&session_id);
                             Ok(HostResponse::SessionClosed { session_id })
                         }
                         Err(err) => {

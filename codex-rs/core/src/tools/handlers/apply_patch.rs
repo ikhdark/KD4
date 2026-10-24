@@ -369,35 +369,6 @@ fn apply_patch_payload_command(payload: &ToolPayload) -> Option<String> {
     }
 }
 
-/// Names other root sessions running a turn in this checkout that edited a
-/// file this patch touches, so a conflict or overlap is not mistaken for the
-/// session's own work.
-async fn concurrent_patch_note(
-    session: &Session,
-    turn: &TurnContext,
-    environment: &TurnEnvironment,
-    hunk_paths: &[PathBuf],
-) -> Option<String> {
-    if matches!(
-        turn.session_source,
-        codex_protocol::protocol::SessionSource::SubAgent(_)
-            | codex_protocol::protocol::SessionSource::Internal(_)
-    ) {
-        return None;
-    }
-    let cwd = environment.cwd().to_abs_path().ok()?;
-    let paths = hunk_paths
-        .iter()
-        .map(|path| cwd.as_path().join(path))
-        .collect::<Vec<_>>();
-    let others = crate::live_sessions::others_in_checkout(
-        turn.config.codex_home.as_path(),
-        &session.thread_id.to_string(),
-        turn.cwd().as_path(),
-    )
-    .await;
-    crate::live_sessions::overlapping_edits_in_resource(&others, &paths, turn.cwd().as_path(), &environment.environment.coordination_resource_id())
-}
 
 /// Says whether each mismatched file still has the content of this session's
 /// latest read_file snapshot of it. Only exact snapshot hashes count: shell
@@ -451,26 +422,13 @@ async fn read_snapshot_note(
         let finding = if read == *current {
             "is unchanged since this session's latest read_file snapshot of it; the patch does not match that content"
         } else {
-            "changed after this session's latest read_file snapshot of it, by this session's own patches or another writer"
+            "changed after this session's latest read_file snapshot of it"
         };
         note.push_str(&format!("\n{} {finding}.", path.display()));
     }
     note
 }
 
-fn hunk_endpoints(hunks: &[Hunk]) -> Vec<PathBuf> {
-    hunks
-        .iter()
-        .flat_map(|hunk| match hunk {
-            Hunk::AddFile { path, .. } | Hunk::DeleteFile { path } => vec![path.clone()],
-            Hunk::UpdateFile {
-                path, move_path, ..
-            } => std::iter::once(path.clone())
-                .chain(move_path.iter().cloned())
-                .collect(),
-        })
-        .collect()
-}
 
 async fn effective_patch_permissions(
     session: &Session,
@@ -667,7 +625,7 @@ impl ApplyPatchHandler {
             })
             .sum();
         let retained_input = args.patch.clone();
-        let hunk_paths = hunk_endpoints(&args.hunks);
+
         let cancellation = cancellation_token.clone();
         let result = async {
             let selected_environment_id =
@@ -782,14 +740,7 @@ impl ApplyPatchHandler {
                                 workspace_operation_permit,
                             )
                             .await?;
-                            let note = concurrent_patch_note(
-                                &session,
-                                &turn,
-                                turn_environment,
-                                &hunk_paths,
-                            )
-                            .await;
-                            Ok(boxed_tool_output(output.with_concurrent_sessions(note)))
+                            Ok(boxed_tool_output(output))
                         }
                     }
                 }
@@ -830,15 +781,14 @@ impl ApplyPatchHandler {
                         .retain(&retained_input, &turn_environment.environment_id,
                             &turn_environment.owner_id(),
                             turn_environment.cwd(), &Default::default(), observed_source);
-                    let note =
-                        concurrent_patch_note(&session, &turn, turn_environment, &hunk_paths).await;
+
                     let read_note =
                         read_snapshot_note(&session, turn_environment, mismatches).await;
                     Ok(boxed_tool_output(ApplyPatchToolOutput::from_delta(
                         format!("apply_patch verification failed: {parse_error}{read_note}"), false,
                         &Default::default(), Some(turn_environment.environment_id.clone()),
                     ).with_retry(retry).with_patch_mismatch(mismatch)
-                    .with_concurrent_sessions(note)))
+                    ))
                 }
                 codex_apply_patch::MaybeApplyPatchVerified::ShellParseError(error) => {
                     tracing::trace!("Failed to parse apply_patch input, {error:?}");

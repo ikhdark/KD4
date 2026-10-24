@@ -120,6 +120,7 @@ pub(crate) fn start_fuzzy_file_search_session(
         pending_deliveries: Mutex::new(PendingDeliveries::default()),
         delivery_ready: Notify::new(),
         query_changed: Notify::new(),
+        completion_ready: Notify::new(),
         delivery_cancellation: CancellationToken::new(),
         canceled: canceled.clone(),
     });
@@ -155,17 +156,19 @@ struct SessionShared {
     pending_deliveries: Mutex<PendingDeliveries>,
     delivery_ready: Notify,
     query_changed: Notify,
+    completion_ready: Notify,
     delivery_cancellation: CancellationToken,
     canceled: Arc<AtomicBool>,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum DeliveryKind {
     Update,
     Completion,
 }
 
 struct QueuedDelivery {
+    kind: DeliveryKind,
     query: String,
     notification: ServerNotification,
 }
@@ -179,13 +182,22 @@ struct PendingDeliveries {
 impl PendingDeliveries {
     fn enqueue(&mut self, kind: DeliveryKind, delivery: QueuedDelivery) {
         match kind {
-            DeliveryKind::Update => self.update = Some(delivery),
-            DeliveryKind::Completion => self.completion = Some(delivery),
+            DeliveryKind::Update => {
+                if !self.completion.as_ref().is_some_and(|completion| completion.query == delivery.query) {
+                    self.update = Some(delivery);
+                }
+            }
+            DeliveryKind::Completion => {
+                if self.update.as_ref().is_some_and(|update| update.query == delivery.query) {
+                    self.update = None;
+                }
+                self.completion = Some(delivery);
+            }
         }
     }
 
     fn take_next(&mut self) -> Option<QueuedDelivery> {
-        self.update.take().or_else(|| self.completion.take())
+        self.completion.take().or_else(|| self.update.take())
     }
 }
 
@@ -203,11 +215,30 @@ impl SessionShared {
         self.pending_deliveries.lock().unwrap().enqueue(
             kind,
             QueuedDelivery {
+                kind,
                 query,
                 notification,
             },
         );
+        if kind == DeliveryKind::Completion {
+            self.completion_ready.notify_waiters();
+        }
         self.delivery_ready.notify_one();
+    }
+
+    async fn progress_superseded(&self, query: &str) {
+        loop {
+            let completed = self.completion_ready.notified();
+            tokio::pin!(completed);
+            completed.as_mut().enable();
+            #[expect(clippy::unwrap_used)]
+            let superseded = self.pending_deliveries.lock().unwrap().completion.as_ref()
+                .is_some_and(|completion| completion.query == query);
+            if superseded {
+                return;
+            }
+            completed.await;
+        }
     }
 
     fn query_is_current(&self, query: &str) -> bool {
@@ -266,6 +297,7 @@ async fn run_delivery_relay(shared: Arc<SessionShared>) {
             biased;
             _ = shared.delivery_cancellation.cancelled() => return,
             _ = query_changed => continue,
+            _ = shared.progress_superseded(&delivery.query), if delivery.kind == DeliveryKind::Update => continue,
             _ = shared.outgoing.send_server_notification_to_connections(
                 &recipients,
                 delivery.notification,
@@ -423,6 +455,7 @@ mod tests {
             pending_deliveries: Mutex::new(PendingDeliveries::default()),
             delivery_ready: Notify::new(),
             query_changed: Notify::new(),
+            completion_ready: Notify::new(),
             delivery_cancellation: CancellationToken::new(),
             canceled: Arc::new(AtomicBool::new(false)),
         });
@@ -510,6 +543,7 @@ mod tests {
             pending_deliveries: Mutex::new(PendingDeliveries::default()),
             delivery_ready: Notify::new(),
             query_changed: Notify::new(),
+            completion_ready: Notify::new(),
             delivery_cancellation: CancellationToken::new(),
             canceled: Arc::new(AtomicBool::new(false)),
         });
@@ -527,15 +561,15 @@ mod tests {
         );
         {
             let pending = shared.pending_deliveries.lock().unwrap();
-            assert!(pending.update.is_some());
+            assert!(pending.update.is_none());
             assert!(pending.completion.is_some());
         }
 
         let relay = DeliveryRelay::start(shared.clone());
         tokio::time::timeout(std::time::Duration::from_secs(1), async {
             loop {
-                let update_pending = shared.pending_deliveries.lock().unwrap().update.is_some();
-                if !update_pending {
+                let completion_pending = shared.pending_deliveries.lock().unwrap().completion.is_some();
+                if !completion_pending {
                     break;
                 }
                 tokio::task::yield_now().await;
@@ -551,6 +585,64 @@ mod tests {
             rx.try_recv(),
             Err(tokio::sync::mpsc::error::TryRecvError::Empty)
         ));
+    }
+
+    #[tokio::test]
+    async fn completion_supersedes_pending_and_unadmitted_progress() {
+        use crate::outgoing_message::OutgoingEnvelope;
+        use crate::outgoing_message::OutgoingMessage;
+        let (tx, mut rx) = mpsc::channel(1);
+        let outgoing = Arc::new(OutgoingMessageSender::new(
+            tx,
+            codex_analytics::AnalyticsEventsClient::disabled(),
+        ));
+        assert!(outgoing.try_send_server_notification(completion_notification("blocker")));
+        let shared = Arc::new(SessionShared {
+            connection_id: ConnectionId(1),
+            session_id: "session".into(),
+            latest_query: Mutex::new("query".into()),
+            outgoing,
+            pending_deliveries: Mutex::new(PendingDeliveries::default()),
+            delivery_ready: Notify::new(),
+            query_changed: Notify::new(),
+            completion_ready: Notify::new(),
+            delivery_cancellation: CancellationToken::new(),
+            canceled: Arc::new(AtomicBool::new(false)),
+        });
+        let mut relay = Box::pin(run_delivery_relay(shared.clone()));
+        shared.enqueue_delivery(DeliveryKind::Update, "query".into(), completion_notification("U1"));
+        assert!(futures::poll!(&mut relay).is_pending());
+        shared.enqueue_delivery(DeliveryKind::Update, "query".into(), completion_notification("U2"));
+        let completed = ServerNotification::FuzzyFileSearchSessionCompleted(
+            FuzzyFileSearchSessionCompletedNotification {
+                session_id: "session".into(),
+                query: "query".into(),
+                results: Some(FuzzyFileSearchResponse {
+                    total_match_count: 7,
+                    walk_complete: true,
+                    ..Default::default()
+                }),
+                cancelled: false,
+            },
+        );
+        shared.enqueue_delivery(DeliveryKind::Completion, "query".into(), completed);
+        rx.recv().await.expect("blocker");
+        let delivery = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            tokio::select! {
+                _ = &mut relay => panic!("relay remains active"),
+                delivery = rx.recv() => delivery.expect("completion"),
+            }
+        }).await.expect("terminal delivery");
+        let OutgoingEnvelope::ToConnection {
+            message: OutgoingMessage::AppServerNotification(
+                ServerNotification::FuzzyFileSearchSessionCompleted(completed)), ..
+        } = delivery else { panic!("terminal notification"); };
+        assert_eq!(completed.query, "query", "neither U1 nor U2 may be admitted");
+        let results = completed.results.expect("self-contained final result");
+        assert!(results.walk_complete);
+        assert_eq!(results.total_match_count, 7);
+        assert!(futures::poll!(&mut relay).is_pending());
+        assert!(rx.try_recv().is_err());
     }
 
     #[tokio::test]

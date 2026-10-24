@@ -208,6 +208,10 @@ impl RequestTracker {
             .retain(|_, execute| &execute.session.id != session_id);
     }
 
+    pub(super) fn operation_count(&self) -> usize {
+        self.pending.len() + self.initial_responses.len() + self.deferred_waits.len()
+    }
+
     pub(super) fn fail_all(&mut self, reason: &str) {
         self.control_deadlines.clear();
         for (_, pending) in self.pending.drain() {

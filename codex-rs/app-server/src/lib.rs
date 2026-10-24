@@ -118,7 +118,6 @@ mod current_time;
 mod dynamic_tools;
 mod error_code;
 mod extensions;
-mod external_agent_config;
 mod external_auth;
 mod filters;
 mod fs_watch;
@@ -1019,6 +1018,9 @@ pub async fn run_main(
         let force_shutdown_token = force_shutdown_token.clone();
         async move {
             let mut listen_for_threads = true;
+            // One ordered lifecycle worker; the bounded broadcast coalesces
+            // overflow into the existing lag/resync path instead of blocking ingress.
+            let mut thread_attachment_tasks = tokio::task::JoinSet::new();
             let mut shutdown_state = ShutdownState::default();
             // Keep the registered listener across unrelated select branches so a pending
             // SIGTERM is not lost when transport traffic wins the race.
@@ -1244,7 +1246,14 @@ pub async fn run_main(
                             .send_server_notification(notification)
                             .await;
                     }
-                    created = thread_created_rx.recv(), if listen_for_threads => {
+                    result = thread_attachment_tasks.join_next(), if !thread_attachment_tasks.is_empty() => {
+                        match result {
+                            Some(Ok(keep_listening)) => listen_for_threads = keep_listening,
+                            Some(Err(error)) => warn!(%error, "thread listener attachment worker failed"),
+                            None => {}
+                        }
+                    }
+                    created = thread_created_rx.recv(), if listen_for_threads && thread_attachment_tasks.is_empty() => {
                         let initialized_connection_ids = connections
                             .iter()
                             .filter_map(|(connection_id, connection_state)| {
@@ -1254,15 +1263,17 @@ pub async fn run_main(
                                     .then_some(*connection_id)
                             })
                             .collect();
-                        listen_for_threads = processor
-                            .thread_processor
-                            .handle_thread_created_event(created, initialized_connection_ids)
-                            .await;
+                        let processor = Arc::clone(&processor);
+                        thread_attachment_tasks.spawn(async move {
+                            processor.thread_processor
+                                .handle_thread_created_event(created, initialized_connection_ids).await
+                        });
                     }
                 }
             };
 
             init_watchdog_shutdown.cancel();
+            thread_attachment_tasks.shutdown().await;
             let disconnect_all = shutdown_state.requested();
             shutdown_state
                 .finish_cleanup(

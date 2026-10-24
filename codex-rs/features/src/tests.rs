@@ -93,28 +93,16 @@ fn unknown_keys_from_other_layers_name_that_layer_instead_of_the_user_config() {
 }
 
 #[test]
-fn removed_apps_mcp_path_override_is_not_reported_as_a_spelling_mistake() {
-    // `FeaturesToml::removed_apps_mcp_path_override` already parses this key and
-    // logs that it is removed and ignored, so the warning must agree with the
-    // parser rather than telling the user to check their spelling.
+fn removed_apps_mcp_path_override_does_not_warn() {
     let table: Table = toml::from_str("apps_mcp_path_override = true").unwrap();
-    let event = crate::unknown_features_warning_event(Some(&table), "config.toml").unwrap();
+    assert!(crate::unknown_features_warning_event(Some(&table), "config.toml").is_none());
+    let mixed: Table = toml::from_str("apps_mcp_path_override = true\nmisspelled = true").unwrap();
+    let event = crate::unknown_features_warning_event(Some(&mixed), "config.toml").unwrap();
     let EventMsg::Warning(warning) = event.msg else {
-        panic!("unknown settings must be visible warnings");
+        panic!("expected warning")
     };
-    let preview: serde_json::Value = serde_json::from_str(
-        warning
-            .message
-            .split_once("Compatibility preview (no settings changed): ")
-            .unwrap()
-            .1,
-    )
-    .unwrap();
-    assert_eq!(preview[0]["classification"], "removed");
-    assert_eq!(
-        preview[0]["suggested_action"],
-        "review removal of this inactive setting"
-    );
+    assert!(warning.message.contains("misspelled"));
+    assert!(!warning.message.contains("apps_mcp_path_override"));
 }
 
 #[test]
@@ -244,6 +232,7 @@ fn default_enabled_features_are_stable() {
 #[test]
 fn retired_feature_keys_are_unknown_and_ignored_by_feature_sources() {
     for key in [
+        "analytics_plan_history",
         "memories",
         "memory_tool",
         "auto_review",
@@ -289,7 +278,7 @@ fn retired_feature_keys_are_unknown_and_ignored_by_feature_sources() {
 }
 
 #[test]
-fn removed_apps_override_warns_without_changing_features_or_serializing() {
+fn removed_apps_override_is_silent_without_changing_features_or_serializing() {
     use std::io::Write;
     use std::sync::Arc;
     use std::sync::Mutex;
@@ -338,14 +327,10 @@ fn removed_apps_override_warns_without_changing_features_or_serializing() {
             );
         });
         let log = String::from_utf8(output.lock().unwrap().clone()).unwrap();
-        if input.is_empty() {
-            assert!(log.is_empty(), "absent setting must not warn: {log}");
-        } else {
-            assert!(
-                log.contains("[features].apps_mcp_path_override has been removed and is ignored"),
-                "missing removal diagnostic: {log}"
-            );
-        }
+        assert!(
+            log.is_empty(),
+            "compatibility-only setting must not warn: {log}"
+        );
     }
 }
 
@@ -480,18 +465,6 @@ fn completed_runtime_mechanisms_are_stable_and_enabled_by_default() {
     }
 }
 
-#[test]
-fn network_proxy_is_experimental_and_disabled_by_default() {
-    assert_eq!(
-        feature_for_key("network_proxy"),
-        Some(Feature::NetworkProxy)
-    );
-    assert!(matches!(
-        Feature::NetworkProxy.stage(),
-        Stage::Experimental { .. }
-    ));
-    assert_eq!(Feature::NetworkProxy.default_enabled(), false);
-}
 
 #[test]
 fn in_app_desktop_gates_are_stable_and_enabled_by_default() {
@@ -725,7 +698,6 @@ fn structured_features_have_one_serialized_storage_location() {
         Feature::CodeMode,
         Feature::MultiAgentV2,
         Feature::CurrentTimeReminder,
-        Feature::NetworkProxy,
     ];
     let input: BTreeMap<String, bool> = structured
         .into_iter()
@@ -869,7 +841,6 @@ fn materialize_resolved_enabled_omits_internal_features_and_preserves_custom_con
     let mut features = Features::with_defaults();
     features.enable(Feature::CodeMode);
     features.enable(Feature::MultiAgentV2);
-    features.enable(Feature::NetworkProxy);
     features.enable(Feature::RespectSystemProxy);
 
     let mut entries = BTreeMap::from([("custom_extension".to_string(), false)]);
@@ -882,11 +853,6 @@ fn materialize_resolved_enabled_omits_internal_features_and_preserves_custom_con
         multi_agent_v2: Some(FeatureToml::Config(crate::MultiAgentV2ConfigToml {
             enabled: Some(false),
             min_wait_timeout_ms: Some(2500),
-            ..Default::default()
-        })),
-        network_proxy: Some(FeatureToml::Config(crate::NetworkProxyConfigToml {
-            enabled: Some(false),
-            proxy_url: Some("http://127.0.0.1:43128".to_string()),
             ..Default::default()
         })),
         entries,
@@ -914,14 +880,6 @@ fn materialize_resolved_enabled_omits_internal_features_and_preserves_custom_con
         Some(FeatureToml::Config(crate::MultiAgentV2ConfigToml {
             enabled: Some(true),
             min_wait_timeout_ms: Some(2500),
-            ..Default::default()
-        }))
-    );
-    assert_eq!(
-        features_toml.network_proxy,
-        Some(FeatureToml::Config(crate::NetworkProxyConfigToml {
-            enabled: Some(true),
-            proxy_url: Some("http://127.0.0.1:43128".to_string()),
             ..Default::default()
         }))
     );
@@ -1055,4 +1013,12 @@ fn direct_runtime_is_user_settable_and_disabled_by_default() {
 fn windows_only_feature_catalog_excludes_unix_shell_backends() {
     assert!(super::feature_for_key("shell_zsh_fork").is_none());
     assert!(super::feature_for_key("unified_exec_zsh_fork").is_none());
+}
+#[test]
+fn removed_network_proxy_cannot_be_enabled_silently() {
+    for source in ["network_proxy = true", "[network_proxy]\nenabled = true"] {
+        assert!(toml::from_str::<FeaturesToml>(source).is_err(), "{source}");
+    }
+    let disabled: FeaturesToml = toml::from_str("network_proxy = false").unwrap();
+    assert!(!disabled.entries().contains_key("network_proxy"));
 }

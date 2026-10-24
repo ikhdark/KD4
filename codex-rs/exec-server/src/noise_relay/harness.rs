@@ -62,6 +62,11 @@ pub(crate) struct NoiseHarnessConnectionArgs {
 const NOISE_RELAY_RESET_DISCONNECT_REASON: &str = "Noise relay stream reset";
 // Give a Pong already queued behind data a bounded chance to reach the reader.
 const MAX_FRAMES_DRAINED_AFTER_PONG_DEADLINE: usize = 32;
+#[cfg(test)]
+const NOISE_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(200);
+#[cfg(not(test))]
+const NOISE_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+const NOISE_HANDSHAKE_TIMEOUT_REASON: &str = "Noise relay handshake timed out";
 
 /// Adapt one harness rendezvous websocket into an authenticated JSON-RPC connection.
 ///
@@ -126,26 +131,53 @@ where
         // responder proves possession of the pinned static key.
         let resume = RelayMessageFrame::resume(stream_id.clone());
         let handshake = RelayMessageFrame::handshake(stream_id.clone(), request);
-        if websocket
-            .send(Message::Binary(encode_relay_message_frame(&resume).into()))
+        // One setup budget includes both writes and every response/control frame.
+        // In particular, unrelated ready frames must not renew the read timeout.
+        let handshake_deadline = tokio::time::Instant::now() + NOISE_HANDSHAKE_TIMEOUT;
+        for frame in [resume, handshake] {
+            if let Err(error) = send_websocket_message(
+                &mut websocket,
+                Message::Binary(encode_relay_message_frame(&frame).into()),
+                handshake_deadline,
+            )
             .await
-            .is_err()
-            || websocket
-                .send(Message::Binary(
-                    encode_relay_message_frame(&handshake).into(),
-                ))
-                .await
-                .is_err()
-        {
-            let _ = disconnected_tx.send(true);
-            return;
+            {
+                let reason = if tokio::time::Instant::now() >= handshake_deadline {
+                    NOISE_HANDSHAKE_TIMEOUT_REASON.to_string()
+                } else {
+                    format!("failed to write Noise relay handshake: {error}")
+                };
+                send_disconnected(&incoming_tx, &disconnected_tx, reason);
+                return;
+            }
         }
 
         // During the handshake, ignore unrelated routed streams and control
         // frames, but reject data on our stream. Accepting early data would
         // create a plaintext or unauthenticated application path.
         let mut transport = loop {
-            let Some(incoming_message) = websocket.next().await else {
+            // Check explicitly as well as timing out the await: an always-ready
+            // stream of ignored frames must not starve the deadline.
+            if tokio::time::Instant::now() >= handshake_deadline {
+                send_disconnected(
+                    &incoming_tx,
+                    &disconnected_tx,
+                    NOISE_HANDSHAKE_TIMEOUT_REASON.to_string(),
+                );
+                return;
+            }
+            let incoming = match tokio::time::timeout_at(handshake_deadline, websocket.next()).await {
+                Ok(incoming) => incoming,
+                Err(_) => {
+                    send_disconnected(
+                        &incoming_tx,
+                        &disconnected_tx,
+                        NOISE_HANDSHAKE_TIMEOUT_REASON.to_string(),
+                    );
+                    return;
+                }
+            };
+            let Some(incoming_message) = incoming else {
                 send_disconnected(
                     &incoming_tx,
                     &disconnected_tx,
@@ -212,13 +244,21 @@ where
                         }
                     };
                     match initiator_handshake.finish(&response) {
-                        Ok(transport) => {
+                        Ok(transport) if tokio::time::Instant::now() < handshake_deadline => {
                             info!(
                                 noise_event = "handshake",
                                 noise_outcome = "ok",
                                 "Noise harness handshake completed"
                             );
                             break transport;
+                        }
+                        Ok(_) => {
+                            send_disconnected(
+                                &incoming_tx,
+                                &disconnected_tx,
+                                NOISE_HANDSHAKE_TIMEOUT_REASON.to_string(),
+                            );
+                            return;
                         }
                         Err(error) => {
                             send_disconnected(
@@ -275,6 +315,7 @@ where
         let mut delivery = std::collections::VecDeque::new();
         let mut delivery_deadline = None;
         let mut frames_drained_after_pong_deadline = 0usize;
+        let mut normal_close = false;
         'relay: loop {
             let now = tokio::time::Instant::now();
             let gap_deadline = inbound_ciphertexts.gap_deadline();
@@ -408,8 +449,31 @@ where
                         }
                         Some(Ok(Message::Ping(_) | Message::Frame(_))) => {}
                         Some(Ok(Message::Text(_))) => { send_malformed(&incoming_tx, "Noise relay transport expects binary protobuf frames".into()); break; }
-                        Some(Ok(Message::Close(_))) | None => break,
+                        Some(Ok(Message::Close(_))) | None => {
+                            normal_close = true;
+                            break;
+                        }
                         Some(Err(error)) => { debug!("Noise relay websocket read failed: {error}"); break; }
+                    }
+                }
+            }
+        }
+        if normal_close {
+            // Stop socket work, but preserve authenticated messages already
+            // accepted before Close/EOF. Publish disconnection only after this
+            // ordered drain; a stalled application still has one fixed bound.
+            drop(writing);
+            drop(sink);
+            drop(reader);
+            if let Some(deadline) = delivery_deadline {
+                while let Some(event) = delivery.pop_front() {
+                    match tokio::time::timeout_at(deadline, incoming_tx.send(event)).await {
+                        Ok(Ok(())) => {}
+                        Ok(Err(_)) => break,
+                        Err(_) => {
+                            send_disconnected(&incoming_tx, &disconnected_tx, "application_backpressure".into());
+                            return;
+                        }
                     }
                 }
             }
@@ -454,6 +518,9 @@ where
     T: Sink<Message, Error = E> + Unpin,
     E: std::fmt::Display,
 {
+    if tokio::time::Instant::now() >= deadline {
+        return Err("websocket write timed out".to_string());
+    }
     match tokio::time::timeout_at(deadline, websocket.send(message)).await {
         Ok(Ok(())) => Ok(()),
         Ok(Err(error)) => Err(error.to_string()),

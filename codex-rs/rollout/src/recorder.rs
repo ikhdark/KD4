@@ -1,5 +1,6 @@
 //! Persist Codex session rollouts (.jsonl) so sessions can be replayed or inspected later.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::fs;
@@ -223,6 +224,7 @@ struct RolloutWriterTask {
     // must not keep a terminated writer's logical ownership alive.
     writer_lease: Mutex<Option<Arc<std::fs::File>>>,
     lifecycle: AtomicU8,
+    shutdown_confirmed: std::sync::atomic::AtomicBool,
     /// Serializes the lifecycle check with command enqueue across recorder
     /// clones so no command can be accepted behind Shutdown.
     enqueue_gate: Arc<tokio::sync::Semaphore>,
@@ -346,6 +348,7 @@ impl RolloutWriterTask {
             terminal_failure: Mutex::new(None),
             writer_lease: Mutex::new(None),
             lifecycle: AtomicU8::new(WRITER_ACTIVE),
+            shutdown_confirmed: std::sync::atomic::AtomicBool::new(false),
             enqueue_gate: Arc::new(tokio::sync::Semaphore::new(1)),
             pending_bytes: Arc::new(tokio::sync::Semaphore::new(MAX_PENDING_ROLLOUT_BYTES)),
         }
@@ -1319,7 +1322,8 @@ impl RolloutRecorder {
         &self,
         items: &[RolloutItem],
     ) -> std::io::Result<()> {
-        if rollout_admission_bytes(items).is_err() {
+        let admission_bytes = rollout_admission_bytes(items);
+        if admission_bytes.is_err() {
             // Validate every individual item before accepting any prefix. Bulk
             // inheritance may exceed admission even though each record fits.
             for item in items {
@@ -1347,7 +1351,8 @@ impl RolloutRecorder {
         // ordering with barriers/shutdown under the enqueue gate. Reuse that path
         // rather than serializing independent work behind slow storage. Neither
         // form promises durability before an explicit barrier.
-        self.record_canonical_items(items).await
+        self.record_canonical_items_with_admission(items, true, false, Some(admission_bytes?))
+            .await
     }
 
     async fn record_canonical_items_with_flush(
@@ -1355,6 +1360,22 @@ impl RolloutRecorder {
         items: &[RolloutItem],
         flush_if_materialized: bool,
         wait_for_acceptance: bool,
+    ) -> std::io::Result<()> {
+        self.record_canonical_items_with_admission(
+            items,
+            flush_if_materialized,
+            wait_for_acceptance,
+            None,
+        )
+        .await
+    }
+
+    async fn record_canonical_items_with_admission(
+        &self,
+        items: &[RolloutItem],
+        flush_if_materialized: bool,
+        wait_for_acceptance: bool,
+        admission_bytes: Option<u32>,
     ) -> std::io::Result<()> {
         let enqueue_guard = self
             .writer_task
@@ -1366,8 +1387,14 @@ impl RolloutRecorder {
         if items.is_empty() {
             return Ok(());
         }
+        // Ordered admission already sized this exact immutable slice. Other
+        // callers still count here, before cloning or accepting any records.
+        let admission_bytes = match admission_bytes {
+            Some(bytes) => bytes,
+            None => rollout_admission_bytes(items)?,
+        };
         let admission = Arc::new(Arc::clone(&self.writer_task.pending_bytes)
-            .try_acquire_many_owned(rollout_admission_bytes(items)?)
+            .try_acquire_many_owned(admission_bytes)
             .map_err(|_| IoError::other("rollout pending byte budget exhausted; no items accepted; use an explicit persistence barrier to retry retained records"))?);
         let (accepted, acceptance) = if wait_for_acceptance {
             let (accepted, acceptance) = oneshot::channel();
@@ -1801,6 +1828,9 @@ impl RolloutRecorder {
             .acquire()
             .await
             .map_err(|_| IoError::other("rollout enqueue gate is closed"))?;
+        if self.writer_task.shutdown_confirmed.load(Ordering::Acquire) {
+            return Ok(());
+        }
         let permit = self.tx.reserve().await.map_err(|e| {
             self.writer_task.terminal_failure().unwrap_or_else(|| {
                 IoError::other(format!("failed to reserve rollout shutdown command: {e}"))
@@ -2745,24 +2775,29 @@ impl RolloutWriterState {
                     settings.thread_settings.developer_instructions = None;
                 }
                 last_settings = Some(value);
-                compacted.push(captured.clone().with_item(RolloutItem::EventMsg(
+                compacted.push(Cow::Owned(captured.with_item(RolloutItem::EventMsg(
                     codex_protocol::protocol::EventMsg::ThreadSettingsApplied(settings),
-                )));
+                ))));
             } else {
-                compacted.push(captured.clone());
+                compacted.push(Cow::Borrowed(captured));
             }
         }
         let items = session_meta_item
             .iter()
-            .chain(compacted.iter())
+            .chain(compacted.iter().map(|captured| captured.as_ref()))
             .collect::<Vec<_>>();
         if items.is_empty() {
+            drop(items);
+            drop(compacted);
             self.pending_items.clear();
             return Ok(());
         }
         writer
             .write_rollout_items_locked(&items, &write_lock)
             .await?;
+        // End the borrowed write view before releasing the retained originals.
+        drop(items);
+        drop(compacted);
         self.last_settings = last_settings;
         self.settings_prefix_len = writer
             .file
@@ -2831,6 +2866,7 @@ async fn rollout_writer(
                 Ok(()) => {
                     drop(state);
                     writer_task.finish_shutdown(true);
+                    writer_task.shutdown_confirmed.store(true, Ordering::Release);
                     let _ = ack.send(Ok(()));
                     return Ok(());
                 }
@@ -2903,6 +2939,7 @@ async fn rollout_writer(
     state.shutdown().await?;
     drop(state);
     writer_task.finish_shutdown(true);
+    writer_task.shutdown_confirmed.store(true, Ordering::Release);
     Ok(())
 }
 
@@ -3058,6 +3095,52 @@ struct RolloutLineRef<'a> {
     item: &'a RolloutItem,
 }
 
+impl<'a> RolloutLineRef<'a> {
+    fn new(item: &'a RolloutItem, captured_at: OffsetDateTime) -> std::io::Result<Self> {
+        let timestamp_format: &[FormatItem] = format_description!(
+            "[year]-[month]-[day]T[hour]:[minute]:[second].[subsecond digits:3]Z"
+        );
+        let timestamp = captured_at
+            .format(timestamp_format)
+            .map_err(|e| IoError::other(format!("failed to format timestamp: {e}")))?;
+        Ok(Self {
+            timestamp,
+            format_version: CURRENT_ROLLOUT_FORMAT_VERSION,
+            item,
+        })
+    }
+
+    fn write_jsonl(&self, mut writer: impl Write) -> std::io::Result<()> {
+        serde_json::to_writer(&mut writer, self)?;
+        writer.write_all(b"\n")
+    }
+}
+
+/// Include the newline in the inline threshold without encoding a whole large
+/// record. Small eligible records still need only one serialization.
+#[derive(Default)]
+struct InlineRolloutLine {
+    bytes: Vec<u8>,
+    limit_reached: bool,
+}
+
+impl Write for InlineRolloutLine {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        if self.limit_reached
+            || bytes.len() >= crate::payload_artifact::INLINE_BYTES - self.bytes.len()
+        {
+            self.limit_reached = true;
+            return Err(IoError::new(ErrorKind::WriteZero, "rollout inline limit reached"));
+        }
+        self.bytes.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 impl JsonlWriter {
     async fn write_rollout_item(&mut self, rollout_item: &RolloutItem) -> std::io::Result<()> {
         // A direct append has no queue between capture and write.
@@ -3093,20 +3176,38 @@ impl JsonlWriter {
                 Self::serialize_rollout_item(&mut bytes, &captured.item, captured.captured_at)?;
                 continue;
             }
-            let mut line = Vec::new();
-            Self::serialize_rollout_item(&mut line, &captured.item, captured.captured_at)?;
-            if line.len() < crate::payload_artifact::INLINE_BYTES {
-                bytes.extend_from_slice(&line);
+            let line = RolloutLineRef::new(&captured.item, captured.captured_at)?;
+            let mut inline = InlineRolloutLine::default();
+            let serialized = line.write_jsonl(&mut inline);
+            if !inline.limit_reached {
+                serialized?;
+                bytes.extend_from_slice(&inline.bytes);
                 continue;
             }
+            // Preserve the line's field insertion order and the artifact owner's
+            // metadata removals, but avoid encoding then parsing its full body.
+            let value = match serde_json::to_value(&line) {
+                Ok(value) => value,
+                Err(error) => {
+                    tracing::warn!(%error, "retaining rollout payload inline because artifact storage failed");
+                    line.write_jsonl(&mut bytes)?;
+                    continue;
+                }
+            };
             let path = self.path.clone();
             let stored = tokio::task::spawn_blocking(move || {
-                crate::payload_artifact::store_line(&path, &line).unwrap_or_else(|error| {
+                crate::payload_artifact::store_value(&path, value)
+            })
+            .await
+            .map_err(IoError::other)?;
+            match stored {
+                Ok(Some(stored)) => bytes.extend_from_slice(&stored),
+                Ok(None) => line.write_jsonl(&mut bytes)?,
+                Err(error) => {
                     tracing::warn!(%error, "retaining rollout payload inline because artifact storage failed");
-                    line
-                })
-            }).await.map_err(IoError::other)?;
-            bytes.extend_from_slice(&stored);
+                    line.write_jsonl(&mut bytes)?;
+                }
+            }
         }
         self.write_transaction(&bytes).await
     }
@@ -3116,21 +3217,7 @@ impl JsonlWriter {
         rollout_item: &RolloutItem,
         captured_at: OffsetDateTime,
     ) -> std::io::Result<()> {
-        let timestamp_format: &[FormatItem] = format_description!(
-            "[year]-[month]-[day]T[hour]:[minute]:[second].[subsecond digits:3]Z"
-        );
-        let timestamp = captured_at
-            .format(timestamp_format)
-            .map_err(|e| IoError::other(format!("failed to format timestamp: {e}")))?;
-
-        let line = RolloutLineRef {
-            timestamp,
-            format_version: CURRENT_ROLLOUT_FORMAT_VERSION,
-            item: rollout_item,
-        };
-        serde_json::to_writer(&mut *bytes, &line)?;
-        bytes.push(b'\n');
-        Ok(())
+        RolloutLineRef::new(rollout_item, captured_at)?.write_jsonl(bytes)
     }
 
     async fn write_transaction(&mut self, bytes: &[u8]) -> std::io::Result<()> {
