@@ -840,6 +840,9 @@ fn collect_spawn_process_output(
                 break;
             }
             let mut chunk = tokio::select! {
+                // Flush a buffered prompt as soon as the spawn response is
+                // enqueued, even if the child is now waiting for stdin.
+                _ = response_ready.cancelled(), if stream_output && !buffer.is_empty() => Vec::new(),
                 chunk = output_rx.recv() => match chunk {
                     Some(chunk) => chunk,
                     None => { reached_eof = true; break; },
@@ -857,24 +860,29 @@ fn collect_spawn_process_output(
             }
             let (capped_chunk, cap_reached) = cap.accept(&chunk);
             if stream_output {
-                if capped_chunk.is_empty() && !cap_reached {
+                buffer.extend_from_slice(capped_chunk);
+                if !response_ready.is_cancelled() {
                     continue;
                 }
-                if !response_ready.is_cancelled() || !outgoing.try_send_server_notification_to_connection(
+                if buffer.is_empty() && !cap_reached {
+                    continue;
+                }
+                if outgoing.try_send_server_notification_to_connection(
                     connection_id,
                     ServerNotification::ProcessOutputDelta(ProcessOutputDeltaNotification {
                         process_handle: process_handle.clone(),
                         stream,
-                        delta_base64: STANDARD.encode(capped_chunk),
-                        cap_reached,
+                        delta_base64: STANDARD.encode(&buffer),
+                        cap_reached: cap.truncated(),
                     }),
                     &connection_cancellation,
                 ) {
+                    buffer.clear();
+                } else {
                     // Preserve the rejected delta and every later byte in the
                     // exit notification; transport waits must not consume the
                     // pipe reader's post-exit drain window.
                     stream_output = false;
-                    buffer.extend_from_slice(capped_chunk);
                 }
             } else {
                 buffer.extend_from_slice(capped_chunk);
@@ -1102,6 +1110,34 @@ mod tests {
             }
         }
         assert_eq!(bytes, b"abc");
+    }
+
+    #[tokio::test]
+    async fn buffered_prompt_streams_after_response_without_waiting_for_more_output() {
+        let (outgoing_tx, mut outgoing_rx) = mpsc::channel(4);
+        let (output_tx, output_rx) = mpsc::channel(1);
+        let (_timeout_tx, stdio_timeout_rx) = watch::channel(false);
+        let response_ready = CancellationToken::new();
+        let capture = collect_spawn_process_output(SpawnProcessOutputParams {
+            connection_id: ConnectionId(42), process_handle: "prompt".into(),
+            output_rx, stdio_timeout_rx,
+            outgoing: Arc::new(OutgoingMessageSender::new(outgoing_tx, codex_analytics::AnalyticsEventsClient::disabled())),
+            stream: ProcessOutputStream::Stdout, stream_output: true,
+            output_bytes_cap: Some(1024), connection_cancellation: CancellationToken::new(),
+            response_ready: response_ready.clone(),
+        });
+        output_tx.send(b"prompt> ".to_vec()).await.unwrap();
+        tokio::task::yield_now().await;
+        assert!(outgoing_rx.try_recv().is_err());
+        response_ready.cancel();
+        let envelope = timeout(Duration::from_secs(2), outgoing_rx.recv()).await.unwrap().unwrap();
+        let OutgoingEnvelope::ToConnection {
+            message: OutgoingMessage::AppServerNotification(ServerNotification::ProcessOutputDelta(delta)), ..
+        } = envelope else { panic!("prompt must stream before stdin or exit"); };
+        assert_eq!(STANDARD.decode(delta.delta_base64).unwrap(), b"prompt> ");
+        assert!(!capture.is_finished());
+        drop(output_tx);
+        assert!(capture.await.unwrap().text.is_empty());
     }
 
     #[tokio::test(start_paused = true)]
