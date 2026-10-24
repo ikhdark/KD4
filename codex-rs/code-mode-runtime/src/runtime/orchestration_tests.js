@@ -1312,7 +1312,7 @@ try {
       "drained rg error became complete");
     for (const code of [0, 1, 2]) {
       reply = () => searchLive("early.rs\u00001\nmid", "early warning\n");
-      const packets = [searchLive("dle.rs\u00002\n"), exited("", code, "late warning\n")];
+      const packets = [searchLive(), exited("early.rs\u00001\nmiddle.rs\u00002\n", code, "early warning\nlate warning\n")];
       tools.write_stdin = async () => packets.shift();
       const gathered = await search_files("x");
       check(gathered.match_count === 3 && gathered.file_count === 2 &&
@@ -1324,7 +1324,7 @@ try {
     const event = JSON.stringify({type:"match", data:{path:{text:"split.rs"},
       line_number:1, lines:{text:"needle\n"}, submatches:[]}}) + "\n";
     reply = () => searchLive(event.slice(0, 13));
-    const pieces = [searchLive(event.slice(13)), exited("")];
+    const pieces = [searchLive(), exited(event)];
     tools.write_stdin = async () => pieces.shift();
     const splitJson = await search_files("needle", {lines:true});
     check(splitJson.complete && splitJson.match_count === 1 &&
@@ -1332,8 +1332,12 @@ try {
     for (const lines of [false, true]) {
       reply = () => ({...searchLive(), streams_complete:false});
       tools.write_stdin = async () => exited(lines ? event : "last.rs\u00001\n");
+      check((await search_files("x", {lines})).match_count === 1,
+        "running observations must not require terminal cumulative streams");
+      reply = () => searchLive();
+      tools.write_stdin = async () => ({...exited(""), streams_complete:false});
       check((await rejected(() => search_files("x", {lines}))).message.includes("exact capture"),
-        "search hid an earlier capture loss");
+        "incomplete terminal streams must not certify a complete search");
     }
     reply = () => searchLive();
     tools.write_stdin = async () => ({...live("", 77), error: "steering"});

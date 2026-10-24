@@ -399,22 +399,17 @@
           evidence,
         );
       }
-      const observations = evidence.observations ?? [result];
-      if (observations.some((packet) => packet.streams_complete !== true ||
-        typeof packet.stdout !== "string" ||
-        (packet.stderr != null && typeof packet.stderr !== "string"))) {
+      // Running observations are display packets. Only the terminal carries
+      // exact cumulative streams; intermediate packets need not be complete.
+      if (result.streams_complete !== true ||
+        typeof result.stdout !== "string" ||
+        (result.stderr != null && typeof result.stderr !== "string")) {
         fail(
           "search output exceeded exact capture; narrow path or glob, or omit lines",
           evidence,
         );
       }
-      // Native observations contain successive packets, not cumulative streams.
-      // Join before parsing so NUL records and JSON events can cross packets.
-      result = {...result,
-        stdout: observations.map((packet) => packet.stdout).join(""),
-        stderr: observations.map((packet) => packet.stderr ?? "").join(""),
-      };
-      const errors = result.stderr
+      const errors = (result.stderr ?? "")
         .split("\n")
         .map((line) => line.trimEnd())
         .filter(Boolean);
