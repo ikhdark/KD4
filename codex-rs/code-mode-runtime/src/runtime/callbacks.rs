@@ -121,7 +121,7 @@ pub(super) fn format_tool_result_callback(
         return;
     };
     let max_name_bytes = scope.get_slot::<RuntimeState>().map_or(0, |state| {
-        state.enabled_tools.by_global_name.keys().map(String::len).max().unwrap_or(0)
+        state.enabled_tools.by_requested_name.keys().map(String::len).max().unwrap_or(0)
     });
     let Ok(name) = super::value::bounded_string(scope, name, max_name_bytes) else {
         throw_type_error(scope, "format_tool_result requires an enabled tool name");
@@ -130,7 +130,7 @@ pub(super) fn format_tool_result_callback(
     let tool = scope.get_slot::<RuntimeState>().and_then(|state| {
         state
             .enabled_tools
-            .index_of(&name)
+            .resolve_requested_name(&name)
             .and_then(|index| state.enabled_tools.get(index))
             .map(|tool| tool.tool_name.clone())
     });

@@ -2359,6 +2359,24 @@ async fn generated_declarations_never_advertise_ambiguous_legacy_aliases() {
 }
 
 #[tokio::test]
+async fn formatting_and_graph_preflight_accept_the_dispatch_resolver_names() {
+    let definition = ToolDefinition {
+        name: "archive__search".into(), tool_name: ToolName::namespaced("archive", "search"),
+        kind: CodeModeToolKind::Function, description: "contract".into(),
+        input_schema: None, output_schema: None, namespace_description: None, default_timeout_ms: None,
+    };
+    let (_tx, _termination, mut rx) = start_with_tools(r#"
+        if (ALL_TOOL_NAMES[0] !== 'archive.search') throw Error('discovery');
+        for (const name of ['archive.search', 'archive__search']) {
+            if (format_tool_result(name, {ok:true}) !== '{"ok":true}') throw Error('format');
+        }
+        await run_graph([{id:'read', requires:['archive__search'], run:()=>true}]);
+    "#, vec![definition]).await;
+    assert!(matches!(next(&mut rx).await, RuntimeEvent::Result {error_text:None,..}));
+    closed(&mut rx).await;
+}
+
+#[tokio::test]
 async fn multiline_command_bigints_print_and_restore_with_the_display_codec() {
     let tool = ToolDefinition { name:"exec_command".into(), tool_name:ToolName::plain("exec_command"),
         kind:CodeModeToolKind::Function, description:"".into(), input_schema:None,

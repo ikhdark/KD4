@@ -173,6 +173,13 @@ Object.defineProperty(globalThis, "run_graph", {
     for (const id of selected) {
       for (const name of graph.get(id).requires) {
         if (capabilities.has(name)) continue;
+        // Discovery uses presentation names; retained canonical aliases use
+        // exactly the same admitted, ambiguity-aware resolver as dispatch.
+        if (typeof globalThis.resolve_tool === "function" &&
+            globalThis.resolve_tool(name) !== undefined) {
+          capabilities.add(name);
+          continue;
+        }
         ++missingCount;
         missingCapabilities ??= [];
         // Failure-only, bounded diagnostics. Names are exact or explicitly
