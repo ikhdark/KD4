@@ -790,12 +790,14 @@ where
                 let harness_public_key = pending.initiator_public_key.clone();
                 let validation_id = next_validation_id;
                 next_validation_id += 1;
+                let validation_cancelled = tokio_util::sync::CancellationToken::new();
                 pending_handshakes.insert(
                     stream_id.clone(),
                     PendingHandshake {
                         validation_id,
                         handshake: pending,
                         reply_permit,
+                        _cancel_validation_on_drop: validation_cancelled.clone().drop_guard(),
                     },
                 );
                 let validator = validator.clone();
@@ -803,16 +805,18 @@ where
                 // Failed validation leaves no transport state and sends only a
                 // generic reset.
                 validation_tasks.spawn(async move {
-                    let result = match timeout(
-                        HARNESS_KEY_VALIDATION_TIMEOUT,
-                        validator.validate_harness_key(&harness_public_key, &authorization),
-                    )
-                    .await
-                    {
-                        Ok(result) => result,
-                        Err(_) => Err(ExecServerError::Protocol(
-                            "timed out validating Noise relay harness key".to_string(),
+                    let result = tokio::select! {
+                        biased;
+                        _ = validation_cancelled.cancelled() => Err(ExecServerError::Protocol(
+                            "Noise relay harness validation cancelled".to_string(),
                         )),
+                        result = timeout(HARNESS_KEY_VALIDATION_TIMEOUT,
+                            validator.validate_harness_key(&harness_public_key, &authorization)) => match result {
+                            Ok(result) => result,
+                            Err(_) => Err(ExecServerError::Protocol(
+                                "timed out validating Noise relay harness key".to_string(),
+                            )),
+                        },
                     };
                     HarnessKeyValidationResult {
                         stream_id,
@@ -894,6 +898,7 @@ struct PendingHandshake {
     validation_id: u64,
     handshake: PendingResponderHandshake,
     reply_permit: mpsc::OwnedPermit<Vec<u8>>,
+    _cancel_validation_on_drop: tokio_util::sync::DropGuard,
 }
 
 /// `validation_id` prevents an old check from completing a reused `stream_id`.

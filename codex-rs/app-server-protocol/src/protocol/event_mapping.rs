@@ -445,10 +445,11 @@ pub fn item_event_to_server_notification(
         }
         EventMsg::ExecCommandOutputDelta(exec_command_output_delta_event) => {
             let item_id = exec_command_output_delta_event.call_id;
-            let decoding_lossy =
-                std::str::from_utf8(&exec_command_output_delta_event.chunk).is_err();
-            let delta =
-                String::from_utf8_lossy(&exec_command_output_delta_event.chunk).into_owned();
+            let (delta, decoding_lossy) =
+                match String::from_utf8(exec_command_output_delta_event.chunk) {
+                    Ok(delta) => (delta, false),
+                    Err(error) => (String::from_utf8_lossy(error.as_bytes()).into_owned(), true),
+                };
             ServerNotification::CommandExecutionOutputDelta(
                 CommandExecutionOutputDeltaNotification {
                     thread_id,

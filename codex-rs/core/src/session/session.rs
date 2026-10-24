@@ -827,7 +827,8 @@ pub(crate) struct Session {
     /// Stable request artifacts retained across turns and invalidated by their exact owners.
     pub(super) prepared_tool_router: super::turn::SessionPreparedRouterCache,
     pub(super) request_scaffold_cache: std::sync::Mutex<super::turn::RequestScaffoldCache>,
-    pub(super) turn_config_cache: std::sync::Mutex<Option<Arc<Config>>>,
+    pub(super) turn_config_cache:
+        std::sync::Mutex<Option<(std::sync::Weak<Config>, Arc<Config>)>>,
     /// Last tool-surface definition queued for this rollout. Repeated requests persist a compact
     /// reference while the terminal barrier remains the durability owner.
     pub(super) queued_tool_manifest_hash: std::sync::Mutex<Option<String>>,
@@ -1659,6 +1660,29 @@ impl Session {
 
         let default_shell =
             shell::LocalShell::new(session_configuration.user_shell_override.clone());
+        let inherited_selections = inherited_environments
+            .as_ref()
+            .map(TurnEnvironmentSnapshot::to_selections)
+            .unwrap_or_default();
+        let needs_local_shell = session_configuration
+            .environment_selections()
+            .iter()
+            .any(|selection| {
+                !inherited_selections.contains(selection)
+                    && environment_manager
+                        .get_environment(&selection.environment_id)
+                        .is_some_and(|environment| !environment.is_remote())
+            });
+        // Resolve only a newly selected local environment, concurrently with
+        // independent startup work. The shared resolver owns discovery; no
+        // detached startup task or second resolution owner is introduced.
+        let local_shell_fut = async {
+            if needs_local_shell {
+                // The selected environment reports discovery failures itself.
+                let _ = default_shell.resolve().await;
+            }
+        }
+        .instrument(info_span!("session_init.shell", otel.name = "session_init.shell"));
         let tool_history_fut = async {
             if !config.completed_tool_history_projection || !restores_initial_tool_history {
                 return None;
@@ -1757,11 +1781,13 @@ impl Session {
             state_db_ctx,
             (auth, mcp_projection, mcp_servers, auth_statuses, tool_plugin_provenance),
             config_validation,
+            (),
         ) = tokio::join!(
             persistence_and_history_fut,
             state_db_fut,
             auth_and_mcp_fut,
             validate_config_lock_if_configured(&session_configuration),
+            local_shell_fut,
         );
 
         let mut live_thread_init = thread_persistence_result.map_err(|e| {
@@ -1838,42 +1864,42 @@ impl Session {
                 });
             }
             let config_path = config.codex_home.join(CONFIG_TOML_FILE);
-            // Attribute each flagged key to the layer that set it. A key
-            // injected by a managed or bundled layer is not in the user's
-            // config.toml, so advising them to edit that file cannot help.
-            let feature_origins = config.config_layer_stack.origins();
-            let user_config_file = config_path.display().to_string();
-            if let Some(event) = codex_features::unknown_features_warning_event_with_origins(
-                config
-                    .config_layer_stack
-                    .effective_config()
-                    .get("features")
-                    .and_then(TomlValue::as_table),
-                &user_config_file,
-                |key| {
-                    let metadata = feature_origins.get(&codex_config::config_origin_key(&["features", key]))?;
-                    if matches!(metadata.name, codex_config::ConfigLayerSource::User { .. }) {
-                        return None;
-                    }
-                    Some(codex_config::format_config_layer_source(
-                        &metadata.name,
-                        CONFIG_TOML_FILE,
-                    ))
-                },
-            ) {
-                post_session_configured_events.push(event);
-            }
-            if let Some(event) = unstable_features_warning_event(
-                config
-                    .config_layer_stack
-                    .effective_config()
-                    .get("features")
-                    .and_then(TomlValue::as_table),
-                config.suppress_unstable_features_warning,
-                &config.features,
-                &config_path.display().to_string(),
-            ) {
-                post_session_configured_events.push(event);
+            {
+                // Attribute each flagged key to the layer that set it. A key
+                // injected by a managed or bundled layer is not in the user's
+                // config.toml, so advising them to edit that file cannot help.
+                let effective_config = config.config_layer_stack.effective_config();
+                let feature_config = effective_config.get("features").and_then(TomlValue::as_table);
+                let feature_origins = std::cell::OnceCell::new();
+                let user_config_file = config_path.display().to_string();
+                if let Some(event) = codex_features::unknown_features_warning_event_with_origins(
+                    feature_config,
+                    &user_config_file,
+                    |key| {
+                        let origins = feature_origins.get_or_init(|| {
+                            config.config_layer_stack.origins_for_effective_config(&effective_config)
+                        });
+                        let metadata =
+                            origins.get(&codex_config::config_origin_key(&["features", key]))?;
+                        if matches!(metadata.name, codex_config::ConfigLayerSource::User { .. }) {
+                            return None;
+                        }
+                        Some(codex_config::format_config_layer_source(
+                            &metadata.name,
+                            CONFIG_TOML_FILE,
+                        ))
+                    },
+                ) {
+                    post_session_configured_events.push(event);
+                }
+                if let Some(event) = unstable_features_warning_event(
+                    feature_config,
+                    config.suppress_unstable_features_warning,
+                    &config.features,
+                    &user_config_file,
+                ) {
+                    post_session_configured_events.push(event);
+                }
             }
             let auth = auth.as_ref();
             let auth_mode = auth.map(CodexAuth::auth_mode).map(TelemetryAuthMode::from);
@@ -1933,28 +1959,8 @@ impl Session {
             } else {
                 ShellSnapshot::disabled()
             };
-            // Host shell discovery is lazy only so remote-only, empty and inherited
-            // selections skip it. A newly selected local environment demands it:
-            // finish discovery before that selection is first resolved, so the
-            // environment attaches at creation (instruction sources, Git, skills)
-            // instead of racing its background resolution. A discovery failure is
-            // reported by that environment's own resolution.
-            let inherited_selections = inherited_environments
-                .as_ref()
-                .map(TurnEnvironmentSnapshot::to_selections)
-                .unwrap_or_default();
-            if session_configuration
-                .environment_selections()
-                .iter()
-                .any(|selection| {
-                    !inherited_selections.contains(selection)
-                        && environment_manager
-                            .get_environment(&selection.environment_id)
-                            .is_some_and(|environment| !environment.is_remote())
-                })
-            {
-                let _ = default_shell.resolve().await;
-            }
+            // Required local discovery completed in the startup join, before
+            // the first environment resolution attaches instruction sources.
             let turn_environments = Arc::new(ThreadEnvironments::new(
                 environment_manager,
                 default_shell.clone(),
@@ -2047,9 +2053,6 @@ impl Session {
                     thread_id.to_string(),
                 );
             }
-            crate::tools::command_output_artifact::spawn_retention_index_prewarm(
-                config.codex_home.as_path(),
-            );
             let plugin_outcome = plugins_manager
                 .plugins_for_config(&config.plugins_config_input())
                 .await;

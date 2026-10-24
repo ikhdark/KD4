@@ -27,12 +27,10 @@ codex-utils-pty = { workspace = true }
 codex-utils-string = { workspace = true }
 dunce = { workspace = true }
 glob = { workspace = true }
-hex = { workspace = true }
 memchr = { workspace = true }
 regex-lite = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
-sha2 = { workspace = true }
 tokio = { workspace = true, features = ["fs", "rt", "sync", "time"] }
 tokio-util = { workspace = true }
 toml = { workspace = true }

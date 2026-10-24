@@ -1278,7 +1278,7 @@ Input row (JSON):\n\
 {row_json}\n\n\
 Expected result schema (JSON Schema or {{}}):\n\
 {output_schema}\n\n\
-You MUST record the result with `report_agent_job_result`; only `accepted: true` confirms this call recorded the item. Call it with:\n\
+You MUST record the result with `report_agent_job_result`; only `accepted: true` confirms the result is recorded. `acknowledgment: accepted_new` records a new report; `accepted_replay` confirms the same retained report, not new work. Call it with:\n\
 1. `job_id` = \"{job_id}\"\n\
 2. `item_id` = \"{item_id}\"\n\
 3. `result` = a JSON object that contains your analysis result for this row.\n\n\

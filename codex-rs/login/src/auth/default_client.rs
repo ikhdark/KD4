@@ -168,7 +168,11 @@ pub fn is_first_party_chat_originator(originator_value: &str) -> bool {
 }
 
 pub fn get_codex_user_agent() -> String {
-    let build_version = env!("CARGO_PKG_VERSION");
+    get_codex_user_agent_with_version(env!("CARGO_PKG_VERSION"))
+}
+
+/// Format a transport-specific version without changing the default client identity.
+pub fn get_codex_user_agent_with_version(build_version: &str) -> String {
     let originator = originator();
     let prefix = format!(
         "{}/{build_version} ({}) {}",

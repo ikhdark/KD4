@@ -118,7 +118,10 @@ impl ExecProcessEventLog {
     pub(crate) fn publish(&self, event: ExecProcessEvent) {
         // Keep byte copies out of the history and broadcast locks. Consumers
         // still receive owned events, materialized after releasing those locks.
-        let event = Arc::new(event);
+        self.publish_shared(Arc::new(event));
+    }
+
+    pub(crate) fn publish_shared(&self, event: Arc<ExecProcessEvent>) {
         let mut history = self
             .inner
             .history
@@ -195,11 +198,15 @@ impl ExecProcessEventReceiver {
     /// delivered, including events delivered by the recovery read. A sequence
     /// gap or truncated initial replay means earlier history may be missing.
     pub async fn recv(&mut self) -> Result<ExecProcessEvent, broadcast::error::RecvError> {
+        self.recv_shared().await.map(Arc::unwrap_or_clone)
+    }
+
+    pub(crate) async fn recv_shared(&mut self) -> Result<Arc<ExecProcessEvent>, broadcast::error::RecvError> {
         if let Some(event) = self.replay.pop_front() {
-            return Ok(Arc::unwrap_or_clone(event));
+            return Ok(event);
         }
 
-        self.live_rx.recv().await.map(Arc::unwrap_or_clone)
+        self.live_rx.recv().await
     }
 }
 

@@ -15,6 +15,9 @@ const BUNDLED_LOCAL_POLICY_SLUGS: &[&str] = &[
     "gpt-5.6-terra",
     "gpt-5.6-luna",
     "gpt-5.5",
+    "gpt-daybreak-blue-latest",
+    "gpt-daybreak-red-latest",
+    "codex-auto-review",
 ];
 
 #[test]

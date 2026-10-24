@@ -1,4 +1,6 @@
 use crate::context::CollaborationModeInstructions;
+use crate::context::ContextualUserFragment;
+use crate::context::PersonalitySpecInstructions;
 use crate::context::UserInstructions;
 use crate::context::world_state::AgentsMdState;
 use codex_protocol::ResponseItemId;
@@ -735,6 +737,40 @@ pub(crate) fn filter_unchanged_stable_context_items(
     filter_unchanged_sections(history, candidates, |slot| !slot.is_volatile())
 }
 
+/// A user-role replacement cannot revoke a source's earlier developer policy.
+/// Withdraw at the old authority before delivering the lower-authority value.
+pub(crate) fn turn_contribution_authority_retractions(
+    history: &[ResponseItem],
+    candidates: &[ResponseItem],
+) -> Vec<String> {
+    let downgraded = candidates
+        .iter()
+        .filter_map(stable_item_signature)
+        .flatten()
+        .filter_map(|section| match section.entry.slot {
+            StableContextSlot::TurnContribution(index) if section.entry.role == "user" => Some(index),
+            _ => None,
+        })
+        .collect::<HashSet<_>>();
+    if downgraded.is_empty() {
+        return Vec::new();
+    }
+    let mut latest = HashMap::new();
+    for section in history.iter().filter_map(stable_item_signature).flatten() {
+        if let StableContextSlot::TurnContribution(index) = section.entry.slot
+            && downgraded.contains(&index)
+        {
+            latest.insert(index, section.entry);
+        }
+    }
+    let mut indices = latest.into_iter().filter_map(|(index, entry)| {
+        (entry.role == "developer"
+            && entry.payload != turn_contribution_removal(index)).then_some(index)
+    }).collect::<Vec<_>>();
+    indices.sort_unstable();
+    indices.into_iter().map(turn_contribution_removal).collect()
+}
+
 /// Removes identical repeats from a whole sampling history before latest-wins
 /// retirement. History keeps a repeated volatile section with its turn, but in
 /// the request retirement would delete the original occurrence in favor of the
@@ -813,13 +849,13 @@ pub(crate) fn project_stable_context(
     items: Arc<[ResponseItem]>,
     target: StableContextTarget,
 ) -> StableContextProjection {
-    project_stable_context_inner(items, target, false, false)
+    project_stable_context_inner(items, target, false, false, true)
 }
 
 /// Replacement history must retain trusted identity, source order, and the
 /// presence markers needed to project the installed history again.
 pub(crate) fn project_compaction_context(items: Arc<[ResponseItem]>) -> Vec<ResponseItem> {
-    project_stable_context_inner(items, StableContextTarget::Sampling, true, false)
+    project_stable_context_inner(items, StableContextTarget::Sampling, true, false, false)
         .items
         .to_vec()
 }
@@ -834,7 +870,7 @@ pub(crate) fn project_sampling_history_context(items: Arc<[ResponseItem]>) -> Ve
 }
 
 pub(crate) fn project_sampling_history_with_receipt(items: Arc<[ResponseItem]>) -> StableContextProjection {
-    project_stable_context_inner(items, StableContextTarget::Sampling, true, true)
+    project_stable_context_inner(items, StableContextTarget::Sampling, true, true, true)
 }
 
 fn project_stable_context_inner(
@@ -842,6 +878,7 @@ fn project_stable_context_inner(
     target: StableContextTarget,
     preserve_history: bool,
     retain_task_state_history: bool,
+    collect_metadata: bool,
 ) -> StableContextProjection {
     let fallback_items = Arc::clone(&items);
     let mut occurrences = Vec::new();
@@ -960,8 +997,9 @@ fn project_stable_context_inner(
             &user_insertion_by_turn,
             preserve_history,
             retain_task_state_history,
+            collect_metadata,
         );
-        if !retained_ambiguous.is_empty() {
+        if collect_metadata && !retained_ambiguous.is_empty() {
             components.extend(analyze_unprojected(&items, &retained_ambiguous, true));
         }
         (projected.into(), components)
@@ -971,7 +1009,7 @@ fn project_stable_context_inner(
         occurrences.extend(retained_ambiguous);
         (
             Arc::clone(&items),
-            analyze_unprojected(&items, &occurrences, fail_open),
+            if collect_metadata { analyze_unprojected(&items, &occurrences, fail_open) } else { Vec::new() },
         )
     };
     let fallback_items = if enabled {
@@ -993,6 +1031,7 @@ fn project_items(
     user_insertion_by_turn: &HashMap<&str, usize>,
     preserve_history: bool,
     retain_task_state_history: bool,
+    collect_metadata: bool,
 ) -> (Vec<ResponseItem>, Vec<StableContextComponent>) {
     let selected_skill_indexes =
         current_selected_skill_indexes(items, occurrences, latest_real_user, retain_task_state_history);
@@ -1225,6 +1264,9 @@ fn project_items(
         projected
     };
 
+    if !collect_metadata {
+        return (projected, Vec::new());
+    }
     let mut components = Vec::new();
     for (slot, latest_index) in latest_by_slot {
         let occurrence = &occurrences[latest_index];
@@ -1841,6 +1883,7 @@ pub(crate) fn disabled_builtin_retractions(
     permissions: bool,
     collaboration: bool,
     environment: bool,
+    personality: bool,
 ) -> Vec<ResponseItem> {
     let mut latest = HashMap::new();
     for item in history {
@@ -1850,6 +1893,7 @@ pub(crate) fn disabled_builtin_retractions(
             }
         }
     }
+    let personality_reset = PersonalitySpecInstructions::reset().render();
     [
         (
             permissions,
@@ -1874,6 +1918,12 @@ pub(crate) fn disabled_builtin_retractions(
             "user",
             StableContextSlot::Subagents,
             SUBAGENTS_REMOVED,
+        ),
+        (
+            personality,
+            "developer",
+            StableContextSlot::Personality,
+            personality_reset.as_str(),
         ),
     ]
     .into_iter()

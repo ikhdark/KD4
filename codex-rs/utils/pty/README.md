@@ -19,8 +19,8 @@ background descendants.
   consumers can lag and lose chunks, so use the split receivers for exact output.
 - `ProcessHandle` exposes:
   - `writer_sender()` → `mpsc::Sender<Vec<u8>>` (stdin); `close_stdin()` drops the owner's sender
-  - `close_stdin_ordered().await` acknowledges pipe input close or canonical Unix VEOF after
-    queued input; raw/disabled-VEOF terminals return an error. Drop external sender clones first.
+  - `close_stdin_ordered().await` acknowledges pipe input close after queued input. Unix PTYs
+    drain accepted input, then return Unsupported instead of injecting VEOF. Drop external sender clones first.
   - `resize(TerminalSize)` and `signal(ProcessSignal)`
   - `has_exited()` and `exit_code()`
   - `request_terminate()` cancels the Windows Job or Unix initial process group and leaves readers draining
@@ -42,8 +42,8 @@ receiver closure alone does not certify complete capture.
 
 Unix `signal(Interrupt)` uses the PTY foreground group on Linux; platforms without an
 identity-safe terminal signal operation report Unsupported. Pipe interrupts retain group semantics.
-Canonical terminal EOF uses the configured VEOF twice to flush a partial line before an empty
-read. This is terminal input, not a permanent pipe half-close, and raw mode cannot provide it.
+Terminal input cannot provide a reliable pipe-like half-close: terminal state may change and
+VEOF may be interpreted as data or a signal. Use pipe stdin when an EOF guarantee is required.
 
 ## Usage example
 

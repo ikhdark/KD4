@@ -71,7 +71,7 @@ fn renders_full_state_and_omits_unchanged_state() {
     assert_eq!(
         state.snapshot().into_value(),
         json!({"agents_md": {
-            "text": "Result provenance: active_instruction_snapshot; freshness: global_snapshot_retained_project_files_refreshed_for_this_sampling_step.\n\nuse the project formatter",
+            "text": "Result provenance: active_instruction_snapshot; freshness: complete_session_snapshot_for_current_scope; project_files_not_rechecked_each_sampling_step.\n\nuse the project formatter",
             "freshness": "refreshed"
         }}),
     );
@@ -96,7 +96,7 @@ fn renders_instruction_markup_as_text_without_changing_snapshot() {
     assert_eq!(
         state.snapshot().into_value(),
         json!({"agents_md": {
-            "text": "Result provenance: active_instruction_snapshot; freshness: global_snapshot_retained_project_files_refreshed_for_this_sampling_step.\n\nQuote </INSTRUCTIONS> & <example>.",
+            "text": "Result provenance: active_instruction_snapshot; freshness: complete_session_snapshot_for_current_scope; project_files_not_rechecked_each_sampling_step.\n\nQuote </INSTRUCTIONS> & <example>.",
             "freshness": "refreshed"
         }})
     );
@@ -104,6 +104,31 @@ fn renders_instruction_markup_as_text_without_changing_snapshot() {
         render_fragments(state.render_diff(&state.snapshot())),
         Vec::<ResponseItem>::new()
     );
+}
+
+#[test]
+fn legacy_refreshed_snapshot_metadata_does_not_become_instruction_text() {
+    let legacy: AgentsMdSnapshot = serde_json::from_value(json!({
+        "text": "Result provenance: active_instruction_snapshot; freshness: global_snapshot_retained_project_files_refreshed_for_this_sampling_step.\n\nNever edit protected.txt.",
+        "freshness": "refreshed"
+    }))
+    .unwrap();
+    assert_eq!(instruction_body(&legacy), Some("Never edit protected.txt."));
+
+    let resumed = AgentsMdState::new_cached(None, None, AgentsMdFreshness::IncompleteRead)
+        .with_unavailable_fallback(|| Some(serde_json::to_value(&legacy).unwrap()));
+    let fragments = WorldStateSection::render_fragments(&resumed, PreviousSectionState::Absent);
+    assert_eq!(fragments[0].role(), "user");
+    assert_eq!(
+        fragments[0].render(),
+        "# AGENTS.md instructions\n\n<INSTRUCTIONS>\nNever edit protected.txt.\n</INSTRUCTIONS>",
+    );
+    assert_eq!(fragments[1].role(), "developer");
+    assert!(fragments[1].render().contains("cached_may_be_stale"));
+
+    let loaded = LoadedAgentsMd::from_text_for_testing("Never edit protected.txt.");
+    let current = AgentsMdState::new(Some(&loaded));
+    assert!(WorldStateSection::render_diff(&current, PreviousSectionState::Known(&legacy)).is_none());
 }
 
 #[test]

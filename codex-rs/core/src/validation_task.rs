@@ -99,6 +99,21 @@ pub(crate) fn reservation_owner(session: &Session, turn: &TurnContext, call: &st
     format!("{}:{}:{call}", session.thread_id(), turn.sub_id)
 }
 
+pub(crate) async fn acquire_execution_resources(
+    ctx: &ToolCtx,
+    command: &[String],
+    cwd: Option<&std::path::Path>,
+) -> Result<Option<crate::validation_resources::ValidationResourceLease>, String> {
+    let owner = reservation_owner(&ctx.session, &ctx.turn, &ctx.call_id);
+    if !ctx.turn.full_suite_budget.reserved_for(&owner)
+        && !ctx.turn.full_suite_budget.started_for(&owner)
+    {
+        return Ok(None);
+    }
+    let Some(cwd) = cwd else { return Ok(None); };
+    crate::validation_resources::acquire_python_test_resource(command, cwd).await
+}
+
 /// Checkpoint consumption before launch. Only proven nonexecution permits retry.
 pub(crate) async fn begin_policy_attempt(ctx: &ToolCtx) -> Result<(), String> {
     let owner = reservation_owner(&ctx.session, &ctx.turn, &ctx.call_id);

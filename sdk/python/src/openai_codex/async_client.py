@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import queue
 import sys
 import threading
 from concurrent.futures import Future
@@ -432,35 +431,21 @@ class AsyncCodexClient:
             max_delay_s=max_delay_s,
         )
 
-    async def _poll_notification(self, receive: Callable[[], Notification]) -> Notification:
-        deadline = asyncio.get_running_loop().time() + self._sync.config.operation_timeout_s
-        while True:
-            try:
-                return receive()
-            except queue.Empty:
-                if asyncio.get_running_loop().time() >= deadline:
-                    raise TimeoutError("notification wait deadline exceeded") from None
-                await asyncio.sleep(0.01)
-
     async def next_notification(self) -> Notification:
         """Wait for a global notification within the configured operation budget."""
-        return await self._poll_notification(lambda: self._sync.next_notification(0.0))
+        return await self._sync._router.global_notification_queue().get_async()
 
     async def next_login_notification(self, login_id: str) -> Notification:
         """Wait for the next notification routed to one login attempt."""
-        return await self._poll_notification(
-            lambda: self._sync.next_login_notification(login_id, 0.0)
-        )
+        return await self._sync._router.login_notification_queue(login_id).get_async()
 
     async def next_turn_notification(self, turn_id: str) -> Notification:
         """Wait for the next notification routed to one turn."""
-        return await self._poll_notification(
-            lambda: self._sync.next_turn_notification(turn_id, 0.0)
-        )
+        return await self._sync._router.turn_notification_queue(turn_id).get_async()
 
     async def next_goal_notification(self, state: _GoalOperationState) -> Notification:
         """Wait for the next notification in a logical goal turn."""
-        return await self._poll_notification(lambda: self._sync.next_goal_notification(state, 0.0))
+        return await state._notifications.get_async()
 
     async def wait_for_login_completed(
         self,

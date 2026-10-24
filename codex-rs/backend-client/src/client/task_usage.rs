@@ -84,9 +84,9 @@ impl Client {
             || threads.iter().any(|thread| {
                 std::iter::once(&thread.thread_id)
                     .chain(&thread.descendant_thread_ids)
-                    .any(|id| id.trim().is_empty() || id.len() > 512 || !ids.insert(id.as_str()))
+                    .any(|id| id.trim().is_empty() || id.len() > 512
+                        || !ids.insert(id.as_str()) || ids.len() > 1_000)
             })
-            || ids.len() > 1_000
         {
             return Err(RequestError::Other(anyhow::anyhow!(
                 "Expected at most 100 disjoint tasks and 1,000 thread IDs."
@@ -186,6 +186,15 @@ impl<'de> Deserialize<'de> for TaskCredits {
 
 impl Ord for TaskCredits {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        // Zero's exponent and minus sign do not affect its value. Opposite
+        // canonical signs decide ordering without allocating normalized digits.
+        let negative = |value: &str| value.starts_with('-')
+            && value.split(['e', 'E']).next().unwrap_or_default()
+                .bytes().any(|byte| matches!(byte, b'1'..=b'9'));
+        let sign = negative(&other.0).cmp(&negative(&self.0));
+        if !sign.is_eq() {
+            return sign;
+        }
         let (negative, power, digits) = self.parts();
         let (other_negative, other_power, other_digits) = other.parts();
         let magnitude = match (digits.is_empty(), other_digits.is_empty()) {

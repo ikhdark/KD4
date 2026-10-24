@@ -351,6 +351,9 @@ impl ToolRuntime<ShellRequest, ExecToolCallOutput> for ShellRuntime {
             .await
             .map_err(ToolError::Codex)?;
         env.windows_sandbox_additional_read_roots = additional_read_roots;
+        let validation_resource = crate::validation_task::acquire_execution_resources(
+            ctx, &req.command_for_approval, Some(req.cwd.as_path()),
+        ).await.map_err(ToolError::Rejected)?;
         crate::validation_task::begin_policy_attempt(ctx).await.map_err(ToolError::Rejected)?;
         let validation_attempt_started = Arc::new(AtomicBool::new(false));
         let after_spawn = req.validation_launch.then(|| {
@@ -362,15 +365,36 @@ impl ToolRuntime<ShellRequest, ExecToolCallOutput> for ShellRuntime {
         let progress = req.stall_timeout_ms.map(|_| CommandProgress::new());
         let progress_observer = progress.as_ref().map(CommandProgress::subscribe);
         let thread_id = ctx.session.thread_id.to_string();
-        let execution = crate::tools::command_output_artifact::capture::capture_legacy_output(
-            &ctx.turn.config.codex_home,
-            &thread_id,
-            execute_exec_request_with_after_spawn(
-                env,
-                Self::stdout_stream(ctx, progress),
-                after_spawn,
-            ),
-        );
+        let capture_home = ctx.turn.config.codex_home.clone();
+        let stdout_stream = Self::stdout_stream(ctx, progress);
+        let owns_resource = validation_resource.is_some();
+        let execution = async move {
+            let _validation_resource = validation_resource;
+            crate::tools::command_output_artifact::capture::capture_legacy_output(
+                &capture_home,
+                &thread_id,
+                execute_exec_request_with_after_spawn(env, stdout_stream, after_spawn),
+            ).await
+        };
+        let terminal_tasks = ctx.session.terminal_tasks.clone();
+        let dispatch_timing = crate::tools::tool_dispatch_trace::active_tool_dispatch_timing();
+        let execution = async move {
+            if owns_resource {
+                // A dropped tool observer must not release a running child's
+                // resource. Existing session shutdown owns this task's cleanup.
+                terminal_tasks.spawn(async move {
+                    match dispatch_timing {
+                        Some(timing) => crate::tools::tool_dispatch_trace::scope_tool_dispatch_timing(
+                            timing, execution,
+                        ).await,
+                        None => execution.await,
+                    }
+                }).await.map_err(|error|
+                    ToolError::Rejected(format!("Python test execution owner failed: {error}")))
+            } else {
+                Ok(execution.await)
+            }
+        };
         tokio::pin!(execution);
         let (out, stalled) = match (req.stall_timeout_ms, progress_observer, stall_cancellation) {
             (Some(stall_timeout_ms), Some(progress_observer), Some(stall_cancellation)) => {
@@ -390,7 +414,7 @@ impl ToolRuntime<ShellRequest, ExecToolCallOutput> for ShellRuntime {
             }
             _ => (execution.await, false),
         };
-        let (out, raw_output) = out;
+        let (out, raw_output) = out?;
         self.raw_output = Some(raw_output);
         let mut out = match out {
             Ok(out) => out,

@@ -324,15 +324,23 @@ def resolve_tool(name: str) -> str:
     return shutil.which(name) or name
 
 
-def run_command(cmd: list[str], cwd: Path | None = None) -> None:
+def run_command(
+    cmd: list[str], cwd: Path | None = None, env: dict[str, str] | None = None
+) -> None:
     print("+", " ".join(cmd), flush=True)
-    subprocess.run([resolve_tool(cmd[0]), *cmd[1:]], cwd=cwd, check=True)
+    subprocess.run([resolve_tool(cmd[0]), *cmd[1:]], cwd=cwd, env=env, check=True)
 
 
 def stage_codex_sdk_sources(staging_dir: Path) -> None:
     package_root = CODEX_SDK_ROOT
 
-    run_command(["pnpm", "install", "--frozen-lockfile"], cwd=package_root)
+    # Keep dependency lifecycle scripts, but give the explicit build below sole
+    # ownership of SDK output even when install's prepare lifecycle is enabled.
+    run_command(
+        ["pnpm", "install", "--frozen-lockfile"],
+        cwd=package_root,
+        env={**os.environ, "CODEX_SDK_SKIP_PREPARE": "1"},
+    )
     run_command(["pnpm", "run", "build"], cwd=package_root)
 
     dist_src = package_root / "dist"

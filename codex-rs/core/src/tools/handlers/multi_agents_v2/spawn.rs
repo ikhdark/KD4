@@ -7,8 +7,6 @@ use crate::agent::control::SpawnAgentOptions;
 use crate::agent::next_thread_spawn_depth;
 use crate::agent::role::AgentRoleLocks;
 use crate::agent::role::DEFAULT_ROLE_NAME;
-use crate::agent::role::apply_role_to_config;
-use crate::agent::role::resolve_role_config;
 use crate::agent_communication::AgentCommunicationContext;
 use crate::agent_communication::AgentCommunicationKind;
 use crate::context::ContextualUserFragment;
@@ -173,33 +171,22 @@ async fn handle_spawn_agent(
     AgentPath::root()
         .join(&args.task_name)
         .map_err(FunctionCallError::RespondToModel)?;
+    args.validate_generic()?;
     if turn.session_source.is_non_root_agent() && args.assignment.is_some() {
         return Err(FunctionCallError::RespondToModel(
             "spawn_agent: durable typed assignments are root-only".to_string(),
         ));
     }
-    let typed_role = if args.assignment.is_some() {
-        parse_typed_role(args.agent_type.as_deref())?
-    } else {
-        // The legacy message shape remains accepted and receives a durable repository-scoped
-        // diagnostic claim so its identity and overlap remain visible without blocking work.
-        // A read-only agent_type that the compatibility claim can satisfy keeps its role.
-        legacy_message_role(args.agent_type.as_deref())
-    };
-    let fork_mode = args.fork_mode(
-        typed_role,
-        turn.config.multi_agent_v2.allow_full_history_forks,
-    )?;
-    let role_name = args
-        .agent_type
-        .as_deref()
-        .map(str::trim)
-        .filter(|role| !role.is_empty());
-    if args.assignment.is_none() && role_name == Some("reviewer") {
-        return Err(FunctionCallError::RespondToModel(
-            "spawn_agent: reviewer requires a typed assignment with a review relation; the compatibility message form cannot establish independent review".to_string(),
-        ));
-    }
+    // Keep the historical Worker tag for durable-record compatibility. New
+    // subagents all have the same runtime profile; this is not a role selector.
+    let typed_role = AgentRole::Worker;
+    let fork_mode = args.fork_mode(turn.config.multi_agent_v2.allow_full_history_forks)?;
+    // History forks do not attach a capsule, but still need the task's explicit
+    // file/symbol pointers. They are hints, not authority beyond the task scopes.
+    let history_relevant_handles = args.assignment.as_ref()
+        .filter(|_| !matches!(fork_mode, Some(SpawnAgentForkMode::TaskCapsule)))
+        .map(|assignment| assignment.relevant_handles.clone())
+        .unwrap_or_default();
 
     let legacy_message = match (args.message.take(), args.assignment.is_some()) {
         (Some(_), true) => {
@@ -284,18 +271,14 @@ async fn handle_spawn_agent(
     }
     if matches!(fork_mode, Some(SpawnAgentForkMode::FullHistory)) {
         reject_full_fork_spawn_overrides(
-            role_name,
+            None,
             args.model.as_deref(),
             args.reasoning_effort.clone(),
         )?;
     }
-    let role_locks = if matches!(fork_mode, Some(SpawnAgentForkMode::FullHistory)) {
-        AgentRoleLocks::default()
-    } else {
-        apply_role_to_config(&mut config, role_name)
-            .await
-            .map_err(FunctionCallError::RespondToModel)?
-    };
+    // Generic subagents inherit runtime authority; configured role profiles cannot
+    // replace their model, effort, instructions, or permissions.
+    let role_locks = AgentRoleLocks::default();
     apply_spawn_agent_model_defaults_and_overrides(
         &session,
         turn.as_ref(),
@@ -313,22 +296,10 @@ async fn handle_spawn_agent(
         args.service_tier.as_deref(),
     )
     .await?;
-    let runtime_role_locks = AgentRoleLocks {
-        permissions: (args.assignment.is_none() || typed_role == AgentRole::Reviewer)
-            && role_locks.permissions,
-        ..role_locks
-    };
-    apply_spawn_agent_runtime_overrides(&mut config, turn.as_ref(), runtime_role_locks)?;
+    apply_spawn_agent_runtime_overrides(&mut config, turn.as_ref(), role_locks)?;
     config.cwd = admission_cwd.clone();
 
-    // Every V2 spawn becomes a durable typed assignment. Legacy message-shaped
-    // calls have no explicit contract; their durable role is Worker unless
-    // legacy_message_role keeps a read-only Explorer, so
-    // carry that canonical role through admission instead of constructing a
-    // role-less ThreadSpawn source that typed admission must reject.
-    // The spawn source stores the durable assignment role, not the optional
-    // configuration-profile name. Custom agent profiles can select model and
-    // instruction locks, but durable admission accepts canonical typed roles.
+    // Durable task metadata retains the historical generic Worker tag.
     let durable_role_name = agent_role_metric_label(typed_role);
     let spawn_source = thread_spawn_source(
         session.thread_id,
@@ -422,64 +393,7 @@ async fn handle_spawn_agent(
             .as_ref()
             .map(|assignment| assignment.workspace_strategy)
             .unwrap_or(WorkspaceStrategy::Shared);
-        let evaluation_root = if matches!(role, AgentRole::Reviewer | AgentRole::Verifier) {
-            let relation = args
-                .assignment
-                .as_ref()
-                .and_then(|assignment| assignment.relation.as_ref())
-                .ok_or_else(|| {
-                    FunctionCallError::RespondToModel(
-                        "spawn_agent: evaluator requires one target relation".to_string(),
-                    )
-                })?;
-            let expected = if role == AgentRole::Reviewer {
-                codex_agent_task_store::RelationKind::Review
-            } else {
-                codex_agent_task_store::RelationKind::Verification
-            };
-            if relation.kind != expected || relation.target_assignment_ids.len() != 1 {
-                return Err(FunctionCallError::RespondToModel(
-                    "spawn_agent: evaluator requires one matching target relation".to_string(),
-                ));
-            }
-            if workspace_strategy == WorkspaceStrategy::Isolated {
-                return Err(FunctionCallError::RespondToModel("spawn_agent: evaluators must share their target's existing workspace; isolated would review different source".to_string()));
-            }
-            Some(
-                store
-                    .evaluation_target_workspace(
-                        &main_repo_root,
-                        &root_session_id,
-                        relation.target_assignment_ids[0],
-                    )
-                    .await
-                    .map_err(typed_task_store_error)?,
-            )
-        } else {
-            None
-        };
-        let repo_root = if let Some(repo_root) = evaluation_root {
-            let previous_cwd = config.cwd.clone();
-            config.cwd = AbsolutePathBuf::from_absolute_path(&repo_root)
-                .map_err(|error| FunctionCallError::RespondToModel(error.to_string()))?;
-            let mut roots = config.workspace_roots.clone();
-            for root in &mut roots {
-                if root == &previous_cwd {
-                    *root = config.cwd.clone();
-                }
-            }
-            if !roots.contains(&config.cwd) {
-                roots.push(config.cwd.clone());
-            }
-            config.workspace_roots = roots.clone();
-            config.permissions.set_workspace_roots(roots);
-            if let Some(environments) = &mut spawn_environments
-                && let Some(primary) = environments.first_mut()
-            {
-                primary.cwd = codex_utils_path_uri::PathUri::from_abs_path(&config.cwd);
-            }
-            repo_root
-        } else if workspace_strategy == WorkspaceStrategy::Isolated {
+        let repo_root = if workspace_strategy == WorkspaceStrategy::Isolated {
             let workspace = Box::pin(create_isolated_worktree(
                 &main_repo_root,
                 config.codex_home.as_path(),
@@ -558,7 +472,6 @@ async fn handle_spawn_agent(
                 "spawn_agent cancelled".to_string(),
             ));
         }
-        let isolated_integrator_available = resolve_role_config(&config, "integrator").is_some();
         let prepared = prepared_typed_spawn.take().ok_or_else(|| {
             FunctionCallError::RespondToModel(
                 "spawn_agent: typed spawn reservation became unavailable".to_string(),
@@ -591,7 +504,7 @@ async fn handle_spawn_agent(
             .create_admitted_assignment(
                 &repo_root,
                 draft,
-                isolated_integrator_available,
+                false,
                 new_agent_path.to_string(),
                 args.task_name.clone(),
             )
@@ -766,7 +679,7 @@ async fn handle_spawn_agent(
             Some((assignment, attempt, _)) => communication_from_plaintext_message(
                 author,
                 new_agent_path.clone(),
-                typed_assignment_message(assignment, attempt),
+                typed_assignment_message(assignment, attempt, &history_relevant_handles),
             ),
             None => unreachable!("all MultiAgentV2 spawns are durably admitted"),
         };
@@ -924,7 +837,7 @@ async fn handle_spawn_agent(
         },
     )
     .await;
-    let role_tag = role_name.unwrap_or(DEFAULT_ROLE_NAME);
+    let role_tag = DEFAULT_ROLE_NAME;
     turn.session_telemetry.counter(
         "codex.multi_agent.spawn",
         /*inc*/ 1,
@@ -1082,7 +995,7 @@ fn emit_admission_reuse_metric(session_telemetry: &SessionTelemetry) {
 }
 
 /// `requested_handles` are the canonical capsule handles a fresh launch of the
-/// request would attach; `None` when that launch would ignore handles.
+/// request would attach; `None` for history forks, which deliver unverified hints.
 async fn reusable_spawn_result(
     control: &crate::agent::AgentControl,
     assignment_id: AssignmentId,
@@ -1772,6 +1685,8 @@ struct SpawnAgentArgs {
     /// published schema lists both aliases. Supplying two spellings is rejected.
     #[serde(alias = "prompt", alias = "instructions")]
     message: Option<String>,
+    // Compatibility input for older structured task producers. New tools expose
+    // message only; even this input always uses the same generic runtime profile.
     assignment: Option<TypedAssignmentArgs>,
     task_name: String,
     agent_type: Option<String>,
@@ -1783,9 +1698,22 @@ struct SpawnAgentArgs {
 }
 
 impl SpawnAgentArgs {
+    fn validate_generic(&self) -> Result<(), FunctionCallError> {
+        if self.agent_type.is_some() {
+            return Err(FunctionCallError::RespondToModel(
+                "spawn_agent: specialized roles are no longer supported; put the complete task, scope, restrictions, and evidence requirements in message".to_string(),
+            ));
+        }
+        if self.model.is_some() || self.reasoning_effort.is_some() {
+            return Err(FunctionCallError::RespondToModel(format!(
+                "spawn_agent: model and reasoning overrides are not supported; subagents use {DEFAULT_SPAWN_AGENT_MODEL} with {DEFAULT_SPAWN_AGENT_REASONING_EFFORT} reasoning"
+            )));
+        }
+        Ok(())
+    }
+
     fn fork_mode(
         &self,
-        role: AgentRole,
         allow_full_history_forks: bool,
     ) -> Result<Option<SpawnAgentForkMode>, FunctionCallError> {
         if self.fork_context.is_some() {
@@ -1799,18 +1727,6 @@ impl SpawnAgentArgs {
             .as_deref()
             .map(str::trim)
             .filter(|fork_turns| !fork_turns.is_empty());
-
-        if matches!(role, AgentRole::Reviewer | AgentRole::Verifier) {
-            if explicit_fork_turns
-                .is_some_and(|fork_turns| !fork_turns.eq_ignore_ascii_case("none"))
-            {
-                return Err(FunctionCallError::RespondToModel(
-                    "typed reviewer and verifier assignments require fork_turns=\"none\""
-                        .to_string(),
-                ));
-            }
-            return Ok(Some(SpawnAgentForkMode::TaskCapsule));
-        }
 
         let Some(fork_turns) = explicit_fork_turns else {
             return Ok(Some(SpawnAgentForkMode::TaskCapsule));
@@ -1901,17 +1817,7 @@ impl TypedAssignmentArgs {
     }
 }
 
-/// Durable role for the compatibility message shape, which carries no explicit
-/// contract. Only Explorer is a read-only role that such a message can satisfy:
-/// a successful Architect receipt must seal an ArchitectureContractV1, and
-/// reviewers and verifiers need a target relation. Every other agent_type,
-/// including absent, custom, and unknown names, keeps the Worker claim.
-fn legacy_message_role(agent_type: Option<&str>) -> AgentRole {
-    match parse_typed_role(agent_type) {
-        Ok(AgentRole::Explorer) => AgentRole::Explorer,
-        _ => AgentRole::Worker,
-    }
-}
+
 
 fn legacy_message_draft(
     root_session_id: String,
@@ -2114,7 +2020,7 @@ async fn normalize_relevant_handles(
 
 /// Validate a reuse request's handles before any reuse, exactly as its fresh
 /// launch would, and return them for the equivalence check. `None` when the
-/// launch forks history instead of a TaskCapsule and so ignores handles.
+/// launch forks history instead of attaching canonical TaskCapsule handles.
 async fn reuse_request_handles(
     uses_task_capsule: bool,
     repo_root: &Path,
@@ -2149,7 +2055,7 @@ async fn reuse_request_handles(
 
 /// Reuse equivalence includes the canonical handle set (file, or symbol
 /// locator, per path). Existence and content observations are launch-time
-/// state, not identity. A producer launched without a capsule has no handles;
+/// state, not identity. A producer launched without a capsule has no canonical handles;
 /// an unreadable capsule never matches.
 fn capsule_handles_match(existing_capsule: Option<&str>, requested: &[TaskCapsuleHandle]) -> bool {
     let existing = match existing_capsule {
@@ -2174,28 +2080,15 @@ fn capsule_handle_identities(handles: &[TaskCapsuleHandle]) -> BTreeSet<(&str, O
         .collect()
 }
 
-fn parse_typed_role(agent_type: Option<&str>) -> Result<AgentRole, FunctionCallError> {
-    match agent_type.map(str::trim).filter(|role| !role.is_empty()) {
-        Some(role) => match role {
-            "architect" => Ok(AgentRole::Architect),
-            "explorer" => Ok(AgentRole::Explorer),
-            "worker" => Ok(AgentRole::Worker),
-            "reviewer" => Ok(AgentRole::Reviewer),
-            "verifier" => Ok(AgentRole::Verifier),
-            "integrator" => Ok(AgentRole::Integrator),
-            _ => Err(FunctionCallError::RespondToModel(format!(
-                "spawn_agent: typed assignments require a supported agent_type; unsupported role {role:?}"
-            ))),
-        },
-        None => Err(FunctionCallError::RespondToModel(
-            "spawn_agent: typed assignments require an explicit agent_type".to_string(),
-        )),
-    }
-}
 
-const TYPED_RECEIPT_LIFECYCLE: &str = "This is an explicit typed assignment. Use get_agent_task only when contract details or captured validation call IDs are missing from the current context. Before your final response, call submit_agent_receipt with the actual outcome and available evidence; report missing validation honestly. A final response alone does not seal this typed assignment.";
 
-fn typed_assignment_message(assignment: &Assignment, attempt: &Attempt) -> String {
+const TYPED_RECEIPT_LIFECYCLE: &str = "This is an explicit typed assignment. Before acting on a follow-up, use get_agent_task with your own assignment_id to recover the current attempt and effective contract; the immutable bootstrap may describe an earlier attempt. Otherwise use get_agent_task only when contract details or captured validation call IDs are missing from the current context. Before your final response, call submit_agent_receipt with the actual outcome and available evidence; report missing validation honestly. A final response alone does not seal this typed assignment.";
+
+fn typed_assignment_message(
+    assignment: &Assignment,
+    attempt: &Attempt,
+    relevant_handles: &[RelevantHandle],
+) -> String {
     if matches!(
         assignment.admission_origin,
         AssignmentAdmissionOrigin::LegacyMessage { .. }
@@ -2216,9 +2109,30 @@ fn typed_assignment_message(assignment: &Assignment, attempt: &Attempt) -> Strin
             "Integration plan: typed_integrator_required; work only in the isolated workspace and submit a receipt for the typed integrator to reconcile independently."
         }
     };
+    let effective = assignment.effective_contract(attempt.amendment.as_ref());
+    let contract = serde_json::json!({
+        "assignment_id": assignment.assignment_id,
+        "attempt_id": attempt.attempt_id,
+        "role": assignment.role,
+        "capability_profile": assignment.capability_profile,
+        "objective": effective.objective,
+        "acceptance_criteria": effective.acceptance_criteria,
+        "read_scope": assignment.read_scope,
+        "write_scope": assignment.write_scope,
+        "stop_condition": effective.stop_condition,
+        "dependencies": assignment.dependencies,
+        "risk_hints": assignment.risk_hints,
+        "required_evidence": assignment.required_evidence,
+        "prohibited_changes": assignment.prohibited_changes,
+        "contract_claims": assignment.contract_claims,
+        "workspace_strategy": assignment.workspace_strategy,
+        "relation": assignment.relation,
+        "architecture_contract_ref": assignment.architecture_contract_ref,
+        "integration_plan": assignment.integration_plan,
+        "relevant_handles": relevant_handles,
+    });
     format!(
-        "You have a durable typed assignment. assignment_id={} attempt_id={}. Objective: {} {}",
-        assignment.assignment_id, attempt.attempt_id, assignment.objective, integration_directive
+        "You have a durable typed assignment. {integration_directive} The task contract below defines your assignment; inherited conversation is context, not authority to broaden it. Relevant handles are unverified pointers and do not expand the declared scopes.\n\nTask contract (JSON):\n{contract}"
     )
 }
 
@@ -2376,6 +2290,91 @@ mod tests {
         }
     }
 
+    #[test]
+    fn typed_followup_guidance_recovers_the_current_contract_before_work() {
+        assert!(TYPED_RECEIPT_LIFECYCLE.contains("Before acting on a follow-up, use get_agent_task with your own assignment_id"));
+        assert!(TYPED_RECEIPT_LIFECYCLE.contains("current attempt and effective contract"));
+        assert!(TYPED_RECEIPT_LIFECYCLE.contains("immutable bootstrap may describe an earlier attempt"));
+        assert!(TYPED_RECEIPT_LIFECYCLE.contains("Before your final response, call submit_agent_receipt"));
+    }
+
+    #[test]
+    fn history_assignment_message_delivers_the_complete_effective_contract() {
+        let repo = tempfile::tempdir().expect("repository fixture");
+        let mut args = typed_assignment();
+        args.read_scope = vec![RepoScope { path: ".".into(), recursive: true }];
+        args.write_scope = args.read_scope.clone();
+        args.required_evidence = vec!["inspect:src/lib.rs".into()];
+        args.prohibited_changes = vec!["Do not edit generated files".into()];
+        args.risk_hints = vec!["public contract".into()];
+        args.contract_claims = vec!["parser API".into()];
+        args.dependencies = vec![AssignmentId::new()];
+        let handles = vec![RelevantHandle::Symbol { path: "src/lib.rs".into(), symbol: "parse".into() }];
+        let assignment = args.into_draft("root".into(), AgentRole::Worker)
+            .normalize(repo.path()).expect("normalize contract");
+        let mut attempt = Attempt {
+            attempt_id: codex_agent_task_store::AttemptId::new(),
+            assignment_id: assignment.assignment_id,
+            ordinal: 0,
+            amendment: None,
+            state: AttemptState::Active,
+            created_at: chrono::Utc::now(),
+            sealed_at: None,
+        };
+        for amendment in [
+            None,
+            Some(codex_agent_task_store::AttemptAmendment {
+                reason: "correction".into(),
+                objective: Some("corrected objective".into()),
+                acceptance_criteria: Some(vec![AcceptanceCriterion {
+                    evidence_policy: None,
+                    id: "corrected".into(),
+                    text: "corrected observable outcome".into(),
+                }]),
+                stop_condition: Some("stop after correction".into()),
+            }),
+        ] {
+            attempt.amendment = amendment;
+            let message = typed_assignment_message(&assignment, &attempt, &handles);
+            let (_, payload) = message.split_once("\n\nTask contract (JSON):\n")
+                .expect("self-contained contract");
+            let contract: serde_json::Value = serde_json::from_str(payload).expect("contract JSON");
+            let effective = assignment.effective_contract(attempt.amendment.as_ref());
+            assert_eq!(contract["objective"], effective.objective);
+            assert_eq!(contract["acceptance_criteria"], serde_json::to_value(effective.acceptance_criteria).unwrap());
+            assert_eq!(contract["stop_condition"], effective.stop_condition);
+            let admitted = serde_json::to_value(&assignment).unwrap();
+            for field in [
+                "assignment_id", "role", "capability_profile", "read_scope", "write_scope",
+                "dependencies", "risk_hints", "required_evidence", "prohibited_changes",
+                "contract_claims", "workspace_strategy", "relation", "architecture_contract_ref",
+                "integration_plan",
+            ] {
+                assert_eq!(contract[field], admitted[field], "{field}");
+            }
+            assert_eq!(contract["attempt_id"], attempt.attempt_id.to_string());
+            assert_eq!(contract["relevant_handles"], serde_json::to_value(&handles).unwrap());
+        }
+    }
+
+    #[test]
+    fn legacy_history_assignment_message_preserves_host_owned_completion() {
+        let repo = tempfile::tempdir().expect("repository fixture");
+        let assignment = legacy_message_draft("root".into(), "Read only; report evidence", None, AgentRole::Worker)
+            .normalize(repo.path()).expect("normalize legacy contract");
+        let attempt = Attempt {
+            attempt_id: codex_agent_task_store::AttemptId::new(),
+            assignment_id: assignment.assignment_id,
+            ordinal: 0,
+            amendment: None,
+            state: AttemptState::Active,
+            created_at: chrono::Utc::now(),
+            sealed_at: None,
+        };
+        assert_eq!(typed_assignment_message(&assignment, &attempt, &[]),
+            "Read only; report evidence\n\nReturn your result in the final response. The host records the outcome; no receipt tool call is required.");
+    }
+
     fn spawn_args() -> SpawnAgentArgs {
         SpawnAgentArgs {
             message: Some("inspect the repo".to_string()),
@@ -2392,25 +2391,11 @@ mod tests {
 
     #[test]
     fn legacy_message_is_converted_to_a_repository_wide_worker_claim() {
-        // Only Explorer is a read-only role a contract-less message can satisfy.
-        for agent_type in [
-            None,
-            Some("worker"),
-            Some("architect"),
-            Some("verifier"),
-            Some("kd4_explorer"),
-        ] {
-            assert_eq!(
-                legacy_message_role(agent_type),
-                AgentRole::Worker,
-                "{agent_type:?}"
-            );
-        }
         let draft = legacy_message_draft(
             "root-session".to_string(),
             "inspect the repo",
             None,
-            legacy_message_role(None),
+            AgentRole::Worker,
         );
         assert_eq!(draft.role, AgentRole::Worker);
         assert_eq!(draft.objective, "inspect the repo");
@@ -2437,7 +2422,7 @@ mod tests {
             .initialize(Arc::clone(&state), "root".into())
             .await
             .unwrap();
-        let role = legacy_message_role(Some(" explorer "));
+        let role = AgentRole::Explorer;
         assert_eq!(role, AgentRole::Explorer);
         let explorer = coordinator
             .create_admitted_assignment(
@@ -2465,7 +2450,7 @@ mod tests {
                     "root".into(),
                     "edit the repo",
                     None,
-                    legacy_message_role(None),
+                    AgentRole::Worker,
                 ),
                 false,
                 "/root/worker".into(),
@@ -2504,13 +2489,12 @@ mod tests {
                     if typed {
                         args.message = None;
                         args.assignment = Some(typed_assignment());
-                        args.agent_type = Some("worker".to_string());
                     }
                     args.model = model.map(str::to_string);
                     args.fork_turns = fork_turns.map(str::to_string);
                     assert!(
                         matches!(
-                            args.fork_mode(AgentRole::Worker, false),
+                            args.fork_mode(false),
                             Ok(Some(SpawnAgentForkMode::TaskCapsule))
                         ),
                         "typed={typed}, model={model:?}, fork_turns={fork_turns:?}"
@@ -2525,27 +2509,27 @@ mod tests {
         let mut args = spawn_args();
         args.fork_turns = Some("all".to_string());
         assert!(matches!(
-            args.fork_mode(AgentRole::Worker, false),
+            args.fork_mode(false),
             Err(FunctionCallError::RespondToModel(message)) if message.contains("is disabled")
         ));
         assert!(matches!(
-            args.fork_mode(AgentRole::Worker, true),
+            args.fork_mode(true),
             Ok(Some(SpawnAgentForkMode::FullHistory))
         ));
 
         args.fork_turns = Some("1".to_string());
         assert!(matches!(
-            args.fork_mode(AgentRole::Worker, false),
+            args.fork_mode(false),
             Ok(Some(SpawnAgentForkMode::LastNTurns(1)))
         ));
         args.fork_turns = Some("5".to_string());
         assert!(matches!(
-            args.fork_mode(AgentRole::Worker, false),
+            args.fork_mode(false),
             Ok(Some(SpawnAgentForkMode::LastNTurns(5)))
         ));
         args.fork_turns = Some("6".to_string());
         assert!(matches!(
-            args.fork_mode(AgentRole::Worker, false),
+            args.fork_mode(false),
             Err(FunctionCallError::RespondToModel(message))
                 if message.contains("requested 6 fork turns")
                     && message.contains("configured limit 5")
@@ -2559,87 +2543,55 @@ mod tests {
         let mut args = spawn_args();
         args.message = None;
         args.assignment = Some(typed_assignment());
-        args.agent_type = Some("worker".to_string());
         args.fork_turns = Some("3".to_string());
         assert!(matches!(
-            args.fork_mode(AgentRole::Worker, false),
+            args.fork_mode(false),
             Ok(Some(SpawnAgentForkMode::LastNTurns(3)))
         ));
     }
 
     #[test]
-    fn typed_worker_full_history_rejects_required_role_override() {
+    fn generic_full_history_keeps_uniform_defaults() {
         let mut args = spawn_args();
-        args.message = None;
-        args.assignment = Some(typed_assignment());
-        args.agent_type = Some("worker".to_string());
         args.fork_turns = Some("all".to_string());
-        let typed_role = parse_typed_role(args.agent_type.as_deref()).expect("typed role");
-        let fork_mode = args
-            .fork_mode(typed_role, true)
-            .expect("explicit fork mode");
-        assert!(matches!(fork_mode, Some(SpawnAgentForkMode::FullHistory)));
-        assert!(
-            reject_full_fork_spawn_overrides(
-                args.agent_type.as_deref(),
-                args.model.as_deref(),
-                args.reasoning_effort,
-            )
-            .is_err()
-        );
+        assert!(args.validate_generic().is_ok());
+        assert!(matches!(args.fork_mode(true), Ok(Some(SpawnAgentForkMode::FullHistory))));
+        assert!(reject_full_fork_spawn_overrides(None, None, None).is_ok());
     }
 
     #[test]
-    fn typed_reviewer_rejects_conflicting_explicit_fork() {
+    fn specialized_roles_are_rejected_before_fork_selection() {
         let mut args = spawn_args();
-        args.message = None;
-        args.assignment = Some(typed_assignment());
         args.agent_type = Some("reviewer".to_string());
         args.fork_turns = Some("all".to_string());
-        assert!(matches!(
-            args.fork_mode(AgentRole::Reviewer, false),
-            Err(FunctionCallError::RespondToModel(message))
-                if message.contains("require fork_turns=\"none\"")
-        ));
+        assert!(matches!(args.validate_generic(), Err(FunctionCallError::RespondToModel(message))
+            if message.contains("specialized roles are no longer supported")));
     }
 
     #[test]
-    fn custom_role_aliases_are_rejected_for_typed_tasks() {
-        for agent_type in [
-            "kd4_architect",
-            "kd4_explorer",
-            "kd4_worker",
-            "kd4_reviewer",
-            "kd4_verifier",
-            "kd4_integrator",
-        ] {
-            assert!(parse_typed_role(Some(agent_type)).is_err());
+    fn named_roles_and_aliases_are_rejected_for_new_subagents() {
+        for role in ["default", "architect", "explorer", "worker", "reviewer", "verifier", "integrator",
+            "kd4_architect", "kd4_explorer", "kd4_worker", "kd4_reviewer", "kd4_verifier", "kd4_integrator"] {
+            let mut args = spawn_args();
+            args.agent_type = Some(role.to_string());
+            assert!(args.validate_generic().is_err(), "{role}");
         }
     }
 
     #[test]
-    fn typed_architect_is_a_distinct_read_only_role() {
-        let role = parse_typed_role(Some("architect")).expect("architect role");
-
-        assert_eq!(role, AgentRole::Architect);
-        assert_eq!(
-            role.capability_profile(),
-            AgentRole::Explorer.capability_profile()
-        );
-        assert_ne!(role, AgentRole::Explorer);
+    fn generic_admission_does_not_select_a_specialized_role() {
+        assert!(spawn_args().validate_generic().is_ok());
+        let mut args = spawn_args();
+        args.agent_type = Some("architect".to_string());
+        assert!(args.validate_generic().is_err());
     }
 
     #[test]
-    fn typed_verifier_accepts_explicit_task_capsule_fork() {
+    fn generic_agent_accepts_explicit_task_capsule_fork() {
         let mut args = spawn_args();
-        args.message = None;
-        args.assignment = Some(typed_assignment());
-        args.agent_type = Some("verifier".to_string());
         args.fork_turns = Some("none".to_string());
-        assert!(matches!(
-            args.fork_mode(AgentRole::Verifier, false),
-            Ok(Some(SpawnAgentForkMode::TaskCapsule))
-        ));
+        assert!(args.validate_generic().is_ok());
+        assert!(matches!(args.fork_mode(false), Ok(Some(SpawnAgentForkMode::TaskCapsule))));
     }
 
     fn file_handle(path: &str) -> RelevantHandle {

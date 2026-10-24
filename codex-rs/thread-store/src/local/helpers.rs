@@ -370,7 +370,7 @@ pub(super) fn git_info_from_parts(
     })
 }
 
-fn thread_id_from_rollout_path(path: &Path) -> Option<ThreadId> {
+pub(super) fn thread_id_from_rollout_path(path: &Path) -> Option<ThreadId> {
     let file_name = path.file_name()?.to_str()?;
     let file_name = file_name.strip_suffix(".zst").unwrap_or(file_name);
     let stem = file_name.strip_suffix(".jsonl")?;

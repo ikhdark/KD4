@@ -229,19 +229,19 @@ impl ThreadMetadataSync {
             if !codex_state::rollout_item_affects_thread_metadata(item) {
                 continue;
             }
-            let previous_settings = self.settings_reducer.settings().clone();
-            if !matches!(
-                item,
-                RolloutItem::SessionMeta(meta_line) if meta_line.meta.id != self.thread_id
-            ) {
+            if matches!(item, RolloutItem::TurnContext(_)
+                | RolloutItem::EventMsg(EventMsg::ThreadSettingsApplied(_)))
+                || matches!(item, RolloutItem::SessionMeta(meta_line) if meta_line.meta.id == self.thread_id)
+            {
+                let previous_settings = self.settings_reducer.settings().clone();
                 self.settings_reducer.apply_item(item);
+                apply_persisted_settings_delta(
+                    &previous_settings,
+                    self.settings_reducer.settings(),
+                    &mut update,
+                    &mut self.cwd_seen,
+                );
             }
-            apply_persisted_settings_delta(
-                &previous_settings,
-                self.settings_reducer.settings(),
-                &mut update,
-                &mut self.cwd_seen,
-            );
             match item {
                 RolloutItem::SessionMeta(meta_line) if meta_line.meta.id == self.thread_id => {
                     update.created_at = parse_session_timestamp(meta_line.meta.timestamp.as_str());

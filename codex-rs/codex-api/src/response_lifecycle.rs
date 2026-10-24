@@ -131,11 +131,11 @@ impl ResponseLifecycle {
         self.connection
     }
 
-    pub(super) fn validate_ownership(
+    fn validate_ownership(
         &self,
         event: &ResponsesStreamEvent<'_>,
+        identity: Option<&ItemIdentity>,
     ) -> Result<(), ResponsesEventError> {
-        let identity = ItemIdentity::from_event(event);
         let supplied_response_id = event
             .response
             .as_ref()
@@ -144,7 +144,6 @@ impl ResponseLifecycle {
             .or(event.response_id.as_deref());
         if supplied_response_id.is_some_and(|id| self.connection.responses.contains(id))
             || identity
-                .as_ref()
                 .is_some_and(|item| item.keys().any(|key| self.connection.items.contains(&key)))
             || event
                 .item_id
@@ -168,15 +167,18 @@ impl ResponseLifecycle {
         mut event: ResponsesStreamEvent<'_>,
         wire_bytes: usize,
         completion_usage: Option<codex_protocol::protocol::TokenUsage>,
+        ownership_admitted: &mut bool,
     ) -> Result<Option<ResponseEvent>, ResponsesEventError> {
-        self.validate_ownership(&event)?;
+        *ownership_admitted = false;
+        let mut identity = ItemIdentity::from_event(&event);
+        self.validate_ownership(&event, identity.as_ref())?;
+        *ownership_admitted = true;
         if matches!(event.kind.as_ref(), "response.output_item.added" | "response.output_item.done")
             && event.item.as_ref().and_then(|item| item.get("id"))
             .is_some_and(|id| !id.is_null() && !id.is_string())
         {
             return Err(invalid("output item id must be a string or null"));
         }
-        let mut identity = ItemIdentity::from_event(&event);
         if !self.connection.responses.is_empty()
             && self.response_id.is_none()
             && matches!(
@@ -224,23 +226,23 @@ impl ResponseLifecycle {
                 if self.active.is_some() {
                     return Err(invalid("response.completed with an unfinished output item"));
                 }
-                if let Some(response) = &event.response {
+                if let Some(response) = &mut event.response {
                     if let Some(expected) = &self.response_id
                         && response.id.as_ref().and_then(Value::as_str) != Some(expected.as_str())
                     {
                         return Err(invalid("response.completed has a different response id"));
                     }
-                    if let Some(snapshot) = &response.output {
-                        let snapshot = snapshot
-                            .as_array()
-                            .ok_or_else(|| invalid("invalid terminal output snapshot"))?;
+                    if let Some(snapshot) = response.output.take() {
+                        let Value::Array(snapshot) = snapshot else {
+                            return Err(invalid("invalid terminal output snapshot"));
+                        };
                         if snapshot.len() != self.admitted.len() {
                             return Err(invalid("terminal output does not match finalized items"));
                         }
-                        for (item, admitted) in snapshot.iter().zip(&self.admitted) {
+                        for (item, admitted) in snapshot.into_iter().zip(&self.admitted) {
                             if parse_required_response_item(
                                 "response.output_item.done",
-                                Some(item.clone()),
+                                Some(item),
                             )? != *admitted
                             {
                                 return Err(invalid(
@@ -668,7 +670,6 @@ mod tests {
 
 #[cfg(test)]
 mod audit143_tests {
-    use super::*;
     use serde_json::json;
 
     #[test]

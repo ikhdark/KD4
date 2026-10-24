@@ -36,6 +36,42 @@ pub struct SkillInjection {
     pub scope: SkillScope,
 }
 
+/// Revision authority created by the skill owner, never parsed from model text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SkillInstructionRevision {
+    source_id: String,
+    revision: String,
+}
+
+impl SkillInstructionRevision {
+    fn new(source_id: String, contents: &str) -> Self {
+        use sha2::Digest;
+        Self {
+            source_id,
+            revision: sha2::Sha256::digest(contents.as_bytes())
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect(),
+        }
+    }
+
+    pub fn message_id(&self) -> codex_protocol::ResponseItemId {
+        codex_protocol::ResponseItemId::new(&format!(
+            "msg_sctx_skill_revision_v1_{}_{}",
+            self.source_id, self.revision,
+        ))
+    }
+}
+
+impl SkillInjection {
+    /// Only callers delivering the complete body may stamp this identity.
+    pub fn revision_identity(&self) -> Option<SkillInstructionRevision> {
+        self.source_id
+            .as_ref()
+            .map(|source| SkillInstructionRevision::new(source.clone(), &self.contents))
+    }
+}
+
 fn revision_source_id(skill: &SkillMetadata) -> String {
     use std::hash::BuildHasher;
     use std::hash::Hasher;
@@ -126,11 +162,20 @@ pub struct InjectedHostSkillPrompts {
     pub selected: Vec<SkillMetadata>,
     resolved: HashMap<String, Result<String, String>>,
     admitted_bodies: Vec<(String, String, String)>,
+    host_fragments: HashMap<String, HostSkillInstructionFragment>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HostSkillInstructionFragment {
+    role: String,
+    rendered: String,
+    revision: Option<SkillInstructionRevision>,
 }
 
 impl InjectedHostSkillPrompts {
     pub fn record_resolution(&mut self, skill: SkillMetadata, result: Result<String, String>) {
         let path = skill.path_to_skills_md.to_string_lossy();
+        self.host_fragments.remove(&normalize_host_skill_path(&path));
         self.resolved
             .insert(normalize_host_skill_path(&path), result);
         if !self
@@ -172,6 +217,44 @@ impl InjectedHostSkillPrompts {
             .push((role.to_string(), rendered, body));
     }
 
+    /// Associate a host resolution with the exact envelope emitted by its producer.
+    /// Completeness comes from the producer's read/budget result, not body tags;
+    /// only a complete fragment at the metadata's role has revision authority.
+    pub fn record_host_instruction_fragment(
+        &mut self,
+        skill: SkillMetadata,
+        role: &str,
+        rendered: String,
+        body: String,
+        complete: bool,
+    ) {
+        let path = normalize_host_skill_path(&skill.path_to_skills_md.to_string_lossy());
+        let revision = (complete && role == crate::skill_instruction_role(skill.scope))
+            .then(|| SkillInstructionRevision::new(revision_source_id(&skill), &body));
+        self.record_instruction_fragment(role, rendered.clone(), body.clone());
+        self.record_resolution(skill, Ok(body));
+        self.host_fragments.insert(path, HostSkillInstructionFragment {
+            role: role.to_string(),
+            rendered,
+            revision,
+        });
+    }
+
+    /// Return authority only for the exact admitted, complete owner envelope.
+    /// Generic fragments, rejected resolutions and body tags confer none.
+    pub fn host_instruction_revision(
+        &self,
+        role: &str,
+        rendered: &str,
+    ) -> Option<&SkillInstructionRevision> {
+        self.host_fragments.iter().find_map(|(path, fragment)| {
+            (fragment.role == role && fragment.rendered == rendered
+                && self.resolved.get(path).is_some_and(Result::is_ok))
+                .then_some(fragment.revision.as_ref())
+                .flatten()
+        })
+    }
+
     /// Final aggregate admission may reject a fragment admitted by its producer.
     /// Runtime consumers must see exactly the same accepted body, never reread it.
     pub fn retain_admitted_items(&mut self, items: &[codex_protocol::models::ResponseItem]) {
@@ -193,14 +276,19 @@ impl InjectedHostSkillPrompts {
             let Some(Ok(body)) = self.resolved.get(&key) else {
                 continue;
             };
-            let injection = SkillInjection {
-                source_id: Some(revision_source_id(skill)),
-                name: skill.name.clone(),
-                path: skill.path_to_skills_md.to_string_lossy().into_owned(),
-                contents: body.clone(),
-                scope: skill.scope,
+            let admitted = if let Some(fragment) = self.host_fragments.get(&key) {
+                retained(&fragment.role, &fragment.rendered)
+            } else {
+                let injection = SkillInjection {
+                    source_id: Some(revision_source_id(skill)),
+                    name: skill.name.clone(),
+                    path: skill.path_to_skills_md.to_string_lossy().into_owned(),
+                    contents: body.clone(),
+                    scope: skill.scope,
+                };
+                retained(injection.role(), &injection.render())
             };
-            if !retained(injection.role(), &injection.render()) {
+            if !admitted {
                 self.resolved.insert(
                     key,
                     Err("Selected skill was not admitted by the final context budget".to_string()),

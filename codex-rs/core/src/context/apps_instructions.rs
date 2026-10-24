@@ -45,7 +45,7 @@ impl ContextualUserFragment for AppsInstructionsUnavailable {
 
     fn body(&self) -> std::borrow::Cow<'_, str> {
         std::borrow::Cow::Borrowed(
-            "\n## Apps (Connectors)\nApps are currently unavailable. Previously provided Apps guidance no longer applies.\n",
+            "\n## Apps (Connectors)\nApps usage guidance is not active. Previously provided Apps guidance no longer applies. Use only capabilities available in the current tool surface.\n",
         )
     }
 }

@@ -2274,7 +2274,6 @@ async fn collect_turn_delivery_outcomes(
     while let Some(outcome) = pending.next().await {
         outcomes.push(outcome);
     }
-    outcomes.sort_unstable_by_key(|outcome| outcome.connection_id.0);
     outcomes
 }
 

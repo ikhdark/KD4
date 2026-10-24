@@ -52,6 +52,7 @@ pub(crate) struct OpenAiModelsEndpoint {
     provider_info: ModelProviderInfo,
     auth_manager: Option<Arc<AuthManager>>,
     transport_builder: Arc<dyn ModelsTransportBuilder>,
+    cache_identity_components: std::sync::OnceLock<crate::provider::ModelProviderCacheIdentity>,
 }
 
 impl OpenAiModelsEndpoint {
@@ -65,7 +66,26 @@ impl OpenAiModelsEndpoint {
             provider_info,
             auth_manager,
             transport_builder: Arc::new(RouteAwareModelsTransportBuilder::default()),
+            cache_identity_components: std::sync::OnceLock::new(),
         }
+    }
+
+    pub(crate) fn current_cache_identity(&self) -> String {
+        self.cache_identity_for_auth_identity(crate::auth::provider_cache_auth_identity(
+            self.auth_manager.as_deref(),
+        ))
+    }
+
+    fn cache_identity_for_auth_identity(
+        &self,
+        auth_identity: crate::auth::ProviderCacheAuthIdentity,
+    ) -> String {
+        self.cache_identity_components
+            .get_or_init(|| crate::provider::ModelProviderCacheIdentity::new(
+                &self.model_provider_id,
+                &self.provider_info,
+            ))
+            .for_auth_identity(&self.provider_info, auth_identity)
     }
 
     async fn auth(&self) -> Option<CodexAuth> {
@@ -127,9 +147,7 @@ impl OpenAiModelsEndpoint {
             );
         }
         let auth = self.auth().await;
-        let request_identity = crate::provider::model_provider_cache_identity_for_auth_identity(
-            &self.model_provider_id,
-            &self.provider_info,
+        let request_identity = self.cache_identity_for_auth_identity(
             crate::auth::provider_cache_auth_identity_for_auth(
                 auth.as_ref(),
                 self.auth_manager.as_deref(),
@@ -517,6 +535,7 @@ mod tests {
         let endpoint = OpenAiModelsEndpoint {
             model_provider_id: "test".into(),
             provider_info: ModelProviderInfo::create_openai_provider(Some(base)),
+            cache_identity_components: std::sync::OnceLock::new(),
             auth_manager: None,
             transport_builder: builder.clone(),
         };
@@ -707,6 +726,7 @@ mod tests {
                 observed_request: Arc::clone(&observed_request),
                 build_count: Arc::new(AtomicUsize::new(0)),
             }),
+            cache_identity_components: std::sync::OnceLock::new(),
         };
 
         endpoint
@@ -751,6 +771,7 @@ mod tests {
                 observed_request: Arc::new(Mutex::new(None)),
                 build_count: Arc::clone(&build_count),
             }),
+            cache_identity_components: std::sync::OnceLock::new(),
         };
         let factory = HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault);
 
@@ -773,6 +794,7 @@ mod tests {
         let endpoint = OpenAiModelsEndpoint {
             model_provider_id: "test".into(),
             provider_info: ModelProviderInfo::create_openai_provider(/*base_url*/ None),
+            cache_identity_components: std::sync::OnceLock::new(),
             auth_manager: None,
             transport_builder: Arc::new(RecordingTransportBuilder {
                 inner: RouteAwareModelsTransportBuilder::default(),
@@ -857,6 +879,7 @@ mod tests {
             provider_info: ModelProviderInfo::create_openai_provider(Some(server.uri())),
             auth_manager: None,
             transport_builder: Arc::new(RouteAwareModelsTransportBuilder::default()),
+            cache_identity_components: std::sync::OnceLock::new(),
         };
 
         let result = endpoint
@@ -901,6 +924,7 @@ mod tests {
         let endpoint = OpenAiModelsEndpoint {
             model_provider_id: "test".into(),
             provider_info: ModelProviderInfo::create_openai_provider(None),
+            cache_identity_components: std::sync::OnceLock::new(),
             auth_manager: None,
             transport_builder: Arc::new(RecordingTransportBuilder {
                 inner: RouteAwareModelsTransportBuilder::default(),

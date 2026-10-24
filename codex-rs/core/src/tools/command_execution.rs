@@ -465,6 +465,11 @@ impl CommandExecutionLedger {
     ) {
         let Some(identity) = identity.filter(|identity| !identity.unavailable) else { return; };
         let Some(persistence) = self.persistence.as_ref() else { return; };
+        if self.state.lock().await.repository.observed_turn_mutation_revisions
+            .get(turn_id).copied().unwrap_or_default() >= mutation_revision
+        {
+            return;
+        }
         let (session_cwd, command_cwd) = (persistence.cwd.clone(), cwd.to_path_buf());
         let roots = tokio::task::spawn_blocking(move || {
             let root = |cwd: &Path| codex_git_utils::get_git_repo_root(cwd)
@@ -530,6 +535,15 @@ impl CommandExecutionLedger {
         }
         let persisted_cwd = &self.persistence.as_ref()?.cwd;
         let command_root = if persisted_cwd != cwd {
+            {
+                let state = self.state.lock().await;
+                let (epoch, _) = state.repository.observed_workspace_identity_hash.as_ref()?;
+                if *epoch != state.repository.epoch
+                    || state.repository.observed_workspace_identity.is_none()
+                {
+                    return None;
+                }
+            }
             let cwd = cwd.to_path_buf();
             Some(
                 tokio::task::spawn_blocking(move || {

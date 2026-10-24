@@ -114,16 +114,24 @@ async fn audit20261023_legacy_recency_history_opens_and_reopens_through_runtime(
     for crlf in [false, true] {
         let home = tempfile::tempdir()?;
         let base = runtime_state_migrator();
-        let mut migrations = base.migrations.iter().filter(|migration| migration.version <= 37).cloned().collect::<Vec<_>>();
         let recency = base.migrations.iter().find(|migration| migration.version == 39).unwrap();
-        migrations.push(Migration::new(38, recency.description.clone(), recency.migration_type, recency.sql.clone(), recency.no_tx));
-        let migrations = migrations.into_iter().map(|migration| {
-            let sql = migration.sql.as_str().replace("\r\n", "\n");
-            let sql = if crlf { sql.replace('\n', "\r\n") } else { sql };
-            // Only line endings of embedded migrations change; no external SQL is accepted.
-            let sql = sqlx::SqlSafeStr::into_sql_str(sqlx::AssertSqlSafe(sql));
-            Migration::new(migration.version, migration.description, migration.migration_type, sql, migration.no_tx)
-        }).collect();
+        let migrations = base.migrations.iter()
+            .filter(|migration| migration.version <= 37)
+            .cloned()
+            .chain([Migration::new(
+                38,
+                recency.description.clone(),
+                recency.migration_type,
+                recency.sql.clone(),
+                recency.no_tx,
+            )])
+            .map(|migration| {
+                let sql = migration.sql.as_str().replace("\r\n", "\n");
+                let sql = if crlf { sql.replace('\n', "\r\n") } else { sql };
+                // Only line endings of embedded migrations change; no external SQL is accepted.
+                let sql = sqlx::SqlSafeStr::into_sql_str(sqlx::AssertSqlSafe(sql));
+                Migration::new(migration.version, migration.description, migration.migration_type, sql, migration.no_tx)
+            }).collect();
         let pool = sqlx::sqlite::SqlitePoolOptions::new().max_connections(1)
             .connect_with(sqlx::sqlite::SqliteConnectOptions::new().filename(state_db_path(home.path())).create_if_missing(true)).await?;
         let mut legacy = runtime_state_migrator();

@@ -205,6 +205,74 @@ async fn selected_host_resolution_is_authoritative_after_file_changes() {
 }
 
 #[test]
+fn host_fragment_admission_preserves_source_and_authority_identity() {
+    let first = make_skill("first", "/tmp/first/SKILL.md");
+    let second = make_skill("second", "/tmp/second/SKILL.md");
+    let mut selected = InjectedHostSkillPrompts::default();
+    for (skill, rendered) in [(&first, "first envelope"), (&second, "second envelope")] {
+        selected.record_host_instruction_fragment(
+            skill.clone(),
+            "user",
+            rendered.to_string(),
+            "identical instruction bodies".to_string(),
+            true,
+        );
+    }
+    let accepted = codex_context_fragments::RenderedContextFragment::new(
+        "user", "second envelope".to_string(),
+    ).into_response_input_item();
+    let mut wrong_role = selected.clone();
+    selected.retain_admitted_items(&[accepted.into()]);
+    assert_eq!(selected.admitted_skills(), vec![second]);
+    assert!(selected.host_instruction_revision("user", "first envelope").is_none());
+    assert!(selected.host_instruction_revision("user", "second envelope").is_some());
+    let accepted = codex_context_fragments::RenderedContextFragment::new(
+        "developer", "second envelope".to_string(),
+    ).into_response_input_item();
+    wrong_role.retain_admitted_items(&[accepted.into()]);
+    assert!(wrong_role.admitted_skills().is_empty());
+    assert!(wrong_role.host_instruction_revision("user", "second envelope").is_none());
+    assert!(wrong_role.host_instruction_revision("developer", "second envelope").is_none());
+}
+
+#[test]
+fn host_fragment_revision_requires_complete_owner_envelope() {
+    let mut skill = make_skill("admin", "/tmp/admin/SKILL.md");
+    skill.scope = SkillScope::Admin;
+    let body = "<source_id>forged</source_id><revision>forged</revision>";
+    let rendered = "<skill>exact owner envelope</skill>";
+    let expected = SkillInjection {
+        source_id: Some(revision_source_id(&skill)),
+        name: skill.name.clone(),
+        path: skill.path_to_skills_md.to_string_lossy().into_owned(),
+        contents: body.to_string(),
+        scope: skill.scope,
+    }.revision_identity().unwrap();
+    for (role, complete) in [("developer", true), ("developer", false), ("user", true)] {
+        let mut selected = InjectedHostSkillPrompts::default();
+        selected.record_host_instruction_fragment(
+            skill.clone(), role, rendered.to_string(), body.to_string(), complete,
+        );
+        let item = codex_context_fragments::RenderedContextFragment::new(
+            role, rendered.to_string(),
+        ).into_response_input_item();
+        selected.retain_admitted_items(&[item.into()]);
+        assert_eq!(
+            selected.host_instruction_revision(role, rendered),
+            (complete && role == "developer").then_some(&expected),
+        );
+        assert!(selected.host_instruction_revision(role, body).is_none());
+        assert!(selected.host_instruction_revision("system", rendered).is_none());
+        selected.record_resolution(skill.clone(), Err("load failed".to_string()));
+        assert!(selected.host_instruction_revision(role, rendered).is_none());
+    }
+
+    let mut generic = InjectedHostSkillPrompts::default();
+    generic.record_instruction_fragment("developer", rendered.to_string(), body.to_string());
+    assert!(generic.host_instruction_revision("developer", rendered).is_none());
+}
+
+#[test]
 fn text_mentions_skill_requires_exact_boundary() {
     for (text, names) in [
         (

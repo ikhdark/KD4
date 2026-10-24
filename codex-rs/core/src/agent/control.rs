@@ -615,6 +615,17 @@ impl AgentControl {
         execution_guard: Option<AgentExecutionGuard>,
     ) -> CodexResult<String> {
         let last_task_message = non_empty_task_message(render_input_preview(&input));
+        self.send_input_with_preview(agent_id, state, input, execution_guard, last_task_message).await
+    }
+
+    async fn send_input_with_preview(
+        &self,
+        agent_id: ThreadId,
+        state: &Arc<ThreadManagerState>,
+        input: Vec<UserInput>,
+        execution_guard: Option<AgentExecutionGuard>,
+        last_task_message: Option<String>,
+    ) -> CodexResult<String> {
         let result = self
             .handle_thread_request_result(
                 agent_id,
@@ -641,17 +652,7 @@ impl AgentControl {
         communication: InterAgentCommunication,
         agent_communication_context: AgentCommunicationContext,
     ) -> CodexResult<String> {
-        // Only the host's terminal publication may report up the agent tree.
-        // Queue-only progress still interrupts an active parent's sampling;
-        // reject it before loading a target, reserving capacity, or enqueuing.
-        let reports_to_ancestor = communication.author.as_str()
-            .strip_prefix(communication.recipient.as_str())
-            .is_some_and(|suffix| suffix.starts_with('/'));
-        if reports_to_ancestor && !agent_communication_context.is_terminal_result() {
-            return Err(CodexErr::InvalidRequest(
-                "Sub-agents report to ancestors only at the end. Finish with one final answer, including any blockers; the host delivers the terminal result automatically. This progress message was not queued.".into(),
-            ));
-        }
+        self.validate_inter_agent_communication(&communication, &agent_communication_context)?;
         let state = self.upgrade()?;
         let execution_guard = self
             .reserve_execution_capacity_for_turn_start(agent_id, communication.trigger_turn)
@@ -664,6 +665,25 @@ impl AgentControl {
             execution_guard,
         )
         .await
+    }
+
+    pub(crate) fn validate_inter_agent_communication(
+        &self,
+        communication: &InterAgentCommunication,
+        agent_communication_context: &AgentCommunicationContext,
+    ) -> CodexResult<()> {
+        // Only the host's terminal publication may report up the agent tree.
+        // Queue-only progress still interrupts an active parent's sampling;
+        // reject it before loading a target, reserving capacity, or enqueuing.
+        let reports_to_ancestor = communication.author.as_str()
+            .strip_prefix(communication.recipient.as_str())
+            .is_some_and(|suffix| suffix.starts_with('/'));
+        if reports_to_ancestor && !agent_communication_context.is_terminal_result() {
+            return Err(CodexErr::InvalidRequest(
+                "Sub-agents report to ancestors only at the end. Finish with one final answer, including any blockers; the host delivers the terminal result automatically. This progress message was not queued.".into(),
+            ));
+        }
+        Ok(())
     }
 
     async fn send_inter_agent_communication_after_capacity_check(
@@ -691,6 +711,10 @@ impl AgentControl {
         self.state.retained_input_queue(id)
     }
 
+    pub(crate) fn can_queue_inter_agent_communication(&self, id: ThreadId) -> bool {
+        self.state.input_queue_for_delivery(id).is_some()
+    }
+
     pub(crate) fn remember_input_queue(
         &self,
         id: ThreadId,
@@ -708,6 +732,20 @@ impl AgentControl {
         execution_guard: Option<AgentExecutionGuard>,
     ) -> CodexResult<String> {
         let last_task_message = last_task_message_from_communication(&communication);
+        self.submit_inter_agent_communication_with_preview(
+            agent_id, state, communication, context, execution_guard, last_task_message,
+        ).await
+    }
+
+    async fn submit_inter_agent_communication_with_preview(
+        &self,
+        agent_id: ThreadId,
+        state: &Arc<ThreadManagerState>,
+        communication: InterAgentCommunication,
+        context: AgentCommunicationContext,
+        execution_guard: Option<AgentExecutionGuard>,
+        last_task_message: Option<String>,
+    ) -> CodexResult<String> {
         let communication_log_metadata = crate::agent_communication::logging_enabled()
             .then(|| crate::agent_communication::agent_communication_log_metadata(&communication));
         let queue = (!communication.trigger_turn)
@@ -1109,7 +1147,7 @@ impl AgentControl {
                             "retained agent `{path}` has a conflicting binding"
                         )));
                     }
-                    self.rehydrate_binding(binding).await?;
+                    self.rehydrate_binding_with_stored(binding, Some(stored)).await?;
                 } else {
                     self.state.restore_cold_agent(
                         AgentMetadata {
@@ -1145,6 +1183,17 @@ impl AgentControl {
         &self,
         binding: codex_agent_task_store::AgentTaskBinding,
     ) -> CodexResult<()> {
+        self.rehydrate_binding_with_stored(binding, None).await
+    }
+
+    // Only cold-tree traversal supplies a stored observation: it has already
+    // checked this child's direct lineage. Authorization and edge status below
+    // remain fresh; a traversal's earlier open-child list is not authority here.
+    async fn rehydrate_binding_with_stored(
+        &self,
+        binding: codex_agent_task_store::AgentTaskBinding,
+        validated_stored: Option<codex_thread_store::StoredThread>,
+    ) -> CodexResult<()> {
         let thread_id = binding
             .thread_id
             .as_deref()
@@ -1158,7 +1207,15 @@ impl AgentControl {
         if self.state.agent_metadata_for_thread(thread_id).is_some() {
             return Ok(());
         }
-        self.ensure_agent_in_tree(thread_id).await?;
+        if let Some(stored) = validated_stored.as_ref() {
+            let parent = stored.parent_thread_id.ok_or(CodexErr::ThreadNotFound(thread_id))?;
+            if stored.thread_id != thread_id || stored.source.parent_thread_id() != Some(parent) {
+                return Err(CodexErr::ThreadNotFound(thread_id));
+            }
+            self.ensure_agent_in_tree(parent).await?;
+        } else {
+            self.ensure_agent_in_tree(thread_id).await?;
+        }
         let coordinator = self.task_coordinator();
         if coordinator.root_session_id().as_deref() != Some(binding.root_session_id.as_str()) {
             return Err(CodexErr::ThreadNotFound(thread_id));
@@ -1183,13 +1240,16 @@ impl AgentControl {
             return Err(CodexErr::ThreadNotFound(thread_id));
         }
         let state = self.upgrade()?;
-        let stored = state
-            .read_stored_thread(codex_thread_store::ReadThreadParams {
-                thread_id,
-                include_archived: false,
-                include_history: false,
-            })
-            .await?;
+        let stored = match validated_stored {
+            Some(stored) => stored,
+            None => state
+                .read_stored_thread(codex_thread_store::ReadThreadParams {
+                    thread_id,
+                    include_archived: false,
+                    include_history: false,
+                })
+                .await?,
+        };
         let parent = stored
             .parent_thread_id
             .ok_or(CodexErr::ThreadNotFound(thread_id))?;
@@ -1205,13 +1265,13 @@ impl AgentControl {
         // runtime that is still loaded shows the agent was not closed: close unloads it.
         let open = match state.agent_graph_store() {
             Some(graph) => graph
-                .list_thread_spawn_children(
+                .has_thread_spawn_child(
                     parent,
-                    Some(codex_agent_graph_store::ThreadSpawnEdgeStatus::Open),
+                    thread_id,
+                    codex_agent_graph_store::ThreadSpawnEdgeStatus::Open,
                 )
                 .await
-                .map_err(|error| CodexErr::Fatal(error.to_string()))?
-                .contains(&thread_id),
+                .map_err(|error| CodexErr::Fatal(error.to_string()))?,
             None => state.get_thread(thread_id).await.is_ok(),
         };
         if !open {
@@ -1639,10 +1699,13 @@ impl AgentControl {
         if let Some(agent_path) = agent_path.as_ref() {
             reservation.reserve_agent_path(agent_path)?;
         }
-        let candidate_names = spawn::agent_nickname_candidates(config, agent_role.as_deref());
-        let candidate_name_refs: Vec<&str> = candidate_names.iter().map(String::as_str).collect();
+        let candidate_names = if preferred_agent_nickname.is_some() {
+            Vec::new()
+        } else {
+            spawn::agent_nickname_candidates(config, agent_role.as_deref())
+        };
         let agent_nickname = Some(reservation.reserve_agent_nickname_with_preference(
-            &candidate_name_refs,
+            &candidate_names,
             preferred_agent_nickname.as_deref(),
         )?);
         let session_source = SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
@@ -1854,29 +1917,32 @@ fn agent_matches_prefix(agent_path: Option<&AgentPath>, prefix: &AgentPath) -> b
 }
 
 pub(crate) fn render_input_preview(input: &[UserInput]) -> String {
-    input
-        .iter()
-        .map(|item| match item {
-            UserInput::Text { text, .. } => text.clone(),
-            UserInput::Image { .. } => "[image]".to_string(),
-            UserInput::LocalImage { path, .. } => {
-                format!("[local_image:{}]", path.display())
-            }
-            UserInput::Skill { name, path, .. } => {
-                format!("[skill:${name}]({})", path.display())
-            }
-            UserInput::Mention { name, path, .. } => format!("[mention:${name}]({path})"),
-            _ => "[input]".to_string(),
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
+    use std::fmt::Write as _;
+    let mut preview = super::registry::TaskMessagePreview::default();
+    for (index, item) in input.iter().enumerate() {
+        if index != 0 && preview.write_str("\n").is_err() {
+            break;
+        }
+        let result = match item {
+            UserInput::Text { text, .. } => preview.write_str(text),
+            UserInput::Image { .. } => preview.write_str("[image]"),
+            UserInput::LocalImage { path, .. } => write!(preview, "[local_image:{}]", path.display()),
+            UserInput::Skill { name, path, .. } => write!(preview, "[skill:${name}]({})", path.display()),
+            UserInput::Mention { name, path, .. } => write!(preview, "[mention:${name}]({path})"),
+            _ => preview.write_str("[input]"),
+        };
+        if result.is_err() {
+            break;
+        }
+    }
+    preview.finish()
 }
 
 fn last_task_message_from_communication(communication: &InterAgentCommunication) -> Option<String> {
     if communication.encrypted_content.is_some() {
         return None;
     }
-    non_empty_task_message(communication.content.clone())
+    non_empty_task_message(super::registry::bounded_task_message_from_text(&communication.content))
 }
 
 fn non_empty_task_message(message: String) -> Option<String> {

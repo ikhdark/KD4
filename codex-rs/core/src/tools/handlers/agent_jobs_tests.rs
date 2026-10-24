@@ -253,6 +253,8 @@ async fn report_rejects_schema_invalid_result_without_completing_then_accepts_co
         "If schema validation rejects your result, correct the payload and call it again."
     ));
     assert!(!prompt.contains("exactly once"));
+    assert!(prompt.contains("`acknowledgment: accepted_new` records a new report"));
+    assert!(prompt.contains("`accepted_replay` confirms the same retained report, not new work"));
 
     let reporting_thread_id = ThreadId::new();
     assert!(
@@ -297,7 +299,7 @@ async fn report_rejects_schema_invalid_result_without_completing_then_accepts_co
     assert_eq!(item.result_json, None);
 
     let delivered = report_agent_job_result::handle(
-        session,
+        session.clone(),
         json!({
             "job_id": job.id.as_str(),
             "item_id": "item-0",
@@ -312,6 +314,17 @@ async fn report_rejects_schema_invalid_result_without_completing_then_accepts_co
         delivered.sampling_request_signal.as_ref().unwrap()["authoritative_wait_owner_v1"]["surfaceable_message"],
         r#"{"score":5}"#
     );
+    let acknowledgment: Value = serde_json::from_str(&delivered.into_text()).expect("report receipt");
+    assert_eq!(acknowledgment, json!({"accepted": true, "acknowledgment": "accepted_new"}));
+    let replay = report_agent_job_result::handle(
+        session,
+        json!({"job_id": job.id.as_str(), "item_id": "item-0", "result": {"score": 5}})
+            .to_string(),
+    )
+    .await
+    .expect("the same retained report is acknowledged without recording new work");
+    let acknowledgment: Value = serde_json::from_str(&replay.into_text()).expect("replay receipt");
+    assert_eq!(acknowledgment, json!({"accepted": true, "acknowledgment": "accepted_replay"}));
     let item = db
         .get_agent_job_item(job.id.as_str(), "item-0")
         .await
@@ -898,7 +911,8 @@ async fn worker_stop_cancels_job_settles_other_worker_and_requests_shutdown() {
     )
     .await
     .expect("reporting worker should be able to cancel the job");
-    assert_eq!(stop_output.into_text(), r#"{"accepted":true}"#);
+    let acknowledgment: Value = serde_json::from_str(&stop_output.into_text()).expect("stop receipt");
+    assert_eq!(acknowledgment, json!({"accepted": true, "acknowledgment": "accepted_new"}));
 
     let late_output = report_agent_job_result::handle(
         create_reporting_session(db.clone(), other_worker_thread_id).await,

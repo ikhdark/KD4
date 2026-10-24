@@ -81,6 +81,28 @@ pub(crate) struct McpServerElicitationOutcome {
     pub(crate) sent: bool,
 }
 
+/// Only the immutable request authority consumed by MCP projection/startup.
+/// Ordinary turns borrow it; out-of-band calls need no synthetic TurnContext.
+struct McpRequestBinding<'a> {
+    config: &'a Config,
+    originator: &'a str,
+    sub_id: &'a str,
+    approval_policy: &'a codex_config::Constrained<AskForApproval>,
+    permission_profile: &'a codex_protocol::models::PermissionProfile,
+}
+
+impl<'a> McpRequestBinding<'a> {
+    fn from_turn(turn: &'a TurnContext) -> Self {
+        Self {
+            config: &turn.config,
+            originator: &turn.originator,
+            sub_id: &turn.sub_id,
+            approval_policy: &turn.approval_policy,
+            permission_profile: &turn.permission_profile,
+        }
+    }
+}
+
 #[derive(Debug, PartialEq, Eq)]
 struct PluginInstallElicitationTelemetryMetadata {
     tool_type: String,
@@ -130,8 +152,60 @@ impl Session {
         environments: &TurnEnvironmentSnapshot,
         selected_capability_roots: &[ResolvedSelectedCapabilityRoot],
     ) -> codex_protocol::error::Result<Arc<McpRuntimeSnapshot>> {
-        let available_environment_ids =
-            Self::available_selected_environment_ids(selected_capability_roots);
+        self.mcp_runtime_for_binding(
+            &McpRequestBinding::from_turn(turn_context), environments, selected_capability_roots,
+        ).await
+    }
+
+    pub(crate) async fn capture_current_mcp_runtime(
+        self: &Arc<Self>,
+    ) -> codex_protocol::error::Result<Arc<McpRuntimeSnapshot>> {
+        let environments = self.services.turn_environments.snapshot().await;
+        let roots = self.resolve_selected_capability_roots_for_step(&environments).await;
+        let available = Self::available_selected_environment_ids(&roots);
+        let context = self.bound_mcp_context(&environments, &roots);
+        let current = self.services.latest_mcp_runtime();
+        if current.available_environment_ids() == available
+            && current.runtime_context().selected_scope_matches(&context)
+        {
+            return Ok(current);
+        }
+        let configuration = self.state.lock().await.session_configuration.clone();
+        let cwd = environments.primary()
+            .and_then(|environment| environment.cwd().to_abs_path().ok())
+            .unwrap_or_else(|| configuration.cwd().clone());
+        let mut config = Self::build_per_turn_config(&configuration, cwd);
+        // Contributors receive the effective Config and thread ModelInfo. Keep
+        // those inputs exact on a rebuild, without discovering skills/catalogs,
+        // refreshing instructions/plan state, or spawning Git enrichment.
+        let model = self.services.models_manager.get_model_info(
+            configuration.collaboration_mode.model(), &config.to_models_manager_config(),
+        ).await;
+        self.services.thread_extension_data.insert(model.clone());
+        self.resolve_multi_agent_version_for_model(&model, &config);
+        let tier = get_service_tier(
+            config.service_tier.clone(), config.features.enabled(Feature::FastMode), &model,
+        );
+        if config.service_tier != tier {
+            Arc::make_mut(&mut config).service_tier = tier;
+        }
+        let permission_profile = configuration.permission_profile();
+        let sub_id = self.next_internal_sub_id();
+        let binding = McpRequestBinding {
+            config: &config,
+            originator: &configuration.originator,
+            sub_id: &sub_id,
+            approval_policy: &configuration.approval_policy,
+            permission_profile: &permission_profile,
+        };
+        self.mcp_runtime_for_binding(&binding, &environments, &roots).await
+    }
+
+    fn bound_mcp_context(
+        &self,
+        environments: &TurnEnvironmentSnapshot,
+        selected_capability_roots: &[ResolvedSelectedCapabilityRoot],
+    ) -> McpRuntimeContext {
         let current_context = self.services.latest_mcp_runtime().runtime_context().clone();
         let local_cwd = environments
             .turn_environments
@@ -146,11 +220,21 @@ impl Session {
                 &root.selected_root().location;
             captured.insert(environment_id.clone(), Some(Arc::clone(root.environment())));
         }
-        let selected_context = McpRuntimeContext::new(
+        McpRuntimeContext::new(
             self.services.turn_environments.environment_manager(),
             local_cwd,
         )
-        .with_selected_environments(captured);
+        .with_selected_environments(captured)
+    }
+
+    async fn mcp_runtime_for_binding(
+        self: &Arc<Self>,
+        binding: &McpRequestBinding<'_>,
+        environments: &TurnEnvironmentSnapshot,
+        selected_capability_roots: &[ResolvedSelectedCapabilityRoot],
+    ) -> codex_protocol::error::Result<Arc<McpRuntimeSnapshot>> {
+        let available_environment_ids = Self::available_selected_environment_ids(selected_capability_roots);
+        let selected_context = self.bound_mcp_context(environments, selected_capability_roots);
         loop {
             let expected_runtime = self.services.latest_mcp_runtime();
             let scope_matches = |runtime: &McpRuntimeSnapshot| {
@@ -177,10 +261,10 @@ impl Session {
                 .services
                 .mcp_manager
                 .runtime_config_for_bound_step(
-                    &turn_context.config,
+                    binding.config,
                     &self.services.mcp_thread_init,
                     &self.services.thread_extension_data,
-                    &turn_context.originator,
+                    binding.originator,
                     &available_environment_ids,
                     selected_capability_roots,
                 )
@@ -249,7 +333,7 @@ impl Session {
             }
             let runtime = self
                 .refresh_mcp_servers_inner(
-                    turn_context,
+                    binding,
                     mcp_projection,
                     environments,
                     &available_environment_ids,
@@ -448,7 +532,7 @@ impl Session {
     )]
     async fn refresh_mcp_servers_inner(
         &self,
-        turn_context: &TurnContext,
+        binding: &McpRequestBinding<'_>,
         mcp_projection: McpRuntimeProjection,
         environments: &TurnEnvironmentSnapshot,
         available_environment_ids: &[String],
@@ -485,6 +569,13 @@ impl Session {
             &mcp_runtime_context,
         )
         .await;
+        // Authentication discovery may have yielded to another publication.
+        // Do not start clients for a candidate already known to have lost.
+        // The final compare-and-publish below still covers later races.
+        let current_runtime = self.services.latest_mcp_runtime();
+        if !Arc::ptr_eq(&current_runtime, &expected_runtime) {
+            return current_runtime;
+        }
         let mut startup_cancellation = McpStartupCancellationGuard::new();
         let mcp_startup_cancellation_token = startup_cancellation.token();
         let published_startup_token = self
@@ -524,11 +615,11 @@ impl Session {
             mcp_config.mcp_oauth_credentials_store_mode,
             mcp_config.auth_keyring_backend_kind,
             auth_statuses,
-            &turn_context.approval_policy,
-            turn_context.sub_id.clone(),
+            binding.approval_policy,
+            binding.sub_id.to_string(),
             self.get_tx_event(),
             mcp_startup_cancellation_token.clone(),
-            turn_context.permission_profile(),
+            (*binding.permission_profile).clone(),
             mcp_runtime_context.clone(),
             mcp_config.codex_home.clone(),
             self.services.mcp_manager.codex_apps_tools_cache(),
@@ -684,7 +775,7 @@ impl Session {
         };
         let runtime = self
             .refresh_mcp_servers_inner(
-                turn_context,
+                &McpRequestBinding::from_turn(turn_context),
                 mcp_projection,
                 &turn_context.environments,
                 &available_environment_ids,
@@ -780,7 +871,7 @@ impl Session {
             break (mcp_projection, available_environment_ids, expected_runtime);
         };
         self.refresh_mcp_servers_inner(
-            turn_context,
+            &McpRequestBinding::from_turn(turn_context),
             mcp_projection,
             &turn_context.environments,
             &available_environment_ids,

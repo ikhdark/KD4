@@ -58,5 +58,9 @@ pub type SkillProviderFuture<'a, T> =
 pub trait SkillProvider: Send + Sync {
     fn list(&self, query: SkillListQuery) -> SkillProviderFuture<'_, SkillCatalog>;
 
+    fn list_shared(&self, query: SkillListQuery) -> SkillProviderFuture<'_, Arc<SkillCatalog>> {
+        Box::pin(async move { self.list(query).await.map(Arc::new) })
+    }
+
     fn read(&self, request: SkillReadRequest) -> SkillProviderFuture<'_, SkillReadResult>;
 }

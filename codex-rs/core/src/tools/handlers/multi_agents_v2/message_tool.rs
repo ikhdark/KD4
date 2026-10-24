@@ -278,13 +278,6 @@ pub(crate) async fn handle_message_string_tool(
             }
         }
     }
-    let resume_config = build_agent_resume_config(turn.as_ref())?;
-    session
-        .services
-        .agent_control
-        .ensure_v2_agent_loaded(resume_config, receiver_thread_id)
-        .await
-        .map_err(|err| collab_agent_error(receiver_thread_id, err))?;
     let author = turn
         .session_source
         .get_agent_path()
@@ -304,10 +297,26 @@ pub(crate) async fn handle_message_string_tool(
         MessageDeliveryMode::TriggerTurn => AgentCommunicationKind::Followup,
     };
     let context = AgentCommunicationContext::new(kind, session.thread_id);
+    let communication = mode.apply(communication);
+    let control = &session.services.agent_control;
+    control
+        .validate_inter_agent_communication(&communication, &context)
+        .map_err(|err| collab_agent_error(receiver_thread_id, err))?;
+    // Queue-only delivery has an existing retained owner even when the runtime
+    // is cold. Reload only when there is no usable queue, or a turn is required.
+    if mode == MessageDeliveryMode::TriggerTurn
+        || !control.can_queue_inter_agent_communication(receiver_thread_id)
+    {
+        let resume_config = build_agent_resume_config(turn.as_ref())?;
+        control
+            .ensure_v2_agent_loaded(resume_config, receiver_thread_id)
+            .await
+            .map_err(|err| collab_agent_error(receiver_thread_id, err))?;
+    }
     let result = session
         .services
         .agent_control
-        .send_inter_agent_communication(receiver_thread_id, mode.apply(communication), context)
+        .send_inter_agent_communication(receiver_thread_id, communication, context)
         .await
         .map_err(|err| collab_agent_error(receiver_thread_id, err));
     result?;

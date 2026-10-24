@@ -1416,6 +1416,15 @@ impl ToolCallRuntime {
         )
     }
 
+    /// These handlers already consume steering without aborting their owner.
+    /// Resolve registrations first so configured namespaces keep that behavior.
+    pub(crate) fn tool_yields_on_steering(&self, tool_name: &codex_tools::ToolName) -> bool {
+        let semantic = self.semantic_tool_name(tool_name);
+        crate::tools::code_mode::is_orchestration_tool_name(&semantic)
+            || semantic == codex_tools::ToolName::plain("sleep")
+            || semantic == codex_tools::ToolName::plain("wait_agent")
+    }
+
     pub(crate) fn command_semantic_name(
         &self,
         tool_name: &codex_tools::ToolName,
@@ -3111,22 +3120,25 @@ impl ToolCallRuntime {
                             workspace_evidence_baseline_is_compatible(original, executed)
                         })
                 });
-                let evidence_response = match result.as_ref() {
-                    Ok(result) => Some(result.response()),
-                    Err(FunctionCallError::Fatal(_)) => None,
-                    Err(err) => Some(Self::failure_response_for_message(
-                        &evidence_call,
-                        err.to_string(),
-                    )),
-                };
                 if post_dispatch_state.handler_started()
-                    && let (Some(response), Some(classification)) = (
-                        evidence_response.as_ref(),
-                        evidence_classification
-                            .as_ref()
-                            .filter(|classification| classification.observes_workspace),
-                    )
+                    && let Some(classification) = evidence_classification
+                        .as_ref()
+                        .filter(|classification| classification.observes_workspace)
                 {
+                    // Direct calls register in their outer response owner, and
+                    // non-workspace calls have no evidence consumer at all.
+                    let evidence_response = match result.as_ref() {
+                        Ok(result) => Some(result.response()),
+                        Err(FunctionCallError::Fatal(_)) => None,
+                        Err(err) => Some(Self::failure_response_for_message(
+                            &evidence_call,
+                            err.to_string(),
+                        )),
+                    };
+                    let Some(response) = evidence_response.as_ref() else {
+                        drop(gate_guard);
+                        return result;
+                    };
                     let evidence_capture_started = Instant::now();
                     let mutation_revision =
                         evidence_tracker.lock().await.current_mutation_revision();

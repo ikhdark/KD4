@@ -12,6 +12,9 @@ path = "src/lib.rs"
 [lints]
 workspace = true
 
+[features]
+test-support = ["opentelemetry_sdk/testing"]
+
 [dependencies]
 chrono = { workspace = true }
 codex-http-client = { workspace = true }
@@ -32,7 +35,7 @@ opentelemetry-otlp = { workspace = true, features = [
     "logs",
     "metrics",
     "trace",
-    "tls-ring",
+    "tls-provider-agnostic",
     "tls-roots",
 ]}
 opentelemetry-semantic-conventions = { workspace = true }
@@ -42,7 +45,6 @@ opentelemetry_sdk = { workspace = true, features = [
     "logs",
     "metrics",
     "rt-tokio",
-    "testing",
     "trace",
 ] }
 http = { workspace = true }
@@ -58,6 +60,7 @@ tracing-opentelemetry = { workspace = true }
 tracing-subscriber = { workspace = true }
 
 [dev-dependencies]
+codex-otel = { path = ".", features = ["test-support"] }
 rcgen = { workspace = true }
 tempfile = { workspace = true }
 opentelemetry_sdk = { workspace = true, features = [

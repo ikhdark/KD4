@@ -3,6 +3,7 @@ use super::*;
 const LOG_RETENTION_DAYS: i64 = 10;
 const MAX_PENDING_RETENTION_KEYS: usize = 256;
 const RETENTION_QUERY_KEY_BATCH: usize = 200;
+const RETENTION_AGE_ROW_BATCH: i64 = 1000;
 // Bounded vacuum steps keep each write transaction short for concurrent log writers.
 const INCREMENTAL_VACUUM_STEP: &str = "PRAGMA incremental_vacuum(2048)";
 
@@ -341,6 +342,38 @@ impl StateRuntime {
             return Ok(());
         }
 
+        if let Some(cutoff) = Utc::now()
+            .checked_sub_signed(chrono::Duration::days(LOG_RETENTION_DAYS))
+            .map(|cutoff| cutoff.timestamp())
+        {
+            // Fence this pass against concurrent inserts with old timestamps. Each
+            // bounded deletion commits before the next one takes writer ownership.
+            let last_id: i64 = sqlx::query_scalar("SELECT COALESCE(MAX(id), 0) FROM logs")
+                .fetch_one(self.logs_pool.as_ref())
+                .await?;
+            loop {
+                let removed = self
+                    .prune_log_retention_batch(None, Some((cutoff, last_id)))
+                    .await?;
+                if removed < RETENTION_AGE_ROW_BATCH as u64 {
+                    break;
+                }
+            }
+        }
+        for batch in scope.into_query_batches() {
+            self.prune_log_retention_batch(Some(&batch), None).await?;
+        }
+        if reconcile_all {
+            self.reclaim_free_log_pages().await;
+        }
+        Ok(())
+    }
+
+    async fn prune_log_retention_batch(
+        &self,
+        scope: Option<&LogRetentionScope>,
+        age_bound: Option<(i64, i64)>,
+    ) -> anyhow::Result<u64> {
         let started = Instant::now();
         let connection_result = self.logs_pool.acquire().await.map_err(anyhow::Error::from);
         crate::telemetry::record_log_phase(
@@ -362,22 +395,25 @@ impl StateRuntime {
         );
         let mut tx = transaction_result?;
         let started = Instant::now();
-        let deletion_result: anyhow::Result<()> = async {
+        let deletion_result: anyhow::Result<u64> = async {
             #[cfg(test)]
             let _active_deletion = self.log_retention_test_control.before_deletion().await?;
-            if let Some(cutoff) = Utc::now()
-                .checked_sub_signed(chrono::Duration::days(LOG_RETENTION_DAYS))
-                .map(|cutoff| cutoff.timestamp())
-            {
-                sqlx::query("DELETE FROM logs WHERE ts < ?")
-                    .bind(cutoff)
-                    .execute(&mut *tx)
-                    .await?;
+            let mut removed = 0;
+            if let Some((cutoff, last_id)) = age_bound {
+                removed = sqlx::query(
+                    "DELETE FROM logs WHERE id IN (SELECT id FROM logs WHERE ts < ? AND id <= ? ORDER BY ts, ts_nanos, id LIMIT ?)",
+                )
+                .bind(cutoff)
+                .bind(last_id)
+                .bind(RETENTION_AGE_ROW_BATCH)
+                .execute(&mut *tx)
+                .await?
+                .rows_affected();
             }
-            for batch in scope.into_query_batches() {
-                self.prune_logs_for_scope(&batch, &mut tx).await?;
+            if let Some(scope) = scope {
+                self.prune_logs_for_scope(scope, &mut tx).await?;
             }
-            Ok(())
+            Ok(removed)
         }
         .await;
         crate::telemetry::record_log_phase(
@@ -387,7 +423,7 @@ impl StateRuntime {
             started.elapsed(),
             &deletion_result,
         );
-        deletion_result?;
+        let removed = deletion_result?;
         let started = Instant::now();
         let commit_result = tx.commit().await.map_err(anyhow::Error::from);
         crate::telemetry::record_log_phase(
@@ -398,13 +434,9 @@ impl StateRuntime {
             &commit_result,
         );
         commit_result?;
-        // Reclamation acquires its own connection. Release the committed
-        // writer first so it cannot wait for its own last available pool slot.
+        // Return the pool slot before a following batch or reclamation acquires one.
         drop(connection);
-        if reconcile_all {
-            self.reclaim_free_log_pages().await;
-        }
-        Ok(())
+        Ok(removed)
     }
 
     /// Return free pages to the filesystem on reconciliation passes. Incremental auto-vacuum

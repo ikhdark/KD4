@@ -192,6 +192,7 @@ struct SamplingToolOutcome {
     tests_executed: bool,
     compile_validation: bool,
     validation_failure_excerpt: Option<String>,
+    #[cfg(test)]
     validation_error_sites: Option<ValidationErrorSites>,
     process_observation_progress: bool,
     validation_mutation_revision: Option<u64>,
@@ -304,6 +305,7 @@ impl SamplingToolOutcome {
             compile_validation: signal
                 .is_some_and(|signal| signal["command_validation"]["compile"] == true),
             validation_failure_excerpt: None,
+            #[cfg(test)]
             validation_error_sites: None,
             process_observation_progress: signal
                 .is_some_and(|signal| signal["process_observation_progress"] == true),
@@ -1151,7 +1153,8 @@ impl SamplingRequestSignalCollector {
         let mut outcome = SamplingToolOutcome::from_signal(ordinal, outcome_context, plan, signal);
         if outcome.is_failure_evidence() {
             outcome.validation_failure_excerpt = validation_failure_excerpt(result);
-            outcome.validation_error_sites = validation_error_sites(result, signal);
+            #[cfg(test)]
+            { outcome.validation_error_sites = validation_error_sites(result, signal); }
         }
         if outcome.is_failure_evidence() && outcome.failure_fingerprint.is_none() {
             outcome.failure_fingerprint = Some(code_mode_result_failure_fingerprint(
@@ -2265,6 +2268,7 @@ fn validation_failure_excerpt(value: &Value) -> Option<String> {
 /// Files a failed compile reported errors in. This locates errors; it does not
 /// prove which writer caused them.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[cfg(test)]
 struct ValidationErrorSites {
     /// The primary file of each reported error.
     primary: BTreeSet<String>,
@@ -2279,10 +2283,12 @@ struct ValidationErrorSites {
 }
 
 /// Larger error sets are never classified as external.
+#[cfg(test)]
 const MAX_VALIDATION_ERROR_SITE_FILES: usize = 64;
 
 /// A chunk, a reduced projection or a partial poll cannot show every error, so
 /// only the exact complete streams of an exited process are parsed.
+#[cfg(test)]
 fn validation_error_sites(result: &Value, signal: Option<&Value>) -> Option<ValidationErrorSites> {
     if result["streams_complete"] != true {
         return None;
@@ -2301,6 +2307,7 @@ fn validation_error_sites(result: &Value, signal: Option<&Value>) -> Option<Vali
 
 /// Absolute directories, from Cargo's `Checking name v1.0.0 (dir)` progress
 /// lines, of the packages it reported it could not compile.
+#[cfg(test)]
 fn failed_package_dirs<'a>(
     streams: impl IntoIterator<Item = &'a str>,
 ) -> Vec<std::path::PathBuf> {
@@ -2330,6 +2337,7 @@ fn failed_package_dirs<'a>(
 /// Files of every error in rendered rustc/cargo diagnostics. Any reported error
 /// without a source location (linker, build script, failed test run, internal
 /// compiler error, unrecognized format) leaves the set unknown.
+#[cfg(test)]
 fn rustc_error_sites<'a>(
     streams: impl IntoIterator<Item = &'a str>,
 ) -> Option<(BTreeSet<String>, BTreeSet<String>)> {
@@ -2376,6 +2384,7 @@ fn rustc_error_sites<'a>(
 
 /// `Some(true)` for an error header, `Some(false)` for a warning or a summary
 /// of errors already reported, `None` for any other line.
+#[cfg(test)]
 fn rustc_diagnostic_header(line: &str) -> Option<bool> {
     let (is_error, rest) = match line.strip_prefix("error") {
         Some(rest) => (true, rest),
@@ -2395,6 +2404,7 @@ fn rustc_diagnostic_header(line: &str) -> Option<bool> {
 }
 
 /// The file of `file:line:column`; Windows drive prefixes keep their `:`.
+#[cfg(test)]
 fn rustc_location_file(location: &str) -> Option<&str> {
     let mut parts = location.rsplitn(3, ':');
     let column = parts.next()?;

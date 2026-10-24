@@ -517,13 +517,21 @@ impl RecoveryContinuationState {
     }
 
     fn cached_page(&self, selector: &ToolOutputSelector) -> Option<ReadToolOutputResult> {
-        let mut owner = self.output.results.first()?.clone();
-        owner.selector = selector.clone();
-        owner.canonical_range = match selector {
+        // Coverage/reconstruction needs only the requested extent. Do not copy
+        // an unrelated first result's body to create this temporary descriptor.
+        let owner = ToolOutputSelectorResult {
+            selector: selector.clone(),
+            status: self.output.results.first()?.status,
+            complete: false,
+            canonical_range: match selector {
             ToolOutputSelector::Bytes { start, end } => {
                 Some(codex_tools::CanonicalByteRange::new(*start, *end))
             }
             _ => None,
+            },
+            exact_bytes: None, text: None, value: None, data_base64: None,
+            subdivision_plan: None, child_selectors: Vec::new(),
+            continuation: None, message: None,
         };
         if !selection_has_coverage(&owner, &self.output.results) {
             return None;
@@ -863,12 +871,14 @@ fn reconstruct_selection(
         if page_range.start > cursor {
             return None;
         }
+        let decoded;
         let fragment = if let Some(text) = &page.text {
-            text.as_bytes().to_vec()
+            text.as_bytes()
         } else {
-            base64::engine::general_purpose::STANDARD
+            decoded = base64::engine::general_purpose::STANDARD
                 .decode(page.data_base64.as_ref()?)
-                .ok()?
+                .ok()?;
+            decoded.as_slice()
         };
         if fragment.len() as u64 != page_range.end.checked_sub(page_range.start)? {
             return None;
@@ -896,10 +906,13 @@ fn reconstruct_selection(
     result.data_base64 = None;
     if matches!(owner.selector, ToolOutputSelector::JsonPointer { .. }) {
         result.value = Some(serde_json::from_slice(&bytes).ok()?);
-    } else if let Ok(text) = String::from_utf8(bytes.clone()) {
-        result.text = Some(text);
     } else {
-        result.data_base64 = Some(base64::engine::general_purpose::STANDARD.encode(bytes));
+        match String::from_utf8(bytes) {
+            Ok(text) => result.text = Some(text),
+            Err(error) => result.data_base64 = Some(
+                base64::engine::general_purpose::STANDARD.encode(error.into_bytes()),
+            ),
+        }
     }
     Some(result)
 }
@@ -1107,23 +1120,68 @@ async fn handle_read_tool_output(
     } else {
         resolved_max_bytes(args.max_bytes)?
     };
-    // Plain command logs do not enter the indexed snapshot/recovery pipeline.
-    let command_limit = max_bytes.min(if code_mode_recovery {
-        (READ_TOOL_OUTPUT_SCRIPT_MAX_BYTES / 8).saturating_sub(1024)
+    // Fit the actual escaped response, rather than charging every source byte
+    // the worst-case expansion. ASCII logs can use the requested script budget.
+    let command_delivery_limit = if code_mode_recovery {
+        READ_TOOL_OUTPUT_SCRIPT_MAX_BYTES
     } else {
         let policy: codex_protocol::protocol::TruncationPolicy =
             invocation.step_context.turn.model_info.truncation_policy.into();
-        (policy.byte_budget() / 8).saturating_sub(1024).max(1)
-    });
-    if let Some(output) = crate::tools::command_output_artifact::capture::read_command_log(
-        invocation.step_context.turn.config.codex_home.as_path(),
-        &invocation.session.thread_id.to_string(), &args.artifact_id,
-        &selectors, command_limit,
-    ).await.map_err(|error| FunctionCallError::RespondToModel(error.for_model()))? {
+        policy.byte_budget()
+    };
+    let mut command_limit = max_bytes;
+    let mut command_identity = None;
+    loop {
+        let Some(output) = crate::tools::command_output_artifact::capture::read_command_log(
+            invocation.step_context.turn.config.codex_home.as_path(),
+            &invocation.session.thread_id.to_string(), &args.artifact_id,
+            &selectors, command_limit,
+        ).await.map_err(|error| FunctionCallError::RespondToModel(error.for_model()))? else {
+            if command_identity.is_some() {
+                return Err(FunctionCallError::RespondToModel(
+                    "Command log disappeared while fitting recovery; no mixed page was delivered.".into(),
+                ));
+            }
+            break;
+        };
+        let identity = (output["canonical_sha256"].clone(), output["canonical_bytes"].clone());
+        if command_identity.as_ref().is_some_and(|previous| previous != &identity) {
+            return Err(FunctionCallError::RespondToModel(
+                "Command log identity changed while fitting recovery; no mixed page was delivered.".into(),
+            ));
+        }
+        command_identity = Some(identity);
+        let model_value = (!code_mode_recovery).then(|| {
+            codex_code_mode::model_visible_tool_result(
+                &ToolName::plain(READ_TOOL_OUTPUT_TOOL_NAME), &output,
+            ).unwrap_or_else(|| output.clone())
+        });
+        let delivered = model_value.as_ref().unwrap_or(&output);
+        let envelope_bytes = serde_json::to_vec(delivered).map_err(|error|
+            FunctionCallError::RespondToModel(format!("failed to serialize command recovery: {error}"))
+        )?.len();
+        if envelope_bytes > command_delivery_limit {
+            let has_source = output["results"].as_array().is_some_and(|results|
+                results.iter().any(|result| ["text", "data_base64"].iter().any(|key|
+                    result[*key].as_str().is_some_and(|text| !text.is_empty()))));
+            let smaller = command_limit.saturating_mul(command_delivery_limit)
+                / envelope_bytes.max(1);
+            let smaller = smaller.min(command_limit.saturating_sub(1));
+            if !has_source || smaller == 0 || invocation.cancellation_token.is_cancelled() {
+                return Err(FunctionCallError::RespondToModel(
+                    "Command recovery cannot fit this delivery budget; request fewer selectors or use bounded byte reads of the saved log.".into(),
+                ));
+            }
+            command_limit = smaller;
+            continue;
+        }
         let success = output["results"].as_array().is_some_and(|results|
             results.iter().all(|result| result["status"] == "ok"));
-        let result = JsonToolOutput::with_success(output, Some(success))
+        let mut result = JsonToolOutput::with_success(output, Some(success))
             .with_code_mode_failure_as_data();
+        if let Some(model_value) = model_value {
+            result = result.with_model_value(model_value);
+        }
         crate::tools::context::ensure_exact_model_delivery(&result, &invocation)?;
         attempt.completed = true;
         return Ok(boxed_tool_output(result));
@@ -1653,6 +1711,11 @@ fn bound_recovery_source_bytes(output: &mut ReadToolOutputResult, max_bytes: usi
             .map_or(0, |range| range.end - range.start);
         if bytes <= remaining {
             remaining -= bytes;
+            if (result.text.is_some() || result.data_base64.is_some())
+                && let Some(range) = result.canonical_range
+            {
+                delivered_hydration.push((range.start, range.end));
+            }
             continue;
         }
         result.status = ToolOutputSelectorStatus::SelectorTooLarge;
@@ -1699,10 +1762,21 @@ async fn drain_recovery_snapshot_with_source_budget(
         .max()
         .unwrap_or_default()
         .saturating_add(256);
-    let mut output = snapshot
-        .select(selectors, token_ceiling.saturating_sub(reserve))
-        .await?;
-    bound_recovery_source_bytes(&mut output, max_bytes);
+    let output = if recovery_envelope_fits(
+        &complete_output, None, token_ceiling.saturating_sub(reserve),
+    ) {
+        // An incomplete source-byte-limited or failed selection can already
+        // leave the full stop-metadata reserve. Reuse those exact selections
+        // instead of repeating search, hydration and payload construction.
+        complete_output
+    } else {
+        drop(complete_output);
+        let mut output = snapshot
+            .select(selectors, token_ceiling.saturating_sub(reserve))
+            .await?;
+        bound_recovery_source_bytes(&mut output, max_bytes);
+        output
+    };
     // Loading this transaction did perform an artifact read. Following its
     // pages reuses that same identity-checked observation, without more I/O.
     let mut state = RecoveryContinuationState::new(output, token_ceiling);

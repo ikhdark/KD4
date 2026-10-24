@@ -90,6 +90,7 @@ enum ShellSnapshotLocation {
 
 const SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(10);
 const SNAPSHOT_RETENTION: Duration = Duration::from_secs(60 * 60 * 24);
+const MAX_CLEANUP_LIVE_ROLLOUTS: usize = 128;
 const SNAPSHOT_DIR: &str = "shell_snapshots";
 const EXCLUDED_EXPORT_VARS: &[&str] = &["PWD", "OLDPWD"];
 pub(crate) const POWERSHELL_SNAPSHOT_FORMAT_HEADER: &str = "# Codex PowerShell snapshot format: 1";
@@ -1303,6 +1304,7 @@ pub async fn cleanup_stale_snapshots(
 
     let now = SystemTime::now();
     let active_session_id = active_session_id.to_string();
+    let mut live_rollout_paths = HashMap::new();
 
     while let Some(entry) = entries.next_entry().await? {
         if !entry.file_type().await?.is_file() {
@@ -1319,6 +1321,24 @@ pub async fn cleanup_stale_snapshots(
         };
         if session_id == active_session_id {
             continue;
+        }
+
+        // A positive path may spare another session/rollout lookup, but never
+        // authorizes deletion. Recheck its mtime for every snapshot generation;
+        // missing or newly stale paths fall through to the fresh owning lookup.
+        if let Some(rollout_path) = live_rollout_paths.get(session_id) {
+            let still_live = fs::metadata(rollout_path)
+                .await
+                .and_then(|metadata| metadata.modified())
+                .is_ok_and(|modified| {
+                    !now.duration_since(modified)
+                        .ok()
+                        .is_some_and(|age| age >= SNAPSHOT_RETENTION)
+                });
+            if still_live {
+                continue;
+            }
+            live_rollout_paths.remove(session_id);
         }
 
         let rollout_path =
@@ -1345,6 +1365,8 @@ pub async fn cleanup_stale_snapshots(
             .is_some_and(|age| age >= SNAPSHOT_RETENTION)
         {
             remove_snapshot_file(&path).await;
+        } else if live_rollout_paths.len() < MAX_CLEANUP_LIVE_ROLLOUTS {
+            live_rollout_paths.insert(session_id.to_string(), rollout_path);
         }
     }
 

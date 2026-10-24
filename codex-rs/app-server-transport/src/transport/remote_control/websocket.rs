@@ -13,12 +13,16 @@ use super::protocol::ClientId;
 use super::protocol::RemoteControlTarget;
 use super::protocol::ServerEnvelope;
 use super::protocol::StreamId;
+use super::protocol::remote_control_user_agent;
 use super::remote_control_status_with_connection_status;
 use super::same_remote_control_enrollment;
 use super::segment::ClientSegmentObservation;
 use super::segment::ClientSegmentReassembler;
+use super::segment::EncodedServerPayload;
 use super::segment::REMOTE_CONTROL_SEGMENT_MAX_BYTES;
+#[cfg(test)]
 use super::segment::encode_server_envelope_for_transport;
+use super::segment::encode_server_payloads_for_transport;
 use crate::transport::TransportEvent;
 use crate::transport::remote_control::auth::RemoteControlConnectionAuth;
 use crate::transport::remote_control::auth::load_remote_control_auth;
@@ -117,6 +121,7 @@ impl BufferedServerEnvelope {
         Ok(Self::from_encoded(envelope, payload))
     }
 
+    #[cfg(test)]
     fn from_encoded(envelope: ServerEnvelope, payload: tungstenite::Utf8Bytes) -> Self {
         Self {
             segment_id: envelope.event.segment_id(),
@@ -124,6 +129,16 @@ impl BufferedServerEnvelope {
             stream_id: envelope.stream_id,
             seq_id: envelope.seq_id,
             payload,
+        }
+    }
+
+    fn from_payload(encoded: EncodedServerPayload) -> Self {
+        Self {
+            client_id: encoded.client_id,
+            stream_id: encoded.stream_id,
+            seq_id: encoded.seq_id,
+            segment_id: encoded.segment_id,
+            payload: encoded.payload.into(),
         }
     }
 }
@@ -179,12 +194,12 @@ impl ServerWriterQueue {
             event: queued.event, client_id: queued.client_id, stream_id: queued.stream_id, seq_id,
         };
         // Complete encoding before publishing any sequence/replay mutation.
-        let encoded = encode_server_envelope_for_transport(envelope)?;
+        let encoded = encode_server_payloads_for_transport(envelope)?;
         let count = encoded.len();
         let mut completion = queued.write_complete_tx;
         let mut state = state.lock().await;
-        for (index, (envelope, payload)) in encoded.into_iter().enumerate() {
-            let buffered = BufferedServerEnvelope::from_encoded(envelope, payload.into());
+        for (index, encoded) in encoded.into_iter().enumerate() {
+            let buffered = BufferedServerEnvelope::from_payload(encoded);
             self.push(key.clone(), buffered.payload.clone(),
                 if index + 1 == count { completion.take() } else { None });
             state.outbound_buffer.insert_encoded(buffered);
@@ -1658,6 +1673,7 @@ fn build_remote_control_websocket_request(
     })?;
     let headers = request.headers_mut();
     headers.extend(default_headers());
+    set_remote_control_header(headers, "user-agent", &remote_control_user_agent())?;
     set_remote_control_header(headers, "x-codex-server-id", &enrollment.server_id)?;
     set_remote_control_header(
         headers,

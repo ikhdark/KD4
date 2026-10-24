@@ -100,7 +100,17 @@ impl LocalSecretsBackend {
         anyhow::ensure!(!value.is_empty(), "secret value must not be empty");
         let _lock = self.lock_secrets()?;
         let canonical_key = scope.canonical_key(name);
-        let mut file = self.load_file()?;
+        let (mut file, migration_required, loaded_passphrase) = self.load_file_with_state()?;
+        if !migration_required && file.secrets.get(&canonical_key).is_some_and(|old| old == value) {
+            // Retain the second current-key lookup that saving performs. A
+            // rotation/removal after decryption must not be hidden by a no-op.
+            let current = self.load_or_create_passphrase()?;
+            if loaded_passphrase.as_ref().is_some_and(|loaded|
+                loaded.expose_secret() == current.expose_secret())
+            {
+                return Ok(());
+            }
+        }
         file.secrets.insert(canonical_key, value.to_string());
         self.save_file(&file)
     }
@@ -175,11 +185,15 @@ impl LocalSecretsBackend {
     }
 
     fn load_file(&self) -> Result<SecretsFile> {
+        self.load_file_with_state().map(|(file, _, _)| file)
+    }
+
+    fn load_file_with_state(&self) -> Result<(SecretsFile, bool, Option<SecretString>)> {
         let path = self.secrets_path();
         let ciphertext = match fs::read(&path) {
             Ok(ciphertext) => ciphertext,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                return Ok(SecretsFile::new_empty());
+                return Ok((SecretsFile::new_empty(), false, None));
             }
             Err(error) => {
                 return Err(error)
@@ -198,7 +212,8 @@ impl LocalSecretsBackend {
                 path.display()
             )
         })?;
-        if parsed.version == 0 {
+        let migration_required = parsed.version == 0;
+        if migration_required {
             parsed.version = SECRETS_VERSION;
         }
         anyhow::ensure!(
@@ -207,7 +222,7 @@ impl LocalSecretsBackend {
             parsed.version,
             SECRETS_VERSION
         );
-        Ok(parsed)
+        Ok((parsed, migration_required, Some(passphrase)))
     }
 
     fn save_file(&self, file: &SecretsFile) -> Result<()> {

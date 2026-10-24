@@ -97,6 +97,20 @@ impl AgentGraphStore for LocalAgentGraphStore {
         })
     }
 
+    fn has_thread_spawn_child(
+        &self,
+        parent_thread_id: ThreadId,
+        child_thread_id: ThreadId,
+        status: ThreadSpawnEdgeStatus,
+    ) -> AgentGraphStoreFuture<'_, bool> {
+        Box::pin(async move {
+            self.state_db
+                .has_thread_spawn_child(parent_thread_id, child_thread_id, to_state_status(status))
+                .await
+                .map_err(|err| internal_error("check thread-spawn edge", err))
+        })
+    }
+
     fn list_thread_spawn_descendants(
         &self,
         root_thread_id: ThreadId,

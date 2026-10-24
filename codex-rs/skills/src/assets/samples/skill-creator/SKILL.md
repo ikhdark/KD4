@@ -24,12 +24,12 @@ Match specificity to fragility: use outcomes and decision criteria when several 
 
 ## Creation and update workflow
 
-Follow these steps, skipping those already satisfied or inapplicable to an update.
+Follow these steps, skipping those already satisfied or inapplicable to an update. Checks and independent forward-testing remain subject to the active validation and delegation policies; this skill does not authorize them.
 
 1. Establish realistic requests and triggers from user examples or examples validated with them. Ask only for unclear usage patterns, with the most important questions first.
 2. Identify reusable scripts, references, and assets from those requests. For example, repeated PDF rotation warrants a helper; repeated schema discovery warrants a reference. Avoid unused directories and placeholders.
 3. For a new skill, always run the initializer below. Do not reinitialize an existing skill.
-4. Implement the resources and concise imperative instructions. Put trigger information in the frontmatter, not a redundant body section. Added scripts must be executed and checked for their intended output; a representative sample suffices for similar scripts.
+4. Implement the resources and concise imperative instructions. Put trigger information in the frontmatter, not a redundant body section. When execution is authorized, check added scripts for their intended output; a representative sample suffices for similar scripts.
 5. Validate, then iterate using real tasks and demonstrated failures. Use the independent forward-testing procedure below after substantial or particularly tricky changes when available.
 
 ### Naming and destination
@@ -64,6 +64,6 @@ Fix reported frontmatter/naming issues and rerun affected validation. Structural
 
 ## Independent forward-testing
 
-When available, prefer independent testing for substantial or complex skills. Assign a realistic task using `Use $skill-name at /path/to/skill-name to solve problem y`, not a request to pretend to test the skill. Give the skill and minimal raw artifacts; do not leak the intended answer, diagnosis, proposed fix, or prior conclusions. Success should depend on the skill and transferable reasoning.
+When authorized and available, prefer independent testing for substantial or complex skills. Assign a realistic task using `Use $skill-name at /path/to/skill-name to solve problem y`, not a request to pretend to test the skill. Give the skill and minimal raw artifacts; do not leak the intended answer, diagnosis, proposed fix, or prior conclusions. Success should depend on the skill and transferable reasoning.
 
 Use fresh agent context, review actual outputs and artifacts, and prevent earlier test artifacts from contaminating later runs. Rebuild context from source artifacts after revisions. If a test may take substantial time, need further authorization, or affect production, show the proposed task and request approval and suggested changes first. Success that depends on leaked context does not validate the skill.

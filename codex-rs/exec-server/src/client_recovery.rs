@@ -71,15 +71,14 @@ pub fn replay_process_events(
     {
         return Err(recovery_gap_error(target));
     }
-    let mut state = SessionState::new(false);
     // The response is already transport-bounded. This private log must not evict
     // small events merely because the ordinary subscriber replay holds only 256.
     // Recovered events are the chunks plus exit, close and trigger; each may be
     // preceded by one declared gap, and one gap may trail them.
-    state.events = crate::process::ExecProcessEventLog::new(
+    let mut state = SessionState::with_event_log(false, crate::process::ExecProcessEventLog::new(
         response.chunks.len().saturating_mul(2).saturating_add(7),
         usize::MAX,
-    );
+    ));
     {
         let ordered = state
             .ordered_events

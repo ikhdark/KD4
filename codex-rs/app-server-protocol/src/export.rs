@@ -177,8 +177,10 @@ pub fn generate_ts_with_options(
         && !ts_files.is_empty()
     {
         let prettier_files = match std::env::current_dir() {
-            Ok(current_dir) => prettier_file_arguments(&ts_files, &current_dir),
-            Err(_) => ts_files.clone(),
+            Ok(current_dir) => {
+                std::borrow::Cow::Owned(prettier_file_arguments(&ts_files, &current_dir))
+            }
+            Err(_) => std::borrow::Cow::Borrowed(ts_files.as_slice()),
         };
         for batch in prettier_file_batches(prettier_bin, &prettier_files)? {
             let status = Command::new(prettier_bin)

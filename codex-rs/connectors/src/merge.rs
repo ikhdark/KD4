@@ -88,8 +88,17 @@ where
         .filter(|connector| connector_ids.insert(connector.id.clone()))
         .collect::<Vec<_>>();
 
-    for connector in plugin_app_ids.into_iter().filter_map(plugin_connector_to_app_info) {
-        if connector_ids.insert(connector.id.clone()) {
+    for connector_id in plugin_app_ids {
+        let Some(canonical_id) = canonical_connector_id(&connector_id) else {
+            continue;
+        };
+        // Existing directory rows and earlier canonical aliases win without
+        // constructing a placeholder name or install URL that will be dropped.
+        if connector_ids.contains(canonical_id) {
+            continue;
+        }
+        if let Some(connector) = plugin_connector_to_app_info(connector_id) {
+            connector_ids.insert(connector.id.clone());
             merged.push(connector);
         }
     }
@@ -115,10 +124,10 @@ pub fn plugin_connector_to_app_info(connector_id: String) -> Option<AppInfo> {
     // Leave the placeholder name as the connector id so merge_connectors() can
     // replace it with canonical app metadata from directory fetches or
     // connector_name values from codex_apps tool discovery.
-    let name = connector_id.clone();
+    let install_url = connector_install_url(&connector_id, &connector_id);
     Some(AppInfo {
-        id: connector_id.clone(),
-        name: name.clone(),
+        name: connector_id.clone(),
+        id: connector_id,
         description: None,
         logo_url: None,
         logo_url_dark: None,
@@ -128,7 +137,7 @@ pub fn plugin_connector_to_app_info(connector_id: String) -> Option<AppInfo> {
         branding: None,
         app_metadata: None,
         labels: None,
-        install_url: Some(connector_install_url(&name, &connector_id)),
+        install_url: Some(install_url),
         is_accessible: false,
         is_enabled: true,
         plugin_display_names: Vec::new(),

@@ -41,6 +41,19 @@ fn renders_only_when_apps_become_available() {
 }
 
 #[test]
+fn guidance_withheld_does_not_revoke_app_tools() {
+    // include_apps_instructions=false selects this state without disabling Apps.
+    let fragments = render(
+        AppsInstructionsState::new(false),
+        PreviousSectionState::Known(&true),
+    );
+    assert_eq!(fragments.len(), 1);
+    assert!(fragments[0].contains("Previously provided Apps guidance no longer applies"));
+    assert!(fragments[0].contains("capabilities available in the current tool surface"));
+    assert!(!fragments[0].contains("Apps are currently unavailable"));
+}
+
+#[test]
 fn unknown_state_reasserts_current_availability() {
     assert_eq!(
         render(

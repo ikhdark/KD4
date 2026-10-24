@@ -83,7 +83,7 @@ where
 {
     let run = run_git_for_stdout_from(crate::git_executable(), dir, args, env)?;
     String::from_utf8(run.output.stdout).map_err(|source| GitToolingError::GitOutputUtf8 {
-        command: run.command,
+        command: build_command_string(&run.command),
         source,
     })
 }
@@ -118,31 +118,29 @@ fn run_git(
     env: Option<&[(OsString, OsString)]>,
 ) -> Result<GitRun, GitToolingError> {
     let args_vec = git_args_with_hardening(&args, None);
-    let command_string = build_command_string(&args_vec);
     let output = run_git_attempt(git, dir, &args_vec, env)?;
     if output.status.success() {
         return Ok(GitRun {
-            command: command_string,
+            command: args_vec,
             output,
         });
     }
 
-    let mut command_string = command_string;
+    let mut command_args = args_vec;
     let mut status = output.status;
     let mut stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
     if is_dubious_ownership_stderr(status.success(), stderr.as_bytes())
         && let Some(repo_root) = get_git_repo_root(dir)
     {
         let retry_args = git_args_with_hardening(&args, Some(repo_root.as_path()));
-        let retry_command_string = build_command_string(&retry_args);
         let retry_output = run_git_attempt(git, dir, &retry_args, env)?;
         if retry_output.status.success() {
             return Ok(GitRun {
-                command: retry_command_string,
+                command: retry_args,
                 output: retry_output,
             });
         }
-        command_string = retry_command_string;
+        command_args = retry_args;
         status = retry_output.status;
         stderr = String::from_utf8_lossy(&retry_output.stderr)
             .trim()
@@ -150,7 +148,7 @@ fn run_git(
     }
 
     Err(GitToolingError::GitCommand {
-        command: command_string,
+        command: build_command_string(&command_args),
         status,
         stderr,
     })
@@ -204,7 +202,7 @@ fn build_command_string(args: &[OsString]) -> String {
 }
 
 struct GitRun {
-    command: String,
+    command: Vec<OsString>,
     output: std::process::Output,
 }
 

@@ -102,6 +102,9 @@
       "prefixes": [
         [
           "clippy-lane"
+        ],
+        [
+          "lint-rust"
         ]
       ],
       "allow_extra_args": true,

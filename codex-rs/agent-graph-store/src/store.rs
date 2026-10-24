@@ -61,6 +61,21 @@ pub trait AgentGraphStore: Send + Sync {
         status_filter: Option<ThreadSpawnEdgeStatus>,
     ) -> AgentGraphStoreFuture<'_, Vec<ThreadId>>;
 
+    /// Check one current incoming edge without requiring a sibling inventory.
+    fn has_thread_spawn_child(
+        &self,
+        parent_thread_id: ThreadId,
+        child_thread_id: ThreadId,
+        status: ThreadSpawnEdgeStatus,
+    ) -> AgentGraphStoreFuture<'_, bool> {
+        Box::pin(async move {
+            Ok(self
+                .list_thread_spawn_children(parent_thread_id, Some(status))
+                .await?
+                .contains(&child_thread_id))
+        })
+    }
+
     /// List spawned descendants breadth-first by depth, then by thread id.
     ///
     /// `status_filter` is applied to every traversed edge, not just to the returned descendants.

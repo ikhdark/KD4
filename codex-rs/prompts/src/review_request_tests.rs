@@ -49,11 +49,11 @@ fn review_prompt_template_renders_commit_variant() {
     for (title, expected) in [
         (
             None,
-            "Review the code changes introduced by commit deadbeef. Provide prioritized, actionable findings.",
+            "Review the code changes introduced by commit deadbeef. Use `git show --diff-merges=first-parent deadbeef` so merge commits use the same first-parent comparison as the host scope. Provide prioritized, actionable findings.",
         ),
         (
             Some("Fix bug"),
-            "Review the code changes introduced by commit deadbeef (\"Fix bug\"). Provide prioritized, actionable findings.",
+            "Review the code changes introduced by commit deadbeef (\"Fix bug\"). Use `git show --diff-merges=first-parent deadbeef` so merge commits use the same first-parent comparison as the host scope. Provide prioritized, actionable findings.",
         ),
     ] {
         assert_eq!(
@@ -116,18 +116,22 @@ fn rejects_blank_custom_review_even_with_a_user_facing_hint() {
 
 #[test]
 fn review_rubric_stays_compact_without_losing_output_contracts() {
+    let rubric = include_str!("../templates/review/rubric.md");
     assert!(
-        REVIEW_PROMPT.len() <= 5_000,
+        rubric.len() <= 5_000,
         "review rubric grew to {} bytes",
-        REVIEW_PROMPT.len()
+        rubric.len()
     );
     for required in [
+        "Shared scope, evidence, validation, and completion policy comes from the canonical base instructions",
+        "This reviewer is source-read-only",
+        "Direct builds, tests, benchmarks, and writes remain blocked",
+        "Completed-review output schema",
+        "Blocked-review output schema",
+        "Return every finding in that JSON",
         "Return every qualifying issue",
-        "including code outside the diff",
-        "generated artifacts, schemas, and required source maps",
-        "relevant tests assert the expected behavior and could catch a plausible regression",
-        "This session is read-only",
-        "do not treat missing validation evidence alone as a demonstrated defect",
+        "Check generated/schema counterparts and added/edited tests for contract drift and plausible regressions",
+        "Missing validation evidence alone is not a defect",
         "Missing requested behavior and violations of preserved invariants qualify",
         "cite the affected callers or contracts in the body",
         "only when applicable requirements and preserved invariants are satisfied",
@@ -137,12 +141,22 @@ fn review_rubric_stays_compact_without_losing_output_contracts() {
         "\"priority\"",
         "\"code_location\"",
         "\"overall_correctness\"",
-        "location must overlap the diff",
+        "Locations must overlap the diff only for patch reviews",
         "Do not generate a PR fix",
     ] {
         assert!(
-            REVIEW_PROMPT.contains(required),
+            rubric.contains(required),
             "review rubric lost required contract: {required}"
         );
     }
+}
+
+#[test]
+fn review_prompt_composes_the_canonical_shared_policy_before_its_profile() {
+    let shared_policy = codex_protocol::models::BASE_INSTRUCTIONS_DEFAULT;
+    let rubric = include_str!("../templates/review/rubric.md");
+    assert_eq!(REVIEW_PROMPT, format!("{shared_policy}\n\n{rubric}"));
+    assert_eq!(REVIEW_PROMPT.matches(shared_policy).count(), 1);
+    assert!(!rubric.contains("Performance findings require"));
+    assert!(!rubric.contains("For a broad audit or an explicit full-read request"));
 }

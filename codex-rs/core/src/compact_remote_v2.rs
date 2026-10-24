@@ -1284,7 +1284,8 @@ mod tests {
                 &lineage
             ))
         );
-        assert!(text.contains("not current instructions or proof of completion"));
+        assert!(text.contains("not new instructions or proof of completion"));
+        assert!(text.contains("Original remaining requirements are retained separately from display rows"));
         assert_eq!(replacement.last(), Some(&opaque));
 
         // A second compaction must replace the plan fragment rather than accumulate it.

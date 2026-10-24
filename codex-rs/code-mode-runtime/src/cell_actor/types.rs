@@ -187,6 +187,7 @@ pub(crate) enum ObservationDelivery {
 }
 
 impl CellState {
+    #[cfg(test)]
     pub(crate) fn new(cancellation_token: CancellationToken) -> Self {
         Self::with_cancellation(NestedCancellation::new(cancellation_token))
     }
@@ -309,7 +310,7 @@ impl CellState {
         let terminal_event = event.clone();
         match response_tx.send(Ok(event)) {
             Ok(()) => {
-                self.record_terminal_event(&terminal_event);
+                self.record_terminal_event(|| terminal_event);
                 self.tool_cancellation.cancel_with(CancellationCause::RuntimeShutdown);
                 CompletionDelivery::Delivered
             }
@@ -392,7 +393,7 @@ impl CellState {
                 let terminal_event = delivered_event.clone();
                 match response_tx.send(Ok(delivered_event)) {
                     Ok(()) => {
-                        self.record_terminal_event(&terminal_event);
+                        self.record_terminal_event(|| terminal_event);
                         self.tool_cancellation.cancel_with(CancellationCause::RuntimeShutdown);
                         ObservationDelivery::Delivered
                     }
@@ -448,7 +449,7 @@ impl CellState {
             CellPhase::Tombstone => None,
         };
         if let Some(event) = observer_event.as_ref() {
-            self.record_terminal_event(event);
+            self.record_terminal_event(|| event.clone());
         }
         self.tool_cancellation.cancel_with(CancellationCause::RuntimeShutdown);
         observer_event
@@ -461,13 +462,15 @@ impl CellState {
             .clone()
     }
 
-    fn record_terminal_event(&self, event: &CellEvent) {
+    // Move owned delivery copies, but clone borrowed termination evidence only
+    // if this is the first retained outcome, under the existing terminal lock.
+    fn record_terminal_event(&self, event: impl FnOnce() -> CellEvent) {
         let mut terminal_event = self
             .terminal_event
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if terminal_event.is_none() {
-            *terminal_event = Some(event.clone());
+            *terminal_event = Some(event());
         }
     }
 

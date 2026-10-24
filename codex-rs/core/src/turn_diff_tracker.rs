@@ -234,13 +234,24 @@ impl TurnDiffTracker {
         &mut self,
         display_roots: impl IntoIterator<Item = (String, PathBuf)>,
     ) {
+        if self.update_environment_display_roots(display_roots) {
+            self.rerender_display_scope();
+        }
+    }
+
+    fn update_environment_display_roots(
+        &mut self,
+        display_roots: impl IntoIterator<Item = (String, PathBuf)>,
+    ) -> bool {
         let roots = display_roots
             .into_iter()
             .map(|(environment_id, root)| (environment_id, normalize_tracked_path(&root)))
             .collect();
         if self.display_roots_by_environment != roots {
             self.display_roots_by_environment = roots;
-            self.rerender_display_scope();
+            true
+        } else {
+            false
         }
     }
 
@@ -272,8 +283,8 @@ impl TurnDiffTracker {
             && self
                 .remote_environments
                 .insert(selected.environment_id.clone());
-        self.set_environment_display_roots(roots);
-        if remote_changed {
+        let roots_changed = self.update_environment_display_roots(roots);
+        if roots_changed || remote_changed {
             self.rerender_display_scope();
         }
     }
@@ -737,6 +748,16 @@ impl TurnDiffTracker {
     /// the display paths whose changes it cannot diff. An empty list means
     /// command effects invalidated the whole diff. Does not affect publication.
     pub(crate) fn exact_unified_diff(&self) -> Result<Option<String>, Vec<String>> {
+        self.ensure_exact_diff()?;
+        let diff = if self.aggregate_dirty {
+            self.flatten_diff()
+        } else {
+            self.unified_diff.clone()
+        };
+        Ok(diff.filter(|diff| !diff.is_empty()))
+    }
+
+    fn ensure_exact_diff(&self) -> Result<(), Vec<String>> {
         if !self.valid {
             return Err(Vec::new());
         }
@@ -763,12 +784,7 @@ impl TurnDiffTracker {
         if !unknown_modes.is_empty() {
             return Err(unknown_modes.into_iter().collect());
         }
-        let diff = if self.aggregate_dirty {
-            self.flatten_diff()
-        } else {
-            self.unified_diff.clone()
-        };
-        Ok(diff.filter(|diff| !diff.is_empty()))
+        Ok(())
     }
 
     /// Machine replay is one executor-root-relative patch, never the UI's
@@ -777,7 +793,7 @@ impl TurnDiffTracker {
     pub(crate) fn exact_export_diff(&self, selected: Option<&str>)
         -> Result<Option<(String, String)>, Vec<String>>
     {
-        self.exact_unified_diff()?;
+        self.ensure_exact_diff()?;
         let environments = self.rendered_diffs.keys().map(|(_, path)| path.environment_id.clone())
             .collect::<BTreeSet<_>>();
         let environment = match selected {

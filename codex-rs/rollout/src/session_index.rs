@@ -102,7 +102,7 @@ fn with_session_index_lock<T>(
 
 fn remove_thread_name_entries_blocking(
     codex_home: &Path,
-    thread_id: ThreadId,
+    thread_ids: &HashSet<ThreadId>,
 ) -> std::io::Result<()> {
     with_session_index_lock(codex_home, || {
         let path = session_index_path(codex_home);
@@ -119,7 +119,7 @@ fn remove_thread_name_entries_blocking(
             let should_remove = std::str::from_utf8(line)
                 .ok()
                 .and_then(|line| serde_json::from_str::<SessionIndexEntry>(line.trim()).ok())
-                .is_some_and(|entry| entry.id == thread_id);
+                .is_some_and(|entry| thread_ids.contains(&entry.id));
             if should_remove {
                 removed = true;
             } else {
@@ -149,8 +149,20 @@ pub async fn remove_thread_name_entries(
     codex_home: &Path,
     thread_id: ThreadId,
 ) -> std::io::Result<()> {
+    remove_threads_name_entries(codex_home, &[thread_id]).await
+}
+
+/// Remove all recorded names for a set of threads in one atomic index rewrite.
+pub async fn remove_threads_name_entries(
+    codex_home: &Path,
+    thread_ids: &[ThreadId],
+) -> std::io::Result<()> {
+    if thread_ids.is_empty() {
+        return Ok(());
+    }
     let codex_home = codex_home.to_path_buf();
-    tokio::task::spawn_blocking(move || remove_thread_name_entries_blocking(&codex_home, thread_id))
+    let thread_ids = thread_ids.iter().copied().collect::<HashSet<_>>();
+    tokio::task::spawn_blocking(move || remove_thread_name_entries_blocking(&codex_home, &thread_ids))
         .await
         .map_err(std::io::Error::other)?
 }
@@ -181,7 +193,7 @@ pub async fn find_thread_names_by_ids(
     }
     let path = session_index_path(codex_home);
     let thread_ids = thread_ids.clone();
-    tokio::task::spawn_blocking(move || scan_index_from_end_by_ids(&path, &thread_ids))
+    tokio::task::spawn_blocking(move || cached_thread_names_by_ids(&path, &thread_ids))
         .await
         .map_err(std::io::Error::other)?
 }
@@ -211,17 +223,24 @@ pub async fn find_thread_meta_by_name_str(
     while let Some(thread_id) = rx.recv().await {
         // Keep walking until a matching id resolves to a loadable rollout so an unsaved or partial
         // rename cannot shadow an older persisted session with the same name.
-        if let Some(path) = super::list::find_thread_path_by_id_str(
+        if let Some((path, header)) = super::list::find_thread_path_and_meta_by_id_str(
             codex_home,
             &thread_id.to_string(),
             state_db_ctx,
         )
         .await?
-            && let Ok(session_meta) = super::list::read_session_meta_line(&path).await
         {
-            drop(rx);
-            scan.await.map_err(std::io::Error::other)??;
-            return Ok(Some((path, session_meta)));
+            // A successfully verified header is one request-local observation.
+            // Keep the legacy retry only for recoverable header-read failures.
+            let header = match header {
+                Some(header) => Some(header),
+                None => super::list::read_session_meta_line(&path).await.ok(),
+            };
+            if let Some(session_meta) = header {
+                drop(rx);
+                scan.await.map_err(std::io::Error::other)??;
+                return Ok(Some((path, session_meta)));
+            }
         }
     }
     scan.await.map_err(std::io::Error::other)??;
@@ -240,13 +259,120 @@ fn scan_index_from_end_by_id(
     scan_index_from_end(path, |entry| entry.id == *thread_id)
 }
 
+#[derive(Clone, PartialEq)]
+struct IndexVersion {
+    identity: (u64, u64),
+    length: u64,
+    modified: std::time::SystemTime,
+}
+
+impl IndexVersion {
+    fn read(file: &File) -> Option<Self> {
+        let metadata = file.metadata().ok()?;
+        #[cfg(unix)]
+        let identity = {
+            use std::os::unix::fs::MetadataExt;
+            (metadata.dev(), metadata.ino())
+        };
+        #[cfg(windows)]
+        let identity = {
+            use std::os::windows::io::AsRawHandle;
+            let mut info = std::mem::MaybeUninit::uninit();
+            // The opened handle remains live across the identity query/cache.
+            if unsafe { windows_sys::Win32::Storage::FileSystem::GetFileInformationByHandle(
+                file.as_raw_handle().cast(), info.as_mut_ptr(),
+            ) } == 0 { return None; }
+            let info = unsafe { info.assume_init() };
+            (u64::from(info.dwVolumeSerialNumber),
+                (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow))
+        };
+        #[cfg(not(any(unix, windows)))]
+        let identity = return None;
+        Some(Self { identity, length: metadata.len(), modified: metadata.modified().ok()? })
+    }
+}
+
+struct CachedNames {
+    version: IndexVersion,
+    // Keep the old file identity allocated even after atomic replacement.
+    _file: File,
+    names: HashMap<ThreadId, Option<String>>,
+}
+
+fn cached_thread_names_by_ids(
+    path: &Path,
+    thread_ids: &HashSet<ThreadId>,
+) -> std::io::Result<HashMap<ThreadId, String>> {
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<HashMap<PathBuf, CachedNames>>> = std::sync::OnceLock::new();
+    let mut file = match File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(HashMap::new()),
+        Err(error) => return Err(error),
+    };
+    let Some(version) = IndexVersion::read(&file) else {
+        return scan_index_from_end_by_ids(path, thread_ids);
+    };
+    let cache = CACHE.get_or_init(Default::default);
+    let known = {
+        let cached = cache.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        cached.get(path).filter(|entry| entry.version == version).map(|entry| {
+            thread_ids.iter().filter_map(|id| entry.names.get(id).map(|name| (*id, name.clone())))
+                .collect::<HashMap<_, _>>()
+        }).unwrap_or_default()
+    };
+    let pending = thread_ids.iter().filter(|id| !known.contains_key(*id))
+        .copied().collect::<HashSet<_>>();
+    let mut names = known.into_iter().filter_map(|(id, name)| name.map(|name| (id, name)))
+        .collect::<HashMap<_, _>>();
+    if pending.is_empty() { return Ok(names); }
+    // Known negatives must not force every new page to scan to the beginning.
+    // Scan only newly requested IDs, retaining the reverse reader's blank-name
+    // and malformed-line behavior.
+    names.extend(scan_index_from_end_by_ids_on_file(&mut file, &pending)?);
+    let named_version = File::open(path).ok().and_then(|file| IndexVersion::read(&file));
+    if IndexVersion::read(&file).as_ref() == Some(&version)
+        && named_version.as_ref() == Some(&version)
+        && thread_ids.len() <= 2048
+        && names.values().map(String::len).sum::<usize>() <= 4 * 1024 * 1024
+    {
+        let mut cached = cache.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if cached.len() >= 4 && !cached.contains_key(path)
+            && let Some(oldest) = cached.keys().next().cloned()
+        { cached.remove(&oldest); }
+        // The query result cache is deliberately bounded. Appends, truncation,
+        // replacement or same-length rewrites invalidate positive AND negative
+        // results together; no cross-process append/remove is hidden.
+        let mut observed = cached.remove(path).filter(|entry| entry.version == version)
+            .map(|entry| entry.names).unwrap_or_default();
+        observed.extend(thread_ids.iter().map(|id| (*id, names.get(id).cloned())));
+        if observed.len() > 2048
+            || observed.values().filter_map(Option::as_ref).map(String::len).sum::<usize>() > 4 * 1024 * 1024
+        {
+            observed = thread_ids.iter().map(|id| (*id, names.get(id).cloned())).collect();
+        }
+        cached.insert(path.to_path_buf(), CachedNames { version, _file: file, names: observed });
+    }
+    Ok(names)
+}
+
 fn scan_index_from_end_by_ids(
     path: &Path,
     thread_ids: &HashSet<ThreadId>,
 ) -> std::io::Result<HashMap<ThreadId, String>> {
+    match File::open(path) {
+        Ok(mut file) => scan_index_from_end_by_ids_on_file(&mut file, thread_ids),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(HashMap::new()),
+        Err(error) => Err(error),
+    }
+}
+
+fn scan_index_from_end_by_ids_on_file(
+    file: &mut File,
+    thread_ids: &HashSet<ThreadId>,
+) -> std::io::Result<HashMap<ThreadId, String>> {
     let mut pending = thread_ids.clone();
     let mut names = HashMap::with_capacity(thread_ids.len());
-    match scan_index_from_end_for_each(path, |entry| {
+    match scan_index_from_end_for_each_file(file, |entry| {
         let name = entry.thread_name.trim();
         if pending.remove(&entry.id) {
             if !name.is_empty() {
@@ -302,12 +428,22 @@ where
 
 fn scan_index_from_end_for_each<F>(
     path: &Path,
-    mut visit_entry: F,
+    visit_entry: F,
 ) -> std::io::Result<Option<SessionIndexEntry>>
 where
     F: FnMut(&SessionIndexEntry) -> std::io::Result<Option<SessionIndexEntry>>,
 {
     let mut file = File::open(path)?;
+    scan_index_from_end_for_each_file(&mut file, visit_entry)
+}
+
+fn scan_index_from_end_for_each_file<F>(
+    file: &mut File,
+    mut visit_entry: F,
+) -> std::io::Result<Option<SessionIndexEntry>>
+where
+    F: FnMut(&SessionIndexEntry) -> std::io::Result<Option<SessionIndexEntry>>,
+{
     let mut remaining = file.metadata()?.len();
     let mut line_rev: Vec<u8> = Vec::new();
     let mut buf = vec![0u8; READ_CHUNK_SIZE];

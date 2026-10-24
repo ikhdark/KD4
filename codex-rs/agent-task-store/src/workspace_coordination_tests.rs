@@ -80,7 +80,7 @@ fn audit151_explorer_identity_preserves_controlling_constraints() {
         dependent.primary_investigation_identity().is_none(),
         "dependency identities without admitted versions must never certify reuse"
     );
-    let mut equivalent = assignment.clone();
+    let mut equivalent = assignment;
     equivalent.assignment_id = AssignmentId::new();
     equivalent.created_at = Utc::now();
     assert_eq!(

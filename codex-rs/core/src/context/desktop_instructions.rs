@@ -68,10 +68,8 @@ pub(crate) fn full(instructions: &str) -> Option<&str> {
     Some(&instructions[start..end])
 }
 
-pub(crate) fn project(instructions: &str) -> Cow<'_, str> {
-    let Some(block) = full(instructions) else {
-        return Cow::Borrowed(instructions);
-    };
+fn supported_body(instructions: &str) -> Option<(&str, &str)> {
+    let block = full(instructions)?;
     // Do not interpret arbitrary XML/Markdown as the Desktop's supported envelope.
     if instructions.matches("<app-context>").count() != 1
         || instructions.matches("</app-context>").count() != 1
@@ -84,7 +82,7 @@ pub(crate) fn project(instructions: &str) -> Cow<'_, str> {
         || block.contains("```")
         || block.contains("~~~")
     {
-        return Cow::Borrowed(instructions);
+        return None;
     }
     let body = block
         .strip_prefix("<app-context>")
@@ -100,8 +98,15 @@ pub(crate) fn project(instructions: &str) -> Cow<'_, str> {
         .skip(1)
         .any(|line| matches!(line.split_whitespace().next(), Some("#" | "##")))
     {
-        return Cow::Borrowed(instructions);
+        return None;
     }
+    Some((block, body))
+}
+
+pub(crate) fn project(instructions: &str) -> Cow<'_, str> {
+    let Some((block, body)) = supported_body(instructions) else {
+        return Cow::Borrowed(instructions);
+    };
     let mut kept = String::new();
     let mut deferred = Vec::new();
     for (index, section) in body.split("\n### ").enumerate() {
@@ -127,6 +132,30 @@ pub(crate) fn project(instructions: &str) -> Cow<'_, str> {
         deferred.join(", ")
     ));
     Cow::Owned(instructions.replacen(block, &format!("<app-context>{kept}</app-context>"), 1))
+}
+
+/// The locator supplies the deferred part of a supported envelope, not another
+/// copy of its eager ordinary/unknown sections. Unsupported shapes stay full.
+pub(crate) fn deferred(instructions: &str) -> Option<Cow<'_, str>> {
+    let block = full(instructions)?;
+    let Some((_, body)) = supported_body(instructions) else {
+        return Some(Cow::Borrowed(block));
+    };
+    let mut sections = body.split("\n### ");
+    let mut retained = sections.next().unwrap_or_default().to_string();
+    let mut found = false;
+    for section in sections {
+        if is_deferred_heading(section.lines().next().unwrap_or_default().trim()) {
+            retained.push_str("\n### ");
+            retained.push_str(section);
+            found = true;
+        }
+    }
+    Some(if found {
+        Cow::Owned(format!("<app-context>{retained}</app-context>"))
+    } else {
+        Cow::Borrowed(block)
+    })
 }
 
 #[cfg(test)]

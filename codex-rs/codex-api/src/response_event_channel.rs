@@ -75,7 +75,7 @@ impl EnqueueTiming {
         self.events.fetch_add(1, Ordering::Relaxed);
         let _ = self
             .wait_ns
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
                 Some(value.saturating_add(elapsed_ns))
             });
         self.max_wait_ns.fetch_max(elapsed_ns, Ordering::Relaxed);

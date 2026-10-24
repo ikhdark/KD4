@@ -125,13 +125,13 @@ impl SkillProviders {
         let mut catalog = SkillCatalog::default();
 
         for source in self.sources.iter().filter(|source| source.kind == kind) {
-            let source_catalog = source.provider.list(query.clone()).await.map_err(|err| {
+            let source_catalog = source.provider.list_shared(query.clone()).await.map_err(|err| {
                 SkillProviderError::new(format!(
                     "{} skills unavailable: {}",
                     source.label, err.message
                 ))
             })?;
-            catalog.extend(source_catalog);
+            catalog.extend_ref(&source_catalog);
         }
 
         Ok(catalog)
@@ -154,7 +154,7 @@ impl SkillProviders {
         for source in self.sources.iter().filter(|source| should_list(source)) {
             extend_catalog(
                 &mut catalog,
-                source.provider.list(query.clone()).await,
+                source.provider.list_shared(query.clone()).await,
                 source.label.as_str(),
             );
         }
@@ -198,11 +198,11 @@ impl SkillProviders {
 
 fn extend_catalog(
     catalog: &mut SkillCatalog,
-    result: Result<SkillCatalog, SkillProviderError>,
+    result: Result<Arc<SkillCatalog>, SkillProviderError>,
     label: &str,
 ) {
     match result {
-        Ok(source_catalog) => catalog.extend(source_catalog),
+        Ok(source_catalog) => catalog.extend_ref(&source_catalog),
         Err(err) => catalog
             .warnings
             .push(format!("{label} skills unavailable: {}", err.message)),

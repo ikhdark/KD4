@@ -149,6 +149,7 @@ fn stall_timeout_schema_is_available_on_all_command_routes() {
             assert!(description.contains("live session"));
         } else {
             assert!(description.contains("cancel"), "{description}");
+            assert!(description.contains("recognized validation commands disable this default"));
             assert!(!description.contains("Silence never terminates"));
             assert!(!description.contains("yielding its live session"));
         }
@@ -658,7 +659,7 @@ fn shell_command_tool_matches_expected_spec() {
             "stall_timeout_ms".to_string(),
             bounded_integer(
                 format!(
-                    "Maximum time without stdout or stderr before cancelling the command. Defaults to {} ms. Set zero to disable this silence timeout; timeout_ms still applies. This native route does not return a resumable session; use exec_command for a non-terminating stall observation.",
+                    "Maximum time without stdout or stderr before cancelling the command. Defaults to {} ms for ordinary commands; recognized validation commands disable this default. Set zero to disable this silence timeout; timeout_ms still applies. This native route does not return a resumable session; use exec_command for a non-terminating stall observation.",
                     crate::exec::DEFAULT_COMMAND_STALL_TIMEOUT_MS,
                 ),
                 0,

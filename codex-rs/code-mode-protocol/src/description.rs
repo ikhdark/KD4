@@ -327,11 +327,11 @@ mod tests {
         assert!(description.contains("Stable built-in contracts may follow"));
         assert!(description.contains("external and omitted contracts remain lazy"));
         assert!(description.contains("Omission is not deactivation"));
-        assert!(description.contains("filter `ALL_TOOL_NAMES` or `ALL_TOOLS` locally"));
-        assert!(description.contains("use `resolve_tool(name)` and call it in the same cell"));
-        assert_eq!(description.matches("`resolve_tool(name)`").count(), 1);
-        assert!(description.contains("resolution retains the full contract"));
-        assert!(description.contains("Do not infer arguments from a name"));
+        assert!(description.contains("Discover deferred tools via ALL_TOOL_NAMES/ALL_TOOLS or tool_search"));
+        assert!(description.contains("Resolve known followups in-cell"));
+        assert_eq!(description.matches("resolve_tool(name)").count(), 1);
+        assert!(description.contains("resolve_tool(name) retains the full contract"));
+        assert!(description.contains("never infer arguments from names"));
         assert!(
             description.len() < 10_000,
             "compact exec prompt unexpectedly expanded to {} bytes",
@@ -342,10 +342,10 @@ mod tests {
     #[test]
     fn exec_description_mentions_timeout_helpers() {
         let description = build_exec_tool_description(false, false, &[]);
-        assert!(description.contains("`setTimeout(callback: () => void, delayMs?: number)`"));
-        assert!(description.contains("`clearTimeout(timeoutId?: number)`"));
+        assert!(description.contains("setTimeout(callback,delayMs?)"));
+        assert!(description.contains("clearTimeout(id) cancels it"));
         assert!(description.contains("returns an ID"));
-        assert!(description.contains("Await a promise resolved by the callback to wait."));
+        assert!(description.contains("Await a callback-resolved promise to wait."));
         assert!(!description.contains("manage timers; await them"));
     }
 
@@ -354,26 +354,26 @@ mod tests {
         let description = build_exec_tool_description(false, false, &[]);
 
         assert!(description.contains("raw JavaScript"));
-        assert!(description.contains("Nested tools live on the global `tools` object"));
+        assert!(description.contains("Nested tools: const r = await tools.exec_command"));
         assert!(description.contains("await tools.exec_command"));
-        assert!(description.contains("`console.log(...)` aliases `text(...)`"));
-        assert!(description.contains("never pipe a patch through a shell wrapper"));
+        assert!(description.contains("console.log aliases text"));
+        assert!(description.contains("never pipe patches through shell"));
         assert!(!description.contains("yield_time_ms"));
         assert!(description.contains("max_output_tokens"));
         // The image helper accepts data URIs, view_image results and MCP image
         // blocks; the runtime has no audio path to advertise.
-        assert!(description.contains("type: \"image\""));
+        assert!(description.contains("image(value,detail?) emits a data: URI, view_image result or MCP image block"));
         assert!(!description.contains("type: \"audio\""));
         assert!(description.contains("unawaited work is discarded"));
         assert!(description.contains("text(r.output)"));
-        assert!(description.contains("`r.exit_code` the exit status"));
+        assert!(description.contains("r.exit_code is status"));
         assert!(description.contains("Use `Promise.allSettled` for independent fallible calls"));
-        assert!(description.contains("resolution retains the full contract"));
-        assert!(description.contains("use `resolve_tool(name)` and call it in the same cell"));
-        assert!(description.contains("filter `ALL_TOOL_NAMES` or `ALL_TOOLS` locally"));
+        assert!(description.contains("resolve_tool(name) retains the full contract"));
+        assert!(description.contains("Resolve known followups in-cell"));
+        assert!(description.contains("Discover deferred tools via ALL_TOOL_NAMES/ALL_TOOLS or tool_search"));
         assert!(!description.contains("Never scan/filter/stringify/print `ALL_TOOLS`"));
         assert!(!description.contains("do not substitute a search or second shell"));
-        assert!(description.contains("host-configured default deadline"));
+        assert!(description.contains("Nested deadlines: { timeout_ms } overrides the host default"));
         assert!(description.contains(
             "Expiry cancels the nested call and may return only an error, without a live handle."
         ));
@@ -391,7 +391,7 @@ mod tests {
         )));
         assert!(!description.contains("the cell budget is separate"));
         assert!(description.contains(&format!(
-            r#"first-line `// @exec: {{"max_output_tokens": {}}}`"#,
+            r#"first-line // @exec: {{"max_output_tokens": {}}}"#,
             crate::MAX_OUTPUT_TOKENS_PER_EXEC_CALL,
         )));
         assert!(description.contains(&format!(
@@ -401,7 +401,7 @@ mod tests {
         assert!(description.contains("queues a model-visible message without yielding"));
         // Cells run in fresh isolates; only session storage carries values forward.
         assert!(description.contains("JS bindings reset per exec"));
-        assert!(description.contains("`store(key, value)`/`load(key)` keep JSON values"));
+        assert!(description.contains("store(key,value)/load(key) retain JSON"));
         // Retired guidance that pushed the model into wait rounds or extra
         // sampling passes must stay out of the contract.
         assert!(!description.contains("per settlement"));
@@ -458,10 +458,10 @@ mod tests {
         let description = build_exec_tool_description(false, true, &[]);
 
         assert!(description.contains("Some deferred nested tools may be omitted"));
-        assert!(description.contains("use `resolve_tool(name)` and call it in the same cell"));
-        assert!(description.contains("filter `ALL_TOOL_NAMES` or `ALL_TOOLS` locally"));
+        assert!(description.contains("Resolve known followups in-cell"));
+        assert!(description.contains("Discover deferred tools via ALL_TOOL_NAMES/ALL_TOOLS or tool_search"));
         assert!(!description.contains("Never scan/filter/stringify/print `ALL_TOOLS`"));
-        assert_eq!(description.matches("`resolve_tool(name)`").count(), 1);
+        assert_eq!(description.matches("resolve_tool(name)").count(), 1);
         assert!(!description.contains("Nested tool schemas are discovered lazily at runtime"));
     }
 
@@ -516,7 +516,7 @@ mod tests {
         let wait = build_wait_tool_description();
 
         assert!(!exec.contains("yield_time_ms"));
-        assert!(exec.contains("documented `{ timeout_ms }` option"));
+        assert!(exec.contains("Nested deadlines: { timeout_ms } overrides the host default"));
         assert!(!wait.contains("yield_time_ms"));
     }
 

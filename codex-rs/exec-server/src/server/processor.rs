@@ -19,7 +19,7 @@ use crate::rpc::encode_server_message;
 use crate::rpc::invalid_request;
 use crate::rpc::method_not_found;
 use crate::server::ExecServerHandler;
-use crate::server::registry::build_router;
+use crate::server::registry::shared_router;
 use crate::server::session_registry::SessionRegistry;
 use crate::telemetry::ConnectionTransport;
 use crate::telemetry::ExecServerTelemetry;
@@ -138,7 +138,7 @@ async fn run_connection_with_shutdown(
     cancelled: CancellationToken,
 ) {
     let _connection_metrics = telemetry.connection_started(transport);
-    let router = Arc::new(build_router());
+    let router = shared_router();
     let JsonRpcConnection {
         outgoing_tx: json_outgoing_tx,
         mut incoming_rx,
@@ -209,6 +209,9 @@ async fn run_connection_with_shutdown(
     let mut ordered = tokio::task::JoinSet::new();
     type Completion = futures::future::Shared<futures::future::BoxFuture<'static, ()>>;
     let mut last_ordered: Option<Completion> = None;
+    let mut filesystem_cohort: Vec<Completion> = Vec::new();
+    let mut filesystem_handle_reads: HashMap<String, Completion> = HashMap::new();
+    let filesystem_capacity = Arc::new(tokio::sync::Semaphore::new(4));
     let mut process_writes: HashMap<String, Completion> = HashMap::new();
     let mut pending_starts: HashMap<
         String,
@@ -260,7 +263,7 @@ async fn run_connection_with_shutdown(
                 }
             }
             JsonRpcConnectionEvent::Message(message) => match message {
-                codex_exec_server_protocol::JSONRPCMessage::Request(request) => {
+                codex_exec_server_protocol::JSONRPCMessage::Request(mut request) => {
                     if matches!(&request.id, codex_exec_server_protocol::RequestId::String(id) if id.len() > 4096) {
                         if send_outbound(&outgoing_tx, RpcServerOutboundMessage::Error {
                             request_id: request.id,
@@ -284,8 +287,16 @@ async fn run_connection_with_shutdown(
                                 crate::protocol::EXEC_TERMINATE_METHOD
                                     | crate::protocol::HTTP_REQUEST_CANCEL_METHOD
                             );
+                        let filesystem_read = initialized && matches!(method,
+                            crate::protocol::FS_READ_FILE_METHOD
+                                | crate::protocol::FS_READ_FILE_BOUNDED_METHOD
+                                | crate::protocol::FS_READ_BLOCK_METHOD
+                                | crate::protocol::FS_GET_METADATA_METHOD
+                                | crate::protocol::FS_CANONICALIZE_METHOD
+                                | crate::protocol::FS_READ_DIRECTORY_METHOD
+                                | crate::protocol::FS_WALK_METHOD);
                         let independent_read = initialized
-                            && matches!(
+                            && (filesystem_read || matches!(
                                 method,
                                 crate::protocol::EXEC_READ_METHOD
                                     | crate::protocol::EXEC_SIGNAL_METHOD
@@ -293,7 +304,7 @@ async fn run_connection_with_shutdown(
                                     | crate::protocol::ENVIRONMENT_INFO_METHOD
                                     | crate::protocol::HTTP_REQUEST_METHOD
                                     | crate::protocol::HTTP_REQUEST_CANCEL_METHOD
-                            );
+                            ));
                         if initialized
                             && (if control {
                                 controls.len()
@@ -337,12 +348,12 @@ async fn run_connection_with_shutdown(
                         }
                         // Reserve HTTP identity before spawning: cancellation may
                         // arrive before the spawned request starts running.
-                        if initialized
-                            && method == crate::protocol::HTTP_REQUEST_METHOD
-                            && let Ok(params) =
-                                serde_json::from_value::<crate::protocol::HttpRequestParams>(
-                                    request.params.clone().unwrap_or_default(),
-                                )
+                        let process_id = request.params.as_ref()
+                            .and_then(|params| params.get("processId"))
+                            .and_then(serde_json::Value::as_str).map(str::to_string);
+                        let admitted_http = (initialized && method == crate::protocol::HTTP_REQUEST_METHOD)
+                            .then(|| crate::rpc::decode_request_params::<crate::protocol::HttpRequestParams>(request.params.take()));
+                        if let Some(Ok(params)) = &admitted_http
                             && params.stream_response
                             && let Err(error) = handler
                                 .reserve_http_body_stream(&params.request_id, &request.id)
@@ -412,12 +423,6 @@ async fn run_connection_with_shutdown(
                             .as_ref()
                             .and_then(|result| result.as_ref().ok())
                             .map(|(_, reservation)| reservation.identity());
-                        let process_id = request
-                            .params
-                            .as_ref()
-                            .and_then(|params| params.get("processId"))
-                            .and_then(serde_json::Value::as_str)
-                            .map(str::to_string);
                         let admitted_terminate = if initialized
                             && method == crate::protocol::EXEC_TERMINATE_METHOD
                         {
@@ -473,7 +478,11 @@ async fn run_connection_with_shutdown(
                                 Err(error) => Err(crate::rpc::invalid_params(error.to_string())),
                             })
                         } else { None };
-                        let predecessor = if admitted_terminate.is_some() || admitted_http_cancel.is_some() {
+                        filesystem_handle_reads.retain(|_, completion| completion.clone().now_or_never().is_none());
+                        let read_handle = (method == crate::protocol::FS_READ_BLOCK_METHOD)
+                            .then(|| request.params.as_ref()?.get("handleId")?.as_str().map(str::to_string))
+                            .flatten();
+                        let mut predecessor = if admitted_terminate.is_some() || admitted_http_cancel.is_some() {
                             None
                         } else if initialized && method == crate::protocol::EXEC_WRITE_METHOD {
                             // A blocked terminal owns only its own FIFO. Starts
@@ -488,6 +497,17 @@ async fn run_connection_with_shutdown(
                                         .and_then(|id| pending_starts.get(id))
                                         .map(|(completion, _)| completion.clone())
                                 })
+                        } else if filesystem_read {
+                            let ordered_barrier = last_ordered.clone();
+                            let previous_read = read_handle.as_ref()
+                                .and_then(|handle| filesystem_handle_reads.get(handle)).cloned();
+                            Some(async move {
+                                if let Some(barrier) = ordered_barrier { barrier.await; }
+                                // A read failure retires this handle. Preserve
+                                // same-handle error/close ordering, not a global
+                                // chain between independent file handles.
+                                if let Some(previous) = previous_read { previous.await; }
+                            }.boxed().shared())
                         } else if independent_read {
                             process_id
                                 .as_ref()
@@ -496,14 +516,32 @@ async fn run_connection_with_shutdown(
                         } else {
                             last_ordered.take()
                         };
+                        filesystem_cohort.retain(|completion| completion.clone().now_or_never().is_none());
+                        if initialized && !independent_read && method != crate::protocol::EXEC_WRITE_METHOD
+                            && !filesystem_cohort.is_empty()
+                        {
+                            // Reads form a finite cohort between mutation/start
+                            // barriers. Never run a write/open/close ahead of any
+                            // earlier read, including its response admission.
+                            let cohort = std::mem::take(&mut filesystem_cohort);
+                            predecessor = Some(async move {
+                                if let Some(previous) = predecessor { previous.await; }
+                                futures::future::join_all(cohort).await;
+                            }.boxed().shared());
+                        }
                         let (completion_tx, completion_rx) = tokio::sync::oneshot::channel::<()>();
-                        if initialized && !independent_read {
+                        if initialized && (!independent_read || filesystem_read) {
                             let completion = async move {
                                 let _ = completion_rx.await;
                             }
                             .boxed()
                             .shared();
-                            if method == crate::protocol::EXEC_WRITE_METHOD {
+                            if filesystem_read {
+                                filesystem_cohort.push(completion.clone());
+                                if let Some(handle) = read_handle {
+                                    filesystem_handle_reads.insert(handle, completion.clone());
+                                }
+                            } else if method == crate::protocol::EXEC_WRITE_METHOD {
                                 if let Some(id) = process_id.as_ref() {
                                     process_writes.insert(id.clone(), completion.clone());
                                 }
@@ -554,12 +592,24 @@ async fn run_connection_with_shutdown(
                             })
                         } else if let Some(result) = admitted_http_cancel {
                             Box::pin(async move { Some(process_response(request.id, result)) })
+                        } else if let Some(admitted) = admitted_http {
+                            let handler = Arc::clone(&handler);
+                            Box::pin(async move {
+                                let result = match admitted {
+                                    Ok(params) => handler.http_request(request.id.clone(), params).await,
+                                    Err(error) => Err(error),
+                                };
+                                result.err().map(|error| RpcServerOutboundMessage::Error {
+                                    request_id: request.id, error,
+                                })
+                            })
                         } else {
                             route(Arc::clone(&handler), request)
                         };
                         let response = response.instrument(request_span.clone());
                         let request_cancelled = cancelled.clone();
                         let outgoing_tx = outgoing_tx.clone();
+                        let read_capacity = filesystem_read.then(|| Arc::clone(&filesystem_capacity));
                         let operation = async move {
                             // Dropping the sender also releases successors during cancellation.
                             let _completion = completion_tx;
@@ -569,6 +619,15 @@ async fn run_connection_with_shutdown(
                                     _ = predecessor => {}
                                 }
                             }
+                            let _read_permit = if let Some(capacity) = read_capacity {
+                                tokio::select! {
+                                    _ = request_cancelled.cancelled() => return false,
+                                    permit = capacity.acquire_owned() => match permit {
+                                        Ok(permit) => Some(permit),
+                                        Err(_) => return false,
+                                    },
+                                }
+                            } else { None };
                             let message = tokio::select! {
                                 message = response => message,
                                 _ = request_cancelled.cancelled() => {

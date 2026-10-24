@@ -484,7 +484,7 @@ async fn registration_repairs_retarget_before_any_native_coverage_exists() {
     let (subscriber, mut rx) = watcher.add_subscriber();
     let registration = commit_resolved_registration_for_test(&watcher, &subscriber, &registrations)
         .expect("reconcile registration");
-    assert_eq!(registration.newly_covered_paths(), &[alias.clone()]);
+    assert_eq!(registration.newly_covered_paths(), std::slice::from_ref(&alias));
     assert_eq!(content_watch_counts(&watcher, &first), None);
     assert_eq!(content_watch_counts(&watcher, &second), Some((0, 1)));
     let canonical_second = second.canonicalize().expect("canonical target");

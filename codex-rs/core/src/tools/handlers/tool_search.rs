@@ -841,6 +841,10 @@ impl ToolSearchHandler {
         Self::new_with_fingerprint(search_infos.into())
     }
 
+    pub(crate) fn search_infos(&self) -> &[ToolSearchInfo] {
+        &self.search_infos
+    }
+
     fn new_with_fingerprint(search_infos: Arc<[ToolSearchInfo]>) -> Self {
         let name_indexes: Arc<[ToolSearchNameIndex]> =
             search_infos.iter().map(ToolSearchNameIndex::new).collect();
@@ -1624,19 +1628,20 @@ impl ToolSearchHandler {
                 let candidate = result.normalize_output(candidate);
                 if !retained.try_push(&candidate) {
                     supplemental_tools.extend(names);
-                    let local_names = match &candidate {
-                        LoadableToolSpec::Function(tool) => HashSet::from([tool.name.clone()]),
-                        LoadableToolSpec::Namespace(namespace) => namespace
-                            .tools
-                            .iter()
-                            .map(|tool| {
+                    let recovery = match &candidate {
+                        // Flat recovery retains the complete serialized call
+                        // contract and adds prose, so it cannot fit after this
+                        // same candidate exhausted the unchanged byte budget.
+                        LoadableToolSpec::Function(_) => None,
+                        LoadableToolSpec::Namespace(namespace) => {
+                            let local_names = namespace.tools.iter().map(|tool| {
                                 let ResponsesApiNamespaceTool::Function(tool) = tool;
                                 tool.name.clone()
-                            })
-                            .collect(),
+                            }).collect();
+                            compact_exact_match_recovery(&candidate, &local_names)
+                        }
                     };
-                    if !compact_exact_match_recovery(&candidate, &local_names)
-                        .is_some_and(|recovery| retained.try_push(&recovery))
+                    if !recovery.is_some_and(|recovery| retained.try_push(&recovery))
                     {
                         // The incomplete receipt reports omitted definitions;
                         // the next request advertises the authoritative contract.
@@ -1717,9 +1722,6 @@ fn compact_exact_match_recovery(
     exact_names: &HashSet<String>,
 ) -> Option<LoadableToolSpec> {
     match output {
-        LoadableToolSpec::Function(tool) if exact_names.contains(&tool.name) => Some(
-            LoadableToolSpec::Function(compact_recovery_tool(tool, &tool.name)),
-        ),
         LoadableToolSpec::Namespace(namespace) => {
             let tools = namespace
                 .tools

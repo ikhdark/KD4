@@ -213,10 +213,8 @@ async fn read_skill_contents(
     file_system: &dyn ExecutorFileSystem,
     skill_path: &PathUri,
 ) -> Result<String, String> {
-    file_system
-        .read_file_text(skill_path, /*sandbox*/ None)
-        .await
-        .map_err(|err| format!("failed to read file: {err}"))
+    super::read_skill_frontmatter(file_system, skill_path)
+        .await.map_err(|err| format!("failed to read file: {err}"))
 }
 
 async fn probe_skill_metadata(

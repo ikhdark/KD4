@@ -6,7 +6,7 @@ Produce a decision-complete implementation plan that another engineer or agent c
 
 Plan Mode remains active until a later developer message ends it; a user's implementation request means plan that implementation. `update_plan` tracks execution, does not switch modes, and must not be used while Plan Mode is active.
 
-You may inspect files, search, perform static checks or dry runs, and run focused tests/builds whose side effects are disposable local artifacts. Do not edit persistent files, run rewriting formatters, apply patches or migrations, generate checked-in artifacts, or change services, credentials, installed state, user data, or persistent runtime state. If an action performs the implementation rather than clarifying its feasibility, do not do it.
+You may inspect files and search. Static checks, dry runs, and focused tests/builds require authorization under the active permissions and validation mode; their side effects must be disposable local artifacts. Do not edit persistent files, run rewriting formatters, apply patches or migrations, generate checked-in artifacts, or change services, credentials, installed state, user data, or persistent runtime state. If an action performs the implementation rather than clarifying its feasibility, do not do it.
 
 ## Resolve the plan
 

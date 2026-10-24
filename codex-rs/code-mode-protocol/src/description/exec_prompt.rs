@@ -7,10 +7,10 @@ pub(crate) const EXEC_DESCRIPTION_TEMPLATE: &str = r#"Run raw JavaScript, not JS
 - exec_command waits; one still running after the default wait returns a live `session_id` (see await_command). r.output is display text; r.exit_code is status; the host reports failed commands itself. For exact parsing use `r.stdout`, present when `r.streams_complete` is true.
 - Await every call: unawaited work is discarded, and an uncaught rejection ends the cell. Earlier effects survive failure; recover receipts, never replay them. Use `Promise.allSettled` for independent fallible calls. Batch independent reads and searches as one `text(await Promise.allSettled([tools.read_file({path:"a.rs"}), tools.exec_command({cmd:"rg -n x src"})]))`. Run builds and other commands that may write outside such batches; they hold the workspace exclusively.
 - Nested deadlines: { timeout_ms } overrides the host default. Expiry cancels the nested call and may return only an error, without a live handle. After expiry, check the outcome before retrying uncertain effects.
-- First-line // @exec: {"deliver": true} makes printed text the final answer, without a model call, when everything in the cell succeeded; close plans first. Printed delivery appears at cell end; use a normal final for long reports.
-- Output defaults to 10000 tokens; first-line // @exec: {"max_output_tokens": 40000} raises it (ceiling 40000). A truncated result names the `read_tool_output` call that returns the rest. Oversized nested results expose result_retained:true and an outcome recovery descriptor (possibly pending); page retained bytes, never rerun the producer.
-- JS bindings reset per exec; store(key,value)/load(key) retain JSON. listKeys({after?,limit?}): `limit` 1-64, default 32; continue next_after. deleteStored(key) removes it. First-line // @exec: {"persist":true} preserves completed values across host restart.
-- Discover deferred tools via ALL_TOOL_NAMES/ALL_TOOLS or tool_search; resolve_tool(name) retains the full contract. Resolve known followups in-cell; never infer arguments from names. namespace_instructions_ref identifies shared namespace rules: follow both shared and operation rules, or resolve the full contract.
+- First-line // @exec: {"deliver": true} makes printed text the final answer, without a model call, when everything in the cell succeeded. For a settled answer, await closing work (including tools.update_plan), then print only that answer in this cell. Plan completion alone is not task completion. Delivery appears at cell end; use a normal final for long reports.
+- Output defaults to 10000 tokens; first-line // @exec: {"max_output_tokens": 40000} raises it (ceiling 40000). A truncated result names the `read_tool_output` call that returns the rest. Oversized: result_retained:true, outcome.recovery (possibly pending). Recover required recovery/canonical_recovery or outcome.recovery ranges with `await tools.read_tool_output(recipe.arguments)` in-cell before returning; consume pages; bound printing; never rerun producers.
+- JS bindings reset per exec; store(key,value)/load(key) retain JSON. Keep one body plus compact state/provenance; deleteStored(key) drops duplicates. Failed quota cells discard staged stores; check listKeys before resuming. listKeys({after?,limit?}): 1-64, default 32; continue next_after. First-line // @exec: {"persist":true} preserves completed values across host restart.
+- Deferred tools: ALL_TOOL_NAMES/ALL_TOOLS or tool_search; resolve_tool(name) retains full contracts. Resolve known followups in-cell; never infer arguments from names. Follow namespace_instructions_ref and operation rules, or resolve the full contract.
 
 Optional helpers:
 - `await read_files(paths, {full?, concurrency?})`: 1–32 paths; {path,status,value?,reason?} each; value={initial,pages,file_complete}. full defaults false; true recovers an already-required full snapshot. Check every status and file_complete; byte coverage is not semantic review.
@@ -102,8 +102,12 @@ mod tests {
                         !code_mode_only,
                     );
                     let directives = description
-                        .split('`')
-                        .filter(|part| part.starts_with("// @exec:"))
+                        .lines()
+                        .filter_map(|line| line.split_once("// @exec:"))
+                        .map(|(_, example)| {
+                            let end = example.find('}').expect("complete pragma example");
+                            format!("// @exec:{}", &example[..=end])
+                        })
                         .collect::<Vec<_>>();
                     let mut options = Vec::new();
                     for directive in directives {
@@ -121,7 +125,7 @@ mod tests {
                         ]
                     );
                     assert!(description.contains(
-                        "override it with the documented `{ timeout_ms }` option when needed."
+                        "Nested deadlines: { timeout_ms } overrides the host default."
                     ));
                 }
             }
@@ -150,7 +154,7 @@ mod tests {
             "Direct-only tools omitted from `ALL_TOOLS`: `apply_patch`. Call these through their direct model tool interface using the schema advertised there, not through `exec`."
         );
         for description in [nested, direct] {
-            assert!(description.contains("Edit with `apply_patch`: nested if registered, otherwise direct (`*** Begin Patch` envelope); never pipe a patch through a shell wrapper."));
+            assert!(description.contains("Edit via apply_patch: nested if registered, otherwise direct (*** Begin Patch envelope); never pipe patches through shell."));
         }
     }
 
@@ -173,7 +177,10 @@ mod tests {
                     "Expiry cancels the nested call and may return only an error, without a live handle.",
                     "check the outcome before retrying uncertain effects",
                     "when everything in the cell succeeded",
+                    "await closing work (including tools.update_plan), then print only that answer in this cell.",
+                    "Plan completion alone is not task completion.",
                     "A truncated result names the `read_tool_output` call that returns the rest.",
+                    "Recover required recovery/canonical_recovery or outcome.recovery ranges with `await tools.read_tool_output(recipe.arguments)` in-cell before returning;",
                     "JS bindings reset per exec;",
                     "throws on failure with that object on the error's `.evidence`",
                     "its dependents are skipped and it throws with `.results` after all started work settles",

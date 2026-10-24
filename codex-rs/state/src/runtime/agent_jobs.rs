@@ -80,6 +80,32 @@ impl StateRuntime {
         self.agent_job_runner_instance_id.as_str()
     }
 
+    async fn ensure_agent_job_runner_registered(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(self.agent_job_runner_registered, "non-owning state runtime cannot own agent jobs");
+        {
+            let enrolled = self.agent_job_runner_enrollment.lock().await;
+            anyhow::ensure!(!*self.agent_job_runner_heartbeat_shutdown.borrow(), "state runtime is closing");
+            if *enrolled { return Ok(()); }
+        }
+        let runtime = self.clone();
+        // Keep the registration mutation and heartbeat publication owned even
+        // when the first job's caller stops waiting. Close waits on this guard.
+        tokio::spawn(async move {
+            let mut enrolled = runtime.agent_job_runner_enrollment.lock().await;
+            anyhow::ensure!(!*runtime.agent_job_runner_heartbeat_shutdown.borrow(), "state runtime is closing");
+            if !*enrolled {
+                register_agent_job_runner_instance(runtime.pool.as_ref(), runtime.agent_job_runner_instance_id()).await?;
+                spawn_agent_job_runner_heartbeat(
+                    Arc::clone(&runtime.pool),
+                    runtime.agent_job_runner_instance_id.clone(),
+                    runtime.agent_job_runner_heartbeat_shutdown.subscribe(),
+                );
+                *enrolled = true;
+            }
+            Ok::<(), anyhow::Error>(())
+        }).await?
+    }
+
     pub async fn agent_job_runner_instance_is_live(&self, owner: &str) -> anyhow::Result<bool> {
         Ok(sqlx::query_scalar::<_, i64>("SELECT EXISTS(SELECT 1 FROM agent_job_runner_instances WHERE runner_instance_id = ? AND heartbeat_at >= ?)")
             .bind(owner).bind(Utc::now().timestamp().saturating_sub(AGENT_JOB_RUNNER_LEASE_TIMEOUT_SECONDS))
@@ -104,6 +130,7 @@ impl StateRuntime {
             .map(i64::try_from)
             .transpose()
             .map_err(|_| anyhow::anyhow!("invalid max_runtime_seconds value"))?;
+        self.ensure_agent_job_runner_registered().await?;
         let mut tx = self.pool.begin().await?;
         sqlx::query(
             r#"
@@ -1204,7 +1231,7 @@ mod tests {
         std::fs::write(&path, b"A")?;
         // SHA-256 of the literal bytes b"A", independently computed for this fixture.
         let digest = "559aead08264d5795d3909718cdd05abd49572e84fe55590eef31a88a08fdffd";
-        runtime.acknowledge_agent_job_artifact(&job, revision, &destination, &digest).await?;
+        runtime.acknowledge_agent_job_artifact(&job, revision, &destination, digest).await?;
         assert!(runtime.agent_job_export_is_published(&job).await?);
         assert!(runtime.reserve_agent_job_destination("other", &destination).await.is_err());
         assert_eq!(std::fs::read(&path)?, b"A");

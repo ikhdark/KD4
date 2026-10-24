@@ -10,15 +10,13 @@ pub(crate) fn emit_fetch_attempt_metric(
     outcome: &str,
     status_code: Option<u16>,
 ) {
-    let attempt_tag = attempt.to_string();
-    let status_code_tag = status_code_tag(status_code);
     emit_metric(
         CLOUD_CONFIG_BUNDLE_FETCH_ATTEMPT_METRIC,
-        vec![
+        || vec![
             ("trigger", trigger.to_string()),
-            ("attempt", attempt_tag),
+            ("attempt", attempt.to_string()),
             ("outcome", outcome.to_string()),
-            ("status_code", status_code_tag),
+            ("status_code", status_code_tag(status_code)),
         ],
     );
 }
@@ -31,16 +29,14 @@ pub(crate) fn emit_fetch_final_metric(
     status_code: Option<u16>,
     bundle: Option<&CloudConfigBundle>,
 ) {
-    let attempt_count_tag = attempt_count.to_string();
-    let status_code_tag = status_code_tag(status_code);
     emit_metric(
         CLOUD_CONFIG_BUNDLE_FETCH_FINAL_METRIC,
-        vec![
+        || vec![
             ("trigger", trigger.to_string()),
             ("outcome", outcome.to_string()),
             ("reason", reason.to_string()),
-            ("attempt_count", attempt_count_tag),
-            ("status_code", status_code_tag),
+            ("attempt_count", attempt_count.to_string()),
+            ("status_code", status_code_tag(status_code)),
             ("bundle_shape", bundle_shape_tag(bundle)),
         ],
     );
@@ -49,7 +45,7 @@ pub(crate) fn emit_fetch_final_metric(
 pub(crate) fn emit_load_metric(trigger: &str, outcome: &str, bundle: Option<&CloudConfigBundle>) {
     emit_metric(
         CLOUD_CONFIG_BUNDLE_LOAD_METRIC,
-        vec![
+        || vec![
             ("trigger", trigger.to_string()),
             ("outcome", outcome.to_string()),
             ("bundle_shape", bundle_shape_tag(bundle)),
@@ -84,8 +80,9 @@ fn status_code_tag(status_code: Option<u16>) -> String {
         .unwrap_or_else(|| "none".to_string())
 }
 
-fn emit_metric(metric_name: &str, tags: Vec<(&str, String)>) {
+fn emit_metric(metric_name: &str, tags: impl FnOnce() -> Vec<(&'static str, String)>) {
     if let Some(metrics) = codex_otel::global() {
+        let tags = tags();
         let tag_refs = tags
             .iter()
             .map(|(key, value)| (*key, value.as_str()))

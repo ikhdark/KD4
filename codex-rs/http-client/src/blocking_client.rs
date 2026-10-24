@@ -175,6 +175,13 @@ impl BlockingRequestBuilder {
         }
     }
 
+    /// Reuses an immutable encoded payload without copying it into a Vec.
+    pub fn body_bytes(self, body: bytes::Bytes) -> Self {
+        Self {
+            inner: self.inner.body(body),
+        }
+    }
+
     pub fn timeout(self, timeout: Duration) -> Self {
         Self {
             inner: self.inner.timeout(timeout),

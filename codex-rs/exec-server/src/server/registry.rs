@@ -45,6 +45,11 @@ use crate::protocol::WriteParams;
 use crate::rpc::RpcRouter;
 use crate::server::ExecServerHandler;
 
+pub(crate) fn shared_router() -> Arc<RpcRouter<ExecServerHandler>> {
+    static ROUTER: std::sync::OnceLock<Arc<RpcRouter<ExecServerHandler>>> = std::sync::OnceLock::new();
+    Arc::clone(ROUTER.get_or_init(|| Arc::new(build_router())))
+}
+
 pub(crate) fn build_router() -> RpcRouter<ExecServerHandler> {
     let mut router = RpcRouter::new();
     router.notification(

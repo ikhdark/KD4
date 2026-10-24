@@ -9,6 +9,7 @@ use codex_extension_api::ToolSpec;
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde::Serialize;
+use std::borrow::Cow;
 
 use crate::catalog::SkillCatalogEntry;
 use crate::render::truncate_catalog_skill_description;
@@ -41,18 +42,18 @@ struct ListArgs {
 
 #[derive(Clone, Debug, Eq, Hash, JsonSchema, PartialEq, Serialize)]
 #[schemars(deny_unknown_fields)]
-struct ListedSkill {
+struct ListedSkill<'a> {
     authority: SkillToolAuthority,
-    package: String,
-    name: String,
-    description: String,
-    main_resource: String,
+    package: &'a str,
+    name: &'a str,
+    description: Cow<'a, str>,
+    main_resource: &'a str,
 }
 
 #[derive(Debug, Eq, JsonSchema, PartialEq, Serialize)]
 #[schemars(deny_unknown_fields)]
-struct ListResponse {
-    skills: Vec<ListedSkill>,
+struct ListResponse<'a> {
+    skills: Vec<ListedSkill<'a>>,
     warnings: Vec<String>,
     warnings_omitted: usize,
     next_cursor: Option<String>,
@@ -104,22 +105,7 @@ impl ToolExecutor<ToolCall> for ListTool {
             }
             let authority = args.authority.into_authority();
             let mut catalog = self.context.catalog(&call.turn_id, args.authority).await;
-            let listed = |catalog: &crate::catalog::SkillCatalog| {
-                catalog
-                    .entries
-                    .iter()
-                    .filter(|entry| entry.enabled && entry.authority == authority)
-                    .filter(|entry| args.name.as_ref().is_none_or(|name| entry.name == *name))
-                    .filter(|entry| query.as_ref().is_none_or(|query| {
-                        entry.name.to_ascii_lowercase().contains(query)
-                            || entry.description.to_ascii_lowercase().contains(query)
-                            || entry.short_description.as_ref().is_some_and(|description| description.to_ascii_lowercase().contains(query))
-                    }))
-                    .cloned()
-                    .filter_map(listed_skill)
-                    .collect::<Vec<_>>()
-            };
-            let mut skills = listed(&catalog);
+            let mut skills = matching_entries(&catalog, &args, query.as_deref(), &authority);
             let start = match args.cursor.as_deref() {
                 None => 0,
                 Some(cursor) => {
@@ -140,11 +126,12 @@ impl ToolExecutor<ToolCall> for ListTool {
                 }
             };
             if catalog.continuation.is_some() && (args.cursor.is_none() || start == skills.len()) {
+                drop(skills);
                 catalog = self
                     .context
                     .continue_catalog(&call.turn_id, catalog.entries.len())
                     .await;
-                skills = listed(&catalog);
+                skills = matching_entries(&catalog, &args, query.as_deref(), &authority);
             }
             let incomplete = catalog.continuation.is_some();
             // Warnings can represent failed provider discovery; never turn
@@ -157,9 +144,9 @@ impl ToolExecutor<ToolCall> for ListTool {
                             && is_bounded_handle(entry.main_prompt.as_str(), MAX_HANDLE_BYTES)
                     }),
             );
-            let (warnings, warnings_omitted) = bounded_warnings(catalog.warnings);
+            let (warnings, warnings_omitted) = bounded_warnings(&catalog.warnings);
             let response = page_response(
-                skills,
+                &skills,
                 warnings,
                 warnings_omitted,
                 start,
@@ -178,8 +165,26 @@ fn invalid_cursor() -> FunctionCallError {
     FunctionCallError::RespondToModel("skills.list cursor is invalid".to_string())
 }
 
-fn page_response(
-    skills: Vec<ListedSkill>,
+fn matching_entries<'a>(
+    catalog: &'a crate::catalog::SkillCatalog,
+    args: &ListArgs,
+    query: Option<&str>,
+    authority: &crate::catalog::SkillAuthority,
+) -> Vec<&'a SkillCatalogEntry> {
+    let contains = |text: &str, query: &str| text.as_bytes().windows(query.len())
+        .any(|part| part.eq_ignore_ascii_case(query.as_bytes()));
+    catalog.entries.iter()
+        .filter(|entry| entry.enabled && &entry.authority == authority)
+        .filter(|entry| args.name.as_ref().is_none_or(|name| entry.name == *name))
+        .filter(|entry| query.is_none_or(|query| contains(&entry.name, query)
+            || contains(&entry.description, query)
+            || entry.short_description.as_deref().is_some_and(|text| contains(text, query))))
+        .filter(|entry| is_listable(entry))
+        .collect()
+}
+
+fn page_response<'a>(
+    skills: &[&'a SkillCatalogEntry],
     warnings: Vec<String>,
     warnings_omitted: usize,
     start: usize,
@@ -187,7 +192,7 @@ fn page_response(
     budget: usize,
     args: &ListArgs,
     search_complete: Option<bool>,
-) -> Result<ListResponse, FunctionCallError> {
+) -> Result<ListResponse<'a>, FunctionCallError> {
     let count = skills.len();
     let mut response = ListResponse {
         skills: Vec::new(),
@@ -196,7 +201,7 @@ fn page_response(
         next_cursor: incomplete.then(|| {
             format!(
                 "{:016x}:{start}",
-                list_fingerprint(&skills[..start], args)
+                0_u64
             )
         }),
         search_complete,
@@ -210,13 +215,13 @@ fn page_response(
         let next_cursor = (index + 1 < count || incomplete).then(|| {
             format!(
                 "{:016x}:{}",
-                list_fingerprint(&skills[..=index], args),
+                0_u64,
                 index + 1
             )
         });
         let previous_cursor = response.next_cursor.clone();
         response.next_cursor = next_cursor;
-        response.skills.push(skill.clone());
+        response.skills.push(listed_skill(skill));
         if super::read::serialized_len(&response)? > budget {
             if response.skills.len() > 1 {
                 response.skills.pop();
@@ -225,7 +230,7 @@ fn page_response(
             }
             // A single long description must not prevent discovery of its intact handles.
             if let Some(skill) = response.skills.last_mut() {
-                skill.description.clear();
+                skill.description = Cow::Borrowed("");
             }
             while super::read::serialized_len(&response)? > budget && !response.warnings.is_empty()
             {
@@ -242,44 +247,49 @@ fn page_response(
             "skills.list response budget is too small".to_string(),
         ));
     }
+    let end = start + response.skills.len();
+    response.next_cursor = (end < count || incomplete)
+        .then(|| format!("{:016x}:{end}", list_fingerprint(&skills[..end], args)));
     Ok(response)
 }
 
-fn list_fingerprint(skills: &[ListedSkill], args: &ListArgs) -> u64 {
-    super::read::value_fingerprint(&(args.name.as_deref(), args.query.as_deref(), skills))
+fn list_fingerprint(skills: &[&SkillCatalogEntry], args: &ListArgs) -> u64 {
+    // Use the original slice hash, including its length prefix. This
+    // borrowed projection is built once for cursor validation/publication, not
+    // once for every tentative row during response fitting.
+    let listed = skills.iter().map(|entry| listed_skill(entry)).collect::<Vec<_>>();
+    super::read::value_fingerprint(&(args.name.as_deref(), args.query.as_deref(), listed.as_slice()))
 }
 
-fn listed_skill(entry: SkillCatalogEntry) -> Option<ListedSkill> {
-    let authority = SkillToolAuthority::from_authority(&entry.authority)?;
-    if !is_bounded_handle(&entry.id.0, MAX_HANDLE_BYTES)
-        || !is_bounded_handle(entry.main_prompt.as_str(), MAX_HANDLE_BYTES)
-    {
-        return None;
-    }
+fn is_listable(entry: &SkillCatalogEntry) -> bool {
+    SkillToolAuthority::from_authority(&entry.authority).is_some()
+        && is_bounded_handle(&entry.id.0, MAX_HANDLE_BYTES)
+        && is_bounded_handle(entry.main_prompt.as_str(), MAX_HANDLE_BYTES)
+}
 
-    Some(ListedSkill {
-        authority,
-        package: entry.id.0,
-        name: entry.name,
+fn listed_skill(entry: &SkillCatalogEntry) -> ListedSkill<'_> {
+    ListedSkill {
+        authority: SkillToolAuthority::Orchestrator,
+        package: &entry.id.0,
+        name: &entry.name,
         description: truncate_catalog_skill_description(
             entry
                 .short_description
                 .as_deref()
                 .unwrap_or(&entry.description),
-        )
-        .into_owned(),
-        main_resource: entry.main_prompt.as_str().to_string(),
-    })
+        ),
+        main_resource: entry.main_prompt.as_str(),
+    }
 }
 
-fn bounded_warnings(warnings: Vec<String>) -> (Vec<String>, usize) {
+fn bounded_warnings(warnings: &[String]) -> (Vec<String>, usize) {
     let omitted = warnings.len().saturating_sub(MAX_WARNINGS);
     let warnings = warnings
-        .into_iter()
+        .iter()
         .take(MAX_WARNINGS)
         .map(|warning| {
             if warning.len() <= MAX_WARNING_BYTES {
-                warning
+                warning.clone()
             } else {
                 let (prefix, _) = truncate_utf8_to_bytes(&warning, MAX_WARNING_BYTES - 3);
                 format!("{prefix}...")

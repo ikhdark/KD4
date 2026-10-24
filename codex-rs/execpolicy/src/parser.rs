@@ -2,6 +2,7 @@ use codex_utils_absolute_path::AbsolutePathBuf;
 use multimap::MultiMap;
 use starlark::any::ProvidesStaticType;
 use starlark::codemap::FileSpan;
+use starlark::environment::Globals;
 use starlark::environment::GlobalsBuilder;
 use starlark::environment::Module;
 use starlark::eval::Evaluator;
@@ -37,6 +38,7 @@ use crate::rule::validate_not_match_examples;
 
 pub struct PolicyParser {
     builder: RefCell<PolicyBuilder>,
+    globals: std::cell::OnceCell<Globals>,
 }
 
 #[cfg(test)]
@@ -87,6 +89,7 @@ impl PolicyParser {
     pub fn new() -> Self {
         Self {
             builder: RefCell::new(PolicyBuilder::new()),
+            globals: std::cell::OnceCell::new(),
         }
     }
 
@@ -103,11 +106,11 @@ impl PolicyParser {
             &dialect,
         )
         .map_err(Error::Starlark)?;
-        let globals = GlobalsBuilder::standard().with(policy_builtins).build();
+        let globals = self.globals.get_or_init(|| GlobalsBuilder::standard().with(policy_builtins).build());
         Module::with_temp_heap(|module| {
             let mut eval = Evaluator::new(&module);
             eval.extra = Some(&self.builder);
-            eval.eval_module(ast, &globals)
+            eval.eval_module(ast, globals)
                 .map(|_| ())
                 .map_err(Error::Starlark)
         })?;

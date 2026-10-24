@@ -204,11 +204,29 @@ fn windows_sandbox_stdin_open(tty: bool, pipe_stdin: bool) -> bool {
     tty || pipe_stdin
 }
 
+#[cfg(test)]
 pub(crate) fn prepare_exec_request(
     params: &ExecParams,
     env: HashMap<String, String>,
     runtime_paths: Option<&ExecServerRuntimePaths>,
 ) -> Result<PreparedExecRequest, JSONRPCErrorError> {
+    prepare_exec_request_cancellable(params, env, runtime_paths, &tokio_util::sync::CancellationToken::new())
+}
+
+pub(crate) fn prepare_exec_request_cancellable(
+    params: &ExecParams,
+    env: HashMap<String, String>,
+    runtime_paths: Option<&ExecServerRuntimePaths>,
+    cancelled: &tokio_util::sync::CancellationToken,
+) -> Result<PreparedExecRequest, JSONRPCErrorError> {
+    let check_cancelled = || {
+        if cancelled.is_cancelled() {
+            Err(crate::rpc::invalid_request(format!("process {} start was cancelled", params.process_id)))
+        } else {
+            Ok(())
+        }
+    };
+    check_cancelled()?;
     if params.enforce_managed_network || params.managed_network.is_some() {
         return Err(invalid_params(
             "managed network proxy support was removed; refusing unsupported network enforcement".to_string(),
@@ -245,6 +263,7 @@ pub(crate) fn prepare_exec_request(
     } else {
         native_workspace_roots.as_slice()
     };
+    check_cancelled()?;
     let permissions = permissions.materialize_project_roots_with_workspace_roots(workspace_roots);
     let (file_system_policy, network_policy) = permissions.to_runtime_permissions();
     let sandbox = select_initial(
@@ -269,6 +288,7 @@ pub(crate) fn prepare_exec_request(
             "Windows sandbox could not be selected".to_string(),
         ));
     }
+    check_cancelled()?;
     let request = transform(SandboxTransformRequest {
         command: SandboxCommand {
             program: program.into(),
@@ -287,6 +307,7 @@ pub(crate) fn prepare_exec_request(
     let proxy_enforced = false;
     let use_elevated =
         windows_sandbox_uses_elevated_backend(request.windows_sandbox_level, proxy_enforced);
+    check_cancelled()?;
     let filesystem_overrides = if use_elevated {
         resolve_windows_elevated_filesystem_overrides(
             request.sandbox,
@@ -303,6 +324,7 @@ pub(crate) fn prepare_exec_request(
         )
     }
     .map_err(|err| invalid_params(format!("failed to prepare process sandbox: {err}")))?;
+    check_cancelled()?;
     Ok(PreparedExecRequest {
         command: request.command,
         cwd: native_path(&request.cwd, "cwd")?,

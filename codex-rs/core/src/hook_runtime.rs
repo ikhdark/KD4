@@ -503,15 +503,19 @@ pub(crate) async fn run_legacy_after_agent_hook(
     input: &[ResponseItem],
     last_assistant_message: Option<String>,
 ) -> LegacyAfterAgentHookOutcome {
+    let hooks = sess.hooks();
+    if !hooks.has_legacy_after_agent_hooks() {
+        return LegacyAfterAgentHookOutcome { aborted: false };
+    }
     let mut abort_message = None;
     let input_messages = input
         .iter()
+        .filter(|item| matches!(item, ResponseItem::Message { role, .. } if role == "user"))
         .filter_map(|item| match parse_turn_item(item) {
             Some(TurnItem::UserMessage(user_message)) => Some(user_message.message()),
             _ => None,
         })
         .collect();
-    let hooks = sess.hooks();
     for hook_outcome in hooks
         .dispatch(codex_hooks::HookPayload {
             session_id: sess.session_id().into(),

@@ -1,8 +1,4 @@
 use super::*;
-use codex_protocol::openai_models::ModelPreset;
-use codex_protocol::openai_models::ModelServiceTier;
-use codex_protocol::openai_models::ReasoningEffort;
-use codex_protocol::openai_models::ReasoningEffortPreset;
 use codex_protocol::protocol::AgentStatus;
 use codex_protocol::protocol::SurfacedToolResult;
 use codex_tools::JsonSchemaPrimitiveType;
@@ -10,33 +6,7 @@ use codex_tools::JsonSchemaType;
 use pretty_assertions::assert_eq;
 use serde_json::json;
 
-fn model_preset(id: &str, show_in_picker: bool) -> ModelPreset {
-    ModelPreset {
-        id: id.to_string(),
-        model: format!("{id}-model"),
-        display_name: format!("{id} display"),
-        description: format!("{id} description"),
-        default_reasoning_effort: ReasoningEffort::Medium,
-        supported_reasoning_efforts: vec![ReasoningEffortPreset {
-            effort: ReasoningEffort::Medium,
-            description: "Balanced".to_string(),
-        }],
-        supports_personality: false,
-        additional_speed_tiers: Vec::new(),
-        service_tiers: vec![ModelServiceTier {
-            id: "priority".to_string(),
-            name: "Fast".to_string(),
-            description: "1.5x speed, increased usage".to_string(),
-        }],
-        default_service_tier: None,
-        is_default: false,
-        upgrade: None,
-        show_in_picker,
-        availability_nux: None,
-        supported_in_api: true,
-        input_modalities: Vec::new(),
-    }
-}
+
 
 
 #[test]
@@ -53,8 +23,8 @@ fn spawn_agent_descriptions_reference_policy_owners() {
     }
 
     let descriptions = [
-        spawn_agent_tool_description_v2(None, None, None, None),
-        spawn_agent_tool_description_v2(None, None, None, Some("Custom guidance.".to_string())),
+        spawn_agent_tool_description_v2(None),
+        spawn_agent_tool_description_v2(Some("Custom guidance.".to_string())),
     ];
     for description in descriptions {
         assert!(description.contains(
@@ -67,149 +37,36 @@ fn spawn_agent_descriptions_reference_policy_owners() {
 }
 
 #[test]
-fn spawn_agent_tool_v2_exposes_typed_assignments_and_lists_visible_models() {
-    let tool = create_spawn_agent_tool_v2(SpawnAgentToolOptions {
-        available_models: Arc::new(vec![
-            model_preset("visible", /*show_in_picker*/ true),
-            model_preset("hidden", /*show_in_picker*/ false),
-        ]),
-        agent_type_description: "role help".to_string(),
-        hide_agent_type_model_reasoning: false,
-        usage_hint_text: None,
-    });
-
-    let ToolSpec::Function(ResponsesApiTool {
-        description,
-        parameters,
-        output_schema,
-        ..
-    }) = tool
-    else {
-        panic!("spawn_agent should be a function tool");
-    };
+fn spawn_agent_tool_v2_exposes_only_generic_tasks() {
+    let ToolSpec::Function(ResponsesApiTool { description, parameters, output_schema, .. }) =
+        create_spawn_agent_tool_v2(SpawnAgentToolOptions::default())
+    else { panic!("spawn_agent should be a function tool"); };
+    let properties = parameters.properties.as_ref().expect("object params");
     assert_eq!(
         parameters.schema_type,
         Some(JsonSchemaType::Single(JsonSchemaPrimitiveType::Object))
     );
-    let properties = parameters
-        .properties
-        .as_ref()
-        .expect("spawn_agent should use object params");
-    assert!(description.contains("Spawns an agent to work on the specified task."));
+    for name in ["task_name", "message", "prompt", "instructions", "fork_turns"] {
+        assert!(properties.contains_key(name), "{name}");
+    }
+    for name in ["agent_type", "assignment", "model", "reasoning_effort", "items", "fork_context"] {
+        assert!(!properties.contains_key(name), "{name}");
+    }
+    // Durable task objectives are serialized into ordinary TaskCapsule input text.
+    // Only the separate messaging path can deliver Responses EncryptedContent.
+    for name in ["message", "prompt", "instructions"] {
+        assert_eq!(properties[name].encrypted, None, "{name}");
+    }
+    assert_eq!(parameters.required.as_ref(), Some(&vec!["task_name".to_string()]));
     assert!(description.contains("The spawned agent receives a durable task binding"));
     assert!(description.contains("Launch authorized independent assignments in the same batch"));
     assert!(description.contains("retain every success and failure"));
     assert!(description.contains("Sequence only real dependencies or shared-resource conflicts"));
-    assert!(description.contains(SPAWN_AGENT_V2_FULL_HISTORY_OVERRIDE_GUIDANCE));
-    assert!(!description.contains("max_concurrent_threads_per_session"));
     assert!(description.contains(&spawn_agent_default_guidance()));
-    assert!(
-        description
-            .contains("Available model overrides (optional; `gpt-6.1-sol` is the spawn default):")
-    );
-    assert!(description.contains(
-        "- `visible-model`: visible description Reasoning efforts: medium (catalog default). Service tiers: priority."
-    ));
-    assert!(!description.contains("hidden-model"));
-    assert!(properties.contains_key("task_name"));
-    assert!(properties.contains_key("message"));
-    assert!(properties.contains_key("assignment"));
-    assert_eq!(
-        properties
-            .get("message")
-            .and_then(|schema| schema.encrypted),
-        Some(true)
-    );
-    assert!(properties.contains_key("fork_turns"));
-    assert!(
-        properties
-            .get("fork_turns")
-            .and_then(|schema| schema.description.as_deref())
-            .is_some_and(|description| {
-                description
-                    .contains("Omitted or `none` creates a lineage-preserving TaskCapsule fork")
-                    && description.contains(SPAWN_AGENT_V2_FULL_HISTORY_OVERRIDE_GUIDANCE)
-            })
-    );
-    let assignment = properties
-        .get("assignment")
-        .expect("typed assignment schema");
-    let assignment_properties = assignment
-        .properties
-        .as_ref()
-        .expect("typed assignment properties");
-    assert_eq!(
-        assignment_properties["write_scope"].description.as_deref(),
-        Some(
-            "Intended repository write scopes; overlaps are advisory and require coordination. Use an empty array for read-only roles."
-        )
-    );
-    let relevant_handles = assignment_properties
-        .get("relevant_handles")
-        .expect("relevant handle schema");
-    assert_eq!(
-        relevant_handles
-            .items
-            .as_ref()
-            .and_then(|schema| schema.any_of.as_ref())
-            .map(Vec::len),
-        Some(2)
-    );
-    assert!(
-        assignment
-            .description
-            .as_deref()
-            .is_some_and(|description| {
-                description.contains("replaces the plaintext typed bootstrap message")
-                    && description
-                        .contains("worker needs non-empty write_scope and required_evidence")
-                    && description.contains(
-                        "architect/explorer need non-empty read_scope and empty required_evidence",
-                    )
-                    && description.contains("reviewer needs empty required_evidence")
-                    && description.contains("verifier/integrator need non-empty required_evidence")
-            })
-    );
-    assert!(!properties.contains_key("items"));
-    assert!(!properties.contains_key("fork_context"));
-    assert_eq!(
-        properties.get("agent_type"),
-        Some(&JsonSchema::string(Some("role help".to_string())))
-    );
-    assert_eq!(
-        properties
-            .get("model")
-            .and_then(|schema| schema.description.as_deref()),
-        Some(spawn_agent_model_override_description().as_str())
-    );
-    assert_eq!(
-        properties
-            .get("reasoning_effort")
-            .and_then(|schema| schema.description.as_deref()),
-        Some(spawn_agent_reasoning_override_description().as_str())
-    );
-    assert_eq!(
-        properties
-            .get("service_tier")
-            .and_then(|schema| schema.description.as_deref()),
-        Some(SPAWN_AGENT_SERVICE_TIER_OVERRIDE_DESCRIPTION)
-    );
-    assert_eq!(
-        parameters.required.as_ref(),
-        Some(&vec!["task_name".to_string()])
-    );
-    let output_schema = output_schema
-        .expect("spawn_agent output schema")
-        .into_value()["oneOf"][0]
-        .clone();
-    assert_eq!(
-        output_schema["required"],
-        json!(["assignment_id", "integration_plan", "nickname", "task_name"])
-    );
-    assert_eq!(
-        output_schema["properties"]["assignment_id"]["type"],
-        json!("string")
-    );
+    assert!(description.contains(SPAWN_AGENT_V2_FULL_HISTORY_OVERRIDE_GUIDANCE));
+    let output = output_schema.expect("output schema").into_value()["oneOf"][0].clone();
+    assert_eq!(output["required"], json!(["assignment_id", "integration_plan", "nickname", "task_name"]));
+    assert_eq!(output["properties"]["assignment_id"]["type"], json!("string"));
 }
 
 #[test]
@@ -262,96 +119,44 @@ fn spawn_agent_task_name_schema_matches_canonical_validator() {
 
 
 #[test]
-fn spawn_agent_tool_caps_visible_model_summaries() {
-    let tool = create_spawn_agent_tool_v2(SpawnAgentToolOptions {
-        available_models: Arc::new(vec![
-            model_preset("first", /*show_in_picker*/ true),
-            model_preset("second", /*show_in_picker*/ true),
-            model_preset("third", /*show_in_picker*/ true),
-            model_preset("fourth", /*show_in_picker*/ true),
-            model_preset("fifth", /*show_in_picker*/ true),
-            model_preset("sixth", /*show_in_picker*/ true),
-        ]),
-        agent_type_description: "role help".to_string(),
-        hide_agent_type_model_reasoning: false,
-        usage_hint_text: None,
-    });
-
-    let ToolSpec::Function(ResponsesApiTool { description, .. }) = tool else {
-        panic!("spawn_agent should be a function tool");
-    };
-
-    for model in ["first", "second", "third", "fourth", "fifth"] {
-        assert!(
-            description.contains(&format!("`{model}-model`")),
-            "expected {model} model summary in spawn_agent description: {description:?}"
-        );
-    }
-    assert!(!description.contains("`sixth-model`"));
+fn spawn_agent_does_not_advertise_specialized_role_choices() {
+    let ToolSpec::Function(ResponsesApiTool { description, parameters, .. }) =
+        create_spawn_agent_tool_v2(SpawnAgentToolOptions::default())
+    else { panic!("spawn_agent should be a function tool"); };
+    assert!(!description.contains("Available model overrides"));
+    assert!(!description.contains("reviewer"));
+    assert!(!description.contains("integrator"));
+    assert!(!parameters.properties.unwrap().contains_key("agent_type"));
 }
 
 #[test]
-fn spawn_agent_tool_caps_reasoning_effort_value_length() {
-    let mut model = model_preset("visible", /*show_in_picker*/ true);
-    let custom_effort = ReasoningEffort::Custom(
-        "é".repeat(MAX_REASONING_EFFORT_CHARS_IN_SPAWN_AGENT_DESCRIPTION + 1),
-    );
-    model.default_reasoning_effort = custom_effort.clone();
-    model.supported_reasoning_efforts = vec![ReasoningEffortPreset {
-        effort: custom_effort,
-        description: "Model-defined".to_string(),
-    }];
-
-    assert_eq!(
-        spawn_agent_models_description(&[model]),
-        format!(
-            "Available model overrides (optional; `{DEFAULT_SPAWN_AGENT_MODEL}` is the spawn default):\n- `visible-model`: visible description Reasoning efforts: {} (catalog default). Service tiers: priority.",
-            "é".repeat(MAX_REASONING_EFFORT_CHARS_IN_SPAWN_AGENT_DESCRIPTION)
-        )
-    );
+fn spawn_agent_uniform_defaults_do_not_depend_on_metadata_visibility() {
+    for hide in [false, true] {
+        let ToolSpec::Function(ResponsesApiTool { description, .. }) =
+            create_spawn_agent_tool_v2(SpawnAgentToolOptions {
+                hide_agent_metadata: hide,
+                usage_hint_text: None,
+            })
+        else { panic!("spawn_agent should be a function tool"); };
+        assert!(description.contains("`gpt-6.1-sol`"));
+        assert!(description.contains("`xhigh`"));
+    }
 }
 
 #[test]
 fn spawn_agent_tool_hides_service_tier_with_spawn_metadata() {
-    let tool = create_spawn_agent_tool_v2(SpawnAgentToolOptions {
-        available_models: Arc::new(vec![model_preset("visible", /*show_in_picker*/ true)]),
-        agent_type_description: "role help".to_string(),
-        hide_agent_type_model_reasoning: true,
-        usage_hint_text: None,
-    });
-
-    let ToolSpec::Function(ResponsesApiTool {
-        description,
-        parameters,
-        ..
-    }) = tool
-    else {
-        panic!("spawn_agent should be a function tool");
-    };
-    let properties = parameters
-        .properties
-        .as_ref()
-        .expect("spawn_agent should use object params");
-
-    assert_eq!(
-        properties.get("agent_type"),
-        Some(&JsonSchema::string(Some("role help".to_string())))
-    );
-    assert!(properties.contains_key("assignment"));
-    assert!(!properties.contains_key("model"));
-    assert!(!properties.contains_key("reasoning_effort"));
-    assert!(!properties.contains_key("service_tier"));
-    assert!(!description.contains(&spawn_agent_default_guidance()));
-    assert!(!description.contains("Available model overrides"));
-    assert!(!description.contains(SPAWN_AGENT_V2_FULL_HISTORY_OVERRIDE_GUIDANCE));
-    assert!(
-        properties
-            .get("fork_turns")
-            .and_then(|schema| schema.description.as_deref())
-            .is_some_and(|description| {
-                !description.contains(SPAWN_AGENT_V2_FULL_HISTORY_OVERRIDE_GUIDANCE)
-            })
-    );
+    let ToolSpec::Function(ResponsesApiTool { description, parameters, .. }) =
+        create_spawn_agent_tool_v2(SpawnAgentToolOptions {
+            hide_agent_metadata: true,
+            usage_hint_text: None,
+        })
+    else { panic!("spawn_agent should be a function tool"); };
+    let properties = parameters.properties.as_ref().expect("object params");
+    for name in ["agent_type", "assignment", "model", "reasoning_effort", "service_tier"] {
+        assert!(!properties.contains_key(name), "{name}");
+    }
+    assert!(description.contains(&spawn_agent_default_guidance()));
+    assert!(description.contains(SPAWN_AGENT_V2_FULL_HISTORY_OVERRIDE_GUIDANCE));
 }
 
 #[test]
@@ -408,11 +213,7 @@ fn send_message_accepts_the_recipient_name_spawn_agent_publishes() {
     let spawn_name = {
         let ToolSpec::Function(ResponsesApiTool { parameters, .. }) =
             create_spawn_agent_tool_v2(SpawnAgentToolOptions {
-                available_models: Arc::new(vec![model_preset(
-                    "visible", /*show_in_picker*/ true,
-                )]),
-                agent_type_description: "role help".to_string(),
-                hide_agent_type_model_reasoning: false,
+                hide_agent_metadata: false,
                 usage_hint_text: None,
             })
         else {
@@ -625,6 +426,14 @@ fn agent_status_schema_accepts_every_serialized_status() {
                 canonical_message: Some("surfaced".to_string()),
             },
         },
+        AgentStatus::Stopped {
+            last_agent_message: Some("partial report".to_string()),
+            stop_cause: codex_protocol::protocol::TurnExecutionStopCause::SubagentContextBudget,
+        },
+        AgentStatus::Stopped {
+            last_agent_message: None,
+            stop_cause: codex_protocol::protocol::TurnExecutionStopCause::SubagentContextBudget,
+        },
         AgentStatus::Errored("failed".to_string()),
         AgentStatus::Shutdown,
         AgentStatus::NotFound,
@@ -642,11 +451,47 @@ fn agent_status_schema_accepts_every_serialized_status() {
         json!({"errored": null}),
         json!({"completed": "done", "errored": "failed"}),
         json!({"completed_with_surface": {"last_agent_message": null}}),
+        json!({"stopped": {"last_agent_message": null}}),
+        json!({"stopped": {"last_agent_message": null, "stop_cause": "unknown"}}),
     ] {
         assert!(
             !validator.is_valid(&value),
             "schema accepts invalid status {value}"
         );
+    }
+}
+
+#[test]
+fn collaboration_output_schemas_preserve_capacity_stop_reports() {
+    let status = serde_json::to_value(AgentStatus::Stopped {
+        last_agent_message: Some("remaining scope and evidence".to_string()),
+        stop_cause: codex_protocol::protocol::TurnExecutionStopCause::SubagentContextBudget,
+    })
+    .expect("serialize stopped status");
+    for (spec, result) in [
+        (
+            create_list_agents_tool(),
+            json!({
+                "agents": [{
+                    "agent_name": "/root/worker",
+                    "agent_status": status,
+                    "last_task_message": null,
+                    "runtime_loaded": true
+                }],
+                "typed_tasks": []
+            }),
+        ),
+        (
+            create_interrupt_agent_tool_v2(),
+            json!({"previous_status": status}),
+        ),
+    ] {
+        let ToolSpec::Function(ResponsesApiTool { output_schema, .. }) = spec else {
+            panic!("collaboration tool should be a function tool");
+        };
+        let schema = output_schema.expect("output schema").into_value();
+        let validator = jsonschema::validator_for(&schema).expect("compile output schema");
+        assert!(validator.is_valid(&result), "output schema rejects {result}");
     }
 }
 
@@ -689,7 +534,7 @@ fn v2_argument_groups_match_required_runtime_choices() {
         (json!({"task_name":"audit","assignment":assignment}), false),
         (
             json!({"task_name":"audit","assignment":assignment,"agent_type":"explorer"}),
-            true,
+            false,
         ),
         (
             json!({"task_name":"audit","assignment":assignment,"message":"inspect"}),
@@ -704,7 +549,7 @@ fn v2_argument_groups_match_required_runtime_choices() {
     }
     let declaration = codex_code_mode::render_json_schema_to_typescript(&schema);
     assert!(declaration.contains("message: unknown"), "{declaration}");
-    assert!(declaration.contains("assignment: unknown"), "{declaration}");
+    assert!(!declaration.contains("assignment: unknown"), "{declaration}");
 
     let ToolSpec::Function(send) = create_send_message_tool() else {
         panic!("send");

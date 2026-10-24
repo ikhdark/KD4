@@ -30,11 +30,9 @@ fn posix_native_paths_round_trip_without_reinterpreting_bytes_or_drive_shapes() 
 
 #[test]
 fn foreign_opaque_unc_parent_retains_lexical_hierarchy_on_every_host() {
-    let mut wide = r"\\server\share\".encode_utf16().collect::<Vec<_>>();
-    wide.push(0xd800);
     let child = PathUri::from_windows_opaque_path_bytes(
-        &wide
-            .into_iter()
+        &r"\\server\share\".encode_utf16()
+            .chain([0xd800])
             .flat_map(u16::to_le_bytes)
             .collect::<Vec<_>>(),
     );

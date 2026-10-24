@@ -155,6 +155,7 @@ impl SkillLoadOutcome {
 pub struct HostSkillsSnapshot {
     outcome: Arc<SkillLoadOutcome>,
     skills_by_catalog_id: Arc<HashMap<String, usize>>,
+    pub(crate) rendered_available_skills: Arc<crate::render::AvailableSkillsCache>,
 }
 
 impl HostSkillsSnapshot {
@@ -172,6 +173,7 @@ impl HostSkillsSnapshot {
         Self {
             outcome,
             skills_by_catalog_id: Arc::new(skills_by_catalog_id),
+            rendered_available_skills: Arc::new(std::sync::Mutex::new(None)),
         }
     }
 

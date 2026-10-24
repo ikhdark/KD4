@@ -1,5 +1,6 @@
 //! Host-owned source scope for the retained review engine. No model-authored freshness claims.
 
+use std::collections::HashMap;
 use std::io::Read;
 use std::path::Component;
 use std::path::Path;
@@ -132,6 +133,43 @@ impl ReviewSourceScope {
                     .into(),
             );
         }
+        let has_locations = !self.custom && !output.findings.is_empty();
+        let changes = ReviewDiffIndex::new(if has_locations { &self.diff } else { "" });
+        let staged_changes = self.staged_diff.as_deref().filter(|_| has_locations)
+            .map(ReviewDiffIndex::new);
+        // One defined source snapshot per (side/revision, path) in this call.
+        // Keep only its empty/line-count facts, not every acquired file body.
+        let mut snapshots = HashMap::<(Option<String>, String), (bool, usize)>::new();
+        let mut source_lines = |path: &Path, name: &str, revision: Option<&str>| -> Result<(bool, usize), String> {
+            let key = (revision.map(str::to_owned), name.to_owned());
+            if let Some(snapshot) = snapshots.get(&key) {
+                return Ok(*snapshot);
+            }
+            let contents = if let Some(revision) = revision {
+                run_git_for_stdout(&self.root, ["show", &format!("{revision}:{name}")], None)
+                    .map_err(|error| error.to_string())?
+            } else {
+                // Read only returned locations, never walk the repository.
+                let metadata = std::fs::symlink_metadata(path).map_err(|error| error.to_string())?;
+                if !metadata.is_file() || metadata.len() > 8 * 1024 * 1024 {
+                    return Err("review location is not a supported regular source file".into());
+                }
+                let file = std::fs::File::open(path).map_err(|error| error.to_string())?;
+                if !file.metadata().map_err(|error| error.to_string())?.is_file() {
+                    return Err("review source was replaced by a nonregular file".into());
+                }
+                let mut contents = String::new();
+                file.take(8 * 1024 * 1024 + 1).read_to_string(&mut contents)
+                    .map_err(|error| error.to_string())?;
+                if contents.len() > 8 * 1024 * 1024 {
+                    return Err("review source exceeds 8 MiB".into());
+                }
+                contents
+            };
+            let snapshot = (contents.is_empty(), contents.lines().count());
+            snapshots.insert(key, snapshot);
+            Ok(snapshot)
+        };
         for finding in &mut output.findings {
             if self.custom {
                 // Custom prompts may embed source from outside the checkout.
@@ -141,6 +179,30 @@ impl ReviewSourceScope {
             let path = &finding.code_location.absolute_file_path;
             let relative = path
                 .strip_prefix(&self.root)
+                .or_else(|error| {
+                    #[cfg(windows)]
+                    {
+                        if !path.is_absolute()
+                            || path.components().any(|part| part == Component::ParentDir)
+                        {
+                            return Err(error);
+                        }
+                        // Accept a differently spelled workspace only when
+                        // the filesystem confirms the same existing root.
+                        let prefix = path
+                            .components()
+                            .take(self.root.components().count())
+                            .collect::<PathBuf>();
+                        if let (Ok(normalized_prefix), Ok(normalized_root)) = (
+                            codex_utils_absolute_path::normalize_for_path_comparison(&prefix),
+                            codex_utils_absolute_path::normalize_for_path_comparison(&self.root),
+                        ) && normalized_prefix == normalized_root
+                        {
+                            return path.strip_prefix(prefix);
+                        }
+                    }
+                    Err(error)
+                })
                 .map_err(|_| "review location is outside the requested workspace")?;
             if relative
                 .components()
@@ -153,24 +215,24 @@ impl ReviewSourceScope {
                 .ok_or("review path is not UTF-8")?
                 .replace('\\', "/");
             let range = &finding.code_location.line_range;
-            let (mut deleted, mut changed) = self.changed_ranges(&name)?;
+            let (mut deleted, mut changed) = changes.changed_ranges(&name)?;
             let overlaps = |changed: &[(u32, u32)]| changed.iter()
                 .any(|(start, end)| range.start <= *end && range.end >= *start);
             let mut staged = false;
-            if !overlaps(&changed) && let Some(diff) = &self.staged_diff {
-                (deleted, changed) = Self::changed_ranges_in(diff, &name)?;
-                staged = overlaps(&changed);
+            if !overlaps(changed) && let Some(diff) = &staged_changes {
+                (deleted, changed) = diff.changed_ranges(&name)?;
+                staged = overlaps(changed);
             }
             let untracked = self.untracked.contains(&name);
             if !self.custom
                 && !untracked
-                && !overlaps(&changed)
+                && !overlaps(changed)
             {
                 return Err(format!(
                     "review location does not overlap the requested change: {name}"
                 ));
             }
-            let mut contents = if deleted {
+            let revision = if deleted {
                 let revision = if self
                     .comparison
                     .first()
@@ -192,56 +254,31 @@ impl ReviewSourceScope {
                     "Base-side location at {revision} (not current workspace lines). {}",
                     finding.body
                 );
-                run_git_for_stdout(&self.root, ["show", &format!("{revision}:{name}")], None)
-                    .map_err(|error| error.to_string())?
+                Some(revision)
             } else if staged {
                 finding.body = format!("Index-side location (staged source, not workspace lines). {}", finding.body);
-                run_git_for_stdout(&self.root, ["show", &format!(":{name}")], None)
-                    .map_err(|error| error.to_string())?
+                Some(String::new())
             } else if self
                 .comparison
                 .first()
                 .is_some_and(|command| command == "show")
             {
-                let revision = self.comparison.last().ok_or("missing review commit")?;
-                run_git_for_stdout(&self.root, ["show", &format!("{revision}:{name}")], None)
-                    .map_err(|error| error.to_string())?
+                Some(self.comparison.last().ok_or("missing review commit")?.clone())
             } else {
-                // Read only returned locations, never walk the repository.
-                let metadata =
-                    std::fs::symlink_metadata(path).map_err(|error| error.to_string())?;
-                if !metadata.is_file() || metadata.len() > 8 * 1024 * 1024 {
-                    return Err("review location is not a supported regular source file".into());
-                }
-                let file = std::fs::File::open(path).map_err(|error| error.to_string())?;
-                if !file
-                    .metadata()
-                    .map_err(|error| error.to_string())?
-                    .is_file()
-                {
-                    return Err("review source was replaced by a nonregular file".into());
-                }
-                let mut contents = String::new();
-                file.take(8 * 1024 * 1024 + 1)
-                    .read_to_string(&mut contents)
-                    .map_err(|error| error.to_string())?;
-                if contents.len() > 8 * 1024 * 1024 {
-                    return Err("review source exceeds 8 MiB".into());
-                }
-                contents
+                None
             };
+            let (empty, mut lines) = source_lines(path, &name, revision.as_deref())?;
             // A retained file can become empty through deletions alone. With
             // no surviving line, line 1 explicitly refers to its removed base.
             let empty_base = if historical {
                 self.comparison.last().map(|commit| format!("{commit}^"))
             } else { self.head.clone() };
-            if contents.is_empty() && range.start == 1 && range.end == 1
+            if empty && range.start == 1 && range.end == 1
                 && !untracked && let Some(base) = empty_base.as_deref() {
-                contents = run_git_for_stdout(&self.root, ["show", &format!("{base}:{name}")], None)
-                    .map_err(|error| error.to_string())?;
+                (_, lines) = source_lines(path, &name, Some(base))?;
                 finding.body = format!("Base-side location at {base} (file is now empty). {}", finding.body);
             }
-            if range.end as usize > contents.lines().count() {
+            if range.end as usize > lines {
                 return Err(format!("review location is beyond source EOF: {name}"));
             }
         }
@@ -268,23 +305,29 @@ impl ReviewSourceScope {
         );
         Ok(())
     }
+}
 
-    fn changed_ranges(&self, name: &str) -> Result<(bool, Vec<(u32, u32)>), String> {
-        Self::changed_ranges_in(&self.diff, name)
-    }
+type ChangedReviewRanges = Result<(bool, Vec<(u32, u32)>), String>;
 
-    fn changed_ranges_in(diff: &str, name: &str) -> Result<(bool, Vec<(u32, u32)>), String> {
-        let mut selected = false;
+#[derive(Default)]
+struct ReviewDiffIndex {
+    files: HashMap<String, ChangedReviewRanges>,
+    header_error: Option<String>,
+}
+
+impl ReviewDiffIndex {
+    fn new(diff: &str) -> Self {
+        let mut index = Self::default();
+        let mut name = None;
         let mut deleted = false;
-        let mut selected_deleted = false;
         // File labels precede a file's first hunk. Inside hunks, `--- ` and
         // `+++ ` prefixes are removed/added source lines, not labels.
         let mut in_header = false;
         let mut old_name = String::new();
-        let mut ranges = Vec::new();
+        let mut ranges = Ok(Vec::new());
         for line in diff.lines() {
             if line.starts_with("diff --git ") {
-                selected = false;
+                index.record(name.take(), deleted, std::mem::replace(&mut ranges, Ok(Vec::new())));
                 deleted = false;
                 in_header = true;
             }
@@ -292,46 +335,72 @@ impl ReviewSourceScope {
                 in_header = false;
             }
             if in_header && let Some(path) = line.strip_prefix("--- ") {
-                old_name = decode_diff_path(path)?;
+                match decode_diff_path(path) {
+                    Ok(path) => old_name = path,
+                    Err(error) => { index.header_error = Some(error); break; }
+                }
             }
             if in_header && let Some(path) = line.strip_prefix("+++ ") {
-                let new_name = decode_diff_path(path)?;
-                deleted = new_name == "/dev/null";
-                selected = if deleted {
-                    old_name == format!("a/{name}")
-                } else {
-                    new_name == format!("b/{name}")
+                let new_name = match decode_diff_path(path) {
+                    Ok(path) => path,
+                    Err(error) => { index.header_error = Some(error); break; }
                 };
-                if selected {
-                    selected_deleted = deleted;
-                }
-            }
-            if selected && line.starts_with("@@ ") {
-                let marker = if deleted { '-' } else { '+' };
-                let field = line
-                    .split_whitespace()
-                    .find(|field| field.starts_with(marker))
-                    .ok_or("invalid review diff hunk")?;
-                let (start, count) = field[1..].split_once(',').unwrap_or((&field[1..], "1"));
-                let start: u32 = start.parse().map_err(|_| "invalid review hunk start")?;
-                let count: u32 = count.parse().map_err(|_| "invalid review hunk count")?;
-                if count > 0 {
-                    ranges.push((
-                        start,
-                        start.checked_add(count - 1).ok_or("review hunk overflow")?,
-                    ));
+                deleted = new_name == "/dev/null";
+                name = if deleted {
+                    old_name.strip_prefix("a/")
                 } else {
-                    // Anchor a deletion-only hunk on the preceding surviving
-                    // line, or line 1 for a beginning/whole-file deletion.
-                    ranges.push((start.max(1), start.max(1)));
-                }
-                // A file's hunks are contiguous in a Git patch. Preserve its side.
+                    new_name.strip_prefix("b/")
+                }.map(str::to_owned);
             }
-            if !ranges.is_empty() && line.starts_with("diff --git ") {
-                break;
+            if name.is_some() && line.starts_with("@@ ")
+                && let Ok(current) = &mut ranges
+            {
+                match Self::hunk_range(line, deleted) {
+                    Ok(range) => current.push(range),
+                    Err(error) => ranges = Err(error),
+                }
             }
         }
-        Ok((selected_deleted, ranges))
+        index.record(name, deleted, ranges);
+        index
+    }
+
+    fn record(&mut self, name: Option<String>, deleted: bool, ranges: Result<Vec<(u32, u32)>, String>) {
+        let Some(name) = name else { return; };
+        // The previous parser stopped after the first range-bearing file for
+        // this path. A header-only entry can still be superseded by a later one.
+        if self.files.get(&name).is_none_or(|entry| matches!(entry, Ok((_, ranges)) if ranges.is_empty())) {
+            self.files.insert(name, ranges.map(|ranges| (deleted, ranges)));
+        }
+    }
+
+    fn changed_ranges(&self, name: &str) -> Result<(bool, &[(u32, u32)]), String> {
+        match self.files.get(name) {
+            Some(Err(error)) => Err(error.clone()),
+            Some(Ok((deleted, ranges))) if !ranges.is_empty() || self.header_error.is_none() => {
+                Ok((*deleted, ranges))
+            }
+            _ => match &self.header_error {
+                Some(error) => Err(error.clone()),
+                None => Ok((false, &[])),
+            },
+        }
+    }
+
+    fn hunk_range(line: &str, deleted: bool) -> Result<(u32, u32), String> {
+        let marker = if deleted { '-' } else { '+' };
+        let field = line.split_whitespace().find(|field| field.starts_with(marker))
+            .ok_or("invalid review diff hunk")?;
+        let (start, count) = field[1..].split_once(',').unwrap_or((&field[1..], "1"));
+        let start: u32 = start.parse().map_err(|_| "invalid review hunk start")?;
+        let count: u32 = count.parse().map_err(|_| "invalid review hunk count")?;
+        if count > 0 {
+            Ok((start, start.checked_add(count - 1).ok_or("review hunk overflow")?))
+        } else {
+            // Anchor a deletion-only hunk on the preceding surviving line,
+            // or line 1 for a beginning/whole-file deletion.
+            Ok((start.max(1), start.max(1)))
+        }
     }
 }
 

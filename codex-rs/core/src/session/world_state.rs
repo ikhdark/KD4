@@ -176,7 +176,10 @@ impl Session {
                         }
                     }
                     for section in sections {
-                        world_state.add_extension_section(section);
+                        let previous_rendering = previous_world_state
+                            .as_ref()
+                            .and_then(|previous| previous.rendered_extension(section.id()));
+                        world_state.add_extension_section_with_previous(section, previous_rendering);
                     }
                 }
                 Err(_) => {

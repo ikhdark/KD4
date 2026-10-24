@@ -53,6 +53,10 @@ impl PlanToolOutput {
             fields.remove("lineage");
             // This is a display projection, not a full replay authority.
             fields.insert("lineage_complete".into(), JsonValue::Bool(false));
+            let remaining = self.lineage.remaining_requirements(&self.current_plan);
+            if !remaining.is_empty() {
+                fields.insert("remaining_requirements".into(), serde_json::json!(remaining));
+            }
         }
         response
     }
@@ -297,6 +301,25 @@ impl PlanHandler {
                     "update_plan was cancelled before publication admission; no changes were made".into(),
                 )),
             };
+            // Lazy provenance lookup: no input journal, prompt projection, or
+            // history scan on ordinary requests or status-only plan updates.
+            let scope_guard = if (!requested_args.superseded.is_empty()
+                || !requested_args.scope_change_instructions.is_empty()
+                || !requested_args.scope_change_refs.is_empty()) && requested_args.needs_scope_inputs(
+                session.services.plan_store.snapshot().await.as_ref(),
+            ) {
+                let (guard, inputs) = tokio::select! {
+                    result = session.plan_scope_inputs() => result.map_err(|error|
+                        FunctionCallError::RespondToModel(format!("scope authorization unavailable: {error}; no changes were made")))?,
+                    _ = cancellation_token.cancelled() => return Err(FunctionCallError::RespondToModel(
+                        "update_plan was cancelled before scope authorization; no changes were made".into(),
+                    )),
+                };
+                requested_args.scope_inputs = Some(inputs);
+                Some(guard)
+            } else {
+                None
+            };
             let staged = session
                 .services
                 .plan_store
@@ -332,6 +355,7 @@ impl PlanHandler {
             #[cfg(test)]
             pause_at_plan_commit_boundary(&_call_id, &cancellation_token).await;
             let update = staged.commit_published();
+            drop(scope_guard);
             match update.effect {
                 PlanUpdateEffect::Initial => turn.turn_timing_state.record_initial_plan_generation(),
                 PlanUpdateEffect::StructuralRevision => {

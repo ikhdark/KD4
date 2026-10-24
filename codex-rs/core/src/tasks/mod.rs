@@ -1386,7 +1386,9 @@ impl Session {
                 turn_context.config.as_ref(),
                 turn_context.multi_agent_version,
             );
-            if abort_reason == Some(TurnAbortReason::SessionShutdown) {
+            if matches!(mode, InterruptedTurnHistoryMarker::Disabled) {
+                None
+            } else if abort_reason == Some(TurnAbortReason::SessionShutdown) {
                 let history = self.clone_history().await;
                 let plan = self.services.plan_store.snapshot().await;
                 let guidance = crate::context::TurnAborted::shutdown_guidance(
@@ -1397,17 +1399,12 @@ impl Session {
             } else {
                 let history = self.clone_history().await;
                 let plan = self.services.plan_store.snapshot().await;
-                let user_guidance = crate::context::TurnAborted::interrupted_guidance(
+                let guidance = crate::context::TurnAborted::interrupted_guidance(
                     history.raw_items(),
                     plan.as_ref(),
-                    false,
+                    matches!(mode, InterruptedTurnHistoryMarker::Developer),
                 );
-                let developer_guidance = crate::context::TurnAborted::interrupted_guidance(
-                    history.raw_items(),
-                    plan.as_ref(),
-                    true,
-                );
-                turn_boundary_history_marker(mode, &user_guidance, &developer_guidance)
+                turn_boundary_history_marker(mode, &guidance, &guidance)
             }
         } else {
             None

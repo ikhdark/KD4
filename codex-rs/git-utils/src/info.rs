@@ -412,14 +412,6 @@ pub struct CommitLogEntry {
 /// Each entry contains the SHA, commit timestamp (seconds), and subject line.
 /// Returns an empty vector if not in a git repo or on error/timeout.
 pub async fn recent_commits(cwd: &Path, limit: usize) -> Vec<CommitLogEntry> {
-    // Ensure we're in a git repo first to avoid noisy errors.
-    let Some(out) = run_git_command_with_timeout(&["rev-parse", "--git-dir"], cwd).await else {
-        return Vec::new();
-    };
-    if !out.status.success() {
-        return Vec::new();
-    }
-
     let fmt = "%H%x1f%ct%x1f%s"; // <sha> <US> <commit_time> <US> <subject>
     let limit_arg = (limit > 0).then(|| limit.to_string());
     let mut args: Vec<String> = vec!["log".to_string()];
@@ -429,6 +421,8 @@ pub async fn recent_commits(cwd: &Path, limit: usize) -> Vec<CommitLogEntry> {
     }
     args.push(format!("--pretty=format:{fmt}"));
     let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    // The captured log result already supplies the quiet repository/error
+    // discriminator, without a separate membership subprocess.
     let Some(log_out) = run_git_command_with_timeout(&arg_refs, cwd).await else {
         return Vec::new();
     };
@@ -1072,6 +1066,15 @@ pub async fn resolve_root_git_project_for_trust(
     cwd: &AbsolutePathBuf,
 ) -> Option<AbsolutePathBuf> {
     let repo_root = get_git_repo_root_with_fs(fs, cwd).await?;
+    resolve_root_git_project_for_trust_from_checkout(fs, &repo_root).await
+}
+
+/// Resolve trust identity for a checkout root already discovered by the caller.
+/// This performs the same linked-worktree interpretation without walking cwd again.
+pub async fn resolve_root_git_project_for_trust_from_checkout(
+    fs: &dyn ExecutorFileSystem,
+    repo_root: &AbsolutePathBuf,
+) -> Option<AbsolutePathBuf> {
     let dot_git = repo_root.join(".git");
     let dot_git_uri = PathUri::from_abs_path(&dot_git);
     if fs
@@ -1080,7 +1083,7 @@ pub async fn resolve_root_git_project_for_trust(
         .ok()?
         .is_directory
     {
-        return Some(repo_root);
+        return Some(repo_root.clone());
     }
 
     let git_dir_s = fs

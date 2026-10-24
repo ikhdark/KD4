@@ -66,6 +66,7 @@ pub use crate::transport::ReqwestTransport;
 pub use crate::transport::StreamResponse;
 pub use crate::transport::TransportTiming;
 pub use crate::transport::capture_transport_timing;
+pub use crate::transport::collect_error_body;
 pub use crate::transport::collect_response_body;
 pub use crate::transport::is_permanent_connection_error;
 pub use codex_network_types::RetryAfter;

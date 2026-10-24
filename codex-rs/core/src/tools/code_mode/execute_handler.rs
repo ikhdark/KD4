@@ -1,4 +1,5 @@
 use crate::FunctionCallError;
+use crate::agent::task_capabilities::TypedToolClass;
 use crate::tools::context::FunctionToolOutput;
 use crate::tools::context::ToolInvocation;
 use crate::tools::context::ToolPayload;
@@ -163,10 +164,10 @@ fn extended_nested_tool_timeout_ms(tool_timeout_ms: u64) -> u64 {
 
 fn nested_tool_timeout_override(
     tool: &ToolName,
-    mcp_timeouts: &HashMap<ToolName, u64>,
+    tool_timeouts: &HashMap<ToolName, u64>,
     terminal_poll_ms: u64,
 ) -> Option<u64> {
-    mcp_timeouts.get(tool).copied().or_else(|| {
+    tool_timeouts.get(tool).copied().or_else(|| {
         if tool == &ToolName::plain("exec_command") {
             Some(extended_nested_tool_timeout_ms(
                 crate::unified_exec::MAX_INITIAL_YIELD_TIME_MS,
@@ -277,14 +278,14 @@ impl CodeModeExecuteHandler {
 
     fn catalog_with_timeouts(
         &self,
-        mcp_timeouts: &HashMap<ToolName, u64>,
+        tool_timeouts: &HashMap<ToolName, u64>,
         terminal_poll_ms: u64,
     ) -> Arc<[codex_code_mode::ToolDefinition]> {
         let overrides = self
             .enabled_tools
             .iter()
             .map(|tool| {
-                nested_tool_timeout_override(&tool.tool_name, mcp_timeouts, terminal_poll_ms)
+                nested_tool_timeout_override(&tool.tool_name, tool_timeouts, terminal_poll_ms)
             })
             .collect::<Vec<_>>();
         let mut cached = self
@@ -325,8 +326,13 @@ impl CodeModeExecuteHandler {
     ) -> Result<FunctionToolOutput, FunctionCallError> {
         let args =
             codex_code_mode::parse_exec_source(&code).map_err(FunctionCallError::RespondToModel)?;
+        // Apply the public ceiling before crossing either session transport.
+        // The remote wire uses i32, while the pragma accepts safe integers.
+        let max_output_tokens = args
+            .max_output_tokens
+            .map(|limit| limit.min(codex_code_mode::MAX_OUTPUT_TOKENS_PER_EXEC_CALL));
         let turn = Arc::clone(&step_context.turn);
-        let mcp_timeouts = step_context
+        let mut tool_timeouts = step_context
             .mcp_tools()
             .await
             .iter()
@@ -346,8 +352,24 @@ impl CodeModeExecuteHandler {
                 )
             })
             .collect::<HashMap<_, _>>();
+        if let Some(router) = step_context.tool_router() {
+            for tool in self.enabled_tools.iter() {
+                if tool.tool_name.name == "wait_agent"
+                    && router.classify_tool_name(&turn, &tool.tool_name)
+                        == TypedToolClass::AgentCommunication
+                {
+                    // Native agent waits own both passive observation and their
+                    // explicit input deadline. A generic wrapper would turn an
+                    // unchanged wait into a spurious model continuation. Match
+                    // the registered owner, not a fixed namespace or an external
+                    // tool with the same leaf name. Explicit call options still
+                    // override this host-owned zero in the runtime callback.
+                    tool_timeouts.insert(tool.tool_name.clone(), 0);
+                }
+            }
+        }
         let enabled_tools = self.catalog_with_timeouts(
-            &mcp_timeouts,
+            &tool_timeouts,
             session
                 .services
                 .unified_exec_manager
@@ -376,7 +398,7 @@ impl CodeModeExecuteHandler {
                     // from an awaited script is buffered until its next decision
                     // boundary, rather than turning a timer into a model call.
                     yield_time_ms: Some(0),
-                    max_output_tokens: args.max_output_tokens,
+                    max_output_tokens,
                     default_tool_timeout_ms: Some(codex_code_mode::DEFAULT_TOOL_TIMEOUT_MS),
                 },
                 &step_context,
@@ -403,7 +425,7 @@ impl CodeModeExecuteHandler {
             .record_output_budget(
                 &cell_id,
                 Some(
-                    args.max_output_tokens
+                    max_output_tokens
                         .unwrap_or(codex_code_mode::DEFAULT_MAX_OUTPUT_TOKENS_PER_EXEC_CALL)
                         .min(
                             exec.turn
@@ -599,7 +621,7 @@ impl CodeModeExecuteHandler {
             .code_mode_service
             .delivery_for_response(&cell_id, &exec.turn, &response);
         let mut output =
-            handle_runtime_response(&exec, response, args.max_output_tokens, started_at)
+            handle_runtime_response(&exec, response, max_output_tokens, started_at)
                 .map_err(FunctionCallError::RespondToModel)?;
         exec.session
             .services
@@ -1161,6 +1183,7 @@ mod tests {
     struct ObservationFailureSession {
         initial_fails: bool,
         observation_fails: std::sync::atomic::AtomicBool,
+        output_budgets: std::sync::Mutex<Vec<Option<usize>>>,
     }
 
     const OBSERVATION_CAPACITY_ERROR: &str =
@@ -1169,9 +1192,10 @@ mod tests {
     impl codex_code_mode::CodeModeSession for ObservationFailureSession {
         fn execute<'a>(
             &'a self,
-            _request: codex_code_mode::ExecuteRequest,
+            request: codex_code_mode::ExecuteRequest,
         ) -> codex_code_mode::CodeModeSessionResultFuture<'a, codex_code_mode::StartedCell>
         {
+            self.output_budgets.lock().unwrap().push(request.max_output_tokens);
             let initial_fails = self.initial_fails;
             Box::pin(async move {
                 let cell_id = CellId::new("observation-failure-cell".into());
@@ -1251,6 +1275,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn exec_clamps_output_budget_before_session_transport() {
+        for requested in [
+            None::<usize>,
+            Some(0),
+            Some(100),
+            Some(40_000),
+            Some(40_001),
+            Some(2_147_483_648),
+        ] {
+            let runtime = Arc::new(ObservationFailureSession {
+                initial_fails: false,
+                observation_fails: std::sync::atomic::AtomicBool::new(false),
+                output_budgets: Default::default(),
+            });
+            let (mut session, turn) = crate::session::tests::make_session_and_context().await;
+            session.services.code_mode_service = super::super::CodeModeService::new(Arc::new(
+                ObservationFailureProvider(Arc::clone(&runtime)),
+            ));
+            let session = Arc::new(session);
+            let step = crate::session::step_context::StepContext::for_test(Arc::new(turn));
+            let handler = CodeModeExecuteHandler::new(
+                super::super::execute_spec::create_code_mode_tool(true, false, &[], &[]),
+                Vec::new(),
+                Vec::new(),
+            )
+            .unwrap();
+            let code = requested.map_or_else(
+                || "text('bounded');".to_string(),
+                |limit| format!("// @exec: {{\"max_output_tokens\":{limit}}}\ntext('bounded');"),
+            );
+            handler
+                .execute(
+                    Arc::clone(&session),
+                    step,
+                    "bounded-output-call".into(),
+                    code,
+                    tokio_util::sync::CancellationToken::new(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                *runtime.output_budgets.lock().unwrap(),
+                vec![requested.map(|limit| limit.min(40_000))],
+            );
+            session.services.code_mode_service.shutdown().await.unwrap();
+        }
+    }
+
+    #[tokio::test]
     async fn observation_failures_preserve_dispatch_until_confirmed_terminal_recovery() {
         // Exercise both exec observation owners: the initial receiver and the
         // held wait after automatic yield. Refusals are injected, not timed.
@@ -1258,6 +1331,7 @@ mod tests {
             let runtime = Arc::new(ObservationFailureSession {
                 initial_fails,
                 observation_fails: std::sync::atomic::AtomicBool::new(true),
+                output_budgets: Default::default(),
             });
             let (mut session, turn) = crate::session::tests::make_session_and_context().await;
             session.services.code_mode_service = super::super::CodeModeService::new(Arc::new(

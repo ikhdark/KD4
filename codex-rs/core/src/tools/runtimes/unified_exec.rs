@@ -429,6 +429,11 @@ impl<'a> ToolRuntime<UnifiedExecRequest, Arc<UnifiedExecProcess>> for UnifiedExe
         let options = unified_exec_options();
         drop(setup_phase);
         drop(setup_timing);
+        let validation_resource = crate::validation_task::acquire_execution_resources(
+            ctx, &req.command_for_approval,
+            native_cwd.as_ref().filter(|_| !req.turn_environment.environment.is_remote())
+                .map(|cwd| cwd.as_path()),
+        ).await.map_err(ToolError::Rejected)?;
         crate::validation_task::begin_policy_attempt(ctx).await.map_err(ToolError::Rejected)?;
         let spawned = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let result = self
@@ -443,7 +448,7 @@ impl<'a> ToolRuntime<UnifiedExecRequest, Arc<UnifiedExecProcess>> for UnifiedExe
                 /*environment_id*/ Some(&req.turn_environment.environment_id),
                 req.exec_server_env_config.clone(),
                 req.tty,
-                Box::new(ObservedSpawnLifecycle::new(Arc::clone(&spawned))),
+                Box::new(ObservedSpawnLifecycle::new(Arc::clone(&spawned), validation_resource)),
                 Some(req.raw_output_artifact.clone()),
                 req.turn_environment.environment.as_ref(),
                 Some(req.turn_environment.exec_backend()),

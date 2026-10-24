@@ -933,11 +933,15 @@ for (const exitCode of [0, 7]) {
   held.resolve();
   await result;
 }
-// Regular callbacks never receive the private scheduler descriptor as `this`.
+// Regular callbacks retain method context on the normalized node.
 {
-  let leaked = false;
+  let receiver;
+  let calls = 0;
   const inspectReceiver = function () {
-    if (this?.claims || this?.deps) leaked = true;
+    receiver ??= this;
+    check(this === receiver && Array.isArray(this.deps) &&
+      this.claims.write[0] === "repo", "normalized receiver lost");
+    ++calls;
     return true;
   };
   const results = await run_graph([
@@ -947,7 +951,7 @@ for (const exitCode of [0, 7]) {
     }),
     node("later", () => true, { resources: { write: ["repo"] } }),
   ], { concurrency: 1 });
-  check(!leaked && results.later.status === "fulfilled", "scheduler receiver escaped");
+  check(calls === 2 && results.later.status === "fulfilled", "callback method context lost");
 }
 // Diagnostics are bounded by serialized UTF-8, including JSON escaping.
 {

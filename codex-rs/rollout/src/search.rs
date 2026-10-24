@@ -184,7 +184,7 @@ async fn matching_payload_patterns(
         }
         Err(err) => return Err(err),
     };
-    let mut stdout = child
+    let stdout = child
         .stdout
         .take()
         .ok_or_else(|| io::Error::other("ripgrep payload search stdout was not captured"))?;
@@ -193,13 +193,24 @@ async fn matching_payload_patterns(
         .take()
         .ok_or_else(|| io::Error::other("ripgrep payload search stderr was not captured"))?;
     let read_paths = async {
-        let mut output = Vec::new();
-        stdout.read_to_end(&mut output).await?;
-        Ok::<_, io::Error>(output)
+        let mut stdout = BufReader::new(stdout);
+        let mut digests = HashSet::new();
+        let mut line = Vec::new();
+        while stdout.read_until(b'\n', &mut line).await? != 0 {
+            if digests.len() <= MAX_PAYLOAD_DIGEST_PATTERNS {
+                digests.extend(payload_digests_from_paths(&line));
+            }
+            // Once 129 distinct valid digests require the conservative fallback,
+            // only drain/reap the child; never retain the remaining path list.
+            line.clear();
+        }
+        let mut digests = digests.into_iter().collect::<Vec<_>>();
+        digests.sort_unstable();
+        Ok::<_, io::Error>(digests)
     };
     let drain_stderr = drain_and_check_empty(stderr);
     let wait_for_exit = child.wait();
-    let (output, stderr_is_empty, status) =
+    let (digests, stderr_is_empty, status) =
         tokio::try_join!(read_paths, drain_stderr, wait_for_exit)?;
     let all_references = vec![super::payload_artifact::KIND.to_string()];
     if !status.success() && !(status.code() == Some(1) && stderr_is_empty) {
@@ -210,7 +221,6 @@ async fn matching_payload_patterns(
         );
         return Ok(Some(all_references));
     }
-    let digests = payload_digests_from_paths(&output);
     Ok(Some(if digests.len() > MAX_PAYLOAD_DIGEST_PATTERNS {
         all_references
     } else {

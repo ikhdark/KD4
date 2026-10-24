@@ -771,7 +771,8 @@ function Try-AcquireCargoLaneReservation {
                 Where-Object { ($_.Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0 -and ($_.Name -eq $BaseLane -or $_.Name -match "^$([regex]::Escape($BaseLane))-\d+$") } |
                 Sort-Object -Property @{ Expression = { Get-CargoLaneLastUsed -Lane $_ }; Descending = $true }, Name |
                 ForEach-Object { $_.Name })
-        $candidates += @($BaseLane) + @(2..65 | ForEach-Object { "$BaseLane-$_" })
+        # Classify only existing lanes. Cold fallback paths are checked lazily
+        # when selected below, after all existing warm candidates.
         $warm = @{}
         foreach ($candidate in @($candidates | Select-Object -Unique)) {
             $target = Join-Path $LaneRoot $candidate

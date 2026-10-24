@@ -197,7 +197,7 @@ impl AgentsMdManager {
             return;
         }
         let mut bundle = loaded.stable_context_bundle(&key.active_cwd);
-        bundle.source_snapshot = Some(value.clone());
+        bundle.source_snapshot = Some(Arc::new(value.clone()));
         cache.key = Some(key);
         cache.loaded = Some(Arc::new(loaded));
         cache.retained_sources = sources;
@@ -442,7 +442,7 @@ impl AgentsMdManager {
             let mut snapshot =
                 loaded.accepted_project_sources(&key.active_cwd, &load.retained_sources);
             snapshot["observation_scope"] = key.persisted_scope(environments);
-            snapshot
+            Arc::new(snapshot)
         });
         cache.retained_sources = load.retained_sources;
         let semantically_unchanged = cache.key.as_ref() == Some(&key)

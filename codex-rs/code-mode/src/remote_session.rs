@@ -641,6 +641,8 @@ impl SessionInner {
                     return Ok(());
                 }
                 ShutdownAction::Close(binding) => {
+                    let jitter = std::collections::hash_map::RandomState::new();
+                    let mut retry = 0u32;
                     let result = loop {
                         let result = binding
                             .connection
@@ -651,7 +653,11 @@ impl SessionInner {
                         }) {
                             // Only re-observe close, never execution. The owned
                             // driver and host lease survive an observer timeout.
-                            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                            let ceiling = 100u64.saturating_mul(1u64 << retry.min(5)).min(2_000);
+                            let delay = ceiling / 2 + std::hash::BuildHasher::hash_one(&jitter, retry)
+                                % (ceiling / 2 + 1);
+                            retry = retry.saturating_add(1);
+                            tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
                             continue;
                         }
                         break result;

@@ -6582,8 +6582,7 @@ async fn task_capsule_attachment_rejects_noncanonical_or_mismatched_payloads() {
     assert!(
         std::fs::read_dir(&capsule_dir)
             .expect("capsule directory reads")
-            .filter(|entry| entry.as_ref().map_or(true, |entry| entry.path() != lock_path))
-            .next()
+            .find(|entry| entry.as_ref().map_or(true, |entry| entry.path() != lock_path))
             .is_none(),
         "rejected attachments must not leave published or staged capsules"
     );

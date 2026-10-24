@@ -142,6 +142,10 @@ impl ConnectionDriver {
             ));
             return true;
         }
+        if caller_cancellation.is_cancelled() || response_tx.is_closed() {
+            let _ = response_tx.send(Err("code-mode request cancelled".to_string()));
+            return true;
+        }
         let mut replacement = None;
         let catalog = if self.tool_catalog_references {
             match self.catalogs.get(&session.id) {
@@ -259,6 +263,10 @@ impl ConnectionDriver {
                 return true;
             }
         };
+        if caller_cancellation.is_cancelled() || response_tx.is_closed() {
+            let _ = response_tx.send(Err("code-mode request cancelled".to_string()));
+            return true;
+        }
         if self.requests.has_cancelled_wait(&session, &request.cell_id) {
             self.requests.push_deferred_wait(DeferredWait {
                 session,

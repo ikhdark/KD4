@@ -172,14 +172,36 @@ fn parse_patch_text(patch: &str, mode: ParseMode) -> Result<ApplyPatchArgs, Pars
         )));
     }
     // Keep CRLF bytes intact: the streaming parser strips exactly one CR.
-    let lines: Vec<&str> = patch.trim().split('\n').collect();
-    let patch_lines = match mode {
-        #[cfg(test)]
-        ParseMode::Strict => check_patch_boundaries_strict(&lines)?,
-        ParseMode::Lenient => check_patch_boundaries_lenient(&lines)?,
+    let patch = patch.trim();
+    let boundaries = |source: &str| {
+        let first = source.split('\n').next();
+        let last = source.rsplit('\n').next();
+        check_start_and_end_lines_strict(first.as_ref(), last.as_ref())
     };
-
-    let patch = patch_lines.join("\n");
+    let patch = match boundaries(patch) {
+        Ok(()) => patch,
+        Err(original_error) => match mode {
+            #[cfg(test)]
+            ParseMode::Strict => return Err(original_error),
+            ParseMode::Lenient => {
+                let first = patch.split('\n').next().unwrap_or_default();
+                let last = patch.rsplit('\n').next().unwrap_or_default();
+                if !matches!(first.strip_suffix('\r').unwrap_or(first), "<<EOF" | "<<'EOF'" | "<<\"EOF\"")
+                    || last.trim() != "EOF"
+                    || patch.split('\n').take(4).count() < 4
+                {
+                    return Err(original_error);
+                }
+                // Split/join previously reconstructed this same contiguous
+                // byte span, including CR and extra-CR line endings.
+                let start = patch.find('\n').expect("four lines have a newline") + 1;
+                let end = patch.rfind('\n').expect("four lines have a newline");
+                let inner = &patch[start..end];
+                boundaries(inner)?;
+                inner
+            }
+        },
+    }.to_owned();
     let mut parser = StreamingPatchParser::default();
     parser.push_delta_in_place(&patch)?;
     let (hunks, environment_id) = parser.into_parts()?;
@@ -247,6 +269,7 @@ mod review_regressions {
 
 /// Checks the start and end lines of the patch text for `apply_patch`,
 /// returning an error if they do not match the expected markers.
+#[cfg(test)]
 fn check_patch_boundaries_strict<'a>(lines: &'a [&'a str]) -> Result<&'a [&'a str], ParseError> {
     let (first_line, last_line) = match lines {
         [] => (None, None),
@@ -264,6 +287,7 @@ fn check_patch_boundaries_strict<'a>(lines: &'a [&'a str]) -> Result<&'a [&'a st
 ///
 /// If successful, returns the lines of the patch text that contain the patch
 /// contents, excluding the heredoc markers.
+#[cfg(test)]
 fn check_patch_boundaries_lenient<'a>(
     original_lines: &'a [&'a str],
 ) -> Result<&'a [&'a str], ParseError> {

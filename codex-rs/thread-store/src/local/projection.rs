@@ -75,6 +75,8 @@ struct ProjectedTurn {
 pub(super) struct LocalThreadProjection {
     builder: ThreadHistoryBuilder,
     initialized: bool,
+    deferred_seed: Option<Arc<Vec<RolloutItem>>>,
+    deferred_committed: Vec<RolloutItem>,
     source_partial: bool,
     turn_order: Vec<String>,
     turn_positions: HashMap<String, usize>,
@@ -90,6 +92,8 @@ impl Default for LocalThreadProjection {
         Self {
             builder: ThreadHistoryBuilder::new(),
             initialized: false,
+            deferred_seed: None,
+            deferred_committed: Vec::new(),
             source_partial: false,
             turn_order: Vec::new(),
             turn_positions: HashMap::new(),
@@ -243,6 +247,10 @@ impl LocalThreadProjection {
 
     fn commit_pending(&mut self) -> ThreadStoreResult<()> {
         let pending_items = std::mem::take(&mut self.pending_items);
+        if self.deferred_seed.is_some() {
+            self.deferred_committed.extend(pending_items);
+            return Ok(());
+        }
         self.apply_persisted_items(pending_items.as_slice())
     }
 
@@ -558,21 +566,18 @@ impl LocalThreadProjectionEntry {
     }
 }
 
-pub(super) async fn initialize_empty(
+pub(super) async fn initialize_deferred(
     store: &LocalThreadStore,
     thread_id: ThreadId,
-) -> ThreadStoreResult<()> {
-    initialize_from_items(store, thread_id, &[]).await
-}
-
-pub(super) async fn initialize_from_items(
-    store: &LocalThreadStore,
-    thread_id: ThreadId,
-    items: &[RolloutItem],
+    history: Option<Arc<Vec<RolloutItem>>>,
 ) -> ThreadStoreResult<()> {
     let projection = projection_entry(store, thread_id).await;
     let _operation = projection.acquire_operation().await?;
-    projection.initialize(items).await
+    *projection.state.lock().await = LocalThreadProjection {
+        deferred_seed: Some(history.unwrap_or_else(|| Arc::new(Vec::new()))),
+        ..Default::default()
+    };
+    Ok(())
 }
 
 pub(super) async fn initialize_from_store(
@@ -607,18 +612,17 @@ pub(super) async fn initialize_from_store(
             || projection.gap_retry_after.lock().await.is_some_and(|deadline| Instant::now() >= deadline)
             || !codex_rollout::payload_versions_match(&dependencies).await;
         if source_changed {
-            // Stamped before the read, so a payload that appears during or after it is
-            // still a change for the next page.
-            let dependencies = if let Some((path, _, _)) = source_version.as_ref() {
-                codex_rollout::named_payload_versions(path).await.ok()
-            } else {
-                None
-            };
+            // The canonical reader stamps each named dependency before hydration.
+            // A repair/replacement during replay still invalidates the next page.
+            let mut dependencies = None;
             let history = store
-                .load_history(LoadThreadHistoryParams {
-                    thread_id,
-                    include_archived,
-                })
+                .load_history_with_payload_versions(
+                    LoadThreadHistoryParams {
+                        thread_id,
+                        include_archived,
+                    },
+                    Some(&mut dependencies),
+                )
                 .await?;
             projection.initialize(history.items.as_slice()).await?;
             let degraded = history.items.iter().any(|item| match item {
@@ -699,6 +703,20 @@ async fn initialize_entry_from_store(
     if projection.is_initialized().await {
         return Ok(());
     }
+    {
+        let mut state = projection.state.lock().await;
+        if let Some(seed) = state.deferred_seed.take() {
+            // Share the resume snapshot until pagination actually needs the
+            // reducer/index. Keep pending versus committed visibility identical
+            // to the eager path, without forcing a recorder persistence barrier.
+            let committed = std::mem::take(&mut state.deferred_committed);
+            let pending = std::mem::take(&mut state.pending_items);
+            state.initialize(&seed)?;
+            state.apply_persisted_items(&committed)?;
+            state.pending_items = pending;
+            return Ok(());
+        }
+    }
     let history = store
         .load_history(LoadThreadHistoryParams {
             thread_id,
@@ -719,13 +737,6 @@ pub(super) async fn initialized_entry_for_append(
     }
     let projection = projection_entry(store, thread_id).await;
     let operation = projection.acquire_operation().await?;
-    initialize_entry_from_store(
-        store,
-        thread_id,
-        /*include_archived*/ true,
-        &projection,
-    )
-    .await?;
     Ok((projection, operation))
 }
 

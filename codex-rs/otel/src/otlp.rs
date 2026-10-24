@@ -48,10 +48,9 @@ pub(crate) fn build_header_map(
 
 /// TLS configuration shared by the OTLP gRPC exporters.
 ///
-/// tonic builds its connector with the process-wide rustls provider when one is
-/// installed and otherwise falls back to ring, which cannot verify the ECDSA
-/// P-521 certificates the shared provider supports. Exporters are built during
-/// startup, before other TLS clients install that provider.
+/// tonic uses the process-wide rustls provider rather than selecting a second
+/// provider through exporter features. Install the shared provider first; it
+/// supports ECDSA P-521 and respects an embedding host's existing provider.
 pub(crate) fn grpc_tls_config(
     endpoint: &str,
     tls: Option<&OtelTlsConfig>,
@@ -282,7 +281,7 @@ impl OtelHttpClient for OtlpBlockingHttpClient {
                 // Preserve one async-body deadline across repeated blocking reads.
                 .timeout(self.1)
                 .headers(parts.headers)
-                .body(body.to_vec())
+                .body_bytes(body)
                 .send()?;
             let status = response.status();
             let headers = response.headers().clone();

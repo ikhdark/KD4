@@ -162,19 +162,40 @@ pub(crate) fn fork_turn_positions_in_rollout(items: &[RolloutItem]) -> Vec<usize
     fork_turn_positions
 }
 
-/// Filter fork history without replaying rollback counts against instruction
-/// turns the filter removed. Use the same typed/legacy boundaries as truncation.
+/// Filter owned history while repairing rollback counts for removed instructions.
 pub(crate) fn filter_rollout_preserving_rollbacks(
     items: Vec<RolloutItem>,
-    mut keep: impl FnMut(&RolloutItem) -> bool,
+    keep: impl FnMut(&RolloutItem) -> bool,
 ) -> Vec<RolloutItem> {
+    let decisions = rollout_filter_decisions(&items, keep);
+    items.into_iter().zip(decisions)
+        .filter_map(|(item, decision)| apply_rollout_filter_decision(item, decision)).collect()
+}
+
+/// Borrow a shared parent until selection is known; clone retained payloads only.
+pub(crate) fn filter_borrowed_rollout_preserving_rollbacks(
+    items: &[RolloutItem],
+    keep: impl FnMut(&RolloutItem) -> bool,
+    mut clone_retained: impl FnMut(&RolloutItem) -> RolloutItem,
+) -> Vec<RolloutItem> {
+    let decisions = rollout_filter_decisions(items, keep);
+    items.iter().zip(decisions).filter_map(|(item, decision)| {
+        decision.0.then(|| clone_retained(item))
+            .and_then(|item| apply_rollout_filter_decision(item, decision))
+    }).collect()
+}
+
+fn rollout_filter_decisions(
+    items: &[RolloutItem],
+    mut keep: impl FnMut(&RolloutItem) -> bool,
+) -> Vec<(bool, Option<u32>)> {
     let mut legacy_mail = LegacyInterAgentMailReader::default();
     let mut instruction_turns = Vec::new();
     let mut decisions = Vec::with_capacity(items.len());
     for (index, item) in items.iter().enumerate() {
         let legacy = legacy_mail.observe(item).is_some();
         let retained = keep(item);
-        if is_rollback_instruction_turn_boundary(&items, index, item, legacy) {
+        if is_rollback_instruction_turn_boundary(items, index, item, legacy) {
             instruction_turns.push(retained);
         }
         let rollback = if let RolloutItem::EventMsg(EventMsg::ThreadRolledBack(event)) = item {
@@ -192,21 +213,18 @@ pub(crate) fn filter_rollout_preserving_rollbacks(
         };
         decisions.push((retained && rollback != Some(0), rollback));
     }
-    items
-        .into_iter()
-        .zip(decisions)
-        .filter_map(|(mut item, (keep, rollback))| {
-            if !keep {
-                return None;
-            }
-            if let (RolloutItem::EventMsg(EventMsg::ThreadRolledBack(event)), Some(count)) =
-                (&mut item, rollback)
-            {
-                event.num_turns = count;
-            }
-            Some(item)
-        })
-        .collect()
+    decisions
+}
+
+fn apply_rollout_filter_decision(
+    mut item: RolloutItem,
+    (keep, rollback): (bool, Option<u32>),
+) -> Option<RolloutItem> {
+    if !keep { return None; }
+    if let (RolloutItem::EventMsg(EventMsg::ThreadRolledBack(event)), Some(count)) = (&mut item, rollback) {
+        event.num_turns = count;
+    }
+    Some(item)
 }
 
 /// `legacy_inter_agent_mail` is the `LegacyInterAgentMailReader` verdict for `item`.

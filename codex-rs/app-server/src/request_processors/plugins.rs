@@ -675,13 +675,6 @@ impl PluginRequestProcessor {
             config.chatgpt_base_url.clone(),
             config.http_client_factory(),
         );
-        let refresh_global_remote_catalog_cache = use_remote_global_catalog
-            && codex_core_plugins::remote::has_cached_global_remote_plugin_catalog(
-                config.codex_home.as_path(),
-                &remote_plugin_service_config,
-                auth.as_ref(),
-            )
-            .await;
         let local = async {
             let outcome = if include_local {
             let config_for_marketplace_listing = plugins_input.clone();
@@ -756,6 +749,13 @@ impl PluginRequestProcessor {
 
         let remote = async {
         let mut data = Vec::new();
+        let mut global_observation = if use_remote_global_catalog {
+            codex_core_plugins::remote::observe_cached_global_remote_plugin_catalog(
+                config.codex_home.as_path(), &remote_plugin_service_config, auth.as_ref(),
+            ).await
+        } else {
+            None
+        };
         // TODO(remote plugins): Remove this once remote plugins are ready and vertical plugins are
         // served directly from the normal remote catalog.
         if include_vertical && !config.features.enabled(Feature::RemotePlugin) {
@@ -800,11 +800,12 @@ impl PluginRequestProcessor {
             remote_sources.push(RemoteMarketplaceSource::SharedWithMe);
         }
         if !remote_sources.is_empty() {
-            match codex_core_plugins::remote::fetch_remote_marketplaces(
+            match codex_core_plugins::remote::fetch_remote_marketplaces_with_global_cache_observation(
                 &remote_plugin_service_config,
                 auth.as_ref(),
                 &remote_sources,
                 /*global_catalog_cache_path*/ Some(config.codex_home.as_path()),
+                global_observation.as_mut(),
             )
             .await
             {
@@ -843,9 +844,11 @@ impl PluginRequestProcessor {
                 }
             }
         }
-        Ok::<_, JSONRPCErrorError>(data)
+        let refresh_global_remote_catalog_cache = global_observation.as_ref().is_some_and(|observed|
+            observed.is_cached_for(config.codex_home.as_path(), &remote_plugin_service_config, auth.as_ref()));
+        Ok::<_, JSONRPCErrorError>((data, refresh_global_remote_catalog_cache))
         };
-        let ((mut data, marketplace_load_errors), remote_data) =
+        let ((mut data, marketplace_load_errors), (remote_data, refresh_global_remote_catalog_cache)) =
             join_plugin_listing_reads(local, remote).await?;
         data.extend(remote_data);
 

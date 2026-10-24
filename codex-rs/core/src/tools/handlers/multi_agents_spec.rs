@@ -1,14 +1,12 @@
 use codex_features::MULTI_AGENT_DEFAULT_WAIT_TIMEOUT_MS;
 use codex_features::MULTI_AGENT_MAX_WAIT_TIMEOUT_MS;
 use codex_features::MULTI_AGENT_MIN_WAIT_TIMEOUT_MS;
-use codex_protocol::openai_models::ModelPreset;
 use codex_tools::JsonSchema;
 use codex_tools::ResponsesApiTool;
 use codex_tools::ToolSpec;
 use serde_json::Value;
 use serde_json::json;
 use std::collections::BTreeMap;
-use std::sync::Arc;
 
 use super::multi_agents_common::DEFAULT_SPAWN_AGENT_MODEL;
 use super::multi_agents_common::DEFAULT_SPAWN_AGENT_REASONING_EFFORT;
@@ -16,35 +14,21 @@ use super::multi_agents_common::DEFAULT_SPAWN_AGENT_REASONING_EFFORT;
 
 const SPAWN_AGENT_SERVICE_TIER_OVERRIDE_DESCRIPTION: &str =
     "Service tier override for the new agent. Omit unless explicitly requested.";
-const SPAWN_AGENT_V2_FULL_HISTORY_OVERRIDE_GUIDANCE: &str = "Full-history forks (`fork_turns=\"all\"`) are disabled by default and do not accept per-call `agent_type`, `model`, or `reasoning_effort` overrides when enabled; set `fork_turns` to `none` or an integer from 1 through 5 when using those fields.";
-const MAX_MODEL_OVERRIDES_IN_SPAWN_AGENT_DESCRIPTION: usize = 5;
-const MAX_REASONING_EFFORT_CHARS_IN_SPAWN_AGENT_DESCRIPTION: usize = 64;
+const SPAWN_AGENT_V2_FULL_HISTORY_OVERRIDE_GUIDANCE: &str = "Full-history forks (`fork_turns=\"all\"`) are disabled by default; prefer `none` or an integer from 1 through 5.";
 /// `message` and the aliases the V2 handler accepts for the same task text.
+/// Keep these plaintext: durable objectives are rendered inside ordinary capsule
+/// or history-bootstrap text, not delivered as Responses EncryptedContent.
 const SPAWN_AGENT_V2_MESSAGE_FIELDS: [&str; 3] = ["message", "prompt", "instructions"];
 
 #[derive(Debug, Clone, Default)]
 pub struct SpawnAgentToolOptions {
-    pub available_models: Arc<Vec<ModelPreset>>,
-    pub agent_type_description: String,
-    pub hide_agent_type_model_reasoning: bool,
+    pub hide_agent_metadata: bool,
     pub usage_hint_text: Option<String>,
 }
 
 fn spawn_agent_default_guidance() -> String {
     format!(
-        "Spawned agents use `{DEFAULT_SPAWN_AGENT_MODEL}` with `{DEFAULT_SPAWN_AGENT_REASONING_EFFORT}` reasoning by default. Omit `model` and `reasoning_effort` to use those defaults; set either field only when an explicit override is needed. If the built-in model is unavailable, use the effective model or provider default. Omitted reasoning effort falls back to a supported model effort."
-    )
-}
-
-fn spawn_agent_model_override_description() -> String {
-    format!(
-        "Model override for the new agent. Omit to use `{DEFAULT_SPAWN_AGENT_MODEL}`. If unavailable, the effective model or provider default is used."
-    )
-}
-
-fn spawn_agent_reasoning_override_description() -> String {
-    format!(
-        "Reasoning effort override for the new agent. Omit to prefer `{DEFAULT_SPAWN_AGENT_REASONING_EFFORT}`, falling back to a supported effort of the selected model."
+        "All subagents are generic and use `{DEFAULT_SPAWN_AGENT_MODEL}` with `{DEFAULT_SPAWN_AGENT_REASONING_EFFORT}` reasoning. Describe the job and its restrictions in `message`; there are no role, model, or reasoning overrides. If the built-in model is unavailable, the effective model or provider default is used with a supported reasoning effort."
     )
 }
 
@@ -67,31 +51,15 @@ impl Default for WaitAgentTimeoutOptions {
 
 
 pub fn create_spawn_agent_tool_v2(options: SpawnAgentToolOptions) -> ToolSpec {
-    let available_models_description = (!options.hide_agent_type_model_reasoning)
-        .then(|| spawn_agent_models_description(&options.available_models));
-    let default_model_guidance =
-        (!options.hide_agent_type_model_reasoning).then(spawn_agent_default_guidance);
-    let full_history_override_guidance = (!options.hide_agent_type_model_reasoning)
-        .then_some(SPAWN_AGENT_V2_FULL_HISTORY_OVERRIDE_GUIDANCE);
     let mut properties = spawn_agent_common_properties_v2(
-        &options.agent_type_description,
-        full_history_override_guidance,
+        Some(SPAWN_AGENT_V2_FULL_HISTORY_OVERRIDE_GUIDANCE),
     );
-    if options.hide_agent_type_model_reasoning {
+    if options.hide_agent_metadata {
         hide_spawn_agent_metadata_options(&mut properties);
-        // Typed assignments require an explicit typed-capable role even when optional legacy
-        // spawn metadata is hidden.
-        properties.insert(
-            "agent_type".to_string(),
-            JsonSchema::string(Some(options.agent_type_description.clone())),
-        );
     }
-    properties.insert("assignment".to_string(), typed_assignment_schema());
     properties.insert(
         "task_name".to_string(),
         JsonSchema {
-            // ECMAScript `$` alone also admits a final newline. Require the
-            // absolute end explicitly and retain AgentPath's reserved name.
             pattern: Some(r"^(?!root$)[a-z0-9_]+$(?![\s\S])".to_string()),
             min_length: Some(1),
             ..JsonSchema::string(Some(
@@ -100,42 +68,22 @@ pub fn create_spawn_agent_tool_v2(options: SpawnAgentToolOptions) -> ToolSpec {
             ))
         },
     );
-    // Other agent APIs name this task text `prompt` or `instructions`. Rejecting
-    // those spellings failed whole exec cells, so they are published aliases.
     for alias in &SPAWN_AGENT_V2_MESSAGE_FIELDS[1..] {
         properties.insert(
             (*alias).to_string(),
-            JsonSchema::string(Some("Alias for `message`.".to_string())).with_encrypted(),
+            JsonSchema::string(Some("Alias for `message`.".to_string())),
         );
     }
 
     ToolSpec::Function(ResponsesApiTool {
         name: "spawn_agent".to_string(),
-        description: spawn_agent_tool_description_v2(
-            available_models_description.as_deref(),
-            default_model_guidance.as_deref(),
-            full_history_override_guidance,
-            options.usage_hint_text,
-        ),
+        description: spawn_agent_tool_description_v2(options.usage_hint_text),
         strict: false,
         defer_loading: None,
         parameters: JsonSchema {
             one_of: Some(
                 SPAWN_AGENT_V2_MESSAGE_FIELDS
                     .into_iter()
-                    .chain(["assignment"])
-                    .map(|field| JsonSchema {
-                        required: Some(vec![field.to_string()]),
-                        ..JsonSchema::object(BTreeMap::new(), None, None)
-                    })
-                    .collect(),
-            ),
-            // Keep role admission separate from the exclusive input choice: otherwise
-            // message + assignment without agent_type could match the message branch.
-            any_of: Some(
-                SPAWN_AGENT_V2_MESSAGE_FIELDS
-                    .into_iter()
-                    .chain(["agent_type"])
                     .map(|field| JsonSchema {
                         required: Some(vec![field.to_string()]),
                         ..JsonSchema::object(BTreeMap::new(), None, None)
@@ -149,7 +97,7 @@ pub fn create_spawn_agent_tool_v2(options: SpawnAgentToolOptions) -> ToolSpec {
             )
         },
         output_schema: Some(
-            spawn_agent_output_schema_v2(options.hide_agent_type_model_reasoning).into(),
+            spawn_agent_output_schema_v2(options.hide_agent_metadata).into(),
         ),
     })
 }
@@ -224,7 +172,7 @@ pub fn create_followup_task_tool() -> ToolSpec {
         (
             "message".to_string(),
             JsonSchema::string(Some(
-                "Message text to send to the target agent.".to_string(),
+                "New task or correction and necessary evidence; reference unchanged context instead of resending the prior assignment.".to_string(),
             ))
             .with_encrypted(),
         ),
@@ -246,7 +194,7 @@ pub fn create_followup_task_tool() -> ToolSpec {
 pub fn create_wait_agent_tool_v2(options: WaitAgentTimeoutOptions) -> ToolSpec {
     ToolSpec::Function(ResponsesApiTool {
         name: "wait_agent".to_string(),
-        description: "Wait for the next mailbox update or durable typed-task progress. Returns at the first event, not when agents finish: a result that reports only the admission of your own spawn is not progress, so wait again in the same cell. Omit cursor to receive new assignment, gate, receipt, lease, and progress deltas using the caller's automatically retained position; set an explicit cursor only to replay from that position. Does not return the content: a finished agent's answer arrives as a message on your next request. The wait also ends early when new user input is steered into the active turn."
+        description: "Wait for mailbox input or durable task progress. Returns at the first event, not when agents finish. On a mailbox, deferred-result or new-input wake, return from the exec cell; empty typed_deltas is not a reason to wait again. Admission-only bookkeeping is folded internally. Omit cursor to receive new deltas from the retained position; supply one only to replay. Does not return the content: a finished agent's answer arrives as a message on your next request."
             .to_string(),
         strict: false,
         defer_loading: None,
@@ -266,14 +214,17 @@ pub fn create_list_agents_tool() -> ToolSpec {
     properties.insert("compact".into(), JsonSchema::boolean(Some(
         "Omit repeated task-message previews; status, results, failures and required actions remain complete. Default false.".into(),
     )));
+    properties.insert("status_only".into(), JsonSchema::boolean(Some(
+        "Opt in to liveness polling without task previews or completed report/surfaced-result bodies. Completed statuses become distinct completed/completed_with_surface strings with exact immutable completed_report_recovery arguments. If report retention fails, completed reports remain inline. Errors, stopped reports, blockers and required actions remain complete. Default false.".into(),
+    )));
     properties.insert("since_revision".into(), JsonSchema::string(Some(
-        "Prior display revision for the same root, prefix and compact mode. An exact match returns unchanged:true with empty arrays (retain the previous snapshot); otherwise a full replacement snapshot includes additions and deletions.".into(),
+        "Prior display revision for the same root, prefix, compact and status_only modes. An exact match returns unchanged:true with empty arrays (retain the previous snapshot); otherwise a replacement snapshot for the requested view includes additions and deletions. Changes to omitted reports also change the revision.".into(),
     )));
 
     ToolSpec::Function(ResponsesApiTool {
         name: "list_agents".to_string(),
         description:
-            "List live agents in the current root thread tree. For routine polling use compact:true and reuse since_revision to avoid repeating unchanged evidence. These revisions do not certify source freshness or task completion."
+            "List live agents in the current root thread tree. For routine liveness polling use status_only:true and reuse since_revision; terminal reports are delivered automatically. Full details remain the default, and compact:true alone preserves final results. Recover omitted reports with completed_report_recovery through the advertised read_tool_output entrypoint; for a current full snapshot request status_only:false with a targeted path_prefix and no since_revision before waking the worker just to resend text. Revisions and completed lifecycle statuses do not certify source freshness or task completion."
                 .to_string(),
         strict: false,
         defer_loading: None,
@@ -350,6 +301,22 @@ fn agent_status_output_schema() -> Value {
             {
                 "type": "object",
                 "properties": {
+                    "stopped": {
+                        "type": "object",
+                        "properties": {
+                            "last_agent_message": {"type": ["string", "null"]},
+                            "stop_cause": {"type": "string", "enum": ["subagent_context_budget"]}
+                        },
+                        "required": ["last_agent_message", "stop_cause"],
+                        "additionalProperties": false
+                    }
+                },
+                "required": ["stopped"],
+                "additionalProperties": false
+            },
+            {
+                "type": "object",
+                "properties": {
                     "errored": {
                         "type": "string"
                     }
@@ -415,12 +382,15 @@ fn list_agents_output_schema() -> Value {
                             "description": "Canonical task name for the agent when available, otherwise the agent id."
                         },
                         "agent_status": {
-                            "description": "Last known status of the agent.",
-                            "allOf": [agent_status_output_schema()]
+                            "description": "Last known lifecycle status, not task acceptance. Only status_only:true replaces completed bodies with distinct status strings; see completed_report_recovery for exact full recovery.",
+                            "oneOf": [
+                                agent_status_output_schema(),
+                                { "type": "string", "enum": ["completed", "completed_with_surface"] }
+                            ]
                         },
                         "last_task_message": {
                             "type": ["string", "null"],
-                            "description": "Most recent user or inter-agent instruction received by the agent, when available."
+                            "description": "Most recent user or inter-agent instruction received by the agent, when available; null in compact or status_only views."
                         },
                         "runtime_loaded": {
                             "type": "boolean",
@@ -446,7 +416,39 @@ fn list_agents_output_schema() -> Value {
             },
             "revision": { "type": "string", "description": "Opaque display identity, not a source or acceptance revision." },
             "unchanged": { "type": "boolean", "description": "If true retain the prior snapshot; empty arrays do not revoke existing failures or agents." },
-            "task_text_recovery": { "type": ["string", "null"]
+            "task_text_recovery": { "type": ["string", "null"] },
+            "completed_report_recovery": {
+                "type": "object",
+                "description": "Exact immutable completed statuses from this revision, including final messages and authoritative surfaced values. Invoke tool through its advertised namespace with these arguments and follow any continuation; the artifact is caller-thread scoped and survives later report changes or agent deletion.",
+                "properties": {
+                    "tool": { "type": "string", "enum": ["read_tool_output"] },
+                    "arguments": {
+                        "type": "object",
+                        "properties": {
+                            "artifact_id": { "type": "string" },
+                            "selectors": {
+                                "type": "array",
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "kind": { "const": "json_pointer" },
+                                        "pointer": { "const": "/agents" }
+                                    },
+                                    "required": ["kind", "pointer"],
+                                    "additionalProperties": false
+                                },
+                                "minItems": 1,
+                                "maxItems": 1
+                            }
+                        },
+                        "required": ["artifact_id", "selectors"],
+                        "additionalProperties": false
+                    },
+                    "canonical_sha256": { "type": "string" },
+                    "canonical_bytes": { "type": "integer" }
+                },
+                "required": ["tool", "arguments", "canonical_sha256", "canonical_bytes"],
+                "additionalProperties": false
             }
         },
         "required": ["agents", "typed_tasks"],
@@ -524,7 +526,6 @@ fn agent_previous_status_output_schema(previous_status_description: &str) -> Val
 
 
 fn spawn_agent_common_properties_v2(
-    agent_type_description: &str,
     full_history_override_guidance: Option<&str>,
 ) -> BTreeMap<String, JsonSchema> {
     let full_history_override_guidance = full_history_override_guidance
@@ -534,28 +535,15 @@ fn spawn_agent_common_properties_v2(
         (
             "message".to_string(),
             JsonSchema::string(Some(
-                "Complete, self-contained task. The new agent sees none of this conversation unless `fork_turns` is set, so include the paths, facts and stop condition it needs. Admitted with a repository-wide diagnostic claim that records coordination risk without blocking overlapping work."
+                "Complete, self-contained task with the needed paths, facts, restrictions, evidence references and stop condition, not a copied transcript. The new agent sees none of this conversation unless `fork_turns` is set. Admitted with a repository-wide diagnostic claim that records coordination risk without blocking overlapping work."
                     .to_string(),
-            ))
-            .with_encrypted(),
-        ),
-        (
-            "agent_type".to_string(),
-            JsonSchema::string(Some(agent_type_description.to_string())),
+            )),
         ),
         (
             "fork_turns".to_string(),
             JsonSchema::string(Some(format!(
-                "Optional fork mode. Omitted or `none` creates a lineage-preserving TaskCapsule fork with no parent conversation. Use an integer string from 1 through 5 for a history-bearing fork. Full history (`all`) is disabled by default.{full_history_override_guidance}"
+                "Optional fork mode. Omitted or `none` creates a lineage-preserving TaskCapsule fork with no parent conversation; prefer this for self-contained tasks. Use the smallest sufficient integer string from 1 through 5 only when prior conversation is needed. Full history (`all`) is disabled by default.{full_history_override_guidance}"
             ))),
-        ),
-        (
-            "model".to_string(),
-            JsonSchema::string(Some(spawn_agent_model_override_description())),
-        ),
-        (
-            "reasoning_effort".to_string(),
-            JsonSchema::string(Some(spawn_agent_reasoning_override_description())),
         ),
         (
             "service_tier".to_string(),
@@ -587,255 +575,9 @@ pub(crate) fn criterion_evidence_policy_schema() -> JsonSchema {
     ]), Some(vec!["kind".into()]), Some(false.into()))
 }
 
-fn typed_assignment_schema() -> JsonSchema {
-    let criterion = JsonSchema::object(
-        BTreeMap::from([
-            (
-                "evidence_policy".to_string(),
-                criterion_evidence_policy_schema(),
-            ),
-            (
-                "id".to_string(),
-                JsonSchema::string(Some("Stable acceptance-criterion id.".to_string())),
-            ),
-            (
-                "text".to_string(),
-                JsonSchema::string(Some("Required observable outcome.".to_string())),
-            ),
-        ]),
-        Some(vec!["id".to_string(), "text".to_string()]),
-        Some(false.into()),
-    );
-    let repo_scope = JsonSchema::object(
-        BTreeMap::from([
-            (
-                "path".to_string(),
-                JsonSchema::string(Some("Repository-relative path.".to_string())),
-            ),
-            (
-                "recursive".to_string(),
-                JsonSchema::boolean(Some(
-                    "Whether this scope includes descendants of path.".to_string(),
-                )),
-            ),
-        ]),
-        Some(vec!["path".to_string(), "recursive".to_string()]),
-        Some(false.into()),
-    );
-    let string_array = |description: &str| {
-        JsonSchema::array(JsonSchema::string(None), Some(description.to_string()))
-    };
-    let relation = JsonSchema::object(
-        BTreeMap::from([
-            (
-                "kind".to_string(),
-                JsonSchema::string_enum(
-                    vec![json!("review"), json!("verification"), json!("integration")],
-                    Some("How this assignment relates to its targets.".to_string()),
-                ),
-            ),
-            (
-                "target_assignment_ids".to_string(),
-                string_array("UUIDv7 assignments reviewed, verified, or integrated."),
-            ),
-        ]),
-        Some(vec![
-            "kind".to_string(),
-            "target_assignment_ids".to_string(),
-        ]),
-        Some(false.into()),
-    );
-    let architecture_contract_ref = JsonSchema::object(
-        BTreeMap::from([
-            (
-                "architect_assignment_id".to_string(),
-                JsonSchema::string(Some(
-                    "Architect assignment owning the sealed receipt.".to_string(),
-                )),
-            ),
-            (
-                "architect_attempt_id".to_string(),
-                JsonSchema::string(Some(
-                    "Exact successful Architect attempt owning the receipt.".to_string(),
-                )),
-            ),
-            (
-                "contract_version".to_string(),
-                JsonSchema::integer(Some("ArchitectureContractV1 version.".to_string())),
-            ),
-            (
-                "contract_sha256".to_string(),
-                JsonSchema::string(Some(
-                    "Canonical SHA-256 from the immutable Architect receipt.".to_string(),
-                )),
-            ),
-        ]),
-        Some(vec![
-            "architect_assignment_id".to_string(),
-            "architect_attempt_id".to_string(),
-            "contract_version".to_string(),
-            "contract_sha256".to_string(),
-        ]),
-        Some(false.into()),
-    );
-    let file_handle = JsonSchema::object(
-        BTreeMap::from([
-            (
-                "kind".to_string(),
-                JsonSchema::string_enum(
-                    vec![json!("file")],
-                    Some("File handle variant.".to_string()),
-                ),
-            ),
-            (
-                "path".to_string(),
-                JsonSchema::string(Some(
-                    "Repository-relative existing file or missing intended file; directories are rejected."
-                        .to_string(),
-                )),
-            ),
-        ]),
-        Some(vec!["kind".to_string(), "path".to_string()]),
-        Some(false.into()),
-    );
-    let symbol_handle = JsonSchema::object(
-        BTreeMap::from([
-            (
-                "kind".to_string(),
-                JsonSchema::string_enum(
-                    vec![json!("symbol")],
-                    Some("Symbol handle variant.".to_string()),
-                ),
-            ),
-            (
-                "path".to_string(),
-                JsonSchema::string(Some(
-                    "Repository-relative existing file or missing intended file; directories are rejected."
-                        .to_string(),
-                )),
-            ),
-            (
-                "symbol".to_string(),
-                JsonSchema::string(Some(
-                    "Stable compiler-neutral symbol locator; line spans are not accepted."
-                        .to_string(),
-                )),
-            ),
-        ]),
-        Some(vec![
-            "kind".to_string(),
-            "path".to_string(),
-            "symbol".to_string(),
-        ]),
-        Some(false.into()),
-    );
-    let mut schema = JsonSchema::object(
-        BTreeMap::from([
-            (
-                "objective".to_string(),
-                JsonSchema::string(Some("Concrete objective; for audits/reviews, include the task type and category inclusions/exclusions.".to_string())),
-            ),
-            (
-                "acceptance_criteria".to_string(),
-                JsonSchema::array(
-                    criterion,
-                    Some("Observable outcomes required for completion; for audits/reviews, include the assigned detection criteria.".to_string()),
-                ),
-            ),
-            (
-                "read_scope".to_string(),
-                JsonSchema::array(
-                    repo_scope.clone(),
-                    Some("Repository paths the agent is expected to inspect.".to_string()),
-                ),
-            ),
-            (
-                "write_scope".to_string(),
-                JsonSchema::array(
-                    repo_scope,
-                    Some(
-                        "Intended repository write scopes; overlaps are advisory and require coordination. Use an empty array for read-only roles."
-                            .to_string(),
-                    ),
-                ),
-            ),
-            (
-                "stop_condition".to_string(),
-                JsonSchema::string(Some(
-                    "Condition that ends the assignment without further work.".to_string(),
-                )),
-            ),
-            (
-                "dependencies".to_string(),
-                string_array("Successful sealed assignment ids required before this task."),
-            ),
-            (
-                "risk_hints".to_string(),
-                string_array(
-                    "Known risks the agent must account for. Use a recognized risk domain \
-                     (concurrency, unsafe, lifecycle, persistence, schema, protocol, security, or \
-                     installation), or prefix a configured risk with path: or contract:.",
-                ),
-            ),
-            (
-                "required_evidence".to_string(),
-                string_array("Completion evidence: inspect:<normalized repository-relative file> for a complete native source read, or exact resolved command argv (JSON array or shell-quoted) for native validation. Listing, busy, zero-test, failed and cancelled runs do not count. See criterion evidence_policy for applicability and freshness."),
-            ),
-            (
-                "prohibited_changes".to_string(),
-                string_array("User and assignment restrictions on edits and execution."),
-            ),
-            (
-                "contract_claims".to_string(),
-                string_array(
-                    "Named behavioral contracts touched by this assignment; overlaps are advisory metadata.",
-                ),
-            ),
-            (
-                "relevant_handles".to_string(),
-                JsonSchema::array(
-                    JsonSchema::any_of(vec![file_handle, symbol_handle], None),
-                    Some(
-                        "Explicit non-recursive file or symbol handles included in a typed TaskCapsule. Paths must be covered by read_scope or write_scope; duplicate handles are rejected."
-                            .to_string(),
-                    ),
-                ),
-            ),
-            (
-                "workspace_strategy".to_string(),
-                JsonSchema::string_enum(
-                    vec![json!("auto"), json!("shared"), json!("isolated")],
-                    Some(
-                        "Use shared (what auto selects) for the common workspace, including coordinated overlap, and isolated for deliberate competing implementations."
-                            .to_string(),
-                    ),
-                ),
-            ),
-            ("relation".to_string(), relation),
-            (
-                "architecture_contract_ref".to_string(),
-                architecture_contract_ref,
-            ),
-        ]),
-        Some(vec![
-            "objective".to_string(),
-            "acceptance_criteria".to_string(),
-            "write_scope".to_string(),
-            "stop_condition".to_string(),
-        ]),
-        Some(false.into()),
-    );
-    schema.description = Some(
-        "Durable typed assignment. Use either assignment or legacy message, never both. Typed assignments require an explicit built-in agent_type: architect, explorer, worker, reviewer, verifier, or integrator. Role requirements: architect/explorer need non-empty read_scope and empty required_evidence; worker needs non-empty write_scope and required_evidence; reviewer needs empty required_evidence; verifier/integrator need non-empty required_evidence. Architect, explorer, reviewer and verifier need an empty write_scope; integrator needs a non-empty one. Architect, explorer and worker declare no relation; reviewer needs a review relation and verifier a verification relation with exactly one target that is also in dependencies; integrator needs an integration relation whose distinct targets are all in dependencies. With omitted or `none` fork_turns, one structured TaskCapsule replaces the plaintext typed bootstrap message and is the sole initial task input."
-            .to_string(),
-    );
-    schema
-}
+
 
 fn hide_spawn_agent_metadata_options(properties: &mut BTreeMap<String, JsonSchema>) {
-    properties.remove("agent_type");
-    properties.remove("model");
-    properties.remove("reasoning_effort");
     properties.remove("service_tier");
 }
 
@@ -843,32 +585,25 @@ fn hide_spawn_agent_metadata_options(properties: &mut BTreeMap<String, JsonSchem
 // Keep tool/assignment mechanics here; audit policy belongs to the base instructions,
 // and role/coordination guidance belongs to config/mod.rs. See AGENTS.md for ownership.
 fn spawn_agent_tool_description_v2(
-    available_models_description: Option<&str>,
-    default_model_guidance: Option<&str>,
-    full_history_override_guidance: Option<&str>,
     usage_hint_text: Option<String>,
 ) -> String {
-    let agent_role_guidance = available_models_description.unwrap_or_default();
-    let default_model_guidance = default_model_guidance.unwrap_or_default();
-    let full_history_override_guidance = full_history_override_guidance.unwrap_or_default();
+    let default_model_guidance = spawn_agent_default_guidance();
+    let full_history_override_guidance = SPAWN_AGENT_V2_FULL_HISTORY_OVERRIDE_GUIDANCE;
 
     let tool_description = format!(
         r#"
-        {agent_role_guidance}
-        Spawns an agent to work on the specified task. If your current task is `/root/task1` and you spawn_agent with task_name "task_3" the agent will have canonical task name `/root/task1/task_3`.
-You are then able to refer to this agent as `task_3` or `/root/task1/task_3` interchangeably. However an agent `/root/task2/task_3` would only be able to communicate with this agent via its canonical name `/root/task1/task_3`.
+        Spawns an agent to work on the specified task. Under `/root/task1`, task_name "task_3" creates `/root/task1/task_3`; its parent can use either name, other branches must use the full path.
 Registered leaf names take precedence over compact UUIDs; use a hyphenated UUID to select a concrete thread unambiguously.
 The spawned agent receives a durable task binding.
 {default_model_guidance}
 Only call this tool for a concrete, bounded subtask that can run independently alongside useful local work; otherwise continue locally.
 Apply the base instructions for audit/review scope, verification, validation, and completion, and the team guidance for ownership and coordination.
-Size assignments to fit the worker's actual context capacity, reserving room for reasoning, evidence, and reporting. Partition by cohesive subsystems and execution paths rather than raw file size alone.
-Legacy `message` assignments must include the task type, category inclusions/exclusions, detection criteria, and user restrictions; typed assignments use the fields below.
-Launch authorized independent assignments in the same batch rather than awaiting each spawn in a loop. In exec, use Promise.allSettled for a bounded batch and retain every success and failure before proceeding; a failed sibling does not authorize respawning successful agents.
-Sequence only real dependencies or shared-resource conflicts. Do not add a model round merely to acknowledge a completed agent; integrate its result with the next substantive step or final response.
-It will be able to send you and other running agents messages, and its final answer will be provided to you when it finishes.
-Use `assignment` for explicitly scoped typed coordination or `message` for a compatibility task admitted with a repository-wide diagnostic claim; exactly one is required. Both forms are durably admitted, record overlap without rejecting it, and return an `assignment_id`. Typed assignments require an explicit built-in `agent_type`: `architect`, `explorer`, `worker`, `reviewer`, `verifier`, or `integrator`.
-The `reviewer` profile requires a typed assignment with a review relation; it cannot be used with the compatibility `message` form.
+Fit assignments to actual worker context, reserving reasoning/evidence/reporting space; partition by cohesive subsystems and execution paths, not just file size.
+The `message` must include the task type, intended read/write scope, category inclusions/exclusions, detection criteria, user restrictions, required evidence, and stop condition. Read-only tasks remain read-only by instruction; no specialized profile is selected.
+Launch authorized independent assignments in the same batch, not a serial spawn loop. In exec, use bounded Promise.allSettled and retain every success and failure; failed siblings do not justify respawning successes.
+Sequence only real dependencies or shared-resource conflicts. Integrate completions with the next substantive step/final, not an acknowledgment-only model round.
+It can message its children and peers, but cannot message ancestors. Its final answer and terminal outcome are delivered to its parent automatically when it finishes.
+Supply `message` (or its `prompt`/`instructions` alias). Each task is durably tracked with a repository-wide diagnostic claim and returns an `assignment_id`; overlap is recorded without rejecting it. The host records the final outcome automatically, without a role-specific receipt workflow.
 
     {full_history_override_guidance}
 Omitted `fork_turns` and `fork_turns="none"` create a lineage-preserving TaskCapsule fork: the capsule is the sole structured bootstrap and no parent conversation or conversation-derived capability selection is inherited. Integers from 1 through 5 retain bounded history. `fork_turns="all"` is disabled by default and is only available with the configuration escape hatch."#
@@ -884,68 +619,7 @@ Omitted `fork_turns` and `fork_turns="none"` create a lineage-preserving TaskCap
     tool_description
 }
 
-fn spawn_agent_models_description(models: &[ModelPreset]) -> String {
-    let visible_models: Vec<&ModelPreset> = models
-        .iter()
-        .filter(|model| model.show_in_picker)
-        .take(MAX_MODEL_OVERRIDES_IN_SPAWN_AGENT_DESCRIPTION)
-        .collect();
-    if visible_models.is_empty() {
-        return "No picker-visible model overrides are currently loaded.".to_string();
-    }
 
-    let model_descriptions = visible_models
-        .into_iter()
-        .map(|model| {
-            let default_reasoning_effort = &model.default_reasoning_effort;
-            let efforts = model
-                .supported_reasoning_efforts
-                .iter()
-                .map(|preset| {
-                    let effort = preset.effort.as_str();
-                    let effort = match effort
-                        .char_indices()
-                        .nth(MAX_REASONING_EFFORT_CHARS_IN_SPAWN_AGENT_DESCRIPTION)
-                    {
-                        Some((index, _)) => &effort[..index],
-                        None => effort,
-                    };
-                    if &preset.effort == default_reasoning_effort {
-                        format!("{effort} (catalog default)")
-                    } else {
-                        effort.to_string()
-                    }
-                })
-                .collect::<Vec<_>>()
-                .join(", ");
-            let reasoning_efforts_suffix = if efforts.is_empty() {
-                String::new()
-            } else {
-                format!(" Reasoning efforts: {efforts}.")
-            };
-            let service_tiers = model
-                .service_tiers
-                .iter()
-                .map(|tier| tier.id.as_str())
-                .collect::<Vec<_>>()
-                .join(", ");
-            let service_tiers_suffix = if service_tiers.is_empty() {
-                String::new()
-            } else {
-                format!(" Service tiers: {service_tiers}.")
-            };
-            let model_slug = &model.model;
-            let description = &model.description;
-            format!(
-                "- `{model_slug}`: {description}{reasoning_efforts_suffix}{service_tiers_suffix}"
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
-    format!(
-        "Available model overrides (optional; `{DEFAULT_SPAWN_AGENT_MODEL}` is the spawn default):\n{model_descriptions}"
-    )
-}
 
 
 fn wait_agent_tool_parameters_v2(options: WaitAgentTimeoutOptions) -> JsonSchema {

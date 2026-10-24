@@ -11,6 +11,7 @@ const LOGIN_CHATGPT_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 // socket; ordinary launches retain the registered OAuth port.
 const LOGIN_TEST_PORT_ENV_VAR: &str = "CODEX_APP_SERVER_TEST_LOGIN_PORT";
 const ACCOUNT_TOKEN_USAGE_FETCH_TIMEOUT: Duration = Duration::from_secs(/*secs*/ 10);
+const ACCOUNT_BACKEND_REQUEST_TIMEOUT: Duration = Duration::from_secs(/*secs*/ 10);
 const ACCOUNT_WORKSPACE_MESSAGES_FETCH_TIMEOUT: Duration =
     Duration::from_millis(/*millis*/ 1000);
 // Login overrides are intentionally available only in debug builds.
@@ -1110,7 +1111,8 @@ impl AccountRequestProcessor {
             ));
         }
 
-        let client = self.backend_client_for_auth(&auth);
+        let client = self.backend_client_for_auth(&auth)
+            .with_request_timeout(ACCOUNT_BACKEND_REQUEST_TIMEOUT);
 
         let required = async {
             let response = client
@@ -1299,7 +1301,8 @@ impl AccountRequestProcessor {
             ));
         }
 
-        let client = self.backend_client_for_auth(&auth);
+        let client = self.backend_client_for_auth(&auth)
+            .with_request_timeout(ACCOUNT_BACKEND_REQUEST_TIMEOUT);
 
         match client
             .send_add_credits_nudge_email(Self::backend_credit_type(params.credit_type))
@@ -1589,6 +1592,7 @@ mod tests {
                 status,
                 content_type: "application/json".to_string(),
                 body: "{}".to_string(),
+                retry_after: None,
             };
             assert_eq!(workspace_messages_feature_disabled(&err), expected);
         }

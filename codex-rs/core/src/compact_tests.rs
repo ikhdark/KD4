@@ -585,7 +585,7 @@ async fn retained_active_plan_omits_retired_history_without_mutating_owner() {
     let item = retained_plan_context(&session).await.unwrap().unwrap();
     let text = serde_json::to_string(&item).unwrap();
     assert!(!text.contains("historical detail"));
-    assert!(!text.contains("unresolved recovery work"));
+    assert!(text.contains("unresolved recovery work"));
     assert!(text.contains("current_plan"));
     assert!(text.contains("current"));
     assert_eq!(

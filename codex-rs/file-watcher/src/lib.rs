@@ -1205,7 +1205,14 @@ impl FileWatcher {
             return Err(notify::Error::generic("injected unwatch failure"));
         }
         if guard.needs_rebuild || retires_coverage {
-            Self::rebuild_backend(guard, &effective)?;
+            #[cfg(windows)]
+            let retired_in_place = next_mode.is_none()
+                && Self::retire_disjoint_native_paths(guard, &effective)?;
+            #[cfg(not(windows))]
+            let retired_in_place = false;
+            if !retired_in_place {
+                Self::rebuild_backend(guard, &effective)?;
+            }
         } else {
             for (root, mode) in namespace_ordered_native_paths(&effective) {
                 if guard.native_paths.get(root) != Some(&mode) {
@@ -1226,6 +1233,48 @@ impl FileWatcher {
         guard.watched_paths = desired;
         guard.degraded_paths.remove(path);
         Ok(())
+    }
+
+    /// The vendored Windows backend removes one exact path and acknowledges only
+    /// after its callback owner stops. Pure disjoint retirement can therefore
+    /// leave unrelated native registrations untouched. Other backends retain
+    /// replacement semantics until their subtree-unwatch behavior is established.
+    #[cfg(windows)]
+    fn retire_disjoint_native_paths(
+        guard: &mut FileWatcherInner,
+        remaining: &HashMap<PathBuf, RecursiveMode>,
+    ) -> notify::Result<bool> {
+        if guard.needs_rebuild || !guard.degraded_paths.is_empty()
+            || remaining.iter().any(|(root, mode)| guard.native_paths.get(root) != Some(mode))
+        {
+            return Ok(false);
+        }
+        let retired = guard.native_paths.keys()
+            .filter(|root| !remaining.contains_key(*root))
+            .cloned().collect::<Vec<_>>();
+        if retired.is_empty() || retired.iter().any(|retired| {
+            remaining.iter().any(|(root, mode)| {
+                root.starts_with(retired)
+                    || (*mode == RecursiveMode::Recursive && retired.starts_with(root))
+            })
+        }) {
+            return Ok(false);
+        }
+        for root in retired {
+            if let Err(error) = guard.watcher.unwatch(&root) {
+                // Some exact removals may already have completed. Restore the
+                // previous committed coverage before reporting the failed retire;
+                // a failed restore keeps the existing degraded retry obligation.
+                guard.needs_rebuild = true;
+                let previous = effective_native_paths(&guard.watched_paths);
+                if let Err(cleanup) = Self::rebuild_backend(guard, &previous) {
+                    warn!("failed to restore partially retired native registration: {cleanup}");
+                }
+                return Err(error);
+            }
+        }
+        guard.native_paths = remaining.clone();
+        Ok(true)
     }
 
     /// Stage complete coverage on one replacement instance before retiring the old
@@ -2023,7 +2072,7 @@ fn effective_native_paths(
     let parents = paths
         .keys()
         .flat_map(|path| path.ancestors().skip(1).map(Path::to_path_buf))
-        .collect::<Vec<_>>();
+        .collect::<HashSet<_>>();
     for parent in parents {
         if parent.is_dir() {
             paths.entry(parent).or_insert(RecursiveMode::NonRecursive);

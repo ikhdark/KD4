@@ -21,7 +21,7 @@ impl OutputDeltaRecovery {
         }
     }
 
-    pub(super) fn publish(&self, stream: &StdoutStream, stderr: bool, chunk: Vec<u8>, admit: bool) {
+    pub(super) fn publish(&self, stream: &StdoutStream, stderr: bool, chunk: Vec<u8>, admit: bool) -> bool {
         let mut state = self
             .state
             .lock()
@@ -30,12 +30,12 @@ impl OutputDeltaRecovery {
         let retained = self.cap.saturating_sub(state.seen[index]).min(chunk.len());
         state.seen[index] = state.seen[index].saturating_add(chunk.len());
         if chunk.is_empty() {
-            return;
+            return !state.stopped || state.seen[index] < self.cap;
         }
         if state.stopped || !admit {
             state.stopped = true;
             state.suffix[index].extend_from_slice(&chunk[..retained]);
-            return;
+            return state.seen[index] < self.cap;
         }
         let event = output_delta_event(stream, stderr, chunk);
         // Unlike the best-effort event helper, retain the rejected raw delta.
@@ -45,6 +45,7 @@ impl OutputDeltaRecovery {
                 state.suffix[index].extend_from_slice(&delta.chunk[..retained]);
             }
         }
+        !state.stopped || state.seen[index] < self.cap
     }
 
     /// Called only after capture and the event sender have finished.

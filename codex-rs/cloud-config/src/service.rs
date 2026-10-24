@@ -337,7 +337,12 @@ where
                 max_attempts = CLOUD_CONFIG_BUNDLE_MAX_ATTEMPTS,
                 "Failed to fetch cloud config bundle; retrying"
             );
-            sleep(backoff(attempt as u64)).await;
+            let local_deadline = tokio::time::Instant::now() + backoff(attempt as u64);
+            let deadline = status.retry_after()
+                .map_or(local_deadline, |advice| local_deadline.max(advice.deadline()));
+            // The enclosing startup deadline remains authoritative. Advice
+            // beyond it exhausts that budget instead of causing an early retry.
+            tokio::time::sleep_until(deadline).await;
             true
         } else {
             false

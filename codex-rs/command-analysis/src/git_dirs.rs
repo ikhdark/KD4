@@ -7,6 +7,20 @@ use codex_utils_absolute_path::AbsolutePathBuf;
 pub fn resolve_git_dirs(
     repo_root: &AbsolutePathBuf,
 ) -> Option<(PathBuf, PathBuf, Option<PathBuf>)> {
+    let (git_dir, common_dir) = resolve_git_directories(repo_root)?;
+    let head_ref = std::fs::read_to_string(git_dir.join("HEAD"))
+        .ok()
+        .and_then(|head| {
+            head.trim()
+                .strip_prefix("ref:")
+                .map(str::trim)
+                .map(PathBuf::from)
+        });
+    Some((git_dir, common_dir, head_ref))
+}
+
+/// Resolve only directory identity when the caller reads HEAD itself.
+pub fn resolve_git_directories(repo_root: &AbsolutePathBuf) -> Option<(PathBuf, PathBuf)> {
     let marker = repo_root.join(".git");
     let git_dir = if marker.is_dir() {
         marker.into_path_buf()
@@ -31,13 +45,5 @@ pub fn resolve_git_dirs(
             }
         })
         .unwrap_or_else(|| git_dir.clone());
-    let head_ref = std::fs::read_to_string(git_dir.join("HEAD"))
-        .ok()
-        .and_then(|head| {
-            head.trim()
-                .strip_prefix("ref:")
-                .map(str::trim)
-                .map(PathBuf::from)
-        });
-    Some((git_dir, common_dir, head_ref))
+    Some((git_dir, common_dir))
 }

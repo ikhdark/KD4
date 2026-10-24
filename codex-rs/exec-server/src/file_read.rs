@@ -25,7 +25,7 @@ impl FileReadHandleManager {
         handle_id: String,
         file: tokio::fs::File,
     ) -> io::Result<String> {
-        let file = Arc::new(file.into_std().await);
+        let file = file.into_std().await;
         let mut handles = self.handles.lock().await;
         if handles.contains_key(&handle_id) {
             return Err(io::Error::new(
@@ -39,7 +39,7 @@ impl FileReadHandleManager {
                 format!("at most {MAX_OPEN_FILE_READS} file reads may be open per connection"),
             ));
         }
-        handles.insert(handle_id.clone(), file);
+        handles.insert(handle_id.clone(), Arc::new(file));
         Ok(handle_id)
     }
 

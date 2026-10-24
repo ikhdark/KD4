@@ -108,6 +108,26 @@ ORDER BY parent, child
         Self::get_thread_on_connection(&mut connection, id).await
     }
 
+    /// Best-effort metadata hydration for a scan listing. Missing or undecodable
+    /// rows are omitted independently, just as individual optional lookups are.
+    pub async fn get_threads_for_listing(
+        &self,
+        ids: &[ThreadId],
+    ) -> anyhow::Result<Vec<crate::ThreadMetadata>> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut query = QueryBuilder::<Sqlite>::new("");
+        push_thread_select_columns(&mut query);
+        query.push(" FROM threads WHERE threads.id IN (SELECT value FROM json_each(");
+        query.push_bind(serde_json::to_string(ids)?);
+        query.push("))");
+        let rows = query.build().fetch_all(self.pool.as_ref()).await?;
+        Ok(rows.iter().filter_map(|row| {
+            ThreadRow::try_from_row(row).and_then(ThreadMetadata::try_from).ok()
+        }).collect())
+    }
+
     async fn get_thread_on_connection(
         connection: &mut sqlx::SqliteConnection,
         id: ThreadId,
@@ -236,6 +256,24 @@ ON CONFLICT(child_thread_id) DO UPDATE SET
             .execute(self.pool.as_ref())
             .await?;
         Ok(())
+    }
+
+    /// Check the child's current parent and lifecycle status using its unique incoming edge.
+    pub async fn has_thread_spawn_child(
+        &self,
+        parent_thread_id: ThreadId,
+        child_thread_id: ThreadId,
+        status: crate::DirectionalThreadSpawnEdgeStatus,
+    ) -> anyhow::Result<bool> {
+        let exists: i64 = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM thread_spawn_edges WHERE child_thread_id = ? AND parent_thread_id = ? AND status = ?)",
+        )
+        .bind(child_thread_id.to_string())
+        .bind(parent_thread_id.to_string())
+        .bind(status.as_ref())
+        .fetch_one(self.pool.as_ref())
+        .await?;
+        Ok(exists != 0)
     }
 
     /// List direct spawned children of `parent_thread_id` whose edge matches `status`.
@@ -670,6 +708,17 @@ ON CONFLICT(child_thread_id) DO NOTHING
         fallback: &crate::ThreadMetadata,
         patch: impl FnOnce(&mut crate::ThreadMetadata) -> Result<(), String> + Send,
     ) -> anyhow::Result<crate::ThreadMetadata> {
+        self.patch_thread_metadata_with_recency(fallback, None, patch).await
+    }
+
+    /// Advance requested recency in the metadata writer's existing transaction,
+    /// returning the same authoritative projection instead of rereading later.
+    pub async fn patch_thread_metadata_with_recency(
+        &self,
+        fallback: &crate::ThreadMetadata,
+        advance_recency_at: Option<DateTime<Utc>>,
+        patch: impl FnOnce(&mut crate::ThreadMetadata) -> Result<(), String> + Send,
+    ) -> anyhow::Result<crate::ThreadMetadata> {
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let mut metadata = Self::get_thread_on_connection(&mut tx, fallback.id)
             .await?
@@ -693,6 +742,10 @@ ON CONFLICT(child_thread_id) DO NOTHING
             .bind(metadata.project_id.as_deref())
             .bind(metadata.id.to_string())
             .execute(&mut *tx).await?;
+        if let Some(recency_at) = advance_recency_at {
+            let recency_at = self.allocate_thread_recency_at(recency_at)?;
+            Self::touch_thread_recency_at_on_connection(&mut tx, metadata.id, recency_at).await?;
+        }
         let metadata = Self::get_thread_on_connection(&mut tx, metadata.id)
             .await?
             .ok_or_else(|| anyhow::anyhow!("thread metadata disappeared during patch"))?;
@@ -732,22 +785,29 @@ ON CONFLICT(child_thread_id) DO NOTHING
         Ok(true)
     }
 
-    /// Merge filesystem extraction against current authority under the write
-    /// reservation. An older snapshot cannot replace a newer explicit update.
+    /// A request-local no-op observation; callers still use writer-fenced repair
+    /// if the path differs. Missing rows are not recreated by this lookup.
+    pub async fn thread_rollout_path_matches(&self, id: ThreadId, path: &Path) -> anyhow::Result<bool> {
+        Ok(sqlx::query_scalar::<_, bool>("SELECT rollout_path = ? FROM threads WHERE id = ?")
+            .bind(path.display().to_string()).bind(id.to_string())
+            .fetch_optional(self.pool.as_ref()).await?.unwrap_or(false))
+    }
+
+    /// Resolve either physical spelling using one full metadata observation.
     pub async fn thread_metadata_for_rollout_path(
         &self,
         path: &Path,
     ) -> anyhow::Result<Option<crate::ThreadMetadata>> {
-        let id: Option<String> =
-            sqlx::query_scalar("SELECT id FROM threads WHERE rollout_path IN (?, ?) LIMIT 1")
-                .bind(path.display().to_string())
-                .bind(path.with_extension("jsonl.zst").display().to_string())
-                .fetch_optional(self.pool.as_ref())
-                .await?;
-        match id {
-            Some(id) => self.get_thread(ThreadId::from_string(&id)?).await,
-            None => Ok(None),
-        }
+        let mut query = QueryBuilder::<Sqlite>::new("");
+        push_thread_select_columns(&mut query);
+        query.push(" FROM threads WHERE rollout_path IN (");
+        query.push_bind(path.display().to_string());
+        query.push(", ");
+        query.push_bind(path.with_extension("jsonl.zst").display().to_string());
+        query.push(") LIMIT 1");
+        let row = query.build().fetch_optional(self.pool.as_ref()).await?;
+        row.map(|row| ThreadRow::try_from_row(&row).and_then(ThreadMetadata::try_from))
+            .transpose()
     }
 
     pub async fn reconcile_thread_metadata(
@@ -848,6 +908,15 @@ ON CONFLICT(child_thread_id) DO NOTHING
         recency_at: DateTime<Utc>,
     ) -> anyhow::Result<bool> {
         let recency_at = self.allocate_thread_recency_at(recency_at)?;
+        let mut connection = self.pool.acquire().await?;
+        Self::touch_thread_recency_at_on_connection(&mut connection, thread_id, recency_at).await
+    }
+
+    async fn touch_thread_recency_at_on_connection(
+        connection: &mut sqlx::SqliteConnection,
+        thread_id: ThreadId,
+        recency_at: DateTime<Utc>,
+    ) -> anyhow::Result<bool> {
         let recency_at_seconds = datetime_to_epoch_seconds(recency_at);
         let recency_at_millis = datetime_to_epoch_millis(recency_at);
         let result = sqlx::query(
@@ -863,7 +932,7 @@ WHERE id = ?
         .bind(recency_at_millis)
         .bind(recency_at_millis)
         .bind(thread_id.to_string())
-        .execute(self.pool.as_ref())
+        .execute(connection)
         .await?;
         Ok(result.rows_affected() > 0)
     }

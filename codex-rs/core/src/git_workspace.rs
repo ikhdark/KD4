@@ -699,12 +699,26 @@ fn record_project_discovery_reuse(
 fn root_dependencies(
     environments: &[EnvironmentWorkspaceKey],
 ) -> Option<Vec<DependencyFingerprint>> {
-    environments
-        .iter()
-        .flat_map(|environment| environment.cwd.ancestors())
-        .map(|ancestor| ancestor.join(".git"))
-        .map(|path| dependency_fingerprint(path.into_path_buf(), true))
-        .collect()
+    let mut dependencies = Vec::new();
+    let mut observed = HashMap::new();
+    for environment in environments {
+        for ancestor in environment.cwd.ancestors() {
+            let path = ancestor.join(".git").into_path_buf();
+            let exists = if let Some(exists) = observed.get(&path) {
+                *exists
+            } else {
+                let dependency = dependency_fingerprint(path.clone(), true)?;
+                let exists = !matches!(dependency.state, DependencyState::Missing);
+                observed.insert(path, exists);
+                dependencies.push(dependency);
+                exists
+            };
+            if exists {
+                break;
+            }
+        }
+    }
+    Some(dependencies)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

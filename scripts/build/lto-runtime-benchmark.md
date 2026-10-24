@@ -33,9 +33,10 @@ are distinct, potentially overlapping diagnostics, **not CPU time** and not a
 complete isolation of harness overhead. Full process wall-clock remains the
 primary metric. Each metric has its own observed-sample count.
 
-PGO is intentionally deferred until representative training and separate
-held-out tasks exist. This fixture alone is not a responsible PGO training
-corpus. Allocator, panic/unwinding, toolchain, affinity and power settings are
+PGO publishing has a separate [staged workflow](../install/README.md#profile-guided-optimization-pgo)
+that requires a user-supplied training script. This fixture alone is not a
+responsible PGO training corpus; use representative training and separate held-out
+tasks. Allocator, panic/unwinding, toolchain, affinity and power settings are
 not changed by this screening. No candidate is installed automatically.
 
 ## Current configuration versus LTO candidates

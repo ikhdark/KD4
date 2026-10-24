@@ -42,10 +42,10 @@ pub(crate) fn create_tool_search_tool(default_limit: usize) -> ToolSpec {
     }
 }
 
-pub(crate) fn render_tool_search_sources(
-    searchable_sources: &[ToolSearchSourceInfo],
+pub(crate) fn render_tool_search_sources<'a>(
+    searchable_sources: impl IntoIterator<Item = &'a ToolSearchSourceInfo>,
     has_unnamed_tools: bool,
-    search_infos: &[ToolSearchInfo],
+    search_infos: impl IntoIterator<Item = &'a ToolSearchInfo>,
 ) -> String {
     let mut scopes = BTreeMap::<&str, BTreeSet<&str>>::new();
     let mut owners = BTreeMap::<&str, BTreeSet<Option<&str>>>::new();

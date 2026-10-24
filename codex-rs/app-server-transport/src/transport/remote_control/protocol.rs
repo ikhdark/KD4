@@ -7,6 +7,24 @@ use std::io::ErrorKind;
 use url::Host;
 use url::Url;
 
+// Desktop rejects the workspace's 0.0.0 development marker for remote control.
+// This transport implements the protocol-v3 contract from rust-v0.146.0-alpha.7.
+// Advertise that compatibility only here; do not relabel the binary or model traffic.
+const DEVELOPMENT_COMPATIBILITY_VERSION: &str = "0.146.0-alpha.7+kd4.remote-control-v3";
+
+pub(super) fn remote_control_app_server_version() -> &'static str {
+    match codex_utils_build_info::CODEX_VERSION {
+        "0.0.0" => DEVELOPMENT_COMPATIBILITY_VERSION,
+        version => version,
+    }
+}
+
+pub(super) fn remote_control_user_agent() -> String {
+    codex_login::default_client::get_codex_user_agent_with_version(
+        remote_control_app_server_version(),
+    )
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct RemoteControlTarget {
     pub(super) websocket_url: String,

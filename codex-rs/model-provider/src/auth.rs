@@ -284,6 +284,18 @@ struct AgentIdentityAuthProvider {
 }
 
 impl AuthProvider for AgentIdentityAuthProvider {
+    fn auth_header_telemetry(&self) -> codex_api::AuthHeaderTelemetry {
+        // AgentIdentityAuth validates its immutable private key in from_record.
+        // Assertions serialize to ASCII; the independently parsed account
+        // header is the remaining fallible header step. Dispatch still signs
+        // freshly through try_add_auth_headers, never through telemetry.
+        let attached = HeaderValue::from_str(self.auth.account_id()).is_ok();
+        codex_api::AuthHeaderTelemetry {
+            attached,
+            name: attached.then_some("authorization"),
+        }
+    }
+
     fn connection_identity(&self) -> Option<Vec<u8>> {
         let record = serde_json::to_vec(self.auth.record()).ok()?;
         let mut digest = Sha256::new();
@@ -357,6 +369,36 @@ impl codex_http_client::RequestDispatchGuard for ManagedDispatchGuard {
     }
 }
 
+impl AuthManagerAuthProvider {
+    fn with_projection<T>(
+        &self,
+        apply: impl FnOnce(&dyn AuthProvider) -> Result<T, AuthError>,
+    ) -> Result<T, AuthError> {
+        self.auth_manager
+            .check_auth_load()
+            .map_err(|err| AuthError::Build(err.to_string()))?;
+        let (epoch, auth) = self
+            .auth_manager
+            .policy_auth_snapshot()
+            .map_err(|err| AuthError::Build(err.to_string()))?;
+        let auth = auth.ok_or_else(|| {
+            AuthError::Build("managed authentication is no longer available".into())
+        })?;
+        if epoch != self.expected_epoch
+            || ProviderAccountScope::from_auth(Some(&auth)) != self.expected_scope
+        {
+            return Err(AuthError::Build("authentication account scope changed or lifecycle invalidated; rebuild request state".into()));
+        }
+        let projection = self
+            .projection
+            .clone()
+            .unwrap_or_else(|| auth_provider_from_auth(&auth));
+        self.auth_manager
+            .with_policy_auth_epoch(epoch, || apply(projection.as_ref()))
+            .map_err(|err| AuthError::Build(err.to_string()))?
+    }
+}
+
 impl AuthProvider for AuthManagerAuthProvider {
     fn dispatch_guard(&self) -> Option<Arc<dyn codex_http_client::RequestDispatchGuard>> {
         Some(Arc::new(ManagedDispatchGuard {
@@ -379,29 +421,13 @@ impl AuthProvider for AuthManagerAuthProvider {
         }
     }
 
+    fn auth_header_telemetry(&self) -> codex_api::AuthHeaderTelemetry {
+        self.with_projection(|projection| Ok(projection.auth_header_telemetry()))
+            .unwrap_or_default()
+    }
+
     fn try_add_auth_headers(&self, headers: &mut HeaderMap) -> Result<(), AuthError> {
-        self.auth_manager
-            .check_auth_load()
-            .map_err(|err| AuthError::Build(err.to_string()))?;
-        let (epoch, auth) = self
-            .auth_manager
-            .policy_auth_snapshot()
-            .map_err(|err| AuthError::Build(err.to_string()))?;
-        let auth = auth.ok_or_else(|| {
-            AuthError::Build("managed authentication is no longer available".into())
-        })?;
-        if epoch != self.expected_epoch
-            || ProviderAccountScope::from_auth(Some(&auth)) != self.expected_scope
-        {
-            return Err(AuthError::Build("authentication account scope changed or lifecycle invalidated; rebuild request state".into()));
-        }
-        let projection = self
-            .projection
-            .clone()
-            .unwrap_or_else(|| auth_provider_from_auth(&auth));
-        self.auth_manager
-            .with_policy_auth_epoch(epoch, || projection.try_add_auth_headers(headers))
-            .map_err(|err| AuthError::Build(err.to_string()))?
+        self.with_projection(|projection| projection.try_add_auth_headers(headers))
     }
 }
 

@@ -227,14 +227,17 @@ impl Environment for ProcessEnvironment {
 
 /// Returns a sanitized terminal identifier for User-Agent strings.
 pub fn user_agent() -> String {
-    terminal_info().user_agent_token()
+    cached_terminal_info().user_agent_token()
 }
 
 /// Returns structured terminal metadata for the current process.
 pub fn terminal_info() -> TerminalInfo {
+    cached_terminal_info().clone()
+}
+
+fn cached_terminal_info() -> &'static TerminalInfo {
     TERMINAL_INFO
         .get_or_init(|| detect_terminal_info_from_env(&ProcessEnvironment))
-        .clone()
 }
 
 /// Detects structured terminal metadata from an injectable environment.

@@ -74,11 +74,14 @@ codex-tools = { workspace = true }
 codex-utils-absolute-path = { workspace = true }
 codex-utils-build-info = { workspace = true }
 codex-utils-path-uri = { workspace = true }
+codex-utils-output-truncation = { workspace = true }
 chrono = { workspace = true }
 clap = { workspace = true, features = ["derive"] }
 futures = { workspace = true }
+fs2 = { workspace = true }
 hex = { workspace = true }
 indexmap = { workspace = true }
+noyalib = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 sha2 = { workspace = true }

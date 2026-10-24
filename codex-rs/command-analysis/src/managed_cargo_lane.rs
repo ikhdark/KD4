@@ -109,7 +109,8 @@ fn check(
             decoded.extend(["-Command".into(), script]);
             return check(&decoded, cwd, env, depth + 1);
         }
-        let parsed = argv_commands(command, Some(shell));
+        let parsed = std::cell::OnceCell::new();
+        let parsed = || parsed.get_or_init(|| argv_commands(command, Some(shell)));
         // A flattened command list cannot model assignments, cd, functions or
         // expansion. Only a standalone literal command proves its environment.
         let standalone = match shell {
@@ -122,7 +123,7 @@ fn check(
             ShellType::Bash | ShellType::Sh | ShellType::Zsh => command
                 .last()
                 .and_then(|script| codex_shell_command::validation::standalone_argv(script)),
-            ShellType::Cmd => parsed
+            ShellType::Cmd => parsed()
                 .as_ref()
                 .filter(|stages| stages.len() == 1)
                 .and_then(|stages| stages.first().cloned())
@@ -132,9 +133,9 @@ fn check(
             return check(&argv, cwd, env, depth + 1);
         }
         // Inspect each recognizable command without rejecting compound scripts.
-        if let Some(stages) = parsed {
+        if let Some(stages) = parsed() {
             for stage in stages {
-                check(&stage, cwd, env, depth + 1)?;
+                check(stage, cwd, env, depth + 1)?;
             }
         }
         return Ok(());
@@ -391,8 +392,10 @@ fn check(
         Some(value) => value.build_path(&workspace, home.as_deref())?,
         None => target.clone(),
     };
-    for (kind, path) in [("target", target), ("build", build)] {
-        if let Some(managed) = managed_target(&path)? {
+    for (kind, path) in std::iter::once(("target", &target))
+        .chain((build != target).then_some(("build", &build)))
+    {
+        if let Some(managed) = managed_target(path)? {
             return Err(rejected(&format!(
                 "Effective {kind} directory: {}. It belongs to managed Cargo directory {}. Use that workspace's documented managed build/test entrypoint to reserve it before launching Cargo.",
                 path.display(),

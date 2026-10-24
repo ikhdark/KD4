@@ -2622,7 +2622,7 @@ async fn plugin_install_tools_are_searchable_but_not_eager_with_tool_search() {
 }
 
 #[tokio::test]
-async fn request_plugin_install_description_requires_exhausting_tool_search() {
+async fn request_plugin_install_description_allows_unavailable_tool_search() {
     let plan = probe_with(
         |turn| {
             set_features(
@@ -2649,7 +2649,7 @@ async fn request_plugin_install_description_requires_exhausting_tool_search() {
     };
     assert!(request_description.contains("listed in `<recommended_plugins>`"));
     assert!(request_description.contains("explicitly asks to use a specific plugin"));
-    assert!(request_description.contains("Tool search has already been exhausted"));
+    assert!(request_description.contains("Tool search is unavailable, or it has already been exhausted"));
     assert!(!request_description.contains("`tool_search`"));
     assert!(request_description.contains("DO NOT call this tool in parallel with other tools"));
     assert!(!request_description.contains("list_available_plugins_to_install"));
@@ -2659,8 +2659,8 @@ async fn request_plugin_install_description_requires_exhausting_tool_search() {
     assert!(!has_parameter(request_spec, "tool_id"));
     assert!(!has_parameter(request_spec, "tool_type"));
     assert!(!has_parameter(request_spec, "action_type"));
-    plan.assert_visible_lacks(&["list_available_plugins_to_install"]);
-    plan.assert_registered_lacks(&["list_available_plugins_to_install"]);
+    plan.assert_visible_lacks(&["list_available_plugins_to_install", "tool_search"]);
+    plan.assert_registered_lacks(&["list_available_plugins_to_install", "tool_search"]);
 }
 
 #[tokio::test]
@@ -3199,7 +3199,7 @@ async fn code_mode_initial_agent_catalog_retains_lifecycle_without_typed_adminis
 }
 
 #[tokio::test]
-async fn multi_agent_v2_message_schemas_are_encrypted() {
+async fn multi_agent_v2_task_and_message_schemas_match_their_delivery_encoding() {
     let plan = probe(|turn| {
         set_feature(turn, Feature::MultiAgentV2, /*enabled*/ true);
     })
@@ -3225,7 +3225,7 @@ async fn multi_agent_v2_message_schemas_are_encrypted() {
             properties
                 .get("message")
                 .and_then(|schema| schema.encrypted),
-            Some(true)
+            (tool_name != "spawn_agent").then_some(true)
         );
     }
 }

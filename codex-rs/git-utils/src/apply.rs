@@ -102,14 +102,8 @@ pub fn apply_git_patch(req: &ApplyGitRequest) -> io::Result<ApplyGitResult> {
         check_args.push(patch_path.to_string_lossy().to_string());
         let rendered = render_command_for_log(&git_root, &cfg_parts, &check_args);
         let (c_code, c_out, c_err) = run_git(&git_root, &cfg_parts, &check_args, Some(&git_env))?;
-        let (mut applied_paths, mut skipped_paths, mut conflicted_paths) =
+        let (applied_paths, skipped_paths, conflicted_paths) =
             parse_git_apply_output(&c_out, &c_err);
-        applied_paths.sort();
-        applied_paths.dedup();
-        skipped_paths.sort();
-        skipped_paths.dedup();
-        conflicted_paths.sort();
-        conflicted_paths.dedup();
         // Git's `--3way --check` performs the in-core merge but skips the
         // write-out phase that normally turns recorded conflicts into a
         // nonzero exit. Preserve the real apply result contract explicitly.
@@ -132,14 +126,8 @@ pub fn apply_git_patch(req: &ApplyGitRequest) -> io::Result<ApplyGitResult> {
     let cmd_for_log = render_command_for_log(&git_root, &cfg_parts, &args);
     let (code, stdout, stderr) = run_git(&git_root, &cfg_parts, &args, Some(&git_env))?;
 
-    let (mut applied_paths, mut skipped_paths, mut conflicted_paths) =
+    let (applied_paths, skipped_paths, conflicted_paths) =
         parse_git_apply_output(&stdout, &stderr);
-    applied_paths.sort();
-    applied_paths.dedup();
-    skipped_paths.sort();
-    skipped_paths.dedup();
-    conflicted_paths.sort();
-    conflicted_paths.dedup();
 
     Ok(ApplyGitResult {
         exit_code: code,
@@ -685,13 +673,6 @@ pub fn parse_git_apply_output(
     stdout: &str,
     stderr: &str,
 ) -> (Vec<String>, Vec<String>, Vec<String>) {
-    let combined = [stdout, stderr]
-        .iter()
-        .filter(|s| !s.is_empty())
-        .cloned()
-        .collect::<Vec<&str>>()
-        .join("\n");
-
     let mut applied = std::collections::BTreeSet::new();
     let mut skipped = std::collections::BTreeSet::new();
     let mut conflicted = std::collections::BTreeSet::new();
@@ -785,7 +766,7 @@ pub fn parse_git_apply_output(
         )
     });
 
-    for raw_line in combined.lines() {
+    for raw_line in stdout.lines().chain(stderr.lines()) {
         let line = raw_line.trim();
         if line.is_empty() {
             continue;

@@ -84,12 +84,20 @@ impl ToolExecutor<ToolInvocation> for SaveTurnDiffHandler {
             let name = validated_patch_name(&args.name)?;
             let (diff, unattributed, receipt, operations) = {
                 let tracker = invocation.tracker.lock().await;
+                let receipt = args.operation
+                    .and_then(|sequence| tracker.owned_operation_receipt(sequence));
+                let diff = args.operation.is_none()
+                    .then(|| tracker.exact_export_diff(args.environment_id.as_deref()));
+                let needs_operations = if args.operation.is_some() {
+                    receipt.is_none()
+                } else {
+                    matches!(&diff, Some(Err(_)))
+                };
                 (
-                    tracker.exact_export_diff(args.environment_id.as_deref()),
+                    diff,
                     tracker.unattributed_display_paths(),
-                    args.operation
-                        .and_then(|sequence| tracker.owned_operation_receipt(sequence)),
-                    tracker.owned_operation_summary(),
+                    receipt,
+                    needs_operations.then(|| tracker.owned_operation_summary()),
                 )
             };
             let receipt_files = receipt
@@ -99,6 +107,7 @@ impl ToolExecutor<ToolInvocation> for SaveTurnDiffHandler {
             let mut export_environment = args.environment_id.clone();
             let diff = if let Some(sequence) = args.operation {
                 let receipt = receipt.ok_or_else(|| {
+                    let operations = operations.as_ref().expect("missing operation prepares its summary");
                     FunctionCallError::RespondToModel(format!(
                         "operation {sequence} is not retained; {operations}"
                     ))
@@ -106,7 +115,7 @@ impl ToolExecutor<ToolInvocation> for SaveTurnDiffHandler {
                 serde_json::to_string_pretty(&receipt)
                     .map_err(|error| FunctionCallError::RespondToModel(error.to_string()))?
             } else {
-                match diff {
+                match diff.expect("net export is prepared only when no operation is selected") {
                     Ok(Some((environment, diff))) => { export_environment = Some(environment); diff },
                     Ok(None) => {
                         return Err(FunctionCallError::RespondToModel(
@@ -114,11 +123,13 @@ impl ToolExecutor<ToolInvocation> for SaveTurnDiffHandler {
                         ));
                     }
                     Err(paths) if paths.is_empty() => {
+                        let operations = operations.as_ref().expect("failed export prepares its summary");
                         return Err(FunctionCallError::RespondToModel(format!(
                             "The turn diff is unavailable because command effects could not be tracked. Historical operation receipts are not integrated patches: {operations}. Select operation explicitly to save a retained receipt; do not infer ownership from current reads."
                         )));
                     }
                     Err(paths) => {
+                        let operations = operations.as_ref().expect("failed export prepares its summary");
                         return Err(FunctionCallError::RespondToModel(format!(
                             "The turn diff is partial. These paths have no exact integrated diff: {}. Historical operation receipts are available separately: {operations}. Select operation explicitly; do not reconstruct ownership from current reads.",
                             paths.join(", "),

@@ -384,124 +384,25 @@ pub(crate) mod spawn_tool_spec {
 mod built_in {
     use super::*;
 
-    const READ_ONLY: &str = "sandbox_mode = \"read-only\"\n";
-    const READ_ONLY_WITH_ELEVATED_WINDOWS_SANDBOX: &str =
-        "sandbox_mode = \"read-only\"\n\n[windows]\nsandbox = \"elevated\"\n";
-
-    /// Keeps built-in read-only roles usable on Windows kernels where the legacy
-    /// restricted-token backend cannot safely enforce delete boundaries.
-    ///
-    /// The elevated backend still enforces the same read-only permission profile;
-    /// this only changes the Windows sandbox implementation selected for the child.
-    pub(super) fn read_only_config_file_contents_for_legacy_compatibility(
-        legacy_windows_sandbox_compatible: bool,
-    ) -> &'static str {
-        if legacy_windows_sandbox_compatible {
-            READ_ONLY
-        } else {
-            READ_ONLY_WITH_ELEVATED_WINDOWS_SANDBOX
-        }
-    }
-
-    fn read_only_config_file_contents() -> &'static str {
-        let legacy_windows_sandbox_compatible =
-            codex_windows_sandbox::legacy_restricted_token_enforces_delete_child();
-
-        read_only_config_file_contents_for_legacy_compatibility(legacy_windows_sandbox_compatible)
-    }
-
-    /// Returns the cached built-in role declarations defined in this module.
+    /// Only the generic profile is available for new subagents. Historical task
+    /// roles remain persisted task metadata, not selectable runtime profiles.
     pub(super) fn configs() -> &'static BTreeMap<String, AgentRoleConfig> {
         static CONFIG: LazyLock<BTreeMap<String, AgentRoleConfig>> = LazyLock::new(|| {
-            BTreeMap::from([
-                (
-                    DEFAULT_ROLE_NAME.to_string(),
-                    AgentRoleConfig {
-                        description: Some("Default agent.".to_string()),
-                        config_file: None,
-                        nickname_candidates: None,
-                        config_snapshot: Default::default(),
-                    }
-                ),
-                (
-                    "architect".to_string(),
-                    AgentRoleConfig {
-                        description: Some(
-                            "Define and seal one authoritative ArchitectureContractV1 for dependent workers. Tool authority follows the root turn; task lifecycle and root-only controls still apply."
-                                .to_string(),
-                        ),
-                        config_file: Some("architect.toml".to_string().parse().unwrap_or_default()),
-                        nickname_candidates: None,
-                        config_snapshot: Default::default(),
-                    },
-                ),
-                (
-                    "explorer".to_string(),
-                    AgentRoleConfig {
-                        description: Some("Use for a well-scoped codebase question when delegation saves work. Reuse an existing explorer for related questions. Run independent questions in parallel. Reuse returned paths and evidence; recheck only when a relevant change, contradiction, or missing detail requires it. Do not duplicate the investigation.".to_string()),
-                        config_file: Some("explorer.toml".to_string().parse().unwrap_or_default()),
-                        nickname_candidates: None,
-                        config_snapshot: Default::default(),
-                    }
-                ),
-                (
-                    "worker".to_string(),
-                    AgentRoleConfig {
-                        description: Some("Use for implementation, fixes, and other execution work. In the worker assignment, specify explicit file/module ownership and tell the worker to preserve others' edits and adapt to concurrent changes rather than reverting them.".to_string()),
-                        config_file: None,
-                        nickname_candidates: None,
-                        config_snapshot: Default::default(),
-                    }
-                ),
-                (
-                    "reviewer".to_string(),
-                    AgentRoleConfig {
-                        description: Some(
-                            "Review one completed assignment against its contract and evidence. Remain read-only and report findings without editing source."
-                                .to_string(),
-                        ),
-                        config_file: Some("reviewer.toml".to_string().parse().unwrap_or_default()),
-                        nickname_candidates: None,
-                        config_snapshot: Default::default(),
-                    },
-                ),
-                (
-                    "verifier".to_string(),
-                    AgentRoleConfig {
-                        description: Some(
-                            "Run focused validation for one completed assignment and report reproducible evidence. Tool authority follows the root turn; task lifecycle and root-only controls still apply."
-                                .to_string(),
-                        ),
-                        config_file: Some("verifier.toml".to_string().parse().unwrap_or_default()),
-                        nickname_candidates: None,
-                        config_snapshot: Default::default(),
-                    },
-                ),
-                (
-                    "integrator".to_string(),
-                    AgentRoleConfig {
-                        description: Some(
-                            "Integrate completed dependent assignments within the explicitly declared write scope. Preserve unrelated work and resolve only scoped conflicts."
-                                .to_string(),
-                        ),
-                        config_file: None,
-                        nickname_candidates: None,
-                        config_snapshot: Default::default(),
-                    },
-                ),
-            ])
+            BTreeMap::from([(
+                DEFAULT_ROLE_NAME.to_string(),
+                AgentRoleConfig {
+                    description: Some("Default agent.".to_string()),
+                    config_file: None,
+                    nickname_candidates: None,
+                    config_snapshot: Default::default(),
+                },
+            )])
         });
         &CONFIG
     }
 
-    /// Resolves a built-in role `config_file` path to embedded content.
-    pub(super) fn config_file_contents(path: &Path) -> Option<&'static str> {
-        match path.to_str()? {
-            "architect.toml" | "explorer.toml" | "reviewer.toml" | "verifier.toml" => {
-                Some(read_only_config_file_contents())
-            }
-            _ => None,
-        }
+    pub(super) fn config_file_contents(_path: &Path) -> Option<&'static str> {
+        None
     }
 }
 

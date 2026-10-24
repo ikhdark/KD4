@@ -171,7 +171,9 @@ impl StoredValue {
 
     pub(crate) fn with_presentation(mut self, presentation: Option<JsonValue>) -> Self {
         if let Some(presentation) = presentation {
-            let bytes = serde_json::to_vec(&presentation).map_or(usize::MAX, |bytes| bytes.len());
+            let mut counter = JsonByteCounter::default();
+            let bytes = serde_json::to_writer(&mut counter, &presentation)
+                .map_or(usize::MAX, |()| counter.bytes);
             self.bytes = self.bytes.saturating_add(bytes);
             self.presentation = Some(Arc::new(presentation));
         }
@@ -1232,12 +1234,14 @@ fn send_result(
     {
         stored_value_writes.clear();
     }
-    let reads = scope
-        .get_slot::<RuntimeState>()
-        .and_then(|state| state.stored_value_reads.clone())
-        .map(Arc::new);
-    for stored in stored_value_writes.values_mut() {
-        stored.read_dependencies = reads.clone();
+    if !stored_value_writes.is_empty() {
+        let reads = scope
+            .get_slot::<RuntimeState>()
+            .and_then(|state| state.stored_value_reads.clone())
+            .map(Arc::new);
+        for stored in stored_value_writes.values_mut() {
+            stored.read_dependencies = reads.clone();
+        }
     }
     let error_text = error_text.map(|text| {
         if text.len() > MAX_ERROR_TEXT_BYTES {

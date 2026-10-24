@@ -45,7 +45,7 @@ async fn concrete_endpoint_client_rejects_userinfo_before_route_selection() {
         "https://user@example.com/",
         "https://:secret@example.com/",
     ] {
-        let error = pool.client_for_url(url).await.err().expect("userinfo must be rejected before route selection");
+        let error = pool.client_for_url(url).await.expect_err("userinfo must be rejected before route selection");
         assert!(matches!(&error, RouteAwareRequestError::Build(_)));
         assert!(!error.to_string().contains("secret"));
         assert_eq!(pool.cached_route_count(), 0);

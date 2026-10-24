@@ -892,6 +892,37 @@ async fn termination_rejects_a_waiting_store_commit_before_the_next_cell_can_loa
     runtime.shutdown().await.unwrap();
 }
 
+#[test]
+fn storage_recovery_distinguishes_rejected_writes_from_uncertain_publication() {
+    for status in ["rejected", "unknown"] {
+        let event = storage_failure_event_with_status(
+            CellEvent::Completed {
+                content_items: vec![OutputItem::Text { text: "retained evidence".into() }],
+                error_text: None,
+                output_loss: None,
+            },
+            "storage diagnostic".into(),
+            status,
+        );
+        let CellEvent::Completed { content_items, error_text: Some(error), .. } = event else {
+            panic!("storage failure must preserve the completion receipt");
+        };
+        assert_eq!(content_items, vec![OutputItem::Text { text: "retained evidence".into() }]);
+        let receipt: JsonValue = serde_json::from_str(&error).unwrap();
+        assert_eq!(receipt["store_commit"], status);
+        assert_eq!(receipt["external_effects_rolled_back"], false);
+        assert_eq!(receipt["automatic_replay_allowed"], false);
+        let recovery = receipt["recovery"].as_str().unwrap();
+        if status == "rejected" {
+            assert_eq!(recovery, "inspect retained nested call receipts; recompute only the rejected named-state transaction");
+        } else {
+            assert!(recovery.contains("inspect current named state"));
+            assert!(recovery.contains("do not assume a rejected transaction or replay the cell"));
+            assert!(!recovery.contains("recompute"));
+        }
+    }
+}
+
 #[tokio::test]
 async fn storage_limit_rejects_the_complete_cell_write_set() {
     let runtime = SessionRuntime::new(Arc::new(RecordingDelegate));

@@ -1713,6 +1713,82 @@ async fn static_manager_fills_a_prompt_the_catalog_leaves_empty() {
 }
 
 #[tokio::test]
+async fn static_manager_preserves_template_authored_policy_for_local_slugs() {
+    use codex_protocol::config_types::Personality;
+    use codex_protocol::openai_models::ApprovalMessages;
+    use codex_protocol::openai_models::ModelInstructionsVariables;
+    use codex_protocol::openai_models::ModelMessages;
+
+    for slug in [
+        "gpt-6-astra",
+        "gpt-daybreak-blue-latest",
+        "gpt-daybreak-red-latest",
+        "codex-auto-review",
+        "gpt-5.2-codex",
+        "exp-codex-personality",
+    ] {
+        let mut authored = remote_model(slug, "Authoritative template", 0);
+        authored.base_instructions.clear();
+        authored.model_messages = Some(ModelMessages {
+            instructions_template: Some("CATALOG_POLICY {{ personality }}".to_string()),
+            instructions_variables: Some(ModelInstructionsVariables {
+                personality_default: Some("DEFAULT_STYLE".to_string()),
+                personality_friendly: Some("FRIENDLY_STYLE".to_string()),
+                personality_pragmatic: Some("PRAGMATIC_STYLE".to_string()),
+            }),
+            approvals: Some(ApprovalMessages {
+                on_request: Some("CATALOG_APPROVAL".to_string()),
+            }),
+        });
+        let manager = static_manager_for_tests(ModelsResponse {
+            models: vec![authored],
+        });
+        for requested in [
+            slug.to_string(),
+            format!("{slug}-preview"),
+            format!("openai/{slug}"),
+            format!("openai-codex/{slug}-preview"),
+        ] {
+            for personality_enabled in [true, false] {
+                let config = ModelsManagerConfig {
+                    personality_enabled,
+                    ..Default::default()
+                };
+                let model = manager.get_model_info(&requested, &config).await;
+                assert_eq!(model.base_instructions, "CATALOG_POLICY ", "{requested}");
+                for (personality, style) in [
+                    (None, "DEFAULT_STYLE"),
+                    (Some(Personality::None), ""),
+                    (Some(Personality::Friendly), "FRIENDLY_STYLE"),
+                    (Some(Personality::Pragmatic), "PRAGMATIC_STYLE"),
+                ] {
+                    let expected_style = if personality_enabled { style } else { "" };
+                    assert_eq!(
+                        model.get_model_instructions(personality),
+                        format!("CATALOG_POLICY {expected_style}"),
+                        "{requested}: enabled={personality_enabled}"
+                    );
+                }
+                assert_eq!(
+                    model.model_messages.unwrap().approvals.unwrap().on_request.as_deref(),
+                    Some("CATALOG_APPROVAL")
+                );
+                let overridden = manager
+                    .get_model_info(
+                        &requested,
+                        &ModelsManagerConfig {
+                            base_instructions: Some("USER_POLICY".to_string()),
+                            ..config
+                        },
+                    )
+                    .await;
+                assert_eq!(overridden.get_model_instructions(None), "USER_POLICY");
+            }
+        }
+    }
+}
+
+#[tokio::test]
 async fn static_manager_fallback_requires_exact_catalog_membership() {
     let manager = static_manager_for_tests(ModelsResponse {
         models: vec![

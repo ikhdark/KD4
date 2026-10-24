@@ -2329,6 +2329,22 @@ async fn uncaught_missing_tool_call_names_resolution_candidates() {
 }
 
 #[tokio::test]
+async fn overwritten_registered_tool_is_not_reported_as_an_unavailable_capability() {
+    let (_tx, _termination, mut rx) =
+        start("tools.sample_tool = null; await tools.sample_tool({});").await;
+    let RuntimeEvent::Result {
+        error_text: Some(error),
+        ..
+    } = next(&mut rx).await
+    else {
+        panic!("overwritten tool must fail before dispatch");
+    };
+    assert!(error.starts_with("TypeError: tools.sample_tool is not a function"), "{error}");
+    assert!(!error.contains("Hint: no nested tool"), "{error}");
+    closed(&mut rx).await;
+}
+
+#[tokio::test]
 async fn generated_declarations_never_advertise_ambiguous_legacy_aliases() {
     for generated in [false, true] {
         let description = if generated {

@@ -217,9 +217,22 @@ pub(crate) fn value_fingerprint(value: &(impl Hash + ?Sized)) -> u64 {
 }
 
 pub(super) fn serialized_len(value: &impl Serialize) -> Result<usize, FunctionCallError> {
-    serde_json::to_vec(value)
-        .map(|value| value.len())
-        .map_err(|err| FunctionCallError::Fatal(err.to_string()))
+    struct Counter(usize);
+    impl std::io::Write for Counter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0 = self.0.checked_add(bytes.len()).ok_or_else(|| {
+                std::io::Error::other("serialized skill response size overflow")
+            })?;
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut counter = Counter(0);
+    serde_json::to_writer(&mut counter, value)
+        .map_err(|err| FunctionCallError::Fatal(err.to_string()))?;
+    Ok(counter.0)
 }
 
 #[cfg(test)]

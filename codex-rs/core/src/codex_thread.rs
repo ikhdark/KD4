@@ -837,12 +837,10 @@ impl CodexThread {
 
     /// Returns the exact MCP config, environment bindings, and manager most recently published.
     pub async fn current_mcp_runtime(&self) -> Arc<crate::session::McpRuntimeSnapshot> {
-        let turn_context = self.codex.session.new_default_turn().await;
         self.codex
             .session
-            .capture_step_context(turn_context)
+            .capture_current_mcp_runtime()
             .await
-            .map(|step| Arc::clone(&step.mcp))
             .unwrap_or_else(|_| self.codex.session.services.latest_mcp_runtime())
     }
 

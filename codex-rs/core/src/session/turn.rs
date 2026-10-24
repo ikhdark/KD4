@@ -197,7 +197,6 @@ use codex_utils_stream_parser::AssistantTextStreamParser;
 use codex_utils_stream_parser::ProposedPlanSegment;
 use codex_utils_stream_parser::extract_proposed_plan_text;
 use futures::future::BoxFuture;
-use futures::future::Either;
 use futures::prelude::*;
 use futures::stream::FuturesOrdered;
 use tokio_util::sync::CancellationToken;
@@ -1936,17 +1935,17 @@ fn refresh_validation_policy(turn: &TurnContext, execution: &mut TurnExecutionCo
 fn validation_mode_base_instructions(turn: &TurnContext) -> Arc<BaseInstructions> {
     let directive = match turn.validation_mode {
         codex_protocol::validation::ValidationMode::Off =>
-            "OFF: Do not run tests, builds, checks, formatters, or validation-only continuations. Do not automatically author regression tests; test authoring requires an explicit user request. Missing validation is intentional, not a blocker or failed check. Finish independent authorized work and report unvalidated results without claiming success for unmet acceptance criteria.",
+            "OFF: No validation or validation-only continuation.",
         codex_protocol::validation::ValidationMode::Compile =>
-            "COMPILE: After the last relevant Rust source/Cargo input edit, perform one targeted cargo check of affected owners and required separate integration-test consumers through the repository's runner; documentation-only changes need no build. No test execution, formatting, or other validation. Do not automatically author regression tests; test authoring requires an explicit user request. At most two compile attempts may start. Retry only after relevant inputs change. If ownership cannot be determined safely, report that limitation; never broaden to the workspace. After exhaustion, report actual compiler errors and unverified requirements; do not continue solely for validation or describe policy refusal as busy.",
+            "COMPILE: Only task-authorized targeted compilation; no tests, formatting, or other validation.",
         codex_protocol::validation::ValidationMode::Benchmark =>
-            "BENCHMARK: Scoped, non-destructive benchmarking is authorized by default for performance audits, within the requested objective, permissions, and configured attempt budget. Targeted cargo check still requires task authorization; retry compilation only after relevant inputs change. Tests, formatting, Clippy, full builds, and mixed or unclassified validation are not authorized by this mode. Do not automatically author regression tests; test authoring requires an explicit user request. Review-only workers must transfer execution to an authorized parent or verifier. Respect explicit OFF/COMPILE selections and user execution restrictions. At exhaustion, report actual errors and unverified requirements without a validation-only continuation.",
+            "BENCHMARK: Only task-authorized targeted compilation and scoped, non-destructive performance-audit benchmarks; no tests, formatting, Clippy, or full builds. The base instructions define the default benchmark authorization and its restrictions.",
         codex_protocol::validation::ValidationMode::Full =>
-            "FULL: Run only task-authorized validation within the configured attempt budget. Batch settled selections, preserve required consumers and exact test obligations, and distinguish busy admission from started failures. At exhaustion, report actual errors and unverified requirements without a validation-only continuation.",
+            "FULL: Only task-authorized validation within the configured attempt budget.",
     };
     let mut instructions = (*turn.base_instructions).clone();
     instructions.text.push_str(&format!(
-        "\n\n<validation_mode>\n{directive}\nAttempt limit: {}. A limit is not permission to validate; explicit user restrictions still apply. Consume already-running work through its owner without launching duplicates.\n</validation_mode>",
+        "\n\n<validation_mode>\n{directive}\nFollow the base instructions for validation authorization, retry, evidence, and completion rules.\nAttempt limit: {}. A limit is not permission to validate; explicit user restrictions still apply. Consume already-running work through its owner without launching duplicates.\n</validation_mode>",
         validation_attempt_limit(turn),
     ));
     Arc::new(instructions)
@@ -1972,6 +1971,13 @@ mod validation_mode_prompt_tests {
             assert_eq!(instructions.text.matches("<validation_mode>").count(), 1);
             assert!(instructions.text.contains(expected));
             assert!(instructions.text.contains(&format!("Attempt limit: {limit}.")));
+            let overlay = instructions.text.strip_prefix(&turn.base_instructions.text).unwrap();
+            assert!(overlay.contains("Follow the base instructions for validation authorization, retry, evidence, and completion rules."));
+            assert!(!overlay.contains("perform one targeted cargo check"));
+            assert!(!overlay.contains("test authoring requires an explicit user request"));
+            if mode == codex_protocol::validation::ValidationMode::Compile {
+                assert!(overlay.contains("Only task-authorized targeted compilation"));
+            }
         }
     }
 }
@@ -2048,14 +2054,6 @@ async fn join_recommendations_and_mcp<A, B>(
     mcp_tools: impl Future<Output = B> + Send,
 ) -> (A, B) {
     tokio::join!(recommendations, mcp_tools)
-}
-
-async fn collect_projected_prompt_state<A, B, C>(
-    active_context: impl Future<Output = A> + Send,
-    committed_history: impl Future<Output = B> + Send,
-    auto_compact_window: impl Future<Output = C> + Send,
-) -> (A, B, C) {
-    tokio::join!(active_context, committed_history, auto_compact_window)
 }
 
 fn authoritative_wait_terminal_surface(
@@ -3319,19 +3317,23 @@ async fn build_pure_pending_turn_plan(
             injected_host_skill_prompts.as_deref()
         ))
     );
-    let skill_connector_items = skill_plan
-        .injections
-        .items
-        .iter()
-        .map(|skill| {
-            ContextualUserFragment::into(RenderedContextFragment::new(skill.role(), skill.render()))
-        })
-        .collect::<Vec<_>>();
-    let skill_connector_ids = collect_explicit_app_ids_from_skill_items(
-        &skill_connector_items,
-        &available_connectors,
-        &skill_name_counts_lower,
-    );
+    let skill_connector_ids = if available_connectors.is_empty() {
+        HashSet::new()
+    } else {
+        let skill_connector_items = skill_plan
+            .injections
+            .items
+            .iter()
+            .map(|skill| {
+                ContextualUserFragment::into(RenderedContextFragment::new(skill.role(), skill.render()))
+            })
+            .collect::<Vec<_>>();
+        collect_explicit_app_ids_from_skill_items(
+            &skill_connector_items,
+            &available_connectors,
+            &skill_name_counts_lower,
+        )
+    };
     let plugin_items = build_plugin_injections(
         &mentioned_plugins,
         mcp_tools,
@@ -3868,23 +3870,10 @@ async fn projected_prompt_pressure(
         AutoCompactTokenLimitScope::BodyAfterPrefix
     );
     let (active_context_tokens, committed_history_tokens, auto_compact_window) =
-        collect_projected_prompt_state(
-            sess.get_context_tokens_for_turn(turn_context),
-            async {
-                if pending_token_estimate.has_real_user_boundary {
-                    sess.get_estimated_token_count_after_pending_user_boundary(turn_context)
-                        .await
-                } else {
-                    sess.get_estimated_token_count(turn_context).await
-                }
-            },
-            async {
-                if body_after_prefix {
-                    Some(sess.auto_compact_window_snapshot().await)
-                } else {
-                    None
-                }
-            },
+        sess.projected_prompt_state(
+            turn_context,
+            pending_token_estimate.has_real_user_boundary,
+            body_after_prefix,
         )
         .await;
     let committed_history_tokens = committed_history_tokens.unwrap_or(active_context_tokens);
@@ -3955,7 +3944,6 @@ fn defer_compaction_for_final_answer(
 fn build_bounded_skill_context_items<'a>(
     skill_fragments: impl IntoIterator<Item = &'a codex_core_skills::injection::SkillInjection>,
 ) -> Vec<ResponseItem> {
-    use sha2::Digest;
     let fragments = skill_fragments.into_iter().collect::<Vec<_>>();
     let notices = fragments.iter().map(|skill| {
         let mut notice = (*skill).clone();
@@ -3986,10 +3974,9 @@ fn build_bounded_skill_context_items<'a>(
             let mut item: ResponseItem = ContextualUserFragment::into(
                 RenderedContextFragment::new(fragment.role(), text),
             );
-            if complete && let Some(source) = &fragment.source_id {
-                let revision = hex::encode(sha2::Sha256::digest(fragment.contents.as_bytes()));
+            if complete && let Some(revision) = fragment.revision_identity() {
                 if let ResponseItem::Message { id, .. } = &mut item {
-                    *id = Some(ResponseItemId::new(&format!("msg_sctx_skill_revision_v1_{source}_{revision}")));
+                    *id = Some(revision.message_id());
                 }
             }
             item
@@ -4119,6 +4106,17 @@ async fn build_extension_turn_input_items(
     {
         let mut selected = (*selected).clone();
         selected.retain_admitted_items(&items);
+        for item in &mut items {
+            let ResponseItem::Message { id, role, content, .. } = item else {
+                continue;
+            };
+            let [ContentItem::InputText { text }] = content.as_slice() else {
+                continue;
+            };
+            if let Some(revision) = selected.host_instruction_revision(role, text) {
+                *id = Some(revision.message_id());
+            }
+        }
         turn_context.extension_data.insert(selected);
     }
     Ok(items)
@@ -5042,6 +5040,7 @@ pub(crate) fn build_prompt(
     let input = input.into();
     Prompt {
         input: Arc::clone(&input),
+        formatted_inputs: Default::default(),
         stable_context_fallback_input: Arc::clone(&input),
         tool_history_fallback_input: Arc::clone(&input),
         stable_context_tool_history_fallback_input: input,
@@ -5469,6 +5468,7 @@ fn build_projected_prompt_from_scaffold(
     );
     Prompt {
         input,
+        formatted_inputs: Default::default(),
         stable_context_fallback_input: fallback_input,
         tool_history_fallback_input,
         stable_context_tool_history_fallback_input,
@@ -5698,6 +5698,7 @@ fn run_sampling_request<'a>(
                 &generation_id,
                 preparation_timing_guard,
                 Arc::clone(&pending_tool_manifest),
+                step_context.user_intent_epoch,
                 cancellation_token.child_token(),
                 &mut attempt_progress,
             ))
@@ -6488,6 +6489,18 @@ struct UnsettledSamplingRequestResult {
     assistant_output: Option<FinalizedAssistantOutput>,
     tool_result_continuation: bool,
     server_end_turn_false: bool,
+}
+
+impl UnsettledSamplingRequestResult {
+    fn steered(tool_result_continuation: bool) -> Self {
+        Self {
+            needs_follow_up: true,
+            last_agent_message: None,
+            assistant_output: None,
+            tool_result_continuation,
+            server_end_turn_false: false,
+        }
+    }
 }
 
 /// Ephemeral per-response state for streaming a single proposed plan.
@@ -7576,6 +7589,7 @@ fn try_run_sampling_request<'a>(
     generation_id: &'a ModelGenerationId,
     preparation_timing_guard: &'a mut Option<TurnTimingGuard>,
     pending_tool_manifest: Arc<Mutex<Option<codex_protocol::protocol::ToolManifestItem>>>,
+    authoring_epoch: u64,
     cancellation_token: CancellationToken,
     attempt_progress: &'a mut SamplingAttemptProgress,
 ) -> impl std::future::Future<Output = CodexResult<SamplingRequestResult>> + 'a {
@@ -7915,22 +7929,36 @@ fn try_run_sampling_request<'a>(
         // In-memory history already contains the accepted ordered mutations.
         // Surface writer failures here; terminalization owns the durability barrier.
         sess.check_tool_history_persistence()?;
-        let stream_result = Box::pin(client_session.stream_with_attempt_prepared(
-            prompt,
-            &turn_context.model_info,
-            &turn_context.session_telemetry,
-            request_effort.clone(),
-            turn_context.reasoning_summary,
-            service_tier,
-            responses_metadata,
-            Some(attempt_prepared),
-        ))
-        .instrument(trace_span!("stream_request"))
-        .or_cancel(&cancellation_token)
-        .await;
+        let steering = sess.input_queue.wait_for_user_intent_change(authoring_epoch);
+        tokio::pin!(steering);
+        let mut was_steered = false;
+        let mut stream = {
+            let request = Box::pin(client_session.stream_with_attempt_prepared(
+                prompt,
+                &turn_context.model_info,
+                &turn_context.session_telemetry,
+                request_effort.clone(),
+                turn_context.reasoning_summary,
+                service_tier,
+                responses_metadata,
+                Some(attempt_prepared),
+            ))
+            .instrument(trace_span!("stream_request"))
+            .or_cancel(&cancellation_token);
+            tokio::pin!(request);
+            tokio::select! {
+                biased;
+                _ = &mut steering => {
+                    was_steered = true;
+                    None
+                }
+                result = &mut request => Some(result??),
+            }
+        };
         drop(model_request_timing_guard);
-        let mut stream = stream_result??;
-        let attempt_identity = stream.attempt_identity().cloned();
+        let attempt_identity = stream
+            .as_ref()
+            .and_then(|stream| stream.attempt_identity().cloned());
         let mut in_flight: FuturesOrdered<BoxFuture<'static, InFlightToolResult>> =
             FuturesOrdered::new();
         let mut completed_in_flight = VecDeque::new();
@@ -7973,6 +8001,11 @@ fn try_run_sampling_request<'a>(
         let receiving_span = trace_span!("receiving_stream");
         let mut model_stream_processing_handoff: Option<TurnTimingGuard> = None;
         let outcome: CodexResult<UnsettledSamplingRequestResult> = loop {
+            let Some(stream) = stream.as_mut() else {
+                break Ok(UnsettledSamplingRequestResult::steered(
+                    tool_result_continuation,
+                ));
+            };
             let handle_responses = trace_span!(
                 parent: &receiving_span,
                 "handle_responses",
@@ -7993,26 +8026,15 @@ fn try_run_sampling_request<'a>(
             // between the two guards records an orchestration interval for every
             // streamed event, which fills the exact activity timeline within minutes.
             drop(model_stream_processing_handoff.take());
-            let stream_event = if in_flight.is_empty() {
-                Either::Left(
-                    stream
-                        .next()
-                        .instrument(trace_span!(parent: &handle_responses, "receiving"))
-                        .or_cancel(&cancellation_token)
-                        .await,
-                )
-            } else {
-                tokio::select! {
-                    event = stream
-                        .next()
-                        .instrument(trace_span!(parent: &handle_responses, "receiving"))
-                        .or_cancel(&cancellation_token) => Either::Left(event),
-                    completion = in_flight.next() => Either::Right(completion),
+            let stream_event = tokio::select! {
+                biased;
+                _ = &mut steering => {
+                    was_steered = true;
+                    break Ok(UnsettledSamplingRequestResult::steered(
+                        tool_result_continuation,
+                    ));
                 }
-            };
-            let stream_event = match stream_event {
-                Either::Left(stream_event) => stream_event,
-                Either::Right(Some(completion)) => {
+                Some(completion) = in_flight.next(), if !in_flight.is_empty() => {
                     drop(model_stream_wait_timing_guard);
                     // Poll eager work while the provider is still streaming, but
                     // defer model-visible delivery until the response has closed.
@@ -8020,7 +8042,10 @@ fn try_run_sampling_request<'a>(
                     completed_in_flight.push_back(completion);
                     continue;
                 }
-                Either::Right(None) => continue,
+                event = stream
+                    .next()
+                    .instrument(trace_span!(parent: &handle_responses, "receiving"))
+                    .or_cancel(&cancellation_token) => event,
             };
             let event = match stream_event {
                 Ok(event) => event,
@@ -8596,6 +8621,17 @@ fn try_run_sampling_request<'a>(
                 }
             }
         };
+        // Dropping the stream cancels its mapper. Never reuse that still-active
+        // socket or a stale final-answer candidate for the steered continuation.
+        drop(stream);
+        if was_steered {
+            client_session.interrupt_response_for_steering();
+            final_message_candidate = None;
+            needs_follow_up = true;
+            if !context_baseline_committed {
+                sess.mark_context_baseline_unknown().await;
+            }
+        }
         drop(model_stream_processing_handoff);
         drop(sampling_timing_guard);
 

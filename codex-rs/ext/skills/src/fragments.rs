@@ -47,6 +47,49 @@ pub(crate) struct SkillInstructions {
     pub(crate) source_scope: Option<SkillScope>,
 }
 
+impl SkillInstructions {
+    pub(crate) fn rendered_len(&self) -> usize {
+        Self::rendered_len_parts(&self.name, &self.path, &[&self.contents], self.source_scope)
+    }
+
+    pub(crate) fn rendered_len_parts(
+        name: &str,
+        path: &str,
+        contents: &[&str],
+        scope: Option<SkillScope>,
+    ) -> usize {
+        struct Counter(usize);
+        impl std::fmt::Write for Counter {
+            fn write_str(&mut self, text: &str) -> std::fmt::Result {
+                self.0 = self.0.saturating_add(text.len());
+                Ok(())
+            }
+        }
+        let mut counter = Counter("<skill></skill>".len());
+        let _ = Self::write_body(&mut counter, name, path, contents, scope);
+        counter.0
+    }
+
+    fn write_body(
+        output: &mut impl std::fmt::Write,
+        name: &str,
+        path: &str,
+        contents: &[&str],
+        scope: Option<SkillScope>,
+    ) -> std::fmt::Result {
+        write!(output, "\n<name>{}</name>\n<path>{}</path>",
+            escape_fragment_text(name), escape_fragment_text(path))?;
+        if let Some(scope) = scope {
+            write!(output, "\n<scope>{}</scope>", skill_scope_label(scope))?;
+        }
+        output.write_str("\n")?;
+        for part in contents {
+            write!(output, "{}", escape_fragment_text(part))?;
+        }
+        output.write_str("\n")
+    }
+}
+
 impl ContextualUserFragment for SkillInstructions {
     fn role(&self) -> &'static str {
         self.source_scope
@@ -63,15 +106,8 @@ impl ContextualUserFragment for SkillInstructions {
     }
 
     fn body(&self) -> std::borrow::Cow<'_, str> {
-        std::borrow::Cow::Owned({
-            let name = escape_fragment_text(&self.name);
-            let path = escape_fragment_text(&self.path);
-            let contents = escape_fragment_text(&self.contents);
-            let scope = self
-                .source_scope
-                .map(|scope| format!("\n<scope>{}</scope>", skill_scope_label(scope)))
-                .unwrap_or_default();
-            format!("\n<name>{name}</name>\n<path>{path}</path>{scope}\n{contents}\n")
-        })
+        let mut body = String::new();
+        let _ = Self::write_body(&mut body, &self.name, &self.path, &[&self.contents], self.source_scope);
+        std::borrow::Cow::Owned(body)
     }
 }

@@ -32,6 +32,7 @@ use crate::tools::handlers::ShellCommandHandler;
 use crate::tools::handlers::ShellCommandHandlerOptions;
 use crate::tools::handlers::SleepHandler;
 use crate::tools::handlers::TestSyncHandler;
+use crate::tools::handlers::ToolSearchHandler;
 use crate::tools::handlers::ToolSearchHandlerCache;
 use crate::tools::handlers::ViewImageHandler;
 use crate::tools::handlers::WaitForEnvironmentHandler;
@@ -230,13 +231,14 @@ pub(crate) fn build_tool_router(
         native_environment_contract(step_context);
     let exposure_identity = params.exposure_identity.clone();
     let tool_suggest_candidates = params.tool_suggest_candidates.clone();
-    let (model_visible_specs, registry, warnings) =
+    let (model_visible_specs, registry, warnings, search_sources) =
         build_tool_specs_and_registry(step_context, params, tool_search_handler_cache)?;
-    let mut router = ToolRouter::from_parts_with_warnings_and_identity(
+    let mut router = ToolRouter::from_parts_with_prepared_search_sources(
         registry,
         model_visible_specs,
         warnings,
         exposure_identity,
+        search_sources,
     )
     .with_planning_context(step_context.turn.as_ref());
     router.tool_suggest_candidates = tool_suggest_candidates;
@@ -248,7 +250,7 @@ fn build_tool_specs_and_registry(
     step_context: &StepContext,
     params: ToolRouterParams<'_>,
     tool_search_handler_cache: &ToolSearchHandlerCache,
-) -> Result<(Vec<ToolSpec>, ToolRegistry, Vec<String>), String> {
+) -> Result<(Vec<ToolSpec>, ToolRegistry, Vec<String>, Option<String>), String> {
     let turn_context = step_context.turn.as_ref();
     let ToolRouterParams {
         mcp_tools,
@@ -306,15 +308,40 @@ fn build_tool_specs_and_registry(
 
     quarantine_conflicting_namespaces(&mut planned_tools);
     apply_namespace_description_budget(&mut planned_tools);
-    append_tool_search_executor(&context, &mut planned_tools);
+    let tool_search = append_tool_search_executor(&context, &mut planned_tools);
     // Generated native controls take precedence before code mode captures its
     // catalog; final registry deduplication cannot repair an earlier snapshot.
     retain_unique_planned_tool_names(&mut planned_tools);
     prepend_code_mode_executors(&context, &mut planned_tools)?;
-    Ok(build_model_visible_specs_and_registry(
+    let (specs, registry, warnings) = build_model_visible_specs_and_registry(
         turn_context,
         planned_tools,
-    ))
+    );
+    let search_sources = tool_search.map(|(handler, indexes)| {
+        // Reuse the handler's immutable inventory, including on a warm cache
+        // hit. Final registration still decides membership and lexical order:
+        // generated controls may have displaced a conflicting deferred name.
+        let entries = registry.manifest_entries();
+        let infos = entries
+            .into_iter()
+            .filter(|tool| tool.exposure() == ToolExposure::Deferred)
+            .filter_map(|tool| {
+                indexes
+                    .get(tool.tool_name())
+                    .map(|index| &handler.search_infos()[*index])
+                    .or_else(|| tool.search_info_ref())
+            })
+            .collect::<Vec<_>>();
+        if infos.is_empty() {
+            return String::new();
+        }
+        crate::tools::handlers::tool_search_spec::render_tool_search_sources(
+            infos.iter().filter_map(|info| info.source_info.as_ref()),
+            infos.iter().any(|info| info.source_info.is_none()),
+            infos.iter().copied(),
+        )
+    });
+    Ok((specs, registry, warnings, search_sources))
 }
 
 fn promote_deferred_tools(turn_context: &TurnContext, planned_tools: &mut PlannedTools) {
@@ -669,10 +696,6 @@ fn wait_agent_timeout_options(turn_context: &TurnContext) -> WaitAgentTimeoutOpt
         min_timeout_ms: turn_context.config.multi_agent_v2.min_wait_timeout_ms,
         max_timeout_ms: turn_context.config.multi_agent_v2.max_wait_timeout_ms,
     }
-}
-
-fn agent_type_description(turn_context: &TurnContext) -> String {
-    crate::agent::role::spawn_tool_spec::build(&turn_context.config.agent_roles)
 }
 
 fn is_hidden_by_code_mode_only(
@@ -1370,7 +1393,6 @@ fn add_collaboration_tools(context: &CoreToolPlanContext<'_>, planned_tools: &mu
             ToolExposure::Direct
         };
         let tool_namespace = active_collaboration_namespace(turn_context, agent_surface_stage);
-        let agent_type_description = agent_type_description(turn_context);
         if can_spawn
             && context
                 .step_context
@@ -1381,9 +1403,7 @@ fn add_collaboration_tools(context: &CoreToolPlanContext<'_>, planned_tools: &mu
             planned_tools.add_arc_with_exposure_and_authorization_class(
                 multi_agent_v2_handler(
                     SpawnAgentHandlerV2::new(SpawnAgentToolOptions {
-                        available_models: turn_context.available_models.clone(),
-                        agent_type_description,
-                        hide_agent_type_model_reasoning: turn_context
+                        hide_agent_metadata: turn_context
                             .config
                             .multi_agent_v2
                             .hide_spawn_agent_metadata,
@@ -1603,26 +1623,35 @@ fn add_extension_tools(context: &CoreToolPlanContext<'_>, planned_tools: &mut Pl
 fn append_tool_search_executor(
     context: &CoreToolPlanContext<'_>,
     planned_tools: &mut PlannedTools,
-) {
+) -> Option<(Arc<ToolSearchHandler>, HashMap<ToolName, usize>)> {
     let turn_context = context.step_context.turn.as_ref();
     if !search_tool_enabled(turn_context) {
-        return;
+        return None;
     }
 
-    let search_infos = planned_tools
+    let (names, search_infos): (Vec<_>, Vec<_>) = planned_tools
         .runtimes()
         .iter()
         .filter(|executor| executor.exposure() == ToolExposure::Deferred)
-        .filter_map(RegisteredTool::search_info)
-        .collect::<Vec<_>>();
+        .filter_map(|tool| Some((tool.tool_name().clone(), tool.search_info()?)))
+        .unzip();
     if search_infos.is_empty() {
-        return;
+        return None;
     }
 
     let handler = context.tool_search_handler_cache.get_or_build(search_infos);
-    planned_tools
-        .runtimes
-        .insert(0, RegisteredTool::new(handler, TypedToolClass::ReadSearch));
+    planned_tools.runtimes.insert(
+        0,
+        RegisteredTool::new(handler.clone(), TypedToolClass::ReadSearch),
+    );
+    Some((
+        handler,
+        names
+            .into_iter()
+            .enumerate()
+            .map(|(index, name)| (name, index))
+            .collect(),
+    ))
 }
 
 fn prepend_code_mode_executors(

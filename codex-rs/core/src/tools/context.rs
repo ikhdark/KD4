@@ -1146,8 +1146,12 @@ impl ApplyPatchToolOutput {
     }
 
     pub(crate) fn model_text(&self) -> String {
+        self.model_text_with_diagnostics(true)
+    }
+
+    fn model_text_with_diagnostics(&self, include_diagnostics: bool) -> String {
         let mut text = if self.success {
-            if self.diagnostics.is_empty() {
+            if self.diagnostics.is_empty() || !include_diagnostics {
                 "Success. Updated the files.".to_string()
             } else {
                 format!(
@@ -1242,7 +1246,9 @@ impl ToolOutput for ApplyPatchToolOutput {
             },
             diagnostic_class: ToolOutputDiagnosticClass::Normal,
             fragments: Vec::new(),
-            spillable_text: vec![self.model_text()],
+            // The projection's essential fields already retain the complete
+            // diagnostic display. Do not repeat that JSON inside selected text.
+            spillable_text: vec![self.model_text_with_diagnostics(false)],
             essential_inline: serde_json::json!({
                 "success": self.success,
                 "changes_count": self.changes.len(),
@@ -1307,7 +1313,9 @@ impl ToolOutput for AbortedToolOutput {
             diagnostic_class: ToolOutputDiagnosticClass::Normal,
             fragments: vec![ToolOutputProjectionFragment::new(
                 ToolOutputProjectionFragmentKind::ErrorOrDiagnostic,
-                self.rendered(),
+                // Recovery remains complete in essential_inline and in the
+                // canonical spillable body, not duplicated in the text fragment.
+                self.message.clone(),
             )],
             spillable_text: vec![self.rendered()],
             essential_inline: {

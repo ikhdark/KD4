@@ -5,8 +5,12 @@ use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_template::Template;
 use std::sync::LazyLock;
 
-/// Review thread system prompt.
-pub const REVIEW_PROMPT: &str = include_str!("../templates/review/rubric.md");
+/// Canonical shared policy followed by the review-specific profile and output contract.
+pub const REVIEW_PROMPT: &str = concat!(
+    include_str!("../../protocol/src/prompts/base_instructions/default.md"),
+    "\n\n",
+    include_str!("../templates/review/rubric.md"),
+);
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct ResolvedReviewRequest {

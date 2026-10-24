@@ -17,6 +17,7 @@ use nucleo::pattern::CaseMatching;
 use nucleo::pattern::Normalization;
 use serde::Serialize;
 use std::borrow::Cow;
+use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::fs;
 use std::num::NonZero;
@@ -734,6 +735,11 @@ fn matcher_worker(
     let shutdown_requested = || inner.shutdown.load(Ordering::Relaxed);
 
     let mut last_query: Option<QuerySubmission> = None;
+    let mut literal = None;
+    let mut exact = None;
+    // This session only appends immutable indexed paths. Scores change as
+    // matching advances, but a path's relevance tier changes only with query.
+    let mut literal_tiers = HashMap::new();
     let mut last_snapshot = FileSearchSnapshot::default();
     let mut completed_generation = None;
     let mut metadata_changed = false;
@@ -765,6 +771,9 @@ fn matcher_worker(
                             Normalization::Smart,
                             append,
                         );
+                        literal = literal_query(&pattern_text);
+                        exact = literal.as_deref().map(|literal| Atom::new(literal, CaseMatching::Ignore, Normalization::Smart, AtomKind::Exact, false));
+                        literal_tiers.clear();
                         last_query = Some(query);
                         last_snapshot = FileSearchSnapshot::default();
                         metadata_changed = true;
@@ -805,8 +814,6 @@ fn matcher_worker(
                     let snapshot = nucleo.snapshot();
                     let limit = inner.limit.min(snapshot.matched_item_count() as usize);
                     let pattern = snapshot.pattern().column_pattern(0);
-                    let literal = literal_query(&match_query(&query.text));
-                    let exact = literal.as_deref().map(|literal| Atom::new(literal, CaseMatching::Ignore, Normalization::Smart, AtomKind::Exact, false));
                     // Select within the retained matcher snapshot, not the
                     // filesystem walk. Nucleo's insertion-index tie breaker
                     // must not determine membership at the cutoff.
@@ -815,7 +822,13 @@ fn matcher_worker(
                         .iter()
                         .filter_map(|matched| {
                             let item = snapshot.get_item(matched.idx)?;
-                            let tier = literal_rank(&item, literal.as_deref(), exact.as_ref(), &mut rank_matcher);
+                            let tier = if literal.is_some() {
+                                *literal_tiers.entry(matched.idx).or_insert_with(|| {
+                                    literal_rank(&item, literal.as_deref(), exact.as_ref(), &mut rank_matcher)
+                                })
+                            } else {
+                                3
+                            };
                             Some((matched, item.matcher_columns[0].slice(..).len(), item.data.full_path.as_ref(), tier))
                         })
                         .collect::<Vec<_>>();

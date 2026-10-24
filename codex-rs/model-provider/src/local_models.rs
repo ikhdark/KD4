@@ -146,8 +146,12 @@ pub(crate) fn manager(
         });
     let id = provider_id.to_owned();
     let identity_info = info.clone();
-    let identity: ModelsCacheIdentity =
-        Arc::new(move || crate::provider::model_provider_cache_identity(&id, &identity_info, None));
+    let components = OnceLock::new();
+    let identity: ModelsCacheIdentity = Arc::new(move || {
+        components
+            .get_or_init(|| crate::provider::ModelProviderCacheIdentity::new(&id, &identity_info))
+            .for_auth_identity(&identity_info, crate::auth::provider_cache_auth_identity(None))
+    });
     let manager = OpenAiModelsManager::new(
         home,
         Arc::new(LocalModelsEndpoint {

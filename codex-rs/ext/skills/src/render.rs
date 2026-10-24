@@ -146,21 +146,20 @@ pub(crate) fn main_prompt_fragment(
     entry: &SkillCatalogEntry,
     budget: usize,
 ) -> Option<(crate::fragments::SkillInstructions, bool)> {
-    use codex_extension_api::ContextualUserFragment;
     let fragment = |contents| crate::fragments::SkillInstructions {
         name: entry.name.clone(),
         path: entry.main_prompt.as_str().to_string(),
         contents,
         source_scope: entry.source_scope,
     };
-    if contents.len() <= budget {
-        let complete = fragment(contents.to_string());
-        if complete.render().len() <= budget {
-            return Some((complete, false));
-        }
+    let rendered_len = |parts: &[&str]| crate::fragments::SkillInstructions::rendered_len_parts(
+        &entry.name, entry.main_prompt.as_str(), parts, entry.source_scope,
+    );
+    if contents.len() <= budget && rendered_len(&[contents]) <= budget {
+        return Some((fragment(contents.to_string()), false));
     }
     let fingerprint = crate::tools::read::value_fingerprint(contents);
-    let partial = |end: usize| {
+    let suffix = |end: usize| {
         let recovery = match &entry.authority.kind {
             SkillSourceKind::Orchestrator => format!(
                 "Read the remaining instructions with skills.read({}); follow next_cursor as cursor until absent.",
@@ -174,29 +173,22 @@ pub(crate) fn main_prompt_fragment(
             },
             SkillSourceKind::Custom(_) => "Report missing instructions; this provider exposes no model-callable recovery route.".to_string(),
         };
-        fragment(format!(
-            "{}\n\n[This skill's instructions are incomplete. The omitted portion has not been loaded. {recovery}]",
-            &contents[..end]
-        ))
+        format!("\n\n[This skill's instructions are incomplete. The omitted portion has not been loaded. {recovery}]")
     };
-    let empty = partial(0);
-    if empty.render().len() > budget {
+    if rendered_len(&[&suffix(0)]) > budget {
         return None;
     }
-    let mut best = empty;
     let mut low = 0;
     let mut high = contents.floor_char_boundary(contents.len().min(budget));
     while low < high {
         let end = contents.ceil_char_boundary(low.midpoint(high) + 1);
-        let candidate = partial(end);
-        if candidate.render().len() <= budget {
+        if rendered_len(&[&contents[..end], &suffix(end)]) <= budget {
             low = end;
-            best = candidate;
         } else {
             high = contents.floor_char_boundary(end - 1);
         }
     }
-    Some((best, true))
+    Some((fragment(format!("{}{}", &contents[..low], suffix(low))), true))
 }
 
 pub(crate) fn truncate_utf8_to_bytes(contents: &str, max_bytes: usize) -> (String, bool) {

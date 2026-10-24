@@ -58,12 +58,12 @@ pub fn truncate_model_text_at_lines_with_limits(
     total_lines: usize,
     artifact_id: Option<&str>,
 ) -> (String, Option<(usize, usize)>) {
-    let all_lines =
+    let all_lines = ||
         (!text.is_empty()).then(|| (line_offset + 1, line_offset + text.lines().count()));
     // Silent projections need neither the vocabulary nor a token vector for
     // output that will be discarded, including logs preceding a script error.
     if limit == 0 {
-        return (String::new(), all_lines);
+        return (String::new(), all_lines());
     }
     // Every ordinary token encodes at least one byte, so text this short fits
     // without encoding it or loading the vocabulary.
@@ -144,7 +144,7 @@ pub fn truncate_model_text_at_lines_with_limits(
             return (result, Some((first + line_offset, last + line_offset)));
         }
         if retained == 0 {
-            return (String::new(), all_lines);
+            return (String::new(), all_lines());
         }
         // The complete packet already tells us how far it exceeds the budget.
         // A fixed 1% decrement needlessly re-tokenizes the packet and rescans

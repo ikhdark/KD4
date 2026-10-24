@@ -178,7 +178,7 @@ pub(crate) fn create_read_tool_output_tool() -> ToolSpec {
 
     ToolSpec::Function(ResponsesApiTool {
         name: READ_TOOL_OUTPUT_TOOL_NAME.to_string(),
-        description: "Read a saved tool-output snapshot without rerunning the tool. Artifacts are thread-private: passing an ID to another agent does not grant access. Have the owning agent recover and share the needed evidence instead. Batch known searches or selections in one call to share authenticated snapshot validation. Search results include matching text in results[].value.hydrated_ranges; a complete search page can still have more matches. Returns exact text or data_base64 for arbitrary bytes up to max_bytes plus continuation metadata; complete indicates requested-selection delivery, not full capture or current workspace freshness. Command logs retain full output on disk and support line ranges only. Source snapshots retain advanced selectors. Capture gaps and disk failures remain explicitly incomplete. Check retained_artifact_complete and continuation_stop.reason/resumable; preserve successful siblings and retry only missing selections. In scripts consume recovered data and print only needed evidence to avoid another enclosing display truncation. Never rerun the producer merely to recover output.".to_string(),
+        description: "Read a saved tool-output snapshot without rerunning the tool. Artifacts are thread-private: passing an ID to another agent does not grant access. Have the owning agent recover and share the needed evidence instead. Batch known searches or selections in one call to share authenticated snapshot validation. Search results include matching text in results[].value.hydrated_ranges; a complete search page can still have more matches. Returns exact text or data_base64 for arbitrary bytes up to max_bytes plus continuation metadata; complete indicates requested-selection delivery, not full capture or current workspace freshness. Command logs retain full output on disk and support byte and line ranges. A line that cannot fit returns an exact byte continuation for the remaining selection in this same artifact; use that continuation rather than read_file, which requires a whole UTF-8 file within its size limit. Source snapshots retain advanced selectors. Capture gaps and disk failures remain explicitly incomplete. Check retained_artifact_complete and continuation_stop.reason/resumable; preserve successful siblings and recover only required missing selections. In an exec cell, call advertised recovery.arguments before returning; follow resumable budget continuations while ranges advance, and report non-resumable failures or gaps instead of looping. For a required full 753-line diff with lines 1-24 delivered, recover lines 25-753 from the saved artifact in that same cell. Consume pages in-script and print only needed evidence to avoid another enclosing display truncation; do not raise default limits or dump huge results. Never rerun the producer merely to recover output.".to_string(),
         strict: false,
         defer_loading: None,
         parameters: JsonSchema::object(
@@ -440,6 +440,10 @@ mod tests {
     fn artifact_recovery_tool_exposes_search_and_exact_select_operations() {
         let tool = serde_json::to_value(create_read_tool_output_tool())
             .expect("serialize read_tool_output spec");
+        let description = tool["description"].as_str().expect("description");
+        assert!(description.contains("Command logs retain full output on disk and support byte and line ranges"));
+        assert!(description.contains("exact byte continuation for the remaining selection in this same artifact"));
+        assert!(!description.contains("saved-file byte-read arguments"));
         let selectors = tool
             .pointer("/parameters/properties/selectors/items/oneOf")
             .and_then(serde_json::Value::as_array)

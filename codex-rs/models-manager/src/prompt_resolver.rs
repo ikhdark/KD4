@@ -17,6 +17,9 @@ pub(crate) const LOCAL_PROMPT_POLICY_SLUGS: &[&str] = &[
     "gpt-5.4",
     "gpt-5.4-mini",
     "gpt-5.2",
+    "gpt-daybreak-blue-latest",
+    "gpt-daybreak-red-latest",
+    "codex-auto-review",
 ];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

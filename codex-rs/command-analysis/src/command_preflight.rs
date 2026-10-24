@@ -210,8 +210,8 @@ fn preflight_command_issues(
 
     for argv in &argv_commands {
         // A basename cannot prove that a native executable does not exist.
-        if let Err(issue) = lint_direct_argv_powershell_cmdlet(argv, preflight_shell_type)
-            && let Some(advisories) = literal_glob_advisories.as_deref_mut()
+        if let Some(advisories) = literal_glob_advisories.as_deref_mut()
+            && let Err(issue) = lint_direct_argv_powershell_cmdlet(argv, preflight_shell_type)
         {
             advisories.push(issue);
         }

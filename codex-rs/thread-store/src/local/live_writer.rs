@@ -70,11 +70,7 @@ where
                 store: store.clone(),
                 thread_id,
             };
-            if let Some(history) = history {
-                super::projection::initialize_from_items(&store, thread_id, &history).await?;
-            } else {
-                super::projection::initialize_empty(&store, thread_id).await?;
-            }
+            super::projection::initialize_deferred(&store, thread_id, history).await?;
             Ok::<_, ThreadStoreError>(guard)
         }
         .await;
@@ -459,6 +455,13 @@ async fn sync_materialized_rollout_path(
         return Ok(());
     };
     let result: ThreadStoreResult<()> = async {
+        if state_db.thread_rollout_path_matches(thread_id, &rollout_path).await
+            .map_err(|err| ThreadStoreError::Internal {
+                message: format!("failed to update thread metadata for {thread_id}: {err}"),
+            })?
+        {
+            return Ok(());
+        }
         state_db
             .patch_existing_thread_metadata(thread_id, |current| {
                 if !rollout_path.exists() && !rollout_path.with_extension("jsonl.zst").exists() {

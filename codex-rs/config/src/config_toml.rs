@@ -3,6 +3,7 @@
 use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::OnceLock;
 
 use crate::HooksToml;
 use crate::permissions_toml::PermissionsToml;
@@ -648,12 +649,13 @@ where
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq, JsonSchema)]
 #[schemars(deny_unknown_fields)]
 pub struct AgentsToml {
-    /// Maximum number of agent threads that can be open concurrently.
-    /// When unset, no limit is enforced.
+    /// Maximum concurrent non-root agent threads for the legacy runtime.
+    /// When unset, the runtime default applies. Cannot be set when multi-agent V2 is enabled;
+    /// configure `features.multi_agent_v2.max_concurrent_threads_per_session` instead.
     #[schemars(range(min = 1))]
     pub max_threads: Option<usize>,
-    /// Maximum nesting depth allowed for spawned agent threads.
-    /// Root sessions start at depth 0.
+    /// Legacy nesting-depth setting; root sessions start at depth 0.
+    /// Multi-agent V2 does not apply this setting and uses runtime admission limits instead.
     #[schemars(range(min = 1))]
     pub max_depth: Option<i32>,
     /// Default maximum runtime in seconds for agent job workers.
@@ -844,34 +846,41 @@ pub(crate) fn normalize_project_lookup_key(key: &str) -> String {
 
 pub(crate) struct ProjectLookup<T> {
     exact: HashMap<String, T>,
-    normalized: BTreeMap<String, String>,
+    normalized: OnceLock<BTreeMap<String, String>>,
 }
 
 impl<T> ProjectLookup<T> {
     pub(crate) fn new(exact: HashMap<String, T>) -> Self {
-        let mut keys = exact.keys().cloned().collect::<Vec<_>>();
-        keys.sort();
-        let mut normalized = BTreeMap::new();
-        for key in keys {
-            // Resolve equivalence using the filesystem, not case folding: Windows
-            // can contain both case-insensitive and case-sensitive directories.
-            if let Ok(canonical) = normalize_for_path_comparison(Path::new(&key)) {
-                normalized
-                    .entry(normalize_project_lookup_key(&canonical.to_string_lossy()))
-                    .or_insert_with(|| key.clone());
-            }
-            normalized
-                .entry(normalize_project_lookup_key(&key))
-                .or_insert(key);
+        Self {
+            exact,
+            normalized: OnceLock::new(),
         }
-        Self { exact, normalized }
     }
 
     pub(crate) fn get(&self, lookup_key: &str) -> Option<(&str, &T)> {
         if let Some((key, value)) = self.exact.get_key_value(lookup_key) {
             return Some((key.as_str(), value));
         }
-        let key = self.normalized.get(lookup_key)?;
+        // Exact spelling has priority and needs no filesystem equivalence work.
+        // Build the deterministic fallback only when a lookup actually needs it.
+        let normalized = self.normalized.get_or_init(|| {
+            let mut keys = self.exact.keys().cloned().collect::<Vec<_>>();
+            keys.sort();
+            let mut normalized = BTreeMap::new();
+            for key in keys {
+                // Do not case-fold: Windows supports case-sensitive directories.
+                if let Ok(canonical) = normalize_for_path_comparison(Path::new(&key)) {
+                    normalized
+                        .entry(normalize_project_lookup_key(&canonical.to_string_lossy()))
+                        .or_insert_with(|| key.clone());
+                }
+                normalized
+                    .entry(normalize_project_lookup_key(&key))
+                    .or_insert(key);
+            }
+            normalized
+        });
+        let key = normalized.get(lookup_key)?;
         self.exact
             .get_key_value(key)
             .map(|(key, value)| (key.as_str(), value))

@@ -145,6 +145,7 @@ pub(crate) mod turn_diff_tracker;
 mod turn_metadata;
 mod turn_timing;
 use codex_command_analysis::validation;
+mod validation_resources;
 mod validation_task;
 mod workspace_operation_gate;
 pub(crate) use codex_tools::FunctionCallError;

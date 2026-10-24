@@ -190,6 +190,39 @@ async fn failed_refresh_retains_last_success_until_recovery_or_removal() {
 }
 
 #[tokio::test]
+async fn failed_override_refresh_retains_last_good_over_readable_default() {
+    let home = TempDir::new().expect("temp dir");
+    let provider = provider(&home);
+    let override_path = home.path().join(LOCAL_AGENTS_MD_FILENAME);
+    fs::write(home.path().join(DEFAULT_AGENTS_MD_FILENAME), "fallback").expect("write default");
+    fs::write(&override_path, "binding override").expect("write override");
+    let initial = provider.load_user_instructions().await;
+    assert_eq!(
+        initial,
+        expected(&home, LOCAL_AGENTS_MD_FILENAME, "binding override", Vec::new()),
+    );
+
+    fs::remove_file(&override_path).expect("remove override");
+    create_symlink_loop(&override_path);
+    let failed = provider.load_user_instructions().await;
+    assert_eq!(failed.instructions, initial.instructions);
+    assert_eq!(failed.warnings.len(), 1);
+    assert_eq!(provider.clone().load_user_instructions().await, initial);
+
+    fs::remove_file(&override_path).expect("remove broken symlink");
+    fs::write(&override_path, "recovered override").expect("restore override");
+    assert_eq!(
+        provider.load_user_instructions().await,
+        expected(&home, LOCAL_AGENTS_MD_FILENAME, "recovered override", Vec::new()),
+    );
+    fs::remove_file(&override_path).expect("confirm override removal");
+    assert_eq!(
+        provider.load_user_instructions().await,
+        expected(&home, DEFAULT_AGENTS_MD_FILENAME, "fallback", Vec::new()),
+    );
+}
+
+#[tokio::test]
 async fn removed_override_is_not_restored_when_default_read_fails() {
     assert_unavailable_override_is_not_restored(None).await;
 }

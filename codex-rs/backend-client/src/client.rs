@@ -64,6 +64,7 @@ pub enum RequestError {
         status: StatusCode,
         content_type: String,
         body: String,
+        retry_after: Option<codex_http_client::RetryAfter>,
     },
     Other(anyhow::Error),
 }
@@ -81,6 +82,13 @@ impl RequestError {
     pub fn is_unauthorized(&self) -> bool {
         self.status() == Some(StatusCode::UNAUTHORIZED)
     }
+
+    pub fn retry_after(&self) -> Option<codex_http_client::RetryAfter> {
+        match self {
+            Self::UnexpectedStatus { retry_after, .. } => *retry_after,
+            _ => None,
+        }
+    }
 }
 
 impl fmt::Display for RequestError {
@@ -96,6 +104,7 @@ impl fmt::Display for RequestError {
                 status,
                 content_type,
                 body,
+                ..
             } => write!(
                 f,
                 "{method} {url} failed: {status}; content-type={content_type}; body={body}"
@@ -334,6 +343,20 @@ impl Client {
             .and_then(|v| v.to_str().ok())
             .unwrap_or("")
             .to_string();
+        if !status.is_success() {
+            let retry_after = codex_http_client::RetryAfter::from_headers(res.headers());
+            let body = codex_http_client::collect_error_body(res.bytes_stream())
+                .await
+                .unwrap_or_else(|| "[HTTP error body unavailable]".to_string());
+            return Err(RequestError::UnexpectedStatus {
+                method: method.to_string(),
+                url: url.to_string(),
+                status,
+                content_type,
+                body,
+                retry_after,
+            });
+        }
         let body = res
             .text()
             .await
@@ -342,15 +365,6 @@ impl Client {
                 status,
                 source: source.without_url(),
             })?;
-        if !status.is_success() {
-            return Err(RequestError::UnexpectedStatus {
-                method: method.to_string(),
-                url: url.to_string(),
-                status,
-                content_type,
-                body,
-            });
-        }
         Ok((body, content_type))
     }
 

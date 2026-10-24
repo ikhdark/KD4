@@ -349,6 +349,12 @@ impl ThreadHistoryBuilder {
             .or_else(|| self.turns.last().cloned())
     }
 
+    /// Lifecycle-only consumers need not clone the active turn's item payloads.
+    pub fn active_turn_status(&self) -> Option<TurnStatus> {
+        self.current_turn.as_ref().map(|turn| turn.status.clone())
+            .or_else(|| self.turns.last().map(|turn| turn.status.clone()))
+    }
+
     /// Returns the current turn only while it is still in progress.
     ///
     /// Interrupted turns intentionally remain open briefly so late items can still be grouped

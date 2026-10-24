@@ -155,21 +155,8 @@ impl RawOutputArtifactTask {
         };
         let id = ToolOutputArtifactId::new();
         let path = codex_home.join("command-output").join(&thread_id).join(format!("{id}.log"));
-        let opened = (|| {
-            let residency = super::command_output_artifact::artifact_residency_file(&codex_home, &thread_id, false)?;
-            std::fs::create_dir_all(path.parent().ok_or_else(|| std::io::Error::other("missing log parent"))?)?;
-            let file = OpenOptions::new().create_new(true).read(true).write(true).open(&path)?;
-            Ok::<_, std::io::Error>((file, residency))
-        })();
-        let (writer, handle, residency, failure) = match opened.and_then(|(file, residency)| {
-            let handle = Arc::new(file.try_clone()?);
-            Ok((BufWriter::with_capacity(64 * 1024, file), handle, residency))
-        }) {
-            Ok((writer, handle, residency)) => (Some(writer), Some(handle), Some(residency), None),
-            Err(error) => (None, None, None, Some(error.to_string())),
-        };
-        let mut capture = Self { state, ready, writer, handle, _residency: residency, id, path, bytes: 0, digest: Sha256::new(),
-            incomplete: false, failure, finished: false };
+        let mut capture = Self { state, ready, writer: None, handle: None, _residency: None, id, path, bytes: 0, digest: Sha256::new(),
+            incomplete: false, failure: None, finished: false };
         if let Some((previous, incomplete)) = previous {
             capture.incomplete = incomplete;
             match File::open(previous) {
@@ -200,6 +187,14 @@ impl RawOutputArtifactTask {
     }
 
     pub(crate) fn write_chunk(&mut self, output: &[u8]) {
+        if output.is_empty() { return; }
+        if self.writer.is_none() && self.failure.is_none() {
+            if let Err(error) = self.initialize_writer() {
+                self.failure = Some(error.to_string());
+                self.incomplete = true;
+                return;
+            }
+        }
         let Some(writer) = self.writer.as_mut() else { return; };
         if let Err(error) = writer.write_all(output) {
             self.failure = Some(error.to_string());
@@ -210,6 +205,19 @@ impl RawOutputArtifactTask {
         self.bytes = self.bytes.saturating_add(output.len() as u64);
         self.digest.update(output);
         self.publish_live();
+    }
+
+    fn initialize_writer(&mut self) -> std::io::Result<()> {
+        let thread = self.path.parent().ok_or_else(|| std::io::Error::other("missing log parent"))?;
+        let home = thread.parent().and_then(Path::parent).ok_or_else(|| std::io::Error::other("missing log home"))?;
+        let thread_id = thread.file_name().and_then(|name| name.to_str()).ok_or_else(|| std::io::Error::other("invalid log thread"))?;
+        let residency = super::artifact_residency_file(home, thread_id, false)?;
+        std::fs::create_dir_all(thread)?;
+        let file = OpenOptions::new().create_new(true).read(true).write(true).open(&self.path)?;
+        self.handle = Some(Arc::new(file.try_clone()?));
+        self.writer = Some(BufWriter::with_capacity(64 * 1024, file));
+        self._residency = Some(residency);
+        Ok(())
     }
 
     fn publish_live(&self) {
@@ -229,6 +237,13 @@ impl RawOutputArtifactTask {
     }
 
     pub(crate) async fn finish(mut self) {
+        // Empty, complete producers need no durable recovery object. Leave the
+        // pending (or previous empty) state for consumers' inline fallback.
+        if self.handle.is_none() && self.failure.is_none() && !self.incomplete {
+            self.finished = true;
+            self.ready.cancel();
+            return;
+        }
         let artifact = if let Some(mut writer) = self.writer.take() {
             let result = (|| {
                 writer.flush()?;
@@ -260,7 +275,7 @@ impl RawOutputArtifactTask {
     }
 
     fn failed(&self, message: String) -> RawOutputArtifact {
-        RawOutputArtifact::Failed { id: Some(self.id), message, owned_path: Some(self.path.clone()), bytes: self.bytes }
+        RawOutputArtifact::Failed { id: self.handle.as_ref().map(|_| self.id), message, owned_path: self.handle.as_ref().map(|_| self.path.clone()), bytes: self.bytes }
     }
 }
 
@@ -274,8 +289,10 @@ impl Drop for RawOutputArtifactTask {
                 "complete": false, "bytes": self.bytes,
                 "sha256": hex::encode(self.digest.clone().finalize()),
             });
-            if let Ok(bytes) = serde_json::to_vec(&status) {
-                let _ = codex_file_system::write_bytes_atomically(&self.path.with_extension("status"), &bytes);
+            if self.handle.is_some() {
+                if let Ok(bytes) = serde_json::to_vec(&status) {
+                    let _ = codex_file_system::write_bytes_atomically(&self.path.with_extension("status"), &bytes);
+                }
             }
             if let Ok(mut state) = self.state.try_lock() {
                 *state = self.failed("command output capture ended before finalization".into());
@@ -286,7 +303,7 @@ impl Drop for RawOutputArtifactTask {
 }
 
 /// Return None for an old/indexed artifact so its existing recovery owner handles it.
-/// Reads are thread-confined, line-only, bounded-memory and never mutate saved logs.
+/// Reads are thread-confined, bounded-memory and never mutate saved logs.
 pub(crate) async fn read_command_log(
     home: &Path, thread_id: &str, artifact_id: &str,
     selectors: &[ToolOutputSelector], max_bytes: usize,
@@ -315,22 +332,43 @@ pub(crate) async fn read_command_log(
         let mut remaining = max_bytes;
         let mut results = Vec::new();
         let mut offsets = std::collections::BTreeMap::new();
+        let mut ranges = Vec::with_capacity(selectors.len());
+        let mut byte_ranges = Vec::new();
         for selector in &selectors {
+            if let ToolOutputSelector::Bytes { start, end } = selector {
+                if start > end || *end > metadata.len() {
+                    return Err(super::ReadToolOutputError::InvalidRange(format!(
+                        "byte range must be within retained bytes 0..{}", metadata.len()
+                    )));
+                }
+                byte_ranges.push((*start, *end));
+                continue;
+            }
             let ToolOutputSelector::Lines { start, end } = selector else {
                 return Err(super::ReadToolOutputError::InvalidRange(
-                    "Command logs support line ranges only; use selectors:[{kind:lines,start:1,end:200}]. Source snapshots retain advanced selectors.".into()));
+                    "Command logs support bytes and lines selectors; source snapshots retain advanced selectors.".into()));
             };
             if *start == 0 || end < start {
                 return Err(super::ReadToolOutputError::InvalidRange("expected 1-based start <= end".into()));
             }
-            offsets.insert(*start, None);
+            ranges.push((*start, *end));
+        }
+        // Use the snapshot owner's canonical union, not independent overlapping
+        // deliveries charged repeatedly against the same response budget.
+        let selectors = super::normalize_line_ranges(ranges).into_iter()
+            .map(|(start, end)| ToolOutputSelector::Lines { start, end })
+            .collect::<Vec<_>>();
+        for selector in &selectors {
+            if let ToolOutputSelector::Lines { start, .. } = selector {
+                offsets.insert(*start, None);
+            }
         }
         let io_error = |error: std::io::Error| super::ReadToolOutputError::Io(error.to_string());
         let mut reader = BufReader::new(File::open(&path).map_err(io_error)?);
         let mut scanned_line = 1usize;
         let mut offset = 0u64;
         // Index only requested starts, in one bounded-memory prefix scan.
-        // Delivery remains in caller order, including its shared byte budget.
+        // Delivery uses canonical source order and a shared byte budget.
         for (start, position) in &mut offsets {
             while scanned_line < *start {
                 let available = reader.fill_buf().map_err(io_error)?;
@@ -346,7 +384,7 @@ pub(crate) async fn read_command_log(
         for selector in selectors {
             let ToolOutputSelector::Lines { start, end } = selector else {
                 return Err(super::ReadToolOutputError::InvalidRange(
-                    "Command logs support line ranges only; use selectors:[{kind:lines,start:1,end:200}]. Source snapshots retain advanced selectors.".into()));
+                    "Command logs support bytes and lines selectors; source snapshots retain advanced selectors.".into()));
             };
             if start == 0 || end < start { return Err(super::ReadToolOutputError::InvalidRange("expected 1-based start <= end".into())); }
             let position = offsets.get(&start).copied().flatten();
@@ -357,6 +395,7 @@ pub(crate) async fn read_command_log(
             let mut selection = Vec::new();
             let mut complete = true;
             let mut next_line = None;
+            let mut next_bytes = None;
             let mut error = None;
             while position.is_some() && line <= end {
                 let mut bytes = Vec::new();
@@ -366,8 +405,25 @@ pub(crate) async fn read_command_log(
                 if count == 0 { break; }
                 if count > remaining {
                     if selection.is_empty() && remaining == max_bytes {
+                        // Find the whole unconsumed selection's exact byte extent
+                        // without buffering it, including later requested lines.
+                        // read_file cannot recover oversized or non-UTF-8 logs.
+                        let start = position.unwrap_or(0);
+                        let mut byte_end = start + count as u64;
+                        let mut lines_left = end - line + 1;
+                        if bytes.last() == Some(&b'\n') { lines_left -= 1; }
+                        while lines_left > 0 {
+                            let available = reader.fill_buf().map_err(io_error)?;
+                            if available.is_empty() { break; }
+                            let newline = available.iter().position(|byte| *byte == b'\n');
+                            let count = newline.map_or(available.len(), |index| index + 1);
+                            reader.consume(count);
+                            byte_end += count as u64;
+                            if newline.is_some() { lines_left -= 1; }
+                        }
+                        next_bytes = Some((start, byte_end));
                         error = Some(format!(
-                            "Line {line} exceeds this response budget. Request a larger max_bytes in Code Mode, or read the saved log directly: {}", path.display()
+                            "Line {line} cannot fit this whole-line response ({max_bytes} source bytes). Recover the remaining requested lines with read_tool_output using the returned byte continuation."
                         ));
                     } else {
                         next_line = Some(line);
@@ -381,8 +437,11 @@ pub(crate) async fn read_command_log(
             }
             let mut item = serde_json::json!({
                 "selector":{"kind":"lines","start":start,"end":end},
-                "status":if error.is_some() { "invalid" } else { "ok" }, "complete":complete,
+                "status":if error.is_some() { "selector_too_large" } else { "ok" }, "complete":complete,
             });
+            if let Some(start) = position {
+                item["canonical_range"] = serde_json::json!({"start":start,"end":start + selection.len() as u64});
+            }
             if let Some(error) = error { item["message"] = error.into(); }
             match String::from_utf8(selection) {
                 Ok(text) => item["text"] = text.into(),
@@ -392,8 +451,45 @@ pub(crate) async fn read_command_log(
             if let Some(start) = next_line {
                 item["continuation"] = serde_json::json!({"kind":"lines","start":start,"end":end});
             }
+            if let Some((start, end)) = next_bytes {
+                item["continuation"] = serde_json::json!({"kind":"bytes","start":start,"end":end});
+            }
             results.push(item);
         }
+        byte_ranges.sort_unstable();
+        let mut normalized_bytes: Vec<(u64, u64)> = Vec::new();
+        for (start, end) in byte_ranges {
+            if let Some((_, previous_end)) = normalized_bytes.last_mut()
+                && start <= *previous_end
+            {
+                *previous_end = (*previous_end).max(end);
+            } else {
+                normalized_bytes.push((start, end));
+            }
+        }
+        for (start, end) in normalized_bytes {
+            let count = (end - start).min(remaining as u64) as usize;
+            reader.seek(SeekFrom::Start(start)).map_err(io_error)?;
+            let mut bytes = vec![0; count];
+            reader.read_exact(&mut bytes).map_err(io_error)?;
+            remaining -= count;
+            let delivered_end = start + count as u64;
+            let mut item = serde_json::json!({
+                "selector":{"kind":"bytes","start":start,"end":end},
+                "status":"ok", "complete":delivered_end == end,
+                "canonical_range":{"start":start,"end":delivered_end},
+            });
+            match String::from_utf8(bytes) {
+                Ok(text) => item["text"] = text.into(),
+                Err(error) => item["data_base64"] =
+                    base64::engine::general_purpose::STANDARD.encode(error.into_bytes()).into(),
+            }
+            if delivered_end < end {
+                item["continuation"] = serde_json::json!({"kind":"bytes","start":delivered_end,"end":end});
+            }
+            results.push(item);
+        }
+        results.sort_by_key(|result| result["canonical_range"]["start"].as_u64().unwrap_or(u64::MAX));
         Ok(Some(serde_json::json!({
             "artifact_id":artifact_id,
             "canonical_sha256":status["sha256"],
@@ -451,10 +547,61 @@ mod tests {
         let batch = read_command_log(home.path(), "lines", &id,
             &[ToolOutputSelector::Lines { start:1, end:1 }, ToolOutputSelector::Lines { start:2, end:2 }],
             8).await.unwrap().unwrap();
-        assert_eq!(batch["results"][0]["status"], "invalid");
+        assert_eq!(batch["results"][0]["status"], "selector_too_large");
+        assert_eq!(batch["results"][0]["continuation"],
+            serde_json::json!({"kind":"bytes", "start":0, "end":32 * 1024 + 1}));
         assert_eq!(batch["results"][1]["text"], "first\n");
         assert_eq!(batch["retained_artifact_complete"], true);
         assert_eq!(batch["canonical_bytes"], 32 * 1024 + 14);
+    }
+    #[tokio::test]
+    async fn oversized_binary_command_lines_recover_through_the_same_artifact() {
+        let home = tempfile::tempdir().unwrap();
+        let state = Arc::new(Mutex::new(RawOutputArtifact::pending(home.path(), "binary")));
+        let mut task = RawOutputArtifactTask::spawn(Some(state.clone()), CancellationToken::new()).unwrap();
+        // Larger than read_file's whole-file limit, and not valid UTF-8.
+        let prefix_bytes = 8 * 1024 * 1024 + 1;
+        task.write_chunk(&vec![b'x'; prefix_bytes]);
+        task.write_chunk(b"\xff\nnext\n");
+        task.finish().await;
+        let id = state.lock().await.artifact_id().unwrap().to_string();
+        let overflow = read_command_log(home.path(), "binary", &id,
+            &[ToolOutputSelector::Lines { start:1, end:1 }], 8).await.unwrap().unwrap();
+        let continuation = &overflow["results"][0]["continuation"];
+        assert_eq!(continuation, &serde_json::json!({
+            "kind":"bytes", "start":0, "end":prefix_bytes + 2,
+        }));
+        let multiline = read_command_log(home.path(), "binary", &id,
+            &[ToolOutputSelector::Lines { start:1, end:2 }], 8).await.unwrap().unwrap();
+        assert_eq!(multiline["results"][0]["continuation"]["end"], prefix_bytes + 7);
+        let selector = serde_json::from_value(continuation.clone()).unwrap();
+        let first = read_command_log(home.path(), "binary", &id,
+            &[selector], 8).await.unwrap().unwrap();
+        assert_eq!(first["results"][0]["text"], "xxxxxxxx");
+        assert_eq!(first["results"][0]["continuation"]["start"], 8);
+        let tail = read_command_log(home.path(), "binary", &id,
+            &[ToolOutputSelector::Bytes { start:prefix_bytes as u64, end:prefix_bytes as u64 + 2 }],
+            8).await.unwrap().unwrap();
+        assert_eq!(tail["results"][0]["data_base64"],
+            base64::engine::general_purpose::STANDARD.encode(b"\xff\n"));
+        assert_eq!(tail["complete"], true);
+        assert_eq!(tail["retained_artifact_complete"], true);
+        let normalized = read_command_log(home.path(), "binary", &id,
+            &[ToolOutputSelector::Bytes { start:0, end:4 }, ToolOutputSelector::Bytes { start:2, end:8 }],
+            8).await.unwrap().unwrap();
+        assert_eq!(normalized["results"].as_array().unwrap().len(), 1);
+        assert_eq!(normalized["results"][0]["text"], "xxxxxxxx");
+        assert!(read_command_log(home.path(), "other-thread", &id,
+            &[ToolOutputSelector::Bytes { start:0, end:8 }], 8).await.unwrap().is_none());
+        let codex_tools::ToolSpec::Function(spec) =
+            crate::tools::handlers::read_tool_output_spec::create_read_tool_output_tool() else {
+                panic!("function tool");
+            };
+        let schema = spec.output_schema.unwrap().into_value();
+        let validator = jsonschema::validator_for(&schema).unwrap();
+        for output in [&overflow, &first, &tail, &normalized] {
+            assert!(validator.is_valid(output), "{output}");
+        }
     }
     #[tokio::test]
     async fn full_log_exceeds_old_cap_and_remains_line_readable() {

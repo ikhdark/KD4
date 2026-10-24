@@ -1130,17 +1130,10 @@ impl RolloutRecorder {
         expected_thread: ThreadId,
         lease: Option<Arc<std::fs::File>>,
     ) -> std::io::Result<(Self, Vec<RolloutItem>)> {
-        let (path, writer) = open_rollout_for_append(&path).await?;
-        let lock_path = path.clone();
-        let _snapshot = tokio::task::spawn_blocking(move || {
-            compression::lock_rollout_for_write_blocking(&lock_path)
-        })
-        .await
-        .map_err(IoError::other)??;
         let mut items = Vec::new();
         let mut manifests = crate::ToolManifestDictionary::default();
-        let (thread_id, errors, partial_tail, unresolved_payloads) =
-            Self::for_each_rollout_item_with_integrity(&path, true, |item, _| {
+        let (path, writer, integrity) =
+            open_rollout_for_append_with_replay(&path, |item, _| {
                 if let RolloutItem::ToolManifest(manifest) = &item
                     && let Err(error) = manifests.apply(manifest)
                 {
@@ -1149,6 +1142,8 @@ impl RolloutRecorder {
                 items.push(item);
             })
             .await?;
+        let (thread_id, errors, partial_tail, unresolved_payloads) = integrity
+            .ok_or_else(|| IoError::new(ErrorKind::InvalidData, "empty session file"))?;
         if thread_id != Some(expected_thread) {
             return Err(IoError::other(
                 "resume rollout belongs to a different thread",
@@ -1243,8 +1238,16 @@ impl RolloutRecorder {
                 let (path, writer, tool_manifests) = if let Some((writer, manifests)) = resumed {
                     (path, writer, manifests)
                 } else {
-                    let tool_manifests = Self::existing_tool_manifests(path.as_path()).await?;
-                    let (path, writer) = open_rollout_for_append(path.as_path()).await?;
+                    let mut tool_manifests = crate::ToolManifestDictionary::default();
+                    let (path, writer, _) = open_rollout_for_append_with_replay(
+                        path.as_path(), |item, _| {
+                            if let RolloutItem::ToolManifest(manifest) = item
+                                && let Err(err) = tool_manifests.apply(&manifest)
+                            {
+                                warn!(%err, "failed to reconstruct persisted tool manifest");
+                            }
+                        },
+                    ).await?;
                     (path, writer, tool_manifests)
                 };
                 (Some(writer), None, path, None, tool_manifests)
@@ -1326,15 +1329,17 @@ impl RolloutRecorder {
         if admission_bytes.is_err() {
             // Validate every individual item before accepting any prefix. Bulk
             // inheritance may exceed admission even though each record fits.
-            for item in items {
-                rollout_admission_bytes(std::slice::from_ref(item))?;
-            }
+            let charges = items.iter()
+                .map(|item| rollout_admission_bytes(std::slice::from_ref(item)))
+                .collect::<std::io::Result<Vec<_>>>()?;
             let mut start = 0;
             let mut charge = 0usize;
-            for (index, item) in items.iter().enumerate() {
-                let next = rollout_admission_bytes(std::slice::from_ref(item))? as usize;
+            for (index, next) in charges.into_iter().enumerate() {
+                let next = next as usize;
                 if index > start && charge.saturating_add(next) > MAX_PENDING_ROLLOUT_BYTES / 2 {
-                    self.record_canonical_items(&items[start..index]).await?;
+                    self.record_canonical_items_with_admission(
+                        &items[start..index], true, false, Some(charge as u32),
+                    ).await?;
                     // Lazy pending items release admission only after materialization.
                     // No enqueue gate is held across this barrier.
                     self.persist().await?;
@@ -1343,7 +1348,9 @@ impl RolloutRecorder {
                 }
                 charge = charge.saturating_add(next);
             }
-            self.record_canonical_items(&items[start..]).await?;
+            self.record_canonical_items_with_admission(
+                &items[start..], true, false, Some(charge as u32),
+            ).await?;
             return self.persist().await;
         }
         // Waiting for the consumer's acknowledgement also waits for its preceding
@@ -1515,10 +1522,41 @@ impl RolloutRecorder {
     pub async fn load_rollout_items(
         path: &Path,
     ) -> std::io::Result<(Vec<RolloutItem>, Option<ThreadId>, usize)> {
+        let (items, thread_id, errors, _) = Self::load_rollout_items_inner(path, false).await?;
+        Ok((items, thread_id, errors))
+    }
+
+    /// Load canonical history and dependency versions observed before hydration,
+    /// without a separate discovery/decompression pass.
+    pub async fn load_rollout_items_with_payload_versions(
+        path: &Path,
+    ) -> std::io::Result<(
+        Vec<RolloutItem>,
+        Option<ThreadId>,
+        usize,
+        Vec<crate::PayloadDependencyVersion>,
+    )> {
+        Self::load_rollout_items_inner(path, true).await
+    }
+
+    async fn load_rollout_items_inner(
+        path: &Path,
+        capture_payload_versions: bool,
+    ) -> std::io::Result<(
+        Vec<RolloutItem>,
+        Option<ThreadId>,
+        usize,
+        Vec<crate::PayloadDependencyVersion>,
+    )> {
         let mut items = Vec::new();
-        let (thread_id, parse_errors, trailing_partial_records, unresolved_payloads) =
-            Self::for_each_rollout_item_with_integrity(path, false, |item, _| items.push(item))
-                .await?;
+        let (thread_id, parse_errors, trailing_partial_records, unresolved_payloads, versions) =
+            Self::for_each_rollout_item_with_versions(
+                path,
+                false,
+                capture_payload_versions,
+                |item, _| items.push(item),
+            )
+            .await?;
         tracing::debug!(
             "Resumed rollout with {} items, thread ID: {:?}, parse errors: {}",
             items.len(),
@@ -1531,7 +1569,7 @@ impl RolloutRecorder {
             trailing_partial_records,
             unresolved_payloads,
         );
-        Ok((items, thread_id, parse_errors))
+        Ok((items, thread_id, parse_errors, versions))
     }
 
     fn append_reconstruction_notice(
@@ -1599,8 +1637,28 @@ impl RolloutRecorder {
     pub(crate) async fn for_each_rollout_item_with_integrity<F>(
         path: &Path,
         enroll_dependencies: bool,
-        mut visit: F,
+        visit: F,
     ) -> std::io::Result<(Option<ThreadId>, usize, usize, usize)>
+    where
+        F: FnMut(RolloutItem, usize),
+    {
+        let (id, errors, partial, unresolved, _) =
+            Self::for_each_rollout_item_with_versions(path, enroll_dependencies, false, visit).await?;
+        Ok((id, errors, partial, unresolved))
+    }
+
+    async fn for_each_rollout_item_with_versions<F>(
+        path: &Path,
+        enroll_dependencies: bool,
+        capture_payload_versions: bool,
+        mut visit: F,
+    ) -> std::io::Result<(
+        Option<ThreadId>,
+        usize,
+        usize,
+        usize,
+        Vec<crate::PayloadDependencyVersion>,
+    )>
     where
         F: FnMut(RolloutItem, usize),
     {
@@ -1609,6 +1667,9 @@ impl RolloutRecorder {
         let mut parse_errors = 0usize;
         let mut last_record_partial = false;
         let mut reader = compression::open_rollout_line_reader(path).await?;
+        if capture_payload_versions {
+            reader.capture_payload_versions();
+        }
         if enroll_dependencies {
             reader.enroll_payload_dependencies();
         }
@@ -1707,9 +1768,11 @@ impl RolloutRecorder {
             parse_errors,
             usize::from(last_record_partial),
             reader.unresolved_payloads(),
+            reader.take_payload_versions(),
         ))
     }
 
+    #[cfg(test)]
     async fn existing_tool_manifests(
         path: &Path,
     ) -> std::io::Result<crate::ToolManifestDictionary> {
@@ -2320,6 +2383,7 @@ fn precompute_log_file_info(
 struct LockedRolloutFile {
     path: PathBuf,
     file: File,
+    payload_sync_owner: Arc<crate::payload_artifact::PayloadSyncOwner>,
     append_lock: compression::RolloutAppendLock,
     payload_retention: std::fs::File,
 }
@@ -2329,6 +2393,7 @@ impl LockedRolloutFile {
         JsonlWriter {
             path: self.path,
             file: tokio::fs::File::from_std(self.file),
+            _payload_sync_owner: self.payload_sync_owner,
             _append_lock: Arc::new(self.append_lock),
             _payload_retention: Arc::new(self.payload_retention),
             #[cfg(test)]
@@ -2367,6 +2432,7 @@ fn open_log_file_with_options(
     let locked_file = LockedRolloutFile {
         path: path.clone(),
         file,
+        payload_sync_owner: crate::payload_artifact::PayloadSyncOwner::new(&path),
         append_lock,
         payload_retention,
     };
@@ -2380,6 +2446,7 @@ fn open_log_file_with_options(
 /// unwritten suffix so the next barrier can reopen the file and retry.
 struct RolloutWriterState {
     writer: Option<JsonlWriter>,
+    payload_sync_owner: Arc<crate::payload_artifact::PayloadSyncOwner>,
     residency: Option<(Arc<compression::RolloutAppendLock>, Arc<std::fs::File>)>,
     deferred_log_file_info: Option<LogFileInfo>,
     pending_items: Vec<CapturedRolloutItem>,
@@ -2413,8 +2480,12 @@ impl RolloutWriterState {
                 Arc::clone(&writer._payload_retention),
             )
         });
+        let payload_sync_owner = writer.as_ref()
+            .map(|writer| Arc::clone(&writer._payload_sync_owner))
+            .unwrap_or_else(|| crate::payload_artifact::PayloadSyncOwner::new(&rollout_path));
         Self {
             writer,
+            payload_sync_owner,
             residency,
             deferred_log_file_info,
             pending_items: Vec::new(),
@@ -2637,6 +2708,7 @@ impl RolloutWriterState {
             JsonlWriter {
                 path: self.rollout_path.clone(),
                 file: tokio::fs::File::from_std(file),
+                _payload_sync_owner: Arc::clone(&self.payload_sync_owner),
                 _append_lock: Arc::clone(append_lock),
                 _payload_retention: Arc::clone(payload_retention),
                 #[cfg(test)]
@@ -2792,19 +2864,14 @@ impl RolloutWriterState {
             self.pending_items.clear();
             return Ok(());
         }
-        writer
-            .write_rollout_items_locked(&items, &write_lock)
+        let committed_end = writer
+            .write_rollout_items_locked(&items, &write_lock, Some(prefix_len))
             .await?;
         // End the borrowed write view before releasing the retained originals.
         drop(items);
         drop(compacted);
         self.last_settings = last_settings;
-        self.settings_prefix_len = writer
-            .file
-            .metadata()
-            .await
-            .ok()
-            .map(|metadata| metadata.len());
+        self.settings_prefix_len = Some(committed_end);
         if session_meta_item.is_some() {
             self.meta = None;
         }
@@ -2835,8 +2902,17 @@ async fn rollout_writer(
         tool_manifests,
     );
 
-    // Process rollout commands
-    while let Some(cmd) = rx.recv().await {
+    // Only adjacent, immediately ready additions may share an append. Bound
+    // each drain so producers cannot postpone incremental persistence forever.
+    let mut next_command = None;
+    loop {
+        let cmd = match next_command.take() {
+            Some(cmd) => cmd,
+            None => match rx.recv().await {
+                Some(cmd) => cmd,
+                None => break,
+            },
+        };
         match cmd {
             RolloutCmd::AddItems {
                 items,
@@ -2846,6 +2922,23 @@ async fn rollout_writer(
                 state.add_items(items);
                 if let Some(accepted) = accepted {
                     let _ = accepted.send(());
+                }
+                let mut flush_if_materialized = flush_if_materialized;
+                for _ in 1..32 {
+                    match rx.try_recv() {
+                        Ok(RolloutCmd::AddItems { items, flush_if_materialized: flush, accepted }) => {
+                            state.add_items(items);
+                            flush_if_materialized |= flush;
+                            if let Some(accepted) = accepted {
+                                let _ = accepted.send(());
+                            }
+                        }
+                        Ok(barrier) => {
+                            next_command = Some(barrier);
+                            break;
+                        }
+                        Err(_) => break,
+                    }
                 }
                 if flush_if_materialized {
                     state.flush_if_materialized().await;
@@ -2965,6 +3058,19 @@ pub async fn append_rollout_item_to_path(
 }
 
 async fn open_rollout_for_append(path: &Path) -> std::io::Result<(PathBuf, JsonlWriter)> {
+    let (path, writer, _) = open_rollout_for_append_with_replay(path, |_, _| {}).await?;
+    Ok((path, writer))
+}
+
+type AppendReplayIntegrity = (Option<ThreadId>, usize, usize, usize);
+
+async fn open_rollout_for_append_with_replay<F>(
+    path: &Path,
+    visit: F,
+) -> std::io::Result<(PathBuf, JsonlWriter, Option<AppendReplayIntegrity>)>
+where
+    F: FnMut(RolloutItem, usize),
+{
     let path = path.to_path_buf();
     let lock_path = path.clone();
     let (payload_retention, append_lock, snapshot) = tokio::task::spawn_blocking(move || {
@@ -2977,17 +3083,18 @@ async fn open_rollout_for_append(path: &Path) -> std::io::Result<(PathBuf, Jsonl
     })
     .await
     .map_err(IoError::other)??;
-    match RolloutRecorder::for_each_rollout_item_with_integrity(&path, false, |_, _| {}).await {
+    let payload_sync_owner = crate::payload_artifact::PayloadSyncOwner::new(&path);
+    // Collection and append preflight share this one verified observation,
+    // while all publication/representation/byte-write owners remain held.
+    let integrity = match RolloutRecorder::for_each_rollout_item_with_integrity(&path, true, visit).await {
         // A live owner can reopen an empty file after an interrupted initial
         // write. There is no unknown semantic record to fence in that case.
         Err(error)
             if error.kind() == ErrorKind::InvalidData
-                && error.to_string() == "empty session file" => {}
-        result => {
-            result?;
-        }
-    }
-    tokio::task::spawn_blocking(move || {
+                && error.to_string() == "empty session file" => None,
+        result => Some(result?),
+    };
+    let (path, writer) = tokio::task::spawn_blocking(move || {
         let path = compression::materialize_rollout_for_append_locked(&path)?;
         let mut file = std::fs::OpenOptions::new()
             .read(true)
@@ -2997,14 +3104,16 @@ async fn open_rollout_for_append(path: &Path) -> std::io::Result<(PathBuf, Jsonl
         let file = LockedRolloutFile {
             path: path.clone(),
             file,
+            payload_sync_owner,
             append_lock,
             payload_retention,
         };
         drop(snapshot);
-        Ok((path, file.into_jsonl_writer()))
+        Ok::<_, IoError>((path, file.into_jsonl_writer()))
     })
     .await
-    .map_err(IoError::other)?
+    .map_err(IoError::other)??;
+    Ok((path, writer, integrity))
 }
 
 fn ensure_rollout_is_newline_terminated(file: &mut File) -> std::io::Result<()> {
@@ -3065,6 +3174,7 @@ fn sync_rollout_namespace(path: &Path) -> std::io::Result<()> {
 struct JsonlWriter {
     path: PathBuf,
     file: tokio::fs::File,
+    _payload_sync_owner: Arc<crate::payload_artifact::PayloadSyncOwner>,
     _append_lock: Arc<compression::RolloutAppendLock>,
     _payload_retention: Arc<std::fs::File>,
     #[cfg(test)]
@@ -3158,17 +3268,22 @@ impl JsonlWriter {
         })
         .await
         .map_err(IoError::other)??;
-        self.write_rollout_items_locked(rollout_items, &write_lock)
-            .await
+        self.write_rollout_items_locked(rollout_items, &write_lock, None)
+            .await.map(|_| ())
     }
 
     async fn write_rollout_items_locked(
         &mut self,
         rollout_items: &[&CapturedRolloutItem],
         _write_lock: &compression::RolloutWriteLock,
-    ) -> std::io::Result<()> {
+        append_start: Option<u64>,
+    ) -> std::io::Result<u64> {
+        let append_start = match append_start {
+            Some(start) => start,
+            None => self.file.metadata().await?.len(),
+        };
         if rollout_items.is_empty() {
-            return Ok(());
+            return Ok(append_start);
         }
         let mut bytes = Vec::new();
         for captured in rollout_items {
@@ -3195,8 +3310,13 @@ impl JsonlWriter {
                 }
             };
             let path = self.path.clone();
+            let payload_sync_owner = Arc::clone(&self._payload_sync_owner);
+            let append_lock = Arc::clone(&self._append_lock);
             let stored = tokio::task::spawn_blocking(move || {
-                crate::payload_artifact::store_value(&path, value)
+                let result = crate::payload_artifact::store_value(&path, value);
+                drop(payload_sync_owner);
+                drop(append_lock);
+                result
             })
             .await
             .map_err(IoError::other)?;
@@ -3209,7 +3329,7 @@ impl JsonlWriter {
                 }
             }
         }
-        self.write_transaction(&bytes).await
+        self.write_transaction(&bytes, append_start).await
     }
 
     fn serialize_rollout_item(
@@ -3220,19 +3340,20 @@ impl JsonlWriter {
         RolloutLineRef::new(rollout_item, captured_at)?.write_jsonl(bytes)
     }
 
-    async fn write_transaction(&mut self, bytes: &[u8]) -> std::io::Result<()> {
+    async fn write_transaction(&mut self, bytes: &[u8], append_start: u64) -> std::io::Result<u64> {
         #[cfg(test)]
         {
             self.append_transaction_count += 1;
         }
-        let append_start = self.file.metadata().await?.len();
+        let committed_end = append_start.checked_add(bytes.len() as u64)
+            .ok_or_else(|| IoError::other("rollout append offset overflow"))?;
         let write_result = self.write_line_bytes(bytes).await;
         let Err(append_error) = write_result else {
-            return Ok(());
+            return Ok(committed_end);
         };
 
         match self.recover_failed_append(append_start, bytes).await {
-            Ok(FailedAppendRecovery::Committed) => Ok(()),
+            Ok(FailedAppendRecovery::Committed) => Ok(committed_end),
             Ok(FailedAppendRecovery::RolledBack) => Err(append_error),
             Err(recovery_error) => Err(IoError::other(RolloutAppendRecoveryError {
                 path: self.path.clone(),

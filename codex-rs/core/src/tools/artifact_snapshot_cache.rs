@@ -67,20 +67,30 @@ pub(super) fn shared() -> &'static Arc<SnapshotCache> {
 }
 
 impl SnapshotCache {
+    #[cfg(test)]
     pub(super) fn load(
         self: &Arc<Self>,
         path: &Path,
         id: ToolOutputArtifactId,
         loader: impl FnOnce() -> Result<Arc<ToolOutputSnapshot>, ReadToolOutputError>,
     ) -> Result<Arc<ToolOutputSnapshot>, ReadToolOutputError> {
-        let Ok(runtime) = Handle::try_current() else { return loader(); };
+        self.load_with_metadata(path, id, |_| loader())
+    }
+
+    pub(super) fn load_with_metadata(
+        self: &Arc<Self>,
+        path: &Path,
+        id: ToolOutputArtifactId,
+        loader: impl FnOnce(Option<LogicalArtifactMetadata>) -> Result<Arc<ToolOutputSnapshot>, ReadToolOutputError>,
+    ) -> Result<Arc<ToolOutputSnapshot>, ReadToolOutputError> {
+        let Ok(runtime) = Handle::try_current() else { return loader(None); };
         // Transaction reconciliation belongs to the uncached owner. Never let a
         // hit conceal a new marker, even one from an interrupted external writer.
         if !matches!(std::fs::symlink_metadata(logical_transaction_path(path)),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound)
         {
             let _mutation = self.mutating(path);
-            return loader();
+            return loader(None);
         }
         let (cached, may_cache) = {
             let state = self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -98,7 +108,7 @@ impl SnapshotCache {
         }
         // Acquire exclusion BEFORE authentication. Acquiring it afterward could
         // bless a same-size replacement using bytes read before the lease.
-        let lease = if may_cache {
+        let mut lease = if may_cache {
             let removed = {
                 let mut state = self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                 let mut removed = take_path_entries(&mut state, path);
@@ -111,11 +121,14 @@ impl SnapshotCache {
             // The same admission covers both cold authentication and cached
             // residency, bounding new native handles under concurrent misses.
             self.2.clone().try_acquire_owned().ok().and_then(|permit| {
-                protect_complete_family(path, id).map(|(files, bytes)| (files, bytes, permit))
+                protect_complete_family(path, id).map(|(files, bytes, metadata)| (files, bytes, Some(metadata), permit))
             })
         } else { None };
-        let snapshot = loader()?;
-        if let Some((files, metadata_bytes, permit)) = lease {
+        // The observation is valid only while all family/ancestor exclusions
+        // above are still held. Authentication below retains every byte check.
+        let metadata = lease.as_mut().and_then(|(_, _, metadata, _)| metadata.take());
+        let snapshot = loader(metadata)?;
+        if let Some((files, metadata_bytes, _, permit)) = lease {
             let charge = snapshot.bytes.len().saturating_add(metadata_bytes.saturating_mul(4));
             if charge <= MAX_CHARGE {
                 self.insert(path, Arc::clone(&snapshot), files, permit, charge, &runtime);
@@ -245,7 +258,7 @@ fn protected_file(path: &Path) -> Option<File> {
     (metadata.is_file() && !metadata_is_reparse_point(&metadata)).then_some(file)
 }
 
-fn protect_complete_family(path: &Path, id: ToolOutputArtifactId) -> Option<(Vec<File>, usize)> {
+fn protect_complete_family(path: &Path, id: ToolOutputArtifactId) -> Option<(Vec<File>, usize, LogicalArtifactMetadata)> {
     let parent = path.parent()?;
     if parent.components().count() > MAX_PARENT_HANDLES { return None; }
     let mut files = codex_file_system::lock_directory_chain(parent).ok()?;
@@ -270,7 +283,7 @@ fn protect_complete_family(path: &Path, id: ToolOutputArtifactId) -> Option<(Vec
             files.push(protected_file(&logical_segment_path(path, segment.index))?);
         }
     }
-    Some((files, bytes.len()))
+    Some((files, bytes.len(), metadata))
 }
 
 #[cfg(test)]

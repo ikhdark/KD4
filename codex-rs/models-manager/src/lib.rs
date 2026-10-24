@@ -25,7 +25,9 @@ pub struct ModelsManagerConfig {
 static BUNDLED_MODELS: OnceLock<ModelsResponse> = OnceLock::new();
 static BUNDLED_MODELS_INIT: Mutex<()> = Mutex::new(());
 
-pub(crate) fn bundled_models() -> Result<&'static ModelsResponse, serde_json::Error> {
+/// Borrow the validated, prompt-policy-applied immutable bundled catalog.
+/// Callers needing ownership can use [`bundled_models_response`].
+pub fn bundled_models() -> Result<&'static ModelsResponse, serde_json::Error> {
     if let Some(response) = BUNDLED_MODELS.get() {
         return Ok(response);
     }

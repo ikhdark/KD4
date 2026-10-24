@@ -2107,7 +2107,20 @@ pub(crate) fn analytics_tool_item(item: &ThreadItem) -> Option<ThreadItem> {
             execution_id: None,
             source: *source,
             status: status.clone(),
-            command_actions: command_actions.clone(),
+            // Analytics consumes action categories/counts, never command,
+            // query or display text. Keep only valid category-shaped values.
+            command_actions: command_actions.iter().map(|action| match action {
+                CommandAction::Read { path, .. } => CommandAction::Read {
+                    command: String::new(), name: String::new(), path: path.clone(),
+                },
+                CommandAction::ListFiles { .. } => CommandAction::ListFiles {
+                    command: String::new(), path: None,
+                },
+                CommandAction::Search { .. } => CommandAction::Search {
+                    command: String::new(), query: None, path: None,
+                },
+                CommandAction::Unknown { .. } => CommandAction::Unknown { command: String::new() },
+            }).collect(),
             aggregated_output: None,
             exit_code: *exit_code,
             duration_ms: *duration_ms,

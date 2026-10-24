@@ -312,7 +312,7 @@ async fn plan_publication_is_ordered_and_cancelled_waiter_cannot_publish() {
 
 
 #[tokio::test]
-async fn plan_snapshots_do_not_accumulate_retired_checklist_rows() {
+async fn plan_snapshots_preserve_requirement_history_without_expanding_model_output() {
     let store = crate::plan_store::PlanStore::default();
     for index in 0..40 {
         let args = serde_json::json!({"expected_revision":store.execution_snapshot().await.map(|snapshot|snapshot.revision),
@@ -335,9 +335,10 @@ async fn plan_snapshots_do_not_accumulate_retired_checklist_rows() {
     assert!(decoded.lineage.step_requirements.is_empty());
     assert_plan_output_schema(&active);
     assert!(crate::plan_store::plan_snapshot_from_item(&crate::plan_store::plan_snapshot_item(&durable)).is_some());
-    assert!(active.get("lineage_complete").is_none());
+    assert_eq!(active["lineage_complete"], false);
+    assert!(!decoded.lineage_complete);
     assert_eq!(durable["lineage_complete"], true);
-    assert!(!durable.to_string().contains("finished 0"));
+    assert!(durable.to_string().contains("finished 0"));
     assert_eq!(active["revision"], durable["revision"]);
     let restored: crate::plan_store::PlanToolResponse = serde_json::from_value(durable).unwrap();
     store
@@ -351,7 +352,7 @@ async fn plan_snapshots_do_not_accumulate_retired_checklist_rows() {
             .1
             .requirements
             .len(),
-        0
+        40
     );
 }
 
@@ -590,6 +591,7 @@ fn assert_plan_output_schema(response: &serde_json::Value) {
     for (pointer, invalid) in [
         ("/effect", serde_json::json!("unknown")),
         ("/no_progress", serde_json::json!("false")),
+        ("/lineage_complete", serde_json::json!(true)),
         (
             "/current_plan/plan",
             serde_json::json!([{"step":"invalid status", "status":"done"}]),
@@ -690,14 +692,15 @@ fn unchanged_plan_output_remains_compact() {
     );
     assert_eq!(response["completion_authority"], "checklist_only");
     assert!(response.get("obligations").is_none());
-    assert!(response.get("lineage_complete").is_none());
-    assert_eq!(response.as_object().expect("object response").len(), 7);
+    assert_eq!(response["lineage_complete"], false);
+    assert_eq!(response.as_object().expect("object response").len(), 8);
     assert_eq!(output.code_mode_result(&payload), response);
 }
 
 #[test]
-fn update_plan_schema_is_the_simple_checklist_contract() {
+fn update_plan_schema_exposes_structural_scope_accounting() {
     let tool = serde_json::to_value(create_update_plan_tool()).expect("serialize update_plan");
+    assert!(tool["description"].as_str().unwrap().contains("Unavailable in Plan mode"));
     assert!(
         tool["parameters"]["properties"]["plan"]["description"]
             .as_str()
@@ -717,7 +720,9 @@ fn update_plan_schema_is_the_simple_checklist_contract() {
 
     assert_eq!(
         properties.keys().map(String::as_str).collect::<Vec<_>>(),
-        vec!["expected_revision", "explanation", "plan", "set"]
+        vec!["expected_revision", "explanation", "plan", "resolve",
+            "scope_change_instructions", "scope_change_refs", "scope_change_reviewed_revision",
+            "set", "superseded"]
     );
     assert_eq!(
         item_properties
@@ -931,7 +936,7 @@ async fn update_plan_rejects_unknown_arguments_at_runtime() {
 }
 
 #[tokio::test]
-async fn plan_revision_can_replace_unfinished_rows_without_obligations() {
+async fn plan_revision_cannot_discard_unfinished_requirements() {
     let (session, turn, events) = make_session_and_context_with_rx().await;
     let initial = UpdatePlanArgs {
         explanation: None,
@@ -970,21 +975,20 @@ async fn plan_revision_can_replace_unfinished_rows_without_obligations() {
             },
         })
         .await;
-    let replaced = replaced.unwrap().code_mode_result(&ToolPayload::Function {
-        arguments: narrowed.to_string(),
-    });
-    assert_plan_output_schema(&replaced);
-    assert!(replaced.get("obligations").is_none());
-    assert_eq!(replaced["current_plan"]["plan"], narrowed["plan"]);
+    assert!(matches!(replaced,
+        Err(FunctionCallError::RespondToModel(message))
+            if message.contains("every unfinished step") && message.contains("Fix warnings")
+    ));
     let mut published = false;
     while let Ok(event) = events.try_recv() {
         published |= matches!(event.msg, EventMsg::PlanUpdate(_));
     }
-    assert!(published);
+    assert!(!published);
     let (_, lineage) = session.services.plan_store.snapshot_with_lineage().await.unwrap();
-    assert!(lineage.requirements.is_empty());
-    assert!(lineage.step_requirements.is_empty());
-    assert_eq!(lineage.obligation_summary(&session.services.plan_store.snapshot().await.unwrap()).unresolved.len(), 1);
+    assert_eq!(session.services.plan_store.snapshot().await, Some(initial.clone()));
+    assert_eq!(lineage.requirements.len(), 2);
+    assert_eq!(lineage.step_requirements.len(), 2);
+    assert_eq!(lineage.obligation_summary(&initial).unresolved.len(), 2);
 }
 
 #[tokio::test]

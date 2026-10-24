@@ -2029,6 +2029,85 @@ pub fn classify_validation_policy_argv_with_runners(
     analyze_validation_policy_argv_with_runners(program, args, runners).0
 }
 
+/// Whether the caller's cwd also names a selected validation child's cwd.
+/// Unlike policy leaves, this must not discard sibling shell commands: `cd`
+/// and Set-Location are not validation, but change a later test's resources.
+pub fn validation_resource_cwd_is_unambiguous(program: &str, args: &[String]) -> bool {
+    fn script(body: &str, powershell: bool, depth: usize) -> bool {
+        if depth > MAX_WRAPPER_DEPTH { return false; }
+        let commands = if powershell {
+            let wrapper = ["pwsh".to_owned(), "-Command".to_owned(), body.to_owned()];
+            crate::powershell::parse_powershell_command_into_plain_commands(&wrapper)
+        } else {
+            crate::bash::try_parse_shell(body).and_then(|tree|
+                crate::bash::try_parse_word_only_commands_with_operators(&tree, body)
+                    .map(|(commands, _)| commands))
+        };
+        let Some(commands) = commands else {
+            return !powershell && grouped_command_body(body.trim())
+                .is_some_and(|body| script(body, false, depth + 1));
+        };
+        let [command] = commands.as_slice() else { return false; };
+        command.split_first().is_some_and(|(program, args)| argv(program, args, depth + 1))
+    }
+
+    fn argv(program: &str, args: &[String], depth: usize) -> bool {
+        if depth > MAX_WRAPPER_DEPTH { return false; }
+        let binary = normalized_program_name(program);
+        if matches!(binary.as_str(), "env" | "command" | "time" | "exec" | "rustup") {
+            return match decode_execution_wrapper(&binary, args) {
+                ExecutionWrapper::Child(index) => {
+                    let changes_cwd = binary == "env" && args[..index].iter().any(|arg|
+                        matches!(arg.as_str(), "-C" | "--chdir")
+                            || arg.starts_with("--chdir=")
+                            || (arg.starts_with("-C") && arg.len() > 2));
+                    !changes_cwd && argv(&args[index], &args[index + 1..], depth + 1)
+                }
+                ExecutionWrapper::NonExecution => true,
+                ExecutionWrapper::Opaque => false,
+            };
+        }
+        if matches!(binary.as_str(), "bash" | "sh") {
+            return executing_posix_shell_script(args)
+                .is_some_and(|body| script(body, false, depth + 1));
+        }
+        if matches!(binary.as_str(), "pwsh" | "powershell") {
+            let wrapper = std::iter::once(program.to_owned()).chain(args.iter().cloned()).collect::<Vec<_>>();
+            return crate::powershell::extract_powershell_command(&wrapper)
+                .is_some_and(|(_, body)| script(body, true, depth + 1));
+        }
+        if binary == "cmd" {
+            let Some(index) = args.iter().position(|arg| arg.eq_ignore_ascii_case("/c")
+                || arg.eq_ignore_ascii_case("/k")) else { return false; };
+            let body = args[index + 1..].join(" ");
+            // Match policy_cmd_script's CMD outer-quote handling before
+            // deciding whether an operator belongs to a sibling command.
+            let body = body.trim();
+            let body = if body.starts_with('"') && body.ends_with('"')
+                && body.matches('"').count() == 2 {
+                &body[1..body.len() - 1]
+            } else { body };
+            let mut quoted = false;
+            for character in body.chars() {
+                if character == '"' { quoted = !quoted; }
+                if !quoted && matches!(character, '&' | '|') { return false; }
+            }
+            let mut leaves = Vec::new();
+            let policy = policy_cmd_script(&body, &[], depth + 1, &mut leaves);
+            return policy.is_validation() && leaves.len() == 1
+                && leaves[0].split_first().is_some_and(|(program, args)| argv(program, args, depth + 1));
+        }
+        if binary == "uv" && args.first().is_some_and(|arg| arg == "run") {
+            return args.get(1).filter(|arg| !arg.starts_with('-'))
+                .is_some_and(|program| argv(program, &args[2..], depth + 1));
+        }
+        // Inline code can call chdir before launching its recognized child.
+        !(is_python_launcher(&binary) && python_inline_code(args).is_some())
+    }
+
+    argv(program, args, 0)
+}
+
 pub fn analyze_validation_policy_script_with_runners(
     script: &str,
     runners: &[RepositoryRunner],
@@ -2190,15 +2269,15 @@ fn policy_argv_inner(
         }
     }
     if let Some(runner) = runners.iter().find(|runner| runner.matches(program, args)) {
-        if let Some(separator) = &runner.passthrough_after {
-            if let Some((program, args)) = args.iter().position(|arg| arg == separator).and_then(|index| args[index + 1..].split_first()) {
-                return policy_argv(program, args, runners, depth + 1, leaves);
-            }
+        if let Some(separator) = &runner.passthrough_after
+            && let Some((program, args)) = args.iter().position(|arg| arg == separator).and_then(|index| args[index + 1..].split_first())
+        {
+            return policy_argv(program, args, runners, depth + 1, leaves);
         }
-        if let Some(skip) = runner.passthrough_args {
-            if let Some((program, args)) = args.get(skip..).and_then(|args| args.split_first()) {
-                return policy_argv(program, args, runners, depth + 1, leaves);
-            }
+        if let Some(skip) = runner.passthrough_args
+            && let Some((program, args)) = args.get(skip..).and_then(|args| args.split_first())
+        {
+            return policy_argv(program, args, runners, depth + 1, leaves);
         }
     }
     let mut canonical_args = args.to_vec();

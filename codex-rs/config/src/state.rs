@@ -654,6 +654,15 @@ impl ConfigLayerStack {
     /// Map paths use `config_origin_key`; array indices use `[index]` components.
     /// Requirement sources are tracked separately and are not included here.
     pub fn origins(&self) -> HashMap<String, ConfigLayerMetadata> {
+        self.origins_for_effective_config(&self.effective_config())
+    }
+
+    /// Field origins for an effective view already merged from this stack.
+    /// Reusing that same immutable view preserves replacement-leaf pruning.
+    pub fn origins_for_effective_config(
+        &self,
+        effective_config: &TomlValue,
+    ) -> HashMap<String, ConfigLayerMetadata> {
         let mut origins = HashMap::new();
         let mut path = Vec::new();
 
@@ -668,12 +677,7 @@ impl ConfigLayerStack {
         // Arrays and type-changing overlays replace whole subtrees, unlike
         // table merges. Origins of removed leaves must not leak into config/read.
         let mut effective_paths = HashMap::new();
-        record_origins(
-            &self.effective_config(),
-            &(),
-            &mut path,
-            &mut effective_paths,
-        );
+        record_origins(effective_config, &(), &mut path, &mut effective_paths);
         origins.retain(|key, _| effective_paths.contains_key(key));
         origins
     }

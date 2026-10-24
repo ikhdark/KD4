@@ -348,9 +348,10 @@ const PROJECTOR: &str = r#"((isProxy, boxedKind, projectTool) => {
             chars += cp > 0xffff ? 2 : 1;
           }
         }
-        return {...item, recovery: {artifact_id: source.artifact_id,
+        return {...item, recovery: {tool: 'read_tool_output',
           source_sha256: source.source_sha256 || source.canonical_sha256,
-          selectors: [{kind: 'bytes', start: range.start, end: range.end}]}};
+          arguments: {artifact_id: source.artifact_id,
+            selectors: [{kind: 'bytes', start: range.start, end: range.end}]}}};
       }
       if (item.selector?.kind === 'search' && item.status === 'ok' && item.value?.hydrated_ranges)
         return {...item, value: {...item.value, hydrated_ranges: resolve(item.value.hydrated_ranges)}};
@@ -791,7 +792,7 @@ fn project_tool_callback(
         .then(|| args.get(1).to_rust_string_lossy(scope));
     let name = args.get(2).to_rust_string_lossy(scope);
     let tool = codex_protocol::ToolName::new(namespace, name);
-    if let Some(projected) = codex_code_mode_protocol::model_visible_tool_result(&tool, &raw) {
+    if let Some(projected) = codex_code_mode_protocol::printed_tool_result(&tool, &raw) {
         match json_to_v8(scope, &projected) {
             Some(projected) => retval.set(projected),
             None => super::value::throw_type_error(scope, "failed to materialize output projection"),
@@ -1220,7 +1221,11 @@ mod tests {
         assert!(!printed[0].contains("\"shared\":true"));
         let invalid: Value = serde_json::from_str(&printed[1]).unwrap();
         assert_eq!(invalid["shared"], true);
-        assert_eq!(invalid["recovery"]["selectors"][0]["start"], size - 6);
+        assert_eq!(invalid["recovery"], json!({
+            "tool":"read_tool_output", "source_sha256":"hash",
+            "arguments":{"artifact_id":"snapshot",
+                "selectors":[{"kind":"bytes", "start":size-6, "end":size}]},
+        }));
         assert_eq!(printed[2].matches("xλ😀\n").count(), 2);
         let changed: Value = serde_json::from_str(&printed[3]).unwrap();
         assert_eq!(changed["shared"], true);

@@ -10,7 +10,7 @@ pub(crate) const USAGE_HINT_LOCATOR: &str = "context:multi-agent";
 
 /// Sent instead of the root guidance while delegation needs an explicit
 /// request, so a session that never delegates does not resend it every step.
-const DEFERRED_ROOT_USAGE_HINT_TEXT: &str = "You are `/root`, the primary agent in a team of agents collaborating to fulfill the user's goals. Agent tools (`spawn_agent`, `followup_task`, `send_message` and the rest of the `agents` namespace) can delegate work when delegation is authorized. Before spawning, messaging or waiting on agents, read the team guidance with `read_file(path=\"context:multi-agent\")`.";
+const DEFERRED_ROOT_USAGE_HINT_TEXT: &str = "You are `/root`, the primary agent in a team of agents collaborating to fulfill the user's goals. Agent tools (`spawn_agent`, `followup_task`, `send_message` and related tools) can delegate work when delegation is authorized; use their advertised namespace and entrypoints. Before spawning, messaging or waiting on agents, read the team guidance with `read_file(path=\"context:multi-agent\")`.";
 
 pub(super) fn usage_hint_text<'a>(
     turn_context: &'a TurnContext,
@@ -58,6 +58,35 @@ fn configured_usage_hint_text_for_source<'a>(
         | SessionSource::Custom(_)
         | SessionSource::Unknown => multi_agent_v2.root_agent_usage_hint_text.as_deref(),
         SessionSource::Internal(_) | SessionSource::SubAgent(_) => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+
+    #[tokio::test]
+    async fn deferred_root_guidance_does_not_assume_the_default_tool_namespace() {
+        let (_session, mut turn) = crate::session::tests::make_session_and_context().await;
+        turn.multi_agent_version = MultiAgentVersion::V2;
+        turn.session_source = SessionSource::Cli;
+        let config = &mut Arc::make_mut(&mut turn.config).multi_agent_v2;
+        config.multi_agent_mode_hint_text = None;
+        config.root_agent_usage_hint_text = Some("Configured root guidance.".to_string());
+
+        for namespace in [None, Some("agents"), Some("custom_agents")] {
+            Arc::make_mut(&mut turn.config).multi_agent_v2.tool_namespace =
+                namespace.map(str::to_string);
+            let hint = usage_hint_text(&turn, &turn.session_source).expect("deferred root guidance");
+            assert!(hint.contains("advertised namespace and entrypoints"));
+            assert!(!hint.contains("`agents` namespace"));
+            assert!(hint.contains(USAGE_HINT_LOCATOR));
+            assert_eq!(
+                full_usage_hint_text(&turn, &turn.session_source),
+                Some("Configured root guidance.")
+            );
+        }
     }
 }
 

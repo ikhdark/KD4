@@ -69,7 +69,7 @@ impl ToolExecutor<ToolInvocation> for WaitForEnvironmentHandler {
                 BTreeMap::from([(
                     "environment_id".to_string(),
                     JsonSchema::string(Some(
-                        "The id of an environment currently marked as starting. Omit when exactly one environment is starting.".to_string(),
+                        "The id of a starting or ready environment. Omit when exactly one environment is starting.".to_string(),
                     )),
                 )]),
                 /*required*/ None,
@@ -172,5 +172,9 @@ mod tests {
                 .contains("call the desired available operation directly")
         );
         assert!(spec.description.contains("readiness-only requests"));
+        assert!(
+            spec.parameters.properties.as_ref().unwrap()["environment_id"]
+                .description.as_deref().unwrap().contains("starting or ready")
+        );
     }
 }

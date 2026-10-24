@@ -5,6 +5,27 @@ use serde_json::Value;
 use std::collections::HashMap;
 use std::collections::HashSet;
 
+#[derive(serde::Serialize)]
+struct FullManifestRef<'a> {
+    hash: &'a str,
+    manifest: &'a Value,
+}
+
+fn serialized_bytes(value: &impl serde::Serialize) -> Option<usize> {
+    struct Counter(usize);
+    impl std::io::Write for Counter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0 = self.0.checked_add(bytes.len())
+                .ok_or_else(|| std::io::Error::other("manifest byte count overflow"))?;
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+    }
+    let mut counter = Counter(0);
+    serde_json::to_writer(&mut counter, value).ok()?;
+    Some(counter.0)
+}
+
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct ToolManifestDictionary {
     manifests: HashMap<String, Value>,
@@ -81,7 +102,7 @@ impl ToolManifestDictionary {
             return ToolManifestItem::reference(hash);
         }
 
-        let encoded = self
+        let delta = self
             .current_hash
             .as_ref()
             .and_then(|base_hash| {
@@ -93,18 +114,15 @@ impl ToolManifestDictionary {
                     added,
                     removed,
                 ))
-            })
-            .unwrap_or_else(|| ToolManifestItem::full(hash.clone(), manifest.clone()));
-        let encoded = if encoded.base_hash.is_some() {
-            let full = ToolManifestItem::full(hash.clone(), manifest.clone());
-            match (serde_json::to_vec(&encoded), serde_json::to_vec(&full)) {
-                (Ok(delta_bytes), Ok(full_bytes)) if delta_bytes.len() < full_bytes.len() => {
-                    encoded
-                }
-                _ => full,
-            }
+            });
+        let encoded = if let Some(delta) = delta
+            && serialized_bytes(&delta).zip(serialized_bytes(&FullManifestRef {
+                hash: &hash, manifest: &manifest,
+            })).is_some_and(|(delta, full)| delta < full)
+        {
+            delta
         } else {
-            encoded
+            ToolManifestItem::full(hash.clone(), manifest.clone())
         };
         self.manifests.insert(hash.clone(), manifest);
         self.current_hash = Some(hash);
@@ -152,12 +170,12 @@ impl ToolManifestDictionary {
 }
 
 #[derive(Clone)]
-struct NamedEntry {
+struct NamedEntry<'a> {
     name: String,
-    value: Value,
+    value: &'a Value,
 }
 
-fn named_entries(values: &[Value]) -> Vec<NamedEntry> {
+fn named_entries(values: &[Value]) -> Vec<NamedEntry<'_>> {
     let mut occurrences = HashMap::<String, usize>::new();
     values
         .iter()
@@ -182,7 +200,7 @@ fn named_entries(values: &[Value]) -> Vec<NamedEntry> {
             *occurrence += 1;
             NamedEntry {
                 name,
-                value: value.clone(),
+                value,
             }
         })
         .collect()
@@ -253,7 +271,7 @@ fn compute_delta(
                             collection: key.to_string(),
                             name: entry.name,
                             index,
-                            value: entry.value,
+                            value: entry.value.clone(),
                         }),
                 );
             }
@@ -275,7 +293,7 @@ fn compute_delta(
     Some((added, removed))
 }
 
-fn longest_common_subsequence(base: &[NamedEntry], target: &[NamedEntry]) -> Vec<(usize, usize)> {
+fn longest_common_subsequence(base: &[NamedEntry<'_>], target: &[NamedEntry<'_>]) -> Vec<(usize, usize)> {
     let mut lengths = vec![vec![0usize; target.len() + 1]; base.len() + 1];
     for base_index in (0..base.len()).rev() {
         for target_index in (0..target.len()).rev() {
@@ -357,10 +375,9 @@ fn apply_delta(
             .collect::<HashSet<_>>();
         let mut values = values
             .iter()
-            .cloned()
             .zip(names)
             .filter(|(_, name)| !removed_names.contains(name.as_str()))
-            .map(|(value, _)| value)
+            .map(|(value, _)| value.clone())
             .collect::<Vec<_>>();
         let mut additions = added
             .iter()

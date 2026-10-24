@@ -6,7 +6,6 @@ use sha2::Digest;
 use sha2::Sha256;
 use std::collections::BTreeSet;
 use std::collections::HashSet;
-use std::fmt::Write as _;
 use std::path::Path;
 
 use crate::AssignmentId;

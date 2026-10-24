@@ -37,6 +37,9 @@ const MAX_QUEUED_CONTROL_REQUESTS_PER_KEY: usize = 8;
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub(crate) enum RequestSerializationQueueKey {
     Control(Box<RequestSerializationQueueKey>),
+    /// Steering is ordered with other steering, never behind thread mutations.
+    /// It retains ordinary payload accounting rather than the small control cap.
+    Steering(Box<RequestSerializationQueueKey>),
     Global(&'static str),
     Thread {
         thread_id: String,

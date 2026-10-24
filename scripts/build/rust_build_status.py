@@ -109,6 +109,11 @@ RUST_WRAPPER_PROCESS_NAMES = (
     "powershell",
     "pwsh",
 )
+RUST_PROCESS_CANDIDATE_NAMES = frozenset({
+    *RUST_PROCESS_NAMES,
+    *RUST_WRAPPER_PROCESS_NAMES,
+    "python", "python3", "pythonw", "sh", "bash", "zsh", "cmd",
+})
 BYTES_PER_KIB = 1024
 BYTES_PER_MIB = BYTES_PER_KIB * 1024
 BYTES_PER_GIB = BYTES_PER_MIB * 1024
@@ -314,6 +319,7 @@ class BuildStatusSnapshot:
             )
         lane_root = cargo_lanes_root(repo_root)
         lane_dirs = existing_lane_dirs(lane_root)
+        lane_names_by_target: dict[str, str] | None = None
         lane_names_by_process: dict[tuple[int, str, str], str] = {}
         for process in process_list:
             lane_name = lane_name_for_process(process)
@@ -327,7 +333,11 @@ class BuildStatusSnapshot:
                     target = str(Path(process.cwd) / target)
                     absolute = True
                 if absolute:
-                    lane_name = next((path.name for path in lane_dirs if _process_path_key(path) == _process_path_key(target)), None)
+                    if lane_names_by_target is None:
+                        lane_names_by_target = {}
+                        for path in lane_dirs:
+                            lane_names_by_target.setdefault(_process_path_key(path), path.name)
+                    lane_name = lane_names_by_target.get(_process_path_key(target))
                 else:
                     lane_name = None
                     unresolved_target = True
@@ -555,6 +565,8 @@ def _process_path_key(path: str | Path) -> str:
 
 def _classify_rust_process(process: RustProcess) -> RustProcessClassification:
     executable = process.name.lower().removesuffix(".exe")
+    if executable not in RUST_PROCESS_CANDIDATE_NAMES:
+        return RustProcessClassification(False, None)
     try:
         tokens = [token.strip('"') for token in shlex.split(process.command_line, posix=False)]
     except ValueError:

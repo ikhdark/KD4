@@ -67,9 +67,9 @@ pub(crate) fn record_timing(update: impl FnOnce(&mut TransportTiming)) {
     });
 }
 
-// Failure headers are authoritative even when diagnostic body delivery stalls.
-// Use one deadline, not a fresh timeout for every chunk of an endless body.
-async fn collect_error_body(
+/// Collect a bounded diagnostic prefix under one deadline. Failure headers
+/// remain authoritative when body delivery stalls or exceeds the byte limit.
+pub async fn collect_error_body(
     stream: impl futures::Stream<Item = Result<Bytes, reqwest::Error>>,
 ) -> Option<String> {
     tokio::pin!(stream);

@@ -9094,6 +9094,83 @@ fn multi_agent_v2_default_usage_hints_reference_report_policy() {
 }
 
 #[test]
+fn multi_agent_v2_default_usage_hints_follow_terminal_parent_delivery() {
+    let config = resolve_multi_agent_v2_config(&ConfigToml::default());
+    for hint in [
+        config.root_agent_usage_hint_text,
+        config.subagent_usage_hint_text.clone(),
+    ] {
+        let hint = hint.expect("default team guidance");
+        assert!(!hint.contains("Analysis-channel messages use:"));
+        assert!(!hint.contains("Messages may be addressed to `/root`"));
+        assert!(!hint.contains("notify your parent before overlapping edits"));
+    }
+    let worker = config.subagent_usage_hint_text.expect("default worker guidance");
+    assert!(worker.contains("coordinate with active owners before overlapping edits"));
+    assert!(worker.contains("stop the affected edits"));
+    assert!(worker.contains("the host delivers the terminal result automatically"));
+    assert!(worker.contains("not ancestor progress updates"));
+}
+
+#[test]
+fn multi_agent_v2_default_usage_hints_do_not_apply_legacy_depth_limits() {
+    let config = resolve_multi_agent_v2_config(&ConfigToml::default());
+    for hint in [
+        config.root_agent_usage_hint_text,
+        config.subagent_usage_hint_text,
+    ] {
+        let hint = hint.expect("default team guidance");
+        assert!(!hint.contains("agents.max_depth"));
+        assert!(hint.contains("within your assignment") || hint.contains("within assignment"));
+        assert!(hint.contains("delegated authority"));
+        assert!(hint.contains("subject to runtime admission limits"));
+    }
+}
+
+#[test]
+fn multi_agent_v2_resolved_usage_hint_projection_preserves_disabled_hints() {
+    for root in [None, Some(""), Some("custom root")] {
+        for worker in [None, Some(""), Some("custom worker")] {
+            let raw = MultiAgentV2ConfigToml {
+                root_agent_usage_hint_text: root.map(str::to_string),
+                subagent_usage_hint_text: worker.map(str::to_string),
+                ..Default::default()
+            };
+            let source = ConfigToml {
+                features: Some(FeaturesToml {
+                    multi_agent_v2: Some(FeatureToml::Config(raw)),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            let resolved = resolve_multi_agent_v2_config(&source);
+            // This is the same resolved projection used by session config-lock export.
+            let projected: MultiAgentV2ConfigToml = crate::config_lock::toml_round_trip(
+                &resolved,
+                "features.multi_agent_v2",
+            )
+            .expect("project resolved multi-agent configuration");
+            assert_eq!(
+                projected.root_agent_usage_hint_text.as_deref(),
+                Some(resolved.root_agent_usage_hint_text.as_deref().unwrap_or_default())
+            );
+            assert_eq!(
+                projected.subagent_usage_hint_text.as_deref(),
+                Some(resolved.subagent_usage_hint_text.as_deref().unwrap_or_default())
+            );
+            let replay = ConfigToml {
+                features: Some(FeaturesToml {
+                    multi_agent_v2: Some(FeatureToml::Config(projected)),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            assert_eq!(resolve_multi_agent_v2_config(&replay), resolved);
+        }
+    }
+}
+
+#[test]
 fn multi_agent_v2_preserves_empty_mode_hint_override() {
     let config_toml = toml::from_str(
         r#"[features.multi_agent_v2]

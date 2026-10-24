@@ -45,11 +45,13 @@ const POWERSHELL_PARSER_RESPONSE_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_CACHED_SYNTAX_BYTES: usize = 64 * 1024;
 const MAX_CACHED_SYNTAX_ENTRIES: usize = 32;
 
+type ScopedSyntaxEntries = HashMap<(String, String), Arc<ScopedSyntax>>;
+
 /// Invocation-local syntax evidence. Never use this to cache executable
 /// resolution: cwd, PATH, PATHEXT and filesystem state remain live inputs.
 #[derive(Clone, Default)]
 pub struct PowershellAnalysisScope {
-    entries: Arc<Mutex<HashMap<(String, String), Arc<ScopedSyntax>>>>,
+    entries: Arc<Mutex<ScopedSyntaxEntries>>,
 }
 
 struct ScopedSyntax {

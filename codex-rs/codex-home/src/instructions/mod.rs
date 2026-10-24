@@ -110,7 +110,7 @@ impl UserInstructionsProvider for CodexHomeUserInstructionsProvider {
                         .map(|instructions| &instructions.source),
                 )
                 .await;
-            if loaded.instructions.is_some() || !cached_source_failed {
+            if !cached_source_failed {
                 state
                     .last_successful_instructions
                     .clone_from(&loaded.instructions);

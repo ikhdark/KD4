@@ -1047,32 +1047,24 @@ impl Session {
         session_configuration: &SessionConfiguration,
         cwd: AbsolutePathBuf,
     ) -> Arc<Config> {
-        // todo(aibrahim): store this state somewhere else so we don't need to mut config
+        Self::build_per_turn_config_with_reuse(session_configuration, cwd, None)
+    }
+
+    fn build_per_turn_config_with_reuse(
+        session_configuration: &SessionConfiguration,
+        cwd: AbsolutePathBuf,
+        previous: Option<&(std::sync::Weak<Config>, Arc<Config>)>,
+    ) -> Arc<Config> {
         let config = session_configuration.original_config_do_not_use.clone();
-        let mut per_turn_config = (*config).clone();
-        per_turn_config.cwd = cwd;
-        per_turn_config.model = Some(session_configuration.collaboration_mode.model().to_string());
-        per_turn_config.workspace_roots = session_configuration.workspace_roots.clone();
-        per_turn_config
-            .permissions
-            .set_workspace_roots(session_configuration.workspace_roots.clone());
-        per_turn_config.model_reasoning_effort =
-            session_configuration.collaboration_mode.reasoning_effort();
-        per_turn_config.model_reasoning_summary = session_configuration.model_reasoning_summary;
-        per_turn_config.service_tier = session_configuration.service_tier.clone();
-        per_turn_config.validation_mode = session_configuration.validation_mode;
-        per_turn_config.validation_full_budget = session_configuration.validation_full_budget;
-        per_turn_config.personality = session_configuration.personality;
-        session_configuration
-            .apply_permission_profile_to_permissions(&mut per_turn_config.permissions);
+        let mut permissions = config.permissions.clone();
+        permissions.set_workspace_roots(session_configuration.workspace_roots.clone());
+        session_configuration.apply_permission_profile_to_permissions(&mut permissions);
         let permission_profile = session_configuration.permission_profile();
+        let mut web_search_mode = config.web_search_mode.clone();
         let resolved_web_search_mode =
-            resolve_web_search_mode_for_turn(&per_turn_config.web_search_mode, &permission_profile);
-        if let Err(err) = per_turn_config
-            .web_search_mode
-            .set(resolved_web_search_mode)
-        {
-            let fallback_value = per_turn_config.web_search_mode.value();
+            resolve_web_search_mode_for_turn(&web_search_mode, &permission_profile);
+        if let Err(err) = web_search_mode.set(resolved_web_search_mode) {
+            let fallback_value = web_search_mode.value();
             tracing::warn!(
                 error = %err,
                 ?resolved_web_search_mode,
@@ -1080,12 +1072,42 @@ impl Session {
                 "resolved web_search_mode is disallowed by requirements; keeping constrained value"
             );
         }
-        per_turn_config.features = config.features.clone();
-        if same_turn_config_projection(&per_turn_config, &config) {
-            config
-        } else {
-            Arc::new(per_turn_config)
+        let matches_projection = |candidate: &Config| {
+            Arc::ptr_eq(&candidate.config_layer_stack, &config.config_layer_stack)
+                && candidate.cwd == cwd
+                && candidate.model.as_deref() == Some(session_configuration.collaboration_mode.model())
+                && candidate.workspace_roots == session_configuration.workspace_roots
+                && candidate.permissions == permissions
+                && candidate.model_reasoning_effort == session_configuration.collaboration_mode.reasoning_effort()
+                && candidate.model_reasoning_summary == session_configuration.model_reasoning_summary
+                && candidate.service_tier == session_configuration.service_tier
+                && candidate.validation_mode == session_configuration.validation_mode
+                && candidate.validation_full_budget == session_configuration.validation_full_budget
+                && candidate.personality == session_configuration.personality
+                && candidate.web_search_mode == web_search_mode
+                && candidate.features == config.features
+        };
+        if matches_projection(&config) {
+            return config;
         }
+        if let Some((_, previous)) = previous.filter(|(base, previous)| {
+            std::sync::Weak::ptr_eq(base, &Arc::downgrade(&config)) && matches_projection(previous)
+        }) {
+            return Arc::clone(previous);
+        }
+        let mut per_turn_config = (*config).clone();
+        per_turn_config.cwd = cwd;
+        per_turn_config.model = Some(session_configuration.collaboration_mode.model().to_string());
+        per_turn_config.workspace_roots = session_configuration.workspace_roots.clone();
+        per_turn_config.permissions = permissions;
+        per_turn_config.model_reasoning_effort = session_configuration.collaboration_mode.reasoning_effort();
+        per_turn_config.model_reasoning_summary = session_configuration.model_reasoning_summary;
+        per_turn_config.service_tier = session_configuration.service_tier.clone();
+        per_turn_config.validation_mode = session_configuration.validation_mode;
+        per_turn_config.validation_full_budget = session_configuration.validation_full_budget;
+        per_turn_config.personality = session_configuration.personality;
+        per_turn_config.web_search_mode = web_search_mode;
+        Arc::new(per_turn_config)
     }
 
     pub(crate) fn build_effective_session_config(
@@ -1329,15 +1351,40 @@ impl Session {
             .as_ref()
             .and_then(|turn_environment| turn_environment.cwd().to_abs_path().ok())
             .unwrap_or_else(|| session_configuration.cwd().clone());
-        let per_turn_config = Self::build_per_turn_config(&session_configuration, cwd.clone());
-        let model_info = self
-            .services
-            .models_manager
-            .get_model_info(
-                session_configuration.collaboration_mode.model(),
-                &per_turn_config.to_models_manager_config(),
-            )
-            .await;
+        let previous_config = self.turn_config_cache.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner).clone();
+        let per_turn_config = Self::build_per_turn_config_with_reuse(
+            &session_configuration, cwd.clone(), previous_config.as_ref(),
+        );
+        drop(previous_config);
+        // Only plugin discovery owns the skill-root dependency. Keep that
+        // chain intact while independent catalog/model leaves make progress.
+        let models_config = per_turn_config.to_models_manager_config();
+        let (model_info, skills_snapshot, available_models) = tokio::join!(
+            self.services.models_manager.get_model_info(
+                session_configuration.collaboration_mode.model(), &models_config,
+            ),
+            async {
+                let plugins_input = per_turn_config.plugins_config_input();
+                let plugin_outcome = self.services.plugins_manager
+                    .plugins_for_config(&plugins_input).await;
+                let effective_skill_roots = plugin_outcome.effective_plugin_skill_roots();
+                let plugin_skill_snapshots = self.services.plugins_manager
+                    .plugin_skill_snapshots_for_config(&plugins_input);
+                let skills_input = skills_load_input_from_config(&per_turn_config, effective_skill_roots)
+                    .with_plugin_skill_snapshots(plugin_skill_snapshots);
+                let fs = primary_turn_environment
+                    .map(|environment| environment.environment.get_filesystem());
+                self.services.skills_service.snapshot_for_config(&skills_input, fs).await
+            },
+            self.services.models_manager.list_models_shared(
+                RefreshStrategy::Offline, per_turn_config.http_client_factory(),
+            ),
+        );
+        let available_models = available_models.unwrap_or_else(|error| {
+            tracing::warn!(%error, "failed to load the current turn model catalog");
+            Arc::new(Vec::new())
+        });
         self.services
             .thread_extension_data
             .insert(model_info.clone());
@@ -1352,38 +1399,6 @@ impl Session {
                 .unwrap_or_else(|| per_turn_config.multi_agent_version_from_features())
                 .runtime_version(),
         };
-        let plugins_input = per_turn_config.plugins_config_input();
-        let plugin_outcome = self
-            .services
-            .plugins_manager
-            .plugins_for_config(&plugins_input)
-            .await;
-        let effective_skill_roots = plugin_outcome.effective_plugin_skill_roots();
-        let plugin_skill_snapshots = self
-            .services
-            .plugins_manager
-            .plugin_skill_snapshots_for_config(&plugins_input);
-        let skills_input = skills_load_input_from_config(&per_turn_config, effective_skill_roots)
-            .with_plugin_skill_snapshots(plugin_skill_snapshots);
-        let fs = primary_turn_environment
-            .map(|turn_environment| turn_environment.environment.get_filesystem());
-        let skills_snapshot = self
-            .services
-            .skills_service
-            .snapshot_for_config(&skills_input, fs)
-            .await;
-        let available_models = self
-            .services
-            .models_manager
-            .list_models_shared(
-                RefreshStrategy::Offline,
-                per_turn_config.http_client_factory(),
-            )
-            .await
-            .unwrap_or_else(|error| {
-                tracing::warn!(%error, "failed to load the current turn model catalog");
-                Arc::new(Vec::new())
-            });
         let resolved_service_tier = get_service_tier(
             per_turn_config.service_tier.clone(),
             per_turn_config.features.enabled(Feature::FastMode),
@@ -1399,13 +1414,17 @@ impl Session {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             match cached.as_ref() {
-                Some(previous)
-                    if same_turn_config_projection(previous.as_ref(), per_turn_config.as_ref()) =>
+                Some((base, previous))
+                    if std::sync::Weak::ptr_eq(base, &Arc::downgrade(&session_configuration.original_config_do_not_use))
+                        && same_turn_config_projection(previous.as_ref(), per_turn_config.as_ref()) =>
                 {
                     Arc::clone(previous)
                 }
                 _ => {
-                    *cached = Some(Arc::clone(&per_turn_config));
+                    *cached = Some((
+                        Arc::downgrade(&session_configuration.original_config_do_not_use),
+                        Arc::clone(&per_turn_config),
+                    ));
                     per_turn_config
                 }
             }

@@ -799,6 +799,8 @@ fn without_config_flags(
 fn main() -> anyhow::Result<()> {
     let remote_control_disabled = codex_app_server::take_remote_control_disabled_env();
     arg0_dispatch_or_else_with_pre_runtime(move || {
+        // SAFETY: dotenv loading has finished and no runtime threads exist yet.
+        unsafe { codex_process_hardening::pre_main_hardening() };
         let cli = parse_multitool_cli(std::env::args_os());
         move |arg0_paths: Arg0DispatchPaths| async move {
             cli_main(cli, arg0_paths, remote_control_disabled).await

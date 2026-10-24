@@ -11,6 +11,7 @@
       throw new TypeError(`invalid ${name}`);
   };
   const nonAscii = RegExp.prototype.exec.bind(/[^\x00-\x7f]/);
+  const charCodeAt = Function.prototype.call.bind(String.prototype.charCodeAt);
   const bytes = (text) => {
     // Most source is ASCII; validate that in native regex code rather than
     // visiting every byte in JavaScript. Non-ASCII retains exact UTF-8 accounting.
@@ -19,7 +20,7 @@
     // every source character. Lone surrogates still charge three UTF-8 bytes.
     let size = text.length;
     for (let i = 0; i < text.length; ++i) {
-      const cp = text.charCodeAt(i);
+      const cp = charCodeAt(text, i);
       if (cp < 0x80) continue;
       if (cp < 0x800) {
         ++size;
@@ -27,7 +28,7 @@
       }
       size += 2;
       if (cp >= 0xd800 && cp <= 0xdbff && i + 1 < text.length) {
-        const next = text.charCodeAt(i + 1);
+        const next = charCodeAt(text, i + 1);
         if (next >= 0xdc00 && next <= 0xdfff) ++i;
       }
     }
@@ -38,6 +39,90 @@
       throw new TypeError(`required tool unavailable: ${name}`);
     return tools[name];
   };
+
+  // A packet may be retained by its caller and mutated during a native await.
+  // Cache its rendered cost only while its plain data descriptors still match.
+  // No getters, proxies, custom prototypes or toJSON hooks enter this path.
+  const nativeIsProxy = globalThis.__codex_is_proxy;
+  const ownNames = Object.getOwnPropertyNames;
+  const ownDescriptor = Object.getOwnPropertyDescriptor;
+  const getPrototype = Object.getPrototypeOf;
+  const nativeIsArray = Array.isArray;
+  const sameValue = Object.is;
+  const nativeString = String;
+  const NativeSet = Set;
+  const setHas = Function.prototype.call.bind(Set.prototype.has);
+  const setAdd = Function.prototype.call.bind(Set.prototype.add);
+  const setDelete = Function.prototype.call.bind(Set.prototype.delete);
+  const arrayPush = Function.prototype.call.bind(Array.prototype.push);
+  const arrayMap = Function.prototype.call.bind(Array.prototype.map);
+  const arraySome = Function.prototype.call.bind(Array.prototype.some);
+  const arrayEvery = Function.prototype.call.bind(Array.prototype.every);
+  const objectPrototype = Object.prototype;
+  const arrayPrototype = Array.prototype;
+  const nativeJSON = JSON;
+  const nativeStringify = JSON.stringify;
+  const bigintPrototype = BigInt.prototype;
+  const bigintToString = ownDescriptor(bigintPrototype, "toString").value;
+  const withoutToJSON = (value) => {
+    for (let depth = 0; value !== null && depth < 128; ++depth) {
+      if (nativeIsProxy(value) || ownDescriptor(value, "toJSON") !== undefined)
+        return false;
+      value = getPrototype(value);
+    }
+    return value === null;
+  };
+  const stableCommandJSON = () =>
+    ownDescriptor(globalThis, "JSON")?.value === nativeJSON &&
+    ownDescriptor(nativeJSON, "stringify")?.value === nativeStringify &&
+    ownDescriptor(bigintPrototype, "toString")?.value === bigintToString &&
+    withoutToJSON(bigintPrototype) && withoutToJSON(objectPrototype) &&
+    withoutToJSON(arrayPrototype);
+  const commandPacketSnapshot = (packet) => {
+    const records = [];
+    const seen = new NativeSet();
+    const active = new NativeSet();
+    const visit = (value, depth = 0) => {
+      if (value === null || typeof value !== "object")
+        return typeof value !== "function" && typeof value !== "symbol";
+      if (nativeIsProxy(value) || depth >= 128 || setHas(active, value)) return false;
+      if (setHas(seen, value)) return true;
+      if (records.length >= 4096) return false;
+      const prototype = getPrototype(value);
+      const array = nativeIsArray(value);
+      if ((prototype !== null && prototype !== (array ? arrayPrototype : objectPrototype)) ||
+          !withoutToJSON(value)) return false;
+      const names = ownNames(value);
+      const fields = arrayMap(names, name => ownDescriptor(value, name));
+      if (arraySome(fields, field => !field || !("value" in field))) return false;
+      // JSON reads inherited numeric properties for sparse array holes.
+      if (array) {
+        const length = ownDescriptor(value, "length").value;
+        if (length > 4096) return false;
+        for (let index = 0; index < length; ++index)
+          if (!ownDescriptor(value, nativeString(index))) return false;
+      }
+      arrayPush(records, {value, prototype, names, fields});
+      setAdd(seen, value);
+      setAdd(active, value);
+      const valid = arrayEvery(fields, field => visit(field.value, depth + 1));
+      setDelete(active, value);
+      return valid;
+    };
+    return visit(packet) ? records : null;
+  };
+  const unchangedCommandPacket = (records) => arrayEvery(records, record => {
+    if (getPrototype(record.value) !== record.prototype || !withoutToJSON(record.value))
+      return false;
+    const names = ownNames(record.value);
+    return names.length === record.names.length && arrayEvery(names, (name, index) => {
+      if (name !== record.names[index]) return false;
+      const field = ownDescriptor(record.value, name), prior = record.fields[index];
+      return field && "value" in field && sameValue(field.value, prior.value) &&
+        field.enumerable === prior.enumerable && field.writable === prior.writable &&
+        field.configurable === prior.configurable;
+    });
+  });
 
   Object.defineProperty(globalThis, "read_status", {
     value: async function read_status(paths, options = {}) {
@@ -328,12 +413,13 @@
       // hosts (or implicit-ignore searches) retain the safe fresh-execution path.
       const typedReplay =
         no_ignore &&
-        typeof ALL_TOOLS !== "undefined" &&
-        ALL_TOOLS.some(
+        (typeof globalThis.resolve_tool === "function"
+          ? globalThis.resolve_tool("exec_command")?.description?.includes("(search_miss_v1)")
+          : typeof ALL_TOOLS !== "undefined" && ALL_TOOLS.some(
           (tool) =>
             tool.name === "exec_command" &&
             tool.description?.includes("(search_miss_v1)"),
-        );
+        ));
       try {
         evidence.result = await run({
           program: "rg",
@@ -602,14 +688,36 @@
         throw new TypeError("on_progress must be a function");
       }
       const observations = [];
+      // Charge each packet once. The current packet appears both as terminal
+      // and in observations; include JSON framing and separators exactly.
+      let observationBytes = 0;
+      const packetSnapshots = [];
+      let incremental = on_progress === undefined && typeof nativeIsProxy === "function";
+      const evidenceFramingBytes = bytes('{"terminal":,"observations":[]}');
       let current = initial;
       let session;
       let incarnation;
       while (true) {
-        observations.push(current);
+        arrayPush(observations, current);
         const evidence = { terminal: current, observations };
-        const retainedBytes = bytes(JSON.stringify(evidence, (_key, value) =>
-          typeof value === 'bigint' ? value.toString() : value));
+        const replacer = (_key, value) => typeof value === 'bigint' ? value.toString() : value;
+        let retainedBytes;
+        if (incremental) {
+          const snapshot = stableCommandJSON() && commandPacketSnapshot(current);
+          incremental = !!snapshot && arrayEvery(packetSnapshots, unchangedCommandPacket);
+          if (incremental) {
+            arrayPush(packetSnapshots, snapshot);
+            const serialized = JSON.stringify(current, replacer);
+            // Undefined is null in an array, but omits the terminal property.
+            const packetBytes = serialized === undefined ? 4 : bytes(serialized);
+            observationBytes += packetBytes + (observations.length > 1 ? 1 : 0);
+            retainedBytes = observationBytes + (serialized === undefined
+              ? bytes('{"observations":[]}')
+              : evidenceFramingBytes + packetBytes);
+          }
+        }
+        if (!incremental)
+          retainedBytes = bytes(JSON.stringify(evidence, replacer));
         if (retainedBytes >= max_bytes)
           fail("command evidence byte limit reached; retain these observations and resume only the retained handle", evidence);
         if (

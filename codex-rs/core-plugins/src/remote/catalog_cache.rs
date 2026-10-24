@@ -35,16 +35,62 @@ struct RemotePluginCatalogDiskCache {
     plugins: Vec<RemotePluginDirectoryItem>,
 }
 
+/// One request's decoded observation, bound to the complete cache partition.
+pub struct GlobalRemotePluginCatalogObservation {
+    codex_home: PathBuf,
+    key: RemotePluginCatalogCacheKey,
+    cache_hit: bool,
+    plugins: Option<Vec<RemotePluginDirectoryItem>>,
+}
+
+impl GlobalRemotePluginCatalogObservation {
+    pub fn is_cached_for(
+        &self,
+        codex_home: &Path,
+        config: &RemotePluginServiceConfig,
+        auth: Option<&CodexAuth>,
+    ) -> bool {
+        super::ensure_chatgpt_auth(auth).is_ok_and(|auth| {
+            self.cache_hit && self.matches(codex_home, config, auth)
+        })
+    }
+
+    pub(crate) fn matches(
+        &self,
+        codex_home: &Path,
+        config: &RemotePluginServiceConfig,
+        auth: &CodexAuth,
+    ) -> bool {
+        self.codex_home.as_path() == codex_home
+            && self.key == RemotePluginCatalogCacheKey::global(config, auth)
+    }
+
+    pub(crate) fn take_plugins(&mut self) -> Option<Vec<RemotePluginDirectoryItem>> {
+        self.plugins.take()
+    }
+}
+
 pub(crate) async fn load_cached_global_directory_plugins_async(
     codex_home: &Path,
     config: &RemotePluginServiceConfig,
     auth: &CodexAuth,
 ) -> Option<Vec<RemotePluginDirectoryItem>> {
-    let cache_path = cache_path(
-        codex_home,
-        &RemotePluginCatalogCacheKey::global(config, auth),
-    );
-    match tokio::task::spawn_blocking(move || {
+    let mut observed = observe_cached_global_directory_plugins_async(codex_home, config, auth).await;
+    if observed.matches(codex_home, config, auth) {
+        observed.take_plugins()
+    } else {
+        None
+    }
+}
+
+pub(crate) async fn observe_cached_global_directory_plugins_async(
+    codex_home: &Path,
+    config: &RemotePluginServiceConfig,
+    auth: &CodexAuth,
+) -> GlobalRemotePluginCatalogObservation {
+    let key = RemotePluginCatalogCacheKey::global(config, auth);
+    let cache_path = cache_path(codex_home, &key);
+    let plugins = match tokio::task::spawn_blocking(move || {
         load_cached_global_directory_plugins_at_path(cache_path)
     })
     .await
@@ -54,6 +100,12 @@ pub(crate) async fn load_cached_global_directory_plugins_async(
             warn!("failed to join remote plugin catalog cache read task: {err}");
             None
         }
+    };
+    GlobalRemotePluginCatalogObservation {
+        codex_home: codex_home.to_path_buf(),
+        key,
+        cache_hit: plugins.is_some(),
+        plugins,
     }
 }
 

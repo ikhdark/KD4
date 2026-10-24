@@ -215,6 +215,20 @@ pub struct SkillDiscoveryContinuation {
 }
 
 impl SkillCatalog {
+    /// Merge an immutable snapshot, cloning only entries that survive precedence.
+    pub(crate) fn extend_ref(&mut self, other: &Self) {
+        let mut seen: HashSet<_> = self.entries.iter()
+            .map(|entry| (&entry.authority, &entry.id)).collect();
+        let additions = other.entries.iter()
+            .filter(|entry| seen.insert((&entry.authority, &entry.id)))
+            .cloned().collect::<Vec<_>>();
+        self.entries.extend(additions);
+        self.warnings.extend(other.warnings.iter().cloned());
+        if other.continuation.is_some() {
+            self.continuation = other.continuation.clone();
+        }
+    }
+
     pub fn extend(&mut self, other: SkillCatalog) {
         self.extend_entries(other.entries);
         self.warnings.extend(other.warnings);

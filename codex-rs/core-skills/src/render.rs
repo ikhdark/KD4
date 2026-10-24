@@ -112,8 +112,61 @@ pub fn build_available_skills(
     budget: SkillMetadataBudget,
     side_effects: SkillRenderSideEffects<'_>,
 ) -> Option<AvailableSkills> {
+    let (selected, empty) = prepare_available_skills(outcome, budget);
+    record_prepared_skills_side_effects(selected.as_ref(), empty, budget, side_effects);
+    selected
+}
+
+pub(crate) type AvailableSkillsCache =
+    std::sync::Mutex<Option<(SkillMetadataBudget, Option<AvailableSkills>, bool)>>;
+
+impl crate::model::HostSkillsSnapshot {
+    /// Reuse only rendering derived from this immutable snapshot and exact
+    /// budget. Live warnings/telemetry still occur for each caller as before.
+    pub fn available_skills(
+        &self,
+        budget: SkillMetadataBudget,
+        side_effects: SkillRenderSideEffects<'_>,
+    ) -> Option<AvailableSkills> {
+        let cached = self.rendered_available_skills.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref().filter(|(cached_budget, _, _)| *cached_budget == budget)
+            .map(|(_, available, empty)| (available.clone(), *empty));
+        let (selected, empty) = cached.unwrap_or_else(|| {
+            // Do not hold the cache lock while formatting. Concurrent cold
+            // callers may do duplicate bounded work, never serialize polling.
+            let prepared = prepare_available_skills(self.outcome(), budget);
+            *self.rendered_available_skills.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                Some((budget, prepared.0.clone(), prepared.1));
+            prepared
+        });
+        record_prepared_skills_side_effects(selected.as_ref(), empty, budget, side_effects);
+        selected
+    }
+}
+
+fn prepare_available_skills(
+    outcome: &SkillLoadOutcome,
+    budget: SkillMetadataBudget,
+) -> (Option<AvailableSkills>, bool) {
     let skills = outcome.allowed_skills_for_implicit_invocation();
     if skills.is_empty() {
+        return (None, true);
+    }
+    let skill_lines = ordered_catalog_skill_lines(&skills);
+    (build_available_skills_from_lines(skill_lines, skills.len(), budget), false)
+}
+
+fn record_prepared_skills_side_effects(
+    selected: Option<&AvailableSkills>,
+    empty: bool,
+    budget: SkillMetadataBudget,
+    side_effects: SkillRenderSideEffects<'_>,
+) {
+    if let Some(selected) = selected {
+        record_available_skills_side_effects(selected, budget, side_effects);
+    } else if empty {
         record_skill_render_side_effects(
             side_effects,
             /*total_count*/ 0,
@@ -121,14 +174,7 @@ pub fn build_available_skills(
             /*omitted_count*/ 0,
             /*truncated_description_chars*/ 0,
         );
-        return None;
     }
-
-    let skill_lines = ordered_catalog_skill_lines(&skills);
-    let selected = build_available_skills_from_lines(skill_lines, skills.len(), budget)?;
-
-    record_available_skills_side_effects(&selected, budget, side_effects);
-    Some(selected)
 }
 
 fn build_available_skills_from_lines(
@@ -507,20 +553,47 @@ fn truncate_default_context_skill_description(description: &str) -> Cow<'_, str>
 
 impl<'a> DescriptionBudgetLine<'a> {
     fn new(line: &'a SkillLine<'a>, budget: SkillMetadataBudget) -> Self {
+        let description_char_count = line.description_char_count();
+        if description_char_count == 0 {
+            return Self { line, description_char_count, extra_costs: vec![0] };
+        }
         let minimum_line = line.render_minimum();
         let minimum_cost = line_cost(budget, &minimum_line);
+        // Replacing one ASCII placeholder with the counted description and
+        // adding the final newline cancels exactly in bytes and characters.
+        let nonempty_line = line.render_with_description("x");
+        let base_bytes = nonempty_line.len();
+        let base_chars = nonempty_line.chars().count();
 
-        let description_char_count = line.description_char_count();
+        #[derive(Default)]
+        struct EncodedLength {
+            bytes: usize,
+            chars: usize,
+        }
+        impl std::fmt::Write for EncodedLength {
+            fn write_str(&mut self, text: &str) -> std::fmt::Result {
+                self.bytes = self.bytes.saturating_add(text.len());
+                self.chars = self.chars.saturating_add(text.chars().count());
+                Ok(())
+            }
+        }
+        use std::fmt::Write as _;
+        let mut encoded = EncodedLength::default();
+
         let mut extra_costs = Vec::with_capacity(description_char_count.saturating_add(1));
         extra_costs.push(0);
 
-        for (byte_offset, ch) in line.description.char_indices() {
+        for ch in line.description.chars() {
             // Count the final encoding: one source character can expand to an
             // entity, and neither character nor token budgets may ignore it.
-            let rendered_cost = line_cost(
-                budget,
-                &line.render_with_description(&line.description[..byte_offset + ch.len_utf8()]),
-            );
+            let mut bytes = [0; 4];
+            let _ = write!(&mut encoded, "{}", codex_utils_string::xml_text(ch.encode_utf8(&mut bytes)));
+            let rendered_cost = match budget {
+                SkillMetadataBudget::Tokens(_) => codex_utils_string::TokenCountEstimate::from_byte_count(
+                    base_bytes.saturating_add(encoded.bytes),
+                ).tokens(),
+                SkillMetadataBudget::Characters(_) => base_chars.saturating_add(encoded.chars),
+            };
             let cost = rendered_cost.saturating_sub(minimum_cost);
             extra_costs.push(cost);
         }

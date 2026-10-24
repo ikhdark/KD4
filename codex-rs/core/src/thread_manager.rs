@@ -2840,37 +2840,22 @@ fn thread_store_metadata_update_error(thread_id: ThreadId, err: ThreadStoreError
     }
 }
 
-/// Return a fork snapshot cut strictly before the nth user message (0-based).
-///
-/// Out-of-range values keep the full committed history at a turn boundary, but
-/// when the source thread is currently mid-turn they fall back to cutting
-/// before the active turn's opening boundary so the fork omits the unfinished
-/// suffix entirely.
 fn truncate_before_nth_user_message(
     history: InitialHistory,
     n: usize,
     snapshot_state: &SnapshotTurnState,
 ) -> InitialHistory {
-    let items = history.get_rollout_items().to_vec();
-    let user_positions = truncation::user_message_positions_in_rollout(&items);
-    let rolled = if snapshot_state.ends_mid_turn && n >= user_positions.len() {
-        if let Some(cut_idx) = snapshot_state
-            .active_turn_start_index
-            .or_else(|| user_positions.last().copied())
-        {
-            truncation::carry_source_integrity_notice(&items, items[..cut_idx].to_vec())
-        } else {
-            items
-        }
+    let items = history.get_rollout_items();
+    let user_positions = truncation::user_message_positions_in_rollout(items);
+    let cut = if snapshot_state.ends_mid_turn && n >= user_positions.len() {
+        snapshot_state.active_turn_start_index
+            .or_else(|| user_positions.last().copied()).unwrap_or(items.len())
+    } else if n < user_positions.len() {
+        user_positions[n]
     } else {
-        truncation::truncate_rollout_before_nth_user_message_from_start(&items, n)
+        items.len()
     };
-
-    if rolled.is_empty() {
-        InitialHistory::New
-    } else {
-        InitialHistory::Forked(rolled)
-    }
+    truncate_owned_initial_history(history, cut)
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -2918,10 +2903,8 @@ fn snapshot_turn_state(history: &InitialHistory) -> SnapshotTurnState {
     }
     let active_turn_id = builder.active_turn_id_if_explicit();
     if builder.has_active_turn() && active_turn_id.is_some() {
-        let active_turn_snapshot = builder.active_turn_snapshot();
-        if active_turn_snapshot
-            .as_ref()
-            .is_some_and(|turn| turn.status != TurnStatus::InProgress)
+        if builder.active_turn_status()
+            .is_some_and(|status| status != TurnStatus::InProgress)
         {
             return SnapshotTurnState {
                 ends_mid_turn: false,
@@ -3033,15 +3016,16 @@ fn fork_history_from_snapshot(
     history: InitialHistory,
     interrupted_marker: InterruptedTurnHistoryMarker,
 ) -> InitialHistory {
-    let snapshot_state = snapshot_turn_state(&history);
     match snapshot {
         ForkSnapshot::TruncateToLastSamplingBoundary => {
-            truncate_to_last_sampling_boundary(history, &snapshot_state)
+            truncate_to_last_sampling_boundary(history)
         }
         ForkSnapshot::TruncateBeforeNthUserMessage(nth_user_message) => {
+            let snapshot_state = snapshot_turn_state(&history);
             truncate_before_nth_user_message(history, nth_user_message, &snapshot_state)
         }
         ForkSnapshot::Interrupted => {
+            let snapshot_state = snapshot_turn_state(&history);
             let history = match history {
                 InitialHistory::New => InitialHistory::New,
                 InitialHistory::Cleared => InitialHistory::Cleared,
@@ -3063,33 +3047,47 @@ fn fork_history_from_snapshot(
     }
 }
 
-fn truncate_to_last_sampling_boundary(
-    history: InitialHistory,
-    snapshot_state: &SnapshotTurnState,
-) -> InitialHistory {
+fn truncate_to_last_sampling_boundary(history: InitialHistory) -> InitialHistory {
     let items = history.get_rollout_items();
-    let retained = if let Some(boundary_index) = items
-        .iter()
+    if let Some(boundary) = items.iter()
         .rposition(|item| matches!(item, RolloutItem::SamplingBoundary(_)))
     {
-        items[..=boundary_index].to_vec()
-    } else if snapshot_state.ends_mid_turn {
-        let cut_index = snapshot_state.active_turn_start_index.or_else(|| {
-            truncation::user_message_positions_in_rollout(items)
-                .last()
-                .copied()
-        });
-        cut_index
-            .map(|index| items[..index].to_vec())
-            .unwrap_or_default()
+        return truncate_owned_initial_history(history, boundary + 1);
+    }
+    let snapshot_state = snapshot_turn_state(&history);
+    let items = history.get_rollout_items();
+    let cut = if snapshot_state.ends_mid_turn {
+        snapshot_state.active_turn_start_index.or_else(|| {
+            truncation::user_message_positions_in_rollout(items).last().copied()
+        }).unwrap_or(0)
     } else {
-        items.to_vec()
+        items.len()
     };
+    truncate_owned_initial_history(history, cut)
+}
 
-    if retained.is_empty() {
-        InitialHistory::New
-    } else {
-        InitialHistory::Forked(truncation::carry_source_integrity_notice(items, retained))
+fn truncate_owned_initial_history(history: InitialHistory, cut: usize) -> InitialHistory {
+    let source = history.get_rollout_items();
+    let cut = cut.min(source.len());
+    // Capture only authenticated global notices from the discarded suffix.
+    let notices = if cut == 0 || cut == source.len() { Vec::new() } else {
+        source[cut..].iter().flat_map(|item| match item {
+            RolloutItem::ResponseItem(item) => std::slice::from_ref(item),
+            RolloutItem::Compacted(item) => item.replacement_history.as_deref().unwrap_or_default(),
+            _ => &[],
+        }).filter(|item| codex_rollout::is_rollout_reconstruction_notice(item))
+            .cloned().map(RolloutItem::ResponseItem).collect()
+    };
+    let retained = match history {
+        InitialHistory::New | InitialHistory::Cleared => Vec::new(),
+        InitialHistory::Forked(mut items) => { items.truncate(cut); items }
+        InitialHistory::Resumed(resumed) => match Arc::try_unwrap(resumed.history) {
+            Ok(mut items) => { items.truncate(cut); items }
+            Err(shared) => shared[..cut].to_vec(),
+        },
+    };
+    if retained.is_empty() { InitialHistory::New } else {
+        InitialHistory::Forked(truncation::carry_source_integrity_notice(&notices, retained))
     }
 }
 

@@ -13,6 +13,7 @@ use serde::Deserialize;
 use serde::Serialize;
 use sha2::Digest;
 use sha2::Sha256;
+use std::sync::Arc;
 
 const REPLACEMENT_NOTICE: &str =
     "These AGENTS.md instructions replace all previously provided AGENTS.md instructions.";
@@ -32,7 +33,7 @@ const MAX_UPDATE_BYTES: usize = 4 * 1024;
 pub(crate) struct AgentsMdState {
     instructions: Option<UserInstructions>,
     freshness: AgentsMdFreshness,
-    source_snapshot: Option<serde_json::Value>,
+    source_snapshot: Option<Arc<serde_json::Value>>,
     legacy_retained: Option<LegacyAgentsMd>,
     instructions_are_recovered_aggregate: bool,
 }
@@ -51,7 +52,7 @@ pub(crate) struct AgentsMdSnapshot {
     #[serde(default)]
     freshness: AgentsMdFreshness,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    source_snapshot: Option<serde_json::Value>,
+    source_snapshot: Option<Arc<serde_json::Value>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     legacy_retained: Option<LegacyAgentsMd>,
 }
@@ -274,8 +275,8 @@ impl WorldStateSection for AgentsMdState {
         items: &[codex_protocol::models::ResponseItem],
     ) -> bool {
         // Freshness-only notices do not replace the last substantive instruction body.
-        let deliveries = retained_deliveries(items);
-        let Some(&(_, text)) = deliveries.last() else {
+        let mut deliveries = retained_deliveries(items);
+        let Some((last_index, text)) = deliveries.next_back() else {
             if previous.text.is_some() {
                 return false;
             }
@@ -290,7 +291,8 @@ impl WorldStateSection for AgentsMdState {
             };
         };
         if parse_update(text).is_some() {
-            if !update_chain_supported(previous, items, &deliveries) {
+            if !update_chain_supported(previous, items,
+                std::iter::once((last_index, text)).chain(deliveries.rev())) {
                 return false;
             }
         } else {
@@ -319,21 +321,18 @@ impl WorldStateSection for AgentsMdState {
         }
         // A warning from an older body must not certify the retained replacement.
         let expected = observation_text(previous);
-        let mut seen_body = false;
         let mut observation = None;
-        for item in items {
+        'observations: for item in items.iter().rev() {
             let codex_protocol::models::ResponseItem::Message { role, content, .. } = item else {
                 continue;
             };
-            for part in content {
+            for part in content.iter().rev() {
                 let codex_protocol::models::ContentItem::InputText { text: retained } = part else {
                     continue;
                 };
                 if role == "user" && retained == text {
-                    seen_body = true;
-                    observation = None;
-                } else if seen_body
-                    && role == "developer"
+                    break 'observations;
+                } else if observation.is_none() && role == "developer"
                     && retained.starts_with("<repository_observation>")
                 {
                     observation = Some(retained);
@@ -452,8 +451,8 @@ fn observation_text(snapshot: &AgentsMdSnapshot) -> String {
 fn instruction_body(snapshot: &AgentsMdSnapshot) -> Option<&str> {
     let text = snapshot.text.as_deref()?;
     Some(
-        text.strip_prefix(snapshot.freshness.model_visible_description())
-            .and_then(|text| text.strip_prefix("\n\n"))
+        snapshot.freshness
+            .strip_model_visible_description(text)
             .unwrap_or(text),
     )
 }
@@ -531,7 +530,7 @@ fn parse_update(text: &str) -> Option<(&str, &str)> {
 
 /// Substantive deliveries in history order, with their item index: complete
 /// bodies (not freshness-only notices) and line diffs.
-fn retained_deliveries(items: &[ResponseItem]) -> Vec<(usize, &str)> {
+fn retained_deliveries(items: &[ResponseItem]) -> impl DoubleEndedIterator<Item = (usize, &str)> {
     items
         .iter()
         .enumerate()
@@ -551,17 +550,16 @@ fn retained_deliveries(items: &[ResponseItem]) -> Vec<(usize, &str)> {
                 _ => None,
             })
         })
-        .collect()
 }
 
 /// Whether retained line diffs lead from a retained complete body to
 /// `previous`. They stand only within the turn that sent them: after a later
 /// real user message (a new turn, or steering) the complete body is sent
 /// again, as it is once the diffs outgrow half of that body.
-fn update_chain_supported(
+fn update_chain_supported<'a>(
     previous: &AgentsMdSnapshot,
     items: &[ResponseItem],
-    deliveries: &[(usize, &str)],
+    deliveries: impl Iterator<Item = (usize, &'a str)>,
 ) -> bool {
     let Some(body) = instruction_body(previous) else {
         return false;
@@ -569,7 +567,7 @@ fn update_chain_supported(
     let mut expected = state_digest(previous.directory.as_deref(), body);
     let mut first_update: Option<usize> = None;
     let mut update_bytes = 0_usize;
-    for &(index, text) in deliveries.iter().rev() {
+    for (index, text) in deliveries {
         let Some((base, result)) = parse_update(text) else {
             return first_update.is_some_and(|first| {
                 rendered_digest(&without_replacement_notice(text)) == expected

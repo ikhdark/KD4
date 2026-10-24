@@ -5,6 +5,7 @@ use codex_protocol::error::Result;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::SubAgentSource;
 use rand::prelude::IndexedRandom;
+use rand::prelude::IteratorRandom;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::collections::hash_map::Entry;
@@ -570,13 +571,13 @@ impl AgentRegistry {
             if names.is_empty() {
                 return None;
             }
-            let available_names: Vec<String> = names
+            let available_name = names
                 .iter()
                 .map(|name| format_agent_nickname(name, active_agents.nickname_reset_count))
                 .filter(|name| !active_agents.used_agent_nicknames.contains(name))
-                .collect();
-            if let Some(name) = available_names.choose(&mut rand::rng()) {
-                name.clone()
+                .choose(&mut rand::rng());
+            if let Some(name) = available_name {
+                name
             } else {
                 active_agents.used_agent_nicknames.clear();
                 active_agents.nickname_reset_count += 1;
@@ -753,6 +754,38 @@ impl Drop for SpawnReservation {
 
 // Display metadata is bounded independently of the authoritative delivered message.
 const MAX_TASK_MESSAGE_BYTES: usize = 2_048;
+
+#[derive(Default)]
+pub(super) struct TaskMessagePreview(String);
+
+impl std::fmt::Write for TaskMessagePreview {
+    fn write_str(&mut self, text: &str) -> std::fmt::Result {
+        // Four lookahead bytes prove overflow without splitting a UTF-8 scalar.
+        let remaining = (MAX_TASK_MESSAGE_BYTES + 4).saturating_sub(self.0.len());
+        let mut end = text.len().min(remaining);
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        self.0.push_str(&text[..end]);
+        if end < text.len() || self.0.len() > MAX_TASK_MESSAGE_BYTES {
+            Err(std::fmt::Error)
+        } else {
+            Ok(())
+        }
+    }
+}
+
+impl TaskMessagePreview {
+    pub(super) fn finish(self) -> String {
+        bounded_task_message(self.0)
+    }
+}
+
+pub(super) fn bounded_task_message_from_text(text: &str) -> String {
+    let mut preview = TaskMessagePreview::default();
+    let _ = std::fmt::Write::write_str(&mut preview, text);
+    preview.finish()
+}
 
 fn bounded_task_message(mut message: String) -> String {
     const SUFFIX: &str = "\n[truncated]";

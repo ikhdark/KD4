@@ -199,6 +199,17 @@ impl AnalyticsEventsQueue {
         let loss_epoch = Arc::new(AtomicU64::new(0));
         let worker_loss_epoch = Arc::clone(&loss_epoch);
         let queue_auth_manager = Arc::clone(&auth_manager);
+        // Keep reduction responsive while a single ordered HTTP owner is slow.
+        // Bound queued dispatch batches to the original fact queue's scale.
+        let (dispatch, mut dispatches) = mpsc::channel::<(u64, Vec<TrackEventRequest>)>(
+            ANALYTICS_EVENTS_QUEUE_SIZE / ANALYTICS_EVENTS_BATCH_SIZE,
+        );
+        let dispatch_auth = Arc::clone(&auth_manager);
+        tokio::spawn(async move {
+            while let Some((epoch, events)) = dispatches.recv().await {
+                send_track_events(&dispatch_auth, epoch, &destination, &http_clients, events).await;
+            }
+        });
         tokio::spawn(async move {
             let mut reducer = AnalyticsReducer::default();
             let mut reducer_epoch = None;
@@ -220,8 +231,13 @@ impl AnalyticsEventsQueue {
                 if receiver.is_empty() {
                     reducer.delivery_queue_drained(drained_epoch);
                 }
-                if let Some(epoch) = reducer_epoch {
-                    send_track_events(&auth_manager, epoch, &destination, &http_clients, events).await;
+                if let Some(epoch) = reducer_epoch
+                    && !events.is_empty()
+                    && dispatch.try_send((epoch, events)).is_err()
+                {
+                    let _ = worker_loss_epoch.try_update(Ordering::AcqRel, Ordering::Acquire,
+                        |epoch| Some(epoch.saturating_add(1)));
+                    tracing::warn!("dropping analytics dispatch: queue is full or closed");
                 }
             }
         });

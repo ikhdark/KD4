@@ -405,7 +405,7 @@ impl ToolExecutor<ToolInvocation> for ReadFileHandler {
             .extend([json!("path"), json!("total_lines"), json!("file_complete")]);
         ToolSpec::Function(ResponsesApiTool {
             name: "read_file".to_string(),
-            description: format!("Read a UTF-8 file without shell quoting. The entire file must be UTF-8 and at most {MAX_FILE_MIB} MiB, even for a small byte selector. Prefer explicit line ranges or Rust/Python symbols for known code; do not dump whole files to locate one function. Path alone returns a first page capped at about {DEFAULT_FILE_READ_TOKEN_CEILING} tokens plus continuation; small files fit inline. Host-owned skill/context guidance keeps its existing delivery budget. Default HTML outside the workspace may be rendered as text: hashes, ranges and recovery then describe that text; use explicit selectors for exact original markup. Use read_tool_output with the artifact_id and continuation only for needed remaining ranges of the immutable snapshot. complete describes the requested page or selectors; file_complete describes acquired source coverage, not final script display or semantic review. A complete inline read may have no retained artifact; that is not a read failure. Explicit lines, bytes and fixed-string search selectors remain exact; check each results[] status and recover only missing selections. In code mode explicit selections return up to 1 MiB to the script independently of its display budget: consume it there and print only needed evidence, not the entire recovered result. Each call reads current contents; retained snapshots are historical. Pass a skill: locator to read its SKILL.md; omit environment_id for host-owned skills."),
+            description: format!("Read a UTF-8 file without shell quoting. The entire file must be UTF-8 and at most {MAX_FILE_MIB} MiB, even for a small byte selector. Structural selectors (symbol, enclosing, section outline/item IDs, and search with enclosing:true) support only Rust (.rs) and Python (.py). For PowerShell (.ps1) and other languages, use fixed-string search without enclosing or explicit line ranges; unsupported structural requests are rejected. Prefer explicit line ranges or supported symbols for known code; do not dump whole files to locate one function. Path alone returns a first page capped at about {DEFAULT_FILE_READ_TOKEN_CEILING} tokens plus continuation; small files fit inline. Host-owned skill/context guidance keeps its existing delivery budget. Default HTML outside the workspace may be rendered as text: hashes, ranges and recovery then describe that text; use explicit selectors for exact original markup. Use read_tool_output with the artifact_id and continuation only for needed remaining ranges of the immutable snapshot. complete describes the requested page or selectors; file_complete describes acquired source coverage, not final script display or semantic review. A complete inline read may have no retained artifact; that is not a read failure. Explicit lines, bytes and fixed-string search selectors remain exact; check each results[] status and recover only missing selections. In code mode explicit selections return up to 1 MiB to the script independently of its display budget: consume it there and print only needed evidence, not the entire recovered result. Each call reads current contents; retained snapshots are historical. Pass a skill: locator to read its SKILL.md; omit environment_id for host-owned skills."),
             strict: false,
             defer_loading: None,
             parameters: JsonSchema {
@@ -509,7 +509,7 @@ impl ToolExecutor<ToolInvocation> for ReadFileHandler {
                 let contents = turn
                     .developer_instructions
                     .as_deref()
-                    .and_then(crate::context::desktop_instructions::full)
+                    .and_then(crate::context::desktop_instructions::deferred)
                     .ok_or_else(|| {
                         FunctionCallError::RespondToModel(
                             "no Desktop guidance is configured for this turn".to_string(),
@@ -525,11 +525,11 @@ impl ToolExecutor<ToolInvocation> for ReadFileHandler {
                 let missing = invocation
                     .step_context
                     .tool_router()
-                    .map(|router| router.desktop_guidance_unavailable_tools(contents))
+                    .map(|router| router.desktop_guidance_unavailable_tools(contents.as_ref()))
                     .unwrap_or_default();
                 (
                     if missing.is_empty() {
-                        contents.to_string()
+                        contents.into_owned()
                     } else {
                         format!("{contents}\n\n{missing}")
                     },
@@ -1475,8 +1475,8 @@ async fn read_environment_file(
             // here: metadata would only repeat the same NotFound.
             if let Some(err) = failure.as_ref().err()
                 && err.kind() == std::io::ErrorKind::NotFound
-                && let Some(note) = suggestion_note(err.kind()).await
             {
+                let note = suggestion_note(err.kind()).await.unwrap_or_default();
                 return Err(FunctionCallError::RespondToModel(format!(
                     "{}{note}",
                     primary_error.clone().unwrap_or_else(|| format!(

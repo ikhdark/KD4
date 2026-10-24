@@ -27,9 +27,9 @@ use crate::HttpClientFactory;
 use crate::OutboundProxyPolicy;
 use crate::OutboundProxyRoute;
 use crate::route_aware_redirect::MAX_REDIRECTS;
+use crate::route_aware_redirect::PreparedRedirect;
 use crate::route_aware_redirect::insert_referer;
 use crate::route_aware_redirect::is_redirect;
-use crate::route_aware_redirect::redirect_request;
 use crate::route_aware_redirect::redirect_url;
 use crate::route_aware_redirect::remove_sensitive_headers;
 
@@ -612,15 +612,8 @@ impl RouteAwareClientPool {
                 }
                 *request.timeout_mut() = Some(remaining);
             }
-            let redirect_state = follows_redirects_manually.then(|| {
-                (
-                    request.method().clone(),
-                    request.headers().clone(),
-                    request.version(),
-                    request.timeout().copied(),
-                    request.try_clone(),
-                )
-            });
+            let redirect_state = follows_redirects_manually
+                .then(|| PreparedRedirect::capture(&request));
             let execute_request = async {
                 if follows_redirects_manually {
                     client.execute_without_request_logging(request).await
@@ -660,12 +653,11 @@ impl RouteAwareClientPool {
                 }
                 return Ok(response);
             };
-            let Some((method, headers, version, timeout, replay)) = redirect_state else {
+            let Some(redirect_state) = redirect_state else {
                 client.log_response(&request_method, &request_url, &response);
                 return Ok(response);
             };
-            let Some(mut next_request) =
-                redirect_request(status, method, headers, version, timeout, replay, next_url)
+            let Some(mut next_request) = redirect_state.into_request(status, next_url)
             else {
                 if follows_redirects_manually {
                     client.log_response(&request_method, &request_url, &response);

@@ -351,7 +351,7 @@ fn bounded_runner_lookup(
 
 fn repository_head_oid(root: &std::path::Path) -> Option<String> {
     let root = codex_utils_absolute_path::AbsolutePathBuf::try_from(root).ok()?;
-    let (git_dir, common_dir, _) = crate::git_dirs::resolve_git_dirs(&root)?;
+    let (git_dir, common_dir) = crate::git_dirs::resolve_git_directories(&root)?;
     let mut value = std::fs::read_to_string(git_dir.join("HEAD")).ok()?;
     // HEAD often contains a stable symbolic ref across commits. Read its target,
     // including packed refs and linked-worktree common dirs, on every lookup.

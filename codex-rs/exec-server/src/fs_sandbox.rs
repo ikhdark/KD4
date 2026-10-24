@@ -63,18 +63,34 @@ impl FileSystemSandboxRunner {
         sandbox: &FileSystemSandboxContext,
         request: FsHelperRequest,
     ) -> Result<FsHelperPayload, JSONRPCErrorError> {
+        let preparation_cancelled = tokio_util::sync::CancellationToken::new();
+        // Only pure preparation is cancellable. Once a helper starts, its
+        // existing native/mutation custodian owns settlement and cleanup.
+        let preparation_guard = preparation_cancelled.clone().drop_guard();
         let runner = self.clone();
         let sandbox = sandbox.clone();
         let (command, request_json) = tokio::task::spawn_blocking(move || {
+            let check_cancelled = || {
+                if preparation_cancelled.is_cancelled() {
+                    Err(invalid_request("fs sandbox preparation cancelled".to_string()))
+                } else {
+                    Ok(())
+                }
+            };
+            check_cancelled()?;
             let capture_lock = prepare_capture_lock(&request)?;
+            check_cancelled()?;
             let command = runner.prepare_command(&sandbox, capture_lock)?;
+            check_cancelled()?;
             let request_json = serde_json::to_vec(&request).map_err(json_error)?;
+            check_cancelled()?;
             Ok::<_, JSONRPCErrorError>((command, request_json))
         })
         .await
         .map_err(|error| {
             internal_error(format!("fs sandbox preparation task failed: {error}"))
         })??;
+        drop(preparation_guard);
         run_command(command, request_json).await
     }
 

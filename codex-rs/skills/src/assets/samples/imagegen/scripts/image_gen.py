@@ -664,54 +664,55 @@ async def _run_generate_batch(args: argparse.Namespace) -> int:
         return 0
 
     # Check every job before starting any requests, including per-job overrides.
+    prepared_jobs: List[Tuple[Dict[str, Any], List[Path], str]] = []
+    claimed_outputs: Dict[Path, int] = {}
     for i, job in enumerate(jobs, start=1):
-        output_format = _normalize_output_format(
-            job.get("output_format")
-            if job.get("output_format") is not None
-            else args.output_format
-        )
+        prompt = str(job["prompt"]).strip()
+        fields = _merge_non_null(base_fields, job.get("fields", {}))
+        fields = _merge_non_null(fields, {k: job.get(k) for k in base_fields.keys()})
+        payload = dict(base_payload)
+        payload["prompt"] = _augment_prompt_fields(args.augment, prompt, fields)
+        payload = _merge_non_null(payload, {k: job.get(k) for k in base_payload.keys()})
+        payload = {k: v for k, v in payload.items() if v is not None}
+        _validate_generate_payload(payload)
+        output_format = _normalize_output_format(payload.get("output_format"))
+        _validate_transparency(payload.get("background"), output_format)
+        payload["output_format"] = output_format
         outputs = _job_output_paths(
             out_dir=out_dir,
             output_format=output_format,
             idx=i,
-            prompt=str(job["prompt"]).strip(),
-            n=int(job["n"] if job.get("n") is not None else args.n),
+            prompt=prompt,
+            n=int(payload.get("n", 1)),
             explicit_out=job.get("out"),
         )
         _check_output_paths(outputs, args)
+        candidates = list(outputs)
+        if args.downscale_max_dim is not None:
+            candidates.extend(
+                _derive_downscale_path(path, args.downscale_suffix) for path in outputs
+            )
+        for path in candidates:
+            identity = path.resolve()
+            if identity in claimed_outputs:
+                _die(
+                    f"Job {i}: output path {path} is also used by job "
+                    f"{claimed_outputs[identity]}; each batch output must be unique."
+                )
+            claimed_outputs[identity] = i
+        prepared_jobs.append((payload, outputs, output_format))
 
     client = _create_async_client()
     sem = asyncio.Semaphore(args.concurrency)
 
     any_failed = False
 
-    async def run_job(i: int, job: Dict[str, Any]) -> Tuple[int, Optional[str]]:
+    async def run_job(
+        i: int, prepared: Tuple[Dict[str, Any], List[Path], str]
+    ) -> Tuple[int, Optional[str]]:
         nonlocal any_failed
-        prompt = str(job["prompt"]).strip()
         job_label = f"[job {i}/{len(jobs)}]"
-
-        fields = _merge_non_null(base_fields, job.get("fields", {}))
-        fields = _merge_non_null(fields, {k: job.get(k) for k in base_fields.keys()})
-        augmented = _augment_prompt_fields(args.augment, prompt, fields)
-
-        payload = dict(base_payload)
-        payload["prompt"] = augmented
-        payload = _merge_non_null(payload, {k: job.get(k) for k in base_payload.keys()})
-        payload = {k: v for k, v in payload.items() if v is not None}
-
-        n = int(payload.get("n", 1))
-        _validate_generate_payload(payload)
-        effective_output_format = _normalize_output_format(payload.get("output_format"))
-        _validate_transparency(payload.get("background"), effective_output_format)
-        payload["output_format"] = effective_output_format
-        outputs = _job_output_paths(
-            out_dir=out_dir,
-            output_format=effective_output_format,
-            idx=i,
-            prompt=prompt,
-            n=n,
-            explicit_out=job.get("out"),
-        )
+        payload, outputs, effective_output_format = prepared
         try:
             async with sem:
                 print(f"{job_label} starting", file=sys.stderr)
@@ -742,7 +743,8 @@ async def _run_generate_batch(args: argparse.Namespace) -> int:
             return i, str(exc)
 
     tasks = [
-        asyncio.create_task(run_job(i, job)) for i, job in enumerate(jobs, start=1)
+        asyncio.create_task(run_job(i, prepared))
+        for i, prepared in enumerate(prepared_jobs, start=1)
     ]
 
     try:

@@ -4201,6 +4201,13 @@ impl ModelClientSession {
             .set_connection_reused(/*connection_reused*/ false);
     }
 
+    /// Steering abandons an unfinished response, not the turn. Its socket may
+    /// still be draining asynchronously, so reconnect without treating local
+    /// interruption as a provider failure or inheriting the abandoned response.
+    pub(crate) fn interrupt_response_for_steering(&mut self) {
+        self.reset_websocket_session();
+    }
+
     /// Replaces a websocket the provider closed mid-response with a code that
     /// invites another connection, so the next attempt of the same request
     /// reconnects instead of abandoning WebSockets for the session.

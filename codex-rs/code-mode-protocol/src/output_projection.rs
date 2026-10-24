@@ -48,7 +48,43 @@ pub fn model_visible_tool_result(tool: &ToolName, raw: &Value) -> Option<Value> 
                     item["type"] == "text" && item.get("text").is_some_and(Value::is_string)
                 })
             });
-    let mut projected = object.clone();
+    let command_streams = tool.namespace.is_none()
+        && matches!(tool.name.as_str(), "exec_command" | "write_stdin")
+        && object.get("streams_complete") == Some(&Value::Bool(true))
+        && object.get("stdout").is_some_and(Value::is_string)
+        && object.get("stderr").is_some_and(Value::is_string);
+    let mcp_content = (!local_text_tool)
+        .then(|| object.get("structuredContent").filter(|value| !value.is_null())
+            .zip(object.get("content").and_then(Value::as_array)))
+        .flatten();
+    // Do not clone bodies that the display recipe will immediately discard.
+    // Native results and script-visible streams keep their original values.
+    let mut projected = object.iter()
+        .filter(|(key, _)| !(command_streams && matches!(key.as_str(), "stdout" | "stderr" | "streams_complete"))
+            && !(mcp_content.is_some() && key.as_str() == "content"))
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect::<serde_json::Map<_, _>>();
+    if let Some((structured, content)) = mcp_content {
+        let retained = content.iter().filter_map(|item| {
+            let mirror = item["type"] == "text"
+                && item["text"].as_str().is_some_and(|text| {
+                    serde_json::from_str::<Value>(text).is_ok_and(|value| value == *structured)
+                });
+            if !mirror { return Some(item.clone()); }
+            if item.as_object().is_some_and(|item| item.len() == 2) { return None; }
+            // Annotations, position and provider metadata are independent
+            // evidence, even when the body is an exact structured JSON mirror.
+            let mut reference = item.as_object()?.iter()
+                .filter(|(key, _)| key.as_str() != "text")
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect::<serde_json::Map<_, _>>();
+            reference.insert("text".into(), Value::String(
+                "[Exact JSON mirror omitted; see structuredContent.]".to_string(),
+            ));
+            Some(Value::Object(reference))
+        }).collect();
+        projected.insert("content".into(), Value::Array(retained));
+    }
     if tool.namespace.is_none() && matches!(tool.name.as_str(), "exec_command" | "write_stdin") {
         // Chunk IDs identify transport frames, not resumable commands or artifacts.
         projected.remove("chunk_id");
@@ -83,14 +119,6 @@ pub fn model_visible_tool_result(tool: &ToolName, raw: &Value) -> Option<Value> 
         }
         // These are exact script inputs, not a second copy to spend the cell's
         // display budget on. Scripts can explicitly emit selected stream data.
-        if object.get("streams_complete") == Some(&Value::Bool(true))
-            && object.get("stdout").is_some_and(Value::is_string)
-            && object.get("stderr").is_some_and(Value::is_string)
-        {
-            projected.remove("stdout");
-            projected.remove("stderr");
-            projected.remove("streams_complete");
-        }
         // Compatibility booleans remain script-visible. Presentation names the
         // scope rather than conflating this poll with the cumulative transcript.
         if let Some(reduced) = object.get("output_reduced").and_then(Value::as_bool) {
@@ -208,34 +236,35 @@ pub fn model_visible_tool_result(tool: &ToolName, raw: &Value) -> Option<Value> 
                 }
             }
         }
-    } else if let Some(structured) = object.get("structuredContent").filter(|v| !v.is_null())
-        && let Some(content) = object.get("content").and_then(Value::as_array)
-    {
-        let retained = content
-            .iter()
-            .filter_map(|item| {
-                let mirror = item["type"] == "text"
-                    && item["text"].as_str().is_some_and(|text| {
-                        serde_json::from_str::<Value>(text).is_ok_and(|value| value == *structured)
-                    });
-                if !mirror {
-                    return Some(item.clone());
-                }
-                if item.as_object().is_some_and(|item| item.len() == 2) {
-                    return None;
-                }
-                // Replace only the redundant body. Annotations, position and
-                // provider metadata are independent evidence and survive.
-                let mut reference = item.clone();
-                reference["text"] = Value::String(
-                    "[Exact JSON mirror omitted; see structuredContent.]".to_string(),
-                );
-                Some(reference)
-            })
-            .collect::<Vec<_>>();
-        projected.insert("content".to_string(), Value::Array(retained));
     }
     (raw_text || mcp_text || projected != *object).then_some(Value::Object(projected))
+}
+
+/// Code Mode printing may use references that are not native schema fields.
+/// Keep the native result and direct response's selector-binding contract intact.
+pub fn printed_tool_result(tool: &ToolName, raw: &Value) -> Option<Value> {
+    let mut projected = model_visible_tool_result(tool, raw)?;
+    // Only a single exact binding/result pair is unambiguous without an index
+    // map. Parser diagnostics and merged/sorted extents remain explicit.
+    if tool.namespace.is_none() && tool.name == "read_file"
+        && let Some(results) = raw.get("results").and_then(Value::as_array)
+        && let [result] = results.as_slice()
+        && result["status"] == "ok"
+        && result["complete"] == true
+        && (result.get("text").is_some_and(Value::is_string)
+            || result.get("data_base64").is_some_and(Value::is_string))
+        && let Some(selector) = result.get("selector")
+        && let Some(bindings) = projected.get_mut("selector_bindings").and_then(Value::as_array_mut)
+        && let [binding] = bindings.as_mut_slice()
+        && binding.get("syntax_error").is_none_or(|value| value == false)
+        && binding.get("resolved_selectors").and_then(Value::as_array)
+            .is_some_and(|ranges| ranges.as_slice() == std::slice::from_ref(selector))
+        && let Some(binding) = binding.as_object_mut()
+    {
+        binding.remove("resolved_selectors");
+        binding.insert("result_index".into(), Value::from(0));
+    }
+    Some(projected)
 }
 
 /// Search coordinates and hydrated evidence remain inline. Only omit aliases
@@ -719,9 +748,10 @@ mod tests {
             "results":[{"selector":delivered, "status":"ok", "complete":true, "text":"fn b(){}"}],
             "selector_bindings":[{"selector_index":0, "qualified_name":"A::b", "kind":"fn",
                 "resolved_selectors":[delivered]}]});
-        let compact = model_visible_tool_result(&ToolName::plain("read_file"), &raw).unwrap();
+        let compact = printed_tool_result(&ToolName::plain("read_file"), &raw).unwrap();
         let binding = &compact["selector_bindings"][0];
-        assert_eq!(binding["resolved_selectors"], json!([delivered]));
+        assert!(binding.get("resolved_selectors").is_none());
+        assert_eq!(binding["result_index"], 0);
         // Result sorting must never detach an owner from its exact range.
         assert_eq!(binding["qualified_name"], "A::b");
         assert_eq!(binding["kind"], "fn");
@@ -737,7 +767,7 @@ mod tests {
                 {"selector_index":0,"qualified_name":"B::run","kind":"fn","resolved_selectors":[later]},
                 {"selector_index":1,"qualified_name":"A::run","kind":"fn","resolved_selectors":[delivered]}]});
         let projected =
-            model_visible_tool_result(&ToolName::plain("read_file"), &reversed).unwrap();
+            printed_tool_result(&ToolName::plain("read_file"), &reversed).unwrap();
         assert_eq!(
             projected["selector_bindings"],
             reversed["selector_bindings"]
@@ -749,7 +779,7 @@ mod tests {
         let mut merged = raw.clone();
         merged["results"][0]["selector"] = json!({"kind":"lines","start":1,"end":121});
         assert_eq!(
-            model_visible_tool_result(&ToolName::plain("read_file"), &merged).unwrap()["selector_bindings"]
+            printed_tool_result(&ToolName::plain("read_file"), &merged).unwrap()["selector_bindings"]
                 [0]["resolved_selectors"],
             json!([delivered])
         );
@@ -764,7 +794,7 @@ mod tests {
             let mut guarded = raw.clone();
             mutate(&mut guarded);
             assert_eq!(
-                model_visible_tool_result(&ToolName::plain("read_file"), &guarded)
+                printed_tool_result(&ToolName::plain("read_file"), &guarded)
                     .unwrap_or_else(|| guarded.clone())["selector_bindings"][0]["resolved_selectors"],
                 json!([delivered])
             );

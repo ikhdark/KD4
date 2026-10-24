@@ -48,12 +48,12 @@ For a new marketplace, use this shape; see [plugin-json-spec.md](references/plug
 
 ## Validate and hand off
 
-Before returning a generated plugin, run:
+The checks below remain subject to the active validation policy; this skill does not authorize them. When authorized, validate a generated plugin before returning it:
 
 ```bash
 python3 scripts/validate_plugin.py <plugin-path>
 ```
 
-After editing this skill, run `python3 ../skill-creator/scripts/quick_validate.py .`.
+After editing this skill, use `python3 ../skill-creator/scripts/quick_validate.py .` when that check is authorized.
 
 When a marketplace entry was created or updated, end with "To view this in the Codex app:" and Markdown links labeled `View <normalized plugin name>` and `Share <normalized plugin name>`. Use `codex://plugins/<normalized plugin name>?marketplacePath=<absolute marketplace.json path>`, adding `&mode=share` for Share. Substitute actual values and URL-encode the path segment/query value. Do not add `pluginName` or `hostId`, and omit these links when no marketplace entry changed.

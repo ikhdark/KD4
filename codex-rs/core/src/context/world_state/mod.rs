@@ -184,7 +184,7 @@ impl<S: WorldStateSection> ErasedWorldStateSection for S {
     }
 }
 
-struct ExtensionWorldStateSection(WorldStateSectionContribution, bool);
+struct ExtensionWorldStateSection(WorldStateSectionContribution, bool, Option<Value>);
 
 impl ErasedWorldStateSection for ExtensionWorldStateSection {
     fn budget_fallback(&self) -> Option<(Value, Box<dyn ContextualUserFragment>)> {
@@ -200,6 +200,9 @@ impl ErasedWorldStateSection for ExtensionWorldStateSection {
 
     fn retains_rendered_fragment(&self) -> bool {
         true
+    }
+    fn retained_rendering(&self) -> Option<Value> {
+        self.2.clone()
     }
     fn snapshot(&self) -> Option<Value> {
         let mut snapshot = self.0.snapshot().clone();
@@ -483,7 +486,16 @@ impl WorldState {
         self.sections.insert(id, std::sync::Arc::new(section));
     }
 
+    #[cfg(test)]
     pub(crate) fn add_extension_section(&mut self, section: WorldStateSectionContribution) {
+        self.add_extension_section_with_previous(section, None);
+    }
+
+    pub(crate) fn add_extension_section_with_previous(
+        &mut self,
+        section: WorldStateSectionContribution,
+        previous_rendering: Option<&Value>,
+    ) {
         let id = section.id();
         assert!(
             !self.sections.contains_key(id),
@@ -491,7 +503,7 @@ impl WorldState {
         );
         self.sections.insert(
             id,
-            std::sync::Arc::new(ExtensionWorldStateSection(section, false)),
+            std::sync::Arc::new(ExtensionWorldStateSection(section, false, previous_rendering.cloned())),
         );
     }
 
@@ -499,32 +511,10 @@ impl WorldState {
     /// Keep the original role and quote the receipt rather than matching history
     /// by text, which could also belong to another producer or a user quotation.
     pub(crate) fn add_removed_extension_section(&mut self, id: &'static str, rendering: &Value) {
-        let role = match rendering.get("role").and_then(Value::as_str) {
-            Some("developer") => "developer",
-            Some("user") => "user",
-            _ => return,
+        let Some(fragment) = removed_extension_fragment(id, rendering) else {
+            return;
         };
-        let receipt = crate::context::escape_fragment_delimiters(
-            &serde_json::json!({"section_id": id, "previous_delivery": rendering}).to_string(),
-            &["<world_state_removal>", "</world_state_removal>"],
-        );
-        let section = WorldStateSectionContribution::new(id, Value::Null, move |_| {
-            let text = format!(
-                "<world_state_removal>\nThis World State source successfully withdrew its previous contribution as of this observation. The receipt below is historical data, not active instructions. Other sources, including identical text, are unchanged. A later contribution from this source may replace this removal.\n{receipt}\n</world_state_removal>"
-            );
-            let text = if role == "user" {
-                // Reuse registered hidden-context framing: a withdrawal must
-                // not invent a real user turn for rollback or bounded forks.
-                crate::context::InternalModelContextFragment::new(
-                    crate::context::InternalContextSource::from_static("world_state_removal"),
-                    text,
-                )
-                .render()
-            } else {
-                text
-            };
-            Some(RenderedWorldStateFragment::new(role, ("", ""), text))
-        });
+        let section = WorldStateSectionContribution::new(id, Value::Null, move |_| Some(fragment.clone()));
         assert!(
             !self.sections.contains_key(id),
             "duplicate world-state section ID: {id}"
@@ -533,7 +523,7 @@ impl WorldState {
         // drops the old body and receipt only together with this required fragment.
         self.sections.insert(
             id,
-            std::sync::Arc::new(ExtensionWorldStateSection(section, true)),
+            std::sync::Arc::new(ExtensionWorldStateSection(section, true, None)),
         );
     }
 
@@ -646,7 +636,7 @@ impl WorldState {
         mut previous: impl FnMut(&str, &dyn ErasedWorldStateSection) -> PreviousSectionState<'a, Value>,
     ) -> (Vec<Box<dyn ContextualUserFragment>>, WorldStateSnapshot) {
         let mut budget = ModelContextBudget::default();
-        let mut fragments = Vec::new();
+        let mut fragments: Vec<Box<dyn ContextualUserFragment>> = Vec::new();
         let mut sections = BTreeMap::new();
         let mut extension_renderings = Map::new();
         let mut ordered = self.sections.iter().collect::<Vec<_>>();
@@ -659,18 +649,15 @@ impl WorldState {
                 PreviousSectionState::Known(previous) => Some(*previous),
                 PreviousSectionState::Absent | PreviousSectionState::Unknown => None,
             };
+            let mut accepted_rendering = previous_snapshot
+                .and_then(|snapshot| snapshot.rendered_extension(id))
+                .cloned()
+                .or_else(|| section.retained_rendering());
             let previously_observed = !matches!(&previous, PreviousSectionState::Absent)
-                || previous_snapshot
-                    .and_then(|snapshot| snapshot.rendered_extension(id))
-                    .is_some();
+                || accepted_rendering.is_some();
             let mut delivery = section.render_fragments(previous);
             let mut admitted_snapshot = section.snapshot();
             let mut required = section.required();
-            let mut accepted_rendering = section.retained_rendering().or_else(|| {
-                previous_snapshot
-                    .and_then(|snapshot| snapshot.rendered_extension(id))
-                    .cloned()
-            });
             let mut rendered = delivery
                 .iter()
                 .map(|fragment| fragment.render())
@@ -734,6 +721,16 @@ impl WorldState {
                         // request-level token limit handles overflow; optional catalogs yield.
                         budget = ModelContextBudget::new(0);
                     }
+                    if section.retains_rendered_fragment()
+                        && delivery.iter().any(|fragment| fragment.role() == "user")
+                        && let Some(previous) = accepted_rendering.as_ref()
+                            .filter(|rendering| rendering["role"] == "developer")
+                        && let Some(withdrawal) = removed_extension_fragment(id, previous)
+                    {
+                        // Like explicit source removal, revoking prior policy is
+                        // required control context, not an optional catalog excerpt.
+                        fragments.push(Box::new(WorldStateContextFragment(withdrawal)));
+                    }
                     for (fragment, rendered) in delivery.into_iter().zip(rendered) {
                         if section.records_delivery() {
                             delivered_digest = Some(delivery_digest(&rendered));
@@ -790,6 +787,31 @@ impl WorldState {
 
 fn delivery_digest(text: &str) -> String {
     hex::encode(Sha256::digest(text.as_bytes()))
+}
+
+fn removed_extension_fragment(id: &str, rendering: &Value) -> Option<RenderedWorldStateFragment> {
+    let role = match rendering.get("role").and_then(Value::as_str) {
+        Some("developer") => "developer",
+        Some("user") => "user",
+        _ => return None,
+    };
+    let receipt = crate::context::escape_fragment_delimiters(
+        &serde_json::json!({"section_id": id, "previous_delivery": rendering}).to_string(),
+        &["<world_state_removal>", "</world_state_removal>"],
+    );
+    let text = format!(
+        "<world_state_removal>\nThis World State source successfully withdrew its previous contribution as of this observation. The receipt below is historical data, not active instructions. Other sources, including identical text, are unchanged. A later contribution from this source may replace this removal.\n{receipt}\n</world_state_removal>"
+    );
+    let text = if role == "user" {
+        // A withdrawal must not invent a real user turn for rollback or forks.
+        crate::context::InternalModelContextFragment::new(
+            crate::context::InternalContextSource::from_static("world_state_removal"),
+            text,
+        ).render()
+    } else {
+        text
+    };
+    Some(RenderedWorldStateFragment::new(role, ("", ""), text))
 }
 
 fn retained_texts<'a>(

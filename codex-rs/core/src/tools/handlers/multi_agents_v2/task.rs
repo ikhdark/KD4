@@ -1130,16 +1130,23 @@ fn bounded_receipt_projection_with_proof_limit(
             "total": receipt.criterion_results.len(),
             "passed": passed,
             "reported_passed": passed,
-            "with_execution_reference": receipt.criterion_results.iter().filter(|result| result.evidence_ref.is_some()).count(),
-            "reported_passed_without_execution_reference": receipt.criterion_results.iter().filter(|result| result.status == CriterionStatus::Passed && result.evidence_ref.is_none()).count(),
+            "with_evidence_reference": receipt.criterion_results.iter().filter(|result| result.evidence_ref.is_some()).count(),
+            "with_execution_reference": receipt.criterion_results.iter().filter(|result| result.evidence_ref.as_ref().is_some_and(|reference| reference.kind == codex_agent_task_store::CriterionEvidenceKind::ValidationExecution)).count(),
+            "with_source_inspection_reference": receipt.criterion_results.iter().filter(|result| result.evidence_ref.as_ref().is_some_and(|reference| reference.kind == codex_agent_task_store::CriterionEvidenceKind::SourceInspection)).count(),
+            "reported_passed_without_execution_reference": receipt.criterion_results.iter().filter(|result| result.status == CriterionStatus::Passed && !result.evidence_ref.as_ref().is_some_and(|reference| reference.kind == codex_agent_task_store::CriterionEvidenceKind::ValidationExecution)).count(),
+            "reported_passed_without_evidence_reference": receipt.criterion_results.iter().filter(|result| result.status == CriterionStatus::Passed && result.evidence_ref.is_none()).count(),
             "failed": failed,
             "not_run": receipt.criterion_results.len().saturating_sub(passed + failed),
         },
         "criterion_execution_references": receipt.criterion_results.iter().filter_map(|result| {
-            result.evidence_ref.as_ref().filter(|reference| result.criterion_id.len() <= MAX_PROJECTED_EXACT_STRING_BYTES && reference.call_id.len() <= MAX_PROJECTED_EXACT_STRING_BYTES && reference.workspace_id.len() <= MAX_PROJECTED_EXACT_STRING_BYTES)
+            result.evidence_ref.as_ref().filter(|reference| reference.kind == codex_agent_task_store::CriterionEvidenceKind::ValidationExecution && result.criterion_id.len() <= MAX_PROJECTED_EXACT_STRING_BYTES && reference.call_id.len() <= MAX_PROJECTED_EXACT_STRING_BYTES && reference.workspace_id.len() <= MAX_PROJECTED_EXACT_STRING_BYTES)
                 .map(|reference| json!({"criterion_id": result.criterion_id, "execution": reference}))
         }).take(proof_limit).collect::<Vec<_>>(),
-        "evidence_scope": "Recorded validation executions; test coverage and current freshness are not established by this receipt alone.",
+        "criterion_source_inspection_references": receipt.criterion_results.iter().filter_map(|result| {
+            result.evidence_ref.as_ref().filter(|reference| reference.kind == codex_agent_task_store::CriterionEvidenceKind::SourceInspection && result.criterion_id.len() <= MAX_PROJECTED_EXACT_STRING_BYTES && reference.call_id.len() <= MAX_PROJECTED_EXACT_STRING_BYTES && reference.workspace_id.len() <= MAX_PROJECTED_EXACT_STRING_BYTES)
+                .map(|reference| json!({"criterion_id": result.criterion_id, "source_inspection": reference}))
+        }).take(proof_limit).collect::<Vec<_>>(),
+        "evidence_scope": "Recorded source acquisitions and validation executions, distinguished by producer kind. Source acquisition is not execution or semantic review; test coverage and current freshness are not established by this receipt alone.",
         "omitted_item_counts": {
             "changed_paths": omitted_changed_paths,
             "proof_references": omitted_proof_references,
@@ -1318,6 +1325,7 @@ fn task_projection(result: &GetAgentTaskResult) -> JsonValue {
         },
         "assignment_id": task.assignment.assignment_id,
         "attempt_id": task.current_attempt.attempt_id,
+        "contract_recovery_json_pointers": ["/task/assignment", "/task/current_attempt/amendment"],
         "role": task.assignment.role,
         "attempt_state": task.current_attempt.state,
         "dependency_provenance": {
@@ -1338,8 +1346,8 @@ fn task_projection(result: &GetAgentTaskResult) -> JsonValue {
         "unresolved_obligations": {
             "acceptance_criteria": unresolved_criteria,
         },
-        "source_inspection_assessments": {
-            "scope": "Explicit source policies only; acquisition and hash applicability, not semantic correctness or other criterion-policy verification.",
+        "criterion_assessments": {
+            "scope": "Explicit evidence policies only; source-acquisition or historical exact-command execution applicability, not semantic correctness or current execution freshness.",
             "satisfied": task.criterion_assessments.iter().filter(|assessment| assessment.satisfied).count(),
             "unsatisfied": task.criterion_assessments.iter().filter(|assessment| !assessment.satisfied).count(),
             "recovery_json_pointer": "/task/criterion_assessments",
@@ -1355,6 +1363,7 @@ fn task_projection(result: &GetAgentTaskResult) -> JsonValue {
             "observations": omitted_observations,
             "acceptance_criteria": omitted_acceptance_criteria,
             "unresolved_acceptance_criteria": omitted_unresolved_criteria,
+            "required_evidence": task.assignment.required_evidence.len(),
             "read_scope": task.assignment.read_scope.len(),
             "write_scope": task.assignment.write_scope.len(),
         },
@@ -1473,7 +1482,7 @@ fn task_projection_json_pointers(
     let task = &result.task;
     let mut selectors = Vec::new();
     if !task.criterion_assessments.is_empty() {
-        push_predetermined_json_pointer(&mut selectors, "task:source-inspection-assessments", "/task/criterion_assessments");
+        push_predetermined_json_pointer(&mut selectors, "task:criterion-assessments", "/task/criterion_assessments");
     }
     if result.cold_review_context.is_some() {
         push_predetermined_json_pointer(
@@ -1544,11 +1553,7 @@ fn task_projection_json_pointers(
             }
             if !retained_inline
                 || criterion.text.len() > MAX_PROJECTED_DETAIL_BYTES
-                || criterion
-                    .evidence_policy
-                    .as_ref()
-                    .and_then(|policy| policy.required_evidence.as_ref())
-                    .is_some_and(|required| required.len() > MAX_PROJECTED_DETAIL_BYTES)
+                || criterion.evidence_policy.is_some()
             {
                 push_predetermined_json_pointer(
                     &mut selectors,
@@ -1559,14 +1564,12 @@ fn task_projection_json_pointers(
         }
     }
     // Recovery selectors expose the requested contract without grading its proof.
-    for (index, requirement) in task.assignment.required_evidence.iter().enumerate() {
-        if index >= MAX_PROJECTED_OBLIGATIONS_PER_KIND || requirement.len() > MAX_PROJECTED_DETAIL_BYTES {
-            push_predetermined_json_pointer(
-                &mut selectors,
-                format!("task:required-evidence:{index}"),
-                format!("/task/assignment/required_evidence/{index}"),
-            );
-        }
+    if !task.assignment.required_evidence.is_empty() {
+        push_predetermined_json_pointer(
+            &mut selectors,
+            "task:required-evidence",
+            "/task/assignment/required_evidence",
+        );
     }
     for (id, pointer) in [
         ("task:objective", "/task/assignment/objective"),
@@ -2169,7 +2172,9 @@ fn amend_agent_task_spec() -> ToolSpec {
     function_spec(
         AMEND_AGENT_TASK_TOOL,
         "Root-only. Create the one allowed correction attempt for a sealed worker assignment \
-         after its review gate requests changes.",
+         after its review gate requests changes. This updates the durable contract and binding, \
+         but does not notify or start the worker. Use followup_task to request the correction; \
+         the worker must recover its current attempt and effective contract before acting.",
         object_schema(
             [
                 ("assignment_id", assignment_id_schema()),
@@ -2316,6 +2321,67 @@ mod projection_tests {
     }
 
     #[test]
+    fn receipt_projection_distinguishes_source_acquisition_from_execution() {
+        use codex_agent_task_store::CriterionEvidenceKind;
+        use codex_agent_task_store::CriterionEvidenceRef;
+        let receipt = AgentReceipt {
+            assignment_id: AssignmentId::new(),
+            attempt_id: AttemptId::new(),
+            status: AgentStatusClaim::Completed,
+            summary: "mixed evidence".into(),
+            criterion_results: [
+                ("source", Some(CriterionEvidenceKind::SourceInspection)),
+                ("execution", Some(CriterionEvidenceKind::ValidationExecution)),
+                ("claim", None),
+            ].into_iter().map(|(id, kind)| CriterionResult {
+                criterion_id: id.into(),
+                status: CriterionStatus::Passed,
+                evidence: None,
+                evidence_ref: kind.map(|kind| CriterionEvidenceRef {
+                    call_id: format!("{id}-call"),
+                    workspace_id: "workspace".into(),
+                    evidence_epoch: 7,
+                    kind,
+                }),
+            }).collect(),
+            declared_changes: Vec::new(),
+            validation_call_ids: vec!["source-call".into(), "execution-call".into()],
+            blockers: Vec::new(),
+            risks: Vec::new(),
+            next_action: None,
+            architecture_contract: None,
+            evidence_epoch: 7,
+            read_scope_fingerprint: None,
+            sealed_at: Utc::now(),
+        };
+        let result = SubmitAgentReceiptResult { receipt };
+        let payload = ToolPayload::Function { arguments: "{}".into() };
+        let response = result.code_mode_result(&payload);
+        let projected = &response["completion_evidence"];
+        assert_eq!(projected["criterion_counts"]["with_evidence_reference"], 2);
+        assert_eq!(projected["criterion_counts"]["with_execution_reference"], 1);
+        assert_eq!(projected["criterion_counts"]["with_source_inspection_reference"], 1);
+        assert_eq!(projected["criterion_counts"]["reported_passed_without_execution_reference"], 2);
+        assert_eq!(projected["criterion_counts"]["reported_passed_without_evidence_reference"], 1);
+        assert_eq!(projected["criterion_execution_references"].as_array().unwrap().len(), 1);
+        assert_eq!(projected["criterion_execution_references"][0]["criterion_id"], "execution");
+        assert_eq!(projected["criterion_source_inspection_references"].as_array().unwrap().len(), 1);
+        assert_eq!(projected["criterion_source_inspection_references"][0]["criterion_id"], "source");
+        assert!(projected["evidence_scope"].as_str().unwrap().contains("Source acquisition is not execution"));
+        assert_eq!(result.projection_metadata().unwrap().essential_inline, *projected);
+    }
+
+    #[test]
+    fn amendment_description_requires_explicit_delivery_and_current_contract_recovery() {
+        let ToolSpec::Function(spec) = amend_agent_task_spec() else {
+            panic!("amendment function spec");
+        };
+        assert!(spec.description.contains("does not notify or start the worker"));
+        assert!(spec.description.contains("Use followup_task"));
+        assert!(spec.description.contains("current attempt and effective contract before acting"));
+    }
+
+    #[test]
     fn oversized_receipt_projection_owner_recovery_is_hard_bounded_and_prioritized() {
         let receipt = AgentReceipt {
             assignment_id: AssignmentId::new(),
@@ -2444,9 +2510,22 @@ mod projection_tests {
                 text: "closed criterion".to_string(),
             },
             AcceptanceCriterion {
-                evidence_policy: None,
+                evidence_policy: Some(codex_agent_task_store::CriterionEvidencePolicy {
+                    kind: codex_agent_task_store::CriterionEvidenceRequirement::SourceInspection,
+                    required_evidence: Some("inspect:src/lib.rs".to_string()),
+                    freshness: codex_agent_task_store::EvidenceFreshness::Current,
+                }),
                 id: "criterion-open".to_string(),
                 text: "open criterion".to_string(),
+            },
+            AcceptanceCriterion {
+                evidence_policy: Some(codex_agent_task_store::CriterionEvidencePolicy {
+                    kind: codex_agent_task_store::CriterionEvidenceRequirement::ValidationExecution,
+                    required_evidence: Some("cargo test focused-proof".to_string()),
+                    freshness: codex_agent_task_store::EvidenceFreshness::Historical,
+                }),
+                id: "criterion-execution".to_string(),
+                text: "historical exact-command execution".to_string(),
             },
         ];
         let capsule = TaskCapsuleV1 {
@@ -2472,8 +2551,8 @@ mod projection_tests {
             workspace_manifest_hash: "a".repeat(64),
             prohibited_changes: Vec::new(),
             required_evidence: vec![
-                "focused validation one".to_string(),
-                "focused validation two".to_string(),
+                "cargo test focused-proof".to_string(),
+                "inspect:src/lib.rs".to_string(),
             ],
         };
         let observations = (0..6)
@@ -2508,6 +2587,17 @@ mod projection_tests {
                     status: CriterionStatus::NotRun,
                     evidence: None,
                 },
+                CriterionResult {
+                    evidence_ref: Some(codex_agent_task_store::CriterionEvidenceRef {
+                        call_id: "validation-satisfied".to_string(),
+                        workspace_id: "workspace".to_string(),
+                        evidence_epoch: 13,
+                        kind: codex_agent_task_store::CriterionEvidenceKind::ValidationExecution,
+                    }),
+                    criterion_id: "criterion-execution".to_string(),
+                    status: CriterionStatus::Passed,
+                    evidence: None,
+                },
             ],
             declared_changes: Vec::new(),
             validation_call_ids: vec!["validation-satisfied".to_string()],
@@ -2522,7 +2612,18 @@ mod projection_tests {
         let result = GetAgentTaskResult {
             task: AgentTask {
                 dependency_admissions: Vec::new(),
-                criterion_assessments: Vec::new(),
+                criterion_assessments: vec![
+                    codex_agent_task_store::CriterionAssessment {
+                        criterion_id: "criterion-open".to_string(),
+                        satisfied: false,
+                        reason: "source acquisition unavailable".to_string(),
+                    },
+                    codex_agent_task_store::CriterionAssessment {
+                        criterion_id: "criterion-execution".to_string(),
+                        satisfied: true,
+                        reason: "successful owned exact-command execution; historical applicability only".to_string(),
+                    },
+                ],
                 assignment: Assignment {
                     assignment_id,
                     root_session_id: "root-session".to_string(),
@@ -2539,8 +2640,8 @@ mod projection_tests {
                     dependencies: Vec::new(),
                     risk_hints: Vec::new(),
                     required_evidence: vec![
-                        "focused validation one".to_string(),
-                        "focused validation two".to_string(),
+                        "cargo test focused-proof".to_string(),
+                        "inspect:src/lib.rs".to_string(),
                     ],
                     prohibited_changes: Vec::new(),
                     contract_claims: Vec::new(),
@@ -2637,12 +2738,7 @@ mod projection_tests {
                 .len()
                 <= TASK_OUTPUT_INLINE_LIMIT_BYTES
         );
-        assert!(
-            projection["workspace"]["freshness"]
-                .as_str()
-                .unwrap()
-                .contains("criterion_policy_assessed")
-        );
+        assert!(projection["workspace"].get("freshness").is_none());
         for field in [
             "epoch",
             "current_epoch",
@@ -2652,30 +2748,27 @@ mod projection_tests {
             assert!(projection["workspace"].get(field).is_none());
         }
         assert_eq!(projection["receipt"]["evidence_epoch"], 13);
-        assert!(
-            projection["completion_evidence"]
-                .as_str()
-                .expect("completion evidence remains inline")
-                .contains("criterion-closed: reported complete")
-        );
+        assert_eq!(projection["receipt"]["criterion_counts"]["reported_passed_without_evidence_reference"], 1);
+        assert!(projection.get("source_inspection_assessments").is_none());
+        assert_eq!(projection["criterion_assessments"]["satisfied"], 1);
+        assert_eq!(projection["criterion_assessments"]["unsatisfied"], 1);
+        assert!(projection["criterion_assessments"]["scope"].as_str().unwrap().contains("historical exact-command execution applicability, not semantic correctness"));
+        assert_eq!(projection["contract_recovery_json_pointers"], json!(["/task/assignment", "/task/current_attempt/amendment"]));
         assert_eq!(projection["unresolved_gates"].as_array().unwrap().len(), 1);
         assert_eq!(projection["unresolved_gates"][0]["kind"], "review");
         assert_eq!(
             projection["unresolved_obligations"]["acceptance_criteria"][0]["id"],
-            "criterion-closed"
+            "criterion-open"
         );
         assert_eq!(
             projection["unresolved_obligations"]["acceptance_criteria"]
                 .as_array()
                 .unwrap()
                 .len(),
-            2,
-            "a reported pass without an applicable evidence policy remains unresolved"
+            1,
+            "a reported legacy pass is distinct from an unsatisfied explicit source policy"
         );
-        assert_eq!(
-            projection["unresolved_obligations"]["required_evidence"][0]["ordinal"],
-            2
-        );
+        assert_eq!(projection["omitted_item_counts"]["required_evidence"], 2);
         assert_eq!(
             projection["recent_observations"].as_array().unwrap().len(),
             4
@@ -2699,13 +2792,14 @@ mod projection_tests {
         for expected in [
             "/task/gates/0",
             "/task/assignment/objective",
+            "/task/assignment/acceptance_criteria/1",
+            "/task/assignment/required_evidence",
             "/task/validation_calls/0",
             "/task/receipt/criterion_results/1",
         ] {
             assert!(pointers.contains(expected), "missing {expected}");
         }
         assert!(!pointers.contains("/task/assignment/acceptance_criteria/0"));
-        assert!(!pointers.contains("/task/assignment/acceptance_criteria/1"));
         assert!(!pointers.contains("/task/assignment/required_evidence/1"));
         assert!(!pointers.contains("/task/workspace_status/next_required_action"));
         assert!(!pointers.contains("/task/observations/0"));
@@ -2715,6 +2809,9 @@ mod projection_tests {
                 arguments: "{}".to_string(),
             })
             .expect("canonical task JSON");
+        for pointer in projection["contract_recovery_json_pointers"].as_array().unwrap() {
+            assert!(canonical.json_pointers.contains_key(pointer.as_str().unwrap()));
+        }
         let empty = crate::agent::task_capabilities::cold_review_receipt_scope(&result.task)
             .unwrap()
             .unwrap();

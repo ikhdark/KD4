@@ -594,8 +594,8 @@ async fn load_skills_under_root(
         return;
     }
     let root_uri = PathUri::from_abs_path(root);
-    let resolved_skills = futures::stream::iter(skills)
-        .map(|skill| async move {
+    let mut resolved_skills = futures::stream::iter(skills.into_iter().enumerate())
+        .map(|(index, skill)| async move {
             let path_uri = fs
                 .canonicalize(&skill.path, /*sandbox*/ None)
                 .await
@@ -604,19 +604,22 @@ async fn load_skills_under_root(
                 Ok(path) => path,
                 Err(err) => {
                     error!("failed to convert discovered skill path {path_uri}: {err}");
-                    return None;
+                    return (index, None);
                 }
             };
-            Some(ResolvedDiscoveredSkill {
-                skill,
-                path,
-                path_uri,
-            })
+            (
+                index,
+                Some(ResolvedDiscoveredSkill { skill, path, path_uri }),
+            )
         })
-        .buffered(MAX_CONCURRENT_SKILL_LOADS)
-        .filter_map(futures::future::ready)
+        .buffer_unordered(MAX_CONCURRENT_SKILL_LOADS)
         .collect::<Vec<_>>()
         .await;
+    resolved_skills.sort_unstable_by_key(|(index, _)| *index);
+    let resolved_skills = resolved_skills
+        .into_iter()
+        .filter_map(|(_, skill)| skill)
+        .collect::<Vec<_>>();
     namespace_roots.extend(resolved_skills.iter().filter_map(|skill| {
         (skill.path_uri != skill.skill.path)
             .then(|| skill.path_uri.parent())
@@ -641,8 +644,8 @@ async fn load_skills_under_root(
             }
         }
     };
-    let skill_results = futures::stream::iter(resolved_skills)
-        .map(|skill| {
+    let skill_results = futures::stream::iter(resolved_skills.into_iter().enumerate())
+        .map(|(index, skill)| {
             let plugin_root = plugin_root.as_ref();
             async move {
                 let result = parse_skill_file(
@@ -656,14 +659,15 @@ async fn load_skills_under_root(
                 )
                 .await
                 .map_err(|err| err.to_string());
-                (skill.path, skill.path_uri, result)
+                (index, skill.path, skill.path_uri, result)
             }
         })
-        .buffered(MAX_CONCURRENT_SKILL_LOADS)
+        .buffer_unordered(MAX_CONCURRENT_SKILL_LOADS)
         .collect::<Vec<_>>()
         .boxed();
-    let (namespace_resolver, skill_results) = tokio::join!(namespace_resolver, skill_results);
-    for (path, path_uri, result) in skill_results {
+    let (namespace_resolver, mut skill_results) = tokio::join!(namespace_resolver, skill_results);
+    skill_results.sort_unstable_by_key(|(index, _, _, _)| *index);
+    for (_, path, path_uri, result) in skill_results {
         let result = result.and_then(|(mut skill, errors)| {
             outcome.errors.extend(errors);
             skill.name = namespace_resolver
@@ -703,7 +707,7 @@ async fn parse_skill_file(
     }
     .unwrap_or(SkillMetadataDiscovery::Absent);
     let (contents, loaded_metadata) = tokio::join!(
-        fs.read_file_text(path_uri, /*sandbox*/ None),
+        read_skill_frontmatter(fs, path_uri),
         load_skill_metadata(fs, path, &metadata, plugin_root),
     );
     let contents = contents.map_err(SkillParseError::Read)?;
@@ -1284,6 +1288,93 @@ fn resolve_color_str(
         diagnostics.push(format!("ignoring {field}: expected #RRGGBB, got {value}"));
         None
     }
+}
+
+/// Retain only metadata, but drain and validate the complete source just as the
+/// former collecting UTF-8 read did. Streaming owners preserve their read caps.
+async fn read_skill_frontmatter(fs: &dyn ExecutorFileSystem, path: &PathUri) -> io::Result<String> {
+    #[derive(Default)]
+    struct Prefix {
+        retained: String,
+        line: String,
+        opened: bool,
+        finished: bool,
+    }
+    impl Prefix {
+        fn finish_line(&mut self) {
+            if self.finished {
+                return;
+            }
+            if !self.opened {
+                let line = self.line.strip_prefix('\u{feff}').unwrap_or(&self.line);
+                if line.trim() != "---" {
+                    self.finished = true;
+                    self.line.clear();
+                    return;
+                }
+                self.opened = true;
+            } else if self.line.trim() == "---" {
+                self.finished = true;
+            }
+            self.retained.push_str(&self.line);
+            self.line.clear();
+        }
+
+        fn push(&mut self, text: &str) {
+            for part in text.split_inclusive('\n') {
+                if self.finished {
+                    break;
+                }
+                self.line.push_str(part);
+                if part.ends_with('\n') {
+                    self.finish_line();
+                } else if !self.opened {
+                    let line = self.line.strip_prefix('\u{feff}').unwrap_or(&self.line).trim();
+                    if !"---".starts_with(line) {
+                        self.finished = true;
+                        self.line.clear();
+                    }
+                }
+            }
+        }
+    }
+    let mut stream = fs.read_file_metadata_stream(path, None).await?;
+    let mut prefix = Prefix::default();
+    let mut pending = Vec::new();
+    let mut invalid_utf8 = None;
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk?;
+        // Read/I/O/size errors still precede UTF-8 decoding errors.
+        if invalid_utf8.is_some() {
+            continue;
+        }
+        pending.extend_from_slice(&chunk);
+        let valid_len = match std::str::from_utf8(&pending) {
+            Ok(text) => {
+                prefix.push(text);
+                pending.clear();
+                continue;
+            }
+            Err(error) if error.error_len().is_none() => error.valid_up_to(),
+            Err(error) => {
+                invalid_utf8 = Some(error);
+                pending.clear();
+                continue;
+            }
+        };
+        let text = std::str::from_utf8(&pending[..valid_len])
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        prefix.push(text);
+        pending.drain(..valid_len);
+    }
+    if let Some(error) = invalid_utf8 {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, error));
+    }
+    if !pending.is_empty() {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "incomplete UTF-8 in skill source"));
+    }
+    prefix.finish_line();
+    Ok(prefix.retained)
 }
 
 fn extract_frontmatter(contents: &str) -> Option<String> {

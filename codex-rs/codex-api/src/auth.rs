@@ -45,6 +45,17 @@ pub trait AuthProvider: Send + Sync {
     /// used by telemetry and non-HTTP request paths.
     fn add_auth_headers(&self, headers: &mut HeaderMap);
 
+    /// Nonsecret metadata for headers available from this provider snapshot.
+    /// Expensive header providers may override this without minting credentials.
+    /// This does not attest to the later dispatched request.
+    fn auth_header_telemetry(&self) -> AuthHeaderTelemetry {
+        let mut headers = HeaderMap::new();
+        self.add_auth_headers(&mut headers);
+        let name = headers.contains_key(http::header::AUTHORIZATION)
+            .then_some("authorization");
+        AuthHeaderTelemetry { attached: name.is_some(), name }
+    }
+
     /// Adds headers for dispatch, rejecting unavailable or malformed credentials.
     /// Telemetry may still use the infallible projection above.
     fn try_add_auth_headers(&self, headers: &mut HeaderMap) -> Result<(), AuthError> {
@@ -97,17 +108,9 @@ pub struct AuthHeaderTelemetry {
     pub name: Option<&'static str>,
 }
 
-/// Reports authorization headers available from `add_auth_headers` only.
+/// Reports nonsecret metadata for the provider's header-only projection.
 /// This does not attest to authentication on the sent request: `apply_auth` may
 /// attach credentials later or replace the request entirely.
 pub fn auth_header_telemetry(auth: &dyn AuthProvider) -> AuthHeaderTelemetry {
-    let mut headers = HeaderMap::new();
-    auth.add_auth_headers(&mut headers);
-    let name = headers
-        .contains_key(http::header::AUTHORIZATION)
-        .then_some("authorization");
-    AuthHeaderTelemetry {
-        attached: name.is_some(),
-        name,
-    }
+    auth.auth_header_telemetry()
 }

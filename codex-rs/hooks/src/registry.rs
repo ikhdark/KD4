@@ -92,6 +92,10 @@ impl Hooks {
         self.engine.warnings()
     }
 
+    pub fn has_legacy_after_agent_hooks(&self) -> bool {
+        !self.after_agent.is_empty()
+    }
+
     /// Keeps the `once_per` run history of the hook set this one replaces, so a
     /// config refresh does not re-admit handlers that already ran in their scope.
     pub fn with_run_history_from(mut self, previous: &Hooks) -> Self {

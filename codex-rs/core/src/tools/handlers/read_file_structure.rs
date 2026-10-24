@@ -18,7 +18,7 @@ use crate::tools::command_output_artifact::ToolOutputSelector;
 struct ParsedSource {
     path: String,
     sha256: String,
-    items: Vec<CodeItem>,
+    items: std::sync::Arc<[CodeItem]>,
     bytes: usize,
 }
 
@@ -29,7 +29,7 @@ const PARSED_SOURCE_CACHE_BYTES: usize = 16 * 1024 * 1024;
 #[cfg(test)]
 thread_local! { static SOURCE_PARSE_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
 
-fn parsed_source(path: &str, source: &str, sha256: &str) -> Option<(Vec<CodeItem>, bool)> {
+fn parsed_source(path: &str, source: &str, sha256: &str) -> Option<(std::sync::Arc<[CodeItem]>, bool)> {
     if let Some(items) = PARSED_SOURCES.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
         .iter().find(|entry| entry.path == path && entry.sha256 == sha256)
         .map(|entry| entry.items.clone())
@@ -53,6 +53,7 @@ fn parsed_source(path: &str, source: &str, sha256: &str) -> Option<(Vec<CodeItem
                 + item.linked_path_candidates.iter().map(String::capacity).sum::<usize>()
         }).sum::<usize>(),
     );
+    let items: std::sync::Arc<[CodeItem]> = items.into();
     // Timeout/failure and recovered syntax must never become a complete hit.
     if complete && bytes <= PARSED_SOURCE_CACHE_BYTES {
         let mut cache = PARSED_SOURCES.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -428,7 +429,7 @@ pub(super) fn resolve_batch(
                 if let FileSelector::Structure(StructureSelector::Symbol { name }) = &selector {
                     let mut matches = items
                         .iter()
-                        .flatten()
+                        .flat_map(|items| items.iter())
                         .filter(|item| {
                             symbol_matches(item, name)
                                 || trait_method_candidate(item, name)
@@ -444,7 +445,7 @@ pub(super) fn resolve_batch(
                         matches.extend(
                             items
                                 .iter()
-                                .flatten()
+                                .flat_map(|items| items.iter())
                                 .filter(|item| item.kind != "impl" && item.name == last),
                         );
                     }
@@ -452,13 +453,15 @@ pub(super) fn resolve_batch(
                     // another scope. Offer source evidence, not import resolution.
                     if matches.is_empty() {
                         let leaf = name.rsplit([':', '.']).next().unwrap_or(name);
-                        matches.extend(items.iter().flatten().filter(|item| {
-                            item.kind == "use"
-                                && item
-                                    .signature
-                                    .split(|ch: char| !(ch.is_alphanumeric() || ch == '_'))
-                                    .any(|token| token == leaf)
-                        }));
+                        matches.extend(
+                            items.iter().flat_map(|items| items.iter()).filter(|item| {
+                                item.kind == "use"
+                                    && item
+                                        .signature
+                                        .split(|ch: char| !(ch.is_alphanumeric() || ch == '_'))
+                                        .any(|token| token == leaf)
+                            }),
+                        );
                         imported = !matches.is_empty();
                     }
                     for item in matches {
@@ -500,7 +503,7 @@ pub(super) fn resolve_batch(
                     // are proximity suggestions, not resolved enclosure.
                     let mut nearby = items
                         .iter()
-                        .flatten()
+                        .flat_map(|items| items.iter())
                         .filter(|item| item.kind != "impl")
                         .map(|item| {
                             let distance = if *line < item.start_line {

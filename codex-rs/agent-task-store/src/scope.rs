@@ -781,7 +781,7 @@ mod audit_tests {
             path: upper.clone(),
             recursive: false,
         };
-        let observed = CandidateScopeCase::observe(temp.path(), &[], &[candidate.clone()]);
+        let observed = CandidateScopeCase::observe(temp.path(), &[], std::slice::from_ref(&candidate));
         let expected = if ignores_case {
             ScopeCaseSemantics::IgnoresCase
         } else {

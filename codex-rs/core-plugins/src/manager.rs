@@ -16,7 +16,7 @@ use crate::loader::materialize_marketplace_plugin_source;
 use crate::loader::plugin_capability_summary_from_root;
 use crate::loader::plugin_load_warnings;
 use crate::loader::refresh_curated_plugin_cache;
-use crate::loader::refresh_non_curated_plugin_cache_detailed;
+use crate::loader::refresh_non_curated_plugin_cache_from_marketplaces;
 use crate::loader::refresh_non_curated_plugin_cache_force_reinstall_detailed;
 use crate::loader::remote_installed_plugins_to_config;
 use crate::manifest::PluginManifestInterface;
@@ -2113,7 +2113,7 @@ impl PluginsManager {
             return Ok(ConfiguredMarketplaceListOutcome::default());
         }
 
-        let (installed_plugins, enabled_plugins) =
+        let (mut installed_versions, enabled_plugins) =
             Self::configured_plugin_states(store, codex_home, config);
         let marketplace_roots = Self::marketplace_roots_with_context(
             codex_home,
@@ -2149,12 +2149,8 @@ impl PluginsManager {
                         }
                         let plugin_id =
                             PluginId::new(plugin.name.clone(), marketplace_name.clone()).ok();
-                        let installed = installed_plugins.contains(&plugin_key);
-                        let installed_version = installed.then_some(()).and_then(|_| {
-                            plugin_id
-                                .as_ref()
-                                .and_then(|plugin_id| store.active_plugin_version(plugin_id))
-                        });
+                        let installed_version = installed_versions.remove(&plugin_key);
+                        let installed = installed_version.is_some();
                         let enabled = enabled_plugins.contains(&plugin_key);
                         let mut interface = plugin.interface;
                         let mut local_version = plugin.local_version;
@@ -2162,7 +2158,9 @@ impl PluginsManager {
                         if installed
                             && plugin.source.is_install_materialized()
                             && let Some(plugin_id) = plugin_id.as_ref()
-                            && let Some(plugin_root) = store.active_plugin_root(plugin_id)
+                            && let Some(plugin_root) = installed_version
+                                .as_deref()
+                                .map(|version| store.plugin_root(plugin_id, version))
                             && let Some(manifest) = load_plugin_manifest(plugin_root.as_path())
                         {
                             local_version = manifest.version.clone();
@@ -3051,46 +3049,18 @@ impl PluginsManager {
                 let outcome = self
                     .list_marketplaces_with_policy(&config, &roots)
                     .map_err(|err| err.to_string())?;
-                let roots = outcome
-                    .marketplaces
-                    .into_iter()
-                    .filter(|marketplace| !is_openai_curated_marketplace_name(&marketplace.name))
-                    .map(|marketplace| marketplace.path)
-                    .collect::<Vec<_>>();
                 let keys = configured_plugins_from_stack(
                     &request.config_layer_stack.0,
                     self.codex_home.as_path(),
                 )
                 .into_keys()
                 .collect::<Vec<_>>();
-                let mut refreshed = match request.mode {
-                    NonCuratedCacheRefreshMode::IfVersionChanged => {
-                        refresh_non_curated_plugin_cache_detailed(
-                            self.codex_home.as_path(),
-                            &roots,
-                            &keys,
-                        )
-                    }
-                    NonCuratedCacheRefreshMode::ForceReinstall => {
-                        refresh_non_curated_plugin_cache_force_reinstall_detailed(
-                            self.codex_home.as_path(),
-                            &roots,
-                            &keys,
-                        )
-                    }
-                }?;
-                refreshed
-                    .errors
-                    .extend(outcome.errors.into_iter().map(|error| {
-                        crate::loader::NonCuratedCacheRefreshError {
-                            marketplace_name: error.path.display().to_string(),
-                            message: format!(
-                                "failed to discover marketplace {}: {}",
-                                error.path.display(),
-                                error.message
-                            ),
-                        }
-                    }));
+                let refreshed = refresh_non_curated_plugin_cache_from_marketplaces(
+                    self.codex_home.as_path(),
+                    &keys,
+                    outcome,
+                    matches!(request.mode, NonCuratedCacheRefreshMode::ForceReinstall),
+                )?;
                 Ok::<_, String>(refreshed)
             })();
             let refreshed = match refresh_result {
@@ -3143,23 +3113,22 @@ impl PluginsManager {
         store: &PluginStore,
         codex_home: &Path,
         config: &PluginsConfigInput,
-    ) -> (HashSet<String>, HashSet<String>) {
+    ) -> (HashMap<String, String>, HashSet<String>) {
         let configured_plugins =
             configured_plugins_from_stack(&config.config_layer_stack, codex_home);
-        let installed_plugins = configured_plugins
+        let installed_versions = configured_plugins
             .keys()
-            .filter(|plugin_key| {
-                PluginId::parse(plugin_key)
-                    .ok()
-                    .is_some_and(|plugin_id| store.is_installed(&plugin_id))
+            .filter_map(|plugin_key| {
+                let plugin_id = PluginId::parse(plugin_key).ok()?;
+                store.active_plugin_version(&plugin_id)
+                    .map(|version| (plugin_key.clone(), version))
             })
-            .cloned()
-            .collect::<HashSet<_>>();
+            .collect::<HashMap<_, _>>();
         let enabled_plugins = configured_plugins
             .into_iter()
             .filter_map(|(plugin_key, plugin)| plugin.enabled.then_some(plugin_key))
             .collect::<HashSet<_>>();
-        (installed_plugins, enabled_plugins)
+        (installed_versions, enabled_plugins)
     }
 
     fn marketplace_roots(

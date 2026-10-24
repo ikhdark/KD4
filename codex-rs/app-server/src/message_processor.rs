@@ -23,6 +23,7 @@ use crate::request_processors::CatalogRequestProcessor;
 use crate::request_processors::CommandExecRequestProcessor;
 use crate::request_processors::ConfigRequestProcessor;
 use crate::request_processors::EnvironmentRequestProcessor;
+use crate::request_processors::ExternalAgentConfigRequestProcessor;
 use crate::request_processors::FeedbackRequestProcessor;
 use crate::request_processors::FsRequestProcessor;
 use crate::request_processors::InitializeRequestProcessor;
@@ -160,6 +161,7 @@ pub(crate) struct MessageProcessor {
     process_exec_processor: ProcessExecRequestProcessor,
     config_processor: ConfigRequestProcessor,
     environment_processor: EnvironmentRequestProcessor,
+    external_agent_config_processor: ExternalAgentConfigRequestProcessor,
     feedback_processor: FeedbackRequestProcessor,
     fs_processor: FsRequestProcessor,
     pub(crate) initialize_processor: InitializeRequestProcessor,
@@ -498,6 +500,17 @@ impl MessageProcessor {
         );
         let environment_processor =
             EnvironmentRequestProcessor::new(thread_manager.environment_manager());
+        let external_agent_config_processor = ExternalAgentConfigRequestProcessor::new(
+            outgoing.clone(),
+            config_processor.clone(),
+            state_db.clone(),
+            config.codex_home.to_path_buf(),
+            thread_processor.background_tasks.clone(),
+            bug_worker_shutdown.clone(),
+            config_manager.clone(),
+            Arc::clone(&thread_manager),
+            Arc::clone(&thread_store),
+        );
         let fs_processor = FsRequestProcessor::new(
             Arc::clone(&environment_manager_for_requests),
             FsWatchManager::new(outgoing.clone()),
@@ -520,6 +533,7 @@ impl MessageProcessor {
             process_exec_processor,
             config_processor,
             environment_processor,
+            external_agent_config_processor,
             feedback_processor,
             fs_processor,
             initialize_processor,
@@ -894,6 +908,7 @@ impl MessageProcessor {
             return Err(invalid_request(experimental_required_message(reason)));
         }
         let control = codex_request.is_control();
+        let steering = matches!(&codex_request, ClientRequest::TurnSteer { .. });
         let estimated_request_bytes = serialized_request_queue_bytes(
             true,
             &(&codex_request, &connection_request_id.request_id),
@@ -927,6 +942,7 @@ impl MessageProcessor {
         let serialization_scope = codex_request.serialization_scope();
         let ordered_preparation =
             !control
+                && !steering
                 && matches!(&serialization_scope,
             Some(codex_app_server_protocol::ClientRequestSerializationScope::Thread { .. }
                 | codex_app_server_protocol::ClientRequestSerializationScope::ThreadPath { .. }));
@@ -985,14 +1001,24 @@ impl MessageProcessor {
             let preparation_rejected_request_id = admission_error_request_id.clone();
             // Resolve concurrently, but publish into per-thread queues in the
             // existing FIFO ticket order. An unresolved path may alias an ID.
-            let resolution = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(
-                RequestSerializationQueueKey::try_from_scope(connection_id, scope),
-            ));
+            let resolution = if matches!(&scope,
+                codex_app_server_protocol::ClientRequestSerializationScope::ThreadPath { .. })
+            {
+                let resolver = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(
+                    RequestSerializationQueueKey::try_from_scope(connection_id, scope),
+                ));
+                futures::future::Either::Left(async move {
+                    resolver.await.map_err(std::io::Error::other).and_then(|result| result)
+                })
+            } else {
+                // Known keys resolve immediately inside their existing FIFO
+                // preparation ticket; only filesystem aliases need a worker.
+                futures::future::Either::Right(
+                    RequestSerializationQueueKey::try_from_scope(connection_id, scope),
+                )
+            };
             let prepare = async move {
-                let resolved = resolution
-                    .await
-                    .map_err(std::io::Error::other)
-                    .and_then(|result| result);
+                let resolved = resolution.await;
                 let (key, access) = match resolved {
                     Ok(prepared) => prepared,
                     Err(error) => {
@@ -1016,6 +1042,14 @@ impl MessageProcessor {
                             .await;
                         return;
                     }
+                };
+                // Steering targets an already active turn and validates its ID
+                // in core. It must not wait for an unrelated thread mutation or
+                // an unresolved path ticket, but still keeps bounded payloads.
+                let key = if steering {
+                    RequestSerializationQueueKey::Steering(Box::new(key))
+                } else {
+                    key
                 };
                 let access = if control
                     && access == crate::request_serialization::RequestSerializationAccess::Exclusive
@@ -1119,6 +1153,21 @@ impl MessageProcessor {
                     ClientRequest::ConfigRead { params, .. } => self
                         .config_processor
                         .read(params)
+                        .await
+                        .map(|response| Some(response.into())),
+                    ClientRequest::ExternalAgentConfigDetect { params, .. } => self
+                        .external_agent_config_processor
+                        .detect(params)
+                        .await
+                        .map(|response| Some(response.into())),
+                    ClientRequest::ExternalAgentConfigImport { params, .. } => self
+                        .external_agent_config_processor
+                        .import(request_id.clone(), params)
+                        .await
+                        .map(|()| None),
+                    ClientRequest::ExternalAgentConfigImportHistoriesRead { .. } => self
+                        .external_agent_config_processor
+                        .read_import_histories()
                         .await
                         .map(|response| Some(response.into())),
                     ClientRequest::WindowsSandboxReadiness { .. } => self

@@ -246,9 +246,9 @@ impl ResponsesEventInterpreter {
             .map(str::to_owned);
         // Failed/incomplete envelopes are admissible observations even though
         // conversion returns an error. Foreign terminal frames are not.
-        let admissible_terminal_failure =
-            matches!(event.kind.as_ref(), "response.failed" | "response.incomplete")
-                && self.lifecycle.validate_ownership(&event).is_ok();
+        let terminal_failure =
+            matches!(event.kind.as_ref(), "response.failed" | "response.incomplete");
+        let mut ownership_admitted = false;
 
         if let Some(response) = event.response.as_ref()
             && let Some(reported_model) = response.model.as_ref().and_then(Value::as_str)
@@ -296,7 +296,7 @@ impl ResponsesEventInterpreter {
         };
         let interpreted = self
             .lifecycle
-            .process(event, payload.len(), completion_usage)
+            .process(event, payload.len(), completion_usage, &mut ownership_admitted)
             .map_err(|error| match (error, rejected_completion_usage) {
                 (ResponsesEventError::Api(source), Some((response_id, usage))) => {
                     ResponsesEventError::Api(ApiError::TerminalResponse {
@@ -307,7 +307,7 @@ impl ResponsesEventInterpreter {
                 }
                 (error, _) => error,
             });
-        if interpreted.is_ok() || admissible_terminal_failure {
+        if interpreted.is_ok() || (terminal_failure && ownership_admitted) {
             if let Some(response_turn_state) = response_turn_state
                 && let Some(turn_state) = self.turn_state.as_deref()
             {
@@ -428,9 +428,10 @@ fn parse_usage(value: Option<Value>) -> Option<TokenUsage> {
     let Some(object) = value.as_object() else {
         return Some(TokenUsage {
             coverage: Some(TokenUsageCoverage {
+                receipts: 1,
                 invalid_receipts: 1,
                 reported_receipts: Some(1),
-                ..TokenUsage::missing_receipt().coverage.expect("missing receipt coverage")
+                ..Default::default()
             }),
             ..Default::default()
         });
@@ -1928,7 +1929,7 @@ mod tests {
                 panic!("expected a retryable rate limit for {message}");
             };
             assert_eq!(
-                delay.map(|delay| delay.remaining_delay()),
+                delay.map(codex_client::RetryAfter::remaining_delay),
                 expected,
                 "{message}"
             );

@@ -300,6 +300,14 @@ impl LocalThreadStore {
         &self,
         params: LoadThreadHistoryParams,
     ) -> ThreadStoreResult<StoredThreadHistory> {
+        self.load_history_with_payload_versions(params, None).await
+    }
+
+    async fn load_history_with_payload_versions(
+        &self,
+        params: LoadThreadHistoryParams,
+        payload_versions: Option<&mut Option<Vec<codex_rollout::PayloadDependencyVersion>>>,
+    ) -> ThreadStoreResult<StoredThreadHistory> {
         if let Ok(rollout_path) = live_writer::rollout_path(self, params.thread_id).await {
             if !params.include_archived
                 && helpers::rollout_path_is_archived(
@@ -311,11 +319,12 @@ impl LocalThreadStore {
                     message: format!("thread {} is archived", params.thread_id),
                 });
             }
-            return read_thread::read_thread_by_rollout_path(
+            return read_thread::read_thread_by_rollout_path_with_payload_versions(
                 self,
                 rollout_path,
                 /*include_archived*/ true,
                 /*include_history*/ true,
+                payload_versions,
             )
             .await?
             .history
@@ -324,13 +333,14 @@ impl LocalThreadStore {
             });
         }
 
-        read_thread::read_thread(
+        read_thread::read_thread_with_payload_versions(
             self,
             ReadThreadParams {
                 thread_id: params.thread_id,
                 include_archived: params.include_archived,
                 include_history: true,
             },
+            payload_versions,
         )
         .await?
         .history

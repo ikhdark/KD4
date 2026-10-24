@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import queue
 import threading
@@ -21,13 +22,19 @@ class _BufferBudget:
         self._lock = threading.Lock()
 
     def reserve(self, notification: Notification) -> int:
+        # Preserve the authoritative admission recheck below: another queue can
+        # reserve from this shared budget while accounting runs outside the lock.
+        with self._lock:
+            if self.items >= self.max_items:
+                raise CodexError("notification buffer limit exceeded")
         payload = notification.payload
         params = (
             payload.params
             if isinstance(payload, UnknownNotification)
             else payload.model_dump(mode="json", warnings=False)
         )
-        size = len(json.dumps({"method": notification.method, "params": params}).encode("utf-8"))
+        # Default ensure_ascii=True makes character and UTF-8 byte counts equal.
+        size = len(json.dumps({"method": notification.method, "params": params}))
         with self._lock:
             if self.items >= self.max_items or self.bytes + size > self.max_bytes:
                 raise CodexError("notification buffer limit exceeded")
@@ -53,6 +60,7 @@ class _NotificationQueue:
         self._items: deque[tuple[Notification, int]] = deque()
         self._condition = threading.Condition()
         self._failure: BaseException | None = None
+        self._async_waiters: set[tuple[asyncio.AbstractEventLoop, asyncio.Future[None]]] = set()
         self.timeout_s = timeout_s
         self.deadline = time.monotonic() + timeout_s if operation_deadline else None
 
@@ -66,12 +74,14 @@ class _NotificationQueue:
             size = self._budget.reserve(item)
             self._items.append((item, size))
             self._condition.notify()
+            self._notify_async_locked()
 
     def put_reserved(self, item: Notification, size: int) -> None:
         """Transfer an already charged early event without releasing its budget."""
         with self._condition:
             self._items.append((item, size))
             self._condition.notify()
+            self._notify_async_locked()
 
     def __del__(self) -> None:
         # A completed goal may outlive its router, then be abandoned by its caller.
@@ -103,6 +113,47 @@ class _NotificationQueue:
                     remaining = min(remaining, self.deadline - now)
                 self._condition.wait(remaining)
 
+    @staticmethod
+    def _complete_async_waiter(waiter: asyncio.Future[None]) -> None:
+        if not waiter.done():
+            waiter.set_result(None)
+
+    def _notify_async_locked(self) -> None:
+        # Detach before scheduling so a burst coalesces to one wake per waiter.
+        waiters, self._async_waiters = self._async_waiters, set()
+        for loop, waiter in waiters:
+            try:
+                loop.call_soon_threadsafe(self._complete_async_waiter, waiter)
+            except RuntimeError:
+                pass  # Its event loop has already closed.
+
+    async def get_async(self) -> Notification:
+        """Wait on publication without polling or retaining a blocked OS thread."""
+        loop = asyncio.get_running_loop()
+        deadline = time.monotonic() + self.timeout_s
+        while True:
+            with self._condition:
+                try:
+                    return self.get(0.0)
+                except queue.Empty:
+                    pass
+                remaining = deadline - time.monotonic()
+                if self.deadline is not None:
+                    remaining = min(remaining, self.deadline - time.monotonic())
+                if remaining <= 0:
+                    raise TimeoutError("notification wait deadline exceeded")
+                waiter = loop.create_future()
+                registration = (loop, waiter)
+                # Empty-check and subscription share the producer's lock.
+                self._async_waiters.add(registration)
+            try:
+                await asyncio.wait_for(waiter, remaining)
+            except asyncio.TimeoutError:
+                pass  # Recheck sticky failure, queued data and route deadline.
+            finally:
+                with self._condition:
+                    self._async_waiters.discard(registration)
+
     def fail(self, exc: BaseException, *, drain: bool = False) -> None:
         with self._condition:
             if self._failure is None:
@@ -111,3 +162,4 @@ class _NotificationQueue:
                 _, size = self._items.popleft()
                 self._budget.release(size)
             self._condition.notify_all()
+            self._notify_async_locked()

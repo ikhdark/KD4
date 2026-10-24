@@ -26,7 +26,7 @@ pub(crate) fn may_be_reference(line: &str) -> bool {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PayloadDependencyVersion {
-    path: PathBuf,
+    pub(crate) path: PathBuf,
     stamp: Option<(
         u64,
         Option<std::time::SystemTime>,
@@ -51,6 +51,22 @@ fn dependency_stamp(
                 metadata.created().ok(),
             )
         })
+}
+
+/// Observe a named artifact before the canonical reader attempts hydration.
+pub(crate) fn named_payload_version(path: &Path, line: &str) -> Option<PayloadDependencyVersion> {
+    let record: serde_json::Value = serde_json::from_str(line).ok()?;
+    if record["type"] != KIND {
+        return None;
+    }
+    let hash = record["payload"]["sha256"].as_str().filter(|hash| {
+        hash.len() == 64 && hash.bytes().all(|byte| byte.is_ascii_hexdigit())
+    })?;
+    let path = root(path).join(format!("{hash}.json"));
+    Some(PayloadDependencyVersion {
+        stamp: dependency_stamp(&path),
+        path,
+    })
 }
 
 /// Cold-cache reference discovery only; verification remains in the canonical
@@ -181,11 +197,52 @@ pub async fn payload_versions_match(versions: &[PayloadDependencyVersion]) -> bo
 struct PendingSync {
     sequence: u64,
     paths: std::collections::BTreeMap<(PathBuf, PathBuf), u64>,
+    owners: std::collections::BTreeMap<PathBuf, usize>,
 }
 
 fn pending_sync() -> &'static std::sync::Mutex<PendingSync> {
     static PENDING: std::sync::OnceLock<std::sync::Mutex<PendingSync>> = std::sync::OnceLock::new();
     PENDING.get_or_init(Default::default)
+}
+
+/// Custody spans handle recovery and accepted blocking publications. A successor
+/// writer re-enrolls persisted references; a failed barrier keeps this owner alive.
+pub(crate) struct PayloadSyncOwner {
+    rollout: PathBuf,
+}
+
+impl PayloadSyncOwner {
+    pub(crate) fn new(path: &Path) -> std::sync::Arc<Self> {
+        let rollout = crate::compression::plain_rollout_path(path);
+        let mut pending = pending_sync()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *pending.owners.entry(rollout.clone()).or_default() += 1;
+        std::sync::Arc::new(Self { rollout })
+    }
+}
+
+impl Drop for PayloadSyncOwner {
+    fn drop(&mut self) {
+        let mut pending = pending_sync()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(owners) = pending.owners.get_mut(&self.rollout) else {
+            return;
+        };
+        *owners -= 1;
+        if *owners != 0 {
+            return;
+        }
+        pending.owners.remove(&self.rollout);
+        let keys = pending.paths.range((self.rollout.clone(), PathBuf::new())..)
+            .take_while(|((owner, _), _)| owner == &self.rollout)
+            .map(|(key, _)| key.clone())
+            .collect::<Vec<_>>();
+        for key in keys {
+            pending.paths.remove(&key);
+        }
+    }
 }
 
 /// Sync payloads before their rollout references. Failed barriers retain their

@@ -494,23 +494,11 @@ async fn put_workspace_plugin_upload(
         .header("x-ms-blob-type", "BlockBlob")
         .header("Content-Type", "application/gzip")
         .body(archive_bytes);
-    let response = request
-        .send()
-        .await
-        .map_err(|source| RemotePluginCatalogError::Request {
-            url: "workspace plugin upload URL".to_string(),
-            source,
-        })?;
-    let status = response.status();
-    let body = response.text().await.unwrap_or_default();
-    if ![StatusCode::OK, StatusCode::CREATED].contains(&status) {
-        return Err(RemotePluginCatalogError::UnexpectedStatus {
-            url: "workspace plugin upload URL".to_string(),
-            status,
-            body,
-        });
-    }
-    Ok(())
+    send_and_expect_status(
+        request,
+        "workspace plugin upload URL",
+        &[StatusCode::OK, StatusCode::CREATED],
+    ).await
 }
 
 async fn finalize_workspace_plugin_upload(
@@ -561,7 +549,7 @@ async fn send_and_expect_status(
     url_for_error: &str,
     expected_statuses: &[StatusCode],
 ) -> Result<(), RemotePluginCatalogError> {
-    let response = request
+    let mut response = request
         .send()
         .await
         .map_err(|source| RemotePluginCatalogError::Request {
@@ -569,14 +557,17 @@ async fn send_and_expect_status(
             source,
         })?;
     let status = response.status();
-    let body = response.text().await.unwrap_or_default();
     if !expected_statuses.contains(&status) {
+        let body = response.text().await.unwrap_or_default();
         return Err(RemotePluginCatalogError::UnexpectedStatus {
             url: url_for_error.to_string(),
             status,
             body,
         });
     }
+    // Preserve the prior drain-to-completion/timeout policy, including ignored
+    // success-body read errors, without retaining or decoding acknowledgement text.
+    while let Ok(Some(_)) = response.chunk().await {}
     Ok(())
 }
 

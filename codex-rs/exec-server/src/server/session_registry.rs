@@ -34,6 +34,7 @@ struct AttachmentState {
     current_connection_id: Option<ConnectionId>,
     detached_connection_id: Option<ConnectionId>,
     detached_expires_at: Option<tokio::time::Instant>,
+    expiry_cancelled: Option<tokio_util::sync::CancellationToken>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -110,6 +111,7 @@ impl SessionRegistry {
         let entry = match outcome? {
             AttachOutcome::Attached(entry) => entry,
             AttachOutcome::Expired { session_id, entry } => {
+                entry.cancel_expiry();
                 entry.process.shutdown().await;
                 return Err(invalid_request(format!("unknown session id {session_id}")));
             }
@@ -136,13 +138,12 @@ impl SessionRegistry {
     pub(crate) async fn shutdown(&self) {
         let sessions = std::mem::take(&mut *self.sessions.lock().await);
         for entry in sessions.into_values() {
+            entry.cancel_expiry();
             entry.process.shutdown().await;
         }
     }
 
     async fn expire_if_detached(&self, session_id: String, connection_id: ConnectionId) {
-        tokio::time::sleep(DETACHED_SESSION_TTL).await;
-
         let removed = {
             let mut sessions = self.sessions.lock().await;
             let Some(entry) = sessions.get(&session_id) else {
@@ -178,6 +179,7 @@ impl SessionEntry {
                 current_connection_id: Some(connection_id),
                 detached_connection_id: None,
                 detached_expires_at: None,
+                expiry_cancelled: None,
             }),
         }
     }
@@ -188,24 +190,33 @@ impl SessionEntry {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         attachment.current_connection_id = Some(connection_id);
+        if let Some(cancelled) = attachment.expiry_cancelled.take() { cancelled.cancel(); }
         attachment.detached_connection_id = None;
         attachment.detached_expires_at = None;
     }
 
-    fn detach(&self, connection_id: ConnectionId) -> bool {
+    fn detach(&self, connection_id: ConnectionId) -> Option<tokio_util::sync::CancellationToken> {
         let mut attachment = self
             .attachment
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if attachment.current_connection_id != Some(connection_id) {
-            return false;
+            return None;
         }
 
         self.process.set_notification_sender(/*notifications*/ None);
         attachment.current_connection_id = None;
         attachment.detached_connection_id = Some(connection_id);
         attachment.detached_expires_at = Some(tokio::time::Instant::now() + DETACHED_SESSION_TTL);
-        true
+        let cancelled = tokio_util::sync::CancellationToken::new();
+        attachment.expiry_cancelled = Some(cancelled.clone());
+        Some(cancelled)
+    }
+
+    fn cancel_expiry(&self) {
+        if let Some(cancelled) = self.attachment.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner).expiry_cancelled.take()
+        { cancelled.cancel(); }
     }
 
     fn has_active_connection(&self) -> bool {
@@ -267,14 +278,21 @@ impl SessionHandle {
     }
 
     pub(crate) async fn detach(&self) {
-        if !self.entry.detach(self.connection_id) {
+        let Some(expiry_cancelled) = self.entry.detach(self.connection_id) else {
             return;
-        }
+        };
 
         let registry = Arc::clone(&self.registry);
         let session_id = self.entry.session_id.clone();
         let connection_id = self.connection_id;
         tokio::spawn(async move {
+            tokio::select! {
+                biased;
+                _ = expiry_cancelled.cancelled() => return,
+                _ = tokio::time::sleep(DETACHED_SESSION_TTL) => {},
+            }
+            // Once expiry claims the entry, native cleanup must finish even
+            // if an observer disappears. Cancel only the obsolete timer wait.
             registry.expire_if_detached(session_id, connection_id).await;
         });
     }

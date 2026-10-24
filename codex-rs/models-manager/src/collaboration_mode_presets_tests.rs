@@ -59,6 +59,7 @@ fn plan_mode_instructions_preserve_planning_contract() {
     assert!(plan_instructions.contains("`update_plan`"));
     assert!(normalized_instructions.contains("must not be used while Plan Mode is active"));
     assert!(plan_instructions.contains("Do not edit persistent files"));
+    assert!(normalized_instructions.contains("require authorization under the active permissions and validation mode"));
     assert!(plan_instructions.contains("`request_user_input` is available"));
     assert!(normalized_instructions.contains("Use fresh evidence already in context"));
     assert!(normalized_instructions.contains("mutually exclusive options allowed by its schema"));

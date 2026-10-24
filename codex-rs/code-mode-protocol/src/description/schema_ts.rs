@@ -55,7 +55,10 @@ pub fn hoist_shared_fragments(
     for fragment in fragments {
         for (hint, rendered) in &fragment.candidates {
             // Repeated numeric bounds can pay for an alias even when short.
-            if rendered.len() < FRAGMENT_HOIST_MIN_BYTES && !rendered.starts_with("number /*") {
+            if rendered.len() < FRAGMENT_HOIST_MIN_BYTES
+                && !rendered.starts_with("number /*")
+                && !rendered.starts_with("(number | bigint) /*")
+            {
                 continue;
             }
             let slot = hints.entry(rendered.as_str()).or_default();
@@ -82,15 +85,15 @@ pub fn hoist_shared_fragments(
             .filter_map(|(index, (rendered, hint))| {
                 let occurrences: usize = types
                     .iter()
-                    .map(|text| type_fragment_offsets(text, rendered).len())
+                    .map(|text| type_fragment_count(text, rendered))
                     .chain(
                         declarations
                             .iter()
                             .filter(|(_, body)| body != rendered)
-                            .map(|(_, body)| type_fragment_offsets(body, rendered).len()),
+                            .map(|(_, body)| type_fragment_count(body, rendered)),
                     )
                     .sum();
-                let name = alias_name(hint.as_deref(), declarations.len(), &mut used.clone());
+                let name = alias_name(hint.as_deref(), declarations.len(), &used);
                 // Include every reference and the alias declaration itself.
                 let removed = occurrences.saturating_sub(1) * rendered.len();
                 let added = (occurrences + 1) * name.len() + 10;
@@ -127,12 +130,12 @@ pub fn hoist_shared_fragments(
         let redundant = declarations.iter().position(|(name, body)| {
             let occurrences: usize = types
                 .iter()
-                .map(|text| type_fragment_offsets(text, name).len())
+                .map(|text| type_fragment_count(text, name))
                 .chain(
                     declarations
                         .iter()
                         .filter(|(other, _)| other != name)
-                        .map(|(_, text)| type_fragment_offsets(text, name).len()),
+                        .map(|(_, text)| type_fragment_count(text, name)),
                 )
                 .sum();
             occurrences * body.len() <= body.len() + (occurrences + 1) * name.len() + 10
@@ -157,9 +160,20 @@ pub fn hoist_shared_fragments(
 
 // Generated types can contain arbitrary schema descriptions and string literals.
 // A repeated shape inside either is data, not a type reference to substitute.
+fn type_fragment_count(text: &str, fragment: &str) -> usize {
+    let mut count = 0;
+    visit_type_fragment_offsets(text, fragment, |_| count += 1);
+    count
+}
+
 fn type_fragment_offsets(text: &str, fragment: &str) -> Vec<usize> {
-    let bytes = text.as_bytes();
     let mut offsets = Vec::new();
+    visit_type_fragment_offsets(text, fragment, |offset| offsets.push(offset));
+    offsets
+}
+
+fn visit_type_fragment_offsets(text: &str, fragment: &str, mut visit: impl FnMut(usize)) {
+    let bytes = text.as_bytes();
     let mut offset = 0;
     while offset < bytes.len() {
         let tail = &bytes[offset..];
@@ -186,7 +200,7 @@ fn type_fragment_offsets(text: &str, fragment: &str) -> Vec<usize> {
                     after.starts_with(':') || after.starts_with("?:")
                 })
         {
-            offsets.push(offset);
+            visit(offset);
             offset += fragment.len();
         } else if matches!(bytes[offset], b'"' | b'\'' | b'`') {
             let quote = bytes[offset];
@@ -205,7 +219,6 @@ fn type_fragment_offsets(text: &str, fragment: &str) -> Vec<usize> {
             offset += 1;
         }
     }
-    offsets
 }
 
 fn is_identifier_byte(byte: u8) -> bool {
@@ -292,7 +305,7 @@ mod fragment_tests {
     }
 }
 
-fn alias_name(hint: Option<&str>, index: usize, used: &mut HashSet<String>) -> String {
+fn alias_name(hint: Option<&str>, index: usize, used: &HashSet<String>) -> String {
     let base = hint
         .map(normalize_code_mode_identifier)
         .filter(|hint| hint.chars().next().is_some_and(char::is_alphabetic))
@@ -304,7 +317,7 @@ fn alias_name(hint: Option<&str>, index: usize, used: &mut HashSet<String>) -> S
         .unwrap_or_else(|| format!("CodeModeShape{}", index + 1));
     let mut name = base.clone();
     let mut suffix = 2;
-    while !used.insert(name.clone()) {
+    while used.contains(&name) {
         name = format!("{base}{suffix}");
         suffix += 1;
     }

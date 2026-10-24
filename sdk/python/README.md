@@ -3,10 +3,13 @@
 Build Python applications that start Codex threads, run turns, stream progress,
 and control workspace access.
 
-Historical `thread/goal/*` and `externalAgentConfig/*` wrappers are retained for
-older compatible runtimes. Current KD4 retires those APIs; use ordinary
-thread/turn operations, and perform legacy imports with a compatible runtime.
-An unsupported call raises `MethodNotFoundError` without retrying or migrating data.
+Historical `thread/goal/*` wrappers require an older compatible runtime; current
+KD4 uses ordinary thread/turn operations. The `externalAgentConfig/*` compatibility
+API supports detection, config/environment, MCP, skills, AGENTS.md, plugins, hooks,
+subagents, commands, sessions, and persistent import histories. Imports preserve
+existing target configuration and report unsupported source controls as per-item
+failures. Imported session tool activity is inert history, not executable tool calls.
+A runtime missing the API raises `MethodNotFoundError` without retrying.
 
 ## Install
 

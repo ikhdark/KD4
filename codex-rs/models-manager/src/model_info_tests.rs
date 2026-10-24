@@ -84,6 +84,8 @@ fn disabled_personality_preserves_catalog_approval_messages() {
 
     let updated = with_config_overrides(model, &config);
 
+    assert_eq!(updated.base_instructions, "template");
+    assert_eq!(updated.get_model_instructions(None), "template");
     assert_eq!(
         updated.model_messages,
         Some(ModelMessages {
@@ -127,7 +129,7 @@ fn local_personality_template_contains_the_base_prompt_once() {
     assert!(rendered.contains(LOCAL_FRIENDLY_TEMPLATE));
 }
 #[test]
-fn enabled_template_preserves_neutral_policy_without_style() {
+fn template_preserves_neutral_policy_with_personality_enabled_or_disabled() {
     let mut model = model_info_from_slug("audit-template-model");
     model.base_instructions = "BASE_POLICY".into();
     model.model_messages = Some(ModelMessages {
@@ -147,7 +149,7 @@ fn enabled_template_preserves_neutral_policy_without_style() {
     assert_eq!(actual.base_instructions, "TEMPLATE_ONLY_POLICY\n");
     assert_eq!(
         with_config_overrides(model.clone(), &ModelsManagerConfig::default()).base_instructions,
-        "BASE_POLICY"
+        "TEMPLATE_ONLY_POLICY\n"
     );
     let overridden = ModelsManagerConfig {
         base_instructions: Some("USER_POLICY".into()),
@@ -157,4 +159,27 @@ fn enabled_template_preserves_neutral_policy_without_style() {
         with_config_overrides(model, &overridden).base_instructions,
         "USER_POLICY"
     );
+}
+
+#[test]
+fn local_personality_fallback_preserves_catalog_variables_without_a_template() {
+    for slug in ["gpt-5.2-codex", "exp-codex-personality"] {
+        let mut model = model_info_from_slug(slug);
+        model.model_messages = Some(ModelMessages {
+            instructions_template: None,
+            instructions_variables: Some(ModelInstructionsVariables {
+                personality_default: None,
+                personality_friendly: Some("CATALOG_STYLE".into()),
+                personality_pragmatic: None,
+            }),
+            approvals: Some(ApprovalMessages {
+                on_request: Some("CATALOG_APPROVAL".into()),
+            }),
+        });
+        let expected = model.clone();
+
+        apply_local_personality_messages(&mut model, slug);
+
+        assert_eq!(model, expected);
+    }
 }

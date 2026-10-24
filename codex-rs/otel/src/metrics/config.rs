@@ -2,6 +2,7 @@ use crate::config::OtelExporter;
 use crate::metrics::Result;
 use crate::metrics::validation::validate_tag_key;
 use crate::metrics::validation::validate_tag_value;
+#[cfg(any(test, feature = "test-support"))]
 use opentelemetry_sdk::metrics::InMemoryMetricExporter;
 use std::collections::BTreeMap;
 use std::time::Duration;
@@ -9,6 +10,7 @@ use std::time::Duration;
 #[derive(Clone, Debug)]
 pub enum MetricsExporter {
     Otlp(OtelExporter),
+    #[cfg(any(test, feature = "test-support"))]
     InMemory(InMemoryMetricExporter),
 }
 
@@ -42,6 +44,7 @@ impl MetricsConfig {
     }
 
     /// Create an in-memory config (used in tests).
+    #[cfg(any(test, feature = "test-support"))]
     pub fn in_memory(
         environment: impl Into<String>,
         service_name: impl Into<String>,

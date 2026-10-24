@@ -244,6 +244,45 @@ mod tests {
     use super::collect_fingerprint_items;
 
     #[test]
+    fn bundled_workflows_preserve_validation_authorization() {
+        for path in [
+            "skill-creator/SKILL.md",
+            "plugin-creator/SKILL.md",
+            "openai-docs/SKILL.md",
+        ] {
+            let instructions = SYSTEM_SKILLS_DIR
+                .get_file(path)
+                .expect("bundled workflow")
+                .contents_utf8()
+                .expect("UTF-8 instructions");
+            assert!(instructions.contains("active validation"), "{path}");
+            assert!(instructions.contains("this skill does not authorize them"), "{path}");
+        }
+        let skill_creator = SYSTEM_SKILLS_DIR
+            .get_file("skill-creator/SKILL.md")
+            .unwrap()
+            .contents_utf8()
+            .unwrap();
+        assert!(skill_creator.contains("active validation and delegation policies"));
+        assert!(skill_creator.contains("When authorized and available"));
+        assert!(!skill_creator.contains("Added scripts must be executed"));
+    }
+
+    #[test]
+    fn codex_reference_does_not_require_forbidden_escalation() {
+        let reference = SYSTEM_SKILLS_DIR
+            .get_file("openai-docs/references/codex-self-knowledge.md")
+            .expect("bundled Codex reference")
+            .contents_utf8()
+            .expect("UTF-8 reference");
+        assert!(reference.contains("escalation only when that policy allows it"));
+        assert!(reference.contains("report the blocker and continue permitted independent work"));
+        assert!(!reference.contains("denials need scoped escalation"));
+        assert!(!reference.contains("writes outside the workspace, or broad access changes require explicit approval"));
+        assert!(reference.contains("This reference grants no additional filesystem, network, or escalation permissions"));
+    }
+
+    #[test]
     fn fingerprint_traverses_nested_entries() {
         let mut items = Vec::new();
         collect_fingerprint_items(&SYSTEM_SKILLS_DIR, &mut items);

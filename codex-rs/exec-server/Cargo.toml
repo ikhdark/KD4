@@ -65,6 +65,7 @@ windows-sys = { workspace = true, features = [
 ] }
 
 [dev-dependencies]
+codex-otel = { workspace = true, features = ["test-support"] }
 anyhow = { workspace = true }
 codex-test-binary-support = { workspace = true }
 ctor = { workspace = true }

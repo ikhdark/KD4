@@ -4,6 +4,72 @@ use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 
 #[tokio::test]
+async fn world_state_authority_downgrade_retracts_before_full_and_delta_user_delivery() {
+    struct Contributor(Arc<std::sync::atomic::AtomicBool>);
+    impl codex_extension_api::ContextContributor for Contributor {
+        fn world_state_section_ids(&self) -> &'static [&'static str] {
+            &["changing_authority"]
+        }
+
+        fn contribute_world_state<'a>(
+            &'a self,
+            _: codex_extension_api::WorldStateContributionInput<'a>,
+        ) -> codex_extension_api::ExtensionFuture<'a, Vec<codex_extension_api::WorldStateSectionContribution>> {
+            let downgraded = self.0.load(Ordering::SeqCst);
+            Box::pin(async move {
+                vec![codex_extension_api::WorldStateSectionContribution::new(
+                    "changing_authority",
+                    json!({"downgraded": downgraded}),
+                    move |_| Some(codex_extension_api::RenderedWorldStateFragment::new(
+                        if downgraded { "user" } else { "developer" },
+                        ("", ""),
+                        if downgraded { "Current discovery data." } else { "Prior policy." }.to_string(),
+                    )),
+                )]
+            })
+        }
+    }
+    let (mut session, turn) = make_session_and_context().await;
+    let downgraded = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut registry = codex_extension_api::ExtensionRegistryBuilder::new();
+    registry.prompt_contributor(Arc::new(Contributor(Arc::clone(&downgraded))));
+    session.services.extensions = Arc::new(registry.build());
+    let step = StepContext::for_test(Arc::new(turn));
+    let initial = session.build_world_state_for_step(&step).await;
+    let (fragments, accepted) = initial.render_full_with_snapshot();
+    let history = fragments.into_iter().map(|fragment| fragment.into_boxed_response_item()).collect::<Vec<_>>();
+    session.state.lock().await.history.set_world_state_baseline(accepted.clone());
+    downgraded.store(true, Ordering::SeqCst);
+    for estimate in [true, false] {
+        let current = if estimate {
+            session.estimate_world_state_for_step(&step).await
+        } else {
+            session.build_world_state_for_step(&step).await
+        };
+        for (fragments, snapshot) in [
+            current.render_full_with_snapshot(),
+            current.render_history_diff_with_snapshot(Some(&accepted), &history),
+        ] {
+            let withdrawal = fragments.iter().position(|fragment|
+                fragment.role() == "developer"
+                    && fragment.render().contains("<world_state_removal>")
+                    && fragment.render().contains("changing_authority")
+            ).expect("withdraw prior developer authority even on full reinjection");
+            let replacement = fragments.iter().position(|fragment|
+                fragment.role() == "user" && fragment.render() == "Current discovery data."
+            ).expect("preserve lower-authority data");
+            assert!(withdrawal < replacement);
+            assert_eq!(snapshot.rendered_extension("changing_authority").unwrap()["role"], "user");
+            let mut updated_history = history.clone();
+            updated_history.extend(fragments.into_iter().map(|fragment| fragment.into_boxed_response_item()));
+            assert!(current.render_history_diff_with_snapshot(Some(&snapshot), &updated_history).0
+                .iter().all(|fragment| !fragment.render().contains("<world_state_removal>")),
+                "the accepted lower-authority receipt must supersede the captured old role");
+        }
+    }
+}
+
+#[tokio::test]
 async fn kd4_ip_008_same_slug_personality_text_refreshes_accepted_context() {
     let (session, turn, _rx) = make_session_and_context_with_auth_and_config_and_rx(
         CodexAuth::from_api_key("Test API Key"),

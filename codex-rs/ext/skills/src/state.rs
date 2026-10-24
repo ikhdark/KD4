@@ -11,6 +11,7 @@ use codex_mcp::CODEX_APPS_MCP_SERVER_NAME;
 use codex_mcp::McpResourceClient;
 use codex_mcp::McpResourceServerCacheKey;
 use codex_protocol::capabilities::SelectedCapabilityRoot;
+use futures::StreamExt;
 use tokio::sync::OnceCell;
 
 use crate::SkillsExtensionConfig;
@@ -29,6 +30,8 @@ use crate::sources::SkillProviders;
 
 const MAX_CACHED_ORCHESTRATOR_RESOURCES: usize = 100;
 const MAX_CACHED_ORCHESTRATOR_CONTENT_BYTES: usize = 8 * 1024 * 1024;
+// Each root already bounds its own file reads; cap the outer fanout too.
+const MAX_CONCURRENT_EXECUTOR_ROOTS: usize = 4;
 // Settle an optional discovery result before the host's five-second phase
 // deadline can drop the initializer. Keep the deadline across cancellation so
 // another projection cannot restart a full wait. Explicit cancellation still
@@ -95,13 +98,19 @@ impl SkillsThreadState {
         mut query: SkillListQuery,
     ) -> SkillCatalog {
         let roots = std::mem::take(&mut query.executor_roots);
+        let mut results = futures::stream::iter(roots.into_iter().enumerate())
+            .map(|(index, root)| {
+                let mut query = query.clone();
+                query.executor_roots = vec![root.clone()];
+                async move { (index, self.executor_root_catalog(providers, root, query).await) }
+            })
+            .buffer_unordered(MAX_CONCURRENT_EXECUTOR_ROOTS)
+            .collect::<Vec<_>>()
+            .await;
+        results.sort_unstable_by_key(|(index, _)| *index);
         let mut catalog = SkillCatalog::default();
-        for root in roots {
-            query.executor_roots = vec![root.clone()];
-            catalog.extend(
-                self.executor_root_catalog(providers, root, query.clone())
-                    .await,
-            );
+        for (_, root_catalog) in results {
+            catalog.extend_ref(&root_catalog);
         }
         catalog
     }
@@ -115,29 +124,47 @@ impl SkillsThreadState {
         mut query: SkillListQuery,
     ) -> SkillCatalog {
         let roots = std::mem::take(&mut query.executor_roots);
+        let mut results = futures::stream::iter(roots.into_iter().enumerate())
+            .map(|(index, root)| {
+                let mut query = query.clone();
+                query.executor_roots = vec![root.clone()];
+                async move {
+                    let catalog = match self.cached_executor_catalog(&root, &query) {
+                        Some(cached) => cached,
+                        None => Arc::new(catalog_or_warning(providers.list_executor_for_turn(query).await)),
+                    };
+                    (index, catalog)
+                }
+            })
+            .buffer_unordered(MAX_CONCURRENT_EXECUTOR_ROOTS)
+            .collect::<Vec<_>>()
+            .await;
+        results.sort_unstable_by_key(|(index, _)| *index);
         let mut catalog = SkillCatalog::default();
-        for root in roots {
-            query.executor_roots = vec![root.clone()];
-            if let Some(cached) = self.cached_executor_catalog(&root, &query) {
-                catalog.extend(cached);
-            } else {
-                catalog.extend(catalog_or_warning(
-                    providers.list_executor_for_turn(query.clone()).await,
-                ));
-            }
+        for (_, root_catalog) in results {
+            catalog.extend_ref(&root_catalog);
         }
         catalog
+    }
+
+    pub(crate) async fn orchestrator_catalog_snapshot(
+        &self,
+        mcp_resources: Option<&McpResourceClient>,
+        initialize: impl Future<Output = Result<SkillCatalog, SkillProviderError>> + Send,
+    ) -> SkillCatalog {
+        self.orchestrator_catalog_snapshot_shared(mcp_resources, initialize)
+            .await.as_ref().clone()
     }
 
     #[expect(
         clippy::await_holding_invalid_type,
         reason = "Continuations wait for the base catalog instead of extending an empty default"
     )]
-    pub(crate) async fn orchestrator_catalog_snapshot(
+    pub(crate) async fn orchestrator_catalog_snapshot_shared(
         &self,
         mcp_resources: Option<&McpResourceClient>,
         initialize: impl Future<Output = Result<SkillCatalog, SkillProviderError>> + Send,
-    ) -> SkillCatalog {
+    ) -> Arc<SkillCatalog> {
         let cache = self.orchestrator_cache(mcp_resources);
         let continued = cache.continued_catalog.lock().await;
         if let Some(catalog) = continued.as_ref() {
@@ -146,13 +173,14 @@ impl SkillsThreadState {
         let deadline = *cache
             .discovery_deadline
             .get_or_init(|| tokio::time::Instant::now() + CATALOG_DISCOVERY_BUDGET);
-        catalog_or_warning(
+        shared_catalog_or_warning(
             cache
                 .catalog
                 .get_or_init(|| async {
                     tokio::time::timeout_at(deadline, initialize)
                         .await
                         .unwrap_or_else(|_| Err(discovery_timeout()))
+                        .map(Arc::new)
                 })
                 .await
                 .clone(),
@@ -163,21 +191,21 @@ impl SkillsThreadState {
         clippy::await_holding_invalid_type,
         reason = "Serialize continuation pages so one page is never appended twice"
     )]
-    pub(crate) async fn continue_orchestrator_catalog(
+    pub(crate) async fn continue_orchestrator_catalog_shared(
         &self,
         providers: &SkillProviders,
         mut query: SkillListQuery,
         expected_len: usize,
-    ) -> SkillCatalog {
+    ) -> Arc<SkillCatalog> {
         let cache = self.orchestrator_cache(query.mcp_resources.as_deref());
         let mut continued = cache.continued_catalog.lock().await;
         let catalog = continued.get_or_insert_with(|| {
-            catalog_or_warning(
+            shared_catalog_or_warning(
                 cache
                     .catalog
                     .get()
                     .cloned()
-                    .unwrap_or_else(|| Ok(SkillCatalog::default())),
+                    .unwrap_or_else(|| Ok(Arc::new(SkillCatalog::default()))),
             )
         });
         if catalog.entries.len() != expected_len {
@@ -189,12 +217,13 @@ impl SkillsThreadState {
         query.continuation = Some(continuation);
         match providers.list_orchestrator_for_turn(query).await {
             Ok(next) => {
+                let catalog = Arc::make_mut(catalog);
                 catalog.continuation = next.continuation;
                 catalog.warnings = next.warnings;
                 catalog.extend_entries(next.entries);
             }
             Err(error) => {
-                catalog.warnings = vec![error.model_message().to_string()];
+                Arc::make_mut(catalog).warnings = vec![error.model_message().to_string()];
             }
         }
         catalog.clone()
@@ -233,10 +262,10 @@ impl SkillsThreadState {
             // the same catalog contribution will render, without committing
             // a cold estimate or starting additional discovery.
             if let Some(catalog) = cache.continued_catalog.lock().await.as_ref() {
-                return catalog.clone();
+                return catalog.as_ref().clone();
             }
             if let Some(catalog) = cache.catalog.get() {
-                return catalog_or_warning(catalog.clone());
+                return shared_catalog_or_warning(catalog.clone()).as_ref().clone();
             }
         }
 
@@ -326,7 +355,7 @@ impl SkillsThreadState {
         providers: &SkillProviders,
         root: SelectedCapabilityRoot,
         query: SkillListQuery,
-    ) -> SkillCatalog {
+    ) -> Arc<SkillCatalog> {
         let binding = query
             .bound_executor_roots
             .iter()
@@ -360,11 +389,12 @@ impl SkillsThreadState {
         };
         // Publish the slot before discovery, without holding the cache mutex
         // across I/O. Cancellation leaves it empty for the next observer.
-        catalog_or_warning(
+        shared_catalog_or_warning(
             slot.get_or_init(|| async {
                 tokio::time::timeout_at(deadline, providers.list_executor_for_turn(query))
                     .await
                     .unwrap_or_else(|_| Err(discovery_timeout()))
+                    .map(Arc::new)
             })
             .await
             .clone(),
@@ -375,7 +405,7 @@ impl SkillsThreadState {
         &self,
         root: &SelectedCapabilityRoot,
         query: &SkillListQuery,
-    ) -> Option<SkillCatalog> {
+    ) -> Option<Arc<SkillCatalog>> {
         self.executor_cache
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -391,7 +421,7 @@ impl SkillsThreadState {
                         || cached.turn_id == query.turn_id)
             })
             .and_then(|cached| cached.catalog.get().cloned())
-            .map(catalog_or_warning)
+            .map(shared_catalog_or_warning)
     }
 }
 
@@ -399,7 +429,7 @@ struct CachedExecutorCatalog {
     root: SelectedCapabilityRoot,
     binding: Option<codex_exec_server::ResolvedSelectedCapabilityRoot>,
     turn_id: String,
-    catalog: Arc<OnceCell<SkillProviderResult<SkillCatalog>>>,
+    catalog: Arc<OnceCell<SkillProviderResult<Arc<SkillCatalog>>>>,
     discovery_deadline: tokio::time::Instant,
 }
 
@@ -412,9 +442,9 @@ impl CachedExecutorCatalog {
 
 struct OrchestratorGenerationCache {
     mcp_cache_key: Option<McpResourceServerCacheKey>,
-    catalog: OnceCell<SkillProviderResult<SkillCatalog>>,
+    catalog: OnceCell<SkillProviderResult<Arc<SkillCatalog>>>,
     discovery_deadline: OnceLock<tokio::time::Instant>,
-    continued_catalog: tokio::sync::Mutex<Option<SkillCatalog>>,
+    continued_catalog: tokio::sync::Mutex<Option<Arc<SkillCatalog>>>,
     resources: Mutex<OrchestratorResourceCache>,
 }
 
@@ -424,6 +454,10 @@ fn catalog_or_warning(result: SkillProviderResult<SkillCatalog>) -> SkillCatalog
         warnings: vec![err.message],
         ..Default::default()
     })
+}
+
+fn shared_catalog_or_warning(result: SkillProviderResult<Arc<SkillCatalog>>) -> Arc<SkillCatalog> {
+    result.unwrap_or_else(|err| Arc::new(catalog_or_warning(Err(err))))
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -491,7 +525,7 @@ impl OrchestratorResourceCache {
 }
 
 #[derive(Clone, Debug, Default)]
-pub(crate) struct ExecutorSkillsStepState(pub(crate) SkillCatalog);
+pub(crate) struct ExecutorSkillsStepState(pub(crate) Arc<SkillCatalog>);
 
 /// Warnings already shown for one turn.
 ///

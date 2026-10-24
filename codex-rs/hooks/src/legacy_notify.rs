@@ -12,31 +12,36 @@ use crate::command_from_argv;
 /// Legacy notify payload appended as the final argv argument for backward compatibility.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(tag = "type", rename_all = "kebab-case")]
-enum UserNotification {
+enum UserNotification<'a> {
     #[serde(rename_all = "kebab-case")]
     AgentTurnComplete {
         thread_id: String,
-        turn_id: String,
+        turn_id: &'a str,
         cwd: String,
         #[serde(skip_serializing_if = "Option::is_none")]
-        client: Option<String>,
-        input_messages: Vec<String>,
-        last_assistant_message: Option<String>,
+        client: Option<&'a str>,
+        input_messages: &'a [String],
+        last_assistant_message: Option<&'a str>,
     },
 }
 
 pub fn legacy_notify_json(payload: &HookPayload) -> Result<String, serde_json::Error> {
-    match &payload.hook_event {
-        HookEvent::AfterAgent { event } => {
-            serde_json::to_string(&UserNotification::AgentTurnComplete {
-                thread_id: event.thread_id.to_string(),
-                turn_id: event.turn_id.clone(),
-                cwd: payload.cwd.display().to_string(),
-                client: payload.client.clone(),
-                input_messages: event.input_messages.clone(),
-                last_assistant_message: event.last_assistant_message.clone(),
-            })
-        }
+    let HookEvent::AfterAgent { event } = &payload.hook_event;
+    serde_json::to_string(&legacy_notification(payload, event.last_assistant_message.as_deref()))
+}
+
+fn legacy_notification<'a>(
+    payload: &'a HookPayload,
+    last_assistant_message: Option<&'a str>,
+) -> UserNotification<'a> {
+    let HookEvent::AfterAgent { event } = &payload.hook_event;
+    UserNotification::AgentTurnComplete {
+        thread_id: event.thread_id.to_string(),
+        turn_id: &event.turn_id,
+        cwd: payload.cwd.display().to_string(),
+        client: payload.client.as_deref(),
+        input_messages: &event.input_messages,
+        last_assistant_message,
     }
 }
 
@@ -93,16 +98,93 @@ fn windows_notify_command_line_len(argv: &[String], payload: &str) -> usize {
 /// documented key present and parseable for existing notifiers, which a
 /// different wire shape (a temp-file path, or stdin delivery) would not.
 fn legacy_notify_argument(payload: &HookPayload, argv: &[String]) -> anyhow::Result<String> {
-    let notify_payload = legacy_notify_json(payload)?;
     #[cfg(windows)]
     {
-        if windows_notify_command_line_len(argv, &notify_payload) > MAX_NOTIFY_COMMAND_LINE {
-            return truncated_notify_json(payload, argv);
-        }
+        truncated_notify_json(payload, argv)
     }
     #[cfg(not(windows))]
-    let _ = argv;
-    Ok(notify_payload)
+    {
+        let _ = argv;
+        Ok(legacy_notify_json(payload)?)
+    }
+}
+
+/// Count std's Windows argument escaping while serde emits JSON. UTF-8 lead
+/// bytes determine UTF-16 width, so serializer writes may split a code point.
+/// Retained JSON stops at the native argument budget. Serde may still scan a
+/// borrowed string before writing its first span; no full encoded copy is kept.
+#[cfg(windows)]
+#[derive(Clone)]
+struct NotifyArgumentWriter {
+    bytes: Vec<u8>,
+    length: usize,
+    backslashes: usize,
+    quoted: bool,
+    limit: usize,
+    exceeded: bool,
+}
+
+#[cfg(windows)]
+impl NotifyArgumentWriter {
+    fn new(limit: usize) -> Self {
+        Self { bytes: Vec::new(), length: 0, backslashes: 0, quoted: false, limit, exceeded: false }
+    }
+
+    fn append_json(&mut self, value: &impl Serialize) -> anyhow::Result<bool> {
+        let result = serde_json::to_writer(&mut *self, value);
+        if self.exceeded {
+            return Ok(false);
+        }
+        result?;
+        Ok(true)
+    }
+
+    fn with_message(&self, message: Option<&str>) -> anyhow::Result<Option<String>> {
+        use std::io::Write;
+        let mut candidate = self.clone();
+        if !candidate.append_json(&message)? {
+            return Ok(None);
+        }
+        let closing = candidate.write_all(b"}");
+        if candidate.exceeded {
+            return Ok(None);
+        }
+        closing?;
+        Ok(Some(String::from_utf8(candidate.bytes)?))
+    }
+}
+
+#[cfg(windows)]
+impl std::io::Write for NotifyArgumentWriter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        for &byte in bytes {
+            if byte.is_ascii() {
+                self.length += 1;
+                if byte == b'\\' {
+                    self.backslashes += 1;
+                } else {
+                    if byte == b'"' {
+                        self.length += self.backslashes + 1;
+                    }
+                    self.backslashes = 0;
+                }
+                self.quoted |= matches!(byte, b' ' | b'\t');
+            } else if byte >= 0xc0 {
+                self.length += if byte >= 0xf0 { 2 } else { 1 };
+                self.backslashes = 0;
+            }
+            // Complete JSON ends in `}`, so trailing argument backslashes
+            // cannot occur. Do not charge a temporary backslash suffix twice.
+            if self.length + (if self.quoted { 2 } else { 0 }) > self.limit {
+                self.exceeded = true;
+                return Err(std::io::Error::new(std::io::ErrorKind::WriteZero, "notification argument budget exceeded"));
+            }
+            self.bytes.push(byte);
+        }
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
 }
 
 /// Re-serialize with `last_assistant_message` truncated to fit the command line.
@@ -111,36 +193,45 @@ fn legacy_notify_argument(payload: &HookPayload, argv: &[String]) -> anyhow::Res
 /// fit, report the failure instead of spawning with an oversized/missing event.
 #[cfg(windows)]
 fn truncated_notify_json(payload: &HookPayload, argv: &[String]) -> anyhow::Result<String> {
+    use std::io::Write;
     let HookEvent::AfterAgent { event } = &payload.hook_event;
-    let mut notification = UserNotification::AgentTurnComplete {
-        thread_id: event.thread_id.to_string(),
-        turn_id: event.turn_id.clone(),
-        cwd: payload.cwd.display().to_string(),
-        client: payload.client.clone(),
-        input_messages: event.input_messages.clone(),
-        last_assistant_message: None,
-    };
-    let envelope = serde_json::to_string(&notification)?;
-    anyhow::ensure!(
-        windows_notify_command_line_len(argv, &envelope) <= MAX_NOTIFY_COMMAND_LINE,
+    let oversized = || anyhow::anyhow!(
         "legacy notify command exceeds the Windows command-line limit of {MAX_NOTIFY_COMMAND_LINE} UTF-16 units even without the assistant message; shorten notify arguments or non-assistant notification fields"
     );
+    // An empty regular argument costs two quotes. Remove only that payload
+    // cost, keeping argv[0], fixed arguments, separators and the terminal NUL.
+    let prefix_length = windows_notify_command_line_len(argv, "").saturating_sub(2);
+    let limit = MAX_NOTIFY_COMMAND_LINE.checked_sub(prefix_length).ok_or_else(oversized)?;
+    let mut envelope = NotifyArgumentWriter::new(limit + 5);
+    if !envelope.append_json(&legacy_notification(payload, None))? {
+        return Err(oversized());
+    }
+    let envelope = String::from_utf8(envelope.bytes)?;
+    let prefix = envelope.strip_suffix("null}")
+        .ok_or_else(|| anyhow::anyhow!("legacy notification assistant field is not terminal"))?;
+    let mut writer = NotifyArgumentWriter::new(limit);
+    if writer.write_all(prefix.as_bytes()).is_err() {
+        return Err(oversized());
+    }
+    // Every UTF-8 string needs at least one UTF-16 unit per three bytes,
+    // before JSON/argv escaping. Skip provably excluded full-message scans.
+    let original = event.last_assistant_message.as_deref();
+    if original.is_none_or(|message| message.len() <= limit * 3)
+        && let Some(complete) = writer.with_message(original)?
+    {
+        return Ok(complete);
+    }
+    // A present empty string can be shorter than null, so try the original
+    // message before deciding that the invariant envelope cannot fit.
+    let envelope = writer.with_message(None)?.ok_or_else(oversized)?;
     if let Some(message) = event.last_assistant_message.as_deref() {
         // Geometric reduction bounds retries. Check the serialized and escaped
         // result each time: both JSON escaping and the truncation marker cost
         // space, so a raw-byte estimate is not a sufficient stopping condition.
         let mut retained_bytes = (message.len() / 2).min(MAX_NOTIFY_COMMAND_LINE);
         loop {
-            let UserNotification::AgentTurnComplete {
-                last_assistant_message,
-                ..
-            } = &mut notification;
-            *last_assistant_message = Some(codex_utils_string::truncate_middle_chars(
-                message,
-                retained_bytes,
-            ));
-            let candidate = serde_json::to_string(&notification)?;
-            if windows_notify_command_line_len(argv, &candidate) <= MAX_NOTIFY_COMMAND_LINE {
+            let shortened = codex_utils_string::truncate_middle_chars(message, retained_bytes);
+            if let Some(candidate) = writer.with_message(Some(&shortened))? {
                 return Ok(candidate);
             }
             if retained_bytes == 0 {

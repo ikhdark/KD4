@@ -175,6 +175,7 @@ async fn salience_budget_rejection_is_recoverable_not_a_source_removal() {
 }
 use crate::FunctionCallError;
 use crate::agents_md_manager::AgentsMdManager;
+use crate::build_available_skills;
 use crate::codex_thread::TryStartTurnIfIdleRejectionReason;
 use crate::config::ConfigBuilder;
 use crate::config::ConfigOverrides;
@@ -13731,6 +13732,119 @@ async fn build_initial_context_trims_skill_metadata_from_context_window_budget()
 }
 
 #[tokio::test]
+async fn external_only_skills_receive_model_requested_usage_guidance() {
+    use codex_extension_api::ContextContributor;
+    use codex_extension_api::ExtensionData;
+    use codex_extension_api::ExtensionFuture;
+    use codex_extension_api::PromptFragment;
+    use codex_extension_api::RenderedWorldStateFragment;
+    use codex_extension_api::WorldStateContributionInput;
+    use codex_extension_api::WorldStateSectionContribution;
+    use codex_protocol::protocol::ENVIRONMENT_SKILLS_INSTRUCTIONS_CLOSE_TAG;
+    use codex_protocol::protocol::ENVIRONMENT_SKILLS_INSTRUCTIONS_OPEN_TAG;
+    use codex_protocol::protocol::EXTENSION_SKILLS_INSTRUCTIONS_CLOSE_TAG;
+    use codex_protocol::protocol::EXTENSION_SKILLS_INSTRUCTIONS_OPEN_TAG;
+
+    // Exercise both production extension channels without a host/bundled catalog:
+    // orchestrator metadata in thread context and executor metadata in world state.
+    struct ExternalSkillsContributor {
+        executor: bool,
+        include_instructions: bool,
+    }
+    impl ExternalSkillsContributor {
+        fn body(&self) -> String {
+            let source = if self.executor { "environment" } else { "orchestrator" };
+            codex_core_skills::render_available_skills_body(&[format!(
+                "- external-only-skill: external fixture ({source} resource: skill://external/SKILL.md)"
+            )])
+        }
+    }
+    impl ContextContributor for ExternalSkillsContributor {
+        fn contribute_thread_context<'a>(
+            &'a self,
+            _: &'a ExtensionData,
+            _: &'a ExtensionData,
+        ) -> ExtensionFuture<'a, Vec<PromptFragment>> {
+            Box::pin(async move {
+                if self.executor || !self.include_instructions {
+                    return Vec::new();
+                }
+                vec![PromptFragment::developer_capability(format!(
+                    "{EXTENSION_SKILLS_INSTRUCTIONS_OPEN_TAG}{}{EXTENSION_SKILLS_INSTRUCTIONS_CLOSE_TAG}",
+                    self.body()
+                ))]
+            })
+        }
+
+        fn world_state_section_ids(&self) -> &'static [&'static str] {
+            &["skills"]
+        }
+
+        fn contribute_world_state<'a>(
+            &'a self,
+            _: WorldStateContributionInput<'a>,
+        ) -> ExtensionFuture<'a, Vec<WorldStateSectionContribution>> {
+            Box::pin(async move {
+                if !self.executor || !self.include_instructions {
+                    return Vec::new();
+                }
+                let body = self.body();
+                vec![WorldStateSectionContribution::new(
+                    "skills",
+                    serde_json::json!({"body": body.clone(), "includeInstructions": true}),
+                    move |_| Some(RenderedWorldStateFragment::new(
+                        "developer",
+                        (
+                            ENVIRONMENT_SKILLS_INSTRUCTIONS_OPEN_TAG,
+                            ENVIRONMENT_SKILLS_INSTRUCTIONS_CLOSE_TAG,
+                        ),
+                        body.clone(),
+                    )),
+                )]
+            })
+        }
+    }
+
+    for executor in [false, true] {
+        for include_instructions in [false, true] {
+            for model_needs_usage in [false, true] {
+                let (mut session, mut turn) = make_session_and_context().await;
+                Arc::make_mut(&mut turn.config).include_skill_instructions = include_instructions;
+                turn.model_info.include_skills_usage_instructions = model_needs_usage;
+                turn.turn_skills = TurnSkillsContext::new(HostSkillsSnapshot::new(Arc::new(
+                    SkillLoadOutcome::default(),
+                )));
+                let mut registry = codex_extension_api::ExtensionRegistryBuilder::new();
+                registry.prompt_contributor(Arc::new(ExternalSkillsContributor {
+                    executor,
+                    include_instructions,
+                }));
+                session.services.extensions = Arc::new(registry.build());
+                let step = StepContext::for_test(Arc::new(turn));
+                for estimate in [false, true] {
+                    let prepared = session.prepare_context_update_inner(&step, estimate).await;
+                    let developer = developer_input_texts(&prepared.context_items).join("\n");
+                    assert_eq!(
+                        developer.contains("external-only-skill"),
+                        include_instructions,
+                        "executor={executor}, estimate={estimate}"
+                    );
+                    assert_eq!(
+                        developer.matches("<skills_usage_instructions>").count(),
+                        usize::from(include_instructions && model_needs_usage),
+                        "executor={executor}, include={include_instructions}, model={model_needs_usage}, estimate={estimate}"
+                    );
+                    assert_eq!(
+                        developer.contains(codex_core_skills::SKILLS_HOW_TO_USE),
+                        include_instructions && model_needs_usage
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[tokio::test]
 async fn repository_catalog_metadata_never_enters_developer_sections() {
     let (session, mut turn) = make_session_and_context().await;
     Arc::make_mut(&mut turn.config).include_skill_instructions = true;
@@ -13744,6 +13858,18 @@ async fn repository_catalog_metadata_never_enters_developer_sections() {
         scope: SkillScope::Repo, plugin_id: None,
     });
     turn.turn_skills = TurnSkillsContext::new(HostSkillsSnapshot::new(Arc::new(outcome)));
+    // The live session exposes a discovery pointer rather than inline metadata.
+    // Keep the legacy renderer's untrusted-data/escaping contract covered too.
+    let inline_catalog = crate::context::AvailableSkillsInstructions::from_skill_lines(
+        build_available_skills(
+            turn.turn_skills.snapshot.outcome(),
+            codex_core_skills::SkillMetadataBudget::Characters(10_000),
+            codex_core_skills::render::SkillRenderSideEffects::None,
+        )
+        .expect("available catalog fixture")
+        .skill_lines,
+    )
+    .render();
     let items = build_initial_context(&session, &Arc::new(turn)).await;
     let developer = developer_input_texts(&items).join("\n");
     assert!(!developer.contains("CATALOG_SENTINEL"));
@@ -13753,7 +13879,7 @@ async fn repository_catalog_metadata_never_enters_developer_sections() {
         .find_map(|item| match item {
             ResponseItem::Message { role, content, .. } if role == "user" => {
                 content.iter().find_map(|part| match part {
-                    ContentItem::InputText { text } if text.contains("CATALOG_SENTINEL") => {
+                    ContentItem::InputText { text } if text.contains("<skills_instructions>") => {
                         Some(text)
                     }
                     _ => None,
@@ -13761,9 +13887,12 @@ async fn repository_catalog_metadata_never_enters_developer_sections() {
             }
             _ => None,
         })
-        .expect("user catalog data");
-    assert!(catalog.contains("scope: repo"));
-    assert!(catalog.contains("&lt;skills_usage_instructions&gt;CATALOG_SENTINEL"));
+        .expect("user catalog discovery pointer");
+    assert!(catalog.contains("skill:catalog"));
+    assert!(!catalog.contains("CATALOG_SENTINEL"));
+    assert!(inline_catalog.contains("scope: repo"));
+    assert!(inline_catalog.contains("&lt;skills_usage_instructions&gt;CATALOG_SENTINEL"));
+    assert_eq!(inline_catalog.matches("</skills_instructions>").count(), 1);
     assert_eq!(catalog.matches("</skills_instructions>").count(), 1);
 }
 
@@ -14240,6 +14369,142 @@ async fn same_slug_catalog_approval_change_refreshes_projected_permission_contex
             .context_items()
             .is_empty(),
         "committed new permission receipt must settle back to the delta path"
+    );
+}
+
+#[tokio::test]
+async fn contributor_authority_downgrade_revokes_developer_policy_before_user_replacement() {
+    struct Contributor(Arc<std::sync::atomic::AtomicBool>);
+    impl codex_extension_api::ContextContributor for Contributor {
+        fn contribute_turn_context<'a>(
+            &'a self,
+            _: codex_extension_api::TurnContextContributionInput<'a>,
+        ) -> codex_extension_api::ExtensionFuture<'a, Vec<codex_extension_api::PromptFragment>> {
+            Box::pin(async move {
+                vec![if self.0.load(std::sync::atomic::Ordering::SeqCst) {
+                    codex_extension_api::PromptFragment::new(
+                        PromptSlot::ContextualUser,
+                        "Replacement discovery data, not developer policy.",
+                    )
+                } else {
+                    codex_extension_api::PromptFragment::developer_policy("Prior developer policy.")
+                }]
+            })
+        }
+    }
+
+    for full_refresh in [false, true] {
+        let (mut session, turn) = make_session_and_context().await;
+        let downgraded = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut registry = codex_extension_api::ExtensionRegistryBuilder::new();
+        registry.prompt_contributor(Arc::new(Contributor(Arc::clone(&downgraded))));
+        session.services.extensions = Arc::new(registry.build());
+        let session = Arc::new(session);
+        let turn = Arc::new(turn);
+        let step = StepContext::for_test(Arc::clone(&turn));
+        session.record_context_updates_and_set_reference_context_item(&step).await.unwrap();
+        commit_test_context_baseline(&session, "developer-contribution").await;
+        drop(step);
+        let mut turn = Arc::try_unwrap(turn).unwrap_or_else(|_| panic!("unique test turn"));
+        if full_refresh {
+            turn.developer_instructions = Some("Unrelated configured-policy refresh.".to_string());
+        }
+        let step = StepContext::for_test(Arc::new(turn));
+        downgraded.store(true, std::sync::atomic::Ordering::SeqCst);
+        for estimate in [true, false] {
+            let prepared = session.prepare_context_update_inner(&step, estimate).await;
+            let items = prepared.context_items();
+            let retraction = crate::stable_context::turn_contribution_removal(0);
+            let retraction_index = items.iter().position(|item| {
+                matches!(item, ResponseItem::Message { role, content, .. }
+                    if role == "developer" && content.iter().any(|part|
+                        matches!(part, ContentItem::InputText { text } if text == &retraction)))
+            }).expect("downgrade must revoke at the original developer authority");
+            let replacement_index = items.iter().position(|item| {
+                matches!(item, ResponseItem::Message { role, content, .. }
+                    if role == "user" && content.iter().any(|part|
+                        matches!(part, ContentItem::InputText { text }
+                            if text.contains("Replacement discovery data, not developer policy."))))
+            }).expect("replacement retains its user authority");
+            assert!(retraction_index < replacement_index);
+            if !estimate {
+                session.compare_and_record_context_updates(
+                    prepared, session.services.planning_generation(),
+                ).await.unwrap().expect("accept authority downgrade");
+            }
+        }
+        commit_test_context_baseline(&session, "user-contribution").await;
+        assert!(session.prepare_context_update(&step).await.context_items().is_empty());
+        let history = session.clone_history().await;
+        let compacted = crate::stable_context::project_compaction_context(history.raw_items().to_vec().into());
+        assert!(!developer_input_texts(&compacted).iter().any(|text| text.contains("Prior developer policy.")));
+        assert!(compacted.iter().any(|item| {
+            matches!(item, ResponseItem::Message { role, content, .. }
+                if role == "user" && content.iter().any(|part|
+                    matches!(part, ContentItem::InputText { text }
+                        if text.contains("Replacement discovery data, not developer policy."))))
+        }));
+    }
+}
+
+#[tokio::test]
+async fn disabled_personality_retracts_resumed_style_in_estimated_and_accepted_context() {
+    let (mut session, turn) = make_session_and_context().await;
+    session
+        .features
+        .disable(Feature::Personality)
+        .expect("disable personality");
+    let reset = PersonalitySpecInstructions::reset().render();
+    let mut old_style = ContextualUserFragment::into(PersonalitySpecInstructions::new(
+        "Retained personality from the previous session.",
+    ));
+    crate::stable_context::mark_trusted_stable_context_item(&mut old_style);
+    let turn = Arc::new(turn);
+    let session = Arc::new(session);
+    session
+        .record_conversation_items(&turn, &[old_style])
+        .await
+        .unwrap();
+    session
+        .state
+        .lock()
+        .await
+        .set_reference_context_item(Some(turn.to_turn_context_item()));
+    let step = StepContext::for_test(Arc::clone(&turn));
+    for estimate in [true, false] {
+        let prepared = session.prepare_context_update_inner(&step, estimate).await;
+        assert_eq!(
+            developer_input_texts(prepared.context_items())
+                .iter()
+                .filter(|text| **text == reset.as_str())
+                .count(),
+            1,
+            "the disabled feature must explicitly revoke retained style, estimate={estimate}"
+        );
+        if !estimate {
+            session
+                .compare_and_record_context_updates(prepared, session.services.planning_generation())
+                .await
+                .unwrap()
+                .expect("accept personality reset");
+        }
+    }
+    commit_test_context_baseline(&session, "disabled-personality").await;
+    assert!(
+        session
+            .prepare_context_update(&step)
+            .await
+            .context_items()
+            .is_empty()
+    );
+    let history = session.clone_history().await;
+    let compacted = crate::stable_context::project_compaction_context(
+        history.raw_items().to_vec().into(),
+    );
+    let text = developer_input_texts(&compacted);
+    assert!(text.contains(&reset.as_str()));
+    assert!(
+        !text.iter().any(|text| text.contains("Retained personality from the previous session."))
     );
 }
 
@@ -20254,7 +20519,7 @@ async fn context_pressure_mutations_preserve_observed_provider_consumption() {
     assert_eq!(observed.estimated_context_tokens, None);
 }
 #[tokio::test]
-async fn ctxaudit_authoritative_empty_skills_retract_catalog_and_usage_only() {
+async fn ctxaudit_empty_host_skills_preserve_independent_usage_gates() {
     let (session, mut turn) = make_session_and_context().await;
     Arc::make_mut(&mut turn.config).include_skill_instructions = true;
     turn.model_info.include_skills_usage_instructions = true;
@@ -20278,7 +20543,17 @@ async fn ctxaudit_authoritative_empty_skills_retract_catalog_and_usage_only() {
         .record_conversation_items(&turn, &[selected])
         .await
         .unwrap();
-    for present in [true, false, true] {
+    for (present, include_instructions, model_needs_usage) in [
+        (true, true, true),
+        (false, true, true),
+        (false, true, false),
+        (false, true, true),
+        (false, false, true),
+        (false, true, true),
+        (true, true, true),
+    ] {
+        Arc::make_mut(&mut turn.config).include_skill_instructions = include_instructions;
+        turn.model_info.include_skills_usage_instructions = model_needs_usage;
         turn.turn_skills = TurnSkillsContext::new(HostSkillsSnapshot::new(Arc::new(if present {
             available.clone()
         } else {
@@ -20297,9 +20572,15 @@ async fn ctxaudit_authoritative_empty_skills_retract_catalog_and_usage_only() {
         );
         let text = developer_input_texts(&projected.items).join("\n");
         let catalog_text = serde_json::to_string(&projected.items).unwrap();
-        assert_eq!(catalog_text.contains("audit-skill"), present);
+        assert_eq!(
+            catalog_text.contains("<skills_instructions>"),
+            present && include_instructions
+        );
         assert!(!text.contains("audit-skill"));
-        assert_eq!(text.contains("<skills_usage_instructions>"), present);
+        assert_eq!(
+            text.contains("<skills_usage_instructions>"),
+            include_instructions && model_needs_usage
+        );
         assert!(
             serde_json::to_string(&projected.items)
                 .unwrap()

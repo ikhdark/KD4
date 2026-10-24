@@ -368,6 +368,17 @@ impl ExecutorFileSystem for LocalFileSystem {
         Box::pin(LocalFileSystem::read_file_stream(self, path, sandbox))
     }
 
+    fn read_file_metadata_stream<'a>(
+        &'a self,
+        path: &'a PathUri,
+        sandbox: Option<&'a FileSystemSandboxContext>,
+    ) -> ExecutorFileSystemFuture<'a, FileSystemReadStream> {
+        Box::pin(async move {
+            let (file_system, sandbox) = self.file_system_for(sandbox)?;
+            file_system.read_file_metadata_stream(path, sandbox).await
+        })
+    }
+
     fn write_file<'a>(
         &'a self,
         path: &'a PathUri,
@@ -696,6 +707,17 @@ impl ExecutorFileSystem for UnsandboxedFileSystem {
         sandbox: Option<&'a FileSystemSandboxContext>,
     ) -> ExecutorFileSystemFuture<'a, FileSystemReadStream> {
         Box::pin(UnsandboxedFileSystem::read_file_stream(self, path, sandbox))
+    }
+
+    fn read_file_metadata_stream<'a>(
+        &'a self,
+        path: &'a PathUri,
+        sandbox: Option<&'a FileSystemSandboxContext>,
+    ) -> ExecutorFileSystemFuture<'a, FileSystemReadStream> {
+        Box::pin(async move {
+            reject_platform_sandbox_context(sandbox)?;
+            self.file_system.read_file_metadata_stream(path, None).await
+        })
     }
 
     fn write_file<'a>(
@@ -1189,6 +1211,21 @@ impl ExecutorFileSystem for DirectFileSystem {
         sandbox: Option<&'a FileSystemSandboxContext>,
     ) -> ExecutorFileSystemFuture<'a, FileSystemReadStream> {
         Box::pin(DirectFileSystem::read_file_stream(self, path, sandbox))
+    }
+
+    fn read_file_metadata_stream<'a>(
+        &'a self,
+        path: &'a PathUri,
+        sandbox: Option<&'a FileSystemSandboxContext>,
+    ) -> ExecutorFileSystemFuture<'a, FileSystemReadStream> {
+        Box::pin(async move {
+            let file = self.open_file_for_read(path, sandbox).await?;
+            if file.metadata().await?.len() > MAX_READ_FILE_BYTES {
+                return Err(file_too_large_error(MAX_READ_FILE_BYTES));
+            }
+            Ok(FileSystemReadStream::new(ReaderStream::with_capacity(file, FILE_READ_CHUNK_SIZE))
+                .with_limit(MAX_READ_FILE_BYTES))
+        })
     }
 
     fn write_file<'a>(

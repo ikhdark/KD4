@@ -342,14 +342,83 @@ pub(super) fn split_server_envelope_for_transport(
         .into_iter().map(|(envelope, _)| envelope).collect())
 }
 
+#[cfg(test)]
 pub(super) fn encode_server_envelope_for_transport(
     envelope: ServerEnvelope,
 ) -> io::Result<Vec<(ServerEnvelope, String)>> {
-    let payload = serde_json::to_string(&envelope).map_err(io::Error::other)?;
+    encode_server_envelope_with(envelope, |envelope, payload| (envelope, payload))
+}
+
+pub(super) struct EncodedServerPayload {
+    pub(super) client_id: ClientId,
+    pub(super) stream_id: StreamId,
+    pub(super) seq_id: u64,
+    pub(super) segment_id: Option<usize>,
+    pub(super) payload: String,
+}
+
+pub(super) fn encode_server_payloads_for_transport(
+    envelope: ServerEnvelope,
+) -> io::Result<Vec<EncodedServerPayload>> {
+    encode_server_envelope_with(envelope, |envelope, payload| EncodedServerPayload {
+        segment_id: envelope.event.segment_id(),
+        client_id: envelope.client_id,
+        stream_id: envelope.stream_id,
+        seq_id: envelope.seq_id,
+        payload,
+    })
+}
+
+fn encode_server_envelope_with<T>(
+    envelope: ServerEnvelope,
+    mut encoded: impl FnMut(ServerEnvelope, String) -> T,
+) -> io::Result<Vec<T>> {
+    struct LimitedEnvelope {
+        bytes: Vec<u8>,
+        limit: usize,
+    }
+    impl io::Write for LimitedEnvelope {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            if bytes.len() > self.limit.saturating_sub(self.bytes.len()) {
+                return Err(io::Error::new(
+                    ErrorKind::InvalidData,
+                    "remote-control server envelope exceeds reassembled size limit",
+                ));
+            }
+            self.bytes.extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+    let payload = if matches!(envelope.event, ServerEvent::ServerMessage { .. }) {
+        // JSON string escaping expands each input byte by at most six. The
+        // fixed envelope keys, quotes, tag and u64 sequence fit in 256 bytes.
+        // This conservative outer bound avoids serializing routing twice; the
+        // exact raw-message ceiling is still enforced below before publication.
+        let routing_bytes = envelope
+            .client_id
+            .0
+            .len()
+            .saturating_add(envelope.stream_id.0.len())
+            .saturating_mul(6)
+            .saturating_add(256);
+        let mut writer = LimitedEnvelope {
+            bytes: Vec::new(),
+            limit: REMOTE_CONTROL_REASSEMBLED_MAX_BYTES.saturating_add(routing_bytes),
+        };
+        serde_json::to_writer(&mut writer, &envelope)
+            .map_err(|error| io::Error::new(ErrorKind::InvalidData, error))?;
+        String::from_utf8(writer.bytes).map_err(io::Error::other)?
+    } else {
+        serde_json::to_string(&envelope).map_err(io::Error::other)?
+    };
     if !matches!(envelope.event, ServerEvent::ServerMessage { .. })
         || payload.len() <= REMOTE_CONTROL_SEGMENT_MAX_BYTES
     {
-        return Ok(vec![(envelope, payload)]);
+        return Ok(vec![encoded(envelope, payload)]);
     }
 
     #[derive(serde::Deserialize)]
@@ -419,7 +488,7 @@ pub(super) fn encode_server_envelope_for_transport(
                         chunk,
                     )?;
                     let payload = serde_json::to_string(&chunk).map_err(io::Error::other)?;
-                    Ok((chunk, payload))
+                    Ok(encoded(chunk, payload))
                 })
                 .collect();
         }

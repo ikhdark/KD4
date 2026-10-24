@@ -225,11 +225,12 @@ struct ThreadTurnIndex {
 }
 
 impl ThreadTurnIndex {
-    fn refresh_retained_turn_item_locations(&mut self, turn_id: &str) {
+    fn index_appended_retained_turn_items(&mut self, turn_id: &str, previous_len: usize) {
         let new_items = self.turns[turn_id]
             .items
             .iter()
             .enumerate()
+            .skip(previous_len)
             .filter_map(|(offset, item)| {
                 let key = IndexedItemKey {
                     turn_id: turn_id.to_string(),
@@ -843,7 +844,7 @@ impl ThreadState {
             if self.turn_index_rollback_generation != expected_generation {
                 return Err(());
             }
-            self.seed_turn_index_from_history(items);
+            self.seed_turn_index_from_checked_history(items, false);
             return Ok(());
         }
         if self.turn_index.initialized {
@@ -852,15 +853,20 @@ impl ThreadState {
         if self.turn_index_rollback_generation != expected_generation {
             return Err(());
         }
-        self.seed_turn_index_from_history(items);
+        self.seed_turn_index_from_checked_history(items, false);
         Ok(())
     }
 
     /// Seeds a synchronous history snapshot while preserving live additions.
     /// Asynchronous readers must use the generation-checked entrypoint above.
     pub(crate) fn seed_turn_index_from_history(&mut self, items: &[RolloutItem]) {
-        self.turn_index_source_partial =
+        let source_partial =
             codex_rollout::ensure_rollout_source_integrity(items).is_err();
+        self.seed_turn_index_from_checked_history(items, source_partial);
+    }
+
+    fn seed_turn_index_from_checked_history(&mut self, items: &[RolloutItem], source_partial: bool) {
+        self.turn_index_source_partial = source_partial;
         let mut live_index = std::mem::take(&mut self.turn_index);
         let mut builder = ThreadHistoryBuilder::new();
         for item in items {
@@ -1058,11 +1064,14 @@ impl ThreadState {
             .and_then(|id| self.turn_index.turns.get_mut(id).map(|turn| (id, turn)));
         let has_retained_turn = retained_turn.is_some();
         let changes = if let Some((turn_id, turn)) = retained_turn {
+            // Retained-turn reduction replaces existing IDs in place or appends
+            // new items; replacement and metadata events cannot move old offsets.
+            let previous_len = turn.items.len();
             let changes = self
                 .current_turn_history
                 .handle_event_with_retained_turn(event, turn);
             self.turn_index
-                .refresh_retained_turn_item_locations(turn_id);
+                .index_appended_retained_turn_items(turn_id, previous_len);
             changes
         } else {
             self.current_turn_history.handle_event_with_changes(event)

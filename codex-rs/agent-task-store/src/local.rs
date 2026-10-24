@@ -8,8 +8,6 @@ mod source_inspection;
 
 use chrono::Utc;
 use codex_state::StateRuntime;
-use futures::StreamExt;
-use futures::TryStreamExt;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use sha2::Digest;
@@ -21,6 +19,7 @@ use sqlx::sqlite::SqliteConnectOptions;
 use sqlx::sqlite::SqliteJournalMode;
 use sqlx::sqlite::SqliteSynchronous;
 use std::collections::BTreeSet;
+use std::collections::HashMap;
 use std::collections::HashSet;
 use std::future::Future;
 use std::io::Write;
@@ -54,7 +53,6 @@ use crate::Attempt;
 use crate::AttemptAmendment;
 use crate::AttemptId;
 use crate::AttemptState;
-use crate::CONCURRENT_DRIFT_REASON;
 use crate::CriterionStatus;
 use crate::DependencyBlocker;
 use crate::DependencyState;
@@ -95,7 +93,6 @@ use crate::scope::repository_identity_async;
 use crate::scope::scopes_overlap_observed;
 
 const COORDINATION_DIR: &str = "agent-task-coordination";
-const COLD_REVIEW_REASON_PREFIX: &str = "cold review required: ";
 const DATABASE_BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 const EXTERNAL_WAKE_RECHECK_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
 const DATABASE_FILENAME: &str = "agent_tasks.sqlite";
@@ -630,24 +627,11 @@ impl LocalAgentTaskStore {
         };
         let mut transaction = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         ensure_task_workspace_tx(&mut transaction, &repository).await?;
-        let allowed_pending_gate = assignment.relation.as_ref().and_then(|relation| {
-            let gate = match (assignment.role, relation.kind) {
-                (AgentRole::Reviewer, RelationKind::Review) => GateKind::Review,
-                (AgentRole::Verifier, RelationKind::Verification) => GateKind::Verification,
-                _ => return None,
-            };
-            relation
-                .target_assignment_ids
-                .first()
-                .copied()
-                .map(|target| (target, gate))
-        });
         let dependency_admissions = validate_dependencies_tx(
             &mut transaction,
             assignment.assignment_id,
             Some(&assignment.repository_id),
             &assignment.dependencies,
-            allowed_pending_gate,
         )
         .await?;
         validate_architecture_contract_reference_tx(
@@ -2173,6 +2157,26 @@ LIMIT 1
         if gate.status.is_sealed() {
             record_gate_verdict_tx(&mut transaction, attempt.attempt_id, &gate).await?;
         }
+        if attempt.state == AttemptState::Completed
+            && (matches!(
+                (kind, status),
+                (GateKind::Review, GateStatus::Failed)
+                    | (GateKind::Verification, GateStatus::Failed | GateStatus::ChangesRequested)
+            ) || kind == GateKind::Review
+                && status == GateStatus::ChangesRequested
+                && attempt.ordinal > 0)
+        {
+            transition_attempt_to_needs_main_tx(&mut transaction, &attempt).await?;
+            append_observation_tx(
+                &mut transaction,
+                &assignment,
+                attempt.attempt_id,
+                ObservationKind::NeedsMain,
+                format!("{kind} gate requires main intervention: {}", gate.reason),
+                None,
+            )
+            .await?;
+        }
         finish_successful_task_if_unblocked_tx(&mut transaction, assignment_id).await?;
         append_observation_tx(
             &mut transaction,
@@ -2403,11 +2407,13 @@ LIMIT 1
         }
 
         let snapshot_before = sqlx::query(
-            "SELECT event_id FROM wake_events
+            "SELECT wake_event_id AS event_id FROM observations
              WHERE root_session_id = ?
+               AND wake_sequence >= (SELECT retained_from_sequence FROM wake_streams WHERE root_session_id = ?)
              ORDER BY wake_sequence DESC
              LIMIT 1 OFFSET ?",
         )
+        .bind(&root_session_id)
         .bind(&root_session_id)
         .bind(MAX_WAKE_EVENTS_PER_READ as i64)
         .fetch_optional(&mut *transaction)
@@ -2967,155 +2973,53 @@ LIMIT 1
         let mismatch = sqlx::query_scalar::<_, i64>(
             r#"
             WITH expected_streams AS (
-                SELECT
-                    observations.root_session_id,
+                SELECT observations.root_session_id,
                     MAX(observations.wake_sequence) + 1 AS next_sequence,
                     MAX(MAX(observations.wake_sequence) - ? + 1, 1) AS retained_from_sequence,
-                    (
-                        SELECT latest.wake_event_id
-                        FROM observations AS latest
-                        WHERE latest.root_session_id = observations.root_session_id
-                        ORDER BY latest.wake_sequence DESC
-                        LIMIT 1
-                    ) AS latest_event_id
-                FROM observations
-                GROUP BY observations.root_session_id
-            ), expected_events AS (
-                SELECT
-                    observations.root_session_id,
-                    observations.wake_sequence,
-                    observations.wake_event_id,
-                    observations.assignment_id,
-                    observations.attempt_id
-                FROM observations
-                JOIN expected_streams
-                    ON expected_streams.root_session_id = observations.root_session_id
-                WHERE observations.wake_sequence >= expected_streams.retained_from_sequence
+                    (SELECT latest.wake_event_id FROM observations AS latest
+                     WHERE latest.root_session_id = observations.root_session_id
+                     ORDER BY latest.wake_sequence DESC LIMIT 1) AS latest_event_id
+                FROM observations GROUP BY observations.root_session_id
             )
             SELECT EXISTS (
-                SELECT 1
-                FROM expected_streams
+                SELECT 1 FROM expected_streams
                 LEFT JOIN wake_streams USING (root_session_id)
                 WHERE wake_streams.root_session_id IS NULL
                     OR wake_streams.next_sequence != expected_streams.next_sequence
                     OR wake_streams.retained_from_sequence != expected_streams.retained_from_sequence
-                    OR wake_streams.latest_event_id != expected_streams.latest_event_id
+                    OR wake_streams.latest_event_id IS NOT expected_streams.latest_event_id
                 UNION ALL
-                SELECT 1
-                FROM wake_streams
+                SELECT 1 FROM wake_streams
                 LEFT JOIN expected_streams USING (root_session_id)
                 WHERE expected_streams.root_session_id IS NULL
-                UNION ALL
-                SELECT 1
-                FROM expected_events
-                LEFT JOIN wake_events
-                    ON wake_events.root_session_id = expected_events.root_session_id
-                    AND wake_events.wake_sequence = expected_events.wake_sequence
-                WHERE wake_events.root_session_id IS NULL
-                    OR wake_events.event_id != expected_events.wake_event_id
-                    OR wake_events.assignment_id != expected_events.assignment_id
-                    OR wake_events.attempt_id != expected_events.attempt_id
-                UNION ALL
-                SELECT 1
-                FROM wake_events
-                LEFT JOIN expected_events
-                    ON expected_events.root_session_id = wake_events.root_session_id
-                    AND expected_events.wake_sequence = wake_events.wake_sequence
-                WHERE expected_events.root_session_id IS NULL
             )
             "#,
         )
         .bind(MAX_WAKE_EVENTS_PER_ROOT as i64)
         .fetch_one(&self.pool)
         .await?;
-        if mismatch != 0 {
-            return Ok(false);
-        }
-        let mut rows = sqlx::query("SELECT o.body_json, o.assignment_id, o.attempt_id, o.wake_event_id, w.body_json AS cached_body FROM observations o JOIN wake_events w ON w.root_session_id = o.root_session_id AND w.wake_sequence = o.wake_sequence")
-            .fetch(&self.pool);
-        while let Some(row) = rows.try_next().await? {
-            // Undecodable authority cannot validate its cache. Its root's reads
-            // decode the same row and fail closed; other roots stay available.
-            let expected = match wake_event_from_observation_row(&row) {
-                Ok(expected) => expected,
-                Err(error) => {
-                    let wake_event_id: String = row.get("wake_event_id");
-                    tracing::warn!(
-                        %wake_event_id,
-                        %error,
-                        "undecodable authoritative wake observation retained; its root's wake reads fail closed"
-                    );
-                    continue;
-                }
-            };
-            let cached = decode::<WakeEvent>(&row.get::<String, _>("cached_body"));
-            if cached.as_ref().ok() != Some(&expected) {
-                return Ok(false);
-            }
-        }
-        // Release the stream's connection before the caller can rebuild the cache.
-        drop(rows);
-        Ok(true)
+        // Payload integrity is checked against observations by each root's
+        // bounded read; there is no second payload cache to authenticate.
+        Ok(mismatch == 0)
     }
 
     async fn rebuild_wake_streams(&self) -> StoreResult<()> {
-        let mut transaction = self.pool.begin().await?;
-        sqlx::query("DELETE FROM wake_events")
-            .execute(&mut *transaction)
-            .await?;
+        let mut transaction = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         sqlx::query("DELETE FROM wake_streams")
             .execute(&mut *transaction)
             .await?;
-        let roots = sqlx::query_scalar::<_, String>(
-            "SELECT DISTINCT root_session_id FROM observations ORDER BY root_session_id",
+        sqlx::query(
+            "INSERT INTO wake_streams (root_session_id, next_sequence, retained_from_sequence, latest_event_id)
+             SELECT observations.root_session_id, MAX(wake_sequence) + 1,
+                 MAX(MAX(wake_sequence) - ? + 1, 1),
+                 (SELECT latest.wake_event_id FROM observations AS latest
+                  WHERE latest.root_session_id = observations.root_session_id
+                  ORDER BY latest.wake_sequence DESC LIMIT 1)
+             FROM observations GROUP BY observations.root_session_id",
         )
-        .fetch_all(&mut *transaction)
+        .bind(MAX_WAKE_EVENTS_PER_ROOT as i64)
+        .execute(&mut *transaction)
         .await?;
-        for root in roots {
-            let mut rows = sqlx::query("SELECT wake_sequence, body_json, assignment_id, attempt_id, wake_event_id FROM observations WHERE root_session_id = ? ORDER BY wake_sequence DESC LIMIT ?")
-                .bind(&root)
-                .bind(MAX_WAKE_EVENTS_PER_ROOT as i64)
-                .fetch_all(&mut *transaction)
-                .await?;
-            rows.reverse();
-            let mut retained_from = 1;
-            let mut next_sequence = 1;
-            let mut latest_event_id = None;
-            for row in rows {
-                let wake_sequence = row.get::<i64, _>("wake_sequence");
-                if latest_event_id.is_none() {
-                    retained_from = wake_sequence;
-                }
-                latest_event_id = Some(row.get::<String, _>("wake_event_id"));
-                next_sequence = wake_sequence + 1;
-                let event = match wake_event_from_observation_row(&row) {
-                    Ok(event) => event,
-                    Err(error) => {
-                        tracing::warn!(root_session_id = %root, %error,
-                            "retaining corrupt wake authority while rebuilding healthy roots");
-                        continue;
-                    }
-                };
-                sqlx::query("INSERT INTO wake_events (root_session_id, wake_sequence, event_id, assignment_id, attempt_id, reason, body_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)")
-                    .bind(&root)
-                    .bind(wake_sequence)
-                    .bind(event.event_id.to_string())
-                    .bind(event.assignment_id.to_string())
-                    .bind(event.attempt_id.to_string())
-                    .bind(encode(&event.reason)?)
-                    .bind(encode(&event)?)
-                    .bind(encode(&event.created_at)?)
-                    .execute(&mut *transaction)
-                    .await?;
-            }
-            sqlx::query("INSERT INTO wake_streams (root_session_id, next_sequence, retained_from_sequence, latest_event_id) VALUES (?, ?, ?, ?)")
-                .bind(root)
-                .bind(next_sequence)
-                .bind(retained_from)
-                .bind(latest_event_id)
-                .execute(&mut *transaction)
-                .await?;
-        }
         transaction.commit().await?;
         Ok(())
     }
@@ -3175,7 +3079,6 @@ impl LocalAgentTaskStore {
                 assignment.assignment_id,
                 Some(&assignment.repository_id),
                 &assignment.dependencies,
-                None,
             )
             .await?;
             let result =
@@ -4075,10 +3978,6 @@ struct StoredNativeCommandResult {
     _duration_ms: u64,
 }
 
-fn validation_call_has_successful_result(call: &ValidationCall) -> bool {
-    verified_evidence_kind(call).is_some()
-}
-
 pub(crate) fn verified_evidence_kind(
     call: &ValidationCall,
 ) -> Option<crate::CriterionEvidenceKind> {
@@ -4649,6 +4548,7 @@ async fn dependency_reaches_tx(
     transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     start: AssignmentId,
     target: AssignmentId,
+    cached_dependencies: &mut HashMap<AssignmentId, Vec<AssignmentId>>,
 ) -> StoreResult<bool> {
     let mut pending = vec![start];
     let mut seen = HashSet::new();
@@ -4656,20 +4556,24 @@ async fn dependency_reaches_tx(
         if !seen.insert(next) {
             continue;
         }
-        let json = sqlx::query_scalar::<_, String>(
-            "SELECT body_json FROM assignments WHERE assignment_id = ?",
-        )
-        .bind(next.to_string())
-        .fetch_optional(&mut **transaction)
-        .await?;
-        let Some(json) = json else {
-            continue;
-        };
-        let assignment: Assignment = decode(&json)?;
-        if assignment.dependencies.contains(&target) {
+        if !cached_dependencies.contains_key(&next) {
+            let json = sqlx::query_scalar::<_, String>(
+                "SELECT body_json FROM assignments WHERE assignment_id = ?",
+            )
+            .bind(next.to_string())
+            .fetch_optional(&mut **transaction)
+            .await?;
+            let dependencies = match json {
+                Some(json) => decode::<Assignment>(&json)?.dependencies,
+                None => Vec::new(),
+            };
+            cached_dependencies.insert(next, dependencies);
+        }
+        let dependencies = cached_dependencies.get(&next).expect("visited dependency cached");
+        if dependencies.contains(&target) {
             return Ok(true);
         }
-        pending.extend(assignment.dependencies);
+        pending.extend(dependencies.iter().copied());
     }
     Ok(false)
 }
@@ -4680,10 +4584,13 @@ async fn validate_dependencies_tx(
     candidate_id: AssignmentId,
     repository_id: Option<&str>,
     dependencies: &[AssignmentId],
-    allowed_pending_gate: Option<(AssignmentId, GateKind)>,
 ) -> StoreResult<Vec<crate::DependencyAdmission>> {
     let mut blockers = Vec::new();
     let mut admitted = Vec::new();
+    // One transaction-local adjacency observation for overlapping DAG roots.
+    // JSON authority is decoded on first visit; no cross-transaction cache can
+    // hide amendments, missing rows or corrupt dependency bodies.
+    let mut cached_dependencies = HashMap::new();
     for dependency in dependencies {
         if *dependency == candidate_id {
             blockers.push(DependencyBlocker {
@@ -4709,6 +4616,7 @@ async fn validate_dependencies_tx(
             continue;
         }
         let dependency_assignment = load_assignment_tx(transaction, *dependency).await?;
+        cached_dependencies.insert(*dependency, dependency_assignment.dependencies.clone());
         if let Some(repository_id) = repository_id {
             let bound_repository_id = sqlx::query_scalar::<_, String>(
                 "SELECT repository_id FROM assignment_repositories WHERE assignment_id = ?",
@@ -4728,7 +4636,7 @@ async fn validate_dependencies_tx(
                 continue;
             }
         }
-        if dependency_reaches_tx(transaction, *dependency, candidate_id).await? {
+        if dependency_reaches_tx(transaction, *dependency, candidate_id, &mut cached_dependencies).await? {
             blockers.push(DependencyBlocker {
                 assignment_id: *dependency,
                 state: DependencyState::Cyclic,
@@ -4798,7 +4706,7 @@ async fn validate_dependencies_tx(
         admitted.push(crate::DependencyAdmission {
             assignment_id: *dependency,
             attempt_id: receipt.attempt_id,
-            receipt_sha256: hex::encode(Sha256::digest(receipt_json.as_bytes())),
+            receipt_sha256: hash_bytes(receipt_json.as_bytes()),
             gates: accepted_gates,
         });
         if !blocking_gates.is_empty() {
@@ -5467,8 +5375,8 @@ async fn hydrate_task_capsule(
     assignment: &mut Assignment,
 ) -> StoreResult<()> {
     let capsule_path = task_capsule_path(coordination_root, assignment.assignment_id);
-    let canonical_payload = match tokio::fs::read_to_string(&capsule_path).await {
-        Ok(payload) => payload,
+    let (canonical_payload, restore_missing) = match tokio::fs::read_to_string(&capsule_path).await {
+        Ok(payload) => (payload, false),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             // The committed assignment copy is the attachment authority. A stage
             // without it is an uncommitted publication: attach stages, publishes
@@ -5477,15 +5385,7 @@ async fn hydrate_task_capsule(
             // the published file. Startup reconciliation settles crash leftovers,
             // and attach still refuses to publish over an unresolved stage.
             let Some(payload) = assignment.task_capsule.as_ref() else { return Ok(()); };
-            let capsule: TaskCapsuleV1 = decode(payload)?;
-            let mut transaction = pool.begin().await?;
-            validate_capsule_contract_tx(&mut transaction, assignment, &capsule).await?;
-            transaction.commit().await?;
-            if !is_canonical_persisted_task_capsule(&capsule, payload)? {
-                return Err(StoreError::CorruptData("noncanonical authoritative capsule".into()));
-            }
-            restore_missing_capsule(capsule_path.clone(), payload.clone()).await?;
-            payload.clone()
+            (payload.clone(), true)
         }
         Err(error) => return Err(error.into()),
     };
@@ -5507,7 +5407,11 @@ async fn hydrate_task_capsule(
     }
     if !is_canonical_persisted_task_capsule(&capsule, &canonical_payload)? {
         return Err(StoreError::CorruptData(
-            "persisted TaskCapsuleV1 payload is not canonical".to_string(),
+            if restore_missing {
+                "noncanonical authoritative capsule"
+            } else {
+                "persisted TaskCapsuleV1 payload is not canonical"
+            }.to_string(),
         ));
     }
     if assignment
@@ -5518,6 +5422,11 @@ async fn hydrate_task_capsule(
         return Err(StoreError::CorruptData(
             "task capsule does not match its authoritative assignment copy".to_string(),
         ));
+    }
+    if restore_missing {
+        // Repair only after the common authority, identity and canonical-byte
+        // checks. The immutable payload needs no second decode or SQL read.
+        restore_missing_capsule(capsule_path, canonical_payload).await?;
     }
     // Publication precedes commit. A sidecar without the authoritative copy
     // cannot turn this database snapshot into an attachment receipt. Startup
@@ -5630,14 +5539,6 @@ async fn append_observation_with_stop_cause_tx(
         call_id,
         created_at: Utc::now(),
     };
-    let wake_event = WakeEvent {
-        event_id: observation.wake_event_id,
-        assignment_id: observation.assignment_id,
-        attempt_id,
-        reason: kind,
-        summary: observation.summary.clone(),
-        created_at: observation.created_at,
-    };
     sqlx::query("INSERT OR IGNORE INTO wake_streams (root_session_id, next_sequence, retained_from_sequence) VALUES (?, 1, 1)")
         .bind(&assignment.root_session_id)
         .execute(&mut **transaction)
@@ -5666,22 +5567,6 @@ async fn append_observation_with_stop_cause_tx(
         .bind(encode(&kind)?)
         .bind(encode(&observation)?)
         .bind(encode(&observation.created_at)?)
-        .execute(&mut **transaction)
-        .await?;
-    sqlx::query("INSERT INTO wake_events (root_session_id, wake_sequence, event_id, assignment_id, attempt_id, reason, body_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)")
-        .bind(&assignment.root_session_id)
-        .bind(wake_sequence)
-        .bind(wake_event.event_id.to_string())
-        .bind(wake_event.assignment_id.to_string())
-        .bind(wake_event.attempt_id.to_string())
-        .bind(encode(&kind)?)
-        .bind(encode(&wake_event)?)
-        .bind(encode(&wake_event.created_at)?)
-        .execute(&mut **transaction)
-        .await?;
-    sqlx::query("DELETE FROM wake_events WHERE root_session_id = ? AND wake_sequence < ?")
-        .bind(&assignment.root_session_id)
-        .bind(retained_from)
         .execute(&mut **transaction)
         .await?;
     Ok(observation)

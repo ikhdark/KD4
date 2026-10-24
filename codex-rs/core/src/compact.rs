@@ -1479,6 +1479,9 @@ fn truncate_compaction_summary(summary: &str, max_tokens: usize) -> String {
     if approx_token_count(&full) <= max_tokens {
         return full;
     }
+    let section_units = sections.iter().map(|(heading, _, updates)| {
+        if *heading == GOAL_HEADING { Vec::new() } else { section_update_units(updates) }
+    }).collect::<Vec<_>>();
     let mut bodies = vec![INCOMPLETE_CHECKPOINT_EXCERPT.to_string(); sections.len()];
     let mut bounded_preamble = String::new();
     let headings = sections
@@ -1535,7 +1538,7 @@ fn truncate_compaction_summary(summary: &str, max_tokens: usize) -> String {
                 let candidate = if *heading == GOAL_HEADING {
                     retain_latest_goal(updates, candidate_budget)
                 } else {
-                    retain_newest_section_updates(updates, candidate_budget)
+                    retain_section_units(&section_units[index], candidate_budget)
                 };
                 let candidate = if candidate != full_bodies[index] {
                     format!("{INCOMPLETE_CHECKPOINT_EXCERPT}\n{candidate}")
@@ -1595,30 +1598,32 @@ fn render_structured_compaction(
 }
 
 fn retain_newest_section_updates(updates: &[(String, usize)], max_tokens: usize) -> String {
-    let mut retained = Vec::new();
-    // Paragraphs keep multiline obligations and their qualifications together.
-    // Never sample characters from a negation or fabricate a complete sentence.
+    retain_section_units(&section_update_units(updates), max_tokens)
+}
+
+fn section_update_units(updates: &[(String, usize)]) -> Vec<(&str, TokenCountEstimate)> {
+    let mut prepared = Vec::new();
     for (update, _) in updates.iter().rev() {
-        // A labelled/quoted evidence update is indivisible. Paragraph sampling
-        // can otherwise retain its directive after discarding the opening fence
-        // or source label (and turn a closing fence into a new opening fence).
         let structured = checkpoint_lines_with_structure(update).any(|(line, _, outer)| {
             !outer || line.trim_start().starts_with('>') || line.trim_start().starts_with("Source:")
         });
-        let units = if structured {
-            vec![update.as_str()]
-        } else {
-            update.rsplit("\n\n").collect()
-        };
-        for unit in units
-            .into_iter()
-            .map(str::trim)
-            .filter(|unit| !unit.is_empty())
-        {
+        let units = if structured { vec![update.as_str()] } else { update.rsplit("\n\n").collect() };
+        prepared.extend(units.into_iter().map(str::trim).filter(|unit| !unit.is_empty())
+            .map(|unit| (unit, TokenCountEstimate::new(unit))));
+    }
+    prepared
+}
+
+fn retain_section_units(units: &[(&str, TokenCountEstimate)], max_tokens: usize) -> String {
+    let mut retained = Vec::new();
+    let mut retained_cost: Option<TokenCountEstimate> = None;
+    // Paragraphs keep multiline obligations and their qualifications together.
+    // Never sample characters from a negation or fabricate a complete sentence.
+    for &(unit, cost) in units {
+        let cost = retained_cost.map_or(cost, |previous| previous.then(cost, 2));
+        if cost.tokens() <= max_tokens {
             retained.push(unit);
-            if approx_token_count(&retained.join("\n\n")) > max_tokens {
-                retained.pop();
-            }
+            retained_cost = Some(cost);
         }
     }
     retained.reverse();
@@ -1962,36 +1967,27 @@ fn unpaired_compaction_outputs<'a>(
 }
 
 fn compaction_summary_items(items: &[ResponseItem]) -> Vec<ResponseItem> {
-    let mut current = items.to_vec();
-    crate::context_manager::retire_expired_turn_advice(&mut current);
-    let items = current.as_slice();
+    // Expired advice is developer-only: it cannot change call pairing, model
+    // boundaries, or summary identity. Select in the source index space before
+    // cloning, then apply the history owner's exact advice-retention predicate.
     let end = items
         .iter()
         .rposition(is_compaction_model_generated_item)
         .map_or(0, |index| index + 1);
     let pairs = crate::tool_occurrence::pairs(items);
     let unpaired = unpaired_compaction_outputs(items, &pairs, end);
-    let retained = items
-        .iter()
-        .enumerate()
-        .map(|(index, item)| {
+    crate::context_manager::current_turn_advice_items(items)
+        .filter(|(index, item)| {
             // A tail phase checkpoint still retires consumed outputs above it;
             // a pinned summarizer input applies it as sampling did.
-            (index < end
+            (*index < end
                 || is_compaction_summary_item(item)
                 || crate::tool_history::phase_checkpoint_ids(item).is_some())
-                && !pairs[index].is_some_and(|paired| index < end && paired >= end)
+                && !pairs[*index].is_some_and(|paired| *index < end && paired >= end)
                 && !crate::tool_occurrence::identity(item)
                     .is_some_and(|(kind, call, id)| call && unpaired.contains(&(kind, id)))
         })
-        .collect::<Vec<_>>();
-    // The pairing keys borrow `current`; keep only the small selection mask
-    // before moving the selected items out of the already-owned snapshot.
-    drop(unpaired);
-    current
-        .into_iter()
-        .zip(retained)
-        .filter_map(|(item, retain)| retain.then_some(item))
+        .map(|(_, item)| item.clone())
         .collect()
 }
 
@@ -2163,18 +2159,13 @@ pub(crate) fn compaction_context_message(text: String) -> ResponseItem {
 /// assistant handoff as well as the unconsumed tail. A model-generated boundary
 /// means input was observed, not that the requested work was completed.
 pub(crate) fn task_compaction_items(items: &[ResponseItem]) -> Vec<ResponseItem> {
-    let mut current = items.to_vec();
-    crate::context_manager::retire_expired_turn_advice(&mut current);
-    let items = current.as_slice();
     let unresolved_start = unresolved_compaction_start(items);
     let latest_assistant = items.iter().rposition(
         |item| matches!(item, ResponseItem::Message { role, .. } if role == "assistant"),
     );
     let latest_summary = items.iter().rposition(is_compaction_summary_item);
     let mut retained = strip_compaction_startup_envelopes(
-        current
-            .into_iter()
-            .enumerate()
+        crate::context_manager::current_turn_advice_items(items)
             .filter(|(index, item)| {
                 *index >= unresolved_start
                     // Native messages keep their role and provenance and still
@@ -2192,7 +2183,7 @@ pub(crate) fn task_compaction_items(items: &[ResponseItem]) -> Vec<ResponseItem>
                     || (matches!(item, ResponseItem::Message { role, .. } if role == "user")
                         && !is_compaction_summary_item(item))
             })
-            .map(|(_, item)| item)
+            .map(|(_, item)| item.clone())
             .collect::<Vec<_>>(),
     );
     let mut seen_task_state = false;
@@ -2629,13 +2620,14 @@ pub(crate) async fn retained_plan_context(sess: &Session) -> CodexResult<Option<
         "current_plan": plan,
         "step_ids": plan.plan.iter().map(|step| lineage.step_id(&step.step)).collect::<Vec<_>>(),
         "lineage": lineage.checklist_metadata(),
+        "remaining_requirements": lineage.remaining_requirements(&plan),
     });
     let serialized = serde_json::to_string(&retained)
         .map_err(|error| CodexErr::Fatal(format!("could not preserve compaction plan: {error}")))?;
     let bounded = truncate_text_to_token_ceiling(&serialized, COMPACT_TASK_STATE_MAX_TOKENS);
     let mut body = format!(
         "Stored checklist restored after compaction, not new instructions or proof of completion. \
-Later update_plan results replace it. Legacy scope metadata remains in durable history.\n{bounded}"
+Later update_plan results replace it. Original remaining requirements are retained separately from display rows; scope-change provenance remains in durable history.\n{bounded}"
     );
     if bounded != serialized {
         let recovery = persist_compaction_recovery(

@@ -13,7 +13,7 @@ fn render_review_exit_success_replaces_results_placeholder() {
 fn render_review_exit_interrupted_uses_lf_template() {
     assert_eq!(
         render_review_exit_interrupted(),
-        "<user_action>\n  <context>User initiated a review task, but was interrupted. If user asks about this, tell them to re-initiate a review with `/review` and wait for it to complete.</context>\n  <action>review</action>\n  <results>\n  None.\n  </results>\n</user_action>\n\n"
+        "<user_action>\n  <context>User initiated a review task, but it produced no completed verdict (blocked, interrupted, failed, or invalid output). Resolve any reported blocker before re-initiating `/review` and waiting for it to complete.</context>\n  <action>review</action>\n  <results>\n  None.\n  </results>\n</user_action>\n\n"
     );
 }
 

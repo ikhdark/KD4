@@ -838,11 +838,11 @@ async fn review_input_isolated_from_parent_history() {
     let instructions = body["instructions"].as_str().expect("instructions string");
     assert_eq!(instructions, REVIEW_PROMPT);
 
-    // Also verify that a user interruption note was recorded in the rollout.
+    // A missing result must retain a non-verdict notice, not imply a clean review.
     codex.flush_rollout().await.expect("flush review rollout");
     let path = codex.rollout_path().expect("rollout path");
     let text = std::fs::read_to_string(&path).expect("read rollout file");
-    let mut saw_interruption_message = false;
+    let mut saw_incomplete_review_message = false;
     for line in text.lines() {
         if line.trim().is_empty() {
             continue;
@@ -854,20 +854,21 @@ async fn review_input_isolated_from_parent_history() {
         {
             for c in content {
                 if let ContentItem::InputText { text } = c
-                    && text.contains("User initiated a review task, but was interrupted.")
+                    && text.contains("produced no completed verdict")
+                    && text.contains("Resolve any reported blocker before re-initiating `/review`")
                 {
-                    saw_interruption_message = true;
+                    saw_incomplete_review_message = true;
                     break;
                 }
             }
         }
-        if saw_interruption_message {
+        if saw_incomplete_review_message {
             break;
         }
     }
     assert!(
-        saw_interruption_message,
-        "expected user interruption message in rollout"
+        saw_incomplete_review_message,
+        "expected incomplete-review and blocker-resolution guidance in rollout"
     );
 
     let _codex_home_guard = codex_home;

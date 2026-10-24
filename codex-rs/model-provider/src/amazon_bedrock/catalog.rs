@@ -5,6 +5,8 @@ use codex_model_provider_info::AMAZON_BEDROCK_GPT_5_6_TERRA_MODEL_ID;
 use codex_model_provider_info::AMAZON_BEDROCK_GPT_6_ASTRA_MODEL_ID;
 use codex_model_provider_info::AMAZON_BEDROCK_GPT_6_LUNA_MODEL_ID;
 use codex_model_provider_info::AMAZON_BEDROCK_GPT_6_SOL_MODEL_ID;
+use codex_models_manager::bundled_models;
+#[cfg(test)]
 use codex_models_manager::bundled_models_response;
 use codex_protocol::openai_models::ModelInfo;
 use codex_protocol::openai_models::ModelVisibility;
@@ -19,8 +21,8 @@ const GPT_5_5_OPENAI_MODEL_ID: &str = "gpt-5.5";
     reason = "The embedded model catalog is validated by catalog tests and cannot change at runtime"
 )]
 pub(crate) fn static_model_catalog() -> ModelsResponse {
-    let bundled = bundled_models_response().expect("bundled models.json should parse");
-    with_default_only_service_tier(ModelsResponse {
+    let bundled = bundled_models().expect("bundled models.json should parse");
+    let mut catalog = ModelsResponse {
         models: vec![
             bedrock_model(
                 bundled_openai_model(&bundled, "gpt-6-astra"),
@@ -65,18 +67,27 @@ pub(crate) fn static_model_catalog() -> ModelsResponse {
                 /*priority*/ 6,
             ),
         ],
-    })
+    };
+    for model in &mut catalog.models {
+        // Constructors already normalized these selected owned models.
+        clear_service_tiers(model);
+    }
+    catalog
 }
 
 pub(crate) fn with_default_only_service_tier(mut catalog: ModelsResponse) -> ModelsResponse {
     for model in &mut catalog.models {
         normalize_bedrock_model(model);
-        // Amazon Bedrock currently only supports the implicit "default" tier for GPT models.
-        model.additional_speed_tiers.clear();
-        model.service_tiers.clear();
-        model.default_service_tier = None;
+        clear_service_tiers(model);
     }
     catalog
+}
+
+fn clear_service_tiers(model: &mut ModelInfo) {
+    // Amazon Bedrock currently only supports the implicit "default" tier for GPT models.
+    model.additional_speed_tiers.clear();
+    model.service_tiers.clear();
+    model.default_service_tier = None;
 }
 
 fn bedrock_model(

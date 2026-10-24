@@ -1299,6 +1299,7 @@ pub(crate) struct RegisteredTool {
     external_mutation_intent: crate::agent::task_capabilities::ExternalMutationIntent,
     spec: ToolSpec,
     canonical_spec_sha256: OnceLock<String>,
+    search_info: OnceLock<Option<codex_tools::ToolSearchInfo>>,
     code_mode_argument_preflight: Arc<CodeModeArgumentPreflight>,
 }
 
@@ -1335,6 +1336,7 @@ impl RegisteredTool {
                 crate::agent::task_capabilities::ExternalMutationIntent::MayMutate,
             spec,
             canonical_spec_sha256: OnceLock::new(),
+            search_info: OnceLock::new(),
             code_mode_argument_preflight: Arc::new(CodeModeArgumentPreflight::default()),
         }
     }
@@ -1384,6 +1386,7 @@ impl RegisteredTool {
 
     pub(crate) fn spec_mut(&mut self) -> &mut ToolSpec {
         self.canonical_spec_sha256.take();
+        self.search_info.take();
         self.code_mode_argument_preflight = Arc::new(CodeModeArgumentPreflight::default());
         &mut self.spec
     }
@@ -1398,7 +1401,13 @@ impl RegisteredTool {
     }
 
     pub(crate) fn search_info(&self) -> Option<codex_tools::ToolSearchInfo> {
-        self.runtime.search_info_for_registered_spec(&self.spec)
+        self.search_info_ref().cloned()
+    }
+
+    pub(crate) fn search_info_ref(&self) -> Option<&codex_tools::ToolSearchInfo> {
+        self.search_info
+            .get_or_init(|| self.runtime.search_info_for_registered_spec(&self.spec))
+            .as_ref()
     }
 
     pub(crate) fn set_exposure(&mut self, exposure: ToolExposure) {
@@ -2485,7 +2494,6 @@ async fn handle_any_tool(
 
 struct ModelProjectionInput {
     fragments: Vec<ToolOutputProjectionFragment>,
-    spillable_text: String,
     outcome: ToolOutputOutcome,
     essential_inline: Value,
     origin_call_id: String,
@@ -2493,6 +2501,8 @@ struct ModelProjectionInput {
     applied_token_limit: usize,
     projected_text: String,
     preserved_content: Vec<Value>,
+    non_text_tokens: usize,
+    non_text_bytes: usize,
     codex_home: std::path::PathBuf,
     thread_id: String,
     tool_name: String,
@@ -2777,10 +2787,10 @@ async fn prepare_model_projection(
         limits.applied_limit,
         limits.hard_limit,
     );
-    let (projected_text, selection_facts) =
+    let (typed_projected_text, selection_facts) =
         if materialization == ProjectionMaterialization::InlineCarrier {
             (
-                spillable_text.clone(),
+                None,
                 ProjectionSelectionFacts {
                     mode: "inline_continuation_carrier",
                     available_fragments: metadata.fragments.len(),
@@ -2797,7 +2807,7 @@ async fn prepare_model_projection(
             )
         } else if metadata.fragments.is_empty() {
             (
-                spillable_text.clone(),
+                None,
                 ProjectionSelectionFacts {
                     mode: "generic_fallback",
                     available_fragments: 0,
@@ -2810,7 +2820,8 @@ async fn prepare_model_projection(
             )
         } else {
             // Select from original fragments only after the rendered header is sized.
-            select_typed_projection_fragments(&metadata.fragments, usize::MAX)
+            let (text, facts) = select_typed_projection_fragments(&metadata.fragments, usize::MAX);
+            (Some(text), facts)
         };
 
     let mut canonical = result
@@ -2887,13 +2898,14 @@ async fn prepare_model_projection(
     );
     Some(ModelProjectionInput {
         fragments: metadata.fragments,
-        spillable_text,
         outcome: metadata.outcome,
         essential_inline: metadata.essential_inline,
         origin_call_id: result.call_id.clone(),
         selection_facts,
         applied_token_limit,
-        projected_text,
+        projected_text: typed_projected_text.unwrap_or(spillable_text),
+        non_text_tokens,
+        non_text_bytes: non_text_projection_byte_cost(&preserved_content),
         preserved_content,
         codex_home: invocation.step_context.turn.config.codex_home.to_path_buf(),
         thread_id: invocation.session.thread_id.to_string(),
@@ -3275,7 +3287,7 @@ fn select_typed_projection_fragments(
     let mut seen = HashSet::new();
     let unique = fragments
         .iter()
-        .filter(|fragment| seen.insert((*fragment).clone()))
+        .filter(|fragment| seen.insert(*fragment))
         .collect::<Vec<_>>();
     let exact_duplicates_removed = fragments.len().saturating_sub(unique.len());
     let active_kinds = PROJECTION_FRAGMENT_KIND_ORDER
@@ -3575,7 +3587,6 @@ fn cell_recovery_note(pages: usize, has_continuation: bool) -> String {
 async fn project_model_output(input: ModelProjectionInput) -> Option<ModelToolProjection> {
     let ModelProjectionInput {
         fragments,
-        spillable_text: _spillable_text,
         outcome,
         essential_inline,
         origin_call_id,
@@ -3583,6 +3594,8 @@ async fn project_model_output(input: ModelProjectionInput) -> Option<ModelToolPr
         mut applied_token_limit,
         projected_text,
         mut preserved_content,
+        non_text_tokens,
+        non_text_bytes,
         codex_home,
         thread_id,
         tool_name,
@@ -3668,8 +3681,6 @@ async fn project_model_output(input: ModelProjectionInput) -> Option<ModelToolPr
             None
         }
     };
-    let non_text_tokens = non_text_projection_token_cost(&preserved_content);
-    let non_text_bytes = non_text_projection_byte_cost(&preserved_content);
     let preserve_non_text_content = !preserved_content.is_empty()
         && non_text_tokens <= applied_token_limit.saturating_sub(MIN_PROJECTION_ENVELOPE_TOKENS);
     let retained_non_text_tokens = if preserve_non_text_content {
@@ -4787,8 +4798,8 @@ fn non_text_projection_token_cost(content: &[Value]) -> usize {
     if text_budgeted.is_empty() {
         return 0;
     }
-    serde_json::to_string(&text_budgeted)
-        .map(|serialized| approx_token_count(&serialized))
+    serialized_json_byte_cost(&text_budgeted)
+        .map(|bytes| codex_utils_string::TokenCountEstimate::from_byte_count(bytes).tokens())
         .unwrap_or(usize::MAX)
 }
 
@@ -4796,9 +4807,23 @@ fn non_text_projection_byte_cost(content: &[Value]) -> usize {
     if content.is_empty() {
         return 0;
     }
-    serde_json::to_vec(content)
-        .map(|serialized| serialized.len())
-        .unwrap_or(usize::MAX)
+    serialized_json_byte_cost(content).unwrap_or(usize::MAX)
+}
+
+fn serialized_json_byte_cost(value: &(impl serde::Serialize + ?Sized)) -> Result<usize, serde_json::Error> {
+    struct Counter(usize);
+    impl std::io::Write for Counter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0 = self.0.checked_add(bytes.len())
+                .ok_or_else(|| std::io::Error::other("serialized byte count overflowed"))?;
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+    }
+    let mut counter = Counter(0);
+    serde_json::to_writer(&mut counter, value)?;
+    Ok(counter.0)
 }
 
 fn function_hook_tool_name(invocation: &ToolInvocation) -> HookToolName {

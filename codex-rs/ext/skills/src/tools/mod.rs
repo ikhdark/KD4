@@ -59,9 +59,9 @@ struct SkillToolContext {
 }
 
 impl SkillToolContext {
-    async fn continue_catalog(&self, turn_id: &str, expected_len: usize) -> SkillCatalog {
+    async fn continue_catalog(&self, turn_id: &str, expected_len: usize) -> Arc<SkillCatalog> {
         self.thread_state
-            .continue_orchestrator_catalog(
+            .continue_orchestrator_catalog_shared(
                 &self.providers,
                 SkillListQuery {
                     continuation: None,
@@ -79,11 +79,11 @@ impl SkillToolContext {
             .await
     }
 
-    async fn catalog(&self, turn_id: &str, authority: SkillToolAuthority) -> SkillCatalog {
+    async fn catalog(&self, turn_id: &str, authority: SkillToolAuthority) -> Arc<SkillCatalog> {
         match authority {
             SkillToolAuthority::Orchestrator => {
                 self.thread_state
-                    .orchestrator_catalog_snapshot(
+                    .orchestrator_catalog_snapshot_shared(
                         self.mcp_resources.as_deref(),
                         self.providers.list_orchestrator_for_turn(SkillListQuery {
                             continuation: None,

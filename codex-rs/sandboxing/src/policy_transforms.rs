@@ -410,8 +410,8 @@ pub fn intersect_permission_profiles(
 ) -> AdditionalPermissionProfile {
     let file_system = requested
         .file_system
-        .map(|requested_file_system| {
-            let granted_file_system = granted.file_system.unwrap_or_default();
+        .zip(granted.file_system.filter(|grant| !grant.entries.is_empty()))
+        .map(|(requested_file_system, granted_file_system)| {
             let requested_policy =
                 FileSystemSandboxPolicy::restricted(requested_file_system.entries.clone());
             let requested_read_deny_matcher = ReadDenyMatcher::new(&requested_policy, cwd);

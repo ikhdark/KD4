@@ -1516,8 +1516,11 @@ fn try_send_limited_output_delta(
 ) -> OutputDeltaSendOutcome {
     if let Some(recovery) = &stream.delivery_recovery {
         let admit = matches!(limiter.claim(), OutputDeltaDecision::Emit);
-        recovery.publish(stream, is_stderr, chunk, admit);
-        return OutputDeltaSendOutcome::Continue;
+        return if recovery.publish(stream, is_stderr, chunk, admit) {
+            OutputDeltaSendOutcome::Continue
+        } else {
+            OutputDeltaSendOutcome::Stop
+        };
     }
     let (chunk, outcome) = match limiter.claim() {
         OutputDeltaDecision::Emit => (chunk, OutputDeltaSendOutcome::Continue),

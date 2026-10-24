@@ -408,6 +408,13 @@ struct CodexAppsToolsCacheEntry {
     current_snapshot: ArcSwapOption<CodexAppsToolsSnapshot>,
     next_fetch_generation: AtomicU64,
     last_accepted_generation: Mutex<u64>,
+    persisted: Mutex<PersistedCodexAppsCache>,
+}
+
+#[derive(Default)]
+struct PersistedCodexAppsCache {
+    tools_revision: Option<u64>,
+    server_info: Option<McpServerInfo>,
 }
 
 impl CodexAppsToolsCacheEntry {
@@ -418,6 +425,7 @@ impl CodexAppsToolsCacheEntry {
             current_snapshot: ArcSwapOption::empty(),
             next_fetch_generation: AtomicU64::new(0),
             last_accepted_generation: Mutex::new(0),
+            persisted: Mutex::new(PersistedCodexAppsCache::default()),
         }
     }
 
@@ -526,7 +534,7 @@ fn write_cached_codex_apps_tools(
     let cache_path = cache_context.tools_cache_path();
     let bytes = serde_json::to_vec_pretty(&CodexAppsToolsDiskCache {
         schema_version: CODEX_APPS_TOOLS_CACHE_SCHEMA_VERSION,
-        tools: tools.to_vec(),
+        tools,
     })
     .context("failed to serialize Codex Apps tools cache")?;
     write_codex_apps_cache_file(&cache_path, "tools", bytes)
@@ -549,7 +557,7 @@ fn write_cached_codex_apps_server_info(
     let cache_path = cache_context.server_info_cache_path();
     let bytes = serde_json::to_vec_pretty(&CodexAppsServerInfoDiskCache {
         schema_version: CODEX_APPS_SERVER_INFO_CACHE_SCHEMA_VERSION,
-        server_info: server_info.clone(),
+        server_info,
     })
     .context("failed to serialize Codex Apps server info cache")?;
     write_codex_apps_cache_file(&cache_path, "server info", bytes)
@@ -586,11 +594,25 @@ fn persist_codex_apps_cache(
     tools: &[ToolInfo],
 ) {
     let cache_write_start = Instant::now();
-    let tools_result = write_cached_codex_apps_tools(cache_context, tools);
+    let mut persisted = lock_unpoisoned(&cache_context.entry.persisted);
+    let revision = cache_context.content_revision();
+    let tools_result = if persisted.tools_revision == Some(revision) {
+        Ok(())
+    } else {
+        write_cached_codex_apps_tools(cache_context, tools).inspect(|()| {
+            persisted.tools_revision = Some(revision);
+        })
+    };
     if let Err(err) = &tools_result {
         tracing::warn!("failed to write Codex Apps tools cache: {err:#}");
     }
-    let server_info_result = write_cached_codex_apps_server_info(cache_context, server_info);
+    let server_info_result = if persisted.server_info.as_ref() == Some(server_info) {
+        Ok(())
+    } else {
+        write_cached_codex_apps_server_info(cache_context, server_info).inspect(|()| {
+            persisted.server_info = Some(server_info.clone());
+        })
+    };
     if let Err(err) = &server_info_result {
         tracing::warn!("failed to write Codex Apps server info cache: {err:#}");
     }
@@ -607,15 +629,15 @@ fn persist_codex_apps_cache(
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct CodexAppsToolsDiskCache {
+struct CodexAppsToolsDiskCache<T = Vec<ToolInfo>> {
     schema_version: u8,
-    tools: Vec<ToolInfo>,
+    tools: T,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct CodexAppsServerInfoDiskCache {
+struct CodexAppsServerInfoDiskCache<T = McpServerInfo> {
     schema_version: u8,
-    server_info: McpServerInfo,
+    server_info: T,
 }
 
 const CODEX_APPS_TOOLS_CACHE_DIR: &str = "cache/codex_apps_tools";

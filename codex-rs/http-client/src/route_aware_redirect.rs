@@ -47,15 +47,85 @@ pub(super) fn redirect_url(response: &reqwest::Response) -> Option<reqwest::Url>
     response.url().join(location).ok()
 }
 
+/// One request-local replay snapshot. Non-replayable streaming bodies retain
+/// metadata only, so redirects that drop the body remain possible.
+pub(super) enum PreparedRedirect {
+    Replay(reqwest::Request),
+    Streaming {
+        method: Method,
+        headers: HeaderMap,
+        version: http::Version,
+        timeout: Option<Duration>,
+    },
+}
+
+impl PreparedRedirect {
+    pub(super) fn capture(request: &reqwest::Request) -> Self {
+        match request.try_clone() {
+            Some(replay) => Self::Replay(replay),
+            None => Self::Streaming {
+                method: request.method().clone(),
+                headers: request.headers().clone(),
+                version: request.version(),
+                timeout: request.timeout().copied(),
+            },
+        }
+    }
+
+    pub(super) fn into_request(
+        self,
+        status: StatusCode,
+        next_url: reqwest::Url,
+    ) -> Option<reqwest::Request> {
+        match self {
+            Self::Replay(mut replay) => {
+                let (method, drop_body) = redirected_method(status, replay.method().clone())?;
+                if drop_body {
+                    Some(bodyless_redirect(
+                        method,
+                        std::mem::take(replay.headers_mut()),
+                        replay.version(),
+                        replay.timeout().copied(),
+                        next_url,
+                    ))
+                } else {
+                    *replay.url_mut() = next_url;
+                    Some(replay)
+                }
+            }
+            Self::Streaming {
+                method,
+                headers,
+                version,
+                timeout,
+            } => {
+                redirect_request(status, method, headers, version, timeout, None, next_url)
+            }
+        }
+    }
+}
+
 pub(super) fn redirect_request(
     status: StatusCode,
-    mut method: Method,
-    mut headers: HeaderMap,
+    method: Method,
+    headers: HeaderMap,
     version: http::Version,
     timeout: Option<Duration>,
     replay: Option<reqwest::Request>,
     next_url: reqwest::Url,
 ) -> Option<reqwest::Request> {
+    let (method, drop_body) = redirected_method(status, method)?;
+    if drop_body {
+        Some(bodyless_redirect(method, headers, version, timeout, next_url))
+    } else {
+        replay.map(|mut request| {
+            *request.url_mut() = next_url;
+            request
+        })
+    }
+}
+
+fn redirected_method(status: StatusCode, mut method: Method) -> Option<(Method, bool)> {
     let drop_body = match status {
         StatusCode::MOVED_PERMANENTLY | StatusCode::FOUND if method == Method::POST => {
             method = Method::GET;
@@ -74,26 +144,29 @@ pub(super) fn redirect_request(
         _ => return None,
     };
 
-    if drop_body {
-        for header in [
-            CONTENT_TYPE,
-            CONTENT_LENGTH,
-            CONTENT_ENCODING,
-            TRANSFER_ENCODING,
-        ] {
-            headers.remove(header);
-        }
-        let mut request = reqwest::Request::new(method, next_url);
-        *request.headers_mut() = headers;
-        *request.version_mut() = version;
-        *request.timeout_mut() = timeout;
-        Some(request)
-    } else {
-        replay.map(|mut request| {
-            *request.url_mut() = next_url;
-            request
-        })
+    Some((method, drop_body))
+}
+
+fn bodyless_redirect(
+    method: Method,
+    mut headers: HeaderMap,
+    version: http::Version,
+    timeout: Option<Duration>,
+    next_url: reqwest::Url,
+) -> reqwest::Request {
+    for header in [
+        CONTENT_TYPE,
+        CONTENT_LENGTH,
+        CONTENT_ENCODING,
+        TRANSFER_ENCODING,
+    ] {
+        headers.remove(header);
     }
+    let mut request = reqwest::Request::new(method, next_url);
+    *request.headers_mut() = headers;
+    *request.version_mut() = version;
+    *request.timeout_mut() = timeout;
+    request
 }
 
 pub(super) fn remove_sensitive_headers(

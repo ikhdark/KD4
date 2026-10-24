@@ -210,13 +210,20 @@ impl ArgumentCommentLint {
             .source_callsite();
             let gap_span = boundary_span.between(arg_span);
             let gap_text = snippet(cx, gap_span, "");
-            let arg_text = snippet(cx, arg_span, "..");
-            let lookbehind_start = BytePos(arg_span.lo().0.saturating_sub(64));
-            let lookbehind_text =
-                snippet(cx, arg_span.shrink_to_lo().with_lo(lookbehind_start), "");
+            let arg_text = std::cell::OnceCell::new();
+            let lookbehind_text = std::cell::OnceCell::new();
             let argument_comment = parse_argument_comment(gap_text.as_ref())
-                .or_else(|| parse_argument_comment(lookbehind_text.as_ref()))
-                .or_else(|| parse_argument_comment_prefix(arg_text.as_ref()));
+                .or_else(|| {
+                    let text = lookbehind_text.get_or_init(|| {
+                        let start = BytePos(arg_span.lo().0.saturating_sub(64));
+                        snippet(cx, arg_span.shrink_to_lo().with_lo(start), "")
+                    });
+                    parse_argument_comment(text.as_ref())
+                })
+                .or_else(|| {
+                    let text = arg_text.get_or_init(|| snippet(cx, arg_span, ".."));
+                    parse_argument_comment_prefix(text.as_ref())
+                });
 
             if let Some(actual_name) = argument_comment {
                 if actual_name != expected_name {
@@ -245,6 +252,7 @@ impl ArgumentCommentLint {
                 continue;
             }
 
+            let arg_text = arg_text.get_or_init(|| snippet(cx, arg_span, ".."));
             span_lint_and_sugg(
                 cx,
                 UNCOMMENTED_ANONYMOUS_LITERAL_ARGUMENT,

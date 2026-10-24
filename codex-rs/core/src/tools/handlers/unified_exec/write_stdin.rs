@@ -114,6 +114,55 @@ fn completed_process_output(
 mod audit149_recovery_tests {
     use super::*;
 
+    #[tokio::test]
+    async fn completed_process_recovery_matches_advertised_output_schema() {
+        use crate::session::step_context::StepContext;
+        use crate::tools::command_execution::CommandAttemptKey;
+        use crate::tools::command_output_artifact::RawOutputArtifact;
+        use crate::turn_diff_tracker::TurnDiffTracker;
+
+        for (facts_available, failure) in [(true, None), (true, Some("cleanup failed")), (false, None)] {
+            let (session, turn) = crate::session::tests::make_session_and_context().await;
+            let ledger = &session.services.command_execution;
+            ledger.track_running_process(
+                41,
+                CommandAttemptKey::new("exec_command", "local", "/repo", &["fixture".into()]),
+                RawOutputArtifact::unavailable("fixture"),
+            ).await.unwrap();
+            let running = ledger.running_process(41).await.unwrap();
+            if facts_available {
+                ledger.record_terminal_facts(
+                    41, &running.parent_tool_execution_id.0, running.incarnation,
+                    Some(0), failure, false,
+                ).await;
+            }
+            assert!(ledger.mark_running_process_completed(41, 0).await.accepted());
+            let payload = ToolPayload::Function {
+                arguments: serde_json::json!({"session_id":41,"incarnation":running.incarnation}).to_string(),
+            };
+            let handler = WriteStdinHandler::default();
+            let output = handler.handle(ToolInvocation {
+                session: Arc::new(session),
+                step_context: StepContext::for_test(Arc::new(turn)),
+                payload: payload.clone(),
+                source: ToolCallSource::Direct,
+                cancellation_token: tokio_util::sync::CancellationToken::new(),
+                tracker: Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new())),
+                call_id: "recovered-schema".into(),
+                tool_name: ToolName::plain("write_stdin"),
+            }).await.unwrap();
+            let result = output.code_mode_result(&payload);
+            assert_eq!(result["completion_recovered"], true);
+            assert_eq!(result["terminal_facts_available"], facts_available);
+            assert_eq!(result["success"], facts_available && failure.is_none());
+            assert_eq!(result["error"].is_null(), facts_available && failure.is_none());
+            let ToolSpec::Function(spec) = handler.spec() else { panic!("function tool") };
+            let schema = spec.output_schema.unwrap().into_value();
+            let validator = jsonschema::validator_for(&schema).unwrap();
+            assert!(validator.is_valid(&result), "{result}");
+        }
+    }
+
     #[test]
     fn recovered_signal_reaches_settlement_without_leaking_internal_metadata() {
         let signal = serde_json::json!({"outcome":"success","command_validation":{"validation":true,"proof":true,"tests":false}});

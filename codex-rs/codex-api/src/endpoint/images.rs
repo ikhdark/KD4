@@ -68,8 +68,6 @@ impl<T: HttpTransport> ImagesClient<T> {
         operation: &str,
         image_count: u64,
     ) -> Result<ImageResponse, ApiError> {
-        let body = EncodedJsonBody::encode(request)
-            .map_err(|e| ApiError::Stream(format!("failed to encode {operation} request: {e}")))?;
         // Each supported image may contain 64 MiB of decoded data. Allow base64
         // plus worst-case JSON Unicode escapes and one MiB of envelope metadata.
         let per_image = (64_usize * 1024 * 1024).div_ceil(3) * 4 * 6;
@@ -80,6 +78,8 @@ impl<T: HttpTransport> ImagesClient<T> {
             .ok_or_else(|| ApiError::InvalidRequest {
                 message: "image response budget overflow".into(),
             })?;
+        let body = EncodedJsonBody::encode(request)
+            .map_err(|e| ApiError::Stream(format!("failed to encode {operation} request: {e}")))?;
         let resp = self
             .session
             .execute_non_idempotent(

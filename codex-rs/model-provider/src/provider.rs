@@ -26,7 +26,6 @@ use crate::amazon_bedrock::AmazonBedrockModelProvider;
 use crate::auth::ProviderAuthScope;
 use crate::auth::ResolvedProviderAuth;
 use crate::auth::auth_manager_for_provider;
-use crate::auth::provider_cache_auth_identity;
 use crate::auth::resolve_provider_auth;
 use crate::auth::resolve_provider_auth_for_scope;
 use crate::models_endpoint::OpenAiModelsEndpoint;
@@ -283,6 +282,7 @@ pub(crate) fn request_api_provider(
     Ok(provider)
 }
 
+#[cfg(test)]
 pub(crate) fn model_provider_cache_identity(
     model_provider_id: &str,
     provider_info: &ModelProviderInfo,
@@ -291,125 +291,175 @@ pub(crate) fn model_provider_cache_identity(
     model_provider_cache_identity_for_auth_identity(
         model_provider_id,
         provider_info,
-        provider_cache_auth_identity(auth_manager),
+        crate::auth::provider_cache_auth_identity(auth_manager),
     )
 }
 
+#[cfg(test)]
 pub(crate) fn model_provider_cache_identity_for_auth_identity(
     model_provider_id: &str,
     provider_info: &ModelProviderInfo,
     auth_identity: crate::auth::ProviderCacheAuthIdentity,
 ) -> String {
-    fn normalize_base_url(raw: &str) -> String {
-        let Ok(mut url) = url::Url::parse(raw) else {
-            return raw.trim().trim_end_matches('/').to_string();
-        };
-        url.set_fragment(None);
-        // The request path preserves the base URL query verbatim. Reordering
-        // repeated keys or trimming query values can select another catalog.
-        let normalized_path = url.path().trim_end_matches('/').to_string();
-        url.set_path(if normalized_path.is_empty() {
-            "/"
-        } else {
-            &normalized_path
+    ModelProviderCacheIdentity::new(model_provider_id, provider_info)
+        .for_auth_identity(provider_info, auth_identity)
+}
+
+/// Immutable configuration components only. Environment and account authority
+/// are deliberately projected afresh for every complete identity.
+pub(crate) struct ModelProviderCacheIdentity {
+    configured: serde_json::Value,
+    normalized_base_urls: BTreeMap<String, String>,
+}
+
+impl fmt::Debug for ModelProviderCacheIdentity {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("ModelProviderCacheIdentity { .. }")
+    }
+}
+
+impl ModelProviderCacheIdentity {
+    pub(crate) fn new(model_provider_id: &str, provider_info: &ModelProviderInfo) -> Self {
+        let query_parameters = provider_info
+            .query_params
+            .as_ref()
+            .into_iter()
+            .flat_map(|values| values.iter())
+            .map(|(key, value)| (key.clone(), model_cache_secret_component(b"query-parameter", value)))
+            .collect::<BTreeMap<_, _>>();
+        let http_headers = provider_info
+            .http_headers
+            .as_ref()
+            .into_iter()
+            .flat_map(|values| values.iter())
+            .map(|(key, value)| {
+                (key.to_ascii_lowercase(), model_cache_secret_component(b"http-header", value))
+            })
+            .collect::<BTreeMap<_, _>>();
+        let command_auth = provider_info.auth.as_ref().map(|auth| {
+            serde_json::json!({
+                "command": &auth.command,
+                "args": &auth.args,
+                "cwd": &auth.cwd,
+            })
         });
-        url.to_string()
+        // Keep the exact existing object keys/order and V2 digest contract.
+        // Dynamic placeholders are overlaid without inserting/removing keys.
+        let configured = serde_json::json!({
+            "version": 2,
+            "provider_id": model_provider_id,
+            "provider_name": &provider_info.name,
+            "effective_base_url": null,
+            "wire_api": provider_info.wire_api.to_string(),
+            "query_parameters": query_parameters,
+            "http_headers": http_headers,
+            "env_http_headers": null,
+            "env_key": null,
+            "experimental_bearer_token_digest": provider_info.experimental_bearer_token.as_deref()
+                .map(|value| model_cache_secret_component(b"experimental-bearer-token", value)),
+            "command_auth": command_auth,
+            "requires_openai_auth": provider_info.requires_openai_auth,
+            "effective_auth_mode": null,
+            "account_scope_digest": null,
+            "aws": &provider_info.aws,
+        });
+        let normalized_base_urls = [None, Some(AuthMode::Chatgpt)]
+            .into_iter()
+            .map(|mode| {
+                let raw = provider_info.effective_base_url(mode);
+                (raw.to_owned(), normalize_model_cache_base_url(raw))
+            })
+            .collect();
+        Self { configured, normalized_base_urls }
     }
 
-    fn secret_component(domain: &[u8], value: &str) -> String {
+    pub(crate) fn for_auth_identity(
+        &self,
+        provider_info: &ModelProviderInfo,
+        auth_identity: crate::auth::ProviderCacheAuthIdentity,
+    ) -> String {
+        let raw_base_url = provider_info.effective_base_url(auth_identity.auth_mode);
+        let effective_base_url = self.normalized_base_urls.get(raw_base_url).cloned()
+            .unwrap_or_else(|| normalize_model_cache_base_url(raw_base_url));
+        let env_http_headers = provider_info
+            .env_http_headers
+            .as_ref()
+            .into_iter()
+            .flat_map(|values| values.iter())
+            .map(|(header, env_var)| {
+                let value_digest = std::env::var(env_var)
+                    .ok()
+                    .filter(|value| !value.trim().is_empty())
+                    .map(|value| model_cache_secret_component(b"environment-header", &value));
+                (header.to_ascii_lowercase(), serde_json::json!({
+                    "env_var": env_var, "value_digest": value_digest,
+                }))
+            })
+            .collect::<BTreeMap<_, _>>();
+        let env_key = provider_info.env_key.as_ref().map(|env_var| {
+            serde_json::json!({
+                "env_var": env_var,
+                "value_digest": std::env::var(env_var)
+                    .ok()
+                    .filter(|value| !value.trim().is_empty())
+                    .map(|value| model_cache_secret_component(b"environment-api-key", &value)),
+            })
+        });
+        let dynamic = BTreeMap::from([
+            ("effective_base_url", serde_json::json!(effective_base_url)),
+            ("env_http_headers", serde_json::json!(env_http_headers)),
+            ("env_key", serde_json::json!(env_key)),
+            ("effective_auth_mode", serde_json::json!(auth_identity.auth_mode)),
+            ("account_scope_digest", serde_json::json!(auth_identity.account_scope_digest)),
+        ]);
+        struct IdentityOverlay<'a> {
+            configured: &'a serde_json::Value,
+            dynamic: &'a BTreeMap<&'static str, serde_json::Value>,
+        }
+        impl serde::Serialize for IdentityOverlay<'_> {
+            fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+                use serde::ser::SerializeMap;
+                let Some(configured) = self.configured.as_object() else {
+                    return serde::Serialize::serialize(self.configured, serializer);
+                };
+                let mut map = serializer.serialize_map(Some(configured.len()))?;
+                for (key, value) in configured {
+                    map.serialize_entry(key, self.dynamic.get(key.as_str()).unwrap_or(value))?;
+                }
+                map.end()
+            }
+        }
+        let value = IdentityOverlay { configured: &self.configured, dynamic: &dynamic };
+        let canonical = serde_json::to_vec(&value).unwrap_or_else(|error| {
+            let mut fallback = b"\0provider-cache-identity-serialization-error:".to_vec();
+            fallback.extend_from_slice(error.to_string().as_bytes());
+            fallback
+        });
         let mut hasher = Sha256::new();
-        hasher.update(b"CODEX_MODELS_CACHE_SECRET_COMPONENT_V1\0");
-        hasher.update(domain);
-        hasher.update([0]);
-        hasher.update(value.as_bytes());
-        hasher
-            .finalize()
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect()
+        hasher.update(b"CODEX_MODELS_CACHE_IDENTITY_V2\0");
+        hasher.update(canonical);
+        let digest = hasher.finalize();
+        digest.iter().map(|byte| format!("{byte:02x}")).collect()
     }
+}
 
-    let effective_base_url =
-        normalize_base_url(provider_info.effective_base_url(auth_identity.auth_mode));
-    let query_parameters = provider_info
-        .query_params
-        .as_ref()
-        .into_iter()
-        .flat_map(|values| values.iter())
-        .map(|(key, value)| (key.clone(), secret_component(b"query-parameter", value)))
-        .collect::<BTreeMap<_, _>>();
-    let http_headers = provider_info
-        .http_headers
-        .as_ref()
-        .into_iter()
-        .flat_map(|values| values.iter())
-        .map(|(key, value)| {
-            (
-                key.to_ascii_lowercase(),
-                secret_component(b"http-header", value),
-            )
-        })
-        .collect::<BTreeMap<_, _>>();
-    let env_http_headers = provider_info
-        .env_http_headers
-        .as_ref()
-        .into_iter()
-        .flat_map(|values| values.iter())
-        .map(|(header, env_var)| {
-            let value_digest = std::env::var(env_var)
-                .ok()
-                .filter(|value| !value.trim().is_empty())
-                .map(|value| secret_component(b"environment-header", &value));
-            (
-                header.to_ascii_lowercase(),
-                serde_json::json!({"env_var": env_var, "value_digest": value_digest}),
-            )
-        })
-        .collect::<BTreeMap<_, _>>();
-    let env_key = provider_info.env_key.as_ref().map(|env_var| {
-        serde_json::json!({
-            "env_var": env_var,
-            "value_digest": std::env::var(env_var)
-                .ok()
-                .filter(|value| !value.trim().is_empty())
-                .map(|value| secret_component(b"environment-api-key", &value)),
-        })
-    });
-    let command_auth = provider_info.auth.as_ref().map(|auth| {
-        serde_json::json!({
-            "command": &auth.command,
-            "args": &auth.args,
-            "cwd": &auth.cwd,
-        })
-    });
-    let value = serde_json::json!({
-        "version": 2,
-        "provider_id": model_provider_id,
-        "provider_name": &provider_info.name,
-        "effective_base_url": effective_base_url,
-        "wire_api": provider_info.wire_api.to_string(),
-        "query_parameters": query_parameters,
-        "http_headers": http_headers,
-        "env_http_headers": env_http_headers,
-        "env_key": env_key,
-        "experimental_bearer_token_digest": provider_info.experimental_bearer_token.as_deref()
-            .map(|value| secret_component(b"experimental-bearer-token", value)),
-        "command_auth": command_auth,
-        "requires_openai_auth": provider_info.requires_openai_auth,
-        "effective_auth_mode": auth_identity.auth_mode,
-        "account_scope_digest": auth_identity.account_scope_digest,
-        "aws": &provider_info.aws,
-    });
-    let canonical = serde_json::to_vec(&value).unwrap_or_else(|error| {
-        let mut fallback = b"\0provider-cache-identity-serialization-error:".to_vec();
-        fallback.extend_from_slice(error.to_string().as_bytes());
-        fallback
-    });
+fn normalize_model_cache_base_url(raw: &str) -> String {
+    let Ok(mut url) = url::Url::parse(raw) else {
+        return raw.trim().trim_end_matches('/').to_string();
+    };
+    url.set_fragment(None);
+    let normalized_path = url.path().trim_end_matches('/').to_string();
+    url.set_path(if normalized_path.is_empty() { "/" } else { &normalized_path });
+    url.to_string()
+}
+
+fn model_cache_secret_component(domain: &[u8], value: &str) -> String {
     let mut hasher = Sha256::new();
-    hasher.update(b"CODEX_MODELS_CACHE_IDENTITY_V2\0");
-    hasher.update(canonical);
-    let digest = hasher.finalize();
-    digest.iter().map(|byte| format!("{byte:02x}")).collect()
+    hasher.update(b"CODEX_MODELS_CACHE_SECRET_COMPONENT_V1\0");
+    hasher.update(domain);
+    hasher.update([0]);
+    hasher.update(value.as_bytes());
+    hasher.finalize().iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 /// Creates the default runtime model provider for configured provider metadata.
@@ -651,16 +701,9 @@ impl ModelProvider for ConfiguredModelProvider {
                     self.info.clone(),
                     self.auth_manager.clone(),
                 ));
-                let model_provider_id = model_provider_id.to_string();
-                let provider_info = self.info.clone();
-                let auth_manager = self.auth_manager.clone();
-                let cache_identity: ModelsCacheIdentity = Arc::new(move || {
-                    model_provider_cache_identity(
-                        &model_provider_id,
-                        &provider_info,
-                        auth_manager.as_deref(),
-                    )
-                });
+                let identity_endpoint = Arc::clone(&endpoint);
+                let cache_identity: ModelsCacheIdentity =
+                    Arc::new(move || identity_endpoint.current_cache_identity());
                 Arc::new(OpenAiModelsManager::new(
                     codex_home,
                     endpoint,

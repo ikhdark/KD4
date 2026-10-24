@@ -157,20 +157,12 @@ impl SessionTask for ReviewTask {
                             Err(error) => error.to_string(),
                             Ok(Ok(_)) => unreachable!(),
                         };
-                        session
-                            .send_event(
-                                &ctx,
-                                EventMsg::Error(codex_protocol::protocol::ErrorEvent {
-                                    message: format!("Review source validation failed: {reason}"),
-                                    codex_error_info: None,
-                                }),
-                            )
-                            .await;
+                        reject_review_source_validation(&session, &ctx, &reason).await;
                     }
                 }
             }
             if !cancellation_token.is_cancelled() {
-                exit_review_mode(Arc::clone(&session), output.clone(), ctx.clone()).await;
+                exit_review_mode(Arc::clone(&session), output, ctx.clone()).await;
             }
             Ok(super::TurnTaskResult::default())
         })
@@ -228,18 +220,57 @@ async fn start_review_conversation(
     .map(|io| io.rx_event)
 }
 
+async fn reject_review_source_validation(
+    session: &Session,
+    ctx: &TurnContext,
+    reason: &str,
+) {
+    let message = format!("Review source validation failed: {reason}");
+    // Error events are UI-only on replay. Retain this host rejection as
+    // non-verdict history so a resumed review knows why no result was accepted.
+    let item = ResponseItem::Message {
+        id: Some(ResponseItemId::new("review-source-rejected")),
+        role: "assistant".to_string(),
+        content: vec![ContentItem::OutputText {
+            text: format!(
+                "Review source validation rejected the result; no completed verdict.\n{message}\nRe-establish the requested source comparison and resolve the rejection before re-running /review."
+            ),
+        }],
+        phase: None,
+        internal_chat_message_metadata_passthrough: None,
+    };
+    if let Err(error) = session.record_conversation_items(ctx, &[item]).await {
+        session
+            .send_event(
+                ctx,
+                EventMsg::Error(codex_protocol::protocol::ErrorEvent {
+                    message: format!("Could not retain review source rejection: {error}"),
+                    codex_error_info: None,
+                }),
+            )
+            .await;
+    }
+    session
+        .send_event(
+            ctx,
+            EventMsg::Error(codex_protocol::protocol::ErrorEvent {
+                message,
+                codex_error_info: None,
+            }),
+        )
+        .await;
+}
+
 async fn process_review_events(
     session: Arc<Session>,
     ctx: Arc<TurnContext>,
     receiver: async_channel::Receiver<Event>,
 ) -> Option<ReviewOutputEvent> {
-    let mut prev_agent_message: Option<Event> = None;
+    let mut prev_agent_message: Option<codex_protocol::protocol::AgentMessageEvent> = None;
     while let Ok(event) = receiver.recv().await {
-        match event.clone().msg {
-            EventMsg::AgentMessage(_) => {
-                if let Some(prev) = prev_agent_message.take()
-                    && let EventMsg::AgentMessage(message) = prev.msg
-                {
+        match event.msg {
+            EventMsg::AgentMessage(message) => {
+                if let Some(message) = prev_agent_message.take() {
                     let item = TurnItem::AgentMessage(codex_protocol::items::AgentMessageItem {
                         id: uuid::Uuid::now_v7().to_string(),
                         content: vec![codex_protocol::items::AgentMessageContent::Text {
@@ -250,7 +281,7 @@ async fn process_review_events(
                     session.emit_turn_item_started(&ctx, &item).await;
                     session.emit_turn_item_completed(&ctx, item).await;
                 }
-                prev_agent_message = Some(event);
+                prev_agent_message = Some(message);
             }
             // Suppress the entire hidden assistant lifecycle: forwarding it
             // would trigger legacy AgentMessage via as_legacy_events(), which this
@@ -285,14 +316,41 @@ async fn process_review_events(
                 if out.is_none() {
                     // Keep blocked outcomes machine-readable without treating them as
                     // successful reviews or changing the persisted completed wire type.
-                    let message = task_complete
+                    let blocked = task_complete
                         .last_agent_message
                         .as_deref()
                         .and_then(parse_blocked_review_output)
-                        .and_then(|blocked| serde_json::to_string(&blocked).ok())
-                        .unwrap_or_else(|| {
-                            "Review did not return a valid structured result. Re-run /review; this is not a clean review verdict.".to_string()
-                        });
+                        .and_then(|blocked| serde_json::to_string(&blocked).ok());
+                    if let Some(blocked) = &blocked {
+                        // Error events reach the UI but are not replayed as model
+                        // input. Retain the exact recovery scope for follow-up and
+                        // resume without inventing a completed review verdict.
+                        let item = ResponseItem::Message {
+                            id: Some(ResponseItemId::new("review-blocked")),
+                            role: "assistant".to_string(),
+                            content: vec![ContentItem::OutputText {
+                                text: format!("Review blocked; no completed verdict.\n{blocked}"),
+                            }],
+                            phase: None,
+                            internal_chat_message_metadata_passthrough: None,
+                        };
+                        if let Err(error) = session.record_conversation_items(&ctx, &[item]).await {
+                            session
+                                .send_event(
+                                    ctx.as_ref(),
+                                    EventMsg::Error(codex_protocol::protocol::ErrorEvent {
+                                        message: format!(
+                                            "Could not retain blocked-review recovery context: {error}"
+                                        ),
+                                        codex_error_info: None,
+                                    }),
+                                )
+                                .await;
+                        }
+                    }
+                    let message = blocked.unwrap_or_else(|| {
+                        "Review did not return a valid structured result. Re-run /review; this is not a clean review verdict.".to_string()
+                    });
                     session
                         .send_event(
                             ctx.as_ref(),
@@ -504,11 +562,11 @@ pub(crate) async fn exit_review_mode(
     review_output: Option<ReviewOutputEvent>,
     ctx: Arc<TurnContext>,
 ) {
-    let (user_message, assistant_message) = if let Some(out) = review_output.clone() {
+    let (user_message, assistant_message) = if let Some(out) = review_output.as_ref() {
         let rendered = render_review_exit_success(
             "The review explanation and findings are in the following assistant message.",
         );
-        let assistant_message = render_review_output_text(&out);
+        let assistant_message = render_review_output_text(out);
         (rendered, assistant_message)
     } else {
         let rendered = render_review_exit_interrupted();
@@ -830,6 +888,118 @@ mod tests {
                     .all(|text| !text.contains("patch is correct"))
             );
         }
+    }
+
+    #[tokio::test]
+    async fn blocked_review_preserves_recovery_scope_in_history_and_resume() {
+        let blocked = serde_json::json!({
+            "status": "blocked",
+            "reason": "A required source directory is unavailable.",
+            "unreviewed_scope": ["src/missing.rs:1-40", "its request consumer"],
+            "required_action": "Restore the source directory, then finish the unread scope."
+        });
+        let (mut session, ctx, events) =
+            crate::session::tests::make_session_and_context_with_rx().await;
+        let path = crate::session::tests::attach_thread_persistence(
+            Arc::get_mut(&mut session).unwrap(),
+        )
+        .await;
+        let (sender, receiver) = async_channel::unbounded();
+        sender
+            .send(Event {
+                id: "review".into(),
+                msg: EventMsg::TurnComplete(TurnCompleteEvent {
+                    turn_id: "review".into(),
+                    last_agent_message: Some(blocked.to_string()),
+                    surfaced_result: None,
+                    error: None,
+                    completed_at: None,
+                    duration_ms: None,
+                    time_to_first_token_ms: None,
+                    timing: None,
+                }),
+            })
+            .await
+            .unwrap();
+        drop(sender);
+
+        let output = process_review_events(Arc::clone(&session), Arc::clone(&ctx), receiver).await;
+        assert!(output.is_none());
+        exit_review_mode(Arc::clone(&session), output, Arc::clone(&ctx)).await;
+        let emitted = std::iter::from_fn(|| events.try_recv().ok()).collect::<Vec<_>>();
+        assert!(emitted.iter().any(|event| {
+            matches!(&event.msg, EventMsg::Error(error)
+                if serde_json::from_str::<serde_json::Value>(&error.message).ok().as_ref()
+                    == Some(&blocked))
+        }));
+        assert!(emitted.iter().any(|event| {
+            matches!(&event.msg, EventMsg::ItemCompleted(ItemCompletedEvent {
+                item: TurnItem::ExitedReviewMode(exited), ..
+            }) if exited.review_output.is_none())
+        }));
+        let assert_recovery = |items: &[ResponseItem]| {
+            assert!(
+                items.iter().any(|item| {
+                    matches!(item, ResponseItem::Message { role, content, .. }
+                        if role == "assistant" && content.iter().any(|part| {
+                            matches!(part, ContentItem::OutputText { text }
+                                if text.strip_prefix("Review blocked; no completed verdict.\n")
+                                    .and_then(|json| serde_json::from_str::<serde_json::Value>(json).ok())
+                                    .as_ref() == Some(&blocked))
+                        }))
+                }),
+                "blocked scope and recovery action must remain model-visible"
+            );
+        };
+        assert_recovery(session.clone_history().await.raw_items());
+        session.live_thread().unwrap().shutdown().await.unwrap();
+        let (items, _, errors) = codex_rollout::RolloutRecorder::load_rollout_items(&path)
+            .await
+            .unwrap();
+        assert_eq!(errors, 0);
+        assert_recovery(&Session::reconstruct_model_history_from_rollout(&items));
+    }
+
+    #[tokio::test]
+    async fn source_validation_rejection_preserves_reason_in_history_and_resume() {
+        let (mut session, ctx, events) =
+            crate::session::tests::make_session_and_context_with_rx().await;
+        let path = crate::session::tests::attach_thread_persistence(
+            Arc::get_mut(&mut session).unwrap(),
+        )
+        .await;
+        let reason = "review source changed after admission; no current-source verdict was published";
+        reject_review_source_validation(&session, &ctx, reason).await;
+        exit_review_mode(Arc::clone(&session), None, Arc::clone(&ctx)).await;
+
+        let emitted = std::iter::from_fn(|| events.try_recv().ok()).collect::<Vec<_>>();
+        assert!(emitted.iter().any(|event| {
+            matches!(&event.msg, EventMsg::Error(error)
+                if error.message == format!("Review source validation failed: {reason}"))
+        }));
+        assert!(emitted.iter().any(|event| {
+            matches!(&event.msg, EventMsg::ItemCompleted(ItemCompletedEvent {
+                item: TurnItem::ExitedReviewMode(exited), ..
+            }) if exited.review_output.is_none())
+        }));
+        let assert_recovery = |items: &[ResponseItem]| {
+            assert!(items.iter().any(|item| {
+                matches!(item, ResponseItem::Message { role, content, .. }
+                    if role == "assistant" && content.iter().any(|part| {
+                        matches!(part, ContentItem::OutputText { text }
+                            if text.starts_with("Review source validation rejected the result; no completed verdict.\n")
+                                && text.contains(reason)
+                                && text.contains("Re-establish the requested source comparison"))
+                    }))
+            }));
+        };
+        assert_recovery(session.clone_history().await.raw_items());
+        session.live_thread().unwrap().shutdown().await.unwrap();
+        let (items, _, errors) = codex_rollout::RolloutRecorder::load_rollout_items(&path)
+            .await
+            .unwrap();
+        assert_eq!(errors, 0);
+        assert_recovery(&Session::reconstruct_model_history_from_rollout(&items));
     }
 
     #[tokio::test]

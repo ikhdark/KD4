@@ -1,5 +1,7 @@
 use codex_core_skills::SkillLoadOutcome;
 use codex_core_skills::SkillMetadata;
+use codex_core_skills::HostSkillsSnapshot;
+use std::sync::{Arc, Mutex, Weak};
 
 use crate::catalog::SkillAuthority;
 use crate::catalog::SkillCatalog;
@@ -21,16 +23,22 @@ const HOST_AUTHORITY_ID: &str = "host";
 /// Discovery and caching belong to `SkillsService`; this provider only maps a
 /// snapshot into the authority-aware catalog/read contract.
 #[derive(Clone, Default)]
-pub struct HostSkillProvider;
+pub struct HostSkillProvider {
+    catalogs: Arc<Mutex<Vec<(Weak<HostSkillsSnapshot>, Arc<SkillCatalog>)>>>,
+}
 
 impl HostSkillProvider {
     pub fn new() -> Self {
-        Self
+        Self::default()
     }
 }
 
 impl SkillProvider for HostSkillProvider {
     fn list(&self, query: SkillListQuery) -> SkillProviderFuture<'_, SkillCatalog> {
+        Box::pin(async move { self.list_shared(query).await.map(|catalog| catalog.as_ref().clone()) })
+    }
+
+    fn list_shared(&self, query: SkillListQuery) -> SkillProviderFuture<'_, Arc<SkillCatalog>> {
         Box::pin(async move {
             let Some(host_snapshot) = query.host_snapshot else {
                 return Err(SkillProviderError::new(
@@ -38,7 +46,16 @@ impl SkillProvider for HostSkillProvider {
                 ));
             };
 
-            Ok(catalog_from_outcome(host_snapshot.outcome()))
+            let mut catalogs = self.catalogs.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            catalogs.retain(|(snapshot, _)| snapshot.strong_count() != 0);
+            if let Some((_, catalog)) = catalogs.iter().find(|(snapshot, _)|
+                snapshot.upgrade().is_some_and(|snapshot| Arc::ptr_eq(&snapshot, &host_snapshot)))
+            {
+                return Ok(Arc::clone(catalog));
+            }
+            let catalog = Arc::new(catalog_from_outcome(host_snapshot.outcome()));
+            catalogs.push((Arc::downgrade(&host_snapshot), Arc::clone(&catalog)));
+            Ok(catalog)
         })
     }
 

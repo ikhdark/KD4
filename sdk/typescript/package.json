@@ -45,7 +45,7 @@
     "coverage": "jest --coverage",
     "format": "prettier --check .",
     "format:fix": "prettier --write .",
-    "prepare": "pnpm run build"
+    "prepare": "node -e \"if (process.env.CODEX_SDK_SKIP_PREPARE !== '1') require('node:child_process').execSync('pnpm run build', {stdio: 'inherit'})\""
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.24.0"

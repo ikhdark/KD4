@@ -501,18 +501,15 @@ fn default_agent_nickname_list() -> Vec<&'static str> {
         .collect()
 }
 
-pub(super) fn agent_nickname_candidates(config: &Config, role_name: Option<&str>) -> Vec<String> {
+pub(super) fn agent_nickname_candidates<'a>(config: &'a Config, role_name: Option<&str>) -> Vec<&'a str> {
     let role_name = role_name.unwrap_or(DEFAULT_ROLE_NAME);
     if let Some(candidates) =
-        resolve_role_config(config, role_name).and_then(|role| role.nickname_candidates.clone())
+        resolve_role_config(config, role_name).and_then(|role| role.nickname_candidates.as_ref())
     {
-        return candidates;
+        return candidates.iter().map(String::as_str).collect();
     }
 
     default_agent_nickname_list()
-        .into_iter()
-        .map(ToOwned::to_owned)
-        .collect()
 }
 
 fn keep_forked_rollout_item(item: &RolloutItem, preserve_reference_context_item: bool) -> bool {
@@ -556,6 +553,30 @@ fn keep_forked_rollout_item(item: &RolloutItem, preserve_reference_context_item:
         | RolloutItem::SamplingBoundary(_)
         | RolloutItem::EventMsg(_)
         | RolloutItem::SessionMeta(_) => true,
+    }
+}
+
+fn keep_forked_replacement_item(item: &ResponseItem, hints: &[String]) -> bool {
+    matches!(item, ResponseItem::Message { .. }
+        | ResponseItem::Compaction { .. } | ResponseItem::ContextCompaction { .. })
+        && crate::plan_store::plan_snapshot_from_item(item).is_none()
+        && !is_multi_agent_v2_usage_hint_message(item, hints)
+}
+
+fn clone_forked_rollout_item(item: &RolloutItem, hints: &[String]) -> RolloutItem {
+    if let RolloutItem::Compacted(compacted) = item {
+        RolloutItem::Compacted(codex_protocol::protocol::CompactedItem {
+            message: compacted.message.clone(),
+            replacement_history: compacted.replacement_history.as_ref().map(|history| {
+                history.iter().filter(|item| keep_forked_replacement_item(item, hints)).cloned().collect()
+            }),
+            window_number: compacted.window_number,
+            first_window_id: compacted.first_window_id.clone(),
+            previous_window_id: compacted.previous_window_id.clone(),
+            window_id: compacted.window_id.clone(),
+        })
+    } else {
+        item.clone()
     }
 }
 
@@ -605,10 +626,9 @@ impl AgentControl {
         if !matches!(
             role_name,
             "architect" | "explorer" | "worker" | "reviewer" | "verifier" | "integrator"
-        ) || resolve_role_config(config, role_name).is_none()
-        {
+        ) {
             return Err(CodexErr::InvalidRequest(format!(
-                "typed role {role_name:?} is not configured"
+                "unknown persisted task role {role_name:?}"
             )));
         }
         if parent_thread_id != Some(source_parent_thread_id) {
@@ -1342,7 +1362,7 @@ impl AgentControl {
                     .parent_thread_id
                     .or_else(|| session_source.parent_thread_id());
                 Box::pin(state.spawn_new_thread_with_source(
-                    config.clone(),
+                    config,
                     child_control.clone(),
                     session_source,
                     parent_thread_id,
@@ -1355,7 +1375,7 @@ impl AgentControl {
                 ))
                 .await?
             }
-            (None, _, _) => Box::pin(state.spawn_new_thread(config.clone(), child_control)).await?,
+            (None, _, _) => Box::pin(state.spawn_new_thread(config, child_control)).await?,
         };
         let mut pending_cleanup = PendingSpawnCleanup::new(
             self.clone(),
@@ -1471,21 +1491,23 @@ impl AgentControl {
         let finish_spawn = async {
             let initial_submission_result = match initial_input {
                 SpawnInitialInput::UserInput(input) => {
-                    self.send_input_after_capacity_check(
+                    self.send_input_with_preview(
                         new_thread.thread_id,
                         &state,
                         input,
                         execution_guard,
+                        initial_last_task_message.clone(),
                     )
                     .await
                 }
                 SpawnInitialInput::InterAgentCommunication(communication, context) => {
-                    self.send_inter_agent_communication_after_capacity_check(
+                    self.submit_inter_agent_communication_with_preview(
                         new_thread.thread_id,
                         &state,
                         communication,
                         context,
                         execution_guard,
+                        initial_last_task_message.clone(),
                     )
                     .await
                 }
@@ -1723,14 +1745,29 @@ impl AgentControl {
             let roots = if let Ok(parent) = state.get_thread(parent_thread_id).await {
                 parent.codex.session.services.selected_capability_roots.clone()
             } else {
-                state.read_stored_thread(ReadThreadParams {
-                    thread_id: parent_thread_id, include_archived: true, include_history: true,
-                }).await?.history.map(|history| {
-                    history.items.iter().find_map(|item| match item {
-                        RolloutItem::SessionMeta(meta) => Some(meta.meta.selected_capability_roots.clone()),
-                        _ => None,
+                let parent = state.read_stored_thread(ReadThreadParams {
+                    thread_id: parent_thread_id, include_archived: true, include_history: false,
+                }).await?;
+                let header_roots = match parent.rollout_path.as_deref() {
+                    Some(path) => codex_rollout::read_session_meta_line(path).await.ok()
+                        .filter(|header| header.meta.id == parent_thread_id)
+                        .map(|header| header.meta.selected_capability_roots),
+                    None => None,
+                };
+                if let Some(roots) = header_roots {
+                    roots
+                } else {
+                    // Custom stores without local paths and recoverable damaged
+                    // headers retain the existing full-history fallback.
+                    state.read_stored_thread(ReadThreadParams {
+                        thread_id: parent_thread_id, include_archived: true, include_history: true,
+                    }).await?.history.map(|history| {
+                        history.items.iter().find_map(|item| match item {
+                            RolloutItem::SessionMeta(meta) => Some(meta.meta.selected_capability_roots.clone()),
+                            _ => None,
+                        }).unwrap_or_default()
                     }).unwrap_or_default()
-                }).unwrap_or_default()
+                }
             };
             let mut extension_init = ExtensionDataInit::new();
             extension_init.insert(roots);
@@ -1799,12 +1836,6 @@ impl AgentControl {
                 Some(meta_line.meta.selected_capability_roots.clone())
             })
             .unwrap_or_default();
-        let mut forked_rollout_items = match fork_mode {
-            SpawnAgentForkMode::LastNTurns(last_n_turns) => {
-                truncate_rollout_to_last_n_fork_turns(&parent_history.items, *last_n_turns)?
-            }
-            _ => parent_history.items.clone(),
-        };
         let multi_agent_v2_usage_hint_texts_to_filter: Vec<String> =
             if let Some(parent_thread) = parent_thread.as_ref() {
                 if multi_agent_version == MultiAgentVersion::V2 {
@@ -1837,38 +1868,29 @@ impl AgentControl {
                 Vec::new()
             };
         let preserve_reference_context_item = matches!(fork_mode, SpawnAgentForkMode::FullHistory);
-        forked_rollout_items =
-            crate::thread_rollout_truncation::filter_rollout_preserving_rollbacks(
-                forked_rollout_items,
-                |item| {
-                    keep_forked_rollout_item(item, preserve_reference_context_item)
-                        && !matches!(
-                            item,
-                            RolloutItem::ResponseItem(response_item)
-                                if is_multi_agent_v2_usage_hint_message(
-                                    response_item,
-                                    &multi_agent_v2_usage_hint_texts_to_filter,
-                                )
-                        )
-                },
-            );
+        let keep = |item: &RolloutItem| {
+            keep_forked_rollout_item(item, preserve_reference_context_item)
+                && !matches!(item, RolloutItem::ResponseItem(response_item)
+                    if is_multi_agent_v2_usage_hint_message(response_item, &multi_agent_v2_usage_hint_texts_to_filter))
+        };
+        let mut forked_rollout_items = match fork_mode {
+            SpawnAgentForkMode::LastNTurns(last_n_turns) => {
+                let selected = truncate_rollout_to_last_n_fork_turns(&parent_history.items, *last_n_turns)?;
+                crate::thread_rollout_truncation::filter_rollout_preserving_rollbacks(selected, keep)
+            }
+            _ => crate::thread_rollout_truncation::filter_borrowed_rollout_preserving_rollbacks(
+                &parent_history.items, keep,
+                |item| clone_forked_rollout_item(item, &multi_agent_v2_usage_hint_texts_to_filter),
+            ),
+        };
         for item in &mut forked_rollout_items {
             if let RolloutItem::Compacted(compacted) = item
+                && matches!(fork_mode, SpawnAgentForkMode::LastNTurns(_))
                 && let Some(replacement_history) = compacted.replacement_history.as_mut()
             {
-                replacement_history.retain(|response_item| {
-                    // Summaries may lack a final phase; opaque compaction state is replay data.
-                    matches!(
-                        response_item,
-                        ResponseItem::Message { .. }
-                            | ResponseItem::Compaction { .. }
-                            | ResponseItem::ContextCompaction { .. }
-                    ) && crate::plan_store::plan_snapshot_from_item(response_item).is_none()
-                        && !is_multi_agent_v2_usage_hint_message(
-                        response_item,
-                        &multi_agent_v2_usage_hint_texts_to_filter,
-                    )
-                });
+                replacement_history.retain(|item| keep_forked_replacement_item(
+                    item, &multi_agent_v2_usage_hint_texts_to_filter,
+                ));
             }
         }
         if preserve_reference_context_item && multi_agent_version == MultiAgentVersion::V2 {

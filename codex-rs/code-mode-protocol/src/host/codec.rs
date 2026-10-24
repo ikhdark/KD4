@@ -80,8 +80,7 @@ impl<F: FnMut(usize) -> io::Result<()>> io::Write for LimitedPayload<F> {
         if needed > self.bytes.capacity() {
             let capacity = needed
                 .next_power_of_two()
-                .max(128)
-                .min(MAX_FRAME_BYTES + LENGTH_PREFIX_BYTES);
+                .clamp(128, MAX_FRAME_BYTES + LENGTH_PREFIX_BYTES);
             // Obtain capacity before allocating, including on the first write.
             // Exact reservation avoids Vec's implicit growth escaping admission.
             (self.admit_capacity)(capacity)?;

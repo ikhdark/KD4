@@ -1,5 +1,7 @@
 use codex_utils_absolute_path as path_utils;
 use std::cmp::Reverse;
+use std::collections::HashMap;
+use std::collections::HashSet;
 use std::ffi::OsStr;
 use std::io;
 use std::ops::ControlFlow;
@@ -506,6 +508,51 @@ async fn get_threads_in_root_by_summary(
                 .and_then(|id| Uuid::parse_str(&id.to_string()).ok()),
         )
     });
+    // UpdatedAt is already known from file metadata. When every candidate has
+    // a representable timestamp, summary hydration cannot change its sort key.
+    // Preserve the full-summary fallback for missing mtimes and RecencyAt.
+    let updated_key = |candidate: &ThreadCandidate| {
+        candidate.updated_at.and_then(format_rfc3339)
+            .and_then(|value| OffsetDateTime::parse(&value, &Rfc3339).ok())
+            .map(|timestamp| (timestamp, candidate.id))
+    };
+    if sort_key == ThreadSortKey::UpdatedAt
+        && candidates.iter().all(|candidate| updated_key(candidate).is_some())
+    {
+        let mut candidates = candidates.into_iter().map(|candidate| {
+            (updated_key(&candidate).expect("checked timestamp"), candidate)
+        }).collect::<Vec<_>>();
+        candidates.sort_by_key(|(key, _)| *key);
+        if !ascending { candidates.reverse(); }
+        let mut items = Vec::with_capacity(page_size.min(candidates.len()));
+        let mut more_matches_available = false;
+        for (key, candidate) in candidates {
+            if anchor.is_some_and(|(timestamp, id)| match id {
+                Some(id) if ascending => key <= (timestamp, id),
+                Some(id) => key >= (timestamp, id),
+                None if ascending => key.0 <= timestamp,
+                None => key.0 >= timestamp,
+            }) { continue; }
+            if let Some(item) = build_thread_item(
+                candidate.path, config.allowed_sources, provider_matcher.as_ref(),
+                config.cwd_filters, candidate.updated_at.and_then(format_rfc3339),
+                config.default_provider,
+            ).await {
+                // Probe the next *matching* summary so filtering/damaged files
+                // cannot manufacture a next-page cursor.
+                if items.len() == page_size {
+                    more_matches_available = true;
+                    break;
+                }
+                items.push(item);
+            }
+        }
+        let next_cursor = more_matches_available
+            .then(|| build_next_cursor(&items, sort_key)).flatten();
+        return Ok(ThreadsPage {
+            items, next_cursor, num_scanned_files: scanned_files, reached_scan_cap: false,
+        });
+    }
     let mut keyed_items = Vec::new();
     for candidate in candidates {
         let updated_at = candidate.updated_at.and_then(format_rfc3339);
@@ -1611,7 +1658,7 @@ async fn find_thread_path_by_id_str_in_subdir(
     subdir: &str,
     id_str: &str,
     state_db_ctx: Option<&codex_state::StateRuntime>,
-) -> io::Result<Option<PathBuf>> {
+) -> io::Result<Option<(PathBuf, Option<SessionMetaLine>)>> {
     // Validate UUID format early.
     if Uuid::parse_str(id_str).is_err() {
         return Ok(None);
@@ -1637,11 +1684,11 @@ async fn find_thread_path_by_id_str_in_subdir(
                 if let Some(existing_db_path) =
                     compression::existing_rollout_path(db_path.as_path()).await
                 {
-                    match verified_rollout_thread_id(&existing_db_path).await {
-                        Ok(id) if id == thread_id => {
-                            return Ok(Some(existing_db_path));
+                    match verified_rollout_identity(&existing_db_path).await {
+                        Ok((id, header)) if id == thread_id => {
+                            return Ok(Some((existing_db_path, header)));
                         }
-                        Ok(id) => {
+                        Ok((id, _)) => {
                             tracing::error!(
                                 "state db returned rollout path for thread {id_str} but file belongs to thread {}: {}",
                                 id,
@@ -1693,8 +1740,8 @@ async fn find_thread_path_by_id_str_in_subdir(
     if !tokio::fs::try_exists(&root).await? {
         return Ok(None);
     }
-    let found = find_rollout_path_by_id_from_filenames(root.as_path(), id_str).await?;
-    if let Some(found_path) = found.as_ref() {
+    let found = find_rollout_location_by_id_from_filenames(root.as_path(), id_str).await?;
+    if let Some((found_path, _)) = found.as_ref() {
         tracing::debug!("state db missing rollout path for thread {id_str}");
         tracing::warn!(
             "state db discrepancy during find_thread_path_by_id_str_in_subdir: falling_back"
@@ -1721,8 +1768,12 @@ async fn find_thread_path_by_id_str_in_subdir(
 // Damaged payloads remain recoverable through the canonical reader, but a
 // filename alone (including an empty file) must never establish ownership.
 pub async fn verified_rollout_thread_id(path: &Path) -> io::Result<ThreadId> {
+    verified_rollout_identity(path).await.map(|(id, _)| id)
+}
+
+async fn verified_rollout_identity(path: &Path) -> io::Result<(ThreadId, Option<SessionMetaLine>)> {
     match read_session_meta_line(path).await {
-        Ok(meta) => Ok(meta.meta.id),
+        Ok(meta) => Ok((meta.meta.id, Some(meta))),
         Err(error)
             if matches!(
                 error.kind(),
@@ -1738,7 +1789,7 @@ pub async fn verified_rollout_thread_id(path: &Path) -> io::Result<ThreadId> {
                 && parse_errors > 0
                 && let Some(id) = id
             {
-                Ok(id)
+                Ok((id, None))
             } else {
                 Err(error)
             }
@@ -1747,15 +1798,21 @@ pub async fn verified_rollout_thread_id(path: &Path) -> io::Result<ThreadId> {
     }
 }
 
-async fn find_rollout_path_by_id_from_filenames(
+#[cfg(test)]
+async fn find_rollout_path_by_id_from_filenames(root: &Path, id_str: &str) -> io::Result<Option<PathBuf>> {
+    find_rollout_location_by_id_from_filenames(root, id_str).await
+        .map(|found| found.map(|(path, _)| path))
+}
+
+async fn find_rollout_location_by_id_from_filenames(
     root: &Path,
     id_str: &str,
-) -> io::Result<Option<PathBuf>> {
+) -> io::Result<Option<(PathBuf, Option<SessionMetaLine>)>> {
     let Ok(target) = Uuid::parse_str(id_str) else {
         return Ok(None);
     };
     let mut stack = vec![root.to_path_buf()];
-    let mut found: Option<PathBuf> = None;
+    let mut found: Option<(PathBuf, Option<SessionMetaLine>)> = None;
     while let Some(dir) = stack.pop() {
         let mut read_dir = match tokio::fs::read_dir(dir.as_path()).await {
             Ok(read_dir) => read_dir,
@@ -1795,69 +1852,96 @@ async fn find_rollout_path_by_id_from_filenames(
             else {
                 continue;
             };
-            if verified_rollout_thread_id(&path)
-                .await
-                .ok()
-                .is_some_and(|id| id.to_string() == target.to_string())
-                && found.as_ref().is_none_or(|current| path < *current)
+            if let Ok((id, header)) = verified_rollout_identity(&path).await
+                && id.to_string() == target.to_string()
+                && found.as_ref().is_none_or(|(current, _)| path < *current)
             {
-                found = Some(path);
+                found = Some((path, header));
             }
         }
     }
     Ok(found)
 }
 
-/// Locate a recorded thread rollout file by its UUID string using the existing
-/// paginated listing implementation. Returns `Ok(Some(path))` if found, `Ok(None)` if not present
-/// or the id is invalid.
-pub async fn find_thread_rollout_paths(
-    home: &Path,
-    thread_id: ThreadId,
-) -> io::Result<Vec<PathBuf>> {
-    let mut stack = vec![
-        home.join(SESSIONS_SUBDIR),
-        home.join(ARCHIVED_SESSIONS_SUBDIR),
-    ];
-    let mut paths = Vec::new();
-    let suffix = format!("-{thread_id}.jsonl");
-    let mut visited = 0usize;
-    while let Some(directory) = stack.pop() {
-        let mut entries = match tokio::fs::read_dir(directory).await {
-            Ok(entries) => entries,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
-            Err(error) => return Err(error),
-        };
-        while let Some(entry) = entries.next_entry().await? {
-            visited += 1;
-            if visited > 1_000_000 {
-                return Err(io::Error::other(
-                    "rollout enumeration limit exceeded; no mutation performed",
-                ));
+/// One bounded directory inventory for a set of thread IDs. Header validation
+/// remains per-ID so callers can preserve their existing database/error order.
+#[derive(Debug)]
+pub struct ThreadRolloutInventory {
+    paths: HashMap<ThreadId, Vec<PathBuf>>,
+    enumeration_error: Option<io::Error>,
+}
+
+impl ThreadRolloutInventory {
+    pub async fn scan(home: &Path, thread_ids: &[ThreadId]) -> Self {
+        let suffixes: HashMap<_, _> = thread_ids.iter().copied()
+            .map(|id| (format!("-{id}.jsonl"), id)).collect();
+        let suffix_lengths: HashSet<_> = suffixes.keys().map(String::len).collect();
+        let mut inventory = Self { paths: HashMap::new(), enumeration_error: None };
+        if suffixes.is_empty() { return inventory; }
+        let mut stack = vec![home.join(SESSIONS_SUBDIR), home.join(ARCHIVED_SESSIONS_SUBDIR)];
+        let mut visited = 0usize;
+        let result = async {
+            while let Some(directory) = stack.pop() {
+                let mut entries = match tokio::fs::read_dir(directory).await {
+                    Ok(entries) => entries,
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                    Err(error) => return Err(error),
+                };
+                while let Some(entry) = entries.next_entry().await? {
+                    visited += 1;
+                    if visited > 1_000_000 {
+                        return Err(io::Error::other(
+                            "rollout enumeration limit exceeded; no mutation performed",
+                        ));
+                    }
+                    let kind = entry.file_type().await?;
+                    if kind.is_dir() {
+                        stack.push(entry.path());
+                        continue;
+                    }
+                    if !kind.is_file() { continue; }
+                    let Some(file) = compression::RolloutFile::from_path(entry.path()) else { continue; };
+                    let name = file.plain_file_name();
+                    let id = suffix_lengths.iter().find_map(|length| {
+                        let start = name.len().checked_sub(*length)?;
+                        suffixes.get(name.get(start..)?).copied()
+                    });
+                    if let Some(id) = id {
+                        inventory.paths.entry(id).or_default().push(file.into_path());
+                    }
+                }
             }
-            let kind = entry.file_type().await?;
-            if kind.is_dir() {
-                stack.push(entry.path());
-                continue;
-            }
-            if !kind.is_file() {
-                continue;
-            }
-            let Some(file) = compression::RolloutFile::from_path(entry.path()) else {
-                continue;
-            };
-            if !file.plain_file_name().ends_with(&suffix) {
-                continue;
-            }
-            let path = file.into_path();
+            Ok::<_, io::Error>(())
+        }.await;
+        // An earlier matching header error must still precede a later scan
+        // error. Keep the traversed prefix and report the latter after those
+        // headers, exactly where a first per-ID traversal would encounter it.
+        inventory.enumeration_error = result.err();
+        inventory
+    }
+
+    /// Consume one requested ID in the caller's original first-seen order.
+    pub async fn take_paths(&mut self, thread_id: ThreadId) -> io::Result<Vec<PathBuf>> {
+        let mut paths = Vec::new();
+        for path in self.paths.remove(&thread_id).unwrap_or_default() {
             if read_session_meta_line(&path).await?.meta.id == thread_id {
                 paths.push(path);
             }
         }
+        if let Some(error) = self.enumeration_error.take() { return Err(error); }
+        paths.sort();
+        paths.dedup();
+        Ok(paths)
     }
-    paths.sort();
-    paths.dedup();
-    Ok(paths)
+}
+
+/// Locate every physical rollout copy for one thread, retaining header checks.
+pub async fn find_thread_rollout_paths(
+    home: &Path,
+    thread_id: ThreadId,
+) -> io::Result<Vec<PathBuf>> {
+    let mut inventory = ThreadRolloutInventory::scan(home, &[thread_id]).await;
+    inventory.take_paths(thread_id).await
 }
 
 pub async fn find_thread_path_by_id_str(
@@ -1865,6 +1949,15 @@ pub async fn find_thread_path_by_id_str(
     id_str: &str,
     state_db_ctx: Option<&codex_state::StateRuntime>,
 ) -> io::Result<Option<PathBuf>> {
+    find_thread_path_by_id_str_in_subdir(codex_home, SESSIONS_SUBDIR, id_str, state_db_ctx)
+        .await.map(|found| found.map(|(path, _)| path))
+}
+
+pub(crate) async fn find_thread_path_and_meta_by_id_str(
+    codex_home: &Path,
+    id_str: &str,
+    state_db_ctx: Option<&codex_state::StateRuntime>,
+) -> io::Result<Option<(PathBuf, Option<SessionMetaLine>)>> {
     find_thread_path_by_id_str_in_subdir(codex_home, SESSIONS_SUBDIR, id_str, state_db_ctx).await
 }
 
@@ -1875,7 +1968,7 @@ pub async fn find_archived_thread_path_by_id_str(
     state_db_ctx: Option<&codex_state::StateRuntime>,
 ) -> io::Result<Option<PathBuf>> {
     find_thread_path_by_id_str_in_subdir(codex_home, ARCHIVED_SESSIONS_SUBDIR, id_str, state_db_ctx)
-        .await
+        .await.map(|found| found.map(|(path, _)| path))
 }
 
 /// Extract the `YYYY/MM/DD` directory components from a rollout filename.

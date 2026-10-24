@@ -369,7 +369,7 @@ pub(crate) fn create_shell_command_tool_for_policy(
             "stall_timeout_ms".to_string(),
             bounded_integer(
                 format!(
-                    "Maximum time without stdout or stderr before cancelling the command. Defaults to {} ms. Set zero to disable this silence timeout; timeout_ms still applies. This native route does not return a resumable session; use exec_command for a non-terminating stall observation.",
+                    "Maximum time without stdout or stderr before cancelling the command. Defaults to {} ms for ordinary commands; recognized validation commands disable this default. Set zero to disable this silence timeout; timeout_ms still applies. This native route does not return a resumable session; use exec_command for a non-terminating stall observation.",
                     crate::exec::DEFAULT_COMMAND_STALL_TIMEOUT_MS,
                 ),
                 0,
@@ -451,7 +451,7 @@ fn unified_exec_output_schema() -> Value {
         "type": "object",
         "properties": {
             "error": {
-                "type": "string",
+                "type": ["string", "null"],
                 "description": "Command failure, including watchdog or cleanup failure. Inspect execution_state and session_id; do not replay uncertain effects."
             },
             "stdout": {
@@ -564,6 +564,14 @@ fn unified_exec_output_schema() -> Value {
                 "required": ["tool", "arguments"]
             },
             "completion_recovered": {"type":"boolean"},
+            "success": {
+                "type": "boolean",
+                "description": "Present on a recovered terminal receipt; true only when retained terminal facts establish success. Missing terminal facts are not a successful execution receipt."
+            },
+            "terminal_facts_available": {
+                "type": "boolean",
+                "description": "Whether a recovered terminal receipt retains outcome details beyond its exit code."
+            },
             "notice": {"type":"string"},
             "repair": {
                 "type": "string",

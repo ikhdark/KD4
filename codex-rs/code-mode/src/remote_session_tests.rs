@@ -211,7 +211,8 @@ async fn cancelled_queued_wait_slots_are_reclaimed_before_admission() {
         waits.insert((1, codex_code_mode_protocol::CellId::new(index.to_string())), Arc::clone(&pending));
         let first = pending.lock().await;
         let mut queued = Box::pin(pending.lock());
-        assert!(futures::poll!(&mut queued).is_pending());
+        let mut context = std::task::Context::from_waker(futures::task::noop_waker_ref());
+        assert!(std::future::Future::poll(queued.as_mut(), &mut context).is_pending());
         drop(first);
         drop(queued);
         drop(pending);

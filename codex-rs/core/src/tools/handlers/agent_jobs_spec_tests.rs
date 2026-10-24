@@ -54,14 +54,14 @@ fn spawn_agents_on_csv_tool_requires_csv_and_instruction() {
                     ),
                     (
                         "max_concurrency".to_string(),
-                        JsonSchema { minimum: Some(0.into()), maximum: Some(usize::MAX.into()), ..JsonSchema::integer(Some(
+                        JsonSchema { minimum: Some(1.into()), maximum: Some(usize::MAX.into()), ..JsonSchema::integer(Some(
                             "Maximum concurrent workers for this job. Defaults to 16 and is capped by config."
                                 .to_string(),
                         )) },
                     ),
                     (
                         "max_workers".to_string(),
-                        JsonSchema { minimum: Some(0.into()), maximum: Some(usize::MAX.into()), ..JsonSchema::integer(Some(
+                        JsonSchema { minimum: Some(1.into()), maximum: Some(usize::MAX.into()), ..JsonSchema::integer(Some(
                             "Legacy alias; prefer max_concurrency and omit this field."
                                 .to_string(),
                         )) },
@@ -98,7 +98,7 @@ fn report_agent_job_result_tool_requires_result_payload() {
         ToolSpec::Function(ResponsesApiTool {
             name: "report_agent_job_result".to_string(),
             description:
-                "Worker-only tool to report a result for an agent job item. Main agents should not call this. Inspect accepted: only accepted:true confirms this call recorded the item. For accepted:false, follow rejection_reason; a successful tool call alone is not an accepted report."
+                "Worker-only tool to report a result for an agent job item. Main agents should not call this. Inspect accepted: only accepted:true confirms the result is recorded. acknowledgment is accepted_new for a new report or accepted_replay for the same retained report; a replay does not record new work. For accepted:false, follow rejection_reason; a successful tool call alone is not an accepted report."
                     .to_string(),
             strict: false,
             defer_loading: None,

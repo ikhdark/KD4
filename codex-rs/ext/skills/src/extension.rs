@@ -245,6 +245,7 @@ where
                     },
                 )
                 .await;
+            let catalog = Arc::new(catalog);
             input
                 .turn_store
                 .insert(ExecutorSkillsStepState(catalog.clone()));
@@ -335,7 +336,7 @@ where
                 );
             }
             if let Some(executor_skills) = turn_store.get::<ExecutorSkillsStepState>() {
-                catalog.extend(executor_skills.0.clone());
+                catalog.extend_ref(&executor_skills.0);
             }
             for warning in &catalog.warnings {
                 self.emit_turn_warning(thread_store, turn_store, &input.turn_id, warning.clone());
@@ -387,21 +388,18 @@ where
                 .buffered(4);
             while let Some((entry, read)) = reads.next().await {
                 let contents = match &read {
-                    Ok(read) => read.contents.as_str().to_string(),
-                    Err(message) => format!("Instructions were not loaded. {message}"),
+                    Ok(read) => std::borrow::Cow::Borrowed(read.contents.as_str()),
+                    Err(message) => std::borrow::Cow::Owned(format!("Instructions were not loaded. {message}")),
                 };
-                complete_costs.push(SkillInstructions {
-                    name: entry.name.clone(),
-                    path: entry.main_prompt.as_str().to_string(),
-                    contents,
-                    source_scope: entry.source_scope,
-                }.render().len());
+                complete_costs.push(SkillInstructions::rendered_len_parts(
+                    &entry.name, entry.main_prompt.as_str(), &[contents.as_ref()], entry.source_scope,
+                ));
                 selected_reads.push(read);
             }
             if complete_costs.iter().copied().try_fold(0usize, usize::checked_add)
                 .is_none_or(|total| total > MAX_SELECTED_PROMPT_BYTES)
             {
-                remaining_prompt_bytes -= unavailable.render().len();
+                remaining_prompt_bytes -= unavailable.rendered_len();
             }
             let budgets = selected_prompt_budgets(&complete_costs, remaining_prompt_bytes);
             for ((entry, read), budget) in selected_entries.iter().zip(selected_reads).zip(budgets) {
@@ -448,7 +446,7 @@ where
                             omitted_instructions = true;
                             continue;
                         };
-                        remaining_prompt_bytes -= fragment.render().len();
+                        remaining_prompt_bytes -= fragment.rendered_len();
                         if truncated {
                             self.emit_turn_warning(
                                 thread_store,
@@ -460,14 +458,20 @@ where
                                 ),
                             );
                         }
-                        injected_host_skill_prompts.record_instruction_fragment(
-                            fragment.role(),
-                            fragment.render(),
-                            fragment.contents.clone(),
-                        );
                         if let Some(skill) = host_metadata {
-                            injected_host_skill_prompts
-                                .record_resolution(skill, Ok(fragment.contents.clone()));
+                            injected_host_skill_prompts.record_host_instruction_fragment(
+                                skill,
+                                fragment.role(),
+                                fragment.render(),
+                                fragment.contents.clone(),
+                                !truncated,
+                            );
+                        } else {
+                            injected_host_skill_prompts.record_instruction_fragment(
+                                fragment.role(),
+                                fragment.render(),
+                                fragment.contents.clone(),
+                            );
                         }
                         fragments.push(Box::new(fragment));
                         if entry.authority.kind == SkillSourceKind::Host {
@@ -491,8 +495,8 @@ where
                             contents: format!("Instructions were not loaded. {message}"),
                             source_scope: entry.source_scope,
                         };
-                        if failure.render().len() <= budget {
-                            remaining_prompt_bytes -= failure.render().len();
+                        if failure.rendered_len() <= budget {
+                            remaining_prompt_bytes -= failure.rendered_len();
                             fragments.push(Box::new(failure));
                         } else {
                             omitted_instructions = true;

@@ -104,9 +104,9 @@ pub(super) fn resolve_tool_response(
                 }});
                 let results = json_to_v8(&mut tc, &results)
                     .ok_or_else(|| "failed to serialize late tool evidence".to_string())?;
-                let key = v8::String::new(&mut tc, "results")
+                let key = v8::String::new(&tc, "results")
                     .ok_or_else(|| "failed to allocate late evidence key".to_string())?;
-                let object = value.to_object(&mut tc)
+                let object = value.to_object(&tc)
                     .ok_or_else(|| "failed to construct late tool error".to_string())?;
                 object.set(&tc, key.into(), results);
             }

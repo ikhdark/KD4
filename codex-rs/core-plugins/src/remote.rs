@@ -43,6 +43,8 @@ mod catalog_cache;
 mod remote_installed_plugin_sync;
 mod share;
 
+pub use catalog_cache::GlobalRemotePluginCatalogObservation;
+
 #[cfg(test)]
 #[path = "remote_tests.rs"]
 mod tests;
@@ -794,6 +796,18 @@ pub async fn fetch_remote_marketplaces(
     sources: &[RemoteMarketplaceSource],
     global_catalog_cache_path: Option<&Path>,
 ) -> Result<Vec<RemoteMarketplace>, RemotePluginCatalogError> {
+    fetch_remote_marketplaces_with_global_cache_observation(
+        config, auth, sources, global_catalog_cache_path, None,
+    ).await
+}
+
+pub async fn fetch_remote_marketplaces_with_global_cache_observation(
+    config: &RemotePluginServiceConfig,
+    auth: Option<&CodexAuth>,
+    sources: &[RemoteMarketplaceSource],
+    global_catalog_cache_path: Option<&Path>,
+    mut global_observation: Option<&mut GlobalRemotePluginCatalogObservation>,
+) -> Result<Vec<RemoteMarketplace>, RemotePluginCatalogError> {
     let auth = ensure_chatgpt_auth(auth)?;
     let client = &config.http_clients;
     let mut marketplaces = Vec::new();
@@ -821,26 +835,40 @@ pub async fn fetch_remote_marketplaces(
         match source {
             RemoteMarketplaceSource::Global => {
                 let scope = RemotePluginScope::Global;
-                if let Some(codex_home) = global_catalog_cache_path
-                    && let Some(directory_plugins) =
-                        catalog_cache::load_cached_global_directory_plugins_async(
+                if let Some(codex_home) = global_catalog_cache_path {
+                    let mut owned_observation;
+                    let observed = if let Some(observed) = global_observation.as_deref_mut() {
+                        if !observed.matches(codex_home, config, auth) {
+                            *observed = catalog_cache::observe_cached_global_directory_plugins_async(
+                                codex_home, config, auth,
+                            ).await;
+                        }
+                        observed
+                    } else {
+                        owned_observation = catalog_cache::observe_cached_global_directory_plugins_async(
                             codex_home, config, auth,
-                        )
-                        .await
-                {
-                    let installed_plugins =
-                        fetch_installed_plugins_for_scope_with_client(client, config, auth, scope)
-                            .await?;
-                    if let Some(marketplace) = build_remote_marketplace(
-                        scope.marketplace_name(),
-                        scope.marketplace_display_name(),
-                        directory_plugins,
-                        installed_plugins,
-                        /*include_installed_only*/ true,
-                    )? {
-                        marketplaces.push(marketplace);
+                        ).await;
+                        &mut owned_observation
+                    };
+                    if observed.is_cached_for(codex_home, config, Some(auth)) {
+                        let installed_plugins = fetch_installed_plugins_for_scope_with_client(
+                            client, config, auth, scope,
+                        ).await?;
+                        // Auth storage may refresh across either await. Never combine
+                        // a previous partition's directory with the current account.
+                        if observed.matches(codex_home, config, auth)
+                            && let Some(directory_plugins) = observed.take_plugins()
+                        {
+                            if let Some(marketplace) = build_remote_marketplace(
+                                scope.marketplace_name(), scope.marketplace_display_name(),
+                                directory_plugins, installed_plugins,
+                                /*include_installed_only*/ true,
+                            )? {
+                                marketplaces.push(marketplace);
+                            }
+                            continue;
+                        }
                     }
-                    continue;
                 }
                 let (directory_plugins, installed_plugins) = tokio::try_join!(
                     fetch_directory_plugins_for_scope_with_client(client, config, auth, scope),
@@ -1068,12 +1096,17 @@ pub async fn has_cached_global_remote_plugin_catalog(
     config: &RemotePluginServiceConfig,
     auth: Option<&CodexAuth>,
 ) -> bool {
-    let Ok(auth) = ensure_chatgpt_auth(auth) else {
-        return false;
-    };
-    catalog_cache::load_cached_global_directory_plugins_async(codex_home, config, auth)
-        .await
-        .is_some()
+    observe_cached_global_remote_plugin_catalog(codex_home, config, auth)
+        .await.is_some_and(|observed| observed.is_cached_for(codex_home, config, auth))
+}
+
+pub async fn observe_cached_global_remote_plugin_catalog(
+    codex_home: &Path,
+    config: &RemotePluginServiceConfig,
+    auth: Option<&CodexAuth>,
+) -> Option<GlobalRemotePluginCatalogObservation> {
+    let auth = ensure_chatgpt_auth(auth).ok()?;
+    Some(catalog_cache::observe_cached_global_directory_plugins_async(codex_home, config, auth).await)
 }
 
 pub async fn cached_global_remote_discoverable_plugins(

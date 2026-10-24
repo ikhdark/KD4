@@ -25,6 +25,7 @@ pub use description::render_code_mode_sample;
 pub use description::render_code_mode_tool_bundle;
 pub use description::render_json_schema_to_typescript;
 pub use output_projection::model_visible_tool_result;
+pub use output_projection::printed_tool_result;
 
 /// Marks the locally constructed MCP envelope. Its structuredContent schema is
 /// an independent schema resource supplied by the server, including local refs.

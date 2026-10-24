@@ -203,13 +203,14 @@ def _apply_alpha_to_image(
     pixels = image.load()
     width, height = image.size
     transparent = 0
+    needs_key_like = soft_matte or spill_cleanup
 
     for y in range(height):
         for x in range(width):
             red, green, blue, alpha = pixels[x, y]
             rgb = (red, green, blue)
             distance = _channel_distance(rgb, key)
-            key_like = _looks_key_colored(rgb, key, distance)
+            key_like = needs_key_like and _looks_key_colored(rgb, key, distance)
             output_alpha = (
                 min(
                     _soft_alpha(distance, transparent_threshold, opaque_threshold),

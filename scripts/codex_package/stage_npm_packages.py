@@ -1253,11 +1253,11 @@ def _main() -> int:
             f"{args.github_repo}"
         )
     github_repo = args.github_repo or workflow_repo
-    if vendor_src_arg is None:
-        github_repo = resolve_github_repo(github_repo)
 
     packages = expand_packages(list(args.packages))
     native_component_sets = collect_native_component_sets(packages)
+    if native_component_sets and vendor_src_arg is None:
+        github_repo = resolve_github_repo(github_repo)
     print("Expanded packages: " + ", ".join(packages), flush=True)
     if native_component_sets:
         component_sets = [

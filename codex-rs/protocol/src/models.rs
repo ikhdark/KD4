@@ -2714,10 +2714,10 @@ mod tests {
     fn default_base_instructions_keep_tool_contract_and_evidence_guidance() {
         let instructions = BaseInstructions::default();
         for required in [
-            "Use repository tools through their documented entrypoints and contracts (`--describe`, `--help`, AGENTS.md)",
-            "fix a failed invocation at the call rather than rewriting a working tool",
-            "Stop inspecting when further reading would not change the answer",
-            "Summarize bulk logs and inventories in-tool",
+            "Use documented entrypoints and active schemas",
+            "Fix failed invocations, not working tools.",
+            "For focused questions, stop when further inspection would not change the answer",
+            "Summarize bulk output in-tool",
             "Separate what you observed from what you infer",
         ] {
             assert!(instructions.text.contains(required), "missing: {required}");
@@ -2728,14 +2728,14 @@ mod tests {
     fn default_base_instructions_shorten_the_critical_path_without_dropping_proof() {
         let instructions = BaseInstructions::default();
         for required in [
-            "read them in one batch with the native file tools",
-            "a new turn or passing check alone does not warrant rereading",
-            "recover truncated output from retained artifacts (`read_tool_output`), not reruns",
+            "Batch known reads with native file tools and suitable symbol selectors.",
+            "Reuse evidence unless relevant changes or contradictions require a scoped refresh.",
+            "Recover missing or truncated output from retained artifacts (`read_tool_output`), not reruns.",
             "coverage is the obligation",
-            "Start expensive validation once its relevant inputs are stable, then overlap it with independent review or report writing",
-            "discover and invoke in the same execution cell",
-            "deliver the final answer directly from that cell",
-            "a passing check alone does not establish completion",
+            "Finish and coordinate related edits before checks; do not edit running-check inputs.",
+            "When possible, discover and invoke known follow-ups in one execution cell.",
+            "When supported and results are sufficient, deliver the final answer from the execution cell.",
+            "a passing check alone is not completion",
         ] {
             assert!(instructions.text.contains(required), "missing: {required}");
         }
@@ -2745,10 +2745,10 @@ mod tests {
     fn default_base_instructions_protect_a_shared_checkout() {
         let instructions = BaseInstructions::default();
         for required in [
-            "In shared checkouts",
-            "reconcile affected source immediately before patching",
-            "never replay obsolete whole-file replacements",
-            "Resume live operations rather than restarting or duplicating them, including validation",
+            "Preserve user changes and untouched formatting, Unicode, and line endings.",
+            "Reconcile shared-checkout source immediately before patching",
+            "never replay obsolete replacements",
+            "Resume live operations rather than duplicate them.",
         ] {
             assert!(instructions.text.contains(required), "missing: {required}");
         }
@@ -2758,11 +2758,11 @@ mod tests {
     fn default_base_instructions_rely_on_discovery_and_recover_reported_instruction_gaps() {
         let instructions = BaseInstructions::default();
         for required in [
-            "Rely on the harness's instruction discovery from the project root to the working directory",
-            "do not repeat discovery merely because an explicit completeness signal is absent",
-            "If the harness reports omitted, truncated, or unavailable instructions",
-            "use the supplied recovery guidance or targeted reads to resolve that gap before affected edits",
-            "report unresolved applicability rather than assuming absence",
+            "Supplied AGENTS.md counts as read.",
+            "Trust harness discovery from root to working directory",
+            "recover reported instruction gaps before affected edits",
+            "Check nested instructions only along edit paths:",
+            "`AGENTS.override.md`, then `AGENTS.md`, then configured fallbacks.",
         ] {
             assert!(instructions.text.contains(required), "missing: {required}");
         }
@@ -2775,8 +2775,9 @@ mod tests {
             "For a review of a named file or unit, read that unit and the callers needed to confirm a candidate defect",
             "For a broad audit or an explicit full-read request, coverage is the obligation",
             "narrowing sets inspection order, not coverage",
-            "track unread ranges",
-            "report unexamined areas as a partial audit, never as a clean result",
+            "Track unread ranges, unexamined mechanisms, and required follow-on paths in the working plan.",
+            "Partial results require explicit user-authorized sampling/scope limits or a genuine access/permission blocker after independent work is exhausted",
+            "remaining scope, and concrete recovery needed, never a completed/clean label.",
         ] {
             assert!(instructions.text.contains(required), "missing: {required}");
         }

@@ -31,6 +31,7 @@ codex-model-provider = { workspace = true }
 codex-state = { workspace = true }
 codex-uds = { workspace = true }
 codex-utils-absolute-path = { workspace = true }
+codex-utils-build-info = { workspace = true }
 codex-utils-home-dir = { workspace = true }
 codex-utils-rustls-provider = { workspace = true }
 constant_time_eq = { workspace = true }

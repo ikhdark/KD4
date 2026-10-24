@@ -240,7 +240,8 @@ pub fn mutate_file_if_matches(
     Ok(FileMutationOutcome::Committed)
 }
 
-/// Compares through `file`; memory is bounded by the already admitted preimage.
+/// Compare through the pinned handle using fixed scratch storage. Drain the
+/// same bounded read after a mismatch so a later I/O failure still takes priority.
 fn preimage_matches(file: &File, expected: &[u8]) -> io::Result<bool> {
     let metadata = file.metadata()?;
     if !metadata.is_file() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
@@ -258,10 +259,22 @@ fn preimage_matches(file: &File, expected: &[u8]) -> io::Result<bool> {
     if metadata.len() != expected.len() as u64 {
         return Ok(false);
     }
-    let mut bytes = Vec::with_capacity(expected.len());
-    file.take(expected.len() as u64 + 1)
-        .read_to_end(&mut bytes)?;
-    Ok(bytes == expected)
+    let mut reader = file.take(expected.len() as u64 + 1);
+    let mut scratch = [0u8; 64 * 1024];
+    let mut offset = 0usize;
+    let mut matches = true;
+    loop {
+        let length = match reader.read(&mut scratch) {
+            Ok(0) => break,
+            Ok(length) => length,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        };
+        matches &= expected.get(offset..)
+            .is_some_and(|remaining| remaining.starts_with(&scratch[..length]));
+        offset = offset.saturating_add(length);
+    }
+    Ok(matches && offset == expected.len())
 }
 
 /// The token cannot give a new file the old object's owner or DACL: setting

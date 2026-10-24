@@ -115,6 +115,7 @@ use crate::rpc::RpcCallError;
 use crate::rpc::RpcClient;
 
 pub(crate) mod http_client;
+mod deferred_notification;
 #[path = "client_recovery.rs"]
 pub(crate) mod recovery;
 use crate::ProcessCleanupRecord;
@@ -217,13 +218,18 @@ struct HttpBodyStreams {
     terminals: HashMap<String, Result<HttpRequestBodyDeltaNotification, String>>,
 }
 
+struct UnsupportedFsMethods {
+    connection: Weak<RpcClient>,
+    methods: HashMap<&'static str, String>,
+}
+
 struct Inner {
     instance_id: String,
     cleanup_records: StdMutex<std::collections::VecDeque<ProcessCleanupTicket>>,
     cleanup_records_evicted: AtomicU64,
     file_read_slots: Arc<tokio::sync::Semaphore>,
     // Key negative capability evidence to the transport, not the recoverable client.
-    unsupported_bounded_read: StdMutex<Option<(Weak<RpcClient>, String)>>,
+    unsupported_fs_methods: StdMutex<Option<UnsupportedFsMethods>>,
     connection: StdMutex<ConnectionState>,
     connection_changed: watch::Sender<()>,
     // The remote transport delivers one shared notification stream for every
@@ -243,6 +249,7 @@ struct Inner {
     http_body_stream_next_id: AtomicU64,
     session_id: OnceLock<String>,
     environment_info: OnceLock<EnvironmentInfo>,
+    environment_info_init: Mutex<()>,
     reconnect_strategy: Option<ExecServerReconnectStrategy>,
 }
 
@@ -755,6 +762,10 @@ impl ExecServerClient {
         if let Some(info) = self.inner.environment_info.get() {
             return Ok(info.clone());
         }
+        let _initialization = self.inner.environment_info_init.lock().await;
+        if let Some(info) = self.inner.environment_info.get() {
+            return Ok(info.clone());
+        }
         let rpc_client = self.rpc_client().await?;
         let info = match rpc_client
             .call_with_timeout(ENVIRONMENT_INFO_METHOD, &(), ENVIRONMENT_INFO_TIMEOUT)
@@ -770,6 +781,11 @@ impl ExecServerClient {
 
     pub(crate) fn cached_environment_info(&self) -> Option<EnvironmentInfo> {
         self.inner.environment_info.get().cloned()
+    }
+
+    pub(crate) fn cached_coordination_resource_id(&self) -> Option<String> {
+        self.inner.session_id.get()?;
+        self.inner.environment_info.get()?.resource_id.clone()
     }
 
     pub async fn read(&self, params: ReadParams) -> Result<ReadResponse, ExecServerError> {
@@ -857,16 +873,30 @@ impl ExecServerClient {
         &self,
         params: FsReadFileBoundedParams,
     ) -> Result<FsReadFileBoundedResponse, ExecServerError> {
+        self.call_optional_fs(FS_READ_FILE_BOUNDED_METHOD, &params).await
+    }
+
+    async fn call_optional_fs<P, T>(
+        &self,
+        method: &'static str,
+        params: &P,
+    ) -> Result<T, ExecServerError>
+    where
+        P: serde::Serialize,
+        T: serde::de::DeserializeOwned,
+    {
+        // Only cache method absence, never path, permission or transient errors.
         const METHOD_NOT_FOUND: i64 = -32601;
         let rpc_client = self.rpc_client().await?;
         {
             let unsupported = self
                 .inner
-                .unsupported_bounded_read
+                .unsupported_fs_methods
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if let Some((connection, message)) = unsupported.as_ref()
-                && connection.ptr_eq(&Arc::downgrade(&rpc_client))
+            if let Some(cached) = unsupported.as_ref()
+                && cached.connection.ptr_eq(&Arc::downgrade(&rpc_client))
+                && let Some(message) = cached.methods.get(method)
             {
                 return Err(ExecServerError::Server {
                     code: METHOD_NOT_FOUND,
@@ -875,18 +905,24 @@ impl ExecServerClient {
                 });
             }
         }
-        let result = self
-            .call_rpc(&rpc_client, FS_READ_FILE_BOUNDED_METHOD, &params)
-            .await;
+        let result = self.call_rpc(&rpc_client, method, params).await;
         if let Err(ExecServerError::Server { code, message, .. }) = &result
             && *code == METHOD_NOT_FOUND
         {
-            *self
+            let mut unsupported = self
                 .inner
-                .unsupported_bounded_read
+                .unsupported_fs_methods
                 .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner) =
-                Some((Arc::downgrade(&rpc_client), message.clone()));
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let cached = unsupported.get_or_insert_with(|| UnsupportedFsMethods {
+                connection: Arc::downgrade(&rpc_client),
+                methods: HashMap::new(),
+            });
+            if !cached.connection.ptr_eq(&Arc::downgrade(&rpc_client)) {
+                cached.connection = Arc::downgrade(&rpc_client);
+                cached.methods.clear();
+            }
+            cached.methods.insert(method, message.clone());
         }
         result
     }
@@ -962,7 +998,7 @@ impl ExecServerClient {
     }
 
     pub async fn fs_walk(&self, params: FsWalkParams) -> Result<FsWalkResponse, ExecServerError> {
-        self.call(FS_WALK_METHOD, &params).await
+        self.call_optional_fs(FS_WALK_METHOD, &params).await
     }
 
     pub async fn fs_remove(
@@ -1202,7 +1238,7 @@ impl ExecServerClient {
             instance_id: uuid::Uuid::new_v4().to_string(),
             cleanup_records: StdMutex::new(std::collections::VecDeque::new()),
             cleanup_records_evicted: AtomicU64::new(0),
-            unsupported_bounded_read: StdMutex::new(None),
+            unsupported_fs_methods: StdMutex::new(None),
             file_read_slots: Arc::new(tokio::sync::Semaphore::new(
                 crate::file_read::MAX_OPEN_FILE_READS,
             )),
@@ -1217,6 +1253,7 @@ impl ExecServerClient {
             http_body_stream_next_id: AtomicU64::new(1),
             session_id,
             environment_info: OnceLock::new(),
+            environment_info_init: Mutex::new(()),
             reconnect_strategy,
         });
         let client = Self {
@@ -1342,6 +1379,8 @@ async fn cleanup_process_start(
     client.inner.retain_cleanup(ticket.clone());
     let mut deadline = Instant::now() + PROCESS_TERMINATION_TIMEOUT;
     let mut poll_delay = Duration::from_millis(10);
+    let mut wake = state.subscribe();
+    let mut terminal_hint = [false; 3];
     let settlement = loop {
         match client
             .terminate_with_incarnation_before(
@@ -1353,7 +1392,7 @@ async fn cleanup_process_start(
         {
             Ok(response) if !response.running => break ProcessCleanupStatus::Confirmed,
             Ok(_) => {
-                if tokio::time::timeout_at(deadline, tokio::time::sleep(poll_delay))
+                if wait_for_termination_reconciliation(state, &mut wake, &mut terminal_hint, deadline)
                     .await
                     .is_err()
                 {
@@ -1392,6 +1431,40 @@ async fn cleanup_process_start(
     client.inner.remove_session_if(process_id, state);
 }
 
+/// Notifications are hints, never termination proof: callers always reconcile
+/// through the incarnation-fenced RPC, including its server-side finish step.
+/// Ordinary output cannot amplify RPCs, and missing/dropped notifications still
+/// reach a bounded fallback inside the existing cleanup deadline.
+async fn wait_for_termination_reconciliation(
+    state: &SessionState,
+    wake: &mut watch::Receiver<u64>,
+    terminal_hint: &mut [bool; 3],
+    deadline: Instant,
+) -> Result<(), tokio::time::error::Elapsed> {
+    tokio::time::timeout_at(deadline, async {
+        let fallback = tokio::time::sleep(Duration::from_secs(1));
+        tokio::pin!(fallback);
+        loop {
+            let hint = {
+                let events = state.ordered_events.lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                [events.observed_exited, events.closed_published, events.failure.is_some()]
+            };
+            if hint != *terminal_hint && hint.contains(&true) {
+                *terminal_hint = hint;
+                return;
+            }
+            tokio::select! {
+                biased;
+                _ = &mut fallback => return,
+                changed = wake.changed() => {
+                    if changed.is_err() { return; }
+                }
+            }
+        }
+    }).await
+}
+
 impl From<RpcCallError> for ExecServerError {
     fn from(value: RpcCallError) -> Self {
         match value {
@@ -1427,14 +1500,18 @@ impl SessionState {
             )
     }
     fn new(recoverable: bool) -> Self {
+        Self::with_event_log(recoverable, ExecProcessEventLog::new(
+            PROCESS_EVENT_CHANNEL_CAPACITY,
+            PROCESS_EVENT_RETAINED_BYTES,
+        ))
+    }
+
+    fn with_event_log(recoverable: bool, events: ExecProcessEventLog) -> Self {
         let (wake_tx, _wake_rx) = watch::channel(0);
         Self {
             incarnation: uuid::Uuid::new_v4().to_string(),
             wake_tx,
-            events: ExecProcessEventLog::new(
-                PROCESS_EVENT_CHANNEL_CAPACITY,
-                PROCESS_EVENT_RETAINED_BYTES,
-            ),
+            events,
             ordered_events: StdMutex::new(OrderedSessionEvents::default()),
             recoverable: AtomicBool::new(recoverable),
             next_write_id: AtomicU64::new(1),
@@ -1778,7 +1855,8 @@ impl Session {
 
     pub(crate) async fn terminate(&self) -> Result<(), ExecServerError> {
         let deadline = Instant::now() + PROCESS_TERMINATION_TIMEOUT;
-        let mut poll_delay = Duration::from_millis(10);
+        let mut wake = self.state.subscribe();
+        let mut terminal_hint = [false; 3];
         loop {
             match self
                 .client
@@ -1791,9 +1869,11 @@ impl Session {
             {
                 Ok(response) if !response.running => return Ok(()),
                 Ok(_) => {
-                    tokio::time::timeout_at(
+                    wait_for_termination_reconciliation(
+                        &self.state,
+                        &mut wake,
+                        &mut terminal_hint,
                         deadline,
-                        tokio::time::sleep(poll_delay),
                     )
                     .await
                     .map_err(|_| {
@@ -1801,7 +1881,6 @@ impl Session {
                             "timed out confirming process termination after {PROCESS_TERMINATION_TIMEOUT:?}"
                         ))
                     })?;
-                    poll_delay = (poll_delay * 2).min(Duration::from_millis(250));
                 }
                 Err(error)
                     if is_transport_closed_error(&error) && !self.client.inner.is_failed() =>
@@ -1843,7 +1922,7 @@ impl Inner {
         }
         records.push_back(ticket);
     }
-    fn get_session(&self, process_id: &ProcessId) -> Option<Arc<SessionState>> {
+    fn get_session(&self, process_id: &str) -> Option<Arc<SessionState>> {
         self.sessions.load().get(process_id).cloned()
     }
 
@@ -1954,8 +2033,20 @@ async fn handle_server_notification(
             }
         }
         EXEC_OUTPUT_DELTA_METHOD => {
-            let params: ExecOutputDeltaNotification =
-                serde_json::from_value(notification.params.unwrap_or(Value::Null))?;
+            let value = notification.params.unwrap_or(Value::Null);
+            let unregistered = value.get("processId").and_then(Value::as_str)
+                .is_some_and(|id| inner.get_session(id).is_none());
+            let (mut params, deferred): (ExecOutputDeltaNotification, _) = if unregistered {
+                deferred_notification::parse_without_chunk(value, "chunk")?
+            } else {
+                (serde_json::from_value(value)?, None)
+            };
+            if let Some(encoded) = deferred {
+                // Registration may race validation. Never deliver to a route
+                // captured before expensive decoding, and never skip malformed bytes.
+                if inner.get_session(&params.process_id).is_none() { return Ok(()); }
+                params.chunk = serde_json::from_value(Value::String(encoded))?;
+            }
             if let Some(session) = inner.get_session(&params.process_id) {
                 let result =
                     session.publish_ordered_event(ExecProcessEvent::Output(ProcessOutputChunk {

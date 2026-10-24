@@ -40,6 +40,12 @@ const MINIMUM_RELATIVE_SAVINGS_PERCENT: u64 = 25;
 const LEDGER_VERSION: u8 = 1;
 const JOURNAL_VERSION: u8 = 1;
 
+pub(crate) struct PreparedArtifactPins {
+    pub(crate) payload: serde_json::Value,
+    // Unadorned candidate values, scoped to this immutable preparation only.
+    pub(crate) rendered_candidates: BTreeMap<String, serde_json::Value>,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub(crate) struct ModelGenerationId {
     pub(crate) turn_id: String,
@@ -296,14 +302,28 @@ pub(crate) struct ToolHistoryCandidate {
     pub(crate) derived: ToolHistoryCandidateDerived,
 }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default)]
 pub(crate) struct ToolHistoryCandidateDerived {
     receipt_id: String,
     bounded_model_output_sha256: String,
     bounded_model_output_tokens: u64,
     receipt: Option<String>,
     receipt_tokens: u64,
+    checkpoint_pin: std::sync::OnceLock<Option<(String, usize)>>,
 }
+
+impl PartialEq for ToolHistoryCandidateDerived {
+    fn eq(&self, other: &Self) -> bool {
+        // Lazy acquisition state is not part of evidence or candidate identity.
+        self.receipt_id == other.receipt_id
+            && self.bounded_model_output_sha256 == other.bounded_model_output_sha256
+            && self.bounded_model_output_tokens == other.bounded_model_output_tokens
+            && self.receipt == other.receipt
+            && self.receipt_tokens == other.receipt_tokens
+    }
+}
+
+impl Eq for ToolHistoryCandidateDerived {}
 
 impl ToolHistoryCandidate {
     pub(crate) fn artifact_reference(&self) -> (u64, String) {
@@ -311,7 +331,7 @@ impl ToolHistoryCandidate {
     }
 
     fn artifact_pin_value(&self) -> Option<serde_json::Value> {
-        if !self.complete || !self.projection_eligible {
+        if !self.artifact_pin_available() {
             return None;
         }
         Some(serde_json::json!({
@@ -334,6 +354,10 @@ impl ToolHistoryCandidate {
         }))
     }
 
+    fn artifact_pin_available(&self) -> bool {
+        self.complete && self.projection_eligible
+    }
+
     fn artifact_pin(&self) -> Option<(String, usize)> {
         let rendered = serde_json::to_string(&self.artifact_pin_value()?).ok()?;
         let tokens = approx_token_count(&rendered);
@@ -348,15 +372,17 @@ impl ToolHistoryCandidate {
         if !self.complete || !self.projection_eligible || self.consumed_by_generation.is_none() {
             return None;
         }
-        let pin = self.artifact_pin()?;
-        let original = codex_utils_output_truncation::model_token_count(&self.bounded_model_output);
-        let replacement = codex_utils_output_truncation::model_token_count(&pin.0);
-        let saved = original.saturating_sub(replacement);
-        (original >= MINIMUM_RAW_TOKENS as usize
-            && saved >= MINIMUM_SAVED_TOKENS as usize
-            && saved.saturating_mul(100) / original.max(1)
-                >= MINIMUM_RELATIVE_SAVINGS_PERCENT as usize)
-            .then_some(pin)
+        self.derived.checkpoint_pin.get_or_init(|| {
+            let pin = self.artifact_pin()?;
+            let original = codex_utils_output_truncation::model_token_count(&self.bounded_model_output);
+            let replacement = codex_utils_output_truncation::model_token_count(&pin.0);
+            let saved = original.saturating_sub(replacement);
+            (original >= MINIMUM_RAW_TOKENS as usize
+                && saved >= MINIMUM_SAVED_TOKENS as usize
+                && saved.saturating_mul(100) / original.max(1)
+                    >= MINIMUM_RELATIVE_SAVINGS_PERCENT as usize)
+                .then_some(pin)
+        }).clone()
     }
 
     #[cfg(test)]
@@ -416,6 +442,7 @@ impl ToolHistoryCandidate {
             bounded_model_output_tokens,
             receipt,
             receipt_tokens,
+            checkpoint_pin: std::sync::OnceLock::new(),
         };
     }
 
@@ -2174,7 +2201,7 @@ impl ToolHistoryState {
             };
             if reused.contains(call_id)
                 || retired.contains(call_id)
-                || non_text_output_token_cost(item) != 0
+                || has_non_text_output(item)
                 || candidate
                     .consumed_by_generation
                     .as_ref()
@@ -2572,13 +2599,27 @@ impl ToolHistoryState {
     /// Sampling and its token estimate share this, so the estimate that drives
     /// automatic compaction sees the prompt sampling will actually send.
     pub(crate) fn apply_checkpoint_pins(&self, items: &Arc<[ResponseItem]>) -> Arc<[ResponseItem]> {
-        let reused = crate::tool_occurrence::reused_call_ids(items);
         // Explicit phase checkpoints can also retire current-task evidence.
-        let retired = items
-            .iter()
-            .filter_map(phase_checkpoint_ids)
-            .flatten()
-            .collect::<BTreeSet<_>>();
+        let mut retired = BTreeSet::new();
+        let mut pressure_cleanup = false;
+        for item in items.iter() {
+            if let Some(payload) = phase_checkpoint_payload(item) {
+                pressure_cleanup |= payload["source"] == PRESSURE_RETIREMENT_SOURCE;
+                if let Some(receipts) = payload["receipts"].as_object() {
+                    retired.extend(receipts.keys().cloned());
+                }
+            }
+        }
+        if retired.is_empty() {
+            return if pressure_cleanup {
+                items.iter().filter(|item| !phase_checkpoint_payload(item)
+                    .is_some_and(|payload| payload["source"] == PRESSURE_RETIREMENT_SOURCE))
+                    .cloned().collect::<Vec<_>>().into()
+            } else {
+                Arc::clone(items)
+            };
+        }
+        let reused = crate::tool_occurrence::reused_call_ids(items);
         let mut checkpointed = ProjectedResponseItems::Shared(Arc::clone(items));
         let resolutions = FailureResolutionIndex::default();
         for (index, item) in items.iter().enumerate() {
@@ -2587,7 +2628,7 @@ impl ToolHistoryState {
             };
             if reused.contains(call_id)
                 || !retired.contains(call_id)
-                || non_text_output_token_cost(item) != 0
+                || has_non_text_output(item)
             {
                 continue;
             }
@@ -2610,10 +2651,7 @@ impl ToolHistoryState {
         }
         // Recovery pins carry the needed addresses. Runtime retirement records
         // remain in canonical history, not in every subsequent model request.
-        if items.iter().any(|item| {
-            phase_checkpoint_payload(item)
-                .is_some_and(|payload| payload["source"] == PRESSURE_RETIREMENT_SOURCE)
-        }) {
+        if pressure_cleanup {
             checkpointed.make_owned().retain(|item| {
                 !phase_checkpoint_payload(item)
                     .is_some_and(|payload| payload["source"] == PRESSURE_RETIREMENT_SOURCE)
@@ -2833,8 +2871,20 @@ impl ToolHistoryState {
         requirements
     }
 
+    /// Share conservative substring discovery across retention/sidecar passes.
+    /// Keep arbitrary legacy IDs and overlapping references, not JSON tokens.
+    fn internal_artifact_references(&self, text: &str) -> BTreeSet<String> {
+        self.internal_artifact_origins.keys()
+            .filter(|id| text.contains(id.as_str())).cloned().collect()
+    }
+
     pub(crate) fn retain_for_history(&mut self, items: &[ResponseItem]) {
-        let serialized = serde_json::to_string(items).unwrap_or_default();
+        let serialized = if self.internal_artifact_origins.is_empty() {
+            String::new()
+        } else {
+            serde_json::to_string(items).unwrap_or_default()
+        };
+        let references = self.internal_artifact_references(&serialized);
         // Legacy directories are hydrated on load. If exact membership could
         // not be read/authenticated, do not guess and delete their dependencies.
         if self
@@ -2842,7 +2892,7 @@ impl ToolHistoryState {
             .iter()
             .any(|(id, ArtifactOrigin(source, _, _, _))| {
                 source == "context:artifact_directory"
-                    && serialized.contains(id)
+                    && references.contains(id)
                     && !self.artifact_directory_members.contains_key(id)
             })
         {
@@ -2850,12 +2900,7 @@ impl ToolHistoryState {
         }
         // Candidate references require typed receipts or explicit reads, not
         // coincidental IDs in prose. Host context directories keep their path.
-        let mut artifacts = self
-            .internal_artifact_origins
-            .keys()
-            .filter(|id| serialized.contains(id.as_str()))
-            .cloned()
-            .collect::<BTreeSet<_>>();
+        let mut artifacts = references.clone();
         let mut pending = artifacts.iter().cloned().collect::<Vec<_>>();
         while let Some(id) = pending.pop() {
             if self.internal_artifact_origins.get(&id).is_some_and(
@@ -2916,7 +2961,7 @@ impl ToolHistoryState {
                 .map(|candidate| candidate.call_id.clone()),
         );
         for (artifact_id, ArtifactOrigin(call_id, _, _, _)) in &self.internal_artifact_origins {
-            if serialized.contains(artifact_id) {
+            if references.contains(artifact_id) {
                 live.insert(call_id.clone());
             }
         }
@@ -2930,21 +2975,26 @@ impl ToolHistoryState {
         // Host context sources share names (for example context:plan), but a
         // reference to one snapshot must not retain every snapshot of that name.
         let live_calls = &live;
-        let nested_outputs = self
-            .code_mode_nested_evidence
-            .iter()
-            .flat_map(|(parent, results)| {
-                results.iter().filter(move |(call, _)| {
-                    live_calls.contains(parent) || live_calls.contains(*call)
+        let nested_references = if self.internal_artifact_origins.is_empty() {
+            BTreeSet::new()
+        } else {
+            let nested_outputs = self
+                .code_mode_nested_evidence
+                .iter()
+                .flat_map(|(parent, results)| {
+                    results.iter().filter(move |(call, _)| {
+                        live_calls.contains(parent) || live_calls.contains(*call)
+                    })
                 })
-            })
-            .map(|(_, result)| result.output.as_str())
-            .collect::<Vec<_>>()
-            .join("\n");
+                .map(|(_, result)| result.output.as_str())
+                .collect::<Vec<_>>()
+                .join("\n");
+            self.internal_artifact_references(&nested_outputs)
+        };
         self.internal_artifact_origins
             .retain(|id, ArtifactOrigin(call_id, _, _, _)| {
                 artifacts.contains(id)
-                    || nested_outputs.contains(id)
+                    || nested_references.contains(id)
                     || (!call_id.starts_with("context:") && live.contains(call_id))
             });
         self.artifact_directory_members
@@ -2978,6 +3028,9 @@ impl ToolHistoryState {
         &self,
         items: &[ResponseItem],
     ) -> BTreeMap<String, (std::cmp::Reverse<usize>, usize)> {
+        if self.candidates.is_empty() {
+            return BTreeMap::new();
+        }
         let mut by_artifact = BTreeMap::<&str, Vec<&ToolHistoryCandidate>>::new();
         for candidate in self.candidates.values() {
             by_artifact
@@ -3155,7 +3208,14 @@ impl ToolHistoryState {
         &self,
         candidate: &ToolHistoryCandidate,
     ) -> Option<serde_json::Value> {
-        let mut pin = candidate.artifact_pin_value()?;
+        Some(self.decorate_artifact_pin_value(candidate, candidate.artifact_pin_value()?))
+    }
+
+    fn decorate_artifact_pin_value(
+        &self,
+        candidate: &ToolHistoryCandidate,
+        mut pin: serde_json::Value,
+    ) -> serde_json::Value {
         if self
             .workspace_evidence
             .get(&candidate.call_id)
@@ -3170,7 +3230,7 @@ impl ToolHistoryState {
         {
             pin["sources"] = sources;
         }
-        Some(pin)
+        pin
     }
 
     /// Paths observed through a call whose own receipt names no source: a
@@ -3203,11 +3263,23 @@ impl ToolHistoryState {
     }
 
     pub(crate) fn artifact_recovery_directory(&self) -> serde_json::Value {
+        self.artifact_recovery_directory_reusing(&mut BTreeMap::new())
+    }
+
+    pub(crate) fn artifact_recovery_directory_reusing(
+        &self,
+        rendered: &mut BTreeMap<String, serde_json::Value>,
+    ) -> serde_json::Value {
         let mut pins = self
             .candidates
             .values()
             .filter_map(|candidate| {
-                let mut pin = self.artifact_pin_value_for(candidate)?;
+                if !candidate.artifact_pin_available() {
+                    return None;
+                }
+                let raw = rendered.remove(&candidate.call_id)
+                    .or_else(|| candidate.artifact_pin_value())?;
+                let mut pin = self.decorate_artifact_pin_value(candidate, raw);
                 if let Some(ranges) = self.recovered_artifact_selectors(&candidate.artifact_id) {
                     pin["recovered_selectors"] = serde_json::json!(ranges);
                 }
@@ -3227,6 +3299,13 @@ impl ToolHistoryState {
     /// prompt. Compaction appends this separately from model-authored prose so retention does not
     /// depend on the model copying a receipt byte-for-byte into its summary.
     pub(crate) fn artifact_pin_payload_for_items(&self, items: &[ResponseItem]) -> Option<String> {
+        serde_json::to_string(&self.prepare_artifact_pin_payload_for_items(items)?.payload).ok()
+    }
+
+    pub(crate) fn prepare_artifact_pin_payload_for_items(&self, items: &[ResponseItem]) -> Option<PreparedArtifactPins> {
+        if self.candidates.is_empty() && self.internal_artifact_origins.is_empty() {
+            return None;
+        }
         let mut candidates = self
             .artifact_reference_positions(items)
             .into_iter()
@@ -3238,25 +3317,26 @@ impl ToolHistoryState {
             .collect::<Vec<_>>();
         candidates.sort_by_key(|(index, _)| *index);
         let mut seen = BTreeSet::new();
+        enum PinReference<'a> {
+            Candidate(&'a ToolHistoryCandidate),
+            Internal(&'a String, &'a ArtifactOrigin),
+        }
         let mut pins = candidates
             .into_iter()
             .filter(|(_, candidate)| seen.insert(candidate.artifact_id.clone()))
-            .filter_map(|(_, candidate)| self.artifact_pin_value_for(candidate))
+            .filter(|(_, candidate)| candidate.artifact_pin_available())
+            .map(|(_, candidate)| PinReference::Candidate(candidate))
             .collect::<Vec<_>>();
-        let serialized = serde_json::to_string(items).ok()?;
+        let references = if self.internal_artifact_origins.is_empty() {
+            BTreeSet::new()
+        } else {
+            self.internal_artifact_references(&serde_json::to_string(items).ok()?)
+        };
         pins.extend(
             self.internal_artifact_origins
                 .iter()
-                .filter(|(id, _)| serialized.contains(id.as_str()) && seen.insert((*id).clone()))
-                .map(|(id, ArtifactOrigin(call_id, bytes, sha, _))| {
-                    let mut pin = serde_json::json!({
-                        "artifact_id": id, "call_id": call_id, "bytes": bytes, "sha256": sha,
-                    });
-                    if let Some(sources) = self.pin_sources(call_id) {
-                        pin["sources"] = sources;
-                    }
-                    pin
-                }),
+                .filter(|(id, _)| references.contains(*id) && seen.insert((*id).clone()))
+                .map(|(id, origin)| PinReference::Internal(id, origin)),
         );
         let total = pins.len();
         if total == 0 {
@@ -3272,10 +3352,27 @@ impl ToolHistoryState {
         });
         // Charge the serialized envelope as well as the pins. Do not truncate JSON or a
         // recovery handle, and prefer the newest references rather than call-id ordering.
-        for mut pin in pins {
+        let mut rendered_candidates = BTreeMap::new();
+        for reference in pins {
             if payload["artifacts"].as_array()?.len() == COMPACTION_ARTIFACT_PIN_MAX_ITEMS {
                 break;
             }
+            let mut pin = match reference {
+                PinReference::Candidate(candidate) => {
+                    let raw = candidate.artifact_pin_value()?;
+                    rendered_candidates.insert(candidate.call_id.clone(), raw.clone());
+                    self.decorate_artifact_pin_value(candidate, raw)
+                }
+                PinReference::Internal(id, ArtifactOrigin(call_id, bytes, sha, _)) => {
+                    let mut pin = serde_json::json!({
+                        "artifact_id": id, "call_id": call_id, "bytes": bytes, "sha256": sha,
+                    });
+                    if let Some(sources) = self.pin_sources(call_id) {
+                        pin["sources"] = sources;
+                    }
+                    pin
+                }
+            };
             if let Some(ranges) = pin["artifact_id"]
                 .as_str()
                 .and_then(|id| self.recovered_artifact_selectors(id))
@@ -3307,7 +3404,7 @@ impl ToolHistoryState {
         }
         payload["omitted_artifact_count"] =
             serde_json::json!(total - payload["artifacts"].as_array()?.len());
-        serde_json::to_string(&payload).ok()
+        Some(PreparedArtifactPins { payload, rendered_candidates })
     }
 
     fn retain_retrievable_artifacts(
@@ -4808,25 +4905,16 @@ fn textual_output_body_mut(item: &mut ResponseItem) -> Option<(&str, &mut Functi
     }
 }
 
-fn non_text_output_token_cost(item: &ResponseItem) -> usize {
+fn has_non_text_output(item: &ResponseItem) -> bool {
     let output = match item {
         ResponseItem::FunctionCallOutput { output, .. }
         | ResponseItem::CustomToolCallOutput { output, .. } => output,
-        _ => return 0,
+        _ => return false,
     };
     let FunctionCallOutputBody::ContentItems(items) = &output.body else {
-        return 0;
+        return false;
     };
-    let non_text = items
-        .iter()
-        .filter(|item| !matches!(item, FunctionCallOutputContentItem::InputText { .. }))
-        .collect::<Vec<_>>();
-    if non_text.is_empty() {
-        return 0;
-    }
-    serde_json::to_string(&non_text)
-        .map(|serialized| approx_token_count(&serialized))
-        .unwrap_or(usize::MAX)
+    items.iter().any(|item| !matches!(item, FunctionCallOutputContentItem::InputText { .. }))
 }
 
 fn canonical_model_visible_output_text(body: &FunctionCallOutputBody) -> Option<Cow<'_, str>> {

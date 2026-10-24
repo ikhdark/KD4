@@ -49,19 +49,22 @@ pub fn with_config_overrides(mut model: ModelInfo, config: &ModelsManagerConfig)
     if let Some(base_instructions) = &config.base_instructions {
         model.base_instructions = base_instructions.clone();
         clear_instruction_messages(&mut model);
-    } else if !config.personality_enabled {
-        clear_instruction_messages(&mut model);
-    } else if let Some(template) = model
-        .model_messages
-        .as_ref()
-        .and_then(|messages| messages.instructions_template.as_ref())
-    {
-        // Personality is emitted separately; retain the template's neutral policy
-        // in the shared base projection used by startup and turn construction.
-        let neutral = template.replace(PERSONALITY_PLACEHOLDER, "");
-        // Mirrored templates must not perturb established prompt/cache bytes.
-        if neutral.trim() != model.base_instructions.trim() {
-            model.base_instructions = neutral;
+    } else {
+        if let Some(template) = model
+            .model_messages
+            .as_ref()
+            .and_then(|messages| messages.instructions_template.as_ref())
+        {
+            // Personality is emitted separately; retain the template's neutral policy
+            // even when personality is disabled, before clearing its style metadata.
+            let neutral = template.replace(PERSONALITY_PLACEHOLDER, "");
+            // Mirrored templates must not perturb established prompt/cache bytes.
+            if neutral.trim() != model.base_instructions.trim() {
+                model.base_instructions = neutral;
+            }
+        }
+        if !config.personality_enabled {
+            clear_instruction_messages(&mut model);
         }
     }
 
@@ -175,6 +178,13 @@ fn local_personality_messages_for_slug(
 }
 
 pub(crate) fn apply_local_personality_messages(model: &mut ModelInfo, requested_slug: &str) {
+    // These are fallback styles, not an override for an authoritative catalog's
+    // template policy or separately authored personality values.
+    if model.model_messages.as_ref().is_some_and(|messages| {
+        messages.instructions_template.is_some() || messages.instructions_variables.is_some()
+    }) {
+        return;
+    }
     let Some(mut local_messages) =
         local_personality_messages_for_slug(requested_slug, &model.base_instructions)
     else {

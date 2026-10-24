@@ -102,11 +102,13 @@ fn insert_directory_cache(
     cache.insert(key, entry);
 }
 
+type DirectoryRefresh = tokio::sync::Mutex<Option<Result<Vec<AppInfo>, String>>>;
+
 static DIRECTORY_REFRESH_LOCKS: LazyLock<
-    StdMutex<HashMap<ConnectorDirectoryCacheKey, Weak<tokio::sync::Mutex<()>>>>,
+    StdMutex<HashMap<ConnectorDirectoryCacheKey, Weak<DirectoryRefresh>>>,
 > = LazyLock::new(|| StdMutex::new(HashMap::new()));
 
-fn directory_refresh_lock(cache_key: &ConnectorDirectoryCacheKey) -> Arc<tokio::sync::Mutex<()>> {
+fn directory_refresh_lock(cache_key: &ConnectorDirectoryCacheKey) -> Arc<DirectoryRefresh> {
     let mut locks = DIRECTORY_REFRESH_LOCKS
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -114,7 +116,7 @@ fn directory_refresh_lock(cache_key: &ConnectorDirectoryCacheKey) -> Arc<tokio::
         return lock;
     }
     locks.retain(|_, lock| lock.strong_count() > 0);
-    let lock = Arc::new(tokio::sync::Mutex::new(()));
+    let lock = Arc::new(tokio::sync::Mutex::new(None));
     locks.insert(cache_key.clone(), Arc::downgrade(&lock));
     lock
 }
@@ -228,7 +230,7 @@ where
     }
 
     // Serialize refreshes for this identity through memory and disk publication.
-    let refresh_guard = directory_refresh_lock(&cache_context.cache_key)
+    let mut refresh_guard = directory_refresh_lock(&cache_context.cache_key)
         .lock_owned()
         .await;
     if !force_refetch
@@ -238,36 +240,51 @@ where
         return Ok(cached_connectors);
     }
 
-    let apps = if cache_context.cache_key.is_workspace_account {
-        let workspace_page =
-            fetch_page("/connectors/directory/list_workspace?external_logos=true".to_string());
-        // Share only synchronous future construction, never a lock across await.
-        // Both pagination chains run in this task and are dropped together on error
-        // or cancellation. The mutex preserves Send for mutable fetch callbacks.
-        let fetch_page = StdMutex::new(&mut fetch_page);
-        let fetch_page = |path| {
-            fetch_page
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)(path)
-        };
-        let workspace_listing = async {
-            list_directory_pages(
-                &mut &fetch_page,
-                "/connectors/directory/list_workspace",
-                workspace_page.await?,
-            )
-            .await
-        };
-        let mut public_fetch = &fetch_page;
-        let (mut apps, workspace_apps) = tokio::try_join!(
-            list_directory_connectors(&mut public_fetch),
-            workspace_listing
-        )?;
-        // Keep public-before-workspace precedence regardless of completion order.
-        apps.extend(workspace_apps);
-        apps
-    } else {
-        list_directory_connectors(&mut fetch_page).await?
+    // Share only this active cohort's failure. Once its last waiter drops,
+    // the weak registry entry cannot suppress a later independent retry.
+    if !force_refetch && let Some(result) = refresh_guard.as_ref() {
+        return result.clone().map_err(anyhow::Error::msg);
+    }
+    let apps: anyhow::Result<_> = async {
+        if cache_context.cache_key.is_workspace_account {
+            let workspace_page =
+                fetch_page("/connectors/directory/list_workspace?external_logos=true".to_string());
+            // Share only synchronous future construction, never a lock across await.
+            // Both pagination chains run in this task and are dropped together on error
+            // or cancellation. The mutex preserves Send for mutable fetch callbacks.
+            let fetch_page = StdMutex::new(&mut fetch_page);
+            let fetch_page = |path| {
+                fetch_page
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)(path)
+            };
+            let workspace_listing = async {
+                list_directory_pages(
+                    &mut &fetch_page,
+                    "/connectors/directory/list_workspace",
+                    workspace_page.await?,
+                )
+                .await
+            };
+            let mut public_fetch = &fetch_page;
+            let (mut apps, workspace_apps) = tokio::try_join!(
+                list_directory_connectors(&mut public_fetch),
+                workspace_listing
+            )?;
+            // Keep public-before-workspace precedence regardless of completion order.
+            apps.extend(workspace_apps);
+            Ok(apps)
+        } else {
+            list_directory_connectors(&mut fetch_page).await
+        }
+    }
+    .await;
+    let apps = match apps {
+        Ok(apps) => apps,
+        Err(error) => {
+            *refresh_guard = Some(Err(format!("{error:#}")));
+            return Err(error);
+        }
     };
 
     let mut connectors = merge_directory_apps(apps)
@@ -291,8 +308,8 @@ where
     });
     tokio::task::spawn_blocking(move || {
         // A cancelled caller must not release refresh ownership while this worker writes.
-        let _refresh_guard = refresh_guard;
         write_cached_directory_connectors(&cache_context, &connectors);
+        *refresh_guard = Some(Ok(connectors.clone()));
         connectors
     })
     .await

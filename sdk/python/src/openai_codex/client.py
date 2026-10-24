@@ -8,7 +8,7 @@ import threading
 import time
 import uuid
 from _thread import LockType
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Iterator, TypeVar
@@ -115,6 +115,8 @@ def _params_dict(
         | JsonObject
         | None
     ),
+    *,
+    exclude_fields: set[str] | None = None,
 ) -> JsonObject:
     if params is None:
         return {}
@@ -122,6 +124,7 @@ def _params_dict(
         dumped = params.model_dump(
             by_alias=True,
             exclude_none=True,
+            exclude=exclude_fields,
             mode="json",
         )
         if not isinstance(dumped, dict):
@@ -443,8 +446,9 @@ class CodexClient:
                 operation.proc, operation.router = proc, router
                 operation.epoch = self._process_epoch
             self._start_stderr_drain_thread(proc)
-            self._start_reader_thread(proc, router)
-            self._start_exit_observer(proc, router, self._reader_thread)
+            delivery_lock = threading.Lock()
+            self._start_reader_thread(proc, router, delivery_lock)
+            self._start_exit_observer(proc, router, self._reader_thread, delivery_lock)
 
     def close(self) -> None:
         with self._lifecycle_lock:
@@ -889,7 +893,7 @@ class CodexClient:
                     f"thread has an active goal operation: {thread_id}",
                 )
             payload = {
-                **_params_dict(params),
+                **_params_dict(params, exclude_fields={"input", "thread_id"}),
                 "threadId": thread_id,
                 "input": self._normalize_input_items(input_items),
             }
@@ -1085,13 +1089,15 @@ class CodexClient:
         self._stderr_thread = threading.Thread(target=_drain, daemon=True)
         self._stderr_thread.start()
 
-    def _start_reader_thread(self, proc: subprocess.Popen[str], router: MessageRouter) -> None:
+    def _start_reader_thread(
+        self, proc: subprocess.Popen[str], router: MessageRouter, delivery_lock: LockType
+    ) -> None:
         """Start the sole stdout reader that fans messages into router queues."""
         if proc.stdout is None:
             return
 
         self._reader_thread = threading.Thread(
-            target=self._reader_loop, args=(proc, router), daemon=True
+            target=self._reader_loop, args=(proc, router, delivery_lock), daemon=True
         )
         self._reader_thread.start()
 
@@ -1100,6 +1106,7 @@ class CodexClient:
         proc: subprocess.Popen[str],
         router: MessageRouter,
         reader: threading.Thread | None,
+        delivery_lock: LockType,
     ) -> None:
         """Observe root exit independently of descendant-held buffered pipes.
 
@@ -1112,23 +1119,29 @@ class CodexClient:
                 code = proc.wait()
                 if reader is not None:
                     reader.join(timeout=0.1)
-                with self._lifecycle_lock:
-                    if proc is not self._proc or router is not self._router or self._closing:
-                        return
-                    self._stopped.set()
-                incomplete = reader is not None and reader.is_alive()
-                suffix = (
-                    "; trailing output capture is incomplete; reader cleanup remains owned"
-                    if incomplete
-                    else ""
-                )
-                router.fail_all(
-                    TransportClosedError(f"Codex process exited with code {code}{suffix}")
-                )
+                # A slow decode/coercion is not a descendant-held pipe. Let the
+                # frame currently being delivered reach terminal retention
+                # before publishing sticky transport failure. Blocking readline
+                # never owns this lock; explicit close also remains independent.
+                with delivery_lock:
+                    with self._lifecycle_lock:
+                        if proc is not self._proc or router is not self._router or self._closing:
+                            return
+                        self._stopped.set()
+                    incomplete = reader is not None and reader.is_alive()
+                    suffix = (
+                        "; trailing output capture is incomplete; reader cleanup remains owned"
+                        if incomplete
+                        else ""
+                    )
+                    router.fail_all(
+                        TransportClosedError(f"Codex process exited with code {code}{suffix}")
+                    )
             except OSError as error:
-                router.fail_all(
-                    TransportClosedError(f"Codex process exit observation failed: {error}")
-                )
+                with delivery_lock:
+                    router.fail_all(
+                        TransportClosedError(f"Codex process exit observation failed: {error}")
+                    )
 
         self._exit_thread = threading.Thread(target=observe, name="codex-exit", daemon=True)
         self._exit_thread.start()
@@ -1137,23 +1150,29 @@ class CodexClient:
         self,
         proc: subprocess.Popen[str] | None = None,
         router: MessageRouter | None = None,
+        delivery_lock: LockType | None = None,
     ) -> None:
         """Continuously classify transport messages into requests, responses, and events."""
         active_router = router or self._router
-        try:
-            while True:
-                msg = self._read_message(proc)
-                if "method" in msg and "id" in msg:
-                    self._dispatch_server_request(msg, proc, active_router)
-                    continue
-                if "method" in msg and "id" not in msg:
+
+        def dispatch(msg: dict[str, JsonValue]) -> None:
+            if "method" in msg:
+                if "id" not in msg:
                     method = msg["method"]
                     if isinstance(method, str):
                         active_router.route_notification(
                             self._coerce_notification(method, msg.get("params"))
                         )
-                    continue
+            else:
                 active_router.route_response(msg)
+
+        try:
+            while True:
+                msg = self._read_message(proc, dispatch=dispatch, delivery_lock=delivery_lock)
+                if "method" in msg and "id" in msg:
+                    # Capacity-exhaustion replies can wait on stdin. Neither
+                    # those writes nor application callbacks own the frame fence.
+                    self._dispatch_server_request(msg, proc, active_router)
         except BaseException as exc:
             active_router.fail_all(exc)
             if proc is not None:
@@ -1204,7 +1223,7 @@ class CodexClient:
         with self._lifecycle_lock:
             epoch = self._process_epoch
 
-        def reply(payload: JsonObject) -> None:
+        def reply(payload: JsonObject, *, wait_for_write: bool = True) -> None:
             # Never send an old approval onto a replacement transport. Recheck
             # at the write owner as well, since restart can race this snapshot.
             with self._operation(control=True) as operation:
@@ -1221,7 +1240,7 @@ class CodexClient:
                     # The callback (e.g. a human approval) may outlive the
                     # operation budget; its reply still gets a full write budget.
                     operation.deadline = time.monotonic() + self.config.operation_timeout_s
-                self._write_message(payload, proc=proc)
+                self._write_message(payload, proc=proc, wait_for_write=wait_for_write)
 
         if not self._server_request_slots.acquire(blocking=False):
             reply(
@@ -1231,7 +1250,8 @@ class CodexClient:
                         "code": -32603,
                         "message": "server-request callback capacity exhausted",
                     },
-                }
+                },
+                wait_for_write=False,
             )
             return
 
@@ -1328,7 +1348,8 @@ class CodexClient:
                     pass
 
     def _write_message(
-        self, payload: JsonObject, *, proc: subprocess.Popen[str] | None = None
+        self, payload: JsonObject, *, proc: subprocess.Popen[str] | None = None,
+        wait_for_write: bool = True,
     ) -> None:
         with self._operation() as operation:
             line = json.dumps(payload) + "\n"
@@ -1354,6 +1375,10 @@ class CodexClient:
                     self._writes.put_nowait(pending)
                 except queue.Full as exc:
                     raise CodexError("outbound message queue limit exceeded") from exc
+            if not wait_for_write:
+                # The bounded writer owns delivery and transport failure. The
+                # stdout reader must keep routing while child stdin is blocked.
+                return
             while not pending.done.wait(self._check_operation(operation)):
                 operation.router.check_failure()
                 if self._stopped.is_set():
@@ -1368,30 +1393,39 @@ class CodexClient:
         if time.monotonic() >= operation.deadline:
             raise TimeoutError("operation deadline exceeded before write")
 
-    def _read_message(self, proc: subprocess.Popen[str] | None = None) -> dict[str, JsonValue]:
+    def _read_message(
+        self,
+        proc: subprocess.Popen[str] | None = None,
+        *,
+        dispatch: Callable[[dict[str, JsonValue]], None] | None = None,
+        delivery_lock: LockType | None = None,
+    ) -> dict[str, JsonValue]:
         target = proc or self._proc
         if target is None or target.stdout is None:
             raise TransportClosedError("Codex process is not running")
 
         line = target.stdout.readline(self.config.max_message_bytes + 1)
-        if len(line.encode("utf-8")) > self.config.max_message_bytes:
-            raise CodexError("inbound message size limit exceeded")
-        if not line:
-            stderr_thread = self._stderr_thread
-            if stderr_thread is not None and stderr_thread is not threading.current_thread():
-                stderr_thread.join(timeout=_STDERR_DRAIN_JOIN_TIMEOUT_S)
-            raise TransportClosedError(
-                f"Codex process closed stdout. stderr_tail={self._stderr_tail()}"
-            )
+        with delivery_lock if delivery_lock is not None else nullcontext():
+            if len(line.encode("utf-8")) > self.config.max_message_bytes:
+                raise CodexError("inbound message size limit exceeded")
+            if not line:
+                stderr_thread = self._stderr_thread
+                if stderr_thread is not None and stderr_thread is not threading.current_thread():
+                    stderr_thread.join(timeout=_STDERR_DRAIN_JOIN_TIMEOUT_S)
+                raise TransportClosedError(
+                    f"Codex process closed stdout. stderr_tail={self._stderr_tail()}"
+                )
 
-        try:
-            message = json.loads(line)
-        except json.JSONDecodeError as exc:
-            raise CodexError(f"Invalid JSON-RPC line: {line!r}") from exc
+            try:
+                message = json.loads(line)
+            except json.JSONDecodeError as exc:
+                raise CodexError(f"Invalid JSON-RPC line: {line!r}") from exc
 
-        if not isinstance(message, dict):
-            raise CodexError(f"Invalid JSON-RPC payload: {message!r}")
-        return message
+            if not isinstance(message, dict):
+                raise CodexError(f"Invalid JSON-RPC payload: {message!r}")
+            if dispatch is not None:
+                dispatch(message)
+            return message
 
 
 def default_codex_home() -> str:

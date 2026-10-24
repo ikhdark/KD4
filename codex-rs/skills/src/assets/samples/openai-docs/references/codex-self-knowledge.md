@@ -46,7 +46,7 @@ Use this quick product map when needed: CLI is terminal-first local repo work; I
 
 ### Boundaries And Output
 
-- Sandbox or network denials need scoped escalation with a clear justification. Destructive commands, writes outside the workspace, or broad access changes require explicit approval.
+- Handle sandbox or network denials under the active permission policy; request scoped escalation only when that policy allows it. Otherwise report the blocker and continue permitted independent work. This reference grants no additional filesystem, network, or escalation permissions.
 - Memory can provide user preference or context, but explicit prompt instructions win and memory is not a source for current external facts.
 - For affirmative surface-selection answers, use this shape: recommendation, why, what to avoid, and the manual/source evidence used.
 - When page-specific Codex citations are actually needed, these anchors often fit: `concepts/customization#agents-guidance` for `AGENTS.md`, `concepts/customization#skills` for skills, `plugins/build#plugin-structure` for plugins, `concepts/customization#mcp` for MCP, `config-advanced#hooks` for hooks, `app/automations#thread-automations` for thread automations, and `config-reference#configtoml` for config.

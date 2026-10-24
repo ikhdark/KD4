@@ -998,7 +998,7 @@ impl<D: SessionRuntimeDelegate> CellHost for RuntimeCellHost<D> {
             drop(gate);
             None
         };
-        let completed = event.clone();
+        let completed = staged.as_ref().map(|_| event.clone());
         let commit =
             cell_state.commit_completion_with_event(event, pending_initial_yield_items, |event| {
                 if writes_fit && !conflicting_write && !conflicting_read {
@@ -1029,6 +1029,7 @@ impl<D: SessionRuntimeDelegate> CellHost for RuntimeCellHost<D> {
             }
             // The atomic decision has been made. Never label a later publication
             // cancelled: termination and timeout observe an uncertain receipt.
+            let completed = completed.expect("staged publication retains its completion event");
             let inner = Arc::clone(&self.inner);
             let cell_id = self.cell_id.clone();
             let publication = self.inner.storage_tasks.spawn_blocking(move || {
@@ -1213,8 +1214,14 @@ fn storage_failure_event_with_status(
             error_text,
             output_loss,
         } => {
+            let recovery = if status == "rejected" {
+                "inspect retained nested call receipts; recompute only the rejected named-state transaction"
+            } else {
+                "inspect current named state and retained nested call receipts; durability is unconfirmed, so do not assume a rejected transaction or replay the cell"
+            };
             // This is a rejected local transaction, not rollback of nested
-            // tools. Preserve the distinction across both session transports.
+            // tools, or an uncertain durable publication of committed values.
+            // Preserve the distinction across both session transports.
             let error_text = Some(serde_json::json!({
                 "kind": "code_mode_store_commit_failure",
                 "version": 1,
@@ -1223,7 +1230,7 @@ fn storage_failure_event_with_status(
                 "script_error": error_text,
                 "external_effects_rolled_back": false,
                 "automatic_replay_allowed": false,
-                "recovery": "inspect retained nested call receipts; recompute only the rejected named-state transaction",
+                "recovery": recovery,
             }).to_string());
             CellEvent::Completed {
                 content_items,

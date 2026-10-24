@@ -91,18 +91,35 @@ fmt-check *args:
     runpy.run_path(script, run_name="__main__")
 [windows]
 fix *args:
-    $forwarded_args = @($args | Select-Object -Skip 1); python "{{ justfile_directory() }}\scripts\build\rust_build_status.py" run-lane --lane auto --warm-wait-seconds "{{ rust_validation_wait_seconds }}" -- cargo clippy --fix --tests --allow-dirty @forwarded_args; exit $LASTEXITCODE
+    $forwarded_args = @($args | Select-Object -Skip 1); python "{{ justfile_directory() }}\scripts\build\rust_build_status.py" run-lane --lane auto --warm-wait-seconds "{{ rust_validation_wait_seconds }}" -- cargo clippy --keep-going --fix --tests --allow-dirty @forwarded_args; exit $LASTEXITCODE
 
 [windows]
 fix-workspace *args:
-    $forwarded_args = @($args | Select-Object -Skip 1); python "{{ justfile_directory() }}\scripts\build\rust_build_status.py" run-lane --lane auto --warm-wait-seconds "{{ rust_validation_wait_seconds }}" -- cargo clippy --fix --tests --allow-dirty @forwarded_args; exit $LASTEXITCODE
+    $forwarded_args = @($args | Select-Object -Skip 1); python "{{ justfile_directory() }}\scripts\build\rust_build_status.py" run-lane --lane auto --warm-wait-seconds "{{ rust_validation_wait_seconds }}" -- cargo clippy --keep-going --fix --tests --allow-dirty @forwarded_args; exit $LASTEXITCODE
 
+# Keep checking independent crates after an error, without hiding diagnostics.
 [windows]
 clippy *args:
-    $forwarded_args = @($args | Select-Object -Skip 1); python "{{ justfile_directory() }}\scripts\build\rust_build_status.py" run-lane --lane auto --warm-wait-seconds "{{ rust_validation_wait_seconds }}" -- cargo clippy --tests @forwarded_args; exit $LASTEXITCODE
+    $forwarded_args = @($args | Select-Object -Skip 1); python "{{ justfile_directory() }}\scripts\build\rust_build_status.py" run-lane --lane auto --warm-wait-seconds "{{ rust_validation_wait_seconds }}" -- cargo clippy --keep-going --tests @forwarded_args; exit $LASTEXITCODE
 [windows]
 cargo-shear *args:
     @$forwarded_args = @($args | Select-Object -Skip 1); if ($forwarded_args.Count -gt 0 -and $forwarded_args[0] -eq "--") { $forwarded_args = @($forwarded_args | Select-Object -Skip 1) }; cargo shear --version *> $null; if ($LASTEXITCODE -ne 0) { Write-Error "cargo-shear is not installed. Install with: cargo install cargo-shear"; exit 2 }; cargo shear --deny-warnings @forwarded_args
+
+# Run both lint passes even if Clippy fails, then summarize their exit codes.
+# Extra arguments select the Clippy scope; cargo-shear scans the workspace.
+[windows]
+[script("python")]
+lint-rust *clippy_args:
+    import subprocess
+    import sys
+    clippy_code = subprocess.run(
+        ["just", "--set", "rust_validation_wait_seconds", "{{ rust_validation_wait_seconds }}", "clippy", *sys.argv[1:]],
+        check=False,
+    ).returncode
+    shear_code = subprocess.run(["just", "cargo-shear"], check=False).returncode
+    print(f"\nRust lint summary: Clippy exit {clippy_code}; cargo-shear exit {shear_code}.", flush=True)
+    sys.exit(clippy_code or shear_code)
+
 [windows]
 install:
     #!powershell.exe -File
@@ -135,6 +152,11 @@ publish-local-codex-final *args:
 [windows]
 publish-local-codex-fast *args:
     @powershell -NoProfile -ExecutionPolicy Bypass -File "{{ justfile_directory() }}\scripts\install\publish-local-codex-fast.ps1" {args}
+
+[no-cd]
+[windows]
+publish-local-codex-pgo *args:
+    @powershell -NoProfile -ExecutionPolicy Bypass -File "{{ justfile_directory() }}\scripts\install\publish-local-codex-pgo.ps1" {args}
 
 [no-cd]
 [windows]
@@ -255,24 +277,24 @@ cargo-lane-isolated-home lane *args:
     @powershell -NoProfile -ExecutionPolicy Bypass -File "{{ justfile_directory() }}\scripts\build\cargo-lane.ps1" -Lane "{{ lane }}" -IsolateCargoHome -WarmWaitSeconds "{{ rust_validation_wait_seconds }}" @($args | Select-Object -Skip 2); exit $LASTEXITCODE
 [no-cd]
 target-disk:
-    @{{ python }} "{{ justfile_directory() }}/scripts/build/rust_build_status.py" disk
+    @{python-recipe}{{ python }}
 
 [no-cd]
 target-prune *args:
-    @{{ python }} "{{ justfile_directory() }}/scripts/build/rust_build_status.py" prune {args}
+    @{python-recipe}{{ python }}
 
 # Preview target cache cleanup with `just target-optimize-dry-run` before pruning.
 [no-cd]
 target-optimize *args:
-    @{{ python }} "{{ justfile_directory() }}/scripts/build/rust_build_status.py" optimize --keep-warm-per-base 2 --max-age-days 14 --max-lane-gib 25 {args}
+    @{python-recipe}{{ python }}
 
 [no-cd]
 target-optimize-dry-run *args:
-    @{{ python }} "{{ justfile_directory() }}/scripts/build/rust_build_status.py" optimize --dry-run --keep-warm-per-base 2 --max-age-days 14 --max-lane-gib 25 {args}
+    @{python-recipe}{{ python }}
 
 [no-cd]
 lanes:
-    @{{ python }} "{{ justfile_directory() }}/scripts/build/rust_build_status.py" lanes
+    @{python-recipe}{{ python }}
 
 [windows]
 test-lane-package package *args:
@@ -288,7 +310,7 @@ check-lane package *args:
 
 [windows]
 clippy-lane package *args:
-    @python "{{ justfile_directory() }}\scripts\build\rust_build_status.py" run-lane --lane "{{ package }}" --warm-wait-seconds "{{ rust_validation_wait_seconds }}" -- cargo clippy --tests -p "{{ package }}" @($args | Select-Object -Skip 2); exit $LASTEXITCODE
+    @python "{{ justfile_directory() }}\scripts\build\rust_build_status.py" run-lane --lane "{{ package }}" --warm-wait-seconds "{{ rust_validation_wait_seconds }}" -- cargo clippy --keep-going --tests -p "{{ package }}" @($args | Select-Object -Skip 2); exit $LASTEXITCODE
 
 [windows]
 watch-lane package *args:
@@ -305,7 +327,7 @@ coverage-lane package *args:
 # Fix only the named package in its own lane.
 [windows]
 fix-lane package *args:
-    @python "{{ justfile_directory() }}\scripts\build\rust_build_status.py" run-lane --lane "{{ package }}" --warm-wait-seconds "{{ rust_validation_wait_seconds }}" -- cargo clippy --fix --tests --allow-dirty -p "{{ package }}" @($args | Select-Object -Skip 2); exit $LASTEXITCODE
+    @python "{{ justfile_directory() }}\scripts\build\rust_build_status.py" run-lane --lane "{{ package }}" --warm-wait-seconds "{{ rust_validation_wait_seconds }}" -- cargo clippy --keep-going --fix --tests --allow-dirty -p "{{ package }}" @($args | Select-Object -Skip 2); exit $LASTEXITCODE
 
 [windows]
 release-lane *args:
@@ -360,8 +382,8 @@ sdk-ts-check:
 # (default marker exclusions apply).
 [windows]
 sdk-python-check:
-    uv run --directory "{{ justfile_directory() }}/sdk/python" --group dev ruff check .
-    python "{{ justfile_directory() }}\scripts\build\rust_build_status.py" run-lane --lane sdk-runtime --warm-wait-seconds "{{ rust_validation_wait_seconds }}" -- just _sdk-runtime-reserved uv run --directory "{{ justfile_directory() }}/sdk/python" --group dev pytest; exit $LASTEXITCODE
+    $env:UV_PROJECT_ENVIRONMENT = "{{ justfile_directory() }}/.cache/sdk-python-check"; uv sync --directory "{{ justfile_directory() }}/sdk/python" --group dev --no-install-package openai-codex-cli-bin; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; uv run --directory "{{ justfile_directory() }}/sdk/python" --no-sync ruff check .; exit $LASTEXITCODE
+    $env:UV_PROJECT_ENVIRONMENT = "{{ justfile_directory() }}/.cache/sdk-python-check"; python "{{ justfile_directory() }}\scripts\build\rust_build_status.py" run-lane --lane sdk-runtime --warm-wait-seconds "{{ rust_validation_wait_seconds }}" -- just _sdk-runtime-reserved uv run --directory "{{ justfile_directory() }}/sdk/python" --no-sync pytest; exit $LASTEXITCODE
 
 # Build the runtime helper pair in the reserved lane, then run an SDK suite
 # with CODEX_EXEC_PATH pointing at that build.

@@ -8,6 +8,12 @@ const MAX_POINTER_ENTRIES: usize = 4_096;
 const MAX_POINTER_BYTES: usize = 2 * 1024 * 1024;
 
 pub(super) fn index(bytes: &[u8], targets: &[String]) -> Option<RawJsonPointerIndex> {
+    index_with_limits(bytes, targets, MAX_POINTER_ENTRIES, MAX_POINTER_BYTES)
+}
+
+fn index_with_limits(
+    bytes: &[u8], targets: &[String], max_entries: usize, max_bytes: usize,
+) -> Option<RawJsonPointerIndex> {
     fn needed(pointer: &str, targets: &[String]) -> bool {
         targets.iter().any(|target| {
             target == pointer
@@ -15,12 +21,12 @@ pub(super) fn index(bytes: &[u8], targets: &[String]) -> Option<RawJsonPointerIn
                 || pointer.strip_prefix(target).is_some_and(|tail| tail.starts_with('/'))
         })
     }
-    struct Budget { entries: usize, bytes: usize }
+    struct Budget { entries: usize, bytes: usize, max_entries: usize, max_bytes: usize }
     impl Budget {
         fn charge(&mut self, pointer: &str) -> Option<()> {
             self.entries = self.entries.checked_add(1)?;
             self.bytes = self.bytes.checked_add(pointer.len().saturating_mul(3).saturating_add(256))?;
-            (self.entries <= MAX_POINTER_ENTRIES && self.bytes <= MAX_POINTER_BYTES).then_some(())
+            (self.entries <= self.max_entries && self.bytes <= self.max_bytes).then_some(())
         }
     }
     struct Children<'a, 'i> {
@@ -87,6 +93,39 @@ pub(super) fn index(bytes: &[u8], targets: &[String]) -> Option<RawJsonPointerIn
     let raw: &serde_json::value::RawValue = serde_json::from_slice(bytes).ok()?;
     let mut index = RawJsonPointerIndex { pointers: BTreeMap::new(), ambiguous: BTreeSet::new() };
     visit(raw, bytes.as_ptr() as usize, String::new(), 0, targets, &mut index,
-        &mut Budget { entries: 0, bytes: 0 })?;
+        &mut Budget { entries: 0, bytes: 0, max_entries, max_bytes })?;
     Some(index)
+}
+
+/// A rejected large target must not invalidate an independently addressable
+/// sibling. Commit only successful target indexes, under the same aggregate
+/// address limits; failed traversals never retain their partially built map.
+pub(super) fn index_preserving_siblings(
+    bytes: &[u8], targets: &[String],
+) -> Option<(RawJsonPointerIndex, BTreeSet<String>)> {
+    let mut combined = RawJsonPointerIndex { pointers: BTreeMap::new(), ambiguous: BTreeSet::new() };
+    let mut failed = BTreeSet::new();
+    for target in targets.iter().collect::<BTreeSet<_>>() {
+        let used = combined.pointers.keys().fold(0usize, |cost, pointer|
+            cost.saturating_add(pointer.len().saturating_mul(3).saturating_add(256)));
+        let Some(mut selected) = index_with_limits(
+            bytes, std::slice::from_ref(target),
+            MAX_POINTER_ENTRIES.saturating_sub(combined.pointers.len()),
+            MAX_POINTER_BYTES.saturating_sub(used),
+        ) else {
+            failed.insert((*target).clone());
+            continue;
+        };
+        for (pointer, entry) in selected.pointers {
+            if let Some(existing) = combined.pointers.get_mut(&pointer) {
+                existing.direct_children.extend(entry.direct_children);
+                existing.direct_children.sort();
+                existing.direct_children.dedup();
+            } else {
+                combined.pointers.insert(pointer, entry);
+            }
+        }
+        combined.ambiguous.append(&mut selected.ambiguous);
+    }
+    (!combined.pointers.is_empty()).then_some((combined, failed))
 }

@@ -34,12 +34,11 @@ use crate::ExecServerRuntimePaths;
 use crate::ProcessId;
 use crate::StartedExecProcess;
 use crate::process::ExecProcessEventLog;
-use crate::process_sandbox::prepare_exec_request;
+use crate::process_sandbox::prepare_exec_request_cancellable;
 use crate::protocol::EXEC_CLOSED_METHOD;
 use crate::protocol::ExecClosedNotification;
 use crate::protocol::ExecEnvPolicy;
 use crate::protocol::ExecExitedNotification;
-use crate::protocol::ExecOutputDeltaNotification;
 use crate::protocol::ExecOutputStream;
 use crate::protocol::ExecParams;
 use crate::protocol::ExecResponse;
@@ -81,7 +80,16 @@ const EXITED_PROCESS_RETENTION: Duration = Duration::from_secs(30);
 struct RetainedOutputChunk {
     seq: u64,
     stream: ExecOutputStream,
-    chunk: Arc<Vec<u8>>,
+    event: Arc<ExecProcessEvent>,
+}
+
+impl RetainedOutputChunk {
+    fn bytes(&self) -> &[u8] {
+        let ExecProcessEvent::Output(output) = self.event.as_ref() else {
+            unreachable!("retained output contains only output events");
+        };
+        &output.chunk.0
+    }
 }
 
 struct RunningProcess {
@@ -172,6 +180,7 @@ impl AcceptedStdinWriteIds {
 #[derive(Default)]
 struct ProcessStart {
     incarnation: Option<String>,
+    preparation_cancelled: tokio_util::sync::CancellationToken,
 }
 
 // Release the exact provisional entry if a connection disappears during spawn.
@@ -213,6 +222,7 @@ impl Drop for ProcessStartReservation {
         if !self.active {
             return;
         }
+        self.start.preparation_cancelled.cancel();
         let inner = Arc::clone(&self.inner);
         let process_id = self.process_id.clone();
         let start = Arc::clone(&self.start);
@@ -235,6 +245,7 @@ enum ProcessEntry {
 
 struct Inner {
     notifications: std::sync::RwLock<Option<RpcNotificationSender>>,
+    forwards_notifications: bool,
     notification_shutdown: tokio_util::sync::CancellationToken,
     processes: Mutex<HashMap<ProcessId, ProcessEntry>>,
     telemetry: ExecServerTelemetry,
@@ -282,6 +293,7 @@ impl LocalProcess {
     ) -> Self {
         Self {
             inner: Arc::new(Inner {
+                forwards_notifications: notifications.is_some(),
                 notifications: std::sync::RwLock::new(notifications),
                 notification_shutdown: tokio_util::sync::CancellationToken::new(),
                 processes: Mutex::new(HashMap::new()),
@@ -300,7 +312,10 @@ impl LocalProcess {
             processes
                 .drain()
                 .filter_map(|(process_id, process)| match process {
-                    ProcessEntry::Starting(_) => None,
+                    ProcessEntry::Starting(start) => {
+                        start.preparation_cancelled.cancel();
+                        None
+                    }
                     ProcessEntry::Running(process) => {
                         process.termination_requested.store(true, Ordering::Release);
                         Some((process_id, process))
@@ -352,7 +367,7 @@ impl LocalProcess {
             ));
         }
         let process_id = process_id.clone();
-        let start = Arc::new(ProcessStart { incarnation });
+        let start = Arc::new(ProcessStart { incarnation, ..Default::default() });
         let mut reservation = ProcessStartReservation {
             inner: Arc::clone(&self.inner),
             process_id: process_id.clone(),
@@ -436,8 +451,12 @@ impl LocalProcess {
         // Sandbox preparation can walk filesystem trees to resolve deny globs.
         // Reserve the process ID first so termination can cancel queued preparation.
         let runtime_paths = self.runtime_paths.clone();
+        let preparation_cancelled = start.preparation_cancelled.clone();
         let preparation = tokio::task::spawn_blocking(move || {
-            prepare_exec_request(&params, child_env(&params), runtime_paths.as_ref())
+            if preparation_cancelled.is_cancelled() {
+                return Err(invalid_request(format!("process {} start was cancelled", params.process_id)));
+            }
+            prepare_exec_request_cancellable(&params, child_env(&params), runtime_paths.as_ref(), &preparation_cancelled)
                 .map(|prepared| (prepared, params.tty, params.pipe_stdin))
         })
         .await
@@ -538,10 +557,12 @@ impl LocalProcess {
             );
             reservation.active = false;
         }
-        tokio::spawn(forward_process_notifications(
-            process_id.clone(), events.clone(), events.subscribe(), Arc::downgrade(&self.inner),
-            self.inner.notification_shutdown.clone(),
-        ));
+        if self.inner.forwards_notifications {
+            tokio::spawn(forward_process_notifications(
+                process_id.clone(), events.clone(), events.subscribe(), Arc::downgrade(&self.inner),
+                self.inner.notification_shutdown.clone(),
+            ));
+        }
         tokio::spawn(stream_output(
             process_id.clone(),
             if tty {
@@ -642,7 +663,7 @@ impl LocalProcess {
                     .output
                     .partition_point(|chunk| chunk.seq <= after_seq);
                 for retained in process.output.range(start..) {
-                    let chunk_len = retained.chunk.len();
+                    let chunk_len = retained.bytes().len();
                     if !chunks.is_empty() && total_bytes + chunk_len > max_bytes {
                         break;
                     }
@@ -680,10 +701,11 @@ impl LocalProcess {
             };
             // Retain an immutable sequence-consistent snapshot under the map
             // lock; copy payload bytes only after unrelated process controls can run.
-            response.chunks = chunks.into_iter().map(|retained| ProcessOutputChunk {
-                seq: retained.seq,
-                stream: retained.stream,
-                chunk: retained.chunk.as_ref().clone().into(),
+            response.chunks = chunks.into_iter().map(|retained| {
+                let ExecProcessEvent::Output(output) = Arc::unwrap_or_clone(retained.event) else {
+                    unreachable!("retained output contains only output events");
+                };
+                output
             }).collect();
 
             // Exercise updates between snapshotting and polling the waiter in tests.
@@ -879,7 +901,8 @@ impl LocalProcess {
                     }
                     true
                 }
-                Some(ProcessEntry::Starting(_)) => {
+                Some(ProcessEntry::Starting(start)) => {
+                    start.preparation_cancelled.cancel();
                     process_map.remove(&params.process_id);
                     true
                 }
@@ -1151,8 +1174,7 @@ async fn stream_output(
     output_notify: Arc<Notify>,
 ) {
     while let Some(chunk) = receiver.recv().await {
-        let event_chunk = chunk.clone();
-        let chunk = Arc::new(chunk);
+        let chunk_bytes = chunk.len();
         {
             let mut processes = inner.processes.lock().await;
             let Some(entry) = processes.get_mut(&process_id) else {
@@ -1163,11 +1185,14 @@ async fn stream_output(
             };
             let seq = process.next_seq;
             process.next_seq += 1;
-            process.retained_bytes += chunk.len();
+            let event = Arc::new(ExecProcessEvent::Output(ProcessOutputChunk {
+                seq, stream, chunk: chunk.into(),
+            }));
+            process.retained_bytes += chunk_bytes;
             process.output.push_back(RetainedOutputChunk {
                 seq,
                 stream,
-                chunk: chunk.clone(),
+                event: Arc::clone(&event),
             });
             while process.retained_bytes > RETAINED_OUTPUT_BYTES_PER_PROCESS {
                 let Some(evicted) = process.output.pop_front() else {
@@ -1176,17 +1201,12 @@ async fn stream_output(
                 // A capture-loss marker may already declare a later hole; front
                 // eviction must never move the declared gap backwards past it.
                 process.last_evicted_seq = process.last_evicted_seq.max(evicted.seq);
-                process.retained_bytes = process.retained_bytes.saturating_sub(evicted.chunk.len());
+                process.retained_bytes = process.retained_bytes.saturating_sub(evicted.bytes().len());
             }
             let _ = process.wake_tx.send(seq);
-            let output = ProcessOutputChunk {
-                seq,
-                stream,
-                chunk: event_chunk.into(),
-            };
             process
                 .events
-                .publish(ExecProcessEvent::Output(output));
+                .publish_shared(event);
         }
         output_notify.notify_waiters();
     }
@@ -1249,7 +1269,7 @@ async fn watch_exit(
             process.session.release_pty_after_exit();
         }
     }
-    let notification = {
+    {
         let mut processes = inner.processes.lock().await;
         if let Some(ProcessEntry::Running(process)) = processes.get_mut(&process_id) {
             let seq = process.next_seq;
@@ -1262,18 +1282,9 @@ async fn watch_exit(
                 exit_code,
                 sandbox_denied: (process.sandbox == SandboxType::None).then_some(false),
             });
-            Some(ExecExitedNotification {
-                process_id: process_id.clone(),
-                seq,
-                exit_code,
-                sandbox_denied: (process.sandbox == SandboxType::None).then_some(false),
-            })
-        } else {
-            None
         }
-    };
+    }
     output_notify.notify_waiters();
-    let _ = notification;
 
     maybe_emit_closed(process_id, Arc::clone(&inner)).await;
 }
@@ -1338,9 +1349,9 @@ async fn maybe_emit_closed(process_id: ProcessId, inner: Arc<Inner>) {
         (
             process.sandbox,
             exit_code,
-            // Unsandboxed completion never classifies output. Avoid copying up
+            // Unsandboxed and successful exits never classify output. Avoid copying up
             // to the retention limit while holding the shared process-map lock.
-            if process.sandbox == SandboxType::None {
+            if process.sandbox == SandboxType::None || exit_code == 0 {
                 VecDeque::new()
             } else {
                 process.output.clone()
@@ -1353,6 +1364,8 @@ async fn maybe_emit_closed(process_id: ProcessId, inner: Arc<Inner>) {
     // the process-map mutex used by unrelated reads and process controls.
     let assessment = if sandbox == SandboxType::None {
         Some(false)
+    } else if exit_code == 0 {
+        complete_output.then_some(false)
     } else {
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
@@ -1360,11 +1373,11 @@ async fn maybe_emit_closed(process_id: ProcessId, inner: Arc<Inner>) {
         for chunk in output {
             match chunk.stream {
                 ExecOutputStream::Stdout | ExecOutputStream::Pty => {
-                    stdout.extend_from_slice(&chunk.chunk)
+                    stdout.extend_from_slice(chunk.bytes())
                 }
-                ExecOutputStream::Stderr => stderr.extend_from_slice(&chunk.chunk),
+                ExecOutputStream::Stderr => stderr.extend_from_slice(chunk.bytes()),
             }
-            aggregated.extend_from_slice(&chunk.chunk);
+            aggregated.extend_from_slice(chunk.bytes());
         }
         let denied = is_likely_sandbox_denied(
             sandbox,
@@ -1380,7 +1393,7 @@ async fn maybe_emit_closed(process_id: ProcessId, inner: Arc<Inner>) {
         );
         (denied || complete_output).then_some(denied)
     };
-    let (notification, output_notify) = {
+    let output_notify = {
         let mut processes = inner.processes.lock().await;
         let Some(ProcessEntry::Running(process)) = processes.get_mut(&process_id) else {
             return;
@@ -1401,14 +1414,7 @@ async fn maybe_emit_closed(process_id: ProcessId, inner: Arc<Inner>) {
             seq,
             sandbox_denied: assessment,
         });
-        (
-            ExecClosedNotification {
-                process_id: process_id.clone(),
-                seq,
-                sandbox_denied: assessment,
-            },
-            Arc::clone(&process.output_notify),
-        )
+        Arc::clone(&process.output_notify)
     };
 
     output_notify.notify_waiters();
@@ -1427,10 +1433,18 @@ async fn maybe_emit_closed(process_id: ProcessId, inner: Arc<Inner>) {
         }
     });
 
-    let _ = notification;
 }
 
 // A blocked transport owns only bounded replay, never native draining/closure.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BorrowedOutputDelta<'a> {
+    process_id: &'a ProcessId,
+    seq: u64,
+    stream: ExecOutputStream,
+    chunk: &'a crate::protocol::ByteChunk,
+}
+
 async fn forward_process_notifications(
     process_id: ProcessId,
     events: ExecProcessEventLog,
@@ -1451,7 +1465,7 @@ async fn forward_process_notifications(
             let event = tokio::select! {
                 biased;
                 _ = shutdown.cancelled() => return,
-                event = receiver.recv() => event,
+                event = receiver.recv_shared() => event,
             };
             match event {
                 Ok(event) => event,
@@ -1512,12 +1526,8 @@ async fn forward_process_notifications(
                         replay.push((process.next_seq, ExecProcessEvent::Failed(failure.clone())));
                     }
                     drop(processes);
-                    replay.extend(retained.into_iter().map(|chunk| (chunk.seq,
-                        ExecProcessEvent::Output(ProcessOutputChunk {
-                            seq: chunk.seq,
-                            stream: chunk.stream,
-                            chunk: chunk.chunk.as_ref().clone().into(),
-                        }))));
+                    let mut replay = replay.into_iter().map(|(seq, event)| (seq, Arc::new(event))).collect::<Vec<_>>();
+                    replay.extend(retained.into_iter().map(|chunk| (chunk.seq, chunk.event)));
                     replay.sort_by_key(|(seq, _)| *seq);
                     pending.extend(replay.into_iter().map(|(_, event)| event));
                     continue;
@@ -1527,7 +1537,7 @@ async fn forward_process_notifications(
         };
         let seq = event.seq();
         if seq.is_some_and(|seq| seq <= last_seq) { continue; }
-        let terminal = matches!(&event, ExecProcessEvent::Closed { .. } | ExecProcessEvent::Failed(_));
+        let terminal = matches!(event.as_ref(), ExecProcessEvent::Closed { .. } | ExecProcessEvent::Failed(_));
         let Some(owner) = inner.upgrade() else { return; };
         let notifications = notification_sender(&owner);
         drop(owner);
@@ -1536,25 +1546,25 @@ async fn forward_process_notifications(
             if terminal { return; }
             continue;
         };
-        let (method, params) = match event {
+        let (method, params) = match event.as_ref() {
             ExecProcessEvent::Output(chunk) => (crate::protocol::EXEC_OUTPUT_DELTA_METHOD,
-                serde_json::to_value(ExecOutputDeltaNotification { process_id: process_id.clone(),
-                    seq: chunk.seq, stream: chunk.stream, chunk: chunk.chunk })),
+                serde_json::to_value(BorrowedOutputDelta { process_id: &process_id,
+                    seq: chunk.seq, stream: chunk.stream, chunk: &chunk.chunk })),
             ExecProcessEvent::OutputGap { through_seq } => (crate::protocol::EXEC_OUTPUT_GAP_METHOD,
-                serde_json::to_value(crate::protocol::ExecOutputGapNotification { process_id: process_id.clone(), through_seq })),
+                serde_json::to_value(crate::protocol::ExecOutputGapNotification { process_id: process_id.clone(), through_seq: *through_seq })),
             ExecProcessEvent::Exited { seq, exit_code, sandbox_denied } => (crate::protocol::EXEC_EXITED_METHOD,
-                serde_json::to_value(ExecExitedNotification { process_id: process_id.clone(), seq, exit_code, sandbox_denied })),
+                serde_json::to_value(ExecExitedNotification { process_id: process_id.clone(), seq: *seq, exit_code: *exit_code, sandbox_denied: *sandbox_denied })),
             ExecProcessEvent::Closed { seq, sandbox_denied } => (EXEC_CLOSED_METHOD,
-                serde_json::to_value(ExecClosedNotification { process_id: process_id.clone(), seq, sandbox_denied })),
+                serde_json::to_value(ExecClosedNotification { process_id: process_id.clone(), seq: *seq, sandbox_denied: *sandbox_denied })),
             ExecProcessEvent::Failed(message) => (crate::protocol::EXEC_FAILED_METHOD,
-                serde_json::to_value(crate::protocol::ExecFailedNotification { process_id: process_id.clone(), message })),
+                serde_json::to_value(crate::protocol::ExecFailedNotification { process_id: process_id.clone(), message: message.clone() })),
         };
         let Ok(params) = params else { return; };
         {
             let result = tokio::select! {
                 biased;
                 _ = shutdown.cancelled() => return,
-                result = tokio::time::timeout(SEND_TIMEOUT, notifications.notify(method, &params)) => result,
+                result = tokio::time::timeout(SEND_TIMEOUT, notifications.notify_value(method, params)) => result,
             };
             if !matches!(result, Ok(Ok(()))) {
                 tracing::warn!(%process_id, ?result, last_seq, replay_required = true,

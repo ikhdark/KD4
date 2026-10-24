@@ -309,10 +309,10 @@ pub trait ModelsManager: fmt::Debug + Send + Sync {
                 if let Some(model) = model.as_ref() {
                     return Ok(model.to_string());
                 }
-                default_model_from_available(
-                    self.list_models(refresh_strategy, http_client_factory)
-                        .await?,
-                )
+                let available_models = self
+                    .list_models_shared(refresh_strategy, http_client_factory)
+                    .await?;
+                default_model_from_available(available_models.as_slice())
             }
             .instrument(tracing::info_span!(
                 "get_default_model",
@@ -508,6 +508,7 @@ struct EtagRefreshState {
     active_etag: Option<String>,
     pending: Option<EtagRefreshNotice>,
     worker_running: bool,
+    failed_hint: Option<(String, String, Instant)>,
 }
 
 #[derive(Debug)]
@@ -602,10 +603,15 @@ impl StaticModelsManager {
         let normalized = normalize_model_catalog_with_rejections(model_catalog.models);
         let mut remote_models = normalized.models;
         // An authoritative catalog keeps the prompts it authors. One copied
-        // from the bundled file has none for local-policy models and would run
-        // them without a base prompt, so only those take the local policy.
+        // from the bundled file has neither a base nor a template for local-policy
+        // models. Only those promptless records take the local policy.
         for model in &mut remote_models {
-            if model.base_instructions.is_empty() {
+            if model.base_instructions.is_empty()
+                && model
+                    .model_messages
+                    .as_ref()
+                    .is_none_or(|messages| messages.instructions_template.is_none())
+            {
                 crate::prompt_resolver::apply_prompt_policy(std::slice::from_mut(model));
             }
         }
@@ -864,6 +870,16 @@ impl OpenAiModelsManager {
             let _refresh = self.refresh_gate.lock().await;
             let refresh_identity = self.ensure_current_cache_identity().await;
             let current_etag = self.get_etag().await;
+            let cooling_down = self.etag_refresh.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .failed_hint.as_ref().is_some_and(|(identity, etag, retry_at)| {
+                    identity == &refresh_identity && etag == &notice.etag && Instant::now() < *retry_at
+                });
+            if cooling_down {
+                // Drop this hint, not the worker or any newer pending hint.
+                // Explicit refreshes retain their existing independent policy.
+                continue;
+            }
             // Inference hints carry no frozen request authority. Equal opaque
             // validators cannot confirm current-scope freshness after an auth switch.
             if current_etag.as_deref() == Some(notice.etag.as_str()) {
@@ -972,7 +988,13 @@ impl OpenAiModelsManager {
                             }
                         }
                     }
-                    Err(err) => error!("failed to refresh available models: {err}"),
+                    Err(err) => {
+                        self.etag_refresh.lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .failed_hint = Some((refresh_identity, notice.etag,
+                                Instant::now() + MODEL_REFRESH_FAILURE_COOLDOWN));
+                        error!("failed to refresh available models: {err}");
+                    }
                 }
             }
 
@@ -998,6 +1020,7 @@ impl OpenAiModelsManager {
         if refresh_strategy != RefreshStrategy::Online && self.memory_is_fresh().await {
             return Ok(());
         }
+        let mut probed_cache_identity = None;
         if refresh_strategy == RefreshStrategy::OnlineIfUncached
             && !self.endpoint_client.has_authoritative_catalog()
             && !self.endpoint_client.has_command_auth()
@@ -1006,7 +1029,15 @@ impl OpenAiModelsManager {
             // when the transaction is free: an ineligible consumer must never
             // queue behind a network refresh. Release before resolving auth on a miss.
             if let Ok(_refresh) = self.refresh_gate.try_lock() {
-                match self.try_load_cache_locked().await {
+                let identity = self.ensure_current_cache_identity().await;
+                let result = self.try_load_cache_locked_for_identity(&identity).await;
+                if !matches!(&result,
+                    Err(codex_protocol::error::CodexErr::Io(error))
+                        if error.kind() == std::io::ErrorKind::WouldBlock)
+                {
+                    probed_cache_identity = Some(identity);
+                }
+                match result {
                     Ok(true) => return Ok(()),
                     Ok(false) => {}
                     Err(err) => error!("models cache unavailable before auth eligibility: {err}"),
@@ -1016,7 +1047,12 @@ impl OpenAiModelsManager {
         if refresh_strategy == RefreshStrategy::Offline || !self.should_refresh_models().await {
             if refresh_strategy != RefreshStrategy::Online {
                 // Offline snapshot readers must not wait behind a network transaction.
-                if let Ok(_refresh) = self.refresh_gate.try_lock()
+                // A completed miss/error is a request-local snapshot, not a
+                // persistent negative cache. Probe again only for a new scope
+                // or when the refresh/file-lock gate could not run.
+                let identity = self.ensure_current_cache_identity().await;
+                if probed_cache_identity.as_deref() != Some(identity.as_str())
+                    && let Ok(_refresh) = self.refresh_gate.try_lock()
                     && let Err(err) = self.try_load_cache_locked().await
                 {
                     error!("models cache unavailable; retaining eligible memory catalog: {err}");
@@ -1386,17 +1422,21 @@ impl OpenAiModelsManager {
     }
 
     async fn try_load_cache_locked(&self) -> CoreResult<bool> {
+        let load_identity = self.ensure_current_cache_identity().await;
+        self.try_load_cache_locked_for_identity(&load_identity).await
+    }
+
+    async fn try_load_cache_locked_for_identity(&self, load_identity: &str) -> CoreResult<bool> {
         if self.memory_is_fresh().await {
             return Ok(true);
         }
-        let load_identity = self.ensure_current_cache_identity().await;
         let _timer =
             codex_otel::start_global_timer("codex.remote_models.load_cache.duration_ms", &[]);
         let client_version = crate::client_version_to_whole();
         info!(client_version, "models cache: evaluating cache eligibility");
         let cache = match self
             .cache_manager
-            .load_fresh_for_identity(&client_version, &load_identity)
+            .load_fresh_for_identity(&client_version, load_identity)
             .await?
         {
             Some(cache) => cache,
@@ -1405,7 +1445,7 @@ impl OpenAiModelsManager {
                 return Ok(false);
             }
         };
-        if !self.cache_manager.identity_is_current(&load_identity) {
+        if !self.cache_manager.identity_is_current(load_identity) {
             self.ensure_current_cache_identity().await;
             return Ok(false);
         }
@@ -1419,18 +1459,18 @@ impl OpenAiModelsManager {
             .apply_remote_models_and_etag_for_identity(
                 cache.models,
                 cache.etag.clone(),
-                &load_identity,
+                load_identity,
             )
             .await
         {
             self.ensure_current_cache_identity().await;
             return Ok(false);
         }
-        if !self.cache_manager.identity_is_current(&load_identity) {
+        if !self.cache_manager.identity_is_current(load_identity) {
             self.ensure_current_cache_identity().await;
             return Ok(false);
         }
-        self.mark_memory_fresh(&load_identity, remaining).await;
+        self.mark_memory_fresh(load_identity, remaining).await;
         info!(
             models_count,
             etag = ?cache.etag,
@@ -1500,7 +1540,7 @@ impl ModelsManager for StaticModelsManager {
                     return Ok(model.clone());
                 }
                 let available_models = self
-                    .list_models(refresh_strategy, http_client_factory)
+                    .list_models_shared(refresh_strategy, http_client_factory)
                     .await?;
                 let requested_model = model.as_deref();
 
@@ -1510,10 +1550,10 @@ impl ModelsManager for StaticModelsManager {
                     {
                         return Ok(requested_model.to_string());
                     }
-                    return default_model_from_available(available_models);
+                    return default_model_from_available(available_models.as_slice());
                 }
 
-                default_model_from_available(available_models)
+                default_model_from_available(available_models.as_slice())
             }
             .instrument(tracing::info_span!(
                 "get_default_model",
@@ -1671,7 +1711,8 @@ fn require_bundled_models(result: Result<Vec<ModelInfo>, std::io::Error>) -> Vec
     result.unwrap_or_else(|err| panic!("bundled model catalog must load: {err}"))
 }
 
-fn default_model_from_available(available: Vec<ModelPreset>) -> CoreResult<String> {
+fn default_model_from_available(available: impl AsRef<[ModelPreset]>) -> CoreResult<String> {
+    let available = available.as_ref();
     available
         .iter()
         .find(|model| model.is_default)

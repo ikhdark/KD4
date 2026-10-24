@@ -415,6 +415,7 @@ impl MetricsClient {
         });
 
         let (meter_provider, meter) = match exporter {
+            #[cfg(any(test, feature = "test-support"))]
             MetricsExporter::InMemory(exporter) => {
                 build_provider(resource, exporter, export_interval, runtime_reader.clone())
             }

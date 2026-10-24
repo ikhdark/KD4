@@ -95,12 +95,21 @@ pub fn resolve_output_limits(
     output_text: &str,
     hard_limit: usize,
 ) -> OutputLimitResolution {
-    resolve_projected_output_limits(
+    let normal = resolve_projected_output_limits(
         requested_limit,
         outcome,
-        classify_diagnostic(command_text, output_text),
+        OutputDiagnosticClass::Normal,
         hard_limit,
-    )
+    );
+    // Classification remains available to producers that actually consume it.
+    // Here it matters only if it can change the reported default/ceiling.
+    if normal.default_limit == DEFAULT_DIAGNOSTIC_OUTPUT_TOKENS {
+        normal
+    } else {
+        resolve_projected_output_limits(
+            requested_limit, outcome, classify_diagnostic(command_text, output_text), hard_limit,
+        )
+    }
 }
 
 /// Resolves a model-visible projection using producer-supplied metadata.
@@ -957,19 +966,20 @@ pub fn formatted_truncate_text_content_items_with_policy(
         return (items.to_vec(), None);
     };
 
-    let mut combined = Cow::Borrowed(first);
-    for text in text_segments {
-        if !combined.is_empty() {
-            combined.to_mut().push('\n');
-        }
-        combined.to_mut().push_str(text);
-    }
+    let combined_bytes = text_segments.fold(first.len(), |bytes, text| {
+        bytes.checked_add(usize::from(bytes != 0))
+            .and_then(|bytes| bytes.checked_add(text.len()))
+            .expect("allocated text and separators fit usize")
+    });
 
+    let estimate_token_count = || {
+        usize::try_from(approx_tokens_from_byte_count(combined_bytes)).unwrap_or(usize::MAX)
+    };
     let mut original_token_count = None;
     let within_budget = match policy {
-        TruncationPolicy::Bytes(max_bytes) => combined.len() <= max_bytes,
+        TruncationPolicy::Bytes(max_bytes) => combined_bytes <= max_bytes,
         TruncationPolicy::Tokens(max_tokens) => {
-            let count = approx_token_count(&combined);
+            let count = estimate_token_count();
             original_token_count = Some(count);
             count <= max_tokens
         }
@@ -978,8 +988,7 @@ pub fn formatted_truncate_text_content_items_with_policy(
         return (items.to_vec(), None);
     }
 
-    let original_token_count =
-        original_token_count.unwrap_or_else(|| approx_token_count(&combined));
+    let original_token_count = original_token_count.unwrap_or_else(estimate_token_count);
     let runs = items
         .chunk_by(|left, right| {
             matches!(

@@ -37,6 +37,7 @@ impl Handler {
             session,
             step_context,
             payload,
+            call_id,
             ..
         } = invocation;
         let turn = Arc::clone(&step_context.turn);
@@ -144,14 +145,45 @@ impl Handler {
         }
 
         let mut result = ListAgentsResult {
-            agents,
+            agents: agents.into_iter().map(ListedAgentView::from).collect(),
             typed_tasks,
             unresolved_descendants: coordinator.unavailable_descendants(),
             revision: String::new(),
             unchanged: false,
             task_text_recovery: None,
+            completed_report_recovery: None,
         };
         result.apply_view(&args, &session.thread_id.to_string())?;
+        if args.status_only && let Some(reports) = result.completed_report_snapshot() {
+            // Retain the exact omitted bodies, not a later current-state reread.
+            // The existing snapshot owner protects and registers the recovery
+            // before any completed payload is removed from this response.
+            let canonical = Arc::new(codex_tools::CanonicalToolResult::json(reports));
+            let artifact = session
+                .create_source_snapshot_artifact(call_id, Arc::clone(&canonical), None)
+                .await;
+            if let Some(artifact_id) = artifact.artifact_id().filter(|_| {
+                artifact.complete
+                    && artifact.retained_bytes == canonical.exact_bytes
+                    && artifact.unavailable_ranges.is_empty()
+            }) {
+                result.omit_completed_reports();
+                result.completed_report_recovery = Some(json!({
+                    "tool": "read_tool_output",
+                    "arguments": {
+                        "artifact_id": artifact_id,
+                        "selectors": [{"kind": "json_pointer", "pointer": "/agents"}],
+                    },
+                    "canonical_sha256": canonical.sha256,
+                    "canonical_bytes": canonical.exact_bytes,
+                }));
+            } else {
+                // Fail open with complete reports rather than hide content
+                // behind an incomplete or unprotected recovery artifact.
+                result.task_text_recovery.get_or_insert_with(String::new)
+                    .push_str(&format!(" Status-only report retention failed; completed reports remain inline: {}", artifact.error.as_deref().unwrap_or("incomplete snapshot")));
+            }
+        }
         Ok(boxed_tool_output(result))
     }
 }
@@ -168,28 +200,65 @@ struct ListAgentsArgs {
     path_prefix: Option<String>,
     #[serde(default)]
     compact: bool,
+    #[serde(default)]
+    status_only: bool,
     since_revision: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
+struct ListedAgentView {
+    agent_name: String,
+    agent_status: ListedAgentStatus,
+    last_task_message: Option<String>,
+    runtime_loaded: bool,
+}
+
+impl From<ListedAgent> for ListedAgentView {
+    fn from(agent: ListedAgent) -> Self {
+        Self {
+            agent_name: agent.agent_name,
+            agent_status: ListedAgentStatus::Full(agent.agent_status),
+            last_task_message: agent.last_task_message,
+            runtime_loaded: agent.runtime_loaded,
+        }
+    }
+}
+
+#[derive(Debug, Serialize, PartialEq, Eq)]
+#[serde(untagged)]
+enum ListedAgentStatus {
+    Full(AgentStatus),
+    StatusOnly(CompletedAgentStatus),
+}
+
+#[derive(Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum CompletedAgentStatus {
+    Completed,
+    CompletedWithSurface,
+}
+
+#[derive(Debug, Serialize)]
 pub(crate) struct ListAgentsResult {
-    agents: Vec<ListedAgent>,
+    agents: Vec<ListedAgentView>,
     typed_tasks: Vec<JsonValue>,
     unresolved_descendants: Vec<(String, String)>,
     revision: String,
     unchanged: bool,
     task_text_recovery: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    completed_report_recovery: Option<JsonValue>,
 }
 
 impl ListAgentsResult {
     fn apply_view(&mut self, args: &ListAgentsArgs, root: &str) -> Result<(), FunctionCallError> {
         use sha2::Digest;
-        // Hash the complete fresh projection, before removing task prose. Lease
+        // Hash the complete fresh projection, before removing any prose/results. Lease
         // expiry, a changed answer, deletion, failed delivery and attempt/gate
         // transitions must invalidate an unchanged response. This is a display
         // fingerprint, never a task-store or source-freshness witness.
         let bytes = serde_json::to_vec(&json!([
-            root, args.path_prefix, args.compact, self.agents, self.typed_tasks,
+            root, args.path_prefix, args.compact, args.status_only, self.agents, self.typed_tasks,
             self.unresolved_descendants,
         ]))
         .map_err(|error| FunctionCallError::RespondToModel(format!("list_agents: snapshot serialization failed: {error}")))?;
@@ -199,15 +268,50 @@ impl ListAgentsResult {
             self.agents.clear();
             self.typed_tasks.clear();
             self.unresolved_descendants.clear();
-        } else if args.compact {
+        } else {
             for agent in &mut self.agents {
-                agent.last_task_message = None;
+                if args.compact || args.status_only {
+                    agent.last_task_message = None;
+                }
             }
-            // Keep lifecycle status (including final results), failures,
-            // blockers and required actions intact even in the compact view.
-            self.task_text_recovery = Some("Call list_agents with compact:false and the same path_prefix to retrieve task messages. A changed/unknown revision returns a full replacement snapshot; unchanged:true preserves the prior snapshot, including its failures.".into());
+            if args.compact || args.status_only {
+                self.task_text_recovery = Some("Call the advertised list_agents entrypoint with compact:false, status_only:false, the same path_prefix and no since_revision to retrieve current task messages and completed reports. Use completed_report_recovery for the exact omitted report snapshot. A changed/unknown revision returns a replacement snapshot for the requested view; unchanged:true preserves the prior snapshot, including its failures.".into());
+            }
         }
         Ok(())
+    }
+
+    fn completed_report_snapshot(&self) -> Option<JsonValue> {
+        let completed_reports = self.agents.iter().filter(|agent| matches!(
+            &agent.agent_status,
+            ListedAgentStatus::Full(AgentStatus::Completed(_) | AgentStatus::CompletedWithSurface { .. })
+        )).map(|agent| json!({
+            "agent_name": agent.agent_name,
+            "agent_status": agent.agent_status,
+        })).collect::<Vec<_>>();
+        (!completed_reports.is_empty()).then(|| json!({
+            "revision": self.revision,
+            "agents": completed_reports,
+        }))
+    }
+
+    fn omit_completed_reports(&mut self) {
+        for agent in &mut self.agents {
+            // Opt in only: preserve errors and capacity-stop reports, and never
+            // fabricate an empty authoritative surfaced value.
+            let status = match &agent.agent_status {
+                ListedAgentStatus::Full(AgentStatus::Completed(_)) => {
+                    Some(CompletedAgentStatus::Completed)
+                }
+                ListedAgentStatus::Full(AgentStatus::CompletedWithSurface { .. }) => {
+                    Some(CompletedAgentStatus::CompletedWithSurface)
+                }
+                _ => None,
+            };
+            if let Some(status) = status {
+                agent.agent_status = ListedAgentStatus::StatusOnly(status);
+            }
+        }
     }
 }
 
@@ -227,7 +331,16 @@ impl ToolOutput for ListAgentsResult {
     }
 
     fn projection_metadata(&self) -> Option<codex_tools::ToolOutputProjectionMetadata> {
-        crate::tools::handlers::multi_agents_common::tool_output_projection_metadata(self, true)
+        let mut metadata = crate::tools::handlers::multi_agents_common::tool_output_projection_metadata(self, true)?;
+        metadata.essential_inline["revision"] = json!(self.revision);
+        metadata.essential_inline["unchanged"] = json!(self.unchanged);
+        if let Some(recovery) = &self.task_text_recovery {
+            metadata.essential_inline["task_text_recovery"] = json!(recovery);
+        }
+        if let Some(recovery) = &self.completed_report_recovery {
+            metadata.essential_inline["completed_report_recovery"] = recovery.clone();
+        }
+        Some(metadata)
     }
 
     fn to_response_item(&self, call_id: &str, payload: &ToolPayload) -> ResponseInputItem {
@@ -247,21 +360,21 @@ mod view_tests {
             agents: vec![ListedAgent {
                 agent_name: "/worker".into(), agent_status: AgentStatus::Completed(Some("retained final answer".into())),
                 last_task_message: Some("λ task instructions ".repeat(500)), runtime_loaded: false,
-            }],
+            }.into()],
             typed_tasks: vec![json!({"assignment_id":"assignment", "attempt_id":"attempt-one",
                 "workspace_status":{"lease_state":"active", "pending_gates":["review"], "next_required_action":"resolve review"}})],
             unresolved_descendants: vec![("/unavailable".into(), "delivery failed".into())],
-            revision: String::new(), unchanged: false, task_text_recovery: None,
+            revision: String::new(), unchanged: false, task_text_recovery: None, completed_report_recovery: None,
         }
     }
 
     #[test]
     fn compact_and_unchanged_views_preserve_failures_results_and_exact_full_recovery() {
         let mut compact = snapshot();
-        let args = ListAgentsArgs { path_prefix: None, compact: true, since_revision: None };
+        let args = ListAgentsArgs { path_prefix: None, compact: true, status_only: false, since_revision: None };
         compact.apply_view(&args, "root").unwrap();
         assert!(compact.agents[0].last_task_message.is_none());
-        assert_eq!(compact.agents[0].agent_status, AgentStatus::Completed(Some("retained final answer".into())));
+        assert_eq!(compact.agents[0].agent_status, ListedAgentStatus::Full(AgentStatus::Completed(Some("retained final answer".into()))));
         assert_eq!(compact.typed_tasks[0]["workspace_status"]["next_required_action"], "resolve review");
         assert_eq!(compact.unresolved_descendants[0].1, "delivery failed");
         assert!(compact.task_text_recovery.as_deref().unwrap().contains("compact:false"));
@@ -270,7 +383,7 @@ mod view_tests {
         assert!(unchanged.unchanged);
         assert!(unchanged.agents.is_empty() && unchanged.typed_tasks.is_empty());
         let mut full = snapshot();
-        full.apply_view(&ListAgentsArgs { path_prefix: None, compact: false, since_revision: Some(compact.revision) }, "root").unwrap();
+        full.apply_view(&ListAgentsArgs { path_prefix: None, compact: false, status_only: false, since_revision: Some(compact.revision) }, "root").unwrap();
         assert!(!full.unchanged, "changing view requires a replacement snapshot");
         assert_eq!(full.agents[0].last_task_message, snapshot().agents[0].last_task_message);
         assert!(serde_json::to_vec(&full).unwrap().len() > serde_json::to_vec(&unchanged).unwrap().len() * 4);
@@ -279,13 +392,13 @@ mod view_tests {
     #[test]
     fn changes_deletions_attempts_leases_and_required_actions_invalidate_display_identity() {
         let mut original = snapshot();
-        let args = || ListAgentsArgs { path_prefix: None, compact: true, since_revision: None };
+        let args = || ListAgentsArgs { path_prefix: None, compact: true, status_only: false, since_revision: None };
         original.apply_view(&args(), "root").unwrap();
         for change in 0..6 {
             let mut changed = snapshot();
             match change {
                 0 => changed.agents.clear(),
-                1 => changed.agents[0].agent_status = AgentStatus::Completed(Some("new answer".into())),
+                1 => changed.agents[0].agent_status = ListedAgentStatus::Full(AgentStatus::Completed(Some("new answer".into()))),
                 2 => changed.typed_tasks[0]["attempt_id"] = json!("attempt-two"),
                 3 => changed.typed_tasks[0]["workspace_status"]["lease_state"] = json!("expired"),
                 4 => changed.typed_tasks[0]["workspace_status"]["next_required_action"] = json!("repair failure"),

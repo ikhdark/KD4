@@ -8,8 +8,10 @@ param(
     [switch]$NoSccache,
     [switch]$BuildOnly,
 
-    [ValidateSet("debug", "release", "local-release", "local-fast")]
+    [ValidateSet("debug", "local-release", "local-fast", "local-pgo-instrumented", "local-pgo")]
     [string]$Profile = "local-release",
+    [string]$PgoGenerateDirectory,
+    [string]$PgoProfileData,
     [switch]$PrintBuiltCodexPath,
     [string]$RepoRoot,
     [string]$SourceExe,
@@ -29,7 +31,7 @@ param(
     [switch]$ConfigureDesktopLocalCli,
     [switch]$RestartDesktop,
     [switch]$RestartDesktopIfNeeded,
-    # Explicitly permit interruption of other chats during activation.
+    # Explicitly permit stopping live runtime/Desktop processes across homes.
     [switch]$Force,
     [ValidateSet("User", "Process")]
     [string]$DesktopCliEnvironmentTarget = "User",
@@ -90,7 +92,8 @@ function Get-FileSha256 {
 $script:LocalPublishContentHashCache = @{}
 # Git pathspec of the tracked publish inputs; the build fingerprint and the
 # embedded dirty flag must describe the same files.
-$script:LocalPublishBuildInputPathspec = @("codex-rs", "scripts/install/publish-local-codex.ps1", "scripts/build/common-rust-env.ps1", "justfile")
+$script:LocalPublishBuildInputPathspec = @("codex-rs", "third_party/notify", "scripts/install/publish-local-codex.ps1", "scripts/install/publish-local-codex-pgo.ps1", "scripts/build/common-rust-env.ps1", "justfile")
+$script:LocalPublishBuildTargetCache = @{}
 
 function Get-TextSha256 {
     param([string]$Value)
@@ -158,7 +161,7 @@ function Get-LocalPublishBuildRecipeFingerprint {
 
     $codexRs = Join-Path $RepoRoot "codex-rs"
     $identity = [ordered]@{
-        schemaVersion = 2
+        schemaVersion = 4
         command = "cargo build -p codex-cli -p codex-code-mode-host -p codex-windows-sandbox --profile <profile>"
         noSccache = [bool]$NoSccache
         cargo = $null
@@ -167,6 +170,8 @@ function Get-LocalPublishBuildRecipeFingerprint {
         environment = [ordered]@{}
         cargoConfig = [ordered]@{}
         nativeArchive = $null
+        pgo = Get-LocalPublishPgoConfiguration -RepoRoot $RepoRoot -Profile $Profile `
+            -GenerateDirectory $PgoGenerateDirectory -ProfileData $PgoProfileData
     }
     # The linker is the lld-link publish injects; its version, not just its
     # path, is identity because scoop's `current` junction keeps the path stable.
@@ -213,7 +218,7 @@ function Get-LocalPublishBuildRecipeFingerprint {
     # forms) feed the vendored C builds; the rest are compiler, build-script,
     # and compile-time inputs outside those namespaces.
     $ignoredEnvironmentNames = @("CARGO_TARGET_DIR", "CARGO_TERM_COLOR")
-    if ($NoSccache -or $Profile -eq "release") {
+    if ($NoSccache -or $Profile -in @("local-pgo-instrumented", "local-pgo")) {
         $ignoredEnvironmentNames += @(
             "RUSTC_WRAPPER", "CARGO_BUILD_RUSTC_WRAPPER",
             "RUSTC_WORKSPACE_WRAPPER", "CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER"
@@ -234,6 +239,23 @@ function Get-LocalPublishBuildRecipeFingerprint {
         $identity.environment[$name] = Get-TextSha256 -Value ([string][Environment]::GetEnvironmentVariable($name, "Process"))
     }
     $selectedArchive = if (-not [string]::IsNullOrWhiteSpace($RustyV8Archive)) { $RustyV8Archive } else { $env:RUSTY_V8_ARCHIVE }
+    if ([string]::IsNullOrWhiteSpace($selectedArchive) -and -not (Test-TruthyEnvValue -Value $env:V8_FROM_SOURCE)) {
+        # Use the same cache selection as the build, including short-name cache
+        # precedence and Cargo-relative CARGO_HOME. Hash bytes, not timestamps.
+        $cache = Get-RustyV8ArchiveCacheInfo -RepoRoot $RepoRoot
+        if ($null -ne $cache) {
+            $archiveHash = if (Test-Path -LiteralPath $cache.Path -PathType Leaf) {
+                Get-FileSha256 -Path $cache.Path
+            }
+            else {
+                # Downloads are pinned to this same checksum by the build.
+                # This permits initial cache population without treating it as
+                # source drift; without checksum metadata we fail closed.
+                Get-RustyV8ExpectedChecksum -RepoRoot $RepoRoot -Version $cache.Version -ArchiveName $cache.Name
+            }
+            $identity.nativeArchive = [ordered]@{ selector = $cache.Url; sha256 = $archiveHash }
+        }
+    }
     if (-not [string]::IsNullOrWhiteSpace($selectedArchive)) {
         if ($selectedArchive -match '^[A-Za-z][A-Za-z0-9+.-]*://') {
             $identity.nativeArchive = @{ selector = $selectedArchive; sha256 = $env:RUSTY_V8_ARCHIVE_SHA256 }
@@ -456,14 +478,97 @@ function Get-DefaultLocalCodexSqliteHome {
     return [System.IO.Path]::GetFullPath((Join-Path $LocalCodexHome "sqlite"))
 }
 
+function Get-LocalPublishCommand {
+    param([string]$Profile)
+
+    if ($Profile -eq "local-fast") {
+        return "just publish-local-codex-fast"
+    }
+    if ($Profile -eq "local-release") {
+        return "just publish-local-codex-final"
+    }
+
+    $publisherPath = Join-Path $PSScriptRoot "publish-local-codex.ps1"
+    if ($Profile -eq "local-pgo-instrumented") {
+        return "powershell -NoProfile -ExecutionPolicy Bypass -File `"$publisherPath`" -Concise -AutoSkipBuild -NoSccache -BuildOnly -Profile $Profile -PgoGenerateDirectory `"$PgoGenerateDirectory`""
+    }
+    if ($Profile -eq "local-pgo") {
+        return "powershell -NoProfile -ExecutionPolicy Bypass -File `"$publisherPath`" -Concise -SkipBuild -NoSccache -Profile $Profile -PgoProfileData `"$PgoProfileData`" -ConfigureDesktopLocalCli -RestartDesktopIfNeeded"
+    }
+    return "powershell -NoProfile -ExecutionPolicy Bypass -File `"$publisherPath`" -Concise -AutoSkipBuild -Profile $Profile -ConfigureDesktopLocalCli -RestartDesktopIfNeeded"
+}
+
+function Get-LocalPublishBuildTarget {
+    param([string]$RepoRoot, [string]$Profile)
+
+    if ($Profile -notin @("local-pgo-instrumented", "local-pgo")) { return $null }
+    if (-not $script:LocalPublishBuildTargetCache.ContainsKey($RepoRoot)) {
+        Push-Location -LiteralPath (Join-Path $RepoRoot "codex-rs")
+        try { $target = Get-WindowsRustyV8Target }
+        finally { Pop-Location }
+        if ([string]::IsNullOrWhiteSpace($target)) { throw "PGO requires a Windows MSVC Rust toolchain." }
+        $script:LocalPublishBuildTargetCache[$RepoRoot] = $target
+    }
+    return $script:LocalPublishBuildTargetCache[$RepoRoot]
+}
+
+function Get-LocalPublishPgoConfiguration {
+    param([string]$RepoRoot, [string]$Profile, [string]$GenerateDirectory, [string]$ProfileData)
+
+    if ($Profile -notin @("local-pgo-instrumented", "local-pgo")) {
+        if ($GenerateDirectory -or $ProfileData) { throw "PGO inputs require a local-pgo profile." }
+        return $null
+    }
+    # Both passes must use the same Cargo profile settings, not ambient overrides.
+    if (@(Get-ChildItem Env: | Where-Object { $_.Name -like "CARGO_PROFILE_*" -or $_.Name -eq "CARGO_INCREMENTAL" }).Count -gt 0) {
+        throw "Unset CARGO_PROFILE_* and CARGO_INCREMENTAL overrides for PGO."
+    }
+    $target = Get-LocalPublishBuildTarget -RepoRoot $RepoRoot -Profile $Profile
+    if ($Profile -eq "local-pgo-instrumented") {
+        if ([string]::IsNullOrWhiteSpace($GenerateDirectory) -or $ProfileData) {
+            throw "Instrumented PGO builds require only -PgoGenerateDirectory."
+        }
+        return [ordered]@{ mode = "generate"; target = $target; path = [IO.Path]::GetFullPath($GenerateDirectory); sha256 = $null }
+    }
+    if ([string]::IsNullOrWhiteSpace($ProfileData) -or $GenerateDirectory) {
+        throw "Optimized PGO builds require only -PgoProfileData."
+    }
+    $path = [IO.Path]::GetFullPath($ProfileData)
+    $hash = Get-CachedLocalPublishFileSha256 -Path $path -ForceRefresh
+    if (-not (Test-Sha256Text -Value $hash)) { throw "PGO profile data is missing or unreadable: $path" }
+    # Cargo fingerprints flags, not the contents of an external profile file.
+    # Content-addressed filenames make every changed profile a new compiler input.
+    if ([IO.Path]::GetFileName($path) -cne "profile-$hash.profdata") {
+        throw "PGO profile data must be content-addressed as profile-<sha256>.profdata; rerun the PGO Optimize stage."
+    }
+    return [ordered]@{ mode = "use"; target = $target; path = $path; sha256 = $hash }
+}
+
+function Get-LocalPublishCargoProfile {
+    param([string]$Profile)
+    if ($Profile -eq "debug") { return "dev" }
+    if ($Profile -eq "local-pgo-instrumented") { return "local-pgo" }
+    return $Profile
+}
+
+function Get-LocalPublishArtifactDirectory {
+    param([string]$RepoRoot, [string]$Profile)
+
+    $directory = Join-Path $RepoRoot "codex-rs\target\publish-$Profile"
+    $target = Get-LocalPublishBuildTarget -RepoRoot $RepoRoot -Profile $Profile
+    if ($target) { $directory = Join-Path $directory $target }
+    $cargoProfile = Get-LocalPublishCargoProfile -Profile $Profile
+    $profileDir = if ($cargoProfile -eq "dev") { "debug" } else { $cargoProfile }
+    return Join-Path $directory $profileDir
+}
+
 function Get-BuiltCodexPath {
     param(
         [string]$RepoRoot,
         [string]$Profile
     )
 
-    $profileDir = if ($Profile -eq "debug") { "debug" } else { $Profile }
-    return Join-Path $RepoRoot "codex-rs\target\publish-$Profile\$profileDir\codex.exe"
+    return Join-Path (Get-LocalPublishArtifactDirectory -RepoRoot $RepoRoot -Profile $Profile) "codex.exe"
 }
 
 function Get-BuiltCodeModeHostPath {
@@ -472,8 +577,7 @@ function Get-BuiltCodeModeHostPath {
         [string]$Profile
     )
 
-    $profileDir = if ($Profile -eq "debug") { "debug" } else { $Profile }
-    return Join-Path $RepoRoot "codex-rs\target\publish-$Profile\$profileDir\codex-code-mode-host.exe"
+    return Join-Path (Get-LocalPublishArtifactDirectory -RepoRoot $RepoRoot -Profile $Profile) "codex-code-mode-host.exe"
 }
 
 function Get-FileLastWriteUtc {
@@ -514,8 +618,10 @@ function Test-LocalPublishBuildRelevantPath {
     $normalized = $Path.Trim('"') -replace "\\", "/"
     return (
         $normalized -like "codex-rs/*" -or
+        $normalized -like "third_party/notify/*" -or
         $normalized -eq "justfile" -or
         $normalized -eq "scripts/install/publish-local-codex.ps1" -or
+        $normalized -eq "scripts/install/publish-local-codex-pgo.ps1" -or
         $normalized -eq "scripts/build/common-rust-env.ps1"
     ) -and
     $normalized -notlike "codex-rs/target/*"
@@ -1200,6 +1306,17 @@ function Get-RunningCodexTargetProcesses {
     )
 }
 
+function Get-RunningCodexBundleProcesses {
+    param([string[]]$BundlePaths)
+
+    $processes = @(
+        foreach ($path in $BundlePaths) {
+            Get-RunningCodexTargetProcesses -TargetPath $path
+        }
+    )
+    return @($processes | Sort-Object -Property Id -Unique)
+}
+
 function Get-CodexTurnHostProcess {
     param(
         [string[]]$BundlePaths
@@ -1318,13 +1435,15 @@ function Get-LiveProcessesById {
 function Stop-RunningCodexTargetProcesses {
     param(
         [object[]]$Processes,
-        [int]$TimeoutSeconds
+        [int]$TimeoutSeconds,
+        [switch]$Force
     )
 
     if ($Processes.Count -eq 0) {
         return
     }
 
+    Assert-CodexProcessesMayBeStopped -Processes $Processes -Force:$Force
     Write-ProofLine "closeRunningTarget" "requested: $(Format-ProcessProof $Processes); timeoutSeconds=$TimeoutSeconds"
 
     $closeDeadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
@@ -1693,8 +1812,7 @@ function Get-BuiltWindowsSandboxSetupPath {
         [string]$Profile
     )
 
-    $profileDir = if ($Profile -eq "debug") { "debug" } else { $Profile }
-    return Join-Path $RepoRoot "codex-rs\target\publish-$Profile\$profileDir\codex-windows-sandbox-setup.exe"
+    return Join-Path (Get-LocalPublishArtifactDirectory -RepoRoot $RepoRoot -Profile $Profile) "codex-windows-sandbox-setup.exe"
 }
 
 function Get-BuiltCommandRunnerPath {
@@ -1703,8 +1821,7 @@ function Get-BuiltCommandRunnerPath {
         [string]$Profile
     )
 
-    $profileDir = if ($Profile -eq "debug") { "debug" } else { $Profile }
-    return Join-Path $RepoRoot "codex-rs\target\publish-$Profile\$profileDir\codex-command-runner.exe"
+    return Join-Path (Get-LocalPublishArtifactDirectory -RepoRoot $RepoRoot -Profile $Profile) "codex-command-runner.exe"
 }
 
 function Get-DesktopEnvironmentRoutingSnapshot {
@@ -2126,7 +2243,7 @@ function Test-DesktopRuntimeProof {
         }
         $stdout = $stdoutTask.GetAwaiter().GetResult()
         $stderr = $stderrTask.GetAwaiter().GetResult()
-        $doctor = ConvertFrom-DoctorOutput -OutputLines @($stdout)
+        $doctor = ConvertFrom-Json -InputObject $stdout -ErrorAction Stop
         if ($null -eq $doctor) {
             throw "Desktop runtime probe returned no JSON report (exit $($process.ExitCode)): $($stderr.Trim())"
         }
@@ -2161,122 +2278,22 @@ function Test-DesktopRuntimeProof {
     }
 }
 
-function Assert-NoCodexRunningTurns {
-    param([string]$LocalCodexHome, [switch]$Force)
+function Assert-CodexProcessesMayBeStopped {
+    param([object[]]$Processes, [switch]$Force)
 
     if ($Force) { return }
-    if ([string]::IsNullOrWhiteSpace($LocalCodexHome)) {
-        throw "Cannot verify running chats without LocalCodexHome. Refusing activation; use -Force to override."
-    }
-    $sessions = Join-Path $LocalCodexHome "sessions"
-    if (-not (Test-Path -LiteralPath $sessions)) { return }
-    $unfinished = [System.Collections.Generic.List[string]]::new()
-    $verifiedPayloads = @{}
-    # Active rollouts are materialized as JSONL. Completed compressed rollouts
-    # cannot contain a live writer. Read every chat, not just the caller's host.
-    foreach ($file in Get-ChildItem -LiteralPath $sessions -Recurse -File -Force -Filter "rollout-*.jsonl") {
-        $active = @{}
-        $reader = [IO.File]::OpenText($file.FullName)
-        try {
-            while ($null -ne ($line = $reader.ReadLine())) {
-                if ([string]::IsNullOrWhiteSpace($line)) { continue }
-                try {
-                    $record = ConvertFrom-Json -InputObject $line -ErrorAction Stop
-                    if ($record -isnot [pscustomobject] -or
-                        $null -eq $record.PSObject.Properties["type"] -or
-                        $record.type -isnot [string]) {
-                        throw "Invalid rollout record type."
-                    }
-                    if ($record.type -eq "rollout_payload_artifact") {
-                        $reference = $record.PSObject.Properties["payload"]
-                        if ($null -eq $reference -or $reference.Value -isnot [pscustomobject]) {
-                            throw "Invalid rollout payload reference."
-                        }
-                        $reference = $reference.Value
-                        foreach ($name in @("item_type", "sha256", "bytes")) {
-                            if ($null -eq $reference.PSObject.Properties[$name]) { throw "Missing payload identity." }
-                        }
-                        if ($reference.item_type -isnot [string]) { throw "Invalid payload item type." }
-                        if ($reference.item_type -ne "event_msg") { continue }
-                        $size = 0L
-                        if ($reference.sha256 -isnot [string] -or $reference.sha256 -cnotmatch '^[0-9a-f]{64}$' -or
-                            ($reference.bytes -isnot [int] -and $reference.bytes -isnot [long]) -or
-                            -not [long]::TryParse([string]$reference.bytes, [ref]$size) -or
-                            $size -lt 0 -or $size -gt 268435456) { throw "Invalid payload identity." }
-                        $cacheKey = "$($reference.sha256):$size"
-                        if ($verifiedPayloads.ContainsKey($cacheKey)) {
-                            $record = $verifiedPayloads[$cacheKey]
-                        }
-                        else {
-                            # Resolve only against this fork home. Never fall back to
-                            # the official home when lifecycle evidence is missing.
-                            $store = Join-Path $LocalCodexHome "rollout-payloads"
-                            $artifact = Join-Path $store "$($reference.sha256).json"
-                            foreach ($path in @($store, $artifact)) {
-                                if (((Get-Item -LiteralPath $path -Force).Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
-                                    throw "Indirect rollout payload path."
-                                }
-                            }
-                            $stream = [IO.File]::Open($artifact, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::ReadWrite)
-                            try {
-                                if ($stream.Length -ne $size) { throw "Payload size mismatch." }
-                                $bytes = [byte[]]::new([int]$size)
-                                $offset = 0
-                                while ($offset -lt $bytes.Length) {
-                                    $read = $stream.Read($bytes, $offset, $bytes.Length - $offset)
-                                    if ($read -eq 0) { throw "Truncated payload." }
-                                    $offset += $read
-                                }
-                                if ($stream.ReadByte() -ne -1) { throw "Payload grew." }
-                            }
-                            finally { $stream.Dispose() }
-                            $sha = [Security.Cryptography.SHA256]::Create()
-                            try { $digest = [BitConverter]::ToString($sha.ComputeHash($bytes)).Replace('-', '').ToLowerInvariant() }
-                            finally { $sha.Dispose() }
-                            if ($digest -cne $reference.sha256) { throw "Payload checksum mismatch." }
-                            $record = ConvertFrom-Json -InputObject ([Text.UTF8Encoding]::new($false, $true).GetString($bytes)) -ErrorAction Stop
-                            if ($record -isnot [pscustomobject] -or $null -eq $record.PSObject.Properties["type"] -or
-                                $record.type -cne "event_msg" -or $null -eq $record.PSObject.Properties["payload"] -or
-                                $record.payload -isnot [pscustomobject] -or $null -eq $record.payload.PSObject.Properties["type"] -or
-                                $record.payload.type -isnot [string]) { throw "Payload type mismatch." }
-                            # Cache only lifecycle fields, not large terminal messages.
-                            $turnId = if ($record.payload.PSObject.Properties["turn_id"]) { $record.payload.turn_id } else { "<unknown>" }
-                            $record = [pscustomobject]@{ type = "event_msg"; payload = [pscustomobject]@{ type = $record.payload.type; turn_id = $turnId } }
-                            $verifiedPayloads[$cacheKey] = $record
-                        }
-                    }
-                    if ($record.type -ne "event_msg") { continue }
-                    $payloadProperty = $record.PSObject.Properties["payload"]
-                    if ($null -eq $payloadProperty -or $payloadProperty.Value -isnot [pscustomobject]) {
-                        throw "Invalid rollout event payload."
-                    }
-                    $payload = $payloadProperty.Value
-                    if ($null -eq $payload.PSObject.Properties["type"] -or $payload.type -isnot [string]) {
-                        throw "Invalid rollout event type."
-                    }
-                }
-                catch {
-                    throw "Cannot verify chat state in $($file.FullName); refusing activation. Retry after writes settle or use -Force."
-                }
-                if ($payload.type -notin @("task_started", "turn_started", "task_complete", "turn_complete", "turn_aborted")) {
-                    continue
-                }
-                $id = if ($payload.PSObject.Properties["turn_id"]) { [string]$payload.turn_id } else { "<unknown>" }
-                if ($payload.type -in @("task_started", "turn_started")) {
-                    $active[$id] = $true
-                }
-                else {
-                    $active.Remove($id)
-                }
-            }
+    # Executable identity does not establish CODEX_HOME or live turn state.
+    # Do not infer liveness from historical rollout events (crashes leave starts
+    # unmatched). Until there is a cross-home live-state contract, fail closed
+    # for every process we would stop, including apparently idle processes.
+    $live = @(Get-LiveProcessesById -Processes $Processes)
+    try {
+        if ($live.Count -gt 0) {
+            throw "Activation deferred: Codex processes are still running ($(Format-ProcessProof $live)). Their home/chat state cannot be verified. Close them manually, or use -Force to explicitly allow interruption across all homes sharing this runtime."
         }
-        finally {
-            $reader.Dispose()
-        }
-        foreach ($id in $active.Keys) { $unfinished.Add("$($file.Name):$id") }
     }
-    if ($unfinished.Count -gt 0) {
-        throw "Activation deferred: $($unfinished.Count) chat turn(s) have no recorded completion. Wait for them to finish, or use -Force to explicitly allow interruption. $($unfinished -join ', ')"
+    finally {
+        foreach ($process in $live) { $process.Dispose() }
     }
 }
 
@@ -2345,8 +2362,6 @@ function Restart-CodexDesktop {
         throw "LocalCodexHome is required to prove the restarted Desktop fork runtime."
     }
 
-    Assert-NoCodexRunningTurns -LocalCodexHome $LocalCodexHome -Force:$Force
-
     # Match on the resolved desktop executable path so codex CLI sessions
     # (same process name, different binary) are never killed.
     $desktopProcesses = @(
@@ -2359,6 +2374,7 @@ function Restart-CodexDesktop {
                 }
             }
     )
+    Assert-CodexProcessesMayBeStopped -Processes $desktopProcesses -Force:$Force
     foreach ($process in @(Get-LiveProcessesById -Processes $desktopProcesses)) {
         try {
             Stop-Process -InputObject $process -ErrorAction SilentlyContinue
@@ -2465,7 +2481,7 @@ function Enable-SccacheForPublish {
             "disabled by -NoSccache"
         }
         else {
-            "disabled for release profile v8 archive linker compatibility"
+            "disabled for PGO builds"
         }
         Set-ProcessEnvironmentVariable -Name "RUSTC_WRAPPER" -Value $null
         Set-ProcessEnvironmentVariable -Name "CARGO_BUILD_RUSTC_WRAPPER" -Value $null
@@ -2792,6 +2808,34 @@ function Assert-RustyV8ArchiveChecksum {
     Write-ProofLine "v8ArchiveChecksumStatus" "ok"
 }
 
+function Get-RustyV8ArchiveCacheInfo {
+    param([string]$RepoRoot, [string]$Version, [string]$Target)
+
+    if ([string]::IsNullOrWhiteSpace($Version)) {
+        $Version = Get-CargoLockPackageVersion -RepoRoot $RepoRoot -PackageName "v8"
+    }
+    if ([string]::IsNullOrWhiteSpace($Target)) { $Target = Get-WindowsRustyV8Target }
+    if ([string]::IsNullOrWhiteSpace($Version) -or [string]::IsNullOrWhiteSpace($Target)) { return $null }
+
+    # Windows always uses release prebuilts. Resolve relative CARGO_HOME from
+    # the Cargo working directory, not the shell invoking the publisher.
+    $archiveName = "rusty_v8_release_$Target.lib.gz"
+    $archiveUrl = "https://github.com/denoland/rusty_v8/releases/download/v$Version/$archiveName"
+    $cargoHome = if (-not [string]::IsNullOrWhiteSpace($env:CARGO_HOME)) {
+        $locator = if ([IO.Path]::IsPathRooted($env:CARGO_HOME)) { $env:CARGO_HOME } else { Join-Path (Join-Path $RepoRoot 'codex-rs') $env:CARGO_HOME }
+        [IO.Path]::GetFullPath($locator)
+    }
+    elseif (-not [string]::IsNullOrWhiteSpace($env:USERPROFILE)) {
+        Join-Path $env:USERPROFILE ".cargo"
+    }
+    else { return $null }
+    $cacheRoot = Join-Path $cargoHome ".rusty_v8"
+    $cachePath = Join-Path $cacheRoot (ConvertTo-RustyV8CacheFileName -Url $archiveUrl)
+    $shortCachePath = Join-Path $cacheRoot (ConvertTo-RustyV8CacheFileName -Url "v$Version/$archiveName")
+    if (Test-Path -LiteralPath $shortCachePath -PathType Leaf) { $cachePath = $shortCachePath }
+    return [pscustomobject]@{ Path = [IO.Path]::GetFullPath($cachePath); Name = $archiveName; Url = $archiveUrl; Version = $Version }
+}
+
 function Assert-RustyV8ArchiveReadyForPublish {
     param(
         [string]$RepoRoot,
@@ -2825,26 +2869,8 @@ function Assert-RustyV8ArchiveReadyForPublish {
     if ((Test-TruthyEnvValue -Value $env:RUSTY_V8_SKIP_DOWNLOAD) -and -not $DryRun) {
         throw 'RUSTY_V8_SKIP_DOWNLOAD is analysis-only and cannot prove a publish build. Unset it before publishing.'
     }
-    # The locked v8 crate always selects release prebuilts on Windows.
-    $archiveProfile = "release"
-    $archiveName = "rusty_v8_${archiveProfile}_$target.lib.gz"
-    $archiveUrl = "https://github.com/denoland/rusty_v8/releases/download/v$v8Version/$archiveName"
-    $cacheFileName = ConvertTo-RustyV8CacheFileName -Url $archiveUrl
-
-    # rusty_v8's build script reads `home::cargo_home()`: CARGO_HOME wins, then
-    # the default user Cargo home. Checking any other directory would bless an
-    # archive the build never reads.
-    $cargoHome = if (-not [string]::IsNullOrWhiteSpace($env:CARGO_HOME)) {
-        $homeLocator = if ([IO.Path]::IsPathRooted($env:CARGO_HOME)) { $env:CARGO_HOME } else { Join-Path (Join-Path $RepoRoot 'codex-rs') $env:CARGO_HOME }
-        [System.IO.Path]::GetFullPath($homeLocator)
-    }
-    elseif (-not [string]::IsNullOrWhiteSpace($env:USERPROFILE)) {
-        Join-Path $env:USERPROFILE ".cargo"
-    }
-    else {
-        $null
-    }
-    if ($null -eq $cargoHome) {
+    $cache = Get-RustyV8ArchiveCacheInfo -RepoRoot $RepoRoot -Version $v8Version -Target $target
+    if ($null -eq $cache) {
         Write-ProofLine "v8ArchiveStatus" "<skipped: neither CARGO_HOME nor USERPROFILE is set>"
         if (-not $DryRun) {
             throw 'Cannot select a verified Rusty V8 archive without CARGO_HOME or USERPROFILE.'
@@ -2852,12 +2878,9 @@ function Assert-RustyV8ArchiveReadyForPublish {
         return
     }
 
-    $cachePath = Join-Path (Join-Path $cargoHome ".rusty_v8") $cacheFileName
-    $shortCacheName = ConvertTo-RustyV8CacheFileName -Url "v$v8Version/$archiveName"
-    $shortCachePath = Join-Path (Join-Path $cargoHome ".rusty_v8") $shortCacheName
-    if (Test-Path -LiteralPath $shortCachePath -PathType Leaf) {
-        $cachePath = $shortCachePath
-    }
+    $cachePath = $cache.Path
+    $archiveName = $cache.Name
+    $archiveUrl = $cache.Url
     Write-ProofLine "v8ArchiveVersion" $v8Version
     Write-ProofLine "v8ArchiveUrl" $archiveUrl
     Write-ProofLine "v8ArchiveCachePath" $cachePath
@@ -2994,6 +3017,31 @@ function Invoke-CargoForPublish {
     }
 }
 
+function Get-LocalPublishCargoConfigLines {
+    param([string]$Profile, [bool]$DisableSccache, [object]$Pgo)
+
+    $lines = [System.Collections.Generic.List[string]]::new()
+    if ($DisableSccache) {
+        $lines.Add("[build]")
+        $lines.Add("rustc-wrapper = `"`"")
+        $lines.Add("rustc-workspace-wrapper = `"`"")
+    }
+    if ($Profile -in @("local-release", "local-pgo-instrumented", "local-pgo")) {
+        # Cargo appends these to the shared stack/static-CRT/native-CPU flags.
+        # Scope MSVC linker syntax to Windows MSVC, not GNU or other platforms.
+        $lines.Add("[target.'cfg(all(windows, target_env = `"msvc`"))']")
+        $lines.Add('rustflags = ["-C", "link-arg=/OPT:REF", "-C", "link-arg=/OPT:ICF"]')
+    }
+    if ($null -ne $Pgo) {
+        # A TOML array preserves profile paths containing spaces. Both passes
+        # retain the same linker optimizations and shared target flags.
+        $flag = "profile-$($Pgo.mode)=$($Pgo.path)" | ConvertTo-Json -Compress
+        $lines.Add("[target.$($Pgo.target)]")
+        $lines.Add("rustflags = [`"-C`", $flag]")
+    }
+    return $lines.ToArray()
+}
+
 function Invoke-CodexBuild {
     param(
         [string]$RepoRoot,
@@ -3009,31 +3057,33 @@ function Invoke-CodexBuild {
             throw "$name is set and would replace the target rustflags in codex-rs/.cargo/config.toml (8 MiB stack, static CRT). Unset it; add flags with CARGO_TARGET_<TRIPLE>_RUSTFLAGS, which Cargo joins with them."
         }
     }
-    $cargoProfile = if ($Profile -eq "debug") { "dev" } else { $Profile }
+    $cargoProfile = Get-LocalPublishCargoProfile -Profile $Profile
+    $pgo = Get-LocalPublishPgoConfiguration -RepoRoot $RepoRoot -Profile $Profile `
+        -GenerateDirectory $PgoGenerateDirectory -ProfileData $PgoProfileData
     $cargoConfigArgs = @()
-    $noSccacheCargoConfigPath = $null
-    $releaseUsesUpstreamProfile = $Profile -eq "release"
-    $effectiveNoSccache = [bool]$NoSccache -or $releaseUsesUpstreamProfile
-    if ($releaseUsesUpstreamProfile) {
-        Write-ProofLine "releaseProfile" "upstream-compatible: thin LTO, line-table debug, strip=symbols, codegen-units=4"
+    $publishCargoConfigPath = $null
+    $effectiveNoSccache = [bool]$NoSccache -or $null -ne $pgo
+    $cargoConfigLines = @(Get-LocalPublishCargoConfigLines -Profile $Profile -DisableSccache $effectiveNoSccache -Pgo $pgo)
+    if ($Profile -eq "local-release") {
+        Write-ProofLine "releaseProfile" "local-final: opt-level=3, fat LTO, codegen-units=1, dependency-codegen-units=1, incremental=false"
+    }
+    if ($Profile -in @("local-release", "local-pgo-instrumented", "local-pgo")) {
+        Write-ProofLine "linkerOptimization" "Windows MSVC: /OPT:REF, /OPT:ICF"
     }
     try {
-        if ($effectiveNoSccache) {
+        if ($cargoConfigLines.Count -gt 0) {
             if ($DryRun) {
                 $cargoConfigArgs = @("--config", "<temporary publish cargo config>")
             }
             else {
-                $noSccacheCargoConfigPath = [System.IO.Path]::GetTempFileName()
-                $cargoConfigLines = [System.Collections.Generic.List[string]]::new()
-                $cargoConfigLines.Add("[build]")
-                $cargoConfigLines.Add("rustc-wrapper = `"`"")
-                $cargoConfigLines.Add("rustc-workspace-wrapper = `"`"")
-                [System.IO.File]::WriteAllText($noSccacheCargoConfigPath, ([string]::Join("`n", $cargoConfigLines) + "`n"))
-                $cargoConfigArgs = @("--config", $noSccacheCargoConfigPath)
+                $publishCargoConfigPath = [System.IO.Path]::GetTempFileName()
+                [System.IO.File]::WriteAllText($publishCargoConfigPath, ([string]::Join("`n", $cargoConfigLines) + "`n"))
+                $cargoConfigArgs = @("--config", $publishCargoConfigPath)
             }
         }
         $publishPackages = @("-p", "codex-cli", "-p", "codex-code-mode-host", "-p", "codex-windows-sandbox")
         $buildArgs = $cargoConfigArgs + @("build") + $publishPackages + @("--profile", $cargoProfile)
+        if ($null -ne $pgo) { $buildArgs += @("--target", $pgo.target) }
 
         $codexRs = Join-Path $RepoRoot "codex-rs"
         $publishTargetDir = Join-Path $codexRs "target\publish-$Profile"
@@ -3120,8 +3170,8 @@ function Invoke-CodexBuild {
         }
     }
     finally {
-        if ($null -ne $noSccacheCargoConfigPath) {
-            Remove-Item -LiteralPath $noSccacheCargoConfigPath -ErrorAction SilentlyContinue
+        if ($null -ne $publishCargoConfigPath) {
+            Remove-Item -LiteralPath $publishCargoConfigPath -ErrorAction SilentlyContinue
         }
     }
 }
@@ -3172,6 +3222,7 @@ function New-CodexRuntimeBundleTransaction {
     $stageRoot = Join-Path $installParent (".$installLeaf.bundle.$transactionId")
     $rollbackRoot = Join-Path $installParent (".$installLeaf.rollback.$transactionId")
     $transactionEntries = [System.Collections.Generic.List[object]]::new()
+    $createdExternalBackups = [System.Collections.Generic.List[string]]::new()
     $transaction = [pscustomobject]@{
         SchemaVersion = 1
         TransactionId = $transactionId
@@ -3186,9 +3237,49 @@ function New-CodexRuntimeBundleTransaction {
     # Persist ownership before creating any substantial preparation residue.
     Write-CodexPublishTransactionJournal -Transaction $transaction
     try {
+        $installPrefix = $installFullPath + [IO.Path]::DirectorySeparatorChar
+        $managedTargets = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+        $managedAncestors = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+        foreach ($entry in $Entries) {
+            $targetFullPath = [IO.Path]::GetFullPath([string]$entry.TargetPath)
+            if (-not $targetFullPath.StartsWith($installPrefix, [StringComparison]::OrdinalIgnoreCase)) {
+                throw "Runtime bundle target is outside the install directory: $targetFullPath"
+            }
+            $null = $managedTargets.Add($targetFullPath)
+            $ancestor = [IO.Path]::GetDirectoryName($targetFullPath)
+            while ($ancestor.StartsWith($installPrefix, [StringComparison]::OrdinalIgnoreCase)) {
+                $null = $managedAncestors.Add($ancestor)
+                $ancestor = [IO.Path]::GetDirectoryName($ancestor)
+            }
+        }
+        # Recurse only along managed ancestors. Copy every unmanaged branch with
+        # the existing Copy-Item behavior, but never stage old bytes at an exact
+        # managed target: every entry below is populated from verified sources.
+        $copyCarryForward = {
+            param([string]$SourceRoot, [string]$DestinationRoot)
+            foreach ($item in Get-ChildItem -LiteralPath $SourceRoot -Force -ErrorAction Stop) {
+                $sourcePath = [IO.Path]::GetFullPath($item.FullName)
+                if ($managedTargets.Contains($sourcePath)) {
+                    if ($item.PSIsContainer) {
+                        throw "Runtime bundle file target is an existing directory: $sourcePath"
+                    }
+                    continue
+                }
+                if ($item.PSIsContainer -and $managedAncestors.Contains($sourcePath)) {
+                    if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+                        throw "Runtime bundle managed ancestor is a reparse point: $sourcePath"
+                    }
+                    Copy-Item -LiteralPath $sourcePath -Destination $DestinationRoot -Force -ErrorAction Stop
+                    & $copyCarryForward $sourcePath (Join-Path $DestinationRoot $item.Name)
+                }
+                else {
+                    Copy-Item -LiteralPath $sourcePath -Destination $DestinationRoot -Recurse -Force -ErrorAction Stop
+                }
+            }
+        }
         New-Item -ItemType Directory -Path $stageRoot -Force | Out-Null
         if (Test-Path -LiteralPath $installFullPath -PathType Container) {
-            Get-ChildItem -LiteralPath $installFullPath -Force | Copy-Item -Destination $stageRoot -Recurse -Force
+            & $copyCarryForward $installFullPath $stageRoot
         }
         for ($index = 0; $index -lt $Entries.Count; $index += 1) {
             $entry = $Entries[$index]
@@ -3223,7 +3314,20 @@ function New-CodexRuntimeBundleTransaction {
                 }
                 else {
                     New-Item -ItemType Directory -Path (Split-Path -Parent $backupFullPath) -Force | Out-Null
-                    [IO.File]::Copy($entry.TargetPath, $backupFullPath, $true)
+                    # CreateNew establishes ownership without overwriting an
+                    # earlier backup. Track before copying, so partial copies
+                    # are also removed if preparation fails.
+                    $backupStream = [IO.File]::Open($backupFullPath, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
+                    $backupSource = $null
+                    try {
+                        $createdExternalBackups.Add($backupFullPath)
+                        $backupSource = [IO.File]::OpenRead($entry.TargetPath)
+                        $backupSource.CopyTo($backupStream)
+                    }
+                    finally {
+                        if ($null -ne $backupSource) { $backupSource.Dispose() }
+                        $backupStream.Dispose()
+                    }
                 }
             }
             $transactionEntries.Add([pscustomobject]@{
@@ -3242,6 +3346,11 @@ function New-CodexRuntimeBundleTransaction {
         return $transaction
     }
     catch {
+        foreach ($createdBackup in $createdExternalBackups) {
+            if (Test-Path -LiteralPath $createdBackup -PathType Leaf) {
+                Remove-Item -LiteralPath $createdBackup -Force
+            }
+        }
         if (Test-Path -LiteralPath $stageRoot -PathType Container) {
             Remove-Item -LiteralPath $stageRoot -Recurse -Force
         }
@@ -3306,7 +3415,7 @@ function Complete-CodexRuntimeBundleTransaction {
 }
 
 function Recover-CodexRuntimeBundleTransaction {
-    param([string]$JournalPath)
+    param([string]$JournalPath, [switch]$Force)
 
     if (-not (Test-Path -LiteralPath $JournalPath -PathType Leaf)) {
         return $false
@@ -3357,23 +3466,61 @@ function Recover-CodexRuntimeBundleTransaction {
         }
     }
     $originalPhase = $transaction.Phase
+    if ($originalPhase -notin @("Preparing", "Prepared", "Deactivating", "Activating", "ActivePendingVerification", "Recovering", "RolledBack", "Committed") -or
+        $transaction.HadPreviousInstall -isnot [bool]) {
+        throw "Cannot recover runtime bundle transaction with an invalid phase or previous-install state: $JournalPath"
+    }
     $preparationOnly = $originalPhase -eq "Preparing" -or $originalPhase -eq "Prepared"
-    if ($transaction.Phase -ne "Committed" -and -not $preparationOnly) {
+    $rollbackExists = Test-Path -LiteralPath $transaction.RollbackRoot -PathType Container
+    $installExists = Test-Path -LiteralPath $transaction.InstallDir -PathType Container
+    # Deactivating is written before the first rename. Only this exact shape
+    # proves that activation never started when the rollback directory is absent.
+    $deactivationNotStarted = $originalPhase -eq "Deactivating" -and $installExists -and
+        (Test-Path -LiteralPath $transaction.StageRoot -PathType Container)
+    if (-not $preparationOnly -and $originalPhase -notin @("Committed", "RolledBack") -and
+        $transaction.HadPreviousInstall -and -not $rollbackExists -and -not $deactivationNotStarted) {
+        throw "Cannot recover runtime bundle transaction: previous installation rollback is missing: $($transaction.RollbackRoot). Journal and installed bundle retained for manual recovery: $JournalPath"
+    }
+    if ($originalPhase -eq "RolledBack" -and $transaction.HadPreviousInstall -and -not $installExists) {
+        throw "Cannot finalize rollback: restored installation is missing. Journal retained: $JournalPath"
+    }
+    if (-not $preparationOnly) {
+        # Recovery can replace/remove bundle directories too. Apply the same
+        # cross-home process protection as normal publishing before mutation.
+        $script:RunningTargetProcessProbeError = $null
+        $script:RunningTargetProcessProbeWarnings = [System.Collections.Generic.List[string]]::new()
+        $recoveryPaths = @(
+            foreach ($root in @($transaction.InstallDir, $transaction.StageRoot, $transaction.RollbackRoot, $failedRoot)) {
+                foreach ($relative in @("codex.exe", "codex-code-mode-host.exe", "codex-resources\codex-windows-sandbox-setup.exe", "codex-resources\codex-command-runner.exe")) {
+                    Join-Path $root $relative
+                }
+            }
+        )
+        $recoveryProcesses = @(Get-RunningCodexBundleProcesses -BundlePaths $recoveryPaths)
+        if (-not [string]::IsNullOrWhiteSpace($script:RunningTargetProcessProbeError) -or $script:RunningTargetProcessProbeWarnings.Count -gt 0) {
+            throw "Cannot safely recover runtime bundle: process detection was indeterminate. Journal retained: $JournalPath"
+        }
+        Assert-CodexProcessesMayBeStopped -Processes $recoveryProcesses -Force:$Force
+    }
+    if ($originalPhase -notin @("Committed", "RolledBack") -and -not $preparationOnly) {
         $transaction.Phase = "Recovering"
         Write-CodexPublishTransactionJournal -Transaction $transaction
-        if (Test-Path -LiteralPath $transaction.RollbackRoot -PathType Container) {
+        if ($rollbackExists) {
             if (Test-Path -LiteralPath $transaction.InstallDir -PathType Container) {
                 if (Test-Path -LiteralPath $failedRoot) {
                     throw "Cannot overwrite retained failed runtime bundle: $failedRoot"
                 }
                 [IO.Directory]::Move($transaction.InstallDir, $failedRoot)
-                Remove-Item -LiteralPath $failedRoot -Recurse -Force
             }
             [IO.Directory]::Move($transaction.RollbackRoot, $transaction.InstallDir)
         }
         elseif (-not $transaction.HadPreviousInstall -and (Test-Path -LiteralPath $transaction.InstallDir -PathType Container)) {
             Remove-Item -LiteralPath $transaction.InstallDir -Recurse -Force
         }
+        # Make cleanup retries distinguishable from a missing rollback while an
+        # unverified bundle is active. A crash before this write fails closed.
+        $transaction.Phase = "RolledBack"
+        Write-CodexPublishTransactionJournal -Transaction $transaction
     }
     if (-not [string]::IsNullOrWhiteSpace([string]$transaction.StageRoot) -and (Test-Path -LiteralPath $transaction.StageRoot -PathType Container)) {
         Remove-Item -LiteralPath $transaction.StageRoot -Recurse -Force
@@ -3533,6 +3680,15 @@ if ($ImportOnly) {
 }
 
 $repoRoot = Get-RepoRoot -Override $RepoRoot
+$pgoConfiguration = Get-LocalPublishPgoConfiguration -RepoRoot $repoRoot -Profile $Profile `
+    -GenerateDirectory $PgoGenerateDirectory -ProfileData $PgoProfileData
+if ($Profile -eq "local-pgo-instrumented" -and -not $BuildOnly -and -not $PrintBuiltCodexPath) {
+    throw "Instrumented PGO bundles are training-only; use -BuildOnly, never publish them to Desktop."
+}
+if ($null -ne $pgoConfiguration -and $SourceBundleManifest) {
+    throw "PGO profiles build from this checkout; -SourceBundleManifest is not supported."
+}
+$publishCommand = Get-LocalPublishCommand -Profile $Profile
 if ($PrintBuiltCodexPath) {
     Write-Output (Get-BuiltCodexPath -RepoRoot $repoRoot -Profile $Profile)
     return
@@ -3641,6 +3797,7 @@ $codeModeHostTargetPath = Join-Path $InstallDir "codex-code-mode-host.exe"
 $sandboxResourcesDir = Join-Path $InstallDir "codex-resources"
 $windowsSandboxSetupTargetPath = Join-Path $sandboxResourcesDir "codex-windows-sandbox-setup.exe"
 $commandRunnerTargetPath = Join-Path $sandboxResourcesDir "codex-command-runner.exe"
+$bundleTargetPaths = @($targetPath, $codeModeHostTargetPath, $windowsSandboxSetupTargetPath, $commandRunnerTargetPath)
 $backupStamp = (Get-Date).ToUniversalTime().ToString("yyyyMMddTHHmmssfffZ")
 $backupPath = Join-Path $BackupDir "codex-$backupStamp.exe"
 $codeModeHostBackupPath = Join-Path $BackupDir "codex-code-mode-host-$backupStamp.exe"
@@ -3690,7 +3847,7 @@ if ($SkipBuild -and $null -eq $sourceBundle) {
         -SourceCommandRunnerExe $SourceCommandRunnerExe
     Write-ProofLine 'sourceBuildStampValidation' $rawSkipDecision.Reason
     if (-not $rawSkipDecision.CanSkip) {
-        throw "SkipBuild requires a current content-bound build stamp or -SourceBundleManifest; timestamps cannot prove build origin. Run just publish-local-codex-final. $($rawSkipDecision.Reason)"
+        throw "SkipBuild requires a current content-bound build stamp or -SourceBundleManifest; timestamps cannot prove build origin. Run $publishCommand. $($rawSkipDecision.Reason)"
     }
     $sourceBuildStampMustRemainValid = $true
     $buildInputSnapshotBefore = $rawSkipDecision.SourceSnapshot
@@ -3831,16 +3988,16 @@ $publishLock = $null
 $desktopRoutingSnapshot = $null
 $publishCommitted = $false
 $restartFailure = $null
+try {
 if (-not $DryRun) {
     $publishLock = Enter-CodexLocalPublishMutex
     Write-ProofLine "publishLock" "acquired"
-    [void](Recover-CodexRuntimeBundleTransaction -JournalPath $publishTransactionJournalPath)
+    [void](Recover-CodexRuntimeBundleTransaction -JournalPath $publishTransactionJournalPath -Force:$Force)
 }
 elseif (Test-Path -LiteralPath $publishTransactionJournalPath -PathType Leaf) {
     throw "A pending runtime bundle transaction requires recovery before dry-run proof: $publishTransactionJournalPath"
 }
 
-try {
 $targetBeforeSha256 = Get-FileSha256 $targetPath
 $codeModeHostTargetBeforeSha256 = Get-FileSha256 $codeModeHostTargetPath
 $windowsSandboxSetupTargetBeforeSha256 = Get-FileSha256 $windowsSandboxSetupTargetPath
@@ -3972,7 +4129,7 @@ Write-ProofLine "windowsSandboxSetupSourceBuildStale" $windowsSandboxSetupSource
 Write-ProofLine "commandRunnerSourceBuildStale" $commandRunnerSourceBuildStale
 Write-ProofLine "sourceBuildStale" $sourceBuildStale
 if ($sourceBuildStale) {
-    Write-ProofLine "sourceBuildStaleRemedy" "Run just publish-local-codex-final, then restart Codex Desktop."
+    Write-ProofLine "sourceBuildStaleRemedy" "Run $publishCommand, then restart Codex Desktop."
 }
 $codexTargetBeforeStale = Test-FileStaleAgainstSource `
     -SourceNewestUtc $sourceLastWriteUtc `
@@ -3993,14 +4150,11 @@ Write-ProofLine "windowsSandboxSetupTargetBeforeStale" $windowsSandboxSetupTarge
 Write-ProofLine "commandRunnerTargetBeforeStale" $commandRunnerTargetBeforeStale
 Write-ProofLine "targetBeforeStale" $targetBeforeStale
 if ($targetBeforeStale) {
-    Write-ProofLine "targetBeforeStaleRemedy" "Run just publish-local-codex-final, then restart Codex Desktop."
+    Write-ProofLine "targetBeforeStaleRemedy" "Run $publishCommand, then restart Codex Desktop."
 }
 $script:RunningTargetProcessProbeError = $null
 $script:RunningTargetProcessProbeWarnings = [System.Collections.Generic.List[string]]::new()
-$runningCodexProcesses = @(Get-RunningCodexTargetProcesses -TargetPath $targetPath)
-$runningCodeModeHostProcesses = @(Get-RunningCodexTargetProcesses -TargetPath $codeModeHostTargetPath)
-$allRunningTargetProcesses = @($runningCodexProcesses) + @($runningCodeModeHostProcesses)
-$runningTargetProcesses = @($allRunningTargetProcesses | Sort-Object -Property Id -Unique)
+$runningTargetProcesses = @(Get-RunningCodexBundleProcesses -BundlePaths $bundleTargetPaths)
 if (-not [string]::IsNullOrWhiteSpace($script:RunningTargetProcessProbeError)) {
     Write-ProofLine "runningTargetProcesses" "<unavailable: $script:RunningTargetProcessProbeError>"
 }
@@ -4107,16 +4261,19 @@ else {
     Write-ProofLine "commandRunnerBackupPath" "<none: target missing>"
 }
 
-$turnHostProcess = Get-CodexTurnHostProcess -BundlePaths @($targetPath, $codeModeHostTargetPath)
+$turnHostProcess = $null
+if ($binaryChanged) {
+    $turnHostProcess = Get-CodexTurnHostProcess -BundlePaths $bundleTargetPaths
+}
 if ($null -ne $turnHostProcess) {
     $turnHostProof = "Codex thread $env:CODEX_THREAD_ID runs under pid=$($turnHostProcess.Id) ($($turnHostProcess.Path))"
     if ($binaryChanged -and -not $DryRun -and -not $skipBuildBlockedByStaleSource) {
         # The build and its content-bound stamp are complete; stopping the host
         # here would end the turn before it can report.
         Write-ProofLine "activation" "deferred: $turnHostProof; replacing the bundle would end that turn"
-        Write-ProofLine "activationCommand" "just publish-local-codex-final (run outside this Codex session; it reuses the stamped build while sources are unchanged)"
+        Write-ProofLine "activationCommand" "$publishCommand (run outside this Codex session; it reuses the stamped build while sources are unchanged)"
         Write-ProofLine "publishCommitted" "false"
-        Write-Output "Build ready; activation deferred. Run just publish-local-codex-final outside this Codex session to replace the bundle and restart Desktop."
+        Write-Output "Build ready; activation deferred. Run $publishCommand outside this Codex session to replace the bundle and restart Desktop."
         exit 0
     }
     if ($binaryChanged -and $DryRun) {
@@ -4124,11 +4281,10 @@ if ($null -ne $turnHostProcess) {
     }
 }
 
-if (-not $DryRun -and ($binaryChanged -or $RestartDesktop -or $ConfigureDesktopLocalCli)) {
-    # Run before closing target processes, replacing binaries, or changing routing.
-    # A conditional restart is checked freshly inside Restart-CodexDesktop only
-    # if runtime proof below determines that a restart is actually necessary.
-    Assert-NoCodexRunningTurns -LocalCodexHome $LocalCodexHome -Force:$Force
+if (-not $DryRun -and $binaryChanged -and -not $AllowRunningTarget) {
+    # Do not change routing before discovering that stopping a process would
+    # require explicit cross-home interruption permission.
+    Assert-CodexProcessesMayBeStopped -Processes $runningTargetProcesses -Force:$Force
 }
 
 $desktopRoutingResult = [pscustomobject]@{
@@ -4164,9 +4320,14 @@ if ($RestartDesktopIfNeeded -and -not $RestartDesktop) {
         Write-ProofLine "desktopRestart" "skipped: current runtime or dry-run no-op"
     }
 }
-if ($RestartDesktop -and $null -ne $turnHostProcess) {
-    $RestartDesktop = $false
-    Write-ProofLine "desktopRestart" "deferred: $turnHostProof; restart Codex Desktop after this turn"
+if ($RestartDesktop) {
+    # Probe at the actual restart gate; never reuse ancestry across a gate.
+    $restartTurnHostProcess = Get-CodexTurnHostProcess -BundlePaths $bundleTargetPaths
+    if ($null -ne $restartTurnHostProcess) {
+        $RestartDesktop = $false
+        $turnHostProof = "Codex thread $env:CODEX_THREAD_ID runs under pid=$($restartTurnHostProcess.Id) ($($restartTurnHostProcess.Path))"
+        Write-ProofLine "desktopRestart" "deferred: $turnHostProof; restart Codex Desktop after this turn"
+    }
 }
 
 if ($DryRun) {
@@ -4175,7 +4336,7 @@ if ($DryRun) {
         Write-ProofLine "replace" "not run: source build stale"
         Write-ProofLine "restartRequired" "unknown until rebuild"
         if ($FailOnStaleSourceBuild) {
-            $staleSourceBuildFailureMessage = "Dry-run source build is stale. Run just publish-local-codex-final, then restart Codex Desktop."
+            $staleSourceBuildFailureMessage = "Dry-run source build is stale. Run $publishCommand, then restart Codex Desktop."
         }
     }
     else {
@@ -4201,24 +4362,21 @@ if ($skipBuildBlockedByStaleSource) {
     Write-ProofLine "replace" "blocked: source build stale"
     Write-ProofLine "restartRequired" "unknown until rebuild"
     if ($sourceBuildStampInvalidated) {
-        throw "The content-bound build stamp no longer matches the source bundle at the final publish gate. Rerun just publish-local-codex-final."
+        throw "The content-bound build stamp no longer matches the source bundle at the final publish gate. Rerun $publishCommand."
     }
     if ($sourceBuildStaleByStamp) {
-        throw "SkipBuild cannot publish these source artifacts because their content-bound build stamp records different publish inputs. Run just publish-local-codex-final."
+        throw "SkipBuild cannot publish these source artifacts because their content-bound build stamp records different publish inputs. Run $publishCommand."
     }
-    throw "SkipBuild cannot publish the newest Codex bundle because tracked source files are newer than one or more source artifacts. Run just publish-local-codex-final."
+    throw "SkipBuild cannot publish the newest Codex bundle because tracked source files are newer than one or more source artifacts. Run $publishCommand."
 }
 
 if ($runningTargetProcesses.Count -gt 0 -and $binaryChanged -and -not $AllowRunningTarget) {
     Stop-RunningCodexTargetProcesses `
         -Processes $runningTargetProcesses `
-        -TimeoutSeconds $CloseRunningTargetTimeoutSeconds
+        -TimeoutSeconds $CloseRunningTargetTimeoutSeconds -Force:$Force
     $script:RunningTargetProcessProbeError = $null
     $script:RunningTargetProcessProbeWarnings = [System.Collections.Generic.List[string]]::new()
-    $runningCodexProcesses = @(Get-RunningCodexTargetProcesses -TargetPath $targetPath)
-    $runningCodeModeHostProcesses = @(Get-RunningCodexTargetProcesses -TargetPath $codeModeHostTargetPath)
-    $allRunningTargetProcesses = @($runningCodexProcesses) + @($runningCodeModeHostProcesses)
-    $runningTargetProcesses = @($allRunningTargetProcesses | Sort-Object -Property Id -Unique)
+    $runningTargetProcesses = @(Get-RunningCodexBundleProcesses -BundlePaths $bundleTargetPaths)
     if (-not [string]::IsNullOrWhiteSpace($script:RunningTargetProcessProbeError)) {
         throw "Cannot safely publish because the post-close running-target process probe failed: $script:RunningTargetProcessProbeError. Rerun after fixing process access, or explicitly use -AllowRunningTarget."
     }
@@ -4290,7 +4448,7 @@ if ($sourceBuildFreshnessProvenByStamp) {
         -SourceCommandRunnerExe $SourceCommandRunnerExe
     Write-ProofLine "sourceBuildStampPublishGate" "runtime bundle: $($publishGateDecision.Reason)"
     if (-not $publishGateDecision.CanSkip) {
-        throw "The content-bound build stamp no longer matches the source bundle immediately before publishing the runtime bundle. Rerun just publish-local-codex-final."
+        throw "The content-bound build stamp no longer matches the source bundle immediately before publishing the runtime bundle. Rerun $publishCommand."
     }
 }
 try {
@@ -4410,7 +4568,7 @@ catch {
     Write-ProofLine "rollback" "requested: $($publishError.Message)"
     if ($null -ne $publishTransaction -and (Test-Path -LiteralPath $publishTransactionJournalPath -PathType Leaf)) {
         try {
-            [void](Recover-CodexRuntimeBundleTransaction -JournalPath $publishTransactionJournalPath)
+            [void](Recover-CodexRuntimeBundleTransaction -JournalPath $publishTransactionJournalPath -Force:$Force)
             Write-ProofLine "bundleTransactionRecovery" "rolled back: $($publishTransaction.TransactionId)"
         }
         catch {

@@ -153,17 +153,18 @@ where
     R: std::io::Read + Send + 'static,
 {
     tokio::spawn(async move {
+        let mut buf = vec![0u8; 8_192];
         loop {
             let result = tokio::task::spawn_blocking(move || {
-                let mut buf = vec![0u8; 8_192];
                 let result = reader.read(&mut buf);
                 (reader, buf, result)
             })
             .await;
-            let Ok((returned_reader, mut buf, result)) = result else {
+            let Ok((returned_reader, returned_buf, result)) = result else {
                 break;
             };
             reader = returned_reader;
+            buf = returned_buf;
             match result {
                 Ok(0) => {
                     complete.store(true, std::sync::atomic::Ordering::Release);
@@ -174,6 +175,7 @@ where
                     if output.send(buf).await.is_err() {
                         break;
                     }
+                    buf = vec![0u8; 8_192];
                 }
                 Err(error) if error.kind() == ErrorKind::Interrupted => continue,
                 Err(error) if error.kind() == ErrorKind::WouldBlock => {

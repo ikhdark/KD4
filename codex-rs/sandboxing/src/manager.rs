@@ -246,11 +246,11 @@ pub fn transform(
         }
     };
     let mut argv = Vec::with_capacity(1 + command.args.len());
-    argv.push(command.program);
-    argv.extend(command.args.into_iter().map(OsString::from));
+    argv.push(os_string_to_command_component(command.program));
+    argv.extend(command.args);
 
     Ok(SandboxExecRequest {
-        command: os_argv_to_strings(argv),
+        command: argv,
         cwd: command.cwd,
         sandbox_policy_cwd: sandbox_policy_cwd.clone(),
         env: command.env,
@@ -456,12 +456,6 @@ fn compatibility_workspace_write_policy(
         exclude_tmpdir_env_var: !tmpdir_writable,
         exclude_slash_tmp: !slash_tmp_writable,
     }
-}
-
-fn os_argv_to_strings(argv: Vec<OsString>) -> Vec<String> {
-    argv.into_iter()
-        .map(os_string_to_command_component)
-        .collect()
 }
 
 fn os_string_to_command_component(value: OsString) -> String {

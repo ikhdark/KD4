@@ -114,6 +114,26 @@ impl InputQueue {
             .incorporated
     }
 
+    /// Wait for successfully admitted steering newer than a request's input.
+    /// Subscribe before checking the retained epoch so an arrival cannot be
+    /// lost, even when a later mailbox wake overwrites the watch's value.
+    pub(crate) async fn wait_for_user_intent_change(&self, authoring_epoch: u64) {
+        let mut activity_rx = self.activity_tx.subscribe();
+        loop {
+            let accepted = self
+                .user_intent
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .accepted;
+            if accepted != authoring_epoch {
+                return;
+            }
+            if activity_rx.changed().await.is_err() {
+                std::future::pending::<()>().await;
+            }
+        }
+    }
+
     /// Poll the first dispatch under the steering commit fence. Once admitted,
     /// the same owner future must settle even if later steering changes intent.
     pub(crate) fn admit_code_mode_tool<T>(
@@ -271,6 +291,22 @@ impl InputQueue {
         &self,
         communication: InterAgentCommunication,
     ) -> Result<bool, codex_protocol::error::CodexErr> {
+        let full_error = || codex_protocol::error::CodexErr::InvalidRequest(format!(
+            "session mailbox is full ({} messages or {} bytes); retry after messages are consumed",
+            self.max_pending_mailbox_communications, self.max_pending_turn_input_bytes
+        ));
+        {
+            let mailbox = self.mailbox.lock().await;
+            if communication.id.as_ref()
+                .is_some_and(|id| mailbox.seen_communication_ids.contains(id))
+            {
+                return Ok(false);
+            }
+            if mailbox.pending_mails.len() >= self.max_pending_mailbox_communications {
+                return Err(full_error());
+            }
+        }
+        // Size outside the mutex, then repeat all admission checks atomically.
         let bytes = serialized_size(&communication);
         let mut mailbox = self.mailbox.lock().await;
         if communication
@@ -283,10 +319,7 @@ impl InputQueue {
         if mailbox.pending_mails.len() >= self.max_pending_mailbox_communications
             || mailbox.bytes.saturating_add(bytes) > self.max_pending_turn_input_bytes
         {
-            return Err(codex_protocol::error::CodexErr::InvalidRequest(format!(
-                "session mailbox is full ({} messages or {} bytes); retry after messages are consumed",
-                self.max_pending_mailbox_communications, self.max_pending_turn_input_bytes
-            )));
+            return Err(full_error());
         }
         if let Some(id) = communication.id.as_ref() {
             mailbox.seen_communication_ids.insert(id.clone());
@@ -721,24 +754,29 @@ impl InputQueue {
         }
         let mut mailbox = self.mailbox.lock().await;
         let take_owned_mail = |source: &mut TurnInputQueue, output: &mut TurnInputQueue| {
-            let mut index = 0;
-            while index < source.items.len() {
-                if !matches!(source.items[index], TurnInput::InterAgentCommunication(_)) {
-                    index += 1;
-                    continue;
-                }
-                let bytes = turn_input_size_bytes(&source.items[index]);
-                if initial_input.len().saturating_add(output.items.len())
-                    >= self.max_pending_turn_input_items
-                    || output.bytes.saturating_add(bytes) > self.max_pending_turn_input_bytes
-                {
+            let mut admitted_items = initial_input.len().saturating_add(output.items.len());
+            let mut admitted_bytes = output.bytes;
+            let mut fits = true;
+            // Compact retained steering input once, without shifting its tail
+            // for every extracted mail. Stop admission at the first full mail.
+            output.items.extend(source.items.extract_if(.., |item| {
+                if !fits || !matches!(item, TurnInput::InterAgentCommunication(_)) {
                     return false;
                 }
-                output.items.push(source.items.remove(index));
-                source.bytes -= bytes;
-                output.bytes += bytes;
-            }
-            true
+                let bytes = turn_input_size_bytes(item);
+                if admitted_items >= self.max_pending_turn_input_items
+                    || admitted_bytes.saturating_add(bytes) > self.max_pending_turn_input_bytes
+                {
+                    fits = false;
+                    return false;
+                }
+                admitted_items += 1;
+                admitted_bytes += bytes;
+                true
+            }));
+            source.bytes -= admitted_bytes - output.bytes;
+            output.bytes = admitted_bytes;
+            fits
         };
         if !take_owned_mail(&mut recovered, &mut output) {
             if retain_for_recording && let Some(turn) = turn.as_mut() {

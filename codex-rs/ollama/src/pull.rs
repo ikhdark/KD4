@@ -27,6 +27,10 @@ pub(crate) struct CliProgressReporter {
     last_completed_sum: u64,
     last_instant: std::time::Instant,
     totals_by_digest: HashMap<String, (u64, u64)>,
+    // Wider exact sums retain revised updates even after an invalid u64 total,
+    // matching the map's existing ability to recover on a later correction.
+    total_sum: u128,
+    completed_sum: u128,
 }
 
 impl Default for CliProgressReporter {
@@ -43,6 +47,8 @@ impl CliProgressReporter {
             last_completed_sum: 0,
             last_instant: std::time::Instant::now(),
             totals_by_digest: HashMap::new(),
+            total_sum: 0,
+            completed_sum: 0,
         }
     }
     pub(crate) fn on_event(&mut self, event: &PullEvent) -> io::Result<()> {
@@ -64,31 +70,22 @@ impl CliProgressReporter {
                 total,
                 completed,
             } => {
-                if let Some(t) = *total {
-                    self.totals_by_digest
-                        .entry(digest.clone())
-                        .or_insert((0, 0))
-                        .0 = t;
+                let overflow = || io::Error::new(
+                    io::ErrorKind::InvalidData, "model pull progress exceeds u64",
+                );
+                if total.is_some() || completed.is_some() {
+                    let old = self.totals_by_digest.get(digest).copied().unwrap_or((0, 0));
+                    let new = (total.unwrap_or(old.0), completed.unwrap_or(old.1));
+                    let next_total = self.total_sum.checked_sub(u128::from(old.0))
+                        .and_then(|sum| sum.checked_add(u128::from(new.0))).ok_or_else(overflow)?;
+                    let next_completed = self.completed_sum.checked_sub(u128::from(old.1))
+                        .and_then(|sum| sum.checked_add(u128::from(new.1))).ok_or_else(overflow)?;
+                    self.totals_by_digest.insert(digest.clone(), new);
+                    self.total_sum = next_total;
+                    self.completed_sum = next_completed;
                 }
-                if let Some(c) = *completed {
-                    self.totals_by_digest
-                        .entry(digest.clone())
-                        .or_insert((0, 0))
-                        .1 = c;
-                }
-
-                let (sum_total, sum_completed) = self
-                    .totals_by_digest
-                    .values()
-                    .try_fold((0u64, 0u64), |acc, (t, c)| {
-                        Some((acc.0.checked_add(*t)?, acc.1.checked_add(*c)?))
-                    })
-                    .ok_or_else(|| {
-                        io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            "model pull progress exceeds u64",
-                        )
-                    })?;
+                let sum_total = u64::try_from(self.total_sum).map_err(|_| overflow())?;
+                let sum_completed = u64::try_from(self.completed_sum).map_err(|_| overflow())?;
                 if sum_total > 0 {
                     if !self.printed_header {
                         let gb = (sum_total as f64) / (1024.0 * 1024.0 * 1024.0);

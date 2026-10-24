@@ -30,15 +30,29 @@ pub(super) async fn read_thread(
     store: &LocalThreadStore,
     params: ReadThreadParams,
 ) -> ThreadStoreResult<StoredThread> {
+    read_thread_with_payload_versions(store, params, None).await
+}
+
+pub(super) async fn read_thread_with_payload_versions(
+    store: &LocalThreadStore,
+    params: ReadThreadParams,
+    mut payload_versions: Option<&mut Option<Vec<codex_rollout::PayloadDependencyVersion>>>,
+) -> ThreadStoreResult<StoredThread> {
     let thread_id = params.thread_id;
-    if let Some(metadata) =
+    if let Some((metadata, header)) =
         visible_sqlite_metadata(store, thread_id, params.include_archived).await?
     {
         let rollout_path = metadata.rollout_path.clone();
-        let mut thread = stored_thread_from_sqlite_metadata(store, metadata).await?;
+        let name = sqlite_metadata_name(store, &metadata).await;
+        let mut thread = stored_thread_from_resolved_sqlite_metadata(store, metadata, name, header);
         reject_paginated_history(&thread, params.include_history)?;
         let preloaded_history = if params.include_history {
-            load_history_items_for_thread(&rollout_path, thread_id).await
+            load_history_items_for_thread_with_versions(
+                &rollout_path,
+                thread_id,
+                payload_versions.as_deref_mut(),
+            )
+            .await
         } else {
             None
         };
@@ -64,7 +78,7 @@ pub(super) async fn read_thread(
         }
     }
 
-    read_thread_from_resolved_rollout(store, params).await
+    read_thread_from_resolved_rollout(store, params, payload_versions).await
 }
 
 /// Returns the rollout path a summary read would report, with the same visibility and identity
@@ -74,10 +88,9 @@ pub(super) async fn read_thread_rollout_path(
     thread_id: codex_protocol::ThreadId,
     include_archived: bool,
 ) -> ThreadStoreResult<Option<std::path::PathBuf>> {
-    if let Some(metadata) = visible_sqlite_metadata(store, thread_id, include_archived).await? {
-        return stored_thread_from_sqlite_metadata_with_name(store, metadata, None)
-            .await
-            .map(|thread| thread.rollout_path);
+    if let Some((metadata, header)) = visible_sqlite_metadata(store, thread_id, include_archived).await? {
+        let foreign = header.as_ref().is_some_and(|line| line.meta.id != metadata.id);
+        return Ok((!foreign).then(|| codex_rollout::plain_rollout_path(&metadata.rollout_path)));
     }
     read_thread_from_resolved_rollout(
         store,
@@ -86,6 +99,7 @@ pub(super) async fn read_thread_rollout_path(
             include_archived,
             include_history: false,
         },
+        None,
     )
     .await
     .map(|thread| thread.rollout_path)
@@ -96,23 +110,24 @@ async fn visible_sqlite_metadata(
     store: &LocalThreadStore,
     thread_id: codex_protocol::ThreadId,
     include_archived: bool,
-) -> ThreadStoreResult<Option<ThreadMetadata>> {
+) -> ThreadStoreResult<Option<(ThreadMetadata, Option<SessionMetaLine>)>> {
     let Some(mut metadata) = read_sqlite_metadata(store, thread_id).await else {
         return Ok(None);
     };
-    resolve_sqlite_rollout_location(store, &mut metadata).await?;
+    let header = resolve_sqlite_rollout_location(store, &mut metadata).await?;
     let visible = include_archived
         || (metadata.archived_at.is_none()
             && !rollout_path_is_archived(
                 store.config.codex_home.as_path(),
                 metadata.rollout_path.as_path(),
             ));
-    Ok(visible.then_some(metadata))
+    Ok(visible.then_some((metadata, header)))
 }
 
 async fn read_thread_from_resolved_rollout(
     store: &LocalThreadStore,
     params: ReadThreadParams,
+    payload_versions: Option<&mut Option<Vec<codex_rollout::PayloadDependencyVersion>>>,
 ) -> ThreadStoreResult<StoredThread> {
     let thread_id = params.thread_id;
     let path = resolve_rollout_path(
@@ -140,7 +155,7 @@ async fn read_thread_from_resolved_rollout(
         });
     }
     reject_paginated_history(&thread, params.include_history)?;
-    attach_history_if_requested(&mut thread, params.include_history).await?;
+    attach_history_if_requested(&mut thread, params.include_history, payload_versions).await?;
     Ok(thread)
 }
 
@@ -153,11 +168,47 @@ async fn load_history_items_for_thread(
     (loaded_thread_id == Some(thread_id)).then_some(items)
 }
 
+async fn load_history_items_for_thread_with_versions(
+    path: &std::path::Path,
+    thread_id: codex_protocol::ThreadId,
+    payload_versions: Option<&mut Option<Vec<codex_rollout::PayloadDependencyVersion>>>,
+) -> Option<Vec<codex_protocol::protocol::RolloutItem>> {
+    if let Some(versions) = payload_versions {
+        *versions = None;
+        codex_rollout::existing_rollout_path(path).await?;
+        let (items, loaded_thread_id, _, observed) =
+            RolloutRecorder::load_rollout_items_with_payload_versions(path).await.ok()?;
+        if loaded_thread_id != Some(thread_id) {
+            return None;
+        }
+        *versions = Some(observed);
+        return Some(items);
+    }
+    load_history_items_for_thread(path, thread_id).await
+}
+
 pub(super) async fn read_thread_by_rollout_path(
     store: &LocalThreadStore,
     rollout_path: std::path::PathBuf,
     include_archived: bool,
     include_history: bool,
+) -> ThreadStoreResult<StoredThread> {
+    read_thread_by_rollout_path_with_payload_versions(
+        store,
+        rollout_path,
+        include_archived,
+        include_history,
+        None,
+    )
+    .await
+}
+
+pub(super) async fn read_thread_by_rollout_path_with_payload_versions(
+    store: &LocalThreadStore,
+    rollout_path: std::path::PathBuf,
+    include_archived: bool,
+    include_history: bool,
+    payload_versions: Option<&mut Option<Vec<codex_rollout::PayloadDependencyVersion>>>,
 ) -> ThreadStoreResult<StoredThread> {
     let path = resolve_requested_rollout_path(store, rollout_path).await?;
     let mut thread = read_thread_from_rollout_path(store, path).await?;
@@ -174,7 +225,7 @@ pub(super) async fn read_thread_by_rollout_path(
         thread = stored_thread_from_sqlite_metadata(store, metadata).await?;
     }
     reject_paginated_history(&thread, include_history)?;
-    attach_history_if_requested(&mut thread, include_history).await?;
+    attach_history_if_requested(&mut thread, include_history, payload_versions).await?;
     Ok(thread)
 }
 
@@ -226,6 +277,7 @@ async fn resolve_requested_rollout_path(
 async fn attach_history_if_requested(
     thread: &mut StoredThread,
     include_history: bool,
+    payload_versions: Option<&mut Option<Vec<codex_rollout::PayloadDependencyVersion>>>,
 ) -> ThreadStoreResult<()> {
     if !include_history {
         return Ok(());
@@ -236,7 +288,7 @@ async fn attach_history_if_requested(
             message: format!("failed to load thread history for thread {thread_id}"),
         });
     };
-    let items = load_history_items_for_thread(&path, thread_id)
+    let items = load_history_items_for_thread_with_versions(&path, thread_id, payload_versions)
         .await
         .ok_or_else(|| ThreadStoreError::Internal {
             message: format!(
@@ -304,10 +356,9 @@ async fn read_thread_from_rollout_path(
 pub(super) async fn resolve_sqlite_rollout_location(
     store: &LocalThreadStore,
     metadata: &mut ThreadMetadata,
-) -> ThreadStoreResult<()> {
-    let foreign = read_session_meta_line(&metadata.rollout_path)
-        .await
-        .is_ok_and(|line| line.meta.id != metadata.id);
+) -> ThreadStoreResult<Option<SessionMetaLine>> {
+    let mut header = read_session_meta_line(&metadata.rollout_path).await.ok();
+    let foreign = header.as_ref().is_some_and(|line| line.meta.id != metadata.id);
     if (foreign
         || codex_rollout::existing_rollout_path(&metadata.rollout_path)
             .await
@@ -315,13 +366,14 @@ pub(super) async fn resolve_sqlite_rollout_location(
         && let Some(resolved) = resolve_rollout_path(store, metadata.id, true, true).await?
     {
         metadata.rollout_path = resolved.path;
+        header = read_session_meta_line(&metadata.rollout_path).await.ok();
         metadata.archived_at = if resolved.archived {
             Some(metadata.archived_at.unwrap_or(metadata.updated_at))
         } else {
             None
         };
     }
-    Ok(())
+    Ok(header)
 }
 
 async fn read_sqlite_metadata(
@@ -336,15 +388,19 @@ pub(super) async fn stored_thread_from_sqlite_metadata(
     store: &LocalThreadStore,
     metadata: ThreadMetadata,
 ) -> ThreadStoreResult<StoredThread> {
-    let name = match distinct_thread_metadata_title(&metadata) {
+    let name = sqlite_metadata_name(store, &metadata).await;
+    stored_thread_from_sqlite_metadata_with_name(store, metadata, name).await
+}
+
+async fn sqlite_metadata_name(store: &LocalThreadStore, metadata: &ThreadMetadata) -> Option<String> {
+    match distinct_thread_metadata_title(metadata) {
         Some(title) => Some(title),
         None => find_thread_name_by_id(store.config.codex_home.as_path(), &metadata.id)
             .await
             .ok()
             .flatten()
             .filter(|title| !title.trim().is_empty()),
-    };
-    stored_thread_from_sqlite_metadata_with_name(store, metadata, name).await
+    }
 }
 
 pub(super) async fn stored_thread_from_sqlite_metadata_with_name(
@@ -352,13 +408,19 @@ pub(super) async fn stored_thread_from_sqlite_metadata_with_name(
     mut metadata: ThreadMetadata,
     name: Option<String>,
 ) -> ThreadStoreResult<StoredThread> {
-    resolve_sqlite_rollout_location(store, &mut metadata).await?;
+    let header = resolve_sqlite_rollout_location(store, &mut metadata).await?;
+    Ok(stored_thread_from_resolved_sqlite_metadata(store, metadata, name, header))
+}
+
+fn stored_thread_from_resolved_sqlite_metadata(
+    store: &LocalThreadStore,
+    metadata: ThreadMetadata,
+    name: Option<String>,
+    header: Option<SessionMetaLine>,
+) -> StoredThread {
     // SQLite owns the persisted projection. Session metadata only supplements fields that are
     // not stored in the row, so an unavailable or malformed rollout must not discard the row.
-    let header = read_session_meta_line(metadata.rollout_path.as_path())
-        .await
-        .ok()
-        .map(|meta_line| meta_line.meta);
+    let header = header.map(|meta_line| meta_line.meta);
     let foreign = header.as_ref().is_some_and(|meta| meta.id != metadata.id);
     let session_meta = header.filter(|meta| meta.id == metadata.id);
     let rollout_path = codex_rollout::plain_rollout_path(metadata.rollout_path.as_path());
@@ -386,7 +448,7 @@ pub(super) async fn stored_thread_from_sqlite_metadata_with_name(
         .unwrap_or_default();
     let permission_profile =
         permission_profile_from_metadata_value(&metadata.sandbox_policy, metadata.cwd.as_path());
-    Ok(StoredThread {
+    StoredThread {
         project_id: metadata.project_id,
         thread_id: metadata.id,
         session_id: metadata
@@ -427,7 +489,7 @@ pub(super) async fn stored_thread_from_sqlite_metadata_with_name(
         token_usage: None,
         first_user_message: metadata.first_user_message,
         history: None,
-    })
+    }
 }
 
 async fn stored_thread_from_session_meta(

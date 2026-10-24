@@ -230,9 +230,8 @@ pub async fn run_plugin_list(
                 .is_none_or(|name| marketplace.name == *name)
         })
         .collect::<Vec<_>>();
-    let marketplace_sources = configured_marketplace_sources(&plugins_input, codex_home.as_path());
-
     if args.json {
+        let marketplace_sources = configured_marketplace_sources(&plugins_input, codex_home.as_path());
         let output = JsonPluginListOutput::from_marketplaces(
             marketplaces,
             args.available,

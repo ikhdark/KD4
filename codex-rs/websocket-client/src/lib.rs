@@ -207,7 +207,7 @@ mod dispatch_tests {
         .await;
         assert!(matches!(result, Err(WebSocketError::Io(error))
             if error.kind() == std::io::ErrorKind::PermissionDenied
-                && error.get_ref().is_some_and(|inner| inner.is::<DispatchRejected>())));
+                && error.get_ref().is_some_and(<dyn std::error::Error + Send + Sync>::is::<DispatchRejected>)));
         assert!(matches!(listener.accept(), Err(error)
             if error.kind() == std::io::ErrorKind::WouldBlock));
     }

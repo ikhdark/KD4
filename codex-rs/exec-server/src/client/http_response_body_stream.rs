@@ -230,7 +230,21 @@ impl Inner {
         &self,
         params: Option<Value>,
     ) -> Result<(), ExecServerError> {
-        let params: HttpRequestBodyDeltaNotification = from_value(params.unwrap_or(Value::Null))?;
+        let value = params.unwrap_or(Value::Null);
+        let unregistered = if let Some(id) = value.get("requestId").and_then(Value::as_str) {
+            !self.http_body_streams.lock().await.streams.contains_key(id)
+        } else { false };
+        let (mut params, deferred): (HttpRequestBodyDeltaNotification, _) = if unregistered {
+            crate::client::deferred_notification::parse_without_chunk(value, "deltaBase64")?
+        } else {
+            (from_value(value)?, None)
+        };
+        if let Some(encoded) = deferred {
+            if !self.http_body_streams.lock().await.streams.contains_key(&params.request_id) {
+                return Ok(());
+            }
+            params.delta = from_value(Value::String(encoded))?;
+        }
         // Unknown request ids are ignored intentionally: a stream may have already
         // reached EOF and released its route.
         let request_id = params.request_id.clone();
@@ -386,7 +400,7 @@ mod tests {
             instance_id: uuid::Uuid::new_v4().to_string(),
             cleanup_records: StdMutex::new(std::collections::VecDeque::new()),
             cleanup_records_evicted: AtomicU64::new(0),
-            unsupported_bounded_read: StdMutex::new(None),
+            unsupported_fs_methods: StdMutex::new(None),
             file_read_slots: Arc::new(tokio::sync::Semaphore::new(
                 crate::file_read::MAX_OPEN_FILE_READS,
             )),
@@ -401,6 +415,7 @@ mod tests {
             http_body_stream_next_id: AtomicU64::new(1),
             session_id: OnceLock::new(),
             environment_info: OnceLock::new(),
+            environment_info_init: Mutex::new(()),
             reconnect_strategy: None,
         })
     }

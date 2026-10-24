@@ -454,13 +454,25 @@ fn structured_compiler_summary_with_streams(
         Some((stdout, stderr)) => (stdout, Some(stderr), "stdout"),
         None => (output, None, "aggregated"),
     };
+    // Only retained groups and the current candidate own line references.
+    // Stream coordinates are not aggregate coordinates: resolve a retained
+    // line against the aggregate once, preserving its existing first-match
+    // semantics and whole-artifact fallback when no match is established.
+    let source_lines = std::cell::RefCell::new(std::collections::BTreeMap::<
+        usize, (&str, Option<(usize, usize)>)
+    >::new());
     let recovery_selector = |source_line: usize| {
-        let range = compiler_output
-            .lines()
-            .nth(source_line.saturating_sub(1))
-            .and_then(|line| output.find(line).map(|start| (start, start + line.len())))
-            .unwrap_or((0, output.len()));
+        let mut lines = source_lines.borrow_mut();
+        let range = lines.get_mut(&source_line).map(|(line, range)| {
+            *range.get_or_insert_with(|| output.find(*line)
+                .map(|start| (start, start + line.len())).unwrap_or((0, output.len())))
+        }).unwrap_or((0, output.len()));
         serde_json::json!({"kind":"bytes", "start":range.0, "end":range.1})
+    };
+    let forget_source = |item: &serde_json::Value| {
+        if let Some(line) = item["source_line"].as_u64() {
+            source_lines.borrow_mut().remove(&(line as usize));
+        }
     };
     // Keep stderr independently and verbatim. If it cannot fit, fall back to
     // ordinary output projection/recovery rather than silently dropping it.
@@ -610,6 +622,7 @@ fn structured_compiler_summary_with_streams(
         if let Some(target) = target {
             item["target"] = target;
         }
+        source_lines.borrow_mut().insert(index + 1, (line, None));
         // Factor only identical retained bodies: spans, children and fixes
         // participate in equality, while each Cargo owner keeps its provenance.
         if let Some(group) = diagnostics.iter_mut().find(|group| {
@@ -637,20 +650,27 @@ fn structured_compiler_summary_with_streams(
                     "kind":"bytes", "start":0, "end":output.len(),
                 });
             }
+            forget_source(&item);
             continue;
         }
         if item.to_string().len() > SUMMARY_MAX_BYTES / 2
             && compact_compiler_diagnostic(&mut item["diagnostic"])
         {
             item["details_omitted"] = true.into();
-            item["recovery_selector"] = recovery_selector(index + 1);
         }
         diagnostics.push(item);
         if diagnostics.len() > MAX_DIAGNOSTIC_GROUPS {
             let removed = diagnostics.remove(lowest_priority_index(&diagnostics)?);
             record_omission(&mut omitted_groups, &removed);
+            forget_source(&removed);
             omitted += removed["occurrence_count"].as_u64().unwrap_or(1) as usize;
             omitted_group_count += 1;
+        }
+    }
+    let original_lines = output.lines().count();
+    for item in &mut diagnostics {
+        if item["details_omitted"] == true {
+            item["recovery_selector"] = recovery_selector(item["source_line"].as_u64()? as usize);
         }
     }
     if total == 0 {
@@ -664,7 +684,7 @@ fn structured_compiler_summary_with_streams(
             "build_success": true, "test_execution": "not_established",
             "records": records, "artifact_count": artifact_count,
             "build_script_count": build_script_count, "target_sample": build_targets,
-            "target_sample_limit": 16, "original_lines": output.lines().count(),
+            "target_sample_limit": 16, "original_lines": original_lines,
             "original_bytes": output.len(), "diagnostic_stream": diagnostic_stream,
             "projection": "Recognized clean Cargo build records only; not evidence that tests ran. Recover exact records from the retained output.",
             "recovery_selector": {"kind":"bytes", "start":0, "end":output.len()},
@@ -679,7 +699,7 @@ fn structured_compiler_summary_with_streams(
             "exit_code": exit_code,
             "timed_out": timed_out,
             "build_success": build_success,
-            "original_lines": output.lines().count(),
+            "original_lines": original_lines,
             "original_bytes": output.len(),
             "records": records,
             "diagnostic_count": total,
@@ -754,6 +774,7 @@ fn structured_compiler_summary_with_streams(
         }
         let removed = diagnostics.remove(index);
         record_omission(&mut omitted_groups, &removed);
+        forget_source(&removed);
         omitted += removed["occurrence_count"].as_u64().unwrap_or(1) as usize;
         omitted_group_count += 1;
     }
@@ -1230,14 +1251,27 @@ fn classify_line(line: &str) -> LineClassification {
 fn compiler_location_error(line: &str) -> bool {
     // Do not classify quoted source/prose merely because it contains an error
     // spelling. Require a compiler-style location before the diagnostic label.
+    let first_quote = line.find(['"', '\'']);
     line.match_indices(": ").any(|(separator, _)| {
+        let diagnostic = &line[separator + 2..];
+        let diagnostic_error = starts_with_ascii_case(diagnostic, "fatal error:")
+            || strip_prefix_ascii_case(diagnostic, "fatal error ")
+                .or_else(|| strip_prefix_ascii_case(diagnostic, "error "))
+                .and_then(|coded| coded.split_once(':'))
+                .is_some_and(|(code, _)| {
+                    code.strip_prefix('C').is_some_and(|digits| {
+                        !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit())
+                    })
+                });
+        if !diagnostic_error || first_quote.is_some_and(|quote| quote < separator) {
+            return false;
+        }
         let location = line[..separator].trim();
         let located = if let Some(location) = location.strip_suffix(')') {
             location
                 .rsplit_once('(')
                 .is_some_and(|(path, coordinates)| {
                     !path.is_empty()
-                        && !path.contains(['"', '\''])
                         && !coordinates.is_empty()
                         && coordinates.split(',').all(|part| {
                             !part.trim().is_empty()
@@ -1247,24 +1281,11 @@ fn compiler_location_error(line: &str) -> bool {
         } else {
             location.rsplit_once(':').is_some_and(|(path, number)| {
                 !path.is_empty()
-                    && !path.contains(['"', '\''])
                     && !number.is_empty()
                     && number.bytes().all(|byte| byte.is_ascii_digit())
             })
         };
-        if !located {
-            return false;
-        }
-        let diagnostic = &line[separator + 2..];
-        starts_with_ascii_case(diagnostic, "fatal error:")
-            || strip_prefix_ascii_case(diagnostic, "fatal error ")
-                .or_else(|| strip_prefix_ascii_case(diagnostic, "error "))
-                .and_then(|coded| coded.split_once(':'))
-                .is_some_and(|(code, _)| {
-                    code.strip_prefix('C').is_some_and(|digits| {
-                        !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit())
-                    })
-                })
+        located
     })
 }
 
@@ -1542,13 +1563,15 @@ fn select_lines(output: &str, line_count: usize, failed: bool, validation: bool)
         indexes.extend(0..line_count);
     }
     indexes.extend(progress.values().copied());
-    for (index, line) in output.lines().enumerate() {
-        if let Some(key) = progress_line_key(line)
-            && progress.get(&key).is_some_and(|latest| *latest != index)
-        {
-            indexes.remove(&index);
-        }
-    }
+    let mut lines = output.lines();
+    let mut next_index = 0;
+    indexes.retain(|&index| {
+        let Some(line) = lines.nth(index - next_index) else { return false; };
+        next_index = index + 1;
+        !progress_line_key(line).is_some_and(|key| {
+            progress.get(&key).is_some_and(|latest| *latest != index)
+        })
+    });
     // Count groups whose representative is absent, including context/tail
     // coverage. After overflow this is a lower bound, never a claim of completeness.
     let omitted_groups = groups

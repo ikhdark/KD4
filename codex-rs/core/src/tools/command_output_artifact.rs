@@ -335,10 +335,11 @@ impl ReadToolOutputResult {
                     ..
                 } = &result.selector
                 {
-                    let mut proof = value.clone();
-                    if let Some(fields) = proof.as_object_mut() {
-                        fields.remove("hydrated_ranges");
-                    }
+                    let proof = value.as_object().map_or_else(|| value.clone(), |fields| {
+                        Value::Object(fields.iter()
+                            .filter(|(key, _)| key.as_str() != "hydrated_ranges")
+                            .map(|(key, value)| (key.clone(), value.clone())).collect())
+                    });
                     values.push(serde_json::json!({
                         "matching": {"query": query, "case_insensitive": case_insensitive, "start_byte": start_byte},
                         "value": proof,
@@ -354,7 +355,7 @@ impl ReadToolOutputResult {
         if ranges.is_empty() && values.is_empty() {
             return None;
         }
-        values.sort_by_key(Value::to_string);
+        values.sort_by_cached_key(Value::to_string);
         values.dedup();
         Some(serde_json::json!({
             "sha256": self.canonical_sha256,
@@ -500,10 +501,19 @@ struct ArtifactRetentionRecord {
 
 #[derive(Debug, Clone, Default)]
 struct ThreadRetentionIndex {
-    paths: BTreeSet<PathBuf>,
+    artifacts: usize,
+    unprotected_paths: BTreeSet<PathBuf>,
     bytes: u64,
     unprotected_bytes: u64,
     unprotected: usize,
+}
+
+impl ThreadRetentionIndex {
+    fn is_near_limit(&self) -> bool {
+        self.unprotected >= max_retained_artifacts_per_thread().saturating_sub(1)
+            || self.unprotected_bytes >= MAX_RETAINED_ARTIFACT_BYTES_PER_THREAD
+                .saturating_sub(RETENTION_BYTE_GUARD_BAND)
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -514,6 +524,7 @@ struct RetentionIndex {
     total_bytes: u64,
     unprotected_bytes: u64,
     unprotected: usize,
+    near_limit_threads: usize,
     logical_mutations_since_reconciliation: u64,
     near_limit_reconciled: bool,
     near_limit_pending: bool,
@@ -541,18 +552,22 @@ impl RetentionIndex {
             .threads
             .entry(record.thread_directory.clone())
             .or_default();
-        thread.paths.insert(record.path.clone());
+        let was_near = thread.is_near_limit();
+        thread.artifacts = thread.artifacts.saturating_add(1);
         thread.bytes = thread_bytes;
         if !record.protected {
+            thread.unprotected_paths.insert(record.path.clone());
             thread.unprotected_bytes += record.bytes;
             thread.unprotected = thread.unprotected.saturating_add(1);
             self.unprotected = self.unprotected.saturating_add(1);
             // Bounded by the checked total_bytes above.
             self.unprotected_bytes += record.bytes;
         }
+        self.near_limit_threads += usize::from(!was_near && thread.is_near_limit());
         self.total_bytes = total_bytes;
-        self.global_order
-            .insert((record.modified, record.path.clone()));
+        if !record.protected {
+            self.global_order.insert((record.modified, record.path.clone()));
+        }
         self.records.insert(record.path.clone(), record);
         true
     }
@@ -567,13 +582,16 @@ impl RetentionIndex {
             self.unprotected_bytes = self.unprotected_bytes.saturating_sub(record.bytes);
         }
         let remove_thread = if let Some(thread) = self.threads.get_mut(&record.thread_directory) {
-            thread.paths.remove(path);
+            let was_near = thread.is_near_limit();
+            thread.artifacts = thread.artifacts.saturating_sub(1);
+            thread.unprotected_paths.remove(path);
             thread.bytes = thread.bytes.saturating_sub(record.bytes);
             if !record.protected {
                 thread.unprotected_bytes = thread.unprotected_bytes.saturating_sub(record.bytes);
                 thread.unprotected = thread.unprotected.saturating_sub(1);
             }
-            thread.paths.is_empty()
+            self.near_limit_threads -= usize::from(was_near && !thread.is_near_limit());
+            thread.artifacts == 0
         } else {
             false
         };
@@ -602,13 +620,7 @@ impl RetentionIndex {
         let global_near = self.unprotected >= max_retained_artifacts_total().saturating_sub(1)
             || self.unprotected_bytes
                 >= MAX_RETAINED_ARTIFACT_BYTES_TOTAL.saturating_sub(RETENTION_BYTE_GUARD_BAND);
-        global_near
-            || self.threads.values().any(|thread| {
-                thread.unprotected >= max_retained_artifacts_per_thread().saturating_sub(1)
-                    || thread.unprotected_bytes
-                        >= MAX_RETAINED_ARTIFACT_BYTES_PER_THREAD
-                            .saturating_sub(RETENTION_BYTE_GUARD_BAND)
-            })
+        global_near || self.near_limit_threads != 0
     }
 
     fn note_logical_mutation(&mut self) {
@@ -3245,6 +3257,17 @@ fn largest_fitting_byte_prefix(
     let text = snapshot
         .get(range.start as usize..range.end as usize)
         .and_then(|bytes| std::str::from_utf8(bytes).ok());
+    largest_fitting_byte_prefix_with_text(artifact_id, canonical_bytes, range, snapshot, token_ceiling, text)
+}
+
+fn largest_fitting_byte_prefix_with_text(
+    artifact_id: &str,
+    canonical_bytes: u64,
+    range: CanonicalByteRange,
+    snapshot: &[u8],
+    token_ceiling: usize,
+    text: Option<&str>,
+) -> u64 {
     let align = |length: u64| match text {
         Some(text) => align_to_char_boundary(text, length),
         None => length,
@@ -5490,6 +5513,7 @@ struct ValidatedJsonPointers {
     metadata: LogicalArtifactMetadata,
     index: Option<RawJsonPointerIndex>,
     error: Option<&'static str>,
+    unavailable_targets: BTreeSet<String>,
 }
 
 impl ValidatedJsonPointers {
@@ -5510,6 +5534,14 @@ impl ValidatedJsonPointers {
             .complete
             .then(|| selective_json::index(bytes, &targets))
             .flatten();
+        if index.is_none() && metadata.complete
+            && let Some((index, failed)) = selective_json::index_preserving_siblings(bytes, &targets)
+        {
+            let available = targets.iter().filter(|target| !failed.contains(*target)).cloned().collect::<Vec<_>>();
+            let mut validated = Self::with_index(metadata, Some(index), Some(&available));
+            validated.unavailable_targets = failed;
+            return validated;
+        }
         Self::with_index(metadata, index, Some(&targets))
     }
 
@@ -5554,6 +5586,7 @@ impl ValidatedJsonPointers {
             metadata: verified,
             index,
             error,
+            unavailable_targets: BTreeSet::new(),
         }
     }
 
@@ -5561,6 +5594,9 @@ impl ValidatedJsonPointers {
         let ToolOutputSelector::JsonPointer { pointer } = selector else {
             return None;
         };
+        if self.unavailable_targets.contains(pointer) {
+            return Some("JSON pointer exceeds the bounded address-index budget; raw bytes and successful sibling selections remain available.");
+        }
         self.error.or_else(|| self.index.as_ref().filter(|index| index.ambiguous(pointer))
             .map(|_| "JSON pointer is ambiguous because a decoded object member name is duplicated; recover bytes instead."))
     }
@@ -5614,6 +5650,14 @@ fn load_logical_metadata_with_snapshot(
     path: &Path,
     id: ToolOutputArtifactId,
 ) -> Result<(LogicalArtifactMetadata, Option<Vec<u8>>, File), ReadToolOutputError> {
+    load_logical_metadata_with_observation(path, id, None)
+}
+
+fn load_logical_metadata_with_observation(
+    path: &Path,
+    id: ToolOutputArtifactId,
+    protected_metadata: Option<LogicalArtifactMetadata>,
+) -> Result<(LogicalArtifactMetadata, Option<Vec<u8>>, File), ReadToolOutputError> {
     match std::fs::symlink_metadata(logical_transaction_path(path)) {
         Ok(_) => reconcile_orphaned_artifact_on_read(path)?,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
@@ -5634,6 +5678,12 @@ fn load_logical_metadata_with_snapshot(
         .map_err(|error| ReadToolOutputError::Io(error.to_string()))?
     {
         return Err(ReadToolOutputError::StillWriting);
+    }
+    if let Some(metadata) = protected_metadata {
+        if metadata.version != LOGICAL_ARTIFACT_METADATA_VERSION || metadata.artifact_id != id.to_string() {
+            return Err(ReadToolOutputError::Io("artifact metadata version or identity mismatch".into()));
+        }
+        return Ok((metadata, None, file));
     }
     let metadata_bytes = read_artifact_metadata_bounded(&metadata_path);
     let raw_capture = match metadata_bytes {
@@ -5877,92 +5927,72 @@ type SelectorRangeAndChildren = (
     Option<Value>,
 );
 
-fn selector_range_and_children(
+fn selector_range(
     selector: &ToolOutputSelector,
     metadata: &LogicalArtifactMetadata,
-) -> Result<SelectorRangeAndChildren, ToolOutputSelectorStatus> {
+) -> Result<Option<CanonicalByteRange>, ToolOutputSelectorStatus> {
     match selector {
         ToolOutputSelector::Bytes { start, end } => {
             if start > end || *end > metadata.retained_bytes {
                 Err(ToolOutputSelectorStatus::Invalid)
             } else {
-                Ok((
-                    Some(CanonicalByteRange::new(*start, *end)),
-                    Vec::new(),
-                    None,
-                ))
+                Ok(Some(CanonicalByteRange::new(*start, *end)))
             }
         }
         ToolOutputSelector::Lines { start, end } => {
             if *start == 0 || end < start || *start > metadata.line_starts.len() {
                 return Err(ToolOutputSelectorStatus::Invalid);
             }
-            let range_start = metadata.line_starts[*start - 1];
-            let range_end = metadata
-                .line_starts
-                .get(*end)
-                .copied()
-                .unwrap_or(metadata.retained_bytes);
-            Ok((
-                Some(CanonicalByteRange::new(range_start, range_end)),
-                Vec::new(),
-                None,
-            ))
+            Ok(Some(CanonicalByteRange::new(
+                metadata.line_starts[*start - 1],
+                metadata.line_starts.get(*end).copied().unwrap_or(metadata.retained_bytes),
+            )))
         }
         ToolOutputSelector::JsonPointer { pointer } => {
-            // RFC 6901 allows the empty root pointer, or slash-prefixed
-            // tokens whose only tilde escapes are ~0 and ~1.
             if (!pointer.is_empty() && !pointer.starts_with('/'))
-                || pointer
-                    .split('~')
-                    .skip(1)
-                    .any(|escape| !escape.starts_with(['0', '1']))
+                || pointer.split('~').skip(1).any(|escape| !escape.starts_with(['0', '1']))
             {
                 return Err(ToolOutputSelectorStatus::Invalid);
             }
-            let entry = metadata
-                .json_pointers
-                .get(pointer)
-                .ok_or(ToolOutputSelectorStatus::NotFound)?;
-            Ok((
-                Some(entry.range),
-                entry
-                    .direct_children
-                    .iter()
-                    .map(|pointer| ToolOutputSelector::JsonPointer {
-                        pointer: pointer.clone(),
-                    })
-                    .collect(),
-                None,
-            ))
+            metadata.json_pointers.get(pointer).map(|entry| Some(entry.range))
+                .ok_or(ToolOutputSelectorStatus::NotFound)
         }
-        ToolOutputSelector::Section { id } => {
-            let section = metadata
-                .sections
-                .iter()
-                .find(|section| section.id == *id)
-                .ok_or(ToolOutputSelectorStatus::NotFound)?;
-            let children = section
-                .children
-                .iter()
-                .map(|id| ToolOutputSelector::Section { id: id.clone() })
-                .collect::<Vec<_>>();
-            if section.canonical_range.is_none() {
-                let mut value = serde_json::json!({
-                    "section_id": section.id,
-                    "kind": "directory",
-                    "children": children,
-                });
-                if let Some(details) = &section.value {
-                    value["details"] = details.clone();
-                }
-                Ok((None, children, Some(value)))
-            } else {
-                Ok((section.canonical_range, children, section.value.clone()))
-            }
-        }
+        ToolOutputSelector::Section { id } => metadata.sections.iter()
+            .find(|section| section.id == *id).map(|section| section.canonical_range)
+            .ok_or(ToolOutputSelectorStatus::NotFound),
         ToolOutputSelector::Search { .. } => Err(ToolOutputSelectorStatus::Invalid),
     }
+}
+
+fn selector_range_and_children(
+    selector: &ToolOutputSelector,
+    metadata: &LogicalArtifactMetadata,
+) -> Result<SelectorRangeAndChildren, ToolOutputSelectorStatus> {
+    let range = selector_range(selector, metadata)?;
+    let (children, value) = match selector {
+        ToolOutputSelector::JsonPointer { pointer } => {
+            let entry = metadata.json_pointers.get(pointer)
+                .ok_or(ToolOutputSelectorStatus::NotFound)?;
+            (entry.direct_children.iter().map(|pointer|
+                ToolOutputSelector::JsonPointer { pointer: pointer.clone() }).collect(), None)
+        }
+        ToolOutputSelector::Section { id } => {
+            let section = metadata.sections.iter().find(|section| section.id == *id)
+                .ok_or(ToolOutputSelectorStatus::NotFound)?;
+            let children = section.children.iter().map(|id|
+                ToolOutputSelector::Section { id: id.clone() }).collect::<Vec<_>>();
+            let value = if range.is_none() {
+                let mut value = serde_json::json!({
+                    "section_id": section.id, "kind": "directory", "children": children,
+                });
+                if let Some(details) = &section.value { value["details"] = details.clone(); }
+                Some(value)
+            } else { section.value.clone() };
+            (children, value)
+        }
+        _ => (Vec::new(), None),
+    };
+    Ok((range, children, value))
 }
 
 fn normalized_selector_order_key(
@@ -5973,8 +6003,8 @@ fn normalized_selector_order_key(
     if let ToolOutputSelector::Search { start_byte, .. } = selector {
         return (*start_byte, *start_byte, 4, serialized);
     }
-    match selector_range_and_children(selector, metadata) {
-        Ok((Some(range), _, _)) => {
+    match selector_range(selector, metadata) {
+        Ok(Some(range)) => {
             let kind = match selector {
                 ToolOutputSelector::Bytes { .. } => 0,
                 ToolOutputSelector::Lines { .. } => 1,
@@ -5984,7 +6014,7 @@ fn normalized_selector_order_key(
             };
             (range.start, range.end, kind, serialized)
         }
-        Ok((None, _, _)) => (u64::MAX - 1, u64::MAX - 1, 2, serialized),
+        Ok(None) => (u64::MAX - 1, u64::MAX - 1, 2, serialized),
         Err(_) => (u64::MAX, u64::MAX, u8::MAX, serialized),
     }
 }
@@ -6126,10 +6156,7 @@ fn normalize_tool_output_selectors_with_fit(
         )
         .chain(others)
         .collect::<Vec<_>>();
-    normalized.sort_by(|left, right| {
-        normalized_selector_order_key(left, metadata)
-            .cmp(&normalized_selector_order_key(right, metadata))
-    });
+    normalized.sort_by_cached_key(|selector| normalized_selector_order_key(selector, metadata));
     normalized
 }
 
@@ -6249,6 +6276,17 @@ fn share_overlapping_search_hydration(
             let right = end.min(value["canonical_range"]["end"].as_u64()?);
             (right.saturating_sub(left) >= 256).then_some((left, right))
         })
+        .chain(previous_results.iter().filter_map(|result| {
+            if result.status != ToolOutputSelectorStatus::Ok
+                || (result.text.is_none() && result.data_base64.is_none())
+            {
+                return None;
+            }
+            let range = result.canonical_range?;
+            let left = start.max(range.start);
+            let right = end.min(range.end);
+            (right.saturating_sub(left) >= 256).then_some((left, right))
+        }))
         .collect::<Vec<_>>();
     overlaps.sort_unstable();
     if overlaps.is_empty() {
@@ -6951,25 +6989,12 @@ fn internally_drain_exact_subdivisions(
     if range != Some(plan.range) {
         return None;
     }
-    let mut bytes = Vec::with_capacity(usize::try_from(plan.range.len()).ok()?);
-    let mut chunk_count = 0_u64;
-    let mut start = plan.range.start;
-    while start < plan.range.end {
-        let end = start.saturating_add(plan.chunk_bytes).min(plan.range.end);
-        if end <= start {
-            return None;
-        }
-        bytes.extend_from_slice(
-            validated_snapshot_range(snapshot, CanonicalByteRange::new(start, end)).ok()?,
-        );
-        start = end;
-        chunk_count = chunk_count.saturating_add(1);
-    }
-    if chunk_count != plan.chunk_count || u64::try_from(bytes.len()).ok()? != plan.range.len() {
-        return None;
-    }
+    // Every validated subdivision is contiguous in this same immutable source.
+    // The checked count/width above defines that exact partition; validating
+    // its complete range proves every child without reconstructing a Vec.
+    let bytes = validated_snapshot_range(snapshot, plan.range).ok()?;
     let mut completed =
-        successful_exact_selector_result(original.selector.clone(), plan.range, children, &bytes);
+        successful_exact_selector_result(original.selector.clone(), plan.range, children, bytes);
     completed.subdivision_plan = Some(plan.clone());
     completed.message = Some(format!(
         "internally drained all {} deterministic byte subdivisions",
@@ -7265,7 +7290,7 @@ pub(crate) async fn load_tool_output_snapshot(
         #[cfg(windows)]
         {
             immutable_snapshot_cache::shared()
-                .load(&path, id, || load_tool_output_snapshot_uncached(&path, id))
+                .load_with_metadata(&path, id, |metadata| load_tool_output_snapshot_with_observation(&path, id, metadata))
         }
         #[cfg(not(windows))]
         load_tool_output_snapshot_uncached(&path, id)
@@ -7274,11 +7299,20 @@ pub(crate) async fn load_tool_output_snapshot(
     .map_err(|err| ReadToolOutputError::Io(format!("failed to read artifact: {err}")))?
 }
 
+#[cfg(any(not(windows), test))]
 fn load_tool_output_snapshot_uncached(
     path: &Path,
     id: ToolOutputArtifactId,
 ) -> Result<Arc<ToolOutputSnapshot>, ReadToolOutputError> {
-    let (metadata, snapshot, _family_lease) = load_logical_metadata_with_snapshot(path, id)?;
+    load_tool_output_snapshot_with_observation(path, id, None)
+}
+
+fn load_tool_output_snapshot_with_observation(
+    path: &Path,
+    id: ToolOutputArtifactId,
+    protected_metadata: Option<LogicalArtifactMetadata>,
+) -> Result<Arc<ToolOutputSnapshot>, ReadToolOutputError> {
+    let (metadata, snapshot, _family_lease) = load_logical_metadata_with_observation(path, id, protected_metadata)?;
     let bytes = snapshot.map_or_else(|| load_validated_logical_snapshot(path, &metadata), Ok)?;
     Ok(Arc::new(ToolOutputSnapshot {
         metadata,
@@ -7861,13 +7895,23 @@ pub(crate) fn bounded_page_selectors(
 ) -> Vec<ToolOutputSelector> {
     let mut pages = Vec::new();
     let end = end.min(bytes.len() as u64);
+    // A validated UTF-8 tail can be sliced at later page boundaries without
+    // rescanning the overlapping suffix. Invalid/binary tails keep the exact
+    // per-range validation path, including readable suffixes after bad bytes.
+    let text = bytes.get(start as usize..end as usize)
+        .and_then(|tail| std::str::from_utf8(tail).ok());
+    let text_start = start;
     while start < end && pages.len() < 8 {
-        let length = largest_fitting_byte_prefix(
+        let range_text = text.and_then(|text| text.get((start - text_start) as usize..))
+            .or_else(|| bytes.get(start as usize..end as usize)
+                .and_then(|tail| std::str::from_utf8(tail).ok()));
+        let length = largest_fitting_byte_prefix_with_text(
             artifact_id,
             bytes.len() as u64,
             CanonicalByteRange::new(start, end),
             bytes,
             token_ceiling,
+            range_text,
         );
         if length == 0 {
             break;
@@ -8787,17 +8831,16 @@ fn apply_thread_retention_listing(
         .into_iter()
         .map(|record| (record.path.clone(), record))
         .collect::<BTreeMap<_, _>>();
+    // Reconcile protected records too, without scanning unrelated thread directories.
     let vanished = index
-        .threads
-        .get(directory)
-        .map_or_else(Vec::new, |thread| {
-            thread
-                .paths
-                .iter()
-                .filter(|path| !listed.contains_key(*path))
-                .cloned()
-                .collect()
-        });
+        .records
+        .range(directory.to_path_buf()..)
+        .take_while(|(path, _)| path.starts_with(directory))
+        .filter(|(path, record)| {
+            record.thread_directory.as_path() == directory && !listed.contains_key(*path)
+        })
+        .map(|(path, _)| path.clone())
+        .collect::<Vec<_>>();
     for path in vanished {
         index.remove(&path);
     }
@@ -8956,6 +8999,7 @@ fn defer_external_retention_reconciliation(root: &Path) -> bool {
 
 /// Builds the index before a process's first artifact write would scan the
 /// whole root inline on a tool result's way back to the model.
+#[cfg(test)]
 pub(crate) fn spawn_retention_index_prewarm(codex_home: &Path) {
     let Ok(runtime) = tokio::runtime::Handle::try_current() else {
         return;
@@ -9038,7 +9082,7 @@ fn enforce_indexed_thread_retention_blocking(
                 return true;
             }
             index.threads.get(&directory).and_then(|thread| {
-                thread.paths.iter().find_map(|path| {
+                thread.unprotected_paths.iter().find_map(|path| {
                     let record = index.records.get(path)?;
                     (!record.protected && path != &keep_path && !skipped.contains(path)).then(
                         || {
@@ -10353,13 +10397,16 @@ fn logical_artifact_disk_bytes(path: &Path) -> std::io::Result<u64> {
         .unwrap_or_default();
     let entries = std::fs::read_dir(directory)?;
     let mut bytes = 0_u64;
+    let base_name = format!("{stem}.log");
+    let metadata_name = format!("{stem}.meta.json");
+    let segment_prefix = format!("{stem}.segment-");
     for entry in entries {
         let entry = entry?;
         let name = entry.file_name();
         let name = name.to_string_lossy();
-        if name == format!("{stem}.log")
-            || name == format!("{stem}.meta.json")
-            || name.starts_with(&format!("{stem}.segment-"))
+        if name == base_name
+            || name == metadata_name
+            || name.starts_with(segment_prefix.as_str())
         {
             bytes = bytes.checked_add(entry.metadata()?.len()).ok_or_else(|| {
                 std::io::Error::new(

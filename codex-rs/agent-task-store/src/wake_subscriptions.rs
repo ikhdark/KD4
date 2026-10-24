@@ -51,19 +51,28 @@ impl WakeSubscriptions {
             .keys()
             .cloned()
             .collect::<Vec<_>>();
+        if names.is_empty() {
+            return Ok(());
+        }
+        // One consistent observation for all subscribed roots. Keep missing rows
+        // distinct from an unobserved interest and retain event identity so a
+        // delete/reinsert with reused sequence values still wakes subscribers.
+        let versions: Vec<(String, i64, i64, Option<String>)> = sqlx::query_as(
+            "SELECT root_session_id, next_sequence, retained_from_sequence, latest_event_id
+             FROM wake_streams WHERE root_session_id IN (SELECT value FROM json_each(?))",
+        )
+        .bind(serde_json::to_string(&names)?)
+        .fetch_all(&mut *connection)
+        .await?;
+        let mut versions = versions.into_iter()
+            .map(|(root, next, retained, event)| (root, (next, retained, event)))
+            .collect::<HashMap<_, _>>();
+        let mut roots = self
+            .roots
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         for root in names {
-            // The event identity also detects delete/reinsert with reused rowids.
-            let version: StreamVersion = sqlx::query_as(
-                "SELECT next_sequence, retained_from_sequence, latest_event_id
-                 FROM wake_streams WHERE root_session_id = ?",
-            )
-            .bind(&root)
-            .fetch_optional(&mut *connection)
-            .await?;
-            let mut roots = self
-                .roots
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let version: StreamVersion = versions.remove(&root);
             if let Some(interest) = roots.get_mut(&root)
                 && interest.observed.as_ref() != Some(&version)
             {

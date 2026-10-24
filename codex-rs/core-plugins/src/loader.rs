@@ -7,6 +7,7 @@ use crate::manifest::PluginManifestMcpServers;
 use crate::manifest::PluginManifestPaths;
 use crate::manifest::load_plugin_manifest;
 use crate::marketplace::MarketplacePluginSource;
+use crate::marketplace::MarketplaceListOutcome;
 use crate::marketplace::list_marketplaces_with_home;
 use crate::marketplace::load_marketplace_with_declared_names;
 use crate::marketplace_policy::configured_plugins_from_stack;
@@ -483,6 +484,7 @@ pub(crate) fn refresh_non_curated_plugin_cache(
     ))
 }
 
+#[cfg(test)]
 pub(crate) fn refresh_non_curated_plugin_cache_detailed(
     codex_home: &Path,
     additional_roots: &[AbsolutePathBuf],
@@ -528,6 +530,44 @@ fn refresh_non_curated_plugin_cache_with_mode(
     configured_plugin_keys: &[String],
     mode: NonCuratedCacheRefreshMode,
 ) -> Result<NonCuratedCacheRefreshOutcome, String> {
+    refresh_non_curated_plugin_cache_with_discovery(
+        codex_home, configured_plugin_keys, mode, || {
+            list_marketplaces_with_home(additional_roots, /*home_dir*/ None)
+                .map_err(|err| format!("failed to discover marketplaces for cache refresh: {err}"))
+        },
+    )
+}
+
+pub(crate) fn refresh_non_curated_plugin_cache_from_marketplaces(
+    codex_home: &Path,
+    configured_plugin_keys: &[String],
+    mut marketplaces: MarketplaceListOutcome,
+    force_reinstall: bool,
+) -> Result<NonCuratedCacheRefreshOutcome, String> {
+    let mode = if force_reinstall {
+        NonCuratedCacheRefreshMode::ForceReinstall
+    } else {
+        NonCuratedCacheRefreshMode::IfVersionChanged
+    };
+    // Discovery errors were historically appended even when no configured
+    // non-curated IDs required refresh. Keep them outside the lazy discovery.
+    let discovery_errors = std::mem::take(&mut marketplaces.errors);
+    let mut outcome = refresh_non_curated_plugin_cache_with_discovery(
+        codex_home, configured_plugin_keys, mode, || Ok(marketplaces),
+    )?;
+    outcome.errors.extend(discovery_errors.into_iter().map(|error| NonCuratedCacheRefreshError {
+        marketplace_name: error.path.display().to_string(),
+        message: format!("failed to discover marketplace {}: {}", error.path.display(), error.message),
+    }));
+    Ok(outcome)
+}
+
+fn refresh_non_curated_plugin_cache_with_discovery(
+    codex_home: &Path,
+    configured_plugin_keys: &[String],
+    mode: NonCuratedCacheRefreshMode,
+    discover: impl FnOnce() -> Result<MarketplaceListOutcome, String>,
+) -> Result<NonCuratedCacheRefreshOutcome, String> {
     let mut configured_non_curated_plugin_ids = configured_plugin_keys
         .iter()
         .filter_map(|plugin_key| match PluginId::parse(plugin_key) {
@@ -558,8 +598,7 @@ fn refresh_non_curated_plugin_cache_with_mode(
         .collect::<HashSet<_>>();
 
     let store = PluginStore::try_new(codex_home.to_path_buf()).map_err(|err| err.to_string())?;
-    let marketplace_outcome = list_marketplaces_with_home(additional_roots, /*home_dir*/ None)
-        .map_err(|err| format!("failed to discover marketplaces for cache refresh: {err}"))?;
+    let marketplace_outcome = discover()?;
     let mut plugin_sources = HashMap::<String, (MarketplacePluginSource, Option<String>)>::new();
 
     for marketplace in marketplace_outcome.marketplaces {

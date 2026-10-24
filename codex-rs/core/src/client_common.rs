@@ -15,7 +15,9 @@ use sha2::Digest;
 use sha2::Sha256;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::OnceLock;
+use std::sync::Weak;
 #[cfg(test)]
 use std::sync::atomic::AtomicUsize;
 #[cfg(test)]
@@ -170,11 +172,20 @@ impl DeferredDynamicHistoryMeasurement {
     }
 }
 
+#[derive(Debug)]
+pub(crate) struct FormattedPromptInput {
+    source: Weak<[ResponseItem]>,
+    input: Arc<[ResponseItem]>,
+}
+
 /// API request payload for a single model turn
 #[derive(Debug, Clone)]
 pub struct Prompt {
     /// Conversation context input items.
     pub input: Arc<[ResponseItem]>,
+    // Admission and dispatch share at most the four immutable Lite projections.
+    // Weak source identity fences later mutations without retaining old histories.
+    pub(crate) formatted_inputs: Arc<Mutex<Vec<FormattedPromptInput>>>,
 
     /// Complete normalized input retained for fail-open dispatch if a
     /// transport cannot establish a fresh non-inheriting provider baseline.
@@ -237,6 +248,7 @@ impl Default for Prompt {
     fn default() -> Self {
         Self {
             input: Arc::from([]),
+            formatted_inputs: Arc::new(Mutex::new(Vec::new())),
             stable_context_fallback_input: Arc::from([]),
             tool_history_fallback_input: Arc::from([]),
             stable_context_tool_history_fallback_input: Arc::from([]),
@@ -331,10 +343,36 @@ impl Prompt {
         &self,
         use_responses_lite: bool,
     ) -> Arc<[ResponseItem]> {
-        let mut input = Arc::clone(&self.input);
-        if use_responses_lite && has_image_details(&input) {
-            strip_image_details(Arc::make_mut(&mut input));
+        self.formatted_input(&self.input, use_responses_lite)
+    }
+
+    fn formatted_input(&self, source: &Arc<[ResponseItem]>, use_lite: bool) -> Arc<[ResponseItem]> {
+        if !use_lite {
+            return Arc::clone(source);
         }
+        let identity = Arc::downgrade(source);
+        {
+            let cached = self.formatted_inputs.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(entry) = cached.iter().find(|entry| Weak::ptr_eq(&entry.source, &identity)) {
+                return Arc::clone(&entry.input);
+            }
+        }
+        if !has_image_details(source) {
+            return Arc::clone(source);
+        }
+        let mut input = Arc::clone(source);
+        strip_image_details(Arc::make_mut(&mut input));
+        let mut cached = self.formatted_inputs.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(entry) = cached.iter().find(|entry| Weak::ptr_eq(&entry.source, &identity)) {
+            return Arc::clone(&entry.input);
+        }
+        cached.retain(|entry| entry.source.strong_count() != 0);
+        if cached.len() == 4 {
+            cached.remove(0);
+        }
+        cached.push(FormattedPromptInput { source: identity, input: Arc::clone(&input) });
         input
     }
 
@@ -354,11 +392,7 @@ impl Prompt {
             if sources[..index].iter().any(|previous| Arc::ptr_eq(previous, source)) {
                 continue;
             }
-            let mut input = Arc::clone(source);
-            if use_responses_lite && has_image_details(&input) {
-                strip_image_details(Arc::make_mut(&mut input));
-            }
-            inputs.push(input);
+            inputs.push(self.formatted_input(source, use_responses_lite));
         }
         inputs
     }
@@ -367,11 +401,7 @@ impl Prompt {
         &self,
         use_responses_lite: bool,
     ) -> Arc<[ResponseItem]> {
-        let mut input = Arc::clone(&self.stable_context_fallback_input);
-        if use_responses_lite && has_image_details(&input) {
-            strip_image_details(Arc::make_mut(&mut input));
-        }
-        input
+        self.formatted_input(&self.stable_context_fallback_input, use_responses_lite)
     }
 
     pub(crate) fn get_formatted_tool_history_fallback_input_for_request(
@@ -379,15 +409,12 @@ impl Prompt {
         use_responses_lite: bool,
         use_stable_context_fallback: bool,
     ) -> Arc<[ResponseItem]> {
-        let mut input = if use_stable_context_fallback {
-            Arc::clone(&self.stable_context_tool_history_fallback_input)
+        let input = if use_stable_context_fallback {
+            &self.stable_context_tool_history_fallback_input
         } else {
-            Arc::clone(&self.tool_history_fallback_input)
+            &self.tool_history_fallback_input
         };
-        if use_responses_lite && has_image_details(&input) {
-            strip_image_details(Arc::make_mut(&mut input));
-        }
-        input
+        self.formatted_input(input, use_responses_lite)
     }
 
     pub(crate) fn tool_history_substitutions_for_request(

@@ -97,28 +97,40 @@ impl PendingRemoteEvents {
     }
 
     fn push_back(&mut self, event: AppServerEvent) -> IoResult<()> {
+        fn exhausted() -> IoError {
+            IoError::new(ErrorKind::OutOfMemory,
+                "remote app-server required event retention budget exceeded; connection retired")
+        }
+        let remaining = MAX_PENDING_REMOTE_EVENT_BYTES.saturating_sub(self.bytes);
+        let overhead = std::mem::size_of::<AppServerEvent>();
+        if self.events.len() >= MAX_PENDING_REMOTE_EVENTS || remaining < overhead {
+            return Err(exhausted());
+        }
         // Count serialized content without allocating a second payload. Charge
         // conservatively for decoded strings/containers as well as the enum.
-        struct Counter(usize);
+        struct Counter { bytes: usize, limit: usize }
         impl std::io::Write for Counter {
             fn write(&mut self, bytes: &[u8]) -> IoResult<usize> {
-                self.0 = self.0.saturating_add(bytes.len());
+                self.bytes = self.bytes.checked_add(bytes.len())
+                    .filter(|next| *next <= self.limit).ok_or_else(exhausted)?;
                 Ok(bytes.len())
             }
             fn flush(&mut self) -> IoResult<()> {
                 Ok(())
             }
         }
-        let mut count = Counter(0);
+        let mut count = Counter { bytes: 0, limit: (remaining - overhead) / 8 };
         match &event {
             AppServerEvent::ServerNotification(value) => serde_json::to_writer(&mut count, value),
             AppServerEvent::ServerRequest(value) => serde_json::to_writer(&mut count, value),
             AppServerEvent::Disconnected { message } => serde_json::to_writer(&mut count, message),
             AppServerEvent::Lagged { skipped } => serde_json::to_writer(&mut count, skipped),
         }
-        .map_err(IoError::other)?;
+        .map_err(|error| if error.io_error_kind() == Some(ErrorKind::OutOfMemory) {
+            exhausted()
+        } else { IoError::other(error) })?;
         let bytes = count
-            .0
+            .bytes
             .saturating_mul(8)
             .saturating_add(std::mem::size_of::<AppServerEvent>());
         if self.events.len() >= MAX_PENDING_REMOTE_EVENTS

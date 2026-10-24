@@ -1,7 +1,5 @@
 use std::sync::Arc;
 
-use codex_code_mode_protocol::EnabledToolMetadata;
-
 use super::EnabledToolCatalog;
 use super::RuntimeState;
 use super::callbacks::clear_timeout_callback;
@@ -93,6 +91,12 @@ pub(super) fn install_globals(scope: &mut v8::PinScope<'_, '_>) -> Result<(), St
         super::callbacks::monotonic_now_callback,
     )?;
     set_global(scope, global, "__codex_monotonic_now", monotonic_now.into())?;
+    let is_proxy = helper_function(
+        scope,
+        "__codex_is_proxy",
+        super::callbacks::is_proxy_callback,
+    )?;
+    set_global(scope, global, "__codex_is_proxy", is_proxy.into())?;
     install_tool_aliases(scope, global, &enabled_tools)?;
     install_console_shim(scope, global)?;
     let text_encoding = v8::String::new(scope, include_str!("text_encoding.js"))

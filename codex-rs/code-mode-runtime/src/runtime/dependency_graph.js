@@ -167,11 +167,12 @@ Object.defineProperty(globalThis, "run_graph", {
     let missingCapabilities;
     let missingCount = 0,
       diagnosticBytes = 2; // The JSON array's brackets.
-    // Snapshot once per invocation, not once per required name. A later graph
-    // still sees a changed catalog; this is not cross-cell capability caching.
-    const capabilities = new Set(ALL_TOOL_NAMES);
+    // Snapshot once when a selected requirement needs it. Compute-only graphs
+    // need no catalog; later invocations still observe the current catalog.
+    let capabilities;
     for (const id of selected) {
       for (const name of graph.get(id).requires) {
+        capabilities ??= new Set(ALL_TOOL_NAMES);
         if (capabilities.has(name)) continue;
         // Discovery uses presentation names; retained canonical aliases use
         // exactly the same admitted, ambiguity-aware resolver as dispatch.
@@ -286,12 +287,11 @@ Object.defineProperty(globalThis, "run_graph", {
       try {
         const dependencies = Object.create(null);
         for (const dep of node.deps) dependencies[dep] = results[dep].value;
-        const { run, accept } = node;
-        value = await run(Object.freeze(dependencies));
+        value = await node.run(Object.freeze(dependencies));
         produced = true;
         // Promise resolution is not tool success. `accept` establishes the
         // node's behavioral postcondition; by default, command exit codes.
-        if ((await accept(value)) !== true) {
+        if ((await node.accept(value)) !== true) {
           results[id] = {
             status: "rejected",
             value,

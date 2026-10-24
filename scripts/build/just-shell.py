@@ -33,6 +33,19 @@ import scripts.build.rust_tool_env as shared_rust_tool_env  # noqa: E402
 
 
 ARGS_TOKEN = "{args}"
+PYTHON_RECIPE_MARKER = "{python-recipe}"
+PYTHON_RECIPE_ACTIONS = {
+    "target-disk": ("disk",),
+    "target-prune": ("prune",),
+    "target-optimize": (
+        "optimize", "--keep-warm-per-base", "2", "--max-age-days", "14", "--max-lane-gib", "25",
+    ),
+    "target-optimize-dry-run": (
+        "optimize", "--dry-run", "--keep-warm-per-base", "2", "--max-age-days", "14",
+        "--max-lane-gib", "25",
+    ),
+    "lanes": ("lanes",),
+}
 STDERR_NULL_TOKEN = "{stderr-null}"
 POWERSHELL_ARGS = "@($args | Select-Object -Skip 1)"
 # This placeholder must be the final token in a recipe snippet because the
@@ -55,8 +68,17 @@ def main() -> int:
     command = sys.argv[1]
     recipe_name = sys.argv[2] if len(sys.argv) > 2 else ""
     recipe_args = sys.argv[3:]
-    which, cache_dir = prepare_recipe_environment(command)
     try:
+        if command.startswith(PYTHON_RECIPE_MARKER):
+            action = PYTHON_RECIPE_ACTIONS.get(recipe_name)
+            if action is None:
+                raise ValueError(f"unknown structured Python recipe: {recipe_name}")
+            return run_python(
+                str(SCRIPT_DIR / "scripts" / "build" / "rust_build_status.py"),
+                [*action, *recipe_args],
+                program=command.removeprefix(PYTHON_RECIPE_MARKER).strip(),
+            )
+        which, cache_dir = prepare_recipe_environment(command)
         return run_powershell(
             command, recipe_name, recipe_args, which=which, cache_dir=cache_dir
         )

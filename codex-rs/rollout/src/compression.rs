@@ -761,6 +761,9 @@ pub struct RolloutLineReader {
     last_line_terminated: bool,
     enroll_payloads: bool,
     unresolved_payloads: usize,
+    payload_versions: Option<
+        std::collections::BTreeMap<PathBuf, crate::payload_artifact::PayloadDependencyVersion>,
+    >,
 }
 
 enum RolloutLineReaderInner {
@@ -774,6 +777,20 @@ struct BlockingRolloutLineReader {
 }
 
 impl RolloutLineReader {
+    pub(crate) fn capture_payload_versions(&mut self) {
+        self.payload_versions = Some(Default::default());
+    }
+
+    pub(crate) fn take_payload_versions(
+        &mut self,
+    ) -> Vec<crate::payload_artifact::PayloadDependencyVersion> {
+        self.payload_versions
+            .take()
+            .unwrap_or_default()
+            .into_values()
+            .collect()
+    }
+
     pub(crate) fn enroll_payload_dependencies(&mut self) {
         self.enroll_payloads = true;
     }
@@ -815,16 +832,28 @@ impl RolloutLineReader {
         }
         let path = self.path.clone();
         let enroll = self.enroll_payloads;
-        match tokio::task::spawn_blocking(move || {
-            if enroll {
+        let capture_versions = self.payload_versions.is_some();
+        let payload_sync_owner = enroll.then(|| crate::payload_artifact::PayloadSyncOwner::new(&path));
+        let (version, result) = tokio::task::spawn_blocking(move || {
+            let version = capture_versions
+                .then(|| crate::payload_artifact::named_payload_version(&path, &line))
+                .flatten();
+            let result = if enroll {
                 crate::payload_artifact::hydrate_line_with_enrollment(&path, line, true)
             } else {
                 crate::payload_artifact::hydrate_line(&path, line)
-            }
+            };
+            drop(payload_sync_owner);
+            (version, result)
         })
         .await
-        .map_err(io::Error::other)?
-        {
+        .map_err(io::Error::other)?;
+        if let (Some(versions), Some(version)) = (&mut self.payload_versions, version) {
+            // Retain the first pre-hydration observation for repeated references:
+            // replacement during replay must invalidate this projection.
+            versions.entry(version.path.clone()).or_insert(version);
+        }
+        match result {
             Ok(line) => Ok(Some(line)),
             Err(error) => {
                 self.unresolved_payloads = self.unresolved_payloads.saturating_add(1);
@@ -1320,6 +1349,16 @@ mod worker {
         path: &Path,
         after_final_check: impl FnOnce() -> io::Result<()>,
     ) -> io::Result<CompressionMeasurement> {
+        // A known-hot/missing/non-file candidate needs no physical lock. This
+        // observation only skips work; eligible files are rechecked under the
+        // lock below, and errors retain the original fenced diagnostic path.
+        if let Ok(ColdFileState::NotCold(state)) = cold_file_state(path) {
+            return Ok(CompressionMeasurement::new(
+                CompressionOutcome::SkippedNotCold,
+                state.map(|state| state.len),
+                /*compressed_bytes*/ None,
+            ));
+        }
         let Some(_rollout_lock) = try_lock_rollout_for_compression(path)? else {
             return Ok(CompressionMeasurement::new(
                 CompressionOutcome::SkippedLocked,
@@ -1516,6 +1555,9 @@ mod worker {
     }
 
     async fn cleanup_stale_temp(entry: &tokio::fs::DirEntry) {
+        if !is_rollout_temp_file_name(entry.file_name().to_str().unwrap_or_default()) {
+            return;
+        }
         let path = entry.path();
         let cleanup_path = path.clone();
         // The worker owns physical exclusion through unlink, including when its
@@ -1796,6 +1838,7 @@ mod reader {
                 last_line_terminated: true,
                 enroll_payloads: false,
                 unresolved_payloads: 0,
+                payload_versions: None,
                 inner: RolloutLineReaderInner::Blocking(BlockingRolloutLineReader {
                     receiver,
                     task: Some(task),
@@ -1808,6 +1851,7 @@ mod reader {
             last_line_terminated: true,
             enroll_payloads: false,
             unresolved_payloads: 0,
+            payload_versions: None,
             inner: RolloutLineReaderInner::Plain(tokio::io::BufReader::new(file)),
         })
     }

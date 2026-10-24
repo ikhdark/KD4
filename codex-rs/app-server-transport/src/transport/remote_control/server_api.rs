@@ -8,6 +8,8 @@ use super::protocol::EnrollRemoteServerRequest;
 use super::protocol::EnrollRemoteServerResponse;
 use super::protocol::RefreshRemoteServerRequest;
 use super::protocol::RemoteControlTarget;
+use super::protocol::remote_control_app_server_version;
+use super::protocol::remote_control_user_agent;
 use axum::http::HeaderMap;
 use axum::http::StatusCode;
 use codex_http_client::HttpClient;
@@ -106,7 +108,7 @@ pub(super) async fn enroll_remote_control_server_with_client(
         name: server_name.to_string(),
         os: std::env::consts::OS,
         arch: std::env::consts::ARCH,
-        app_server_version: env!("CARGO_PKG_VERSION"),
+        app_server_version: remote_control_app_server_version(),
         installation_id: installation_id.to_string(),
     };
     let enrollment_response = send_remote_control_server_request::<_, EnrollRemoteServerResponse>(
@@ -255,6 +257,7 @@ where
         .timeout(timeout)
         .headers(auth_headers)
         .header(REMOTE_CONTROL_INSTALLATION_ID_HEADER, installation_id)
+        .header("user-agent", remote_control_user_agent())
         .json(request)
         .send()
         .await

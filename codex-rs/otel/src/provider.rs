@@ -123,16 +123,18 @@ impl OtelProvider {
             Some(MetricsClient::new(config)?)
         };
 
-        let log_resource = make_resource(settings, ResourceKind::Logs);
-        let trace_resource = make_resource(settings, ResourceKind::Traces);
         let logger = log_enabled
-            .then(|| build_logger(&log_resource, &settings.exporter))
+            .then(|| {
+                let resource = make_resource(settings, ResourceKind::Logs);
+                build_logger(&resource, &settings.exporter)
+            })
             .transpose()?;
 
         let tracer_provider = trace_enabled
             .then(|| {
+                let resource = make_resource(settings, ResourceKind::Traces);
                 build_tracer_provider(
-                    &trace_resource,
+                    &resource,
                     &settings.trace_exporter,
                     settings.span_attributes.clone(),
                 )
@@ -212,11 +214,12 @@ impl Drop for OtelProvider {
 }
 
 fn make_resource(settings: &OtelSettings, kind: ResourceKind) -> Resource {
+    let host_name = (kind == ResourceKind::Logs).then(detected_host_name).flatten();
     Resource::builder()
         .with_service_name(settings.service_name.clone())
         .with_attributes(resource_attributes(
             settings,
-            detected_host_name().as_deref(),
+            host_name.as_deref(),
             kind,
         ))
         .build()

@@ -306,6 +306,14 @@ struct PreparedHistoryCacheEntry {
     pending_append: Vec<ResponseItem>,
 }
 
+#[derive(Clone, Debug)]
+struct LocalCompactionItemsCacheEntry {
+    source_items: Weak<Vec<ResponseItem>>,
+    projection_revision: u64,
+    policy: PreparedHistoryPolicy,
+    items: Arc<[ResponseItem]>,
+}
+
 /// Keep measurement state with the exact projection it describes. A verified
 /// continuation can extend it without hashing or classifying the sent prefix.
 #[derive(Clone, Debug)]
@@ -416,6 +424,8 @@ pub(crate) struct ContextManager {
     tool_history: Arc<ToolHistoryState>,
     tool_call_classes: Arc<StdMutex<ToolCallClassificationIndex>>,
     prepared_history: Arc<StdMutex<Option<PreparedHistoryCacheEntry>>>,
+    /// One items-only normalization result; never supplies sampling provenance.
+    local_compaction_items: Arc<StdMutex<Option<LocalCompactionItemsCacheEntry>>>,
     /// The tool-history projection sent by the latest sampling request of the
     /// current turn. Continuation requests extend it so their input keeps the
     /// previous request as an exact prefix; compaction,
@@ -449,6 +459,7 @@ impl ContextManager {
             tool_history: Arc::new(ToolHistoryState::default()),
             tool_call_classes: Default::default(),
             prepared_history: Arc::new(StdMutex::new(None)),
+            local_compaction_items: Arc::new(StdMutex::new(None)),
             sampling_projection_anchor: Arc::new(StdMutex::new(None)),
             item_token_estimates: Arc::new(StdMutex::new(HashMap::new())),
             token_info: TokenUsageInfo::new_or_append(
@@ -843,11 +854,10 @@ impl ContextManager {
         git_workspace: &crate::git_workspace::GitWorkspaceCache,
     ) -> Arc<[ResponseItem]> {
         let tool_history = Arc::clone(&self.tool_history);
-        let prepared =
-            self.prepare_for_prompt_target(input_modalities, StableContextTarget::FailOpen);
+        let items = self.prepare_local_compaction_items(input_modalities);
         tool_history
             .project_workspace_freshness_with_cache(
-                prepared.shared_items(),
+                items,
                 workspace_identity,
                 git_workspace,
             )
@@ -865,15 +875,45 @@ impl ContextManager {
         git_workspace: &crate::git_workspace::GitWorkspaceCache,
     ) -> Arc<[ResponseItem]> {
         let tool_history = Arc::clone(&self.tool_history);
-        let prepared =
-            self.prepare_for_prompt_target(input_modalities, StableContextTarget::FailOpen);
+        let items = self.prepare_local_compaction_items(input_modalities);
         tool_history
             .project_sampling_with_workspace_cache(
-                prepared.shared_items(),
+                items,
                 workspace_identity,
                 git_workspace,
             )
             .items
+    }
+
+    fn prepare_local_compaction_items(mut self, input_modalities: &[InputModality]) -> Arc<[ResponseItem]> {
+        let policy = PreparedHistoryPolicy {
+            version: PREPARED_HISTORY_POLICY_VERSION,
+            supports_images: input_modalities.contains(&InputModality::Image),
+            stable_context_target: StableContextTarget::FailOpen,
+        };
+        let source_items = Arc::downgrade(&self.items);
+        if let Some(items) = self.local_compaction_items.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner).as_ref()
+            .filter(|entry| weak_ptr_eq_arc(&entry.source_items, &self.items)
+                && entry.projection_revision == self.projection_revision && entry.policy == policy)
+            .map(|entry| Arc::clone(&entry.items))
+        {
+            return items;
+        }
+        // Exactly the FailOpen normalization used by generic preparation.
+        // FailOpen stable-context projection leaves these items unchanged;
+        // its manifest, provenance and fingerprint are not local-model input.
+        evict_resolved_reasoning(Arc::make_mut(&mut self.items));
+        project_update_plan_history(Arc::make_mut(&mut self.items));
+        self.normalize_history(input_modalities);
+        let mut items = Arc::unwrap_or_clone(self.items);
+        retire_expired_turn_advice(&mut items);
+        let items: Arc<[ResponseItem]> = items.into();
+        *self.local_compaction_items.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(LocalCompactionItemsCacheEntry {
+                source_items, projection_revision: self.projection_revision, policy, items: Arc::clone(&items),
+            });
+        items
     }
 
     fn prepare_for_prompt_with_completed_tool_projection_target(
@@ -1467,24 +1507,7 @@ impl ContextManager {
         input_modalities: &[InputModality],
     ) -> i64 {
         let items_after_last_model_generated = self.items_after_last_model_generated_item();
-        let local_tail_contains_instruction_boundary = self
-            .items
-            .iter()
-            .rposition(is_model_generated_item)
-            .map_or_else(
-                || self.items.iter().any(is_user_turn_boundary),
-                |last_model_generated| {
-                    self.items[last_model_generated.saturating_add(1)..]
-                        .iter()
-                        .any(is_user_turn_boundary)
-                },
-            );
-        if local_tail_contains_instruction_boundary
-            || self
-                .token_info
-                .as_ref()
-                .is_none_or(|info| info.estimated_context_tokens.is_some())
-        {
+        if self.requires_local_context_estimate() {
             // Server usage is stale across an instruction boundary, so estimate
             // the whole history that sampling will actually send.
             return self
@@ -1510,6 +1533,50 @@ impl ContextManager {
                 /*policy*/ None,
             );
         last_tokens.saturating_add(items_after_last_model_generated_tokens)
+    }
+
+    fn requires_local_context_estimate(&self) -> bool {
+        let local_tail_contains_instruction_boundary = self
+            .items
+            .iter()
+            .rposition(is_model_generated_item)
+            .map_or_else(
+                || self.items.iter().any(is_user_turn_boundary),
+                |last_model_generated| {
+                    self.items[last_model_generated.saturating_add(1)..]
+                        .iter()
+                        .any(is_user_turn_boundary)
+                },
+            );
+        local_tail_contains_instruction_boundary
+            || self
+                .token_info
+                .as_ref()
+                .is_none_or(|info| info.estimated_context_tokens.is_some())
+    }
+
+    /// Share sampling preparation/projection while retaining the distinct
+    /// active-context and hypothetical future-user reasoning boundaries.
+    pub(crate) fn projected_token_estimates(
+        &self,
+        base_instructions: &BaseInstructions,
+        input_modalities: &[InputModality],
+        pending_user_boundary: bool,
+    ) -> (i64, Option<i64>) {
+        let prepared = self.clone()
+            .prepare_for_prompt_target(input_modalities, StableContextTarget::Sampling);
+        let source = prepared.shared_items();
+        let (projected, tail) = self.sampling_items_for_estimate(&source);
+        let estimate = |pending| self.estimate_projected_items_token_count(
+            &source, &projected, tail, base_instructions, pending, Some(prepared.policy),
+        );
+        let committed = estimate(pending_user_boundary);
+        let active = if self.requires_local_context_estimate() {
+            (if pending_user_boundary { estimate(false) } else { committed }).unwrap_or(0)
+        } else {
+            self.get_total_token_usage_for_modalities(base_instructions, input_modalities)
+        };
+        (active, committed)
     }
 
     pub(crate) fn estimated_tokens_after_last_model_generated_item(&self) -> i64 {
@@ -2587,6 +2654,28 @@ pub(crate) fn is_turn_local_advice(item: &ResponseItem) -> bool {
         if role == "developer" && id.as_str().starts_with("msg_turn_advice_"))
 }
 
+fn turn_advice_expired(
+    index: usize,
+    item: &ResponseItem,
+    current_turn: Option<&str>,
+    completed: Option<usize>,
+) -> bool {
+    is_turn_local_advice(item)
+        && (completed.is_some_and(|boundary| index < boundary)
+            || current_turn.is_some_and(|turn| item.turn_id().is_some_and(|owner| owner != turn)))
+}
+
+pub(crate) fn current_turn_advice_items(
+    items: &[ResponseItem],
+) -> impl Iterator<Item = (usize, &ResponseItem)> {
+    let current_turn = items.iter().rev().find(|item| is_user_turn_boundary(item))
+        .and_then(ResponseItem::turn_id);
+    let completed = completed_turn_boundary(items);
+    items.iter().enumerate().filter(move |(index, item)| {
+        !turn_advice_expired(*index, item, current_turn, completed)
+    })
+}
+
 pub(crate) fn retire_expired_turn_advice(items: &mut Vec<ResponseItem>) {
     let current_turn = items
         .iter()
@@ -2597,11 +2686,7 @@ pub(crate) fn retire_expired_turn_advice(items: &mut Vec<ResponseItem>) {
     let completed = completed_turn_boundary(items);
     let mut index = 0;
     items.retain(|item| {
-        let expired = is_turn_local_advice(item)
-            && (completed.is_some_and(|boundary| index < boundary)
-                || current_turn
-                    .as_deref()
-                    .is_some_and(|turn| item.turn_id().is_some_and(|owner| owner != turn)));
+        let expired = turn_advice_expired(index, item, current_turn.as_deref(), completed);
         index += 1;
         !expired
     });

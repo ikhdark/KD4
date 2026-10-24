@@ -313,7 +313,7 @@ async fn spawn_agent_rejects_empty_message() {
 
 
 #[tokio::test]
-async fn spawn_agent_uses_explorer_role_and_preserves_approval_policy() {
+async fn spawn_agent_is_generic_and_preserves_approval_policy() {
     #[derive(Debug, Deserialize)]
     struct SpawnAgentResult {
         task_name: String,
@@ -346,8 +346,7 @@ async fn spawn_agent_uses_explorer_role_and_preserves_approval_policy() {
         Arc::new(turn),
         "spawn_agent",
         function_payload(json!({"task_name": "test_agent",
-            "message": "inspect this repo",
-            "agent_type": "explorer"
+            "message": "inspect this repo"
         })),
     );
     let output = SpawnAgentHandlerV2::default()
@@ -435,7 +434,7 @@ async fn spawn_agent_keeps_effective_bedrock_model_when_sol_6_1_is_unavailable()
 }
 
 #[tokio::test]
-async fn spawn_agent_role_switches_provider_before_default_reasoning_validation() {
+async fn spawn_agent_ignores_configured_role_model_and_provider() {
     #[derive(Debug, Deserialize)]
     struct SpawnAgentResult {
         task_name: String,
@@ -465,6 +464,7 @@ async fn spawn_agent_role_switches_provider_before_default_reasoning_validation(
         },
     );
     set_turn_config(&mut turn, config);
+    let expected_provider_id = turn.config.model_provider_id.clone();
 
     let manager = thread_manager();
     let root = manager
@@ -480,8 +480,7 @@ async fn spawn_agent_role_switches_provider_before_default_reasoning_validation(
             Arc::new(turn),
             "spawn_agent",
             function_payload(json!({"task_name": "test_agent",
-                "message": "inspect this repo",
-                "agent_type": "bedrock"
+                "message": "inspect this repo"
             })),
         ))
         .await
@@ -496,8 +495,8 @@ async fn spawn_agent_role_switches_provider_before_default_reasoning_validation(
         .config_snapshot()
         .await;
 
-    assert_eq!(snapshot.model_provider_id, AMAZON_BEDROCK_PROVIDER_ID);
-    assert_eq!(snapshot.model, AMAZON_BEDROCK_GPT_5_6_SOL_MODEL_ID);
+    assert_eq!(snapshot.model_provider_id, expected_provider_id);
+    assert_eq!(snapshot.model, DEFAULT_SPAWN_AGENT_MODEL);
     assert_eq!(
         snapshot.reasoning_effort,
         Some(DEFAULT_SPAWN_AGENT_REASONING_EFFORT)
@@ -505,7 +504,7 @@ async fn spawn_agent_role_switches_provider_before_default_reasoning_validation(
 }
 
 #[tokio::test]
-async fn spawn_agent_validates_role_locked_reasoning_against_requested_model() {
+async fn spawn_agent_rejects_role_selection_before_model_overrides() {
     let (session, mut turn) = make_session_and_context().await;
     tokio::fs::create_dir_all(&turn.config.codex_home)
         .await
@@ -546,16 +545,16 @@ async fn spawn_agent_validates_role_locked_reasoning_against_requested_model() {
     assert_eq!(
         result.err(),
         Some(FunctionCallError::RespondToModel(
-            "Reasoning effort `minimal` is not supported for model `gpt-5.6-luna`. Supported reasoning efforts: low, medium, high, xhigh, max. Update model_reasoning_effort or the turn reasoning setting."
+            "spawn_agent: specialized roles are no longer supported; put the complete task, scope, restrictions, and evidence requirements in message"
                 .to_string()
         ))
     );
 }
 
 #[tokio::test]
-async fn spawn_agent_events_report_role_resolved_model_and_reasoning() {
+async fn spawn_agent_events_report_uniform_model_and_reasoning() {
     let (mut session, mut turn, rx) = make_session_and_context_with_rx().await;
-    let role_name = install_role_with_model_override(
+    let _role_name = install_role_with_model_override(
         Arc::get_mut(&mut turn).expect("turn context should be uniquely owned"),
     )
     .await;
@@ -576,10 +575,7 @@ async fn spawn_agent_events_report_role_resolved_model_and_reasoning() {
             Arc::clone(&turn),
             "spawn_agent",
             function_payload(json!({"task_name": "test_agent",
-                "message": "inspect this repo",
-                "agent_type": role_name,
-                "model": "gpt-5.4",
-                "reasoning_effort": "low"
+                "message": "inspect this repo"
             })),
         ))
         .await
@@ -616,10 +612,10 @@ async fn spawn_agent_events_report_role_resolved_model_and_reasoning() {
     .await
     .expect("spawn lifecycle events should arrive");
 
-    assert_eq!(started.model.as_deref(), Some("gpt-5-role-override"));
-    assert_eq!(started.reasoning_effort, Some(ReasoningEffort::Minimal));
-    assert_eq!(completed.model.as_deref(), Some("gpt-5-role-override"));
-    assert_eq!(completed.reasoning_effort, Some(ReasoningEffort::Minimal));
+    assert_eq!(started.model.as_deref(), Some(DEFAULT_SPAWN_AGENT_MODEL));
+    assert_eq!(started.reasoning_effort, Some(DEFAULT_SPAWN_AGENT_REASONING_EFFORT));
+    assert_eq!(completed.model.as_deref(), Some(DEFAULT_SPAWN_AGENT_MODEL));
+    assert_eq!(completed.reasoning_effort, Some(DEFAULT_SPAWN_AGENT_REASONING_EFFORT));
 }
 
 
@@ -717,60 +713,27 @@ async fn multi_agent_v2_spawn_fork_turns_all_rejects_agent_type_override() {
     assert_eq!(
         err,
         FunctionCallError::RespondToModel(
-            "Full-history forked agents use the built-in spawn defaults and do not accept per-call agent_type, model, or reasoning_effort overrides; omit those fields, or spawn without a full-history fork.".to_string(),
+            "spawn_agent: specialized roles are no longer supported; put the complete task, scope, restrictions, and evidence requirements in message".to_string(),
         )
     );
 }
 
 #[tokio::test]
-async fn multi_agent_v2_spawn_model_override_defaults_to_no_fork() {
-    let (mut session, mut turn) = make_session_and_context().await;
-    let manager = thread_manager();
-    let root = manager
-        .start_thread((*turn.config).clone())
-        .await
-        .expect("root thread should start");
-    session.services.agent_control = manager.agent_control();
-    session.thread_id = root.thread_id;
-    let mut config = (*turn.config).clone();
-    config
-        .features
-        .enable(Feature::MultiAgentV2)
-        .expect("test config should allow feature update");
-    set_turn_config(&mut turn, config);
-
-    let output = SpawnAgentHandlerV2::default()
-        .handle(invocation(
-            Arc::new(session),
-            Arc::new(turn),
-            "spawn_agent",
-            function_payload(json!({
-                "message": "inspect this repo",
-                "task_name": "fork_context_v2",
-                "model": "gpt-5.4",
-                "reasoning_effort": "low"
-            })),
-        ))
-        .await
-        .expect("model override should preserve durable admission");
-    let (content, _) = expect_text_output(output);
-    let result: serde_json::Value =
-        serde_json::from_str(&content).expect("spawn_agent result should be json");
-    assert_eq!(result["task_name"], "/root/fork_context_v2");
-    let agent_id = manager
-        .captured_ops()
-        .into_iter()
-        .map(|(thread_id, _)| thread_id)
-        .find(|thread_id| *thread_id != root.thread_id)
-        .expect("spawned agent should receive an op");
-    let snapshot = manager
-        .get_thread(agent_id)
-        .await
-        .expect("spawned agent thread should exist")
-        .config_snapshot()
-        .await;
-    assert_eq!(snapshot.model, "gpt-5.4");
-    assert_eq!(snapshot.reasoning_effort, Some(ReasoningEffort::Low));
+async fn multi_agent_v2_spawn_rejects_model_and_reasoning_overrides() {
+    for overrides in [
+        json!({"model": "gpt-5.4"}),
+        json!({"reasoning_effort": "low"}),
+        json!({"model": "gpt-5.4", "reasoning_effort": "low"}),
+    ] {
+        let (session, turn) = make_session_and_context().await;
+        let mut args = json!({"task_name": "generic", "message": "inspect this repo"});
+        args.as_object_mut().unwrap().extend(overrides.as_object().unwrap().clone());
+        let error = SpawnAgentHandlerV2::default()
+            .handle(invocation(Arc::new(session), Arc::new(turn), "spawn_agent", function_payload(args)))
+            .await.err().expect("uniform defaults cannot be overridden");
+        assert!(error.to_string().contains("model and reasoning overrides are not supported"));
+        assert!(error.to_string().contains("gpt-6.1-sol with xhigh reasoning"));
+    }
 }
 
 #[test_case::test_case(true; "compact")]
@@ -877,7 +840,6 @@ async fn multi_agent_v2_typed_spawn_persists_and_binds_assignment_before_start(c
         "spawn_agent",
         function_payload(json!({
             "task_name": task_name.clone(),
-            "agent_type": "worker",
             "assignment": {
                 "objective": "inspect the bounded path",
                 "acceptance_criteria": [{
@@ -1291,7 +1253,7 @@ async fn multi_agent_v2_typed_spawn_persists_and_binds_assignment_before_start(c
 }
 
 #[tokio::test]
-async fn multi_agent_v2_spawn_does_not_reuse_completed_explorer_without_input_fingerprint() {
+async fn multi_agent_v2_spawn_does_not_reuse_completed_generic_task_without_input_fingerprint() {
     let (mut session, mut turn) = make_session_and_context().await;
     let mut config = (*turn.config).clone();
     config
@@ -1329,7 +1291,6 @@ async fn multi_agent_v2_spawn_does_not_reuse_completed_explorer_without_input_fi
     let assignment = |task_name: &str| {
         function_payload(json!({
             "task_name": task_name,
-            "agent_type": "explorer",
             "assignment": {
                 "objective": objective,
                 "acceptance_criteria": [{
@@ -1337,7 +1298,8 @@ async fn multi_agent_v2_spawn_does_not_reuse_completed_explorer_without_input_fi
                     "text": "report the ownership trace"
                 }],
                 "read_scope": [{"path": read_path, "recursive": false}],
-                "write_scope": [],
+                "write_scope": [{"path": read_path, "recursive": false}],
+                "required_evidence": ["bounded trace"],
                 "stop_condition": "stop after reporting the trace"
             }
         }))
@@ -1579,7 +1541,6 @@ async fn multi_agent_v2_typed_spawn_admits_overlapping_write_claims() {
             "spawn_agent",
             function_payload(json!({
                 "task_name": first_task_name,
-                "agent_type": "worker",
                 "assignment": {
                     "objective": "edit the claimed path",
                     "acceptance_criteria": [{
@@ -1611,7 +1572,6 @@ async fn multi_agent_v2_typed_spawn_admits_overlapping_write_claims() {
             "spawn_agent",
             function_payload(json!({
                 "task_name": second_task_name,
-                "agent_type": "worker",
                 "assignment": {
                     "objective": "edit an overlapping path",
                     "acceptance_criteria": [{
@@ -1743,7 +1703,6 @@ async fn multi_agent_v2_typed_spawn_failure_releases_write_claim() {
         "spawn_agent",
         function_payload(json!({
             "task_name": task_name.clone(),
-            "agent_type": "worker",
             "assignment": {
                 "objective": "exercise spawn rollback",
                 "acceptance_criteria": [{
@@ -1835,7 +1794,6 @@ async fn multi_agent_v2_typed_spawn_is_root_only() {
             "spawn_agent",
             function_payload(json!({
                 "task_name": "nested_typed_worker",
-                "agent_type": "worker",
                 "assignment": {
                     "objective": "modify the bounded path",
                     "acceptance_criteria": [{
@@ -1887,7 +1845,6 @@ async fn spawn_agent_service_tier_override_validates_the_effective_child_model()
                 "spawn_agent",
                 function_payload(json!({"task_name": "test_agent",
                     "message": "inspect this repo",
-                    "model": "gpt-5.5",
                     "service_tier": ServiceTier::Fast.request_value()
                 })),
             ))
@@ -1918,7 +1875,6 @@ async fn spawn_agent_service_tier_override_validates_the_effective_child_model()
                 "spawn_agent",
                 function_payload(json!({"task_name": "test_agent",
                     "message": "inspect this repo",
-                    "model": "gpt-5.4",
                     "service_tier": "turbo"
                 })),
             ))
@@ -1929,37 +1885,12 @@ async fn spawn_agent_service_tier_override_validates_the_effective_child_model()
         assert_eq!(
             err,
             FunctionCallError::RespondToModel(
-                "Service tier `turbo` is not supported for model `gpt-5.4`. Supported service tiers: priority"
+                "Service tier `turbo` is not supported for model `gpt-6.1-sol`. Supported service tiers: priority"
                     .to_string()
             )
         );
     }
 
-    {
-        let (session, turn) = make_session_and_context().await;
-        let err = SpawnAgentHandlerV2::default()
-            .handle(invocation(
-                Arc::new(session),
-                Arc::new(turn),
-                "spawn_agent",
-                function_payload(json!({"task_name": "test_agent",
-                    "message": "inspect this repo",
-                    "model": "gpt-5.4-mini",
-                    "service_tier": ServiceTier::Fast.request_value()
-                })),
-            ))
-            .await
-            .err()
-            .expect("tier unsupported by the final child model should be rejected");
-
-        assert_eq!(
-            err,
-            FunctionCallError::RespondToModel(
-                "Service tier `priority` is not supported for model `gpt-5.4-mini`. Supported service tiers: none"
-                    .to_string()
-            )
-        );
-    }
 }
 
 #[tokio::test]
@@ -2019,7 +1950,7 @@ async fn spawn_agent_service_tier_inheritance_preserves_supported_or_configured_
         let mut config = (*turn.config).clone();
         config.service_tier = Some(ServiceTier::Fast.request_value().to_string());
         turn.config = Arc::new(config);
-        set_session_service_tier(&session, ServiceTier::Fast.request_value()).await;
+        set_session_service_tier(&session, "turbo").await;
         let manager = thread_manager();
         let root = manager
             .start_thread((*turn.config).clone())
@@ -2034,8 +1965,7 @@ async fn spawn_agent_service_tier_inheritance_preserves_supported_or_configured_
                 Arc::new(turn),
                 "spawn_agent",
                 function_payload(json!({"task_name": "test_agent",
-                    "message": "inspect this repo",
-                    "model": "gpt-5.4-mini"
+                    "message": "inspect this repo"
                 })),
             ))
             .await
@@ -2098,12 +2028,11 @@ service_tier = "priority"
                 Arc::new(turn),
                 "spawn_agent",
                 function_payload(json!({"task_name": "test_agent",
-                    "message": "inspect this repo",
-                    "agent_type": role_name
+                    "message": "inspect this repo"
                 })),
             ))
             .await
-            .expect("spawn_agent should preserve the child role service tier");
+            .expect("generic spawn ignores a configured role service tier");
         let (content, _) = expect_text_output(output);
         let result: SpawnAgentResult =
             serde_json::from_str(&content).expect("spawn_agent result should be json");
@@ -2114,10 +2043,7 @@ service_tier = "priority"
             .config_snapshot()
             .await;
 
-        assert_eq!(
-            snapshot.service_tier,
-            Some(ServiceTier::Fast.request_value().to_string())
-        );
+        assert_eq!(snapshot.service_tier, None);
     }
 }
 
@@ -2173,8 +2099,7 @@ service_tier = "turbo"
             Arc::new(turn),
             "spawn_agent",
             function_payload(json!({"task_name": "test_agent",
-                "message": "inspect this repo",
-                "agent_type": role_name
+                "message": "inspect this repo"
             })),
         ))
         .await
@@ -2297,7 +2222,6 @@ service_tier = "priority"
             "spawn_agent",
             function_payload(json!({"task_name": "test_agent",
                 "message": "inspect this repo",
-                "agent_type": role_name,
                 "service_tier": "turbo"
             })),
         ))
@@ -2306,7 +2230,7 @@ service_tier = "priority"
     assert_eq!(
         result.err(),
         Some(FunctionCallError::RespondToModel(
-            "Service tier `turbo` is not supported for model `gpt-5.4`. Supported service tiers: priority"
+            "Service tier `turbo` is not supported for model `gpt-6.1-sol`. Supported service tiers: priority"
                 .to_string()
         ))
     );
@@ -2388,9 +2312,10 @@ async fn multi_agent_v2_full_history_fork_accepts_explicit_service_tier() {
 }
 
 #[tokio::test]
-async fn multi_agent_v2_spawn_partial_fork_turns_allows_agent_type_override() {
+async fn multi_agent_v2_spawn_partial_fork_keeps_uniform_defaults() {
     let (mut session, mut turn) = make_session_and_context().await;
-    let role_name = install_role_with_model_override(&mut turn).await;
+    let _role_name = install_role_with_model_override(&mut turn).await;
+    let expected_provider_id = turn.config.model_provider_id.clone();
     let manager = thread_manager();
     let root = manager
         .start_thread((*turn.config).clone())
@@ -2417,7 +2342,6 @@ async fn multi_agent_v2_spawn_partial_fork_turns_allows_agent_type_override() {
             function_payload(json!({
                 "message": "inspect this repo",
                 "task_name": "partial_fork",
-                "agent_type": role_name,
                 "fork_turns": "1"
             })),
         ))
@@ -2440,9 +2364,9 @@ async fn multi_agent_v2_spawn_partial_fork_turns_allows_agent_type_override() {
         .config_snapshot()
         .await;
 
-    assert_eq!(snapshot.model, "gpt-5-role-override");
-    assert_eq!(snapshot.model_provider_id, "ollama");
-    assert_eq!(snapshot.reasoning_effort, Some(ReasoningEffort::Minimal));
+    assert_eq!(snapshot.model, DEFAULT_SPAWN_AGENT_MODEL);
+    assert_eq!(snapshot.model_provider_id, expected_provider_id);
+    assert_eq!(snapshot.reasoning_effort, Some(DEFAULT_SPAWN_AGENT_REASONING_EFFORT));
 }
 
 
@@ -4081,8 +4005,7 @@ async fn spawn_agent_reapplies_runtime_sandbox_when_role_does_not_override_permi
         Arc::new(turn),
         "spawn_agent",
         function_payload(json!({"task_name": "test_agent",
-            "message": "await this command",
-            "agent_type": "default"
+            "message": "await this command"
         })),
     );
     let output = SpawnAgentHandlerV2::default()
@@ -4121,7 +4044,7 @@ async fn spawn_agent_reapplies_runtime_sandbox_when_role_does_not_override_permi
 }
 
 #[tokio::test]
-async fn spawn_agent_preserves_read_only_role_permissions_over_runtime_profile() {
+async fn spawn_agent_inherits_runtime_permissions_without_a_role_profile() {
     let (mut session, mut turn) = make_session_and_context().await;
     let manager = thread_manager();
     let root = manager.start_thread((*turn.config).clone()).await.expect("start root");
@@ -4129,6 +4052,7 @@ async fn spawn_agent_preserves_read_only_role_permissions_over_runtime_profile()
     session.services.agent_control = manager.agent_control();
     let parent_permission_profile = PermissionProfile::workspace_write();
     turn.permission_profile = parent_permission_profile.clone();
+    let expected_file_system_policy = turn.file_system_sandbox_policy();
     assert_ne!(parent_permission_profile, PermissionProfile::read_only());
 
     let output = SpawnAgentHandlerV2::default()
@@ -4137,12 +4061,11 @@ async fn spawn_agent_preserves_read_only_role_permissions_over_runtime_profile()
             Arc::new(turn),
             "spawn_agent",
             function_payload(json!({"task_name": "test_agent",
-                "message": "inspect this repo without editing it",
-                "agent_type": "explorer"
+                "message": "inspect this repo without editing it"
             })),
         ))
         .await
-        .expect("read-only explorer spawn should succeed");
+        .expect("generic spawn should preserve runtime permissions");
     let (content, _) = expect_text_output(output);
     let result: serde_json::Value =
         serde_json::from_str(&content).expect("spawn_agent result should be json");
@@ -4154,21 +4077,21 @@ async fn spawn_agent_preserves_read_only_role_permissions_over_runtime_profile()
     let child_thread = manager
         .get_thread(agent_id)
         .await
-        .expect("spawned explorer thread should exist");
+        .expect("spawned generic thread should exist");
     let snapshot = child_thread.config_snapshot().await;
-    assert_eq!(snapshot.permission_profile, PermissionProfile::read_only());
+    assert_eq!(snapshot.permission_profile, parent_permission_profile);
     assert!(matches!(
         snapshot.sandbox_policy(),
-        SandboxPolicy::ReadOnly { .. }
+        SandboxPolicy::WorkspaceWrite { .. }
     ));
     let child_turn = child_thread.codex.session.new_default_turn().await;
     assert_eq!(
         child_turn.permission_profile(),
-        PermissionProfile::read_only()
+        parent_permission_profile
     );
     assert_eq!(
         child_turn.file_system_sandbox_policy(),
-        FileSystemSandboxPolicy::read_only()
+        expected_file_system_policy
     );
 }
 
@@ -5507,7 +5430,7 @@ async fn compatibility_reviewer_is_rejected_before_admission_or_child_creation()
     assert!(
         error
             .to_string()
-            .contains("reviewer requires a typed assignment")
+            .contains("specialized roles are no longer supported")
     );
     assert_eq!(manager.list_thread_ids().await, vec![root.thread_id]);
     assert!(

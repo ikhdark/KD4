@@ -56,6 +56,10 @@ pub(crate) trait SpawnLifecycle: std::fmt::Debug + Send + Sync {
     }
 
     fn after_spawn(&mut self) {}
+
+    fn owns_execution_resources(&self) -> bool {
+        false
+    }
 }
 
 pub(crate) type SpawnLifecycleHandle = Box<dyn SpawnLifecycle>;
@@ -69,17 +73,27 @@ impl SpawnLifecycle for NoopSpawnLifecycle {}
 /// Records process creation, so an owner can tell a definite pre-creation
 /// failure from a possible start.
 #[derive(Debug)]
-pub(crate) struct ObservedSpawnLifecycle(Arc<AtomicBool>);
+pub(crate) struct ObservedSpawnLifecycle {
+    spawned: Arc<AtomicBool>,
+    _validation_resource: Option<crate::validation_resources::ValidationResourceLease>,
+}
 
 impl ObservedSpawnLifecycle {
-    pub(crate) fn new(spawned: Arc<AtomicBool>) -> Self {
-        Self(spawned)
+    pub(crate) fn new(
+        spawned: Arc<AtomicBool>,
+        validation_resource: Option<crate::validation_resources::ValidationResourceLease>,
+    ) -> Self {
+        Self { spawned, _validation_resource: validation_resource }
     }
 }
 
 impl SpawnLifecycle for ObservedSpawnLifecycle {
     fn after_spawn(&mut self) {
-        self.0.store(true, Ordering::Release);
+        self.spawned.store(true, Ordering::Release);
+    }
+
+    fn owns_execution_resources(&self) -> bool {
+        self._validation_resource.is_some()
     }
 }
 
@@ -192,7 +206,7 @@ pub(crate) struct UnifiedExecProcess {
     raw_output_target: Option<RawOutputArtifact>,
     artifact_ready: CancellationToken,
     sandbox_type: SandboxType,
-    _spawn_lifecycle: Option<SpawnLifecycleHandle>,
+    _spawn_lifecycle: Arc<StdMutex<Option<SpawnLifecycleHandle>>>,
 }
 
 impl std::fmt::Debug for UnifiedExecProcess {
@@ -310,6 +324,44 @@ impl UnifiedExecProcess {
         let output_drained = CancellationToken::new();
         let (output_tx, output_rx) = broadcast::channel(64);
         let (state_tx, state_rx) = watch::channel(ProcessState::default());
+        let owns_execution_resources = spawn_lifecycle.as_ref()
+            .is_some_and(|lifecycle| lifecycle.owns_execution_resources());
+        let spawn_lifecycle = Arc::new(StdMutex::new(spawn_lifecycle));
+        if owns_execution_resources {
+            let lifecycle = Arc::clone(&spawn_lifecycle);
+            let mut state = state_rx.clone();
+            let closed = Arc::clone(&output_closed);
+            let closed_notify = Arc::clone(&output_closed_notify);
+            // Retained process handles outlive execution for output recovery.
+            // Release only after native exit AND output custody have settled,
+            // without waiting for those retained handles to be dropped.
+            tokio::spawn(async move {
+                loop {
+                    let output_ready = closed_notify.notified();
+                    tokio::pin!(output_ready);
+                    output_ready.as_mut().enable();
+                    let exited = state.borrow().has_exited;
+                    let drained = closed.load(Ordering::Acquire);
+                    if exited && drained {
+                        let released = lifecycle.lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner).take();
+                        drop(released);
+                        break;
+                    }
+                    tokio::select! {
+                        _ = output_ready, if !drained => {},
+                        changed = state.changed(), if !exited => {
+                            if changed.is_err() {
+                                // Lost observation is not a proven child exit.
+                                // Keep resource custody rather than admit an
+                                // overlapping test with an unknown live owner.
+                                std::future::pending::<()>().await;
+                            }
+                        },
+                    }
+                }
+            });
+        }
 
         Self {
             launch_observed_at,
@@ -368,6 +420,7 @@ impl UnifiedExecProcess {
     }
 
     pub(super) async fn wait_for_terminal_completion(&self) -> Result<(), String> {
+        self.release_finished_execution_resources();
         let receiver = self
             .terminal_completion
             .lock()
@@ -380,9 +433,18 @@ impl UnifiedExecProcess {
         let result = receiver.wait_for(Option::is_some).await.map_err(|_| {
             "unified exec exit watcher closed before terminal finalization".to_string()
         })?;
+        self.release_finished_execution_resources();
         result
             .clone()
             .ok_or_else(|| "unified exec terminal completion is missing".to_string())?
+    }
+
+    fn release_finished_execution_resources(&self) {
+        if self.has_exited() && self.output_closed.load(Ordering::Acquire) {
+            let released = self._spawn_lifecycle.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner).take();
+            drop(released);
+        }
     }
 
     pub(super) async fn write(&self, data: &[u8]) -> Result<(), UnifiedExecError> {

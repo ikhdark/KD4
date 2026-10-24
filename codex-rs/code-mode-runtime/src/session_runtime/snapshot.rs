@@ -24,14 +24,14 @@ const MAX_SNAPSHOT_BYTES: usize =
 
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-#[serde(bound(deserialize = "V: Deserialize<'de>, E: Deserialize<'de>"))]
-struct Snapshot<V, E = CellEvent> {
+#[serde(bound(deserialize = "V: Deserialize<'de>, E: Deserialize<'de>, P: Deserialize<'de>"))]
+struct Snapshot<V, E = CellEvent, P = Value> {
     version: u32,
     revision: u64,
     completed_call_id: String,
     values: BTreeMap<String, V>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    presentations: BTreeMap<String, Value>,
+    presentations: BTreeMap<String, P>,
     #[serde(default)]
     completed_cells: BTreeMap<String, E>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -384,7 +384,7 @@ impl DurableState {
                     value
                         .presentation
                         .as_ref()
-                        .map(|metadata| (key.clone(), (**metadata).clone()))
+                        .map(|metadata| (key.clone(), Arc::clone(metadata)))
                 })
                 .collect(),
             values: values

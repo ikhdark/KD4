@@ -70,8 +70,13 @@ impl Client {
         &self,
         thread_ids: &[&str],
     ) -> Result<Vec<ThreadUsage>, RequestError> {
+        if thread_ids.is_empty() || thread_ids.len() > 100 {
+            return Err(RequestError::from(anyhow!(
+                "expected 1–100 distinct thread IDs"
+            )));
+        }
         let requested: std::collections::HashSet<_> = thread_ids.iter().copied().collect();
-        if thread_ids.is_empty() || thread_ids.len() > 100 || requested.len() != thread_ids.len() {
+        if requested.len() != thread_ids.len() {
             return Err(RequestError::from(anyhow!(
                 "expected 1–100 distinct thread IDs"
             )));

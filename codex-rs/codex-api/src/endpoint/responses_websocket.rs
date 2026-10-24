@@ -1015,7 +1015,9 @@ fn map_ws_error(err: WsError, url: &Url) -> ApiError {
         WsError::Io(err)
             if err
                 .get_ref()
-                .is_some_and(|inner| inner.is::<codex_websocket_client::DispatchRejected>()) =>
+                .is_some_and(
+                    <dyn std::error::Error + Send + Sync>::is::<codex_websocket_client::DispatchRejected>,
+                ) =>
         {
             ApiError::Transport(TransportError::Build(err.to_string()))
         }

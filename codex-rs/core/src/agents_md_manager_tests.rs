@@ -700,6 +700,11 @@ async fn sampling_steps_keep_session_instructions_until_scope_changes() {
         .refresh_and_observe_shared(&config, &environments)
         .await;
     assert_eq!(filesystem.target_stream_calls(), 1);
+    assert_eq!(third.freshness, AgentsMdFreshness::Refreshed);
+    assert_eq!(
+        third.freshness.model_visible_description(),
+        "Result provenance: active_instruction_snapshot; freshness: complete_session_snapshot_for_current_scope; project_files_not_rechecked_each_sampling_step.",
+    );
     assert!(Arc::ptr_eq(
         first.loaded.as_ref().unwrap(),
         second.loaded.as_ref().unwrap(),

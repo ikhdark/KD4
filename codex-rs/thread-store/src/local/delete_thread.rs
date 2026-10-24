@@ -8,7 +8,7 @@ use std::path::PathBuf;
 
 use codex_rollout::ARCHIVED_SESSIONS_SUBDIR;
 use codex_rollout::SESSIONS_SUBDIR;
-use codex_rollout::remove_thread_name_entries;
+use codex_rollout::remove_threads_name_entries;
 
 use super::LocalThreadStore;
 use super::helpers::matching_rollout_file_name;
@@ -417,14 +417,15 @@ impl StagedThreadDelete<'_> {
             Ok(incomplete) => self.files.retirement_pending = incomplete,
             Err(error) => tracing::warn!(%error, "auxiliary retirement worker incomplete; recovery queue retained"),
         }
-        for thread_id in &self.thread_ids {
-            if let Err(err) =
-                remove_thread_name_entries(self.store.config.codex_home.as_path(), *thread_id).await
-            {
-                tracing::warn!(
-                    "failed to delete thread name index entries for {thread_id} after committing thread deletion: {err}"
-                );
-            }
+        if let Err(err) = remove_threads_name_entries(
+            self.store.config.codex_home.as_path(),
+            &self.thread_ids,
+        )
+        .await
+        {
+            tracing::warn!(
+                "failed to delete thread name index entries after committing thread deletion: {err}"
+            );
         }
 
         {
@@ -608,7 +609,9 @@ pub(super) async fn stage_thread_deletes<'a>(
             message: "rollout maintenance is busy; deletion recovery deferred".to_string(),
         });
     }
-    let mut ordered_ids = thread_ids.to_vec();
+    let mut seen = std::collections::HashSet::new();
+    let requested_ids: Vec<_> = thread_ids.iter().copied().filter(|id| seen.insert(*id)).collect();
+    let mut ordered_ids = requested_ids.clone();
     ordered_ids.sort_by_key(ToString::to_string);
     ordered_ids.dedup();
     let mut writer_leases = Vec::new();
@@ -637,8 +640,11 @@ pub(super) async fn stage_thread_deletes<'a>(
     let mut found_thread_ids = Vec::new();
     let mut candidates = Vec::new();
     let mut auxiliary_threads = Vec::new();
-    for thread_id in thread_ids {
-        let paths = rollout_paths(store, *thread_id).await?;
+    let mut inventory = codex_rollout::ThreadRolloutInventory::scan(
+        &store.config.codex_home, &requested_ids,
+    ).await;
+    for thread_id in &requested_ids {
+        let paths = inventory.take_paths(*thread_id).await.map_err(delete_recovery_error)?;
         if !paths.is_empty() {
             found_thread_ids.push(*thread_id);
         }
@@ -803,7 +809,7 @@ pub(super) async fn stage_thread_deletes<'a>(
         })??;
     Ok(StagedThreadDelete {
         store,
-        thread_ids: thread_ids.to_vec(),
+        thread_ids: requested_ids,
         found_thread_ids,
         files,
     })

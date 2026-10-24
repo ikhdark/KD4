@@ -1737,7 +1737,10 @@ async fn remote_control_http_mode_enrolls_before_connecting() {
             "name": expected_server_name,
             "os": std::env::consts::OS,
             "arch": std::env::consts::ARCH,
-            "app_server_version": env!("CARGO_PKG_VERSION"),
+            "app_server_version": match codex_utils_build_info::CODEX_VERSION {
+                "0.0.0" => "0.146.0-alpha.7+kd4.remote-control-v3",
+                version => version,
+            },
             "installation_id": TEST_INSTALLATION_ID,
         })
     );

@@ -70,7 +70,7 @@ async fn list_threads_with_state_db_read_count(
     let SelectedRolloutThreads {
         page,
         storage_path,
-        state_metadata,
+        mut state_metadata,
         mut state_db_reads,
     } = select_rollout_threads(
         state_db.clone(),
@@ -102,6 +102,19 @@ async fn list_threads_with_state_db_read_count(
     } else {
         None
     };
+    if storage_path != ThreadListStoragePath::StateDb
+        && let Some(state_db_ctx) = hydration_db.as_deref()
+    {
+        let ids = page.items.iter().filter_map(|item| {
+            item.thread_id.or_else(|| super::helpers::thread_id_from_rollout_path(&item.path))
+        }).collect::<Vec<_>>();
+        if !ids.is_empty() {
+            state_db_reads += 1;
+            if let Ok(metadata) = state_db_ctx.get_threads_for_listing(&ids).await {
+                state_metadata = metadata.into_iter().map(|metadata| (metadata.id, metadata)).collect();
+            }
+        }
+    }
     let mut items = Vec::with_capacity(page.items.len());
     for item in page.items {
         let Some(mut thread) = stored_thread_from_rollout_item(
@@ -112,18 +125,7 @@ async fn list_threads_with_state_db_read_count(
             continue;
         };
         let relation_parent_thread_id = thread.parent_thread_id;
-        let metadata = if storage_path == ThreadListStoragePath::StateDb {
-            state_metadata.get(&thread.thread_id).cloned()
-        } else if let Some(state_db_ctx) = hydration_db.as_deref() {
-            state_db_reads += 1;
-            state_db_ctx
-                .get_thread(thread.thread_id)
-                .await
-                .ok()
-                .flatten()
-        } else {
-            None
-        };
+        let metadata = state_metadata.remove(&thread.thread_id);
         if let Some(metadata) = metadata {
             let name = distinct_thread_metadata_title(&metadata);
             if let Some(title) = name.as_ref() {

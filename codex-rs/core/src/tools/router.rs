@@ -226,31 +226,47 @@ impl ToolRouter {
         )
     }
 
+    #[cfg(test)]
     pub(crate) fn from_parts_with_warnings_and_identity(
-        mut registry: ToolRegistry,
+        registry: ToolRegistry,
         model_visible_specs: Vec<ToolSpec>,
         planning_warnings: Vec<String>,
         exposure_identity: ToolExposureIdentity,
     ) -> Self {
+        Self::from_parts_with_prepared_search_sources(
+            registry,
+            model_visible_specs,
+            planning_warnings,
+            exposure_identity,
+            None,
+        )
+    }
+
+    pub(crate) fn from_parts_with_prepared_search_sources(
+        mut registry: ToolRegistry,
+        model_visible_specs: Vec<ToolSpec>,
+        planning_warnings: Vec<String>,
+        exposure_identity: ToolExposureIdentity,
+        search_sources: Option<String>,
+    ) -> Self {
         registry.set_model_visible_specs(model_visible_specs);
-        let search_infos = registry
-            .manifest_entries()
-            .into_iter()
-            .filter(|tool| tool.exposure() == codex_tools::ToolExposure::Deferred)
-            .filter_map(RegisteredTool::search_info)
-            .collect::<Vec<_>>();
-        let mut tool_search_sources = if search_infos.is_empty() {
-            String::new()
-        } else {
-            crate::tools::handlers::tool_search_spec::render_tool_search_sources(
-                &search_infos
-                    .iter()
-                    .filter_map(|info| info.source_info.clone())
-                    .collect::<Vec<_>>(),
-                search_infos.iter().any(|info| info.source_info.is_none()),
-                &search_infos,
-            )
-        };
+        let mut tool_search_sources = search_sources.unwrap_or_else(|| {
+            let search_infos = registry
+                .manifest_entries()
+                .into_iter()
+                .filter(|tool| tool.exposure() == codex_tools::ToolExposure::Deferred)
+                .filter_map(RegisteredTool::search_info_ref)
+                .collect::<Vec<_>>();
+            if search_infos.is_empty() {
+                String::new()
+            } else {
+                crate::tools::handlers::tool_search_spec::render_tool_search_sources(
+                    search_infos.iter().filter_map(|info| info.source_info.as_ref()),
+                    search_infos.iter().any(|info| info.source_info.is_none()),
+                    search_infos.iter().copied(),
+                )
+            }
+        });
         // Keep installed-but-rejected capabilities visible through the existing
         // source notice even when no callable survived registration.
         for warning in planning_warnings

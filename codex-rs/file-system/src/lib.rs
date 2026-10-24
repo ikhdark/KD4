@@ -448,6 +448,29 @@ impl FileSystemReadStream {
             inner: Box::pin(stream),
         }
     }
+
+    /// Preserve a collecting read's limit while allowing a metadata consumer
+    /// to discard body chunks. No successful prefix certifies an oversized file.
+    pub fn with_limit(self, max_bytes: u64) -> Self {
+        Self::new(self.scan(Some(0_u64), move |used, chunk| {
+            let Some(current) = used.as_mut() else {
+                return std::future::ready(None);
+            };
+            let result = chunk.and_then(|bytes| {
+                if bytes.len() as u64 > max_bytes.saturating_sub(*current) {
+                    Err(io::Error::new(io::ErrorKind::InvalidData,
+                        format!("file exceeds the {max_bytes}-byte read limit")))
+                } else {
+                    *current += bytes.len() as u64;
+                    Ok(bytes)
+                }
+            });
+            if result.is_err() {
+                *used = None;
+            }
+            std::future::ready(Some(result))
+        }))
+    }
 }
 
 impl Stream for FileSystemReadStream {
@@ -514,6 +537,20 @@ pub trait ExecutorFileSystem: Send + Sync {
         path: &'a PathUri,
         sandbox: Option<&'a FileSystemSandboxContext>,
     ) -> ExecutorFileSystemFuture<'a, FileSystemReadStream>;
+
+    /// Metadata-only consumer stream with the same accepted size/sandbox policy
+    /// as `read_file`. Implementations may stream; the safe default preserves
+    /// custom collecting readers rather than bypassing their admission limits.
+    fn read_file_metadata_stream<'a>(
+        &'a self,
+        path: &'a PathUri,
+        sandbox: Option<&'a FileSystemSandboxContext>,
+    ) -> ExecutorFileSystemFuture<'a, FileSystemReadStream> {
+        Box::pin(async move {
+            let bytes = Bytes::from(self.read_file(path, sandbox).await?);
+            Ok(FileSystemReadStream::new(futures::stream::once(std::future::ready(Ok(bytes)))))
+        })
+    }
 
     /// Performs two bounded reads and returns at most `max_bytes` when they agree.
     ///

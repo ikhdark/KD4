@@ -67,6 +67,17 @@ class MessageRouter:
         return notifications
 
     def _check_route_capacity(self, kind: str, key: str) -> None:
+        if kind == "turn" and (
+            key in self._turn_notifications
+            or key in self._pending_turn_notifications
+            or key in self._abandoned_turns
+            or key in self._terminal_turns
+        ):
+            return
+        if kind == "login" and (
+            key in self._login_notifications or key in self._pending_login_notifications
+        ):
+            return
         turns = (
             self._turn_notifications.keys()
             | self._pending_turn_notifications.keys()
@@ -74,8 +85,6 @@ class MessageRouter:
             | self._terminal_turns
         )
         logins = self._login_notifications.keys() | self._pending_login_notifications.keys()
-        if (kind == "turn" and key in turns) or (kind == "login" and key in logins):
-            return
         if len(turns) + len(logins) + len(self._goal_operations) >= self._max_routes:
             raise CodexError("notification route limit exceeded")
 
@@ -109,15 +118,14 @@ class MessageRouter:
 
     def next_global_notification(self, timeout_s: float | None = None) -> Notification:
         """Block until the next notification that is not scoped to a turn."""
+        return self.global_notification_queue().get(timeout=timeout_s)
 
+    def global_notification_queue(self) -> _NotificationQueue:
         with self._lock:
             failure = self._failure
         if failure is not None:
             raise failure
-        item = self._global_notifications.get(timeout=timeout_s)
-        if isinstance(item, BaseException):
-            raise item
-        return item
+        return self._global_notifications
 
     def register_login(self, login_id: str, *, deadline: float | None = None) -> None:
         """Register a queue for one interactive login attempt."""
@@ -205,7 +213,9 @@ class MessageRouter:
         self, login_id: str, timeout_s: float | None = None
     ) -> Notification:
         """Block until the next notification for a registered login attempt."""
+        return self.login_notification_queue(login_id).get(timeout=timeout_s)
 
+    def login_notification_queue(self, login_id: str) -> _NotificationQueue:
         with self._lock:
             login_queue = self._login_notifications.get(login_id)
             if login_queue is None:
@@ -218,10 +228,7 @@ class MessageRouter:
                 raise self._failure
         if login_queue is None:
             raise RuntimeError(f"login {login_id!r} is not registered for waiting")
-        item = login_queue.get(timeout=timeout_s)
-        if isinstance(item, BaseException):
-            raise item
-        return item
+        return login_queue
 
     def register_turn(self, turn_id: str, *, deadline: float | None = None) -> None:
         """Register a queue for a turn stream and replay early events."""
@@ -260,17 +267,16 @@ class MessageRouter:
 
     def next_turn_notification(self, turn_id: str, timeout_s: float | None = None) -> Notification:
         """Block until the next notification for a registered turn."""
+        return self.turn_notification_queue(turn_id).get(timeout=timeout_s)
 
+    def turn_notification_queue(self, turn_id: str) -> _NotificationQueue:
         with self._lock:
             if self._failure is not None and turn_id not in self._terminal_turns:
                 raise self._failure
             turn_queue = self._turn_notifications.get(turn_id)
         if turn_queue is None:
             raise RuntimeError(f"turn {turn_id!r} is not registered for streaming")
-        item = turn_queue.get(timeout=timeout_s)
-        if isinstance(item, BaseException):
-            raise item
-        return item
+        return turn_queue
 
     def register_goal(
         self, thread_id: str, *, deadline: float | None = None
@@ -404,7 +410,6 @@ class MessageRouter:
                 if notification.method == "turn/completed":
                     self._abandoned_turns.remove(turn_id)
                 return
-            self._check_route_capacity("turn", turn_id)
             turn_queue = self._turn_notifications.get(turn_id)
             if turn_queue is None:
                 if turn_id not in self._pending_turn_notifications:

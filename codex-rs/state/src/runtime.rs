@@ -61,6 +61,8 @@ use uuid::Uuid;
 
 mod agent_jobs;
 mod backfill;
+mod external_agent_config_imports;
+pub use external_agent_config_imports::{ExternalAgentConfigImportFailureRecord, ExternalAgentConfigImportHistoryRecord, ExternalAgentConfigImportSuccessRecord};
 
 #[cfg(test)]
 #[path = "runtime_compat_tests.rs"]
@@ -147,7 +149,9 @@ pub struct StateRuntime {
     pool: Arc<sqlx::SqlitePool>,
     logs_pool: Arc<sqlx::SqlitePool>,
     agent_job_runner_instance_id: String,
+    // Capability for owning jobs; the actual lease is enrolled on first use.
     agent_job_runner_registered: bool,
+    agent_job_runner_enrollment: Arc<tokio::sync::Mutex<bool>>,
     agent_job_runner_heartbeat_shutdown: tokio::sync::watch::Sender<bool>,
     agent_job_updates: tokio::sync::watch::Sender<u64>,
     db_telemetry: Option<DbTelemetryHandle>,
@@ -330,35 +334,14 @@ SELECT
         let thread_updated_at_millis = thread_updated_at_millis.unwrap_or(0);
         let thread_recency_at_millis = thread_recency_at_millis.unwrap_or(0);
         let agent_job_runner_instance_id = Uuid::new_v4().to_string();
-        if register_job_runner && let Err(err) = agent_jobs::register_agent_job_runner_instance(
-            pool.as_ref(),
-            agent_job_runner_instance_id.as_str(),
-        )
-        .await
-        {
-            close_sqlite_pools(&[pool.as_ref(), logs_pool.as_ref()]).await;
-            return Err(recovery::RuntimeDbInitError::new(
-                STATE_DB.label,
-                "register agent job runner",
-                &state_path,
-                err,
-            )
-            .into());
-        }
-        let (agent_job_runner_heartbeat_shutdown, heartbeat_shutdown_rx) =
+        let (agent_job_runner_heartbeat_shutdown, _) =
             tokio::sync::watch::channel(false);
-        if register_job_runner {
-            agent_jobs::spawn_agent_job_runner_heartbeat(
-                Arc::clone(&pool),
-                agent_job_runner_instance_id.clone(),
-                heartbeat_shutdown_rx,
-            );
-        }
         let runtime = Arc::new(Self {
             pool,
             logs_pool,
             agent_job_runner_instance_id,
             agent_job_runner_registered: register_job_runner,
+            agent_job_runner_enrollment: Arc::new(tokio::sync::Mutex::new(false)),
             agent_job_runner_heartbeat_shutdown,
             agent_job_updates: tokio::sync::watch::channel(0).0,
             db_telemetry: telemetry_override,
@@ -383,8 +366,11 @@ SELECT
 
     /// Close all SQLite pools and wait for outstanding pool workers to exit.
     pub async fn close(&self) {
+        // Registration and close share custody: a cancelled observer cannot
+        // enroll a heartbeat after shutdown or leave enrollment half-settled.
+        let mut enrolled = self.agent_job_runner_enrollment.lock().await;
         self.agent_job_runner_heartbeat_shutdown.send_replace(true);
-        if self.agent_job_runner_registered && let Err(error) = agent_jobs::unregister_agent_job_runner_instance(
+        if *enrolled && let Err(error) = agent_jobs::unregister_agent_job_runner_instance(
             self.pool.as_ref(),
             self.agent_job_runner_instance_id.as_str(),
         )
@@ -392,6 +378,8 @@ SELECT
         {
             warn!(%error, "failed to unregister agent job runner instance");
         }
+        *enrolled = false;
+        drop(enrolled);
         self.logs_pool.close().await;
         self.pool.close().await;
     }

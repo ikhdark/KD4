@@ -80,8 +80,17 @@ where
         .map(|value| ToolOutputProjectionMetadata::from_json(&value, success, None))
 }
 
+const AGENT_CAPACITY_RECOVERY: &str =
+    "Capacity refusal is not evidence that the target's task or result is missing. \
+     Do not immediately retry or spawn a duplicate. Continue independent work; wait for a real \
+     completion or capacity change before one targeted retry. Use queue-only send_message only \
+     for information when no new turn is needed; it does not start work.";
+
 pub(crate) fn collab_spawn_error(err: CodexErr) -> FunctionCallError {
     match err {
+        err @ CodexErr::AgentLimitReached { .. } => FunctionCallError::RespondToModel(format!(
+            "collab spawn failed: {err}. {AGENT_CAPACITY_RECOVERY}"
+        )),
         CodexErr::UnsupportedOperation(message) if message == "thread manager dropped" => {
             FunctionCallError::RespondToModel("collab manager unavailable".to_string())
         }
@@ -92,6 +101,9 @@ pub(crate) fn collab_spawn_error(err: CodexErr) -> FunctionCallError {
 
 pub(crate) fn collab_agent_error(agent_id: ThreadId, err: CodexErr) -> FunctionCallError {
     match err {
+        err @ CodexErr::AgentLimitReached { .. } => FunctionCallError::RespondToModel(format!(
+            "collab tool failed: {err}. {AGENT_CAPACITY_RECOVERY}"
+        )),
         CodexErr::ThreadNotFound(id) => {
             FunctionCallError::RespondToModel(format!("agent with id {id} not found"))
         }
@@ -534,7 +546,7 @@ fn validate_spawn_agent_reasoning_effort(
 mod compatible_defaults_tests {
     use super::*;
     #[test]
-    fn defaults_prefer_sol_6_1_and_extra_high_over_astra_high() {
+    fn defaults_prefer_sol_6_1_and_xhigh_reasoning() {
         let preset = |model: &str| -> codex_protocol::openai_models::ModelPreset {
             serde_json::from_value(serde_json::json!({
                 "id": model, "model": model, "display_name": model, "description": model,

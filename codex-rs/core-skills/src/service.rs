@@ -158,23 +158,35 @@ impl SkillsService {
         fs: Option<Arc<dyn ExecutorFileSystem>>,
     ) -> HostSkillsSnapshot {
         let generation = self.cache_generation.load(Ordering::SeqCst);
-        let input_cache_key = SkillsInputCacheKey::new(input, fs.as_ref(), generation);
-        if let Some(snapshot) = self.cached_input_snapshot(&input_cache_key) {
+        let input_cache_key = (!self.cache_reuse_disabled.load(Ordering::Acquire))
+            .then(|| SkillsInputCacheKey::new(input, fs.as_ref(), generation));
+        if let Some(snapshot) = input_cache_key
+            .as_ref()
+            .and_then(|key| self.cached_input_snapshot(key))
+        {
             return snapshot;
         }
         let _flight = if self.cache_reuse_disabled.load(Ordering::Acquire) {
             None
         } else {
-            match snapshot_load_flight(&self.input_loads, &input_cache_key) {
+            match input_cache_key
+                .as_ref()
+                .and_then(|key| snapshot_load_flight(&self.input_loads, key))
+            {
                 Some(flight) => Some(flight.lock_owned().await),
                 None => None,
             }
         };
-        if let Some(snapshot) = self.cached_input_snapshot(&input_cache_key) {
+        if let Some(snapshot) = input_cache_key
+            .as_ref()
+            .and_then(|key| self.cached_input_snapshot(key))
+        {
             return snapshot;
         }
         let roots = self.skill_roots_for_config(input, fs).await;
-        let root_dependencies = roots.iter().map(|root| root.path.clone()).collect();
+        let root_dependencies = input_cache_key
+            .as_ref()
+            .map(|_| roots.iter().map(|root| root.path.clone()).collect());
         let skill_config_rules = skill_config_rules_from_stack(&input.config_layer_stack);
         let snapshot = self
             .snapshot_for_roots(
@@ -190,7 +202,9 @@ impl SkillsService {
                 },
             )
             .await;
-        self.cache_input_snapshot(input_cache_key, snapshot.clone(), root_dependencies);
+        if let Some((input_cache_key, root_dependencies)) = input_cache_key.zip(root_dependencies) {
+            self.cache_input_snapshot(input_cache_key, snapshot.clone(), root_dependencies);
+        }
         snapshot
     }
 
@@ -284,28 +298,38 @@ impl SkillsService {
             cwd_cache_key,
             plugin_skill_preload,
         } = cache_options;
-        let cache_key = skills_cache_key(
-            &roots,
-            &skill_config_rules,
-            input.plugin_skill_snapshots.as_ref(),
-            cwd_cache_key,
-            generation,
-        );
-        if cache_result
-            && !force_reload
-            && let Some(snapshot) = self.cached_snapshot(&cache_key)
+        let cache_key = (cache_result && !self.cache_reuse_disabled.load(Ordering::Acquire))
+            .then(|| {
+                skills_cache_key(
+                    &roots,
+                    &skill_config_rules,
+                    input.plugin_skill_snapshots.as_ref(),
+                    cwd_cache_key,
+                    generation,
+                )
+            });
+        if !force_reload
+            && let Some(snapshot) = cache_key.as_ref().and_then(|key| self.cached_snapshot(key))
         {
             return snapshot;
         }
-        let _flight = if !cache_result || force_reload || self.cache_reuse_disabled.load(Ordering::Acquire) {
+        let _flight = if !cache_result
+            || force_reload
+            || self.cache_reuse_disabled.load(Ordering::Acquire)
+        {
             None
         } else {
-            match snapshot_load_flight(&self.snapshot_loads, &cache_key) {
+            match cache_key
+                .as_ref()
+                .and_then(|key| snapshot_load_flight(&self.snapshot_loads, key))
+            {
                 Some(flight) => Some(flight.lock_owned().await),
                 None => None,
             }
         };
-        if cache_result && !force_reload && let Some(snapshot) = self.cached_snapshot(&cache_key) {
+        if !force_reload
+            && let Some(snapshot) = cache_key.as_ref().and_then(|key| self.cached_snapshot(key))
+        {
             return snapshot;
         }
 
@@ -313,11 +337,17 @@ impl SkillsService {
             self.build_skill_outcome(input, roots, &skill_config_rules, plugin_skill_preload)
                 .await,
         ));
-        if cache_result {
+        if let Some(cache_key) = cache_key
+            && !self.cache_reuse_disabled.load(Ordering::Acquire)
+        {
             let mut cache = self
                 .snapshot_cache
                 .write()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
+            // Disabling reuse also fences loads that were already in flight.
+            if self.cache_reuse_disabled.load(Ordering::Acquire) {
+                return snapshot;
+            }
             if !cache.contains_key(&cache_key)
                 && cache.len() >= MAX_CACHED_SKILL_SNAPSHOTS
                 && let Some(evicted_key) = cache.keys().next().cloned()
@@ -460,10 +490,16 @@ impl SkillsService {
         snapshot: HostSkillsSnapshot,
         roots: Vec<AbsolutePathBuf>,
     ) {
+        if self.cache_reuse_disabled.load(Ordering::Acquire) {
+            return;
+        }
         let mut cache = self
             .input_snapshot_cache
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if self.cache_reuse_disabled.load(Ordering::Acquire) {
+            return;
+        }
         if !cache.contains_key(&cache_key)
             && cache.len() >= MAX_CACHED_SKILL_SNAPSHOTS
             && let Some(evicted_key) = cache.keys().next().cloned()

@@ -118,6 +118,14 @@ impl RpcNotificationSender {
         params: &P,
     ) -> Result<(), JSONRPCErrorError> {
         let params = serde_json::to_value(params).map_err(|err| internal_error(err.to_string()))?;
+        self.notify_value(method, params).await
+    }
+
+    pub(crate) async fn notify_value(
+        &self,
+        method: &str,
+        params: Value,
+    ) -> Result<(), JSONRPCErrorError> {
         self.outgoing_tx
             .send(RpcServerOutboundMessage::Notification(
                 JSONRPCNotification {
@@ -676,7 +684,7 @@ pub(crate) fn internal_error(message: String) -> JSONRPCErrorError {
     }
 }
 
-fn decode_request_params<P>(params: Option<Value>) -> Result<P, JSONRPCErrorError>
+pub(crate) fn decode_request_params<P>(params: Option<Value>) -> Result<P, JSONRPCErrorError>
 where
     P: DeserializeOwned,
 {

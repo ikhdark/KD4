@@ -280,7 +280,15 @@ impl OrderedResponseItemRecorder {
         let mut state = self.state.lock().await;
         let preceding_required = state.required_tail.clone();
         let preceding_auxiliary = state.auxiliary_tail.clone();
-        let primary = item.clone();
+        let defers_mailbox_delivery = finalized_facts.as_ref().map_or_else(
+            || {
+                completed_item_defers_mailbox_delivery_to_next_turn(
+                    &item,
+                    turn_context.collaboration_mode.mode == ModeKind::Plan,
+                )
+            },
+            |facts| facts.defers_mailbox_delivery_to_next_turn,
+        );
         let required_sess = Arc::clone(&sess);
         let required_turn_context = Arc::clone(&turn_context);
         let required_barrier = async move {
@@ -303,15 +311,6 @@ impl OrderedResponseItemRecorder {
                 preceding.await?;
             }
             required_for_auxiliary.await?;
-            let defers_mailbox_delivery = finalized_facts.as_ref().map_or_else(
-                || {
-                    completed_item_defers_mailbox_delivery_to_next_turn(
-                        &primary,
-                        turn_context.collaboration_mode.mode == ModeKind::Plan,
-                    )
-                },
-                |facts| facts.defers_mailbox_delivery_to_next_turn,
-            );
             if defers_mailbox_delivery {
                 sess.input_queue
                     .defer_mailbox_delivery_to_next_turn(&sess.active_turn, &turn_context.sub_id)
@@ -583,17 +582,35 @@ pub(crate) async fn handle_output_item_done(
             let tool_runtime = ctx.tool_runtime.clone();
             let accepted_call = call.clone();
             let future_timing = Arc::clone(&timing);
+            let session = Arc::clone(&ctx.sess);
+            let authoring_epoch = session.input_queue.incorporated_user_intent_epoch();
+            // Cooperative waits and Code Mode already yield on steering.
+            // Other direct tools must enter their supervised cancellation path
+            // rather than holding the model behind a long-running operation.
+            let yields_on_steering = tool_runtime.tool_yields_on_steering(&call.tool_name);
             // Recording runs in provider order on the recorder's owned task.
             // Join it before relaying outputs, without delaying tool execution.
             let completion = async move {
-                tool_runtime
-                    .handle_model_tool_call_with_admission(
-                        call,
-                        cancellation_token,
-                        future_timing,
-                        Some((admission, read_only)),
-                    )
-                    .await
+                let execution = tool_runtime.handle_model_tool_call_with_admission(
+                    call,
+                    cancellation_token.clone(),
+                    future_timing,
+                    Some((admission, read_only)),
+                );
+                tokio::pin!(execution);
+                if yields_on_steering {
+                    return execution.await;
+                }
+                tokio::select! {
+                    biased;
+                    _ = session.input_queue.wait_for_user_intent_change(authoring_epoch) => {
+                        cancellation_token.cancel();
+                        // Preserve completed results and required effect/commit
+                        // cleanup receipts before relaying the tool output.
+                        execution.await
+                    }
+                    result = &mut execution => result,
+                }
             };
             let tool_future: InFlightFuture<'static> = Box::pin(completion);
 

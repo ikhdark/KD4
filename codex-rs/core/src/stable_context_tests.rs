@@ -308,12 +308,48 @@ fn audit_instruction_authority_provider_id_injective_and_builtin_removal() {
         ),
         text_message("user", "<environment_context>old cwd</environment_context>"),
     ];
-    let removed = disabled_builtin_retractions(&old, false, false, false);
+    let removed = disabled_builtin_retractions(&old, false, false, false, true);
     assert_eq!(removed.len(), 2);
     let mut history = old;
     history.extend(removed);
     assert!(project_compaction_context(history.clone().into()).is_empty());
-    assert!(disabled_builtin_retractions(&history, false, false, false).is_empty());
+    assert!(disabled_builtin_retractions(&history, false, false, false, true).is_empty());
+}
+
+#[test]
+fn contributor_authority_retraction_requires_an_active_trusted_developer_source() {
+    let old = text_message("developer", &turn_contribution_text(4, "Policy."));
+    let user = text_message("user", &turn_contribution_text(4, "Discovery data."));
+    let removal = turn_contribution_removal(4);
+    assert_eq!(
+        turn_contribution_authority_retractions(&[old.clone()], &[user.clone()]),
+        vec![removal.clone()]
+    );
+    assert!(turn_contribution_authority_retractions(
+        &[old.clone()], &[untrusted_user_message(&turn_contribution_text(4, "Quotation."))],
+    ).is_empty());
+    assert!(turn_contribution_authority_retractions(
+        &[text_message("developer", &removal)], &[user.clone()],
+    ).is_empty());
+    assert!(turn_contribution_authority_retractions(&[old, user.clone()], &[user]).is_empty());
+}
+
+#[test]
+fn disabled_personality_retracts_retained_style_once_at_developer_authority() {
+    let old_style = PersonalitySpecInstructions::new("Use an obsolete style.").render();
+    let old = vec![text_message("developer", &old_style)];
+    assert!(disabled_builtin_retractions(&old, true, true, true, true).is_empty());
+    assert!(disabled_builtin_retractions(&[], true, true, true, false).is_empty());
+
+    let reset = PersonalitySpecInstructions::reset().render();
+    let retractions = disabled_builtin_retractions(&old, true, true, true, false);
+    assert_eq!(visible_text(&retractions), vec![reset.as_str()]);
+    assert!(matches!(&retractions[0], ResponseItem::Message { role, .. } if role == "developer"));
+    let mut history = old;
+    history.extend(retractions);
+    assert!(disabled_builtin_retractions(&history, true, true, true, false).is_empty());
+    let compacted = project_compaction_context(history.into());
+    assert_eq!(visible_text(&compacted), vec![reset.as_str()]);
 }
 
 #[test]

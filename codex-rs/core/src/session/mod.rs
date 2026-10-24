@@ -20,7 +20,6 @@ use crate::agent::status::is_final;
 use crate::agent_communication::AgentCommunicationContext;
 use crate::agent_communication::AgentCommunicationKind;
 use crate::attestation::AttestationProvider;
-use crate::build_available_skills;
 use crate::compact;
 use crate::config::ManagedFeatures;
 use crate::config::resolve_tool_suggest_config_from_layer_stack;
@@ -1958,6 +1957,22 @@ impl Session {
             &turn.base_instructions,
             &turn.model_info.input_modalities,
         )
+    }
+
+    pub(crate) async fn projected_prompt_state(
+        &self,
+        turn: &TurnContext,
+        pending_user_boundary: bool,
+        body_after_prefix: bool,
+    ) -> (i64, Option<i64>, Option<AutoCompactWindowSnapshot>) {
+        let (history, window) = {
+            let state = self.state.lock().await;
+            (state.history.clone(), body_after_prefix.then(|| state.auto_compact_window_snapshot()))
+        };
+        let (active, committed) = history.projected_token_estimates(
+            &turn.base_instructions, &turn.model_info.input_modalities, pending_user_boundary,
+        );
+        (active, committed, window)
     }
 
     pub(crate) async fn auto_compact_window_snapshot(&self) -> AutoCompactWindowSnapshot {
@@ -5639,7 +5654,15 @@ impl Session {
             }
         }
         let mut skill_catalog_present = false;
-        let mut skill_usage_present = false;
+        // An empty host catalog does not mean executor or orchestrator skills
+        // are unavailable. Shared usage guidance follows the model/config gates.
+        let skill_usage_present = turn_context.config.include_skill_instructions
+            && turn_context.model_info.include_skills_usage_instructions;
+        if skill_usage_present {
+            let skills_usage = SkillsUsageInstructions.render();
+            developer_sections.push(skills_usage.clone());
+            stable_developer_sections.push(skills_usage);
+        }
         let mut skill_source_unavailable = turn_context.config.include_skill_instructions
             && !turn_context
                 .turn_skills
@@ -5648,8 +5671,7 @@ impl Session {
                 .errors
                 .is_empty();
         if turn_context.config.include_skill_instructions {
-            let available_skills = build_available_skills(
-                turn_context.turn_skills.snapshot.outcome(),
+            let available_skills = turn_context.turn_skills.snapshot.available_skills(
                 default_skill_metadata_budget(turn_context.model_info.context_window),
                 if estimate {
                     SkillRenderSideEffects::None
@@ -5672,12 +5694,6 @@ impl Session {
             }
             if let Some(available_skills) = available_skills {
                 skill_catalog_present = true;
-                if turn_context.model_info.include_skills_usage_instructions {
-                    skill_usage_present = true;
-                    let skills_usage = SkillsUsageInstructions.render();
-                    developer_sections.push(skills_usage.clone());
-                    stable_developer_sections.push(skills_usage);
-                }
                 let warning_message = available_skills.warning_message.clone();
                 let skills_instructions =
                     AvailableSkillsInstructions::from_available_skills(&available_skills);
@@ -5704,8 +5720,7 @@ impl Session {
             ),
             (
                 skill_usage_present,
-                skill_source_unavailable
-                    && turn_context.model_info.include_skills_usage_instructions,
+                false,
                 crate::stable_context::SKILL_USAGE_REMOVED,
             ),
         ] {
@@ -5724,6 +5739,7 @@ impl Session {
             turn_context.config.include_permissions_instructions,
             turn_context.config.include_collaboration_mode_instructions,
             turn_context.config.include_environment_context,
+            self.features.enabled(Feature::Personality),
         );
         let fallback_context = if represented_digests.is_none() {
             let state = self.state.lock().await;
@@ -5993,13 +6009,23 @@ impl Session {
         // Only exact same-scope retained bodies count as delivered; a digest alone
         // must never assert that an absent instruction survived replacement.
         fragment_digests.sort_by(|a, b| a.key.cmp(&b.key));
-        let turn_context_items = Self::build_context_contribution_items_from_rendered_fragments(
+        let mut turn_context_items = Self::build_context_contribution_items_from_rendered_fragments(
             rendered_turn_context_fragments
                 .into_iter()
                 .map(|(_, slot, text)| (slot, text))
                 .chain(unavailable_items)
                 .collect(),
         );
+        if let Some(retractions) = crate::context_manager::updates::build_developer_update_item(
+            crate::stable_context::turn_contribution_authority_retractions(
+                retained_history.raw_items(),
+                &turn_context_items,
+            ),
+        ) {
+            // Keep the replacement last for latest-value projection while the
+            // old developer authority explicitly releases its prior policy.
+            turn_context_items.insert(0, retractions);
+        }
         let full_context_required = !disabled_builtin_items.is_empty()
             || represented_context.is_none()
             || represented_digests.is_some_and(|represented| {
@@ -6231,6 +6257,20 @@ impl Session {
 
     pub(crate) async fn clone_history(&self) -> ContextManager {
         self.state.lock().await.clone_history()
+    }
+
+    /// Scope retirement alone needs input provenance. Hold the existing history
+    /// gate through the plan commit so steering/rollback cannot replace the
+    /// authorization boundary between checking it and publishing the revision.
+    pub(crate) async fn plan_scope_inputs(
+        &self,
+    ) -> std::io::Result<(tokio::sync::SemaphorePermit<'_>, crate::plan_store::PlanScopeInputs)> {
+        let guard = self.durable_history_commit_gate.acquire().await
+            .map_err(|_| std::io::Error::other("history commit gate is closed"))?;
+        let inputs = crate::plan_store::PlanScopeInputs::from_history(
+            self.state.lock().await.history.raw_items(),
+        );
+        Ok((guard, inputs))
     }
 
     pub(crate) async fn reserved_tool_call_ids(&self) -> std::collections::HashSet<String> {
@@ -6548,17 +6588,18 @@ impl Session {
         state: &crate::tool_history::ToolHistoryState,
         items: &[ResponseItem],
     ) -> CodexResult<Option<String>> {
-        let Some(payload) = state.artifact_pin_payload_for_items(items) else {
+        let Some(prepared) = state.prepare_artifact_pin_payload_for_items(items) else {
             return Ok(None);
         };
-        let mut payload: serde_json::Value =
-            serde_json::from_str(&payload).map_err(|error| CodexErr::Fatal(error.to_string()))?;
+        let mut payload = prepared.payload;
+        let mut rendered_candidates = prepared.rendered_candidates;
         if payload["omitted_artifact_count"].as_u64().unwrap_or(0) != 0
             || payload["omitted_detail_count"].as_u64().unwrap_or(0) != 0
         {
             let mut retained = state.clone();
             retained.retain_for_history(items);
-            let pins = retained.artifact_recovery_directory();
+            let pins = retained.artifact_recovery_directory_reusing(&mut rendered_candidates);
+            drop(rendered_candidates);
             let members = pins
                 .as_array()
                 .into_iter()

@@ -228,11 +228,10 @@ impl ToolOrchestrator {
                         network_policy_decision,
                     })));
                 }
-                let retry_reason = build_denial_reason_from_output(output.as_ref());
-
                 let bypass_retry_approval = tool
                     .should_bypass_approval(approval_policy, already_approved);
                 if !bypass_retry_approval {
+                    let retry_reason = build_denial_reason_from_output(output.as_ref());
                     let approval_ctx = ApprovalCtx {
                         session: &tool_ctx.session,
                         turn: &tool_ctx.turn,

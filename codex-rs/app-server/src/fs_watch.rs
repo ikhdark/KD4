@@ -38,7 +38,7 @@ const FS_WATCH_SHUTDOWN_GRACE: Duration = Duration::from_secs(1);
 #[derive(Clone)]
 pub(crate) struct FsWatchManager {
     outgoing: Arc<OutgoingMessageSender>,
-    file_watcher: Option<Arc<FileWatcher>>,
+    file_watcher: Arc<std::sync::OnceLock<Option<Arc<FileWatcher>>>>,
     state: Arc<AsyncMutex<FsWatchState>>,
     setup_slots: Arc<tokio::sync::Semaphore>,
     #[cfg(test)]
@@ -133,16 +133,9 @@ struct WatchKey {
 
 impl FsWatchManager {
     pub(crate) fn new(outgoing: Arc<OutgoingMessageSender>) -> Self {
-        let file_watcher = match FileWatcher::new() {
-            Ok(file_watcher) => Some(Arc::new(file_watcher)),
-            Err(err) => {
-                warn!("filesystem watch manager unavailable: {err}");
-                None
-            }
-        };
         Self {
             outgoing,
-            file_watcher,
+            file_watcher: Arc::new(std::sync::OnceLock::new()),
             state: Arc::new(AsyncMutex::new(FsWatchState::default())),
             setup_slots: Arc::new(tokio::sync::Semaphore::new(4)),
             #[cfg(test)]
@@ -159,7 +152,7 @@ impl FsWatchManager {
     ) -> Self {
         Self {
             outgoing,
-            file_watcher: Some(file_watcher),
+            file_watcher: Arc::new(std::sync::OnceLock::from(Some(file_watcher))),
             state: Arc::new(AsyncMutex::new(FsWatchState::default())),
             setup_slots: Arc::new(tokio::sync::Semaphore::new(4)),
             watch_setup_count: Arc::new(AtomicUsize::new(0)),
@@ -231,8 +224,18 @@ impl FsWatchManager {
             }
             let file_watcher = setup_manager
                 .file_watcher
+                .get_or_init(|| match FileWatcher::new() {
+                    Ok(watcher) => Some(Arc::new(watcher)),
+                    Err(err) => {
+                        warn!("filesystem watch manager unavailable: {err}");
+                        None
+                    }
+                })
                 .as_ref()
                 .ok_or_else(|| internal_error("filesystem watching is unavailable"))?;
+            if cancellation.is_cancelled() {
+                return Err(invalid_request("watch registration was canceled"));
+            }
             let outgoing = setup_manager.outgoing.clone();
             let (subscriber, rx) = file_watcher.add_subscriber();
             let watch_root = setup_path.clone();
@@ -554,7 +557,7 @@ mod tests {
                 tx,
                 codex_analytics::AnalyticsEventsClient::disabled(),
             )),
-            file_watcher: None,
+            file_watcher: Arc::new(std::sync::OnceLock::from(None)),
             state: Arc::new(AsyncMutex::new(FsWatchState::default())),
             setup_slots: Arc::new(tokio::sync::Semaphore::new(4)),
             watch_setup_count: Arc::new(AtomicUsize::new(0)),

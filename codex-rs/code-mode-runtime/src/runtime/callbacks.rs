@@ -149,7 +149,7 @@ pub(super) fn format_tool_result_callback(
         throw_type_error(scope, "failed to format result");
         return;
     };
-    if let Some(projected) = codex_code_mode_protocol::model_visible_tool_result(&tool, &raw)
+    if let Some(projected) = codex_code_mode_protocol::printed_tool_result(&tool, &raw)
         && let Err(error) =
             super::output_projection::register(scope, value, &raw, &projected, false)
     {
@@ -597,15 +597,30 @@ pub(super) fn list_keys_callback(
     };
     // Enumeration observes absence too; reject phantom writes on commit.
     state.stored_value_reads = None;
-    let mut keys = state
+    // Retain only the page and its lookahead, borrowing keys until selection
+    // finishes. Small-page enumeration must not clone/sort the whole suffix.
+    let page_len = limit as usize;
+    let mut selected = std::collections::BinaryHeap::with_capacity(page_len + 1);
+    for key in state
         .stored_values
         .keys()
         .filter(|key| after.is_none_or(|after| key.as_str() > after))
+    {
+        if selected.len() <= page_len {
+            selected.push(key);
+        } else if let Some(mut largest) = selected.peek_mut()
+            && key < *largest
+        {
+            *largest = key;
+        }
+    }
+    let more = selected.len() > page_len;
+    let keys = selected
+        .into_sorted_vec()
+        .into_iter()
+        .take(page_len)
         .cloned()
         .collect::<Vec<_>>();
-    keys.sort();
-    let more = keys.len() > limit as usize;
-    keys.truncate(limit as usize);
     // Use admission's cached byte counts, including display recipes. Recovery
     // must not deserialize every retained result just to discover its cost.
     // Align sizes with keys instead of duplicating potentially large key text.
@@ -818,6 +833,14 @@ fn tool_timeout_ms(
         ));
     }
     Ok(timeout_ms as u64)
+}
+
+pub(super) fn is_proxy_callback(
+    _scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments,
+    mut retval: v8::ReturnValue<v8::Value>,
+) {
+    retval.set_bool(args.get(0).is_proxy());
 }
 
 pub(super) fn monotonic_now_callback(

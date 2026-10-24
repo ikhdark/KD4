@@ -473,6 +473,16 @@ type RolloutSourceVersion = (PathBuf, u64, Option<SystemTime>);
 pub(crate) struct BackfillMemo {
     entries: HashMap<PathBuf, BackfillMemoEntry>,
     last_pass: Option<PassRemainder>,
+    discovery: Option<BackfillDiscovery>,
+}
+
+struct BackfillDiscovery {
+    home: PathBuf,
+    pending: Vec<(PathBuf, bool)>,
+    current: Option<(tokio::fs::ReadDir, bool)>,
+    entry: Option<(tokio::fs::DirEntry, bool)>,
+    paths: std::collections::BTreeMap<String, BackfillRolloutPath>,
+    failed: bool,
 }
 
 /// What a pass that claimed the backfill lease left unsettled.
@@ -603,37 +613,21 @@ pub(crate) async fn backfill_sessions_until(
         ..Default::default()
     };
 
-    let sessions_root = codex_home.join(SESSIONS_SUBDIR);
-    let archived_root = codex_home.join(ARCHIVED_SESSIONS_SUBDIR);
-    let mut rollout_paths: Vec<BackfillRolloutPath> = Vec::new();
-    let mut unresolved_failures = false;
-    for (root, archived) in [(sessions_root, false), (archived_root, true)] {
-        match tokio::fs::try_exists(&root).await {
-            Ok(true) => {}
-            Ok(false) => continue,
-            Err(err) => {
-                unresolved_failures = true;
-                warn!("failed to inspect rollout root {}: {err}", root.display());
-                continue;
-            }
-        }
-        match collect_rollout_paths(&root).await {
-            Ok(paths) => {
-                rollout_paths.extend(paths.into_iter().map(|path| BackfillRolloutPath {
-                    watermark: backfill_watermark_for_path(codex_home, &path),
-                    path,
-                    archived,
-                }));
-            }
-            Err(err) => {
-                unresolved_failures = true;
-                warn!(
-                    "failed to collect rollout paths under {}: {err}",
-                    root.display()
-                );
-            }
-        }
+    if memo.discovery.as_ref().is_none_or(|discovery| discovery.home != codex_home) {
+        memo.discovery = Some(BackfillDiscovery::new(codex_home));
     }
+    if !memo.discovery.as_mut().expect("discovery initialized").advance(&mut should_stop).await {
+        // A partial tree cannot certify a contiguous durable watermark. Retain
+        // the in-memory traversal but release the cross-process claim promptly.
+        memo.last_pass = Some(PassRemainder::Unresolved);
+        if let Err(error) = runtime.release_backfill_claim(&claim).await {
+            warn!(%error, "failed to release paused rollout discovery claim");
+        }
+        return BackfillPassReport::default();
+    }
+    let discovery = memo.discovery.take().expect("completed discovery");
+    let mut unresolved_failures = discovery.failed;
+    let mut rollout_paths = discovery.paths.into_values().collect::<Vec<_>>();
     if !unresolved_failures {
         // Rollouts that moved or disappeared are read again under their new paths.
         let discovered = rollout_paths
@@ -643,7 +637,6 @@ pub(crate) async fn backfill_sessions_until(
         memo.entries
             .retain(|path, _| discovered.contains(path.as_path()));
     }
-    rollout_paths.sort_by(|a, b| a.watermark.cmp(&b.watermark));
     if let Some(last_watermark) = backfill_state.last_watermark.as_deref() {
         rollout_paths.retain(|entry| entry.watermark.as_str() > last_watermark);
     }
@@ -970,27 +963,76 @@ fn parse_timestamp_to_utc(ts: &str) -> Option<DateTime<Utc>> {
     None
 }
 
-async fn collect_rollout_paths(root: &Path) -> std::io::Result<Vec<PathBuf>> {
-    let mut stack = vec![root.to_path_buf()];
-    let mut paths = Vec::new();
-    while let Some(dir) = stack.pop() {
-        let mut read_dir = tokio::fs::read_dir(&dir).await?;
-        while let Some(entry) = read_dir.next_entry().await? {
-            let path = entry.path();
-            let file_type = entry.file_type().await?;
-            if file_type.is_dir() {
-                stack.push(path);
-                continue;
-            }
-            if !file_type.is_file() {
-                continue;
-            }
-            if let Some(rollout_file) = compression::RolloutFile::from_path(path) {
-                paths.push(rollout_file.into_path());
-            }
+impl BackfillDiscovery {
+    fn new(home: &Path) -> Self {
+        Self {
+            home: home.to_path_buf(),
+            pending: vec![(home.join(SESSIONS_SUBDIR), false), (home.join(ARCHIVED_SESSIONS_SUBDIR), true)],
+            current: None,
+            entry: None,
+            paths: std::collections::BTreeMap::new(),
+            failed: false,
         }
     }
-    Ok(paths)
+
+    async fn advance(&mut self, should_stop: &mut impl FnMut() -> bool) -> bool {
+        // Retain traversal and in-flight entry ownership at every await so a
+        // cancelled pass cannot silently omit a directory or consumed entry.
+        for _ in 0..4096 {
+            if should_stop() { return false; }
+            if self.entry.is_none() {
+                if self.current.is_none() {
+                    let Some((dir, archived)) = self.pending.last().cloned() else { return true; };
+                    let opened = tokio::fs::read_dir(&dir).await;
+                    self.pending.pop();
+                    match opened {
+                        Ok(reader) => self.current = Some((reader, archived)),
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                        Err(error) => {
+                            self.failed = true;
+                            warn!(path = %dir.display(), %error, "rollout discovery remains incomplete");
+                            continue;
+                        }
+                    }
+                }
+                let (reader, archived) = self.current.as_mut().expect("discovery owns a directory");
+                let archived = *archived;
+                match reader.next_entry().await {
+                    Ok(Some(entry)) => self.entry = Some((entry, archived)),
+                    Ok(None) => { self.current = None; continue; }
+                    Err(error) => {
+                        self.failed = true;
+                        self.current = None;
+                        warn!(%error, "rollout directory enumeration remains incomplete");
+                        continue;
+                    }
+                }
+            }
+            let (entry, archived) = self.entry.as_ref().expect("discovery owns an entry");
+            let archived = *archived;
+            let path = entry.path();
+            let inspected = entry.file_type().await;
+            self.entry.take();
+            let file_type = match inspected {
+                Ok(file_type) => file_type,
+                Err(error) => {
+                    self.failed = true;
+                    warn!(path = %path.display(), %error, "rollout entry inspection remains incomplete");
+                    continue;
+                }
+            };
+            if file_type.is_dir() {
+                self.pending.push((path, archived));
+            } else if file_type.is_file()
+                && let Some(rollout_file) = compression::RolloutFile::from_path(path)
+            {
+                let path = rollout_file.into_path();
+                let watermark = backfill_watermark_for_path(&self.home, &path);
+                self.paths.insert(watermark.clone(), BackfillRolloutPath { watermark, path, archived });
+            }
+        }
+        false
+    }
 }
 
 #[cfg(test)]

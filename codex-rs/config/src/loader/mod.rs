@@ -35,7 +35,7 @@ use crate::strict_config::unknown_feature_toml_value_field;
 use crate::thread_config::ThreadConfigContext;
 use crate::thread_config::ThreadConfigLoader;
 use codex_file_system::ExecutorFileSystem;
-use codex_git_utils::resolve_root_git_project_for_trust;
+use codex_git_utils::resolve_root_git_project_for_trust_from_checkout;
 use codex_protocol::config_types::SandboxMode;
 use codex_protocol::config_types::TrustLevel;
 use codex_protocol::protocol::AskForApproval;
@@ -1212,7 +1212,10 @@ async fn project_trust_context(
         .cloned()
         .unwrap_or_else(|| project_trust_key(project_root.as_path()));
     let checkout_root = find_git_checkout_root(fs, cwd, &mut probes).await?;
-    let repo_root = resolve_root_git_project_for_trust(fs, cwd).await;
+    let repo_root = match checkout_root.as_ref() {
+        Some(root) => resolve_root_git_project_for_trust_from_checkout(fs, root).await,
+        None => None,
+    };
     let repo_root_lookup_keys = repo_root
         .as_ref()
         .map(|root| normalized_project_lookup_keys(root.as_path()));

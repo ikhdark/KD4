@@ -2485,6 +2485,7 @@ async fn retried_records_keep_their_capture_time() -> std::io::Result<()> {
         Some(JsonlWriter {
             path: rollout_path.clone(),
             file: tokio::fs::File::from_std(read_only_file),
+            _payload_sync_owner: crate::payload_artifact::PayloadSyncOwner::new(&rollout_path),
             _append_lock: Arc::new(append_lock),
             _payload_retention: Arc::new(crate::payload_artifact::lock_publication(&rollout_path)?),
             write_fault: None,

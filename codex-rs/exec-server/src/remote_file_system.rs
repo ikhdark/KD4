@@ -442,6 +442,23 @@ impl ExecutorFileSystem for RemoteFileSystem {
         Box::pin(RemoteFileSystem::read_file_stream(self, path, sandbox))
     }
 
+    fn read_file_metadata_stream<'a>(
+        &'a self,
+        path: &'a PathUri,
+        sandbox: Option<&'a FileSystemSandboxContext>,
+    ) -> ExecutorFileSystemFuture<'a, FileSystemReadStream> {
+        Box::pin(async move {
+            if sandbox.is_some_and(FileSystemSandboxContext::should_run_in_sandbox) {
+                let bytes = RemoteFileSystem::read_file(self, path, sandbox).await?;
+                return Ok(FileSystemReadStream::new(futures::stream::once(
+                    std::future::ready(Ok(bytes.into())),
+                )));
+            }
+            Ok(RemoteFileSystem::read_file_stream(self, path, sandbox).await?
+                .with_limit(MAX_FILE_PAYLOAD_BYTES as u64))
+        })
+    }
+
     fn read_file_bounded<'a>(
         &'a self,
         path: &'a PathUri,

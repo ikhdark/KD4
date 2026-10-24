@@ -25,7 +25,7 @@ Never substitute a newer model for an explicit target; mention newer guidance on
 
 Use `openai-platform-api-key` when available before authenticated API calls or live API tests. Offline implementation, examples, review, and conceptual work do not require credentials; continue that work when live access is unavailable.
 
-A documentation lookup does not authorize installing an MCP server, configuration changes, escalation, or restarting Codex. Do not make those prerequisites for answering. Follow the active permission policy and existing user authorization.
+A documentation lookup does not authorize installing an MCP server, configuration changes, escalation, or restarting Codex. Do not make those prerequisites for answering. Follow the active permission policy and existing user authorization. Checks described by this skill and its references remain subject to the active validation policy; this skill does not authorize them.
 
 ## Upgrade scope
 

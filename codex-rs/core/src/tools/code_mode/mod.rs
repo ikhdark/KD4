@@ -2301,9 +2301,29 @@ fn retained_artifact_reference(result: &JsonValue) -> Option<JsonValue> {
     if result.get("retained_artifact_complete") == Some(&JsonValue::Bool(false)) {
         return None;
     }
+    // A locator alone is not a callable recovery recipe. Reuse the producer's
+    // exact selectors: command logs support lines, not arbitrary byte ranges,
+    // and a selected source read need not authorize recovering the whole file.
+    let results = result.get("results")?.as_array()?;
+    if results.is_empty()
+        || results.len() > crate::tools::handlers::read_tool_output_spec::READ_TOOL_OUTPUT_MAX_SELECTORS
+    {
+        return None;
+    }
+    let selectors = results
+        .iter()
+        .map(|result| {
+            serde_json::from_value::<crate::tools::command_output_artifact::ToolOutputSelector>(
+                result.get("selector")?.clone(),
+            )
+            .ok()
+        })
+        .collect::<Option<Vec<_>>>()?;
     let mut reference = serde_json::json!({
         "artifact_id": artifact_id,
-        "recovery": {"tool": "read_tool_output", "arguments": {"artifact_id": artifact_id}},
+        "recovery": {"tool": "read_tool_output", "arguments": {
+            "artifact_id": artifact_id, "selectors": selectors,
+        }},
     });
     if let Some(sha256) = result.get("canonical_sha256").and_then(JsonValue::as_str) {
         reference["canonical_sha256"] = sha256.into();
@@ -5694,8 +5714,18 @@ mod tests {
         });
         let reference = json!({
             "artifact_id": "snapshot", "canonical_sha256": "hash", "canonical_bytes": 202025,
-            "recovery": {"tool": "read_tool_output", "arguments": {"artifact_id": "snapshot"}},
+            "recovery": {"tool": "read_tool_output", "arguments": {
+                "artifact_id": "snapshot", "selectors": [{"kind":"lines", "start":2, "end":400}],
+            }},
         });
+        let codex_tools::ToolSpec::Function(tool) =
+            crate::tools::handlers::read_tool_output_spec::create_read_tool_output_tool()
+        else {
+            panic!("retained-output recovery must remain a function tool");
+        };
+        let schema = serde_json::to_value(tool.parameters).unwrap();
+        let validator = jsonschema::validator_for(&schema).unwrap();
+        assert!(validator.is_valid(&reference["recovery"]["arguments"]));
         let serialized = result.to_string();
         for emitted in ["", body.as_str(), serialized.as_str()] {
             assert_eq!(
@@ -5718,6 +5748,10 @@ mod tests {
             ("artifact_id", json!(null)),
             ("artifact_id", json!("")),
             ("retained_artifact_complete", json!(false)),
+            ("results", json!([])),
+            ("results", json!([{"selector":{"kind":"symbol", "name":"unresolved"}}])),
+            ("results", json!(vec![json!({"selector":{"kind":"lines", "start":2, "end":400}});
+                crate::tools::handlers::read_tool_output_spec::READ_TOOL_OUTPUT_MAX_SELECTORS + 1])),
         ] {
             let mut unretained = entry.clone();
             unretained["outcome"]["result"][key] = value;

@@ -346,11 +346,11 @@ const buildOutline = (manual) => {
 
   for (let index = 0; index < headings.length; index += 1) {
     const heading = headings[index];
-    const nextPeer = headings
-      .slice(index + 1)
-      .find((candidate) => candidate.level <= heading.level);
-    if (nextPeer) {
-      heading.endLine = nextPeer.startLine - 1;
+    for (let next = index + 1; next < headings.length; next += 1) {
+      if (headings[next].level <= heading.level) {
+        heading.endLine = headings[next].startLine - 1;
+        break;
+      }
     }
   }
 
@@ -408,6 +408,12 @@ const writeCachedManual = async (cacheDir, manual) => {
 };
 
 const writeOutline = async (cacheDir, outlineText) => {
+  try {
+    const existing = await readFile(outlineFilePath(cacheDir));
+    if (existing.equals(Buffer.from(outlineText, "utf8"))) return;
+  } catch {
+    // Preserve the existing replacement/repair path for missing or unreadable output.
+  }
   await mkdir(cacheDir, { recursive: true });
   const tmpPath = tempFilePath(cacheDir, `.${OUTLINE_FILE_NAME}.tmp`);
   await writeFile(tmpPath, outlineText, "utf8");

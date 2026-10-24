@@ -9,14 +9,11 @@ use codex_protocol::error::Result as CodexResult;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::user_input::UserInput;
-use tokio_util::sync::CancellationToken;
 
 use crate::StateDbHandle;
 use crate::config::Config;
 use crate::resolve_installation_id;
 use crate::session::session::Session;
-use crate::session::turn::build_prompt;
-use crate::session::turn::built_tools;
 use crate::thread_manager::ThreadManager;
 use crate::thread_manager::thread_store_from_config;
 use codex_extension_api::empty_extension_registry;
@@ -100,14 +97,5 @@ pub(crate) async fn build_prompt_input_from_session(
         .clone_history()
         .await
         .for_prompt(&turn_context.model_info.input_modalities);
-    let router = built_tools(sess, &step_context, &[], &CancellationToken::new()).await?;
-    let base_instructions = sess.get_base_instructions().await;
-    let prompt = build_prompt(
-        prompt_input,
-        router.as_ref(),
-        turn_context.as_ref(),
-        base_instructions,
-    );
-
-    Ok(prompt.input.to_vec())
+    Ok(prompt_input)
 }

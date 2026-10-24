@@ -12,23 +12,27 @@ use codex_protocol::models::ResponseItem;
 use sha2::Digest;
 use sha2::Sha256;
 
-/// Smaller bodies cost about as much as the reference that would replace them.
-const MIN_ELIDED_BODY_BYTES: usize = 1024;
+/// Skip tiny bodies; the final reference must also be smaller than its body.
+const MIN_ELIDED_BODY_BYTES: usize = 256;
 const MAX_FIRST_LINE_CHARS: usize = 160;
-/// Bounds the alternation memory; clearing it only re-prints a body once more.
+/// Bounds bookkeeping; visible prompt bytes remain the authority for elision.
 const MAX_REMEMBERED_ELISIONS: usize = 4096;
 const LABEL_PREFIX: &str = "[source {";
 const LABEL_SUFFIX: &str = "}]";
 
 /// Replaces each large printed body whose exact text appears in a tool output
-/// of `visible_prompt`, the input of the request that issued this cell. A body
-/// elided before prints in full the next time, so printing it again is the
-/// way to repeat the text.
+/// of `visible_prompt`, the input of the request that issued this cell.
+/// Ordinary rereads stay referential. To explicitly repeat evidence, print the
+/// selected text itself instead of the labeled result envelope.
 pub(super) fn elide_bodies_already_in_context(
     body: &mut [FunctionCallOutputContentItem],
     visible_prompt: &[ResponseItem],
     elided: &mut HashSet<[u8; 32]>,
 ) {
+    if !body.iter().any(|item| matches!(item,
+        FunctionCallOutputContentItem::InputText { text } if text.contains(LABEL_PREFIX))) {
+        return;
+    }
     let visible = visible_prompt
         .iter()
         .flat_map(|item| match item {
@@ -68,8 +72,7 @@ pub(super) fn elide_bodies_already_in_context(
 }
 
 fn elide_text(text: &str, visible: &[&str], elided: &mut HashSet<[u8; 32]>) -> Option<String> {
-    let mut output = String::with_capacity(text.len());
-    let mut changed = false;
+    let mut output: Option<String> = None;
     let mut cursor = 0;
     while cursor < text.len() {
         let line_end = text[cursor..]
@@ -79,22 +82,22 @@ fn elide_text(text: &str, visible: &[&str], elided: &mut HashSet<[u8; 32]>) -> O
         let Some((body_end, next)) =
             body_line_count(label).and_then(|lines| body_bounds(text, line_end, lines))
         else {
-            output.push_str(&text[cursor..line_end]);
+            if let Some(output) = &mut output {
+                output.push_str(&text[cursor..line_end]);
+            }
             cursor = line_end;
             continue;
         };
         let body_text = &text[line_end..body_end];
-        let digest = <[u8; 32]>::from(Sha256::digest(body_text.as_bytes()));
         if body_text.len() < MIN_ELIDED_BODY_BYTES
             || !visible.iter().any(|visible| visible.contains(body_text))
-            || elided.remove(&digest)
         {
-            output.push_str(&text[cursor..next]);
+            if let Some(output) = &mut output {
+                output.push_str(&text[cursor..next]);
+            }
             cursor = next;
             continue;
         }
-        elided.insert(digest);
-        changed = true;
         let first_line = body_text
             .lines()
             .next()
@@ -102,22 +105,34 @@ fn elide_text(text: &str, visible: &[&str], elided: &mut HashSet<[u8; 32]>) -> O
             .chars()
             .take(MAX_FIRST_LINE_CHARS)
             .collect::<String>();
+        let reference = serde_json::json!({
+            "first_line": first_line,
+            "note": "identical text is already visible; to repeat it explicitly, print the selected text without its envelope",
+        }).to_string();
+        if reference.len() + ",\"already_in_context\":".len() + 1 >= body_text.len() {
+            if let Some(output) = &mut output {
+                output.push_str(&text[cursor..next]);
+            }
+            cursor = next;
+            continue;
+        }
+        let digest = <[u8; 32]>::from(Sha256::digest(body_text.as_bytes()));
+        elided.insert(digest);
+        let output = output.get_or_insert_with(|| {
+            let mut output = String::with_capacity(text.len());
+            output.push_str(&text[..cursor]);
+            output
+        });
         output.push_str(&label[..label.len() - LABEL_SUFFIX.len()]);
         output.push_str(",\"already_in_context\":");
-        output.push_str(
-            &serde_json::json!({
-                "first_line": first_line,
-                "note": "identical text appears in an earlier tool output in this context; print it again to repeat it",
-            })
-            .to_string(),
-        );
+        output.push_str(&reference);
         output.push_str(LABEL_SUFFIX);
         output.push('\n');
         // Keep the newline that separates this body from the next label.
         output.push_str(&text[body_end..next]);
         cursor = next;
     }
-    changed.then_some(output)
+    output
 }
 
 /// The end of a body of `lines` lines starting at `start`, and the offset after
@@ -227,8 +242,8 @@ mod tests {
         // The following label still starts its own line, so it stays parseable.
         assert!(first.contains("\n[source {\"body\":2,"));
 
-        // Printing it again is the opt-out: the next copy is complete.
-        assert_eq!(elide(&reread, &prompt, &mut elided), reread);
+        // Ordinary rereads stay referential; explicit raw text is not labeled.
+        assert_eq!(elide(&reread, &prompt, &mut elided), first);
         assert_ne!(elide(&reread, &prompt, &mut elided), reread);
 
         // A final body ending in a newline has no separator after it.

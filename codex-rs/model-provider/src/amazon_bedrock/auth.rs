@@ -50,14 +50,16 @@ pub(super) async fn resolve_auth_method(
         return Ok(BedrockAuthMethod::EnvBearerToken { token, region });
     }
 
-    let config = match endpoint {
-        BedrockEndpoint::Mantle => aws_auth_config(aws),
-        BedrockEndpoint::Runtime => runtime::aws_auth_config(aws),
-    };
     // Cache the SDK context, not credentials. Signing still asks its refreshable
     // provider for credentials on every request. Failed/cancelled loads are retried.
     let context = sdk_context
-        .get_or_try_init(|| AwsAuthContext::load(config))
+        .get_or_try_init(|| {
+            let config = match endpoint {
+                BedrockEndpoint::Mantle => aws_auth_config(aws),
+                BedrockEndpoint::Runtime => runtime::aws_auth_config(aws),
+            };
+            AwsAuthContext::load(config)
+        })
         .await
         .map_err(aws_auth_error_to_codex_error)?
         .clone();

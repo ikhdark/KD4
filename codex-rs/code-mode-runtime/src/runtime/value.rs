@@ -442,6 +442,7 @@ pub(super) fn value_to_error_text(
         .map(str::to_owned);
     if let Some(name) = missing_tool
         && let Some(catalog) = enabled_tools.as_deref()
+        && catalog.resolve_requested_name(&name).is_none()
     {
         let diagnostic = catalog.resolution_diagnostic(Some(name.as_str()));
         text.push_str(&format!(

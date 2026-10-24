@@ -3386,6 +3386,77 @@
             },
             "method": {
               "enum": [
+                "externalAgentConfig/detect"
+              ],
+              "title": "ExternalAgentConfig/detectRequestMethod",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/definitions/ExternalAgentConfigDetectParams"
+            }
+          },
+          "required": [
+            "id",
+            "method",
+            "params"
+          ],
+          "title": "ExternalAgentConfig/detectRequest",
+          "type": "object"
+        },
+        {
+          "properties": {
+            "id": {
+              "$ref": "#/definitions/RequestId"
+            },
+            "method": {
+              "enum": [
+                "externalAgentConfig/import"
+              ],
+              "title": "ExternalAgentConfig/importRequestMethod",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/definitions/ExternalAgentConfigImportParams"
+            }
+          },
+          "required": [
+            "id",
+            "method",
+            "params"
+          ],
+          "title": "ExternalAgentConfig/importRequest",
+          "type": "object"
+        },
+        {
+          "properties": {
+            "id": {
+              "$ref": "#/definitions/RequestId"
+            },
+            "method": {
+              "enum": [
+                "externalAgentConfig/import/readHistories"
+              ],
+              "title": "ExternalAgentConfig/import/readHistoriesRequestMethod",
+              "type": "string"
+            },
+            "params": {
+              "type": "null"
+            }
+          },
+          "required": [
+            "id",
+            "method"
+          ],
+          "title": "ExternalAgentConfig/import/readHistoriesRequest",
+          "type": "object"
+        },
+        {
+          "properties": {
+            "id": {
+              "$ref": "#/definitions/RequestId"
+            },
+            "method": {
+              "enum": [
                 "config/value/write"
               ],
               "title": "Config/value/writeRequestMethod",
@@ -4295,6 +4366,17 @@
         "declined"
       ],
       "type": "string"
+    },
+    "CommandMigration": {
+      "properties": {
+        "name": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "name"
+      ],
+      "type": "object"
     },
     "ComputerUseRequirements": {
       "properties": {
@@ -5832,6 +5914,302 @@
         }
       ]
     },
+    "ExternalAgentConfigDetectParams": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "properties": {
+        "cwds": {
+          "description": "Zero or more working directories to include for repo-scoped detection.",
+          "items": {
+            "type": "string"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        },
+        "includeHome": {
+          "description": "If true, include detection under the user's home directory.",
+          "type": "boolean"
+        }
+      },
+      "title": "ExternalAgentConfigDetectParams",
+      "type": "object"
+    },
+    "ExternalAgentConfigDetectResponse": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "properties": {
+        "items": {
+          "items": {
+            "$ref": "#/definitions/ExternalAgentConfigMigrationItem"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "items"
+      ],
+      "title": "ExternalAgentConfigDetectResponse",
+      "type": "object"
+    },
+    "ExternalAgentConfigImportCompletedNotification": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "properties": {
+        "importId": {
+          "type": "string"
+        },
+        "itemTypeResults": {
+          "items": {
+            "$ref": "#/definitions/ExternalAgentConfigImportTypeResult"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "importId",
+        "itemTypeResults"
+      ],
+      "title": "ExternalAgentConfigImportCompletedNotification",
+      "type": "object"
+    },
+    "ExternalAgentConfigImportHistoriesReadResponse": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "properties": {
+        "data": {
+          "items": {
+            "$ref": "#/definitions/ExternalAgentConfigImportHistory"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "data"
+      ],
+      "title": "ExternalAgentConfigImportHistoriesReadResponse",
+      "type": "object"
+    },
+    "ExternalAgentConfigImportHistory": {
+      "properties": {
+        "completedAtMs": {
+          "format": "int64",
+          "type": "integer"
+        },
+        "failures": {
+          "items": {
+            "$ref": "#/definitions/ExternalAgentConfigImportItemTypeFailure"
+          },
+          "type": "array"
+        },
+        "importId": {
+          "type": "string"
+        },
+        "successes": {
+          "items": {
+            "$ref": "#/definitions/ExternalAgentConfigImportItemTypeSuccess"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "completedAtMs",
+        "failures",
+        "importId",
+        "successes"
+      ],
+      "type": "object"
+    },
+    "ExternalAgentConfigImportItemTypeFailure": {
+      "properties": {
+        "cwd": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "errorType": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "failureStage": {
+          "type": "string"
+        },
+        "itemType": {
+          "$ref": "#/definitions/ExternalAgentConfigMigrationItemType"
+        },
+        "message": {
+          "type": "string"
+        },
+        "source": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "failureStage",
+        "itemType",
+        "message"
+      ],
+      "type": "object"
+    },
+    "ExternalAgentConfigImportItemTypeSuccess": {
+      "properties": {
+        "cwd": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "itemType": {
+          "$ref": "#/definitions/ExternalAgentConfigMigrationItemType"
+        },
+        "source": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "target": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "itemType"
+      ],
+      "type": "object"
+    },
+    "ExternalAgentConfigImportParams": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "properties": {
+        "migrationItems": {
+          "items": {
+            "$ref": "#/definitions/ExternalAgentConfigMigrationItem"
+          },
+          "type": "array"
+        },
+        "source": {
+          "description": "Source product that produced the migration items. Missing means unspecified.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "migrationItems"
+      ],
+      "title": "ExternalAgentConfigImportParams",
+      "type": "object"
+    },
+    "ExternalAgentConfigImportProgressNotification": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "properties": {
+        "importId": {
+          "type": "string"
+        },
+        "itemTypeResults": {
+          "items": {
+            "$ref": "#/definitions/ExternalAgentConfigImportTypeResult"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "importId",
+        "itemTypeResults"
+      ],
+      "title": "ExternalAgentConfigImportProgressNotification",
+      "type": "object"
+    },
+    "ExternalAgentConfigImportResponse": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "properties": {
+        "importId": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "importId"
+      ],
+      "title": "ExternalAgentConfigImportResponse",
+      "type": "object"
+    },
+    "ExternalAgentConfigImportTypeResult": {
+      "properties": {
+        "failures": {
+          "items": {
+            "$ref": "#/definitions/ExternalAgentConfigImportItemTypeFailure"
+          },
+          "type": "array"
+        },
+        "itemType": {
+          "$ref": "#/definitions/ExternalAgentConfigMigrationItemType"
+        },
+        "successes": {
+          "items": {
+            "$ref": "#/definitions/ExternalAgentConfigImportItemTypeSuccess"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "failures",
+        "itemType",
+        "successes"
+      ],
+      "type": "object"
+    },
+    "ExternalAgentConfigMigrationItem": {
+      "properties": {
+        "cwd": {
+          "description": "Null or empty means home-scoped migration; non-empty means repo-scoped migration.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "description": {
+          "type": "string"
+        },
+        "details": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/MigrationDetails"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "itemType": {
+          "$ref": "#/definitions/ExternalAgentConfigMigrationItemType"
+        }
+      },
+      "required": [
+        "description",
+        "itemType"
+      ],
+      "type": "object"
+    },
+    "ExternalAgentConfigMigrationItemType": {
+      "enum": [
+        "AGENTS_MD",
+        "CONFIG",
+        "SKILLS",
+        "PLUGINS",
+        "MCP_SERVER_CONFIG",
+        "SUBAGENTS",
+        "HOOKS",
+        "COMMANDS",
+        "SESSIONS"
+      ],
+      "type": "string"
+    },
     "FeedbackUploadParams": {
       "$schema": "http://json-schema.org/draft-07/schema#",
       "properties": {
@@ -7208,6 +7586,17 @@
       ],
       "type": "object"
     },
+    "HookMigration": {
+      "properties": {
+        "name": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "name"
+      ],
+      "type": "object"
+    },
     "HookOutputEntry": {
       "properties": {
         "kind": {
@@ -8466,6 +8855,17 @@
       ],
       "type": "object"
     },
+    "McpServerMigration": {
+      "properties": {
+        "name": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "name"
+      ],
+      "type": "object"
+    },
     "McpServerOauthLoginCompletedNotification": {
       "$schema": "http://json-schema.org/draft-07/schema#",
       "properties": {
@@ -8889,6 +9289,60 @@
           "type": "string"
         }
       ]
+    },
+    "MigrationDetails": {
+      "properties": {
+        "commands": {
+          "default": [],
+          "items": {
+            "$ref": "#/definitions/CommandMigration"
+          },
+          "type": "array"
+        },
+        "hooks": {
+          "default": [],
+          "items": {
+            "$ref": "#/definitions/HookMigration"
+          },
+          "type": "array"
+        },
+        "mcpServers": {
+          "default": [],
+          "items": {
+            "$ref": "#/definitions/McpServerMigration"
+          },
+          "type": "array"
+        },
+        "plugins": {
+          "default": [],
+          "items": {
+            "$ref": "#/definitions/PluginsMigration"
+          },
+          "type": "array"
+        },
+        "sessions": {
+          "default": [],
+          "items": {
+            "$ref": "#/definitions/SessionMigration"
+          },
+          "type": "array"
+        },
+        "skills": {
+          "default": [],
+          "items": {
+            "$ref": "#/definitions/SkillMigration"
+          },
+          "type": "array"
+        },
+        "subagents": {
+          "default": [],
+          "items": {
+            "$ref": "#/definitions/SubagentMigration"
+          },
+          "type": "array"
+        }
+      },
+      "type": "object"
     },
     "ModeKind": {
       "description": "Initial collaboration mode to use when the TUI starts.",
@@ -10928,6 +11382,24 @@
     "PluginUninstallResponse": {
       "$schema": "http://json-schema.org/draft-07/schema#",
       "title": "PluginUninstallResponse",
+      "type": "object"
+    },
+    "PluginsMigration": {
+      "properties": {
+        "marketplaceName": {
+          "type": "string"
+        },
+        "pluginNames": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "marketplaceName",
+        "pluginNames"
+      ],
       "type": "object"
     },
     "ProcessExitedNotification": {
@@ -13679,6 +14151,46 @@
           "properties": {
             "method": {
               "enum": [
+                "externalAgentConfig/import/progress"
+              ],
+              "title": "ExternalAgentConfig/import/progressNotificationMethod",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/definitions/ExternalAgentConfigImportProgressNotification"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "title": "ExternalAgentConfig/import/progressNotification",
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "enum": [
+                "externalAgentConfig/import/completed"
+              ],
+              "title": "ExternalAgentConfig/import/completedNotificationMethod",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/definitions/ExternalAgentConfigImportCompletedNotification"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "title": "ExternalAgentConfig/import/completedNotification",
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "enum": [
                 "fs/changed"
               ],
               "title": "Fs/changedNotificationMethod",
@@ -14016,6 +14528,27 @@
       "title": "ServerRequestResolvedNotification",
       "type": "object"
     },
+    "SessionMigration": {
+      "properties": {
+        "cwd": {
+          "type": "string"
+        },
+        "path": {
+          "type": "string"
+        },
+        "title": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "cwd",
+        "path"
+      ],
+      "type": "object"
+    },
     "SessionSource": {
       "oneOf": [
         {
@@ -14213,6 +14746,17 @@
         "name",
         "path",
         "scope"
+      ],
+      "type": "object"
+    },
+    "SkillMigration": {
+      "properties": {
+        "name": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "name"
       ],
       "type": "object"
     },
@@ -14554,6 +15098,17 @@
           "type": "object"
         }
       ]
+    },
+    "SubagentMigration": {
+      "properties": {
+        "name": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "name"
+      ],
+      "type": "object"
     },
     "SurfacedToolResult": {
       "description": "Authoritative typed tool result surfaced as the terminal result of a turn. `canonical_message`, when present, is owner-authored and may be copied unchanged into legacy last-message consumers. `value` is never rendered into synthetic assistant prose by the host.",

@@ -4,6 +4,7 @@ use codex_protocol::protocol::AgentStatus;
 use codex_protocol::protocol::InterAgentCommunication;
 use codex_utils_output_truncation::TruncationPolicy;
 use codex_utils_output_truncation::approx_token_count;
+use codex_utils_output_truncation::approx_tokens_from_byte_count;
 use codex_utils_output_truncation::truncate_text;
 use sha2::Digest;
 use sha2::Sha256;
@@ -247,9 +248,14 @@ fn format_bounded_inter_agent_completion_message(
             .with_receipt(receipt)
             .render()
     };
-    let unabridged = render(payload, &protected);
-    if approx_token_count(&unabridged) < COMPLETION_MESSAGE_MAX_TOKENS {
-        return unabridged;
+    // The envelope only adds bytes. If its body already cannot fit, do not
+    // allocate the complete authored report merely to reject that rendering.
+    let body_bytes = payload.len().saturating_add(protected.len());
+    if approx_tokens_from_byte_count(body_bytes) < COMPLETION_MESSAGE_MAX_TOKENS as u64 {
+        let unabridged = render(payload, &protected);
+        if approx_token_count(&unabridged) < COMPLETION_MESSAGE_MAX_TOKENS {
+            return unabridged;
+        }
     }
 
     let retrieval_guidance = if receipt.is_some() {

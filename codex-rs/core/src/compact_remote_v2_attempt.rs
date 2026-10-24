@@ -65,10 +65,11 @@ pub(super) async fn run_remote_compact_v2_attempt(
     // Only tool-search schemas can be rewritten by this trimmer. Size those
     // before observing the workspace: preliminary sizing does not authorize
     // source-evidence reuse and must not freeze an early workspace identity.
-    let preliminary_deleted_tokens = if history
-        .raw_items()
-        .iter()
-        .any(|item| matches!(item, ResponseItem::ToolSearchOutput { .. }))
+    // Without that intervening observation, the authoritative pass below is
+    // sufficient; do not build and size the same request twice.
+    let preliminary_deleted_tokens = if history.requires_workspace_evidence_validation()
+        && history.raw_items().iter()
+            .any(|item| matches!(item, ResponseItem::ToolSearchOutput { .. }))
     {
         let prepared = history
             .clone()

@@ -432,8 +432,9 @@ async fn apply_metadata_update(
             }
             let fallback = metadata;
             let name_update = patch.name.is_some();
-            let mut metadata = state_db
-                .patch_thread_metadata(&fallback, |metadata| {
+            let metadata = state_db
+                .patch_thread_metadata_with_recency(&fallback,
+                    advance_recency_at.filter(|_| existing.is_some()), |metadata| {
                     if !include_archived && metadata.archived_at.is_some() {
                         return Err(format!("thread {thread_id} is archived"));
                     }
@@ -534,31 +535,6 @@ async fn apply_metadata_update(
                         ThreadStoreError::Internal { message }
                     }
                 })?;
-            if existing.is_some()
-                && let Some(recency_at) = advance_recency_at
-            {
-                state_db
-                    .touch_thread_recency_at(thread_id, recency_at)
-                    .await
-                    .map_err(|err| ThreadStoreError::Internal {
-                        message: format!(
-                            "failed to advance thread recency_at for {thread_id}: {err}"
-                        ),
-                    })?;
-                metadata = state_db
-                    .get_thread(thread_id)
-                    .await
-                    .map_err(|err| ThreadStoreError::Internal {
-                        message: format!(
-                            "failed to read advanced thread recency_at for {thread_id}: {err}"
-                        ),
-                    })?
-                    .ok_or_else(|| ThreadStoreError::Internal {
-                        message: format!(
-                            "thread metadata unavailable after advancing recency_at: {thread_id}"
-                        ),
-                    })?;
-            }
             Ok(Some(metadata))
         }
         .await

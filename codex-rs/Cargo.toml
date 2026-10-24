@@ -130,7 +130,6 @@ codex-app-server = { path = "app-server" }
 codex-app-server-transport = { path = "app-server-transport" }
 codex-app-server-client = { path = "app-server-client" }
 codex-app-server-protocol = { path = "app-server-protocol" }
-codex-app-server-test-client = { path = "app-server-test-client" }
 codex-apply-patch = { path = "apply-patch" }
 codex-arg0 = { path = "arg0" }
 codex-async-utils = { path = "async-utils" }
@@ -343,7 +342,6 @@ rustls = { version = "0.23", default-features = false, features = [
 ] }
 rustls-native-certs = "0.8.3"
 rustls-pki-types = "1.14.0"
-schannel = "0.1"
 schemars = { version = "0.8.22", features = ["indexmap2"] }
 semver = "1.0"
 # Only the envelope types are used; codex-feedback sends envelopes through
@@ -429,7 +427,6 @@ windows-sys = "0.61.2"
 # `bzip2-rs` keeps bzip2 on the C `bzip2-sys` backend that zip 2 used. Plain `bzip2`
 # selects `libbz2-rs-sys`, whose bzip2-1.0.6 license is not on the cargo-deny allow list.
 zip = { version = "9.0.3", default-features = false, features = [
-    "aes-crypto",
     "bzip2-rs",
     "deflate-flate2",
     "deflate64",
@@ -441,7 +438,6 @@ zip = { version = "9.0.3", default-features = false, features = [
 zstd = "0.14.2"
 
 wiremock = "0.6"
-zeroize = "1.8.2"
 
 [workspace.lints]
 rust = {}
@@ -512,26 +508,24 @@ strip = "symbols"
 debug = "none"
 
 [profile.release]
-lto = "thin"
+opt-level = 3
+lto = "fat"
 debug = "line-tables-only"
 split-debuginfo = "off"
 # Release archives do not publish a separate symbol bundle. Strip symbols in
 # the owner build so distributable binaries cannot silently retain them.
 strip = "symbols"
 
-# Balance parallel release code generation against binary size.
-codegen-units = 4
+# Final publish and ordinary release share one source of optimization settings.
+codegen-units = 1
+incremental = false
 
+[profile.release.package."*"]
+codegen-units = 1
+
+# Retain the final publisher's profile name and isolated output directory.
 [profile.local-release]
 inherits = "release"
-opt-level = 3
-lto = "fat"
-# Favor runtime optimization over local build throughput.
-codegen-units = 1
-incremental = true
-
-[profile.local-release.package."*"]
-codegen-units = 1
 
 # Warm local publish builds: reuse incremental codegen and avoid whole-program LTO.
 # Keep release semantics (no debug assertions/overflow checks), but trade peak
@@ -543,17 +537,32 @@ lto = "off"
 codegen-units = 16
 incremental = true
 
+# Preserve fast-build dependency parallelism when the release defaults change.
+[profile.local-fast.package."*"]
+codegen-units = 4
+
 # rustc 1.99.1/LLVM 23 reports `Missing .seh_endepilogue` while optimizing
 # icu_calendar's AnyCalendar::day_of_year for Windows. Limit the workaround to
 # this dependency in local-fast; leave the other crates and final builds alone.
 [profile.local-fast.package.icu_calendar]
 opt-level = 0
 
+# Both PGO passes use this same Cargo profile, in separate target directories.
+[profile.local-pgo]
+inherits = "local-release"
+incremental = false
+
 [profile.profiling]
 inherits = "release"
 debug = "full"
 lto = false
 strip = false
+# Keep the existing profiling behavior independent of final-publish tuning.
+codegen-units = 4
+incremental = false
+
+[profile.profiling.package."*"]
+codegen-units = 4
 
 [patch.crates-io]
 notify = { path = "../third_party/notify" }

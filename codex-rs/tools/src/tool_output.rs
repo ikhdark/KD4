@@ -631,6 +631,10 @@ where
         (**self).model_delivery_unavailable()
     }
 
+    fn model_delivery_notice(&self) -> Option<&str> {
+        (**self).model_delivery_notice()
+    }
+
     fn canonical_result(&self, payload: &ToolPayload) -> Option<CanonicalToolResult> {
         (**self).canonical_result(payload)
     }

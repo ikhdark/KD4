@@ -13,6 +13,7 @@ import tempfile
 import urllib.error
 import urllib.parse
 import zipfile
+from pathlib import PureWindowsPath
 
 from github_utils import github_request
 
@@ -78,7 +79,9 @@ def _parse_github_url(url: str, default_ref: str) -> tuple[str, str, str, str | 
     return owner, repo, ref, subpath or None
 
 
-def _download_repo_zip(owner: str, repo: str, ref: str, dest_dir: str) -> str:
+def _download_repo_zip(
+    owner: str, repo: str, ref: str, dest_dir: str, paths: list[str] | None = None
+) -> str:
     owner, repo, ref = (
         urllib.parse.quote(value, safe="") for value in (owner, repo, ref)
     )
@@ -91,7 +94,7 @@ def _download_repo_zip(owner: str, repo: str, ref: str, dest_dir: str) -> str:
     with open(zip_path, "wb") as file_handle:
         file_handle.write(payload)
     with zipfile.ZipFile(zip_path, "r") as zip_file:
-        _safe_extract_zip(zip_file, dest_dir)
+        _safe_extract_zip(zip_file, dest_dir, paths)
         top_levels = {name.split("/")[0] for name in zip_file.namelist() if name}
     if not top_levels:
         raise InstallError("Downloaded archive was empty.")
@@ -108,14 +111,85 @@ def _run_git(args: list[str]) -> None:
         raise InstallError(result.stderr.strip() or "Git command failed.")
 
 
-def _safe_extract_zip(zip_file: zipfile.ZipFile, dest_dir: str) -> None:
+def _safe_extract_zip(
+    zip_file: zipfile.ZipFile, dest_dir: str, paths: list[str] | None = None
+) -> None:
     dest_root = os.path.realpath(dest_dir)
-    for info in zip_file.infolist():
+    members = zip_file.infolist()
+    for info in members:
         extracted_path = os.path.realpath(os.path.join(dest_dir, info.filename))
         if extracted_path == dest_root or extracted_path.startswith(dest_root + os.sep):
             continue
         raise InstallError("Archive contains files outside the destination.")
-    zip_file.extractall(dest_dir)
+    roots = {info.filename.split("/")[0] for info in members if info.filename}
+    if paths is None or len(roots) != 1:
+        zip_file.extractall(dest_dir)
+        return
+    # Leave Unicode normalization, native aliases and path conflicts to the
+    # existing full extractor rather than changing platform path behavior.
+    ordinary = True
+    is_reserved = getattr(os.path, "isreserved", None)
+    def needs_native_windows_name(part: str) -> bool:
+        return (
+            any(ch in part for ch in '<>:"|?*')
+            or any(ord(ch) < 32 for ch in part)
+            or part.endswith((".", " "))
+            or (is_reserved(part) if is_reserved else PureWindowsPath(part).is_reserved())
+        )
+
+    files: set[str] = set()
+    directories: set[str] = set()
+    for info in members:
+        parts = info.filename.rstrip("/").split("/")
+        if not all(parts) or any(part in (".", "..") or not part.isascii() for part in parts):
+            ordinary = False
+        if len(parts) == 1 and not info.is_dir():
+            ordinary = False
+        if os.name == "nt" and (
+            "\\" in info.filename
+            or any("~" in part or needs_native_windows_name(part) for part in parts)
+        ):
+            ordinary = False
+        if not ordinary:
+            break
+        logical = os.path.normcase(info.filename.rstrip("/")).casefold()
+        if logical in files or logical in directories:
+            ordinary = False
+            break
+        (directories if info.is_dir() else files).add(logical)
+        directories.update(os.path.normcase("/".join(parts[:end])).casefold() for end in range(1, len(parts)))
+    if files & directories:
+        ordinary = False
+    for selected in paths or []:
+        components = selected.replace(os.sep, "/").split("/")
+        if any(part in (".", "..") or not part.isascii() for part in components):
+            ordinary = False
+        if os.name == "nt" and any("~" in part or needs_native_windows_name(part) for part in components):
+            ordinary = False
+    if not ordinary:
+        zip_file.extractall(dest_dir)
+        return
+
+    root = next(iter(roots))
+    # Case folding can only widen selection on a case-sensitive filesystem;
+    # ZipFile still writes every selected member with its original name.
+    selected_roots = [
+        os.path.normcase(os.path.realpath(os.path.join(dest_dir, root, selected))).casefold()
+        for selected in paths or []
+    ]
+    for info in members:
+        target = os.path.normcase(os.path.realpath(os.path.join(dest_dir, info.filename))).casefold()
+        selected = any(os.path.commonpath((prefix, target)) == prefix for prefix in selected_roots)
+        if selected:
+            zip_file.extract(info, dest_dir)
+        elif not info.is_dir():
+            # extractall also reads every regular member to EOF. Preserve CRC,
+            # decompression and encrypted-member failures without retaining it.
+            with zip_file.open(info) as source:
+                while source.read(64 * 1024):
+                    pass
+    # Even an empty selection preserves the single-root archive layout.
+    os.makedirs(os.path.join(dest_dir, root), exist_ok=True)
 
 
 def _validate_relative_path(path: str) -> None:
@@ -204,7 +278,7 @@ def _build_repo_ssh(owner: str, repo: str) -> str:
 def _prepare_repo(source: Source, method: str, tmp_dir: str) -> str:
     if method in ("download", "auto"):
         try:
-            return _download_repo_zip(source.owner, source.repo, source.ref, tmp_dir)
+            return _download_repo_zip(source.owner, source.repo, source.ref, tmp_dir, source.paths)
         except InstallError as exc:
             if method == "download":
                 raise

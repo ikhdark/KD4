@@ -15,12 +15,23 @@ use std::future::Future;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum RetryableFailureKind {
     Request { status_code: Option<u16> },
+    RequestWithAdvice {
+        status_code: Option<u16>,
+        retry_after: codex_http_client::RetryAfter,
+    },
 }
 
 impl RetryableFailureKind {
     pub(crate) fn status_code(self) -> Option<u16> {
         match self {
-            Self::Request { status_code } => status_code,
+            Self::Request { status_code } | Self::RequestWithAdvice { status_code, .. } => status_code,
+        }
+    }
+
+    pub(crate) fn retry_after(self) -> Option<codex_http_client::RetryAfter> {
+        match self {
+            Self::RequestWithAdvice { retry_after, .. } => Some(retry_after),
+            Self::Request { .. } => None,
         }
     }
 }
@@ -102,7 +113,12 @@ impl BundleClient for BackendBundleClient {
                 } else if status_code.is_none_or(|status| {
                     status == 408 || status == 429 || (500..600).contains(&status)
                 }) {
-                    BundleRequestError::Retryable(RetryableFailureKind::Request { status_code })
+                    BundleRequestError::Retryable(match err.retry_after() {
+                        Some(retry_after) => RetryableFailureKind::RequestWithAdvice {
+                            status_code, retry_after,
+                        },
+                        None => RetryableFailureKind::Request { status_code },
+                    })
                 } else {
                     BundleRequestError::Terminal(CloudConfigBundleLoadError::new(
                         CloudConfigBundleLoadErrorCode::RequestFailed,

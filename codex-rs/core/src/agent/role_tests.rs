@@ -73,94 +73,39 @@ async fn apply_role_returns_error_for_unknown_role() {
 }
 
 #[tokio::test]
-async fn apply_explorer_role_preserves_model_and_adds_read_only_session_flags() {
+async fn apply_generic_role_preserves_parent_configuration() {
     let (_home, mut config) = test_config_with_cli_overrides(vec![
-        (
-            "model".to_string(),
-            TomlValue::String("configured-model".to_string()),
-        ),
-        (
-            "model_reasoning_effort".to_string(),
-            TomlValue::String("high".to_string()),
-        ),
-    ])
-    .await;
+        ("model".to_string(), TomlValue::String("configured-model".to_string())),
+        ("model_reasoning_effort".to_string(), TomlValue::String("high".to_string())),
+    ]).await;
+    let before = config.clone();
     let before_layers = session_flags_layer_count(&config);
-
-    let locks = apply_role_to_config(&mut config, Some("explorer"))
-        .await
-        .expect("explorer role should apply");
-
-    assert_eq!(config.model.as_deref(), Some("configured-model"));
-    assert_eq!(config.model_reasoning_effort, Some(ReasoningEffort::High));
-    assert_eq!(session_flags_layer_count(&config), before_layers + 1);
-    assert!(locks.permissions);
-    assert_eq!(
-        config.permissions.permission_profile(),
-        &PermissionProfile::read_only()
-    );
+    let locks = apply_role_to_config(&mut config, None).await.expect("generic profile");
+    assert_eq!(config, before);
+    assert_eq!(session_flags_layer_count(&config), before_layers);
+    assert_eq!(locks, AgentRoleLocks::default());
 }
 
 #[tokio::test]
-async fn apply_explorer_role_sets_read_only_permissions() {
-    // Start from a writable parent: the default profile is already read-only,
-    // which would hide a role that left the parent's permissions in place.
+async fn removed_builtin_roles_do_not_change_permissions() {
     let (_home, mut config) = test_config_with_cli_overrides(vec![(
         "sandbox_mode".to_string(),
         TomlValue::String("danger-full-access".to_string()),
-    )])
-    .await;
-    assert_ne!(
-        config.permissions.permission_profile(),
-        &PermissionProfile::read_only()
-    );
-    let before_layers = session_flags_layer_count(&config);
-
-    let locks = apply_role_to_config(&mut config, Some("explorer"))
-        .await
-        .expect("explorer role should apply");
-
-    assert!(locks.permissions);
-    assert_eq!(
-        config.permissions.permission_profile(),
-        &PermissionProfile::read_only()
-    );
-
-    if !codex_windows_sandbox::legacy_restricted_token_enforces_delete_child() {
-        assert_eq!(
-            config.permissions.windows_sandbox_mode,
-            Some(codex_config::types::WindowsSandboxModeToml::Elevated)
-        );
+    )]).await;
+    let before = config.clone();
+    for role in ["architect", "explorer", "worker", "reviewer", "verifier", "integrator"] {
+        let error = apply_role_to_config(&mut config, Some(role)).await.expect_err("removed role");
+        assert_eq!(error, format!("unknown agent_type '{role}'"));
+        assert_eq!(config, before);
     }
-    assert_eq!(session_flags_layer_count(&config), before_layers + 1);
 }
 
 #[test]
-fn read_only_role_config_selects_backend_for_legacy_windows_compatibility() {
-    for compatible in [true, false] {
-        let config: TomlValue = toml::from_str(
-            built_in::read_only_config_file_contents_for_legacy_compatibility(compatible),
-        )
-        .expect("built-in read-only role config should parse");
-
-        assert_eq!(
-            config.get("sandbox_mode").and_then(TomlValue::as_str),
-            Some("read-only"),
-            "legacy compatibility: {compatible}"
-        );
-        if compatible {
-            assert!(config.get("windows").is_none());
-        } else {
-            assert_eq!(
-                config
-                    .get("windows")
-                    .and_then(TomlValue::as_table)
-                    .and_then(|windows| windows.get("sandbox"))
-                    .and_then(TomlValue::as_str),
-                Some("elevated")
-            );
-        }
-    }
+fn only_generic_builtin_profile_is_registered() {
+    let roles = built_in::configs();
+    assert_eq!(roles.len(), 1);
+    let generic = roles.get(DEFAULT_ROLE_NAME).expect("generic profile");
+    assert!(generic.config_file.is_none());
 }
 
 #[tokio::test]
@@ -753,26 +698,10 @@ fn spawn_tool_spec_marks_role_locked_service_tier() {
 }
 
 #[test]
-fn built_in_read_only_roles_resolve_embedded_config() {
-    let expected = built_in::config_file_contents(Path::new("explorer.toml"))
-        .expect("explorer should have an embedded config");
-    let parsed: TomlValue = toml::from_str(expected).expect("embedded config should be valid TOML");
-    assert_eq!(
-        parsed.get("sandbox_mode").and_then(TomlValue::as_str),
-        Some("read-only")
-    );
-
-    for role_file in ["architect.toml", "reviewer.toml", "verifier.toml"] {
-        assert_eq!(
-            built_in::config_file_contents(Path::new(role_file)),
-            Some(expected),
-            "unexpected embedded config for {role_file}"
-        );
+fn specialized_embedded_role_configs_are_removed() {
+    for file in ["architect.toml", "explorer.toml", "reviewer.toml", "verifier.toml", "missing.toml"] {
+        assert_eq!(built_in::config_file_contents(Path::new(file)), None, "{file}");
     }
-    assert_eq!(
-        built_in::config_file_contents(Path::new("missing.toml")),
-        None
-    );
 }
 
 #[test]

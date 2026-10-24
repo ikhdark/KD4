@@ -136,10 +136,14 @@ function Assert-SupportedReleaseVersion {
 function Find-ReleaseAssetMetadata {
     param(
         [string]$AssetName,
-        [string]$ResolvedVersion
+        [string]$ResolvedVersion,
+        [object]$ReleaseMetadata = $null
     )
 
-    $release = Invoke-RestMethod -Uri (Get-ReleaseApiUri -RelativePath "tags/rust-v$ResolvedVersion")
+    $release = $ReleaseMetadata
+    if ($null -eq $release) {
+        $release = Invoke-RestMethod -Uri (Get-ReleaseApiUri -RelativePath "tags/rust-v$ResolvedVersion")
+    }
     $asset = $release.assets | Where-Object { $_.name -eq $AssetName } | Select-Object -First 1
     if ($null -eq $asset) {
         return $null
@@ -343,6 +347,8 @@ function Remove-StaleInstallArtifacts {
 }
 
 function Resolve-Version {
+    param([ref]$ReleaseMetadata)
+
     $normalizedVersion = Normalize-Version -RawVersion $Release
     Assert-ValidReleaseVersion -Version $normalizedVersion
     if ($normalizedVersion -ne "latest") {
@@ -359,6 +365,9 @@ function Resolve-Version {
     $resolvedVersion = Normalize-Version -RawVersion $release.tag_name
     Assert-ValidReleaseVersion -Version $resolvedVersion
     Assert-SupportedReleaseVersion -Version $resolvedVersion
+    if ($null -ne $ReleaseMetadata) {
+        $ReleaseMetadata.Value = $release
+    }
     return $resolvedVersion
 }
 
@@ -1169,8 +1178,6 @@ if ([string]::IsNullOrWhiteSpace($env:CODEX_INSTALL_DIR)) {
     $visibleBinDir = $env:CODEX_INSTALL_DIR
 }
 
-$currentVersion = Get-CurrentInstalledVersion -StandaloneCurrentDir $currentDir
-
 if ($Uninstall) {
     Invoke-WithInstallLock -LockPath $lockPath -Script {
         if (Test-IsJunction -Path $visibleBinDir) {
@@ -1200,8 +1207,10 @@ if ($Uninstall) {
     exit 0
 }
 
+$currentVersion = Get-CurrentInstalledVersion -StandaloneCurrentDir $currentDir
 $tarCommand = Get-NativeTarCommand
-$resolvedVersion = Resolve-Version
+$releaseMetadata = $null
+$resolvedVersion = Resolve-Version -ReleaseMetadata ([ref]$releaseMetadata)
 
 if (-not [string]::IsNullOrWhiteSpace($currentVersion) -and $currentVersion -ne $resolvedVersion) {
     Write-Step "Updating Codex CLI from $currentVersion to $resolvedVersion"
@@ -1218,8 +1227,11 @@ $oldStandaloneBackup = $null
 
 $packageAsset = "codex-package-$target.tar.gz"
 $checksumAsset = "codex-package_SHA256SUMS"
-$packageMetadata = Find-ReleaseAssetMetadata -AssetName $packageAsset -ResolvedVersion $resolvedVersion
-$checksumMetadata = Find-ReleaseAssetMetadata -AssetName $checksumAsset -ResolvedVersion $resolvedVersion
+if ($null -eq $releaseMetadata) {
+    $releaseMetadata = Invoke-RestMethod -Uri (Get-ReleaseApiUri -RelativePath "tags/rust-v$resolvedVersion")
+}
+$packageMetadata = Find-ReleaseAssetMetadata -AssetName $packageAsset -ResolvedVersion $resolvedVersion -ReleaseMetadata $releaseMetadata
+$checksumMetadata = Find-ReleaseAssetMetadata -AssetName $checksumAsset -ResolvedVersion $resolvedVersion -ReleaseMetadata $releaseMetadata
 $installLayout = "Package"
 if ($null -eq $packageMetadata -or $null -eq $checksumMetadata) {
     throw "Could not find Codex standalone package release assets for Codex $resolvedVersion."
