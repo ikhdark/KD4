@@ -107,6 +107,7 @@ fn auto_fallback_requires_a_known_empty_preferred_store() -> anyhow::Result<()> 
 }
 
 #[test]
+#[cfg(windows)]
 fn file_storage_failed_replace_preserves_committed_credentials() -> anyhow::Result<()> {
     use std::os::windows::fs::OpenOptionsExt;
     let home = tempdir()?;
