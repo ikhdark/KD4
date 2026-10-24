@@ -347,7 +347,10 @@ impl AgentsMdManager {
             if cache.complete && cache.key.as_ref() == Some(&key) {
                 // Refreshed denotes a complete load for this scope, not a
                 // claim that files were reread for the current model request.
-                return cache.cached_observation(AgentsMdFreshness::Refreshed);
+                drop(cache);
+                // Verify only an overflow manifest, using the existing bounded
+                // recovery owner. Instruction files stay session-snapshotted.
+                return self.cached_observation_with_recovery(AgentsMdFreshness::Refreshed).await;
             }
         }
         self.refresh_with_gate_held(config, environments).await
@@ -486,6 +489,10 @@ impl AgentsMdManager {
 
     /// Returns the published cache without claiming that it was refreshed for this consumer.
     pub(crate) async fn get_cached_observation(&self) -> AgentsMdObservation {
+        self.cached_observation_with_recovery(AgentsMdFreshness::CachedFallback).await
+    }
+
+    async fn cached_observation_with_recovery(&self, freshness: AgentsMdFreshness) -> AgentsMdObservation {
         let available = match &self.omission_recovery {
             Some(owner) => owner.cached_manifest_available().await,
             None => true,
@@ -500,7 +507,7 @@ impl AgentsMdManager {
         self.cache
             .lock()
             .await
-            .cached_observation(AgentsMdFreshness::CachedFallback)
+            .cached_observation(freshness)
     }
 
     pub(crate) fn user_instructions(&self) -> Option<UserInstructions> {
