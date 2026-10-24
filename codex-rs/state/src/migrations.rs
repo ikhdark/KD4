@@ -8,6 +8,49 @@ use sha2::Sha384;
 use sqlx::SqlitePool;
 use sqlx::migrate::Migrator;
 
+#[cfg(test)]
+mod retirement_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn goal_retirement_archives_before_drop_and_rolls_back_failed_preservation() {
+        for fail_archive in [false, true] {
+            let pool = sqlx::sqlite::SqlitePoolOptions::new().max_connections(1)
+                .connect("sqlite::memory:").await.unwrap();
+            sqlx::raw_sql("CREATE TABLE threads(id TEXT PRIMARY KEY); INSERT INTO threads VALUES ('thread');")
+                .execute(&pool).await.unwrap();
+            sqlx::raw_sql(include_str!("../migrations/0029_thread_goals.sql"))
+                .execute(&pool).await.unwrap();
+            sqlx::query("INSERT INTO thread_goals VALUES ('thread', 'goal', 'keep objective', 'paused', 100, 42, 7, 1, 2)")
+                .execute(&pool).await.unwrap();
+            if fail_archive {
+                sqlx::query("CREATE TABLE thread_goals_legacy_archive(wrong INTEGER)").execute(&pool).await.unwrap();
+            }
+            let migrator = Migrator {
+                migrations: Cow::Owned(STATE_MIGRATOR.iter().filter(|migration| [33,34].contains(&migration.version)).cloned().collect()),
+                ..runtime_state_migrator()
+            };
+            let migrated = run_state_migrations(&pool, &migrator).await;
+            assert_eq!(migrated.is_err(), fail_archive);
+            let query: &'static str = if fail_archive {
+                "SELECT objective, tokens_used, time_used_seconds FROM thread_goals"
+            } else {
+                "SELECT objective, tokens_used, time_used_seconds FROM thread_goals_legacy_archive"
+            };
+            let row: (String, i64, i64) = sqlx::query_as(query)
+                .fetch_one(&pool).await.unwrap();
+            assert_eq!(row, ("keep objective".into(), 42, 7));
+            if !fail_archive {
+                run_state_migrations(&pool, &migrator).await.unwrap();
+                let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM thread_goals_legacy_archive")
+                    .fetch_one(&pool).await.unwrap();
+                assert_eq!(count, 1);
+            }
+            pool.close().await;
+        }
+    }
+}
+
 pub(crate) static STATE_MIGRATOR: Migrator = sqlx::migrate!("./migrations");
 pub(crate) static LOGS_MIGRATOR: Migrator = sqlx::migrate!("./logs_migrations");
 pub(crate) static BUGS_MIGRATOR: Migrator = sqlx::migrate!("./bugs_migrations");
@@ -56,6 +99,34 @@ pub(crate) async fn run_state_migrations(
         migrator.run(pool).await?;
     } else {
         let mut transaction = pool.begin_with("BEGIN IMMEDIATE").await?;
+        // Migration 34 intentionally retires the live API, not user data. Keep
+        // the deployed SQL/checksum intact and archive before its DROP, within
+        // the same migration transaction (never on the warm-open path).
+        if migrator.iter().any(|migration| migration.version == 34) {
+            // Older databases still need migration 33's goal-table rewrite.
+            // Reach that boundary before preserving its final legacy schema.
+            let before_retirement = Migrator {
+                migrations: Cow::Owned(migrator.iter().filter(|migration| migration.version < 34).cloned().collect()),
+                ignore_missing: true,
+                locking: migrator.locking,
+                no_tx: migrator.no_tx,
+                table_name: migrator.table_name.clone(),
+                create_schemas: migrator.create_schemas.clone(),
+            };
+            before_retirement.run_direct(None, &mut *transaction, false).await?;
+        }
+        let legacy_goals = migrator.iter().any(|migration| migration.version == 34)
+            && sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'thread_goals')",
+        ).fetch_one(&mut *transaction).await?;
+        if legacy_goals {
+            sqlx::query("CREATE TABLE IF NOT EXISTS thread_goals_legacy_archive AS SELECT * FROM thread_goals WHERE 0")
+                .execute(&mut *transaction).await?;
+            sqlx::query("INSERT INTO thread_goals_legacy_archive SELECT * FROM thread_goals")
+                .execute(&mut *transaction).await?;
+            // The deployed DROP below retires the original only after the
+            // copy; a failure rolls back both within this transaction.
+        }
         migrator.run_direct(None, &mut *transaction, false).await?;
         transaction.commit().await?;
     }
