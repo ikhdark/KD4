@@ -2,7 +2,7 @@
 #   filename:  codex_app_server_protocol.v2.schemas.json
 
 from __future__ import annotations
-from pydantic import BaseModel, ConfigDict, Field, RootModel
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field, RootModel
 from typing import Annotated, Any, Literal
 from enum import Enum
 
@@ -8524,7 +8524,7 @@ class ImageGenerationThreadItem(BaseModel):
             description="Separate image-model receipt; never add these tokens to text inference.",
         ),
     ] = None
-    result: str
+    result: str | None
     revised_prompt: Annotated[str | None, Field(alias="revisedPrompt")] = None
     saved_path: Annotated[AbsolutePathBuf | None, Field(alias="savedPath")] = None
     status: str
@@ -8994,6 +8994,10 @@ class TurnTimingCounters(BaseModel):
         int | None,
         Field(
             alias="continuationAfterTruncationCount",
+            validation_alias=AliasChoices(
+                "continuationAfterTruncationCount",
+                "truncationInducedContinuationCount",
+            ),
             description="Tool-result generations immediately following provider-visible output that actually omitted or truncated canonical tool information. Temporal succession only: this does not establish an extra generation caused by truncation. Historical causal spelling is accepted on input.",
             ge=0,
         ),

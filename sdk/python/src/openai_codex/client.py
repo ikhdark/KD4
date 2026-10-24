@@ -19,7 +19,7 @@ from ._goal import _GoalOperationState
 from ._message_router import MessageRouter
 from ._run import _raise_for_failed_turn
 from ._version import __version__ as SDK_VERSION
-from .errors import CodexError, InvalidRequestError, TransportClosedError
+from .errors import CodexError, InvalidRequestError, MethodNotFoundError, TransportClosedError
 from .generated.notification_registry import NOTIFICATION_MODELS
 from .generated.v2_all import (
     AccountLoginCompletedNotification,
@@ -542,7 +542,14 @@ class CodexClient:
         *,
         response_model: type[ModelT],
     ) -> ModelT:
-        result = self._request_raw(method, params)
+        try:
+            result = self._request_raw(method, params)
+        except MethodNotFoundError as exc:
+            if method.startswith("thread/goal/"):
+                raise MethodNotFoundError(exc.code, "This runtime has retired thread goals. Use thread/turn operations; historical goal methods require an older compatible runtime.", exc.data) from exc
+            if method.startswith("externalAgentConfig/"):
+                raise MethodNotFoundError(exc.code, "This runtime does not support the legacy external-agent import API. Import with a compatible runtime version; no migration was performed.", exc.data) from exc
+            raise
         if not isinstance(result, dict):
             raise CodexError(f"{method} response must be a JSON object")
         return response_model.model_validate(result)
@@ -862,7 +869,7 @@ class CodexClient:
                 )
             return state, turn_id
         except BaseException as exc:
-            if activated or not isinstance(exc, InvalidRequestError):
+            if activated or not isinstance(exc, (InvalidRequestError, MethodNotFoundError)):
                 self.cancel_goal_operation(state)
             state.finish()
             self.unregister_goal_operation(state)

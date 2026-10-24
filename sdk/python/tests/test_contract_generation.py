@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import runpy
 import shutil
 import subprocess
@@ -11,6 +12,8 @@ from typing import get_args
 import pytest
 from pydantic import ValidationError
 
+from openai_codex.client import CodexClient
+from openai_codex.errors import MethodNotFoundError
 import openai_codex.generated.v2_all as generated_v2
 from openai_codex.generated.notification_registry import NOTIFICATION_MODELS
 from openai_codex.models import NotificationPayload, ServerInfo, UnknownNotification
@@ -20,6 +23,52 @@ GENERATED_TARGETS = [
     Path("src/openai_codex/generated"),
     Path("src/openai_codex/api.py"),
 ]
+
+
+def test_nullable_image_lifecycle_and_historical_timing_alias() -> None:
+    image = generated_v2.ImageGenerationThreadItem.model_validate(
+        {"type": "imageGeneration", "id": "image-1", "status": "inProgress", "result": None}
+    )
+    assert image.result is None
+    wire = {name: 0 for name, field in generated_v2.TurnTimingCounters.model_fields.items() if field.is_required()}
+    wire["truncationInducedContinuationCount"] = 7
+    timing = generated_v2.TurnTimingCounters.model_validate(wire)
+    assert timing.continuation_after_truncation_count == 7
+    assert timing.model_dump(by_alias=True)["continuationAfterTruncationCount"] == 7
+
+
+@pytest.mark.parametrize("method", ["thread/goal/clear", "externalAgentConfig/detect"])
+def test_retired_api_error_is_localized_and_does_not_retry(monkeypatch, method):
+    client = CodexClient.__new__(CodexClient)
+    calls = []
+    def missing(method, params):
+        calls.append(method)
+        raise MethodNotFoundError(-32601, "unknown method", {"version": "fixture"})
+    monkeypatch.setattr(client, "_request_raw", missing)
+    with pytest.raises(MethodNotFoundError) as raised:
+        client.request(method, {}, response_model=generated_v2.ThreadGoalClearResponse)
+    assert raised.value.code == -32601
+    assert raised.value.data == {"version": "fixture"}
+    assert "compatible runtime" in raised.value.message
+    assert calls == [method]
+
+
+@pytest.mark.parametrize("target", ["missing", "../missing-relative"])
+def test_sdk_publication_restores_dangling_symlink_after_later_failure(tmp_path, target):
+    generator = runpy.run_path(str(ROOT / "scripts/update_sdk_artifacts.py"))
+    destination = tmp_path / "generated"
+    try:
+        destination.symlink_to(target, target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"symlink creation is unavailable: {exc}")
+    staged = tmp_path / "stage"
+    staged.mkdir()
+    with pytest.raises(FileNotFoundError):
+        generator["_publish_staged_paths"]([
+            (staged, destination), (tmp_path / "absent-stage", tmp_path / "api.py")
+        ])
+    assert destination.is_symlink()
+    assert os.readlink(destination) == target
 
 
 def test_generated_wrappers_distinguish_omitted_service_tier() -> None:

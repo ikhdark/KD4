@@ -3,6 +3,11 @@
 Build Python applications that start Codex threads, run turns, stream progress,
 and control workspace access.
 
+Historical `thread/goal/*` and `externalAgentConfig/*` wrappers are retained for
+older compatible runtimes. Current KD4 retires those APIs; use ordinary
+thread/turn operations, and perform legacy imports with a compatible runtime.
+An unsupported call raises `MethodNotFoundError` without retrying or migrating data.
+
 ## Install
 
 Install the SDK:

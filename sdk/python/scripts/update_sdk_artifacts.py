@@ -752,7 +752,26 @@ def generate_v2_all(schema_dir: Path) -> None:
             cwd=sdk_root(),
         )
     _require_nullable_chatgpt_account_email(out_path)
+    _preserve_retained_wire_contracts(out_path)
     _normalize_generated_timestamps(out_path)
+
+
+def _preserve_retained_wire_contracts(out_path: Path) -> None:
+    """Keep runtime nullability and historical input aliases across regeneration."""
+    content = out_path.read_text()
+    content = re.sub(
+        r"(class ImageGenerationThreadItem\(BaseModel\):[\s\S]*?\n    result:) str(?=\n)",
+        r"\1 str | None",
+        content,
+        count=1,
+    )
+    canonical = 'alias="continuationAfterTruncationCount",'
+    compatible = canonical + '\n            validation_alias=AliasChoices(\n                "continuationAfterTruncationCount",\n                "truncationInducedContinuationCount",\n            ),'
+    if canonical in content and "validation_alias=AliasChoices(" not in content:
+        content = content.replace(canonical, compatible, 1)
+    if "AliasChoices(" in content and "from pydantic import AliasChoices," not in content:
+        content = content.replace("from pydantic import ", "from pydantic import AliasChoices, ", 1)
+    out_path.write_text(content)
 
 
 def _require_nullable_chatgpt_account_email(out_path: Path) -> None:
