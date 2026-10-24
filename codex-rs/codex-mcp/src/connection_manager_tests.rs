@@ -1161,6 +1161,27 @@ fn tool_with_model_visible_input_schema_leaves_tools_without_file_params_unchang
 }
 
 #[test]
+fn file_schema_refs_and_exclusive_object_alternatives_accept_local_paths() {
+    let mut tool = create_test_tool("files", "upload").tool;
+    tool.input_schema = Arc::new(serde_json::from_value(serde_json::json!({
+        "type":"object", "required":["file"],
+        "$defs":{"Uploaded":{"type":"object", "required":["uri"]}},
+        "properties":{"file":{"oneOf":[
+            {"$ref":"#/$defs/Uploaded"}, {"type":"object", "required":["id"]}, {"type":"null"}
+        ]}}
+    })).unwrap());
+    tool.meta = Some(MetaObject(serde_json::from_value(serde_json::json!({"openai/fileParams":["file"]})).unwrap()));
+    let projected = tool_with_model_visible_input_schema(&tool);
+    let schema = serde_json::to_value(projected.input_schema).unwrap();
+    assert!(schema["properties"]["file"].get("oneOf").is_none());
+    for branch in schema["properties"]["file"]["anyOf"].as_array().unwrap() {
+        assert!(branch.get("$ref").is_none());
+    }
+    assert_eq!(schema["properties"]["file"]["anyOf"][0]["type"], "string");
+    assert_eq!(schema["properties"]["file"]["anyOf"][2]["type"], "null");
+}
+
+#[test]
 fn file_schema_projection_preserves_nullable_arrays_and_composed_branches() {
     let mut tool = create_test_tool("files", "upload").tool;
     tool.input_schema = Arc::new(serde_json::from_value(serde_json::json!({

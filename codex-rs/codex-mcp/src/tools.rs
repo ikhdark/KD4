@@ -274,6 +274,17 @@ fn rewrite_input_property_schema_as_local_file_path(schema: &mut JsonValue) {
             for branch in branches { rewrite_input_property_schema_as_local_file_path(branch); }
         }
     }
+    // Distinct provider object variants may lower to the same local string.
+    // Exclusive alternatives would then reject that string for matching twice.
+    if let Some(branches) = object.remove("oneOf") {
+        if object.contains_key("anyOf") {
+            if let Some(all) = object.entry("allOf").or_insert_with(|| serde_json::json!([])).as_array_mut() {
+                all.push(serde_json::json!({"anyOf":branches}));
+            }
+        } else {
+            object.insert("anyOf".into(), branches);
+        }
+    }
 
     let mut description = object
         .get("description")
@@ -296,6 +307,9 @@ fn rewrite_input_property_schema_as_local_file_path(schema: &mut JsonValue) {
     }
 
     object.insert("description".to_string(), JsonValue::String(description));
+    // A provider-side reference/object constraint is not a local-path
+    // constraint. In particular, $ref applies alongside type in JSON Schema.
+    object.remove("$ref");
     if is_array {
         let items = object.entry("items").or_insert_with(|| serde_json::json!({}));
         let had_description = items.get("description").is_some();
@@ -306,9 +320,7 @@ fn rewrite_input_property_schema_as_local_file_path(schema: &mut JsonValue) {
     } else if !composed || object.contains_key("type") || object.contains_key("properties") {
         let nullable = object.get("type").and_then(JsonValue::as_array)
             .is_some_and(|types| types.iter().any(|kind| kind.as_str() == Some("null")));
-        for keyword in ["properties", "required", "additionalProperties", "enum", "const", "default", "examples"] {
-            object.remove(keyword);
-        }
+        object.retain(|key, _| matches!(key.as_str(), "description" | "title" | "anyOf" | "allOf"));
         object.insert("type".to_string(), if nullable {
             serde_json::json!(["string", "null"])
         } else { JsonValue::String("string".to_string()) });
