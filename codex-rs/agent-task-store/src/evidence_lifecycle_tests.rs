@@ -7,7 +7,20 @@ async fn admitted_read_only_roles_can_acquire_their_bound_source_evidence() {
     for role in [AgentRole::Explorer, AgentRole::Architect, AgentRole::Reviewer] {
         let fixture = Fixture::new().await;
         initialize_validation_repository(fixture.repo.path());
-        let mut draft = explorer_draft("read-only-proof", "src", "inspect source");
+        let mut draft = if role == AgentRole::Reviewer {
+            let (worker, worker_attempt) = fixture.store.create_assignment(fixture.repo.path(),
+                worker_draft("read-only-proof", "src")).await.unwrap();
+            fixture.store.submit_agent_receipt(worker_attempt.attempt_id, completed_receipt(Vec::new())).await.unwrap();
+            for kind in [GateKind::Review, GateKind::Verification] {
+                fixture.store.set_agent_gate(TaskActor::Root, worker.assignment_id, worker_attempt.attempt_id,
+                    kind, GateStatus::Passed, "fixture dependency accepted".into()).await.unwrap();
+            }
+            let mut reviewer = relation_draft("read-only-proof", role, worker.assignment_id);
+            reviewer.read_scope = vec![RepoScope {path:"src".into(), recursive:true}];
+            reviewer
+        } else {
+            explorer_draft("read-only-proof", "src", "inspect source")
+        };
         draft.role = role;
         draft.required_evidence = vec!["inspect:src/lib.rs".into()];
         draft.acceptance_criteria[0].evidence_policy = Some(CriterionEvidencePolicy {
@@ -21,9 +34,8 @@ async fn admitted_read_only_roles_can_acquire_their_bound_source_evidence() {
         let bytes = std::fs::read(path).unwrap();
         let reference = fixture.store.record_source_inspection(pending, "read-only-acquisition".into(),
             hex::encode(sha2::Sha256::digest(&bytes)), bytes.len() as u64).await.unwrap();
-        let mut receipt = completed_receipt(vec![reference.call_id.clone()]);
-        receipt.criterion_results[0].evidence_ref = Some(reference);
-        fixture.store.submit_agent_receipt(attempt.attempt_id, receipt).await.unwrap();
+        let call = fixture.store.get_validation_call(reference.call_id).await.unwrap().unwrap();
+        assert_eq!(call.verified_evidence_kind(), Some(CriterionEvidenceKind::SourceInspection));
     }
 }
 
