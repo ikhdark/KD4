@@ -1446,7 +1446,12 @@ impl ToolSearchHandler {
         let mut ambiguous = std::collections::BTreeSet::new();
         let terms = if self.exact_name_index.contains_key(&key.query) {
             vec![key.query.as_str()]
-        } else { key.query.split_whitespace().filter(|term| !term.starts_with('+')).collect() };
+        } else if key.query.split_whitespace().all(|term| {
+            self.exact_name_index.contains_key(term)
+                || (term.contains('_') && !term.starts_with('+'))
+        }) {
+            key.query.split_whitespace().collect()
+        } else { Vec::new() };
         for term in terms {
             let names = self.exact_name_index.get(term).into_iter().flatten()
                 .filter(|id| matches_source(id.info(&self.search_infos), key.source.as_deref()))
@@ -3631,6 +3636,17 @@ text('one-cell-complete');
             ),]
         );
         assert!(exact.unactivated_matches.is_empty());
+    }
+
+    #[test]
+    fn capability_prose_does_not_inherit_an_unrelated_exact_alias_collision() {
+        let handler = ToolSearchHandler::new(vec![
+            search_info("Search contacts by name", Some("contacts"), "contacts", "search"),
+            search_info("Search mail by sender", Some("mail"), "mail", "search"),
+            search_info("Find invoice records", Some("finance"), "finance", "find_invoice"),
+        ]);
+        assert!(handler.search("search invoice", 1).unwrap().exact_name_ambiguity.is_none());
+        assert!(handler.search("search", 1).unwrap().exact_name_ambiguity.is_some());
     }
 
     #[test]
