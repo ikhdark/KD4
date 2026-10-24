@@ -702,7 +702,8 @@ trait EnvSource {
 fn validate_rustls_ca_environment(
     env_source: &dyn EnvSource,
 ) -> Result<(), BuildCustomCaTransportError> {
-    if env_source.var(SSL_CERT_FILE_ENV).as_deref() == Some("") {
+    if env_source.non_empty_path(CODEX_CA_CERT_ENV).is_none()
+        && env_source.var(SSL_CERT_FILE_ENV).as_deref() == Some("") {
         return Err(BuildCustomCaTransportError::InvalidCaFile {
             source_env: SSL_CERT_FILE_ENV,
             path: PathBuf::new(),
@@ -964,6 +965,9 @@ mod tests {
             .unwrap_err();
         assert!(error.to_string().contains("unset SSL_CERT_FILE"));
         super::validate_rustls_ca_environment(&map_env(&[])).unwrap();
+        super::validate_rustls_ca_environment(&map_env(&[
+            (CODEX_CA_CERT_ENV, "/configured/codex.pem"), (SSL_CERT_FILE_ENV, ""),
+        ])).unwrap();
     }
 
     #[test]
