@@ -6761,16 +6761,31 @@ impl Session {
 
     pub(crate) async fn register_workspace_evidence<WorkspaceGateGuard: Send>(
         &self,
-        _observation: crate::tool_history::WorkspaceEvidenceObservation,
+        observation: crate::tool_history::WorkspaceEvidenceObservation,
         workspace_gate_guard: WorkspaceGateGuard,
     ) {
         drop(workspace_gate_guard);
+        self.register_workspace_evidence_batch(vec![observation]).await;
     }
 
     pub(crate) async fn register_workspace_evidence_batch(
         &self,
-        _observations: Vec<crate::tool_history::WorkspaceEvidenceObservation>,
-    ) {}
+        observations: Vec<crate::tool_history::WorkspaceEvidenceObservation>,
+    ) {
+        if observations.is_empty() { return; }
+        let Ok(_permit) = self.tool_history_reconciliation_gate.acquire().await else {
+            unreachable!("session-owned tool-history reconciliation semaphore is never closed");
+        };
+        let mut writer = self.tool_history_persistence.writer().await;
+        let mut state = self.state.lock().await;
+        for observation in observations {
+            let mutation = crate::tool_history::ToolHistoryMutation::RegisterWorkspaceEvidence { observation };
+            state.apply_tool_history_mutation(&mutation);
+            if let Err(err) = writer.enqueue_mutation(mutation, "native source acquisition metadata") {
+                tracing::warn!("failed to enqueue native source acquisition metadata: {err}");
+            }
+        }
+    }
 
     pub(crate) async fn register_code_mode_nested_evidence(
         &self,

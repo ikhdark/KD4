@@ -1656,11 +1656,29 @@ impl ToolCallRuntime {
     }
 
     async fn register_workspace_evidence_observation(
-        _session: &Session,
-        _turn: &TurnContext,
+        session: &Session,
+        turn: &TurnContext,
         input: WorkspaceEvidenceObservation<'_>,
     ) {
         drop(input.workspace_gate_guard);
+        // Record only already-acquired, scoped source output. Do not revive
+        // command freshness tracking or perform another source read.
+        if input.source_dependencies.is_empty() {
+            return;
+        }
+        let response = session.prepare_workspace_evidence_item(
+            &ResponseItem::from(input.response.clone()),
+            turn.model_info.truncation_policy.into(),
+        ).await;
+        if let Some(observation) = crate::tool_history::WorkspaceEvidenceObservation::from_response_item_with_freshness(
+            input.revision, &response, input.source_dependencies, input.captured_current,
+        ) {
+            session.register_workspace_evidence(
+                observation.with_source_scope_complete(input.source_scope_complete)
+                    .with_source_path_observations(input.source_path_observations),
+                (),
+            ).await;
+        }
     }
 
 
@@ -7083,6 +7101,39 @@ mod tests {
         follower
             .await
             .expect("queued workspace evidence task should join");
+    }
+
+    #[tokio::test]
+    async fn native_acquisition_registration_reaches_nested_read_status_without_rereading() {
+        let (session, turn) = crate::session::tests::make_session_and_context().await;
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("never-open-this-file.rs");
+        let output = serde_json::json!({
+            "path":path, "environment_id":"local", "canonical_uri":"file:///source",
+            "source_sha256":"acquired-snapshot", "canonical_bytes":4,
+            "results":[{"status":"ok", "complete":true, "text":"data",
+                "canonical_range":{"start":0,"end":4}}]
+        }).to_string();
+        let response = ResponseInputItem::FunctionCallOutput {
+            call_id:"native-acquisition".into(),
+            output:FunctionCallOutputPayload::from_text(output.clone()),
+        };
+        ToolCallRuntime::register_workspace_evidence_observation(&session, &turn,
+            WorkspaceEvidenceObservation {
+                response:&response, revision:None, captured_current:false,
+                source_scope_complete:true,
+                source_dependencies:std::collections::BTreeSet::from([
+                    crate::tool_history::SourceDependencyV1::new(&path, false),
+                ]),
+                source_path_observations:Vec::new(), workspace_gate_guard:None,
+            }).await;
+        session.register_code_mode_nested_evidence("outer-cell".into(), "native-acquisition".into(), output).await;
+        let coverage = session.clone_history().await.read_status_page(
+            std::slice::from_ref(&path), Some("local"), &crate::tool_history::ReadStatusQuery::default(),
+        );
+        assert_eq!(coverage["paths"][0]["status"], "observed");
+        assert_eq!(coverage["paths"][0]["snapshots"][0]["obtained_bytes"], 4);
+        assert!(!path.exists(), "registration must use the acquisition, not reopen source");
     }
 
     #[tokio::test]
