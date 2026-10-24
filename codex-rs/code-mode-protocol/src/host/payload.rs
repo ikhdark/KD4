@@ -121,17 +121,21 @@ pub struct WireToolDefinition {
 
 impl From<ToolDefinition> for WireToolDefinition {
     fn from(value: ToolDefinition) -> Self {
-        // Carry guidance separately without doubling its transport bytes. The
-        // receiver reconstructs the self-contained lazy-resolution contract.
-        let description = value.namespace_description.as_deref().map(str::trim)
-            .and_then(|guidance| value.description.strip_prefix(guidance))
-            .and_then(|rest| rest.strip_prefix("\n\n"))
-            .map(std::sync::Arc::from).unwrap_or_else(|| value.description.clone());
+        // V1 hosts reject unknown fields. Keep namespace guidance embedded in
+        // the existing description until a future wire capability negotiates
+        // the optional structured metadata.
+        let description = match value.namespace_description.as_deref().map(str::trim) {
+            Some(guidance) if !guidance.is_empty()
+                && !value.description.strip_prefix(guidance).is_some_and(|rest| rest.starts_with("\n\n")) => {
+                format!("{guidance}\n\n{}", value.description).into()
+            }
+            _ => value.description,
+        };
         Self {
             name: value.name,
             tool_name: value.tool_name.into(),
             description,
-            namespace_description: value.namespace_description,
+            namespace_description: None,
             kind: value.kind.into(),
             input_schema: value.input_schema,
             output_schema: value.output_schema,
@@ -587,6 +591,21 @@ fn bounded_clock_pair(
         }
     }
     None
+}
+
+#[cfg(test)]
+#[test]
+fn v1_tool_wire_omits_unnegotiated_namespace_metadata_but_keeps_guidance() {
+    let wire = WireToolDefinition::from(ToolDefinition {
+        name: "archive__search".into(),
+        tool_name: ToolName::namespaced("archive", "search"),
+        kind: CodeModeToolKind::Function, description: "Guidance\n\nContract".into(),
+        namespace_description: Some("Guidance".into()),
+        input_schema: None, output_schema: None, default_timeout_ms: None,
+    });
+    let value = serde_json::to_value(wire).unwrap();
+    assert!(value.get("namespace_description").is_none());
+    assert_eq!(value["description"], "Guidance\n\nContract");
 }
 
 #[cfg(test)]
