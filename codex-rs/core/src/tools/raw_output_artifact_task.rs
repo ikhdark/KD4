@@ -32,7 +32,8 @@ pub(crate) struct RawOutputArtifactTask {
 #[derive(Debug)]
 pub(crate) struct LegacyRawCapture {
     task: Option<RawOutputArtifactTask>,
-
+    inline: Vec<u8>,
+    gap: bool,
     attached: bool,
 }
 
@@ -56,14 +57,16 @@ pub(crate) fn current_legacy_capture() -> Option<SharedLegacyRawCapture> {
 
 impl LegacyRawCapture {
     pub(crate) fn write_chunk(&mut self, bytes: &[u8]) {
-
+        let remaining = super::MAX_RAW_OUTPUT_ARTIFACT_BYTES.saturating_sub(self.inline.len());
+        self.inline.extend_from_slice(&bytes[..bytes.len().min(remaining)]);
+        self.gap |= bytes.len() > remaining;
         if let Some(task) = &mut self.task {
             task.write_chunk(bytes);
         }
     }
 
     pub(crate) fn mark_output_gap(&mut self) {
-
+        self.gap = true;
         if let Some(task) = &mut self.task {
             task.mark_output_gap();
         }
@@ -84,14 +87,15 @@ pub(crate) async fn capture_legacy_output<F: std::future::Future>(
     let state = Arc::new(Mutex::new(RawOutputArtifact::pending(home, thread_id)));
     let capture = Arc::new(std::sync::Mutex::new(LegacyRawCapture {
         task: RawOutputArtifactTask::spawn(Some(Arc::clone(&state)), CancellationToken::new()),
-
+        inline: Vec::new(),
+        gap: false,
         attached: false,
     }));
     let output = LEGACY_RAW_CAPTURE.scope(Arc::clone(&capture), future).await;
     // Never hold the reader's synchronous lock while waiting for storage.
-    let (task, attached) = {
+    let (task, inline, gap, attached) = {
         let mut capture = capture.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        (capture.task.take(), capture.attached)
+        (capture.task.take(), std::mem::take(&mut capture.inline), capture.gap, capture.attached)
     };
     if !attached {
         drop(task);
@@ -104,12 +108,13 @@ pub(crate) async fn capture_legacy_output<F: std::future::Future>(
         task.finish().await;
     }
     let artifact = state.lock().await.clone();
-
+    let mut canonical = codex_tools::CanonicalToolResult::bytes(inline);
+    canonical.complete = !gap;
     (
         output,
         CapturedShellOutput {
             artifact,
-            canonical: None,
+            canonical: Some(canonical),
         },
     )
 }
@@ -406,6 +411,29 @@ pub(crate) async fn read_command_log(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn legacy_shell_canonical_bytes_are_bounded_and_never_manufactured_empty() {
+        let home = tempfile::tempdir().unwrap();
+        for gap in [false, true] {
+            let (_, capture) = capture_legacy_output(home.path(), "canonical", async {
+                let shared = current_legacy_capture().unwrap();
+                let mut sink = shared.lock().unwrap();
+                sink.write_chunk(b"hello\r\n\0\xff");
+                if gap { sink.mark_output_gap(); }
+            }).await;
+            let canonical = capture.canonical.unwrap();
+            assert_eq!(canonical.bytes, b"hello\r\n\0\xff");
+            assert_eq!(canonical.complete, !gap);
+        }
+        let (_, capture) = capture_legacy_output(home.path(), "overflow", async {
+            current_legacy_capture().unwrap().lock().unwrap()
+                .write_chunk(&vec![b'x'; super::super::MAX_RAW_OUTPUT_ARTIFACT_BYTES + 1]);
+        }).await;
+        let canonical = capture.canonical.unwrap();
+        assert_eq!(canonical.bytes.len(), super::super::MAX_RAW_OUTPUT_ARTIFACT_BYTES);
+        assert!(!canonical.complete);
+        assert!(capture.artifact.capture_finalized_complete());
+    }
     #[tokio::test]
     async fn command_lines_preserve_batch_progress_and_skip_large_preceding_lines() {
         let home = tempfile::tempdir().unwrap();
