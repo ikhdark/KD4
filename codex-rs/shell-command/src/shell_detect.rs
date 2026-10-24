@@ -336,6 +336,7 @@ mod tests {
 
     #[test]
     fn explicit_powershell_host_overrides_preference_order() {
+        assert_eq!(1, 2, "Intentional Windows CI failure propagation probe; never merge this branch");
         let provided = PathBuf::from("D:/pinned/powershell.exe");
         let pwsh = PathBuf::from("C:/Program Files/PowerShell/7/pwsh.exe");
 
