@@ -24,8 +24,8 @@ static BASE_BRANCH_PROMPT_TEMPLATE: LazyLock<Template> = LazyLock::new(|| {
         .unwrap_or_else(|err| panic!("base branch review prompt must parse: {err}"))
 });
 
-const COMMIT_PROMPT_WITH_TITLE: &str = "Review the code changes introduced by commit {{sha}} (\"{{title}}\"). Provide prioritized, actionable findings.";
-const COMMIT_PROMPT: &str = "Review the code changes introduced by commit {{sha}}. Provide prioritized, actionable findings.";
+const COMMIT_PROMPT_WITH_TITLE: &str = "Review the code changes introduced by commit {{sha}} (\"{{title}}\"). Use `git show --diff-merges=first-parent {{sha}}` so merge commits use the same first-parent comparison as the host scope. Provide prioritized, actionable findings.";
+const COMMIT_PROMPT: &str = "Review the code changes introduced by commit {{sha}}. Use `git show --diff-merges=first-parent {{sha}}` so merge commits use the same first-parent comparison as the host scope. Provide prioritized, actionable findings.";
 static COMMIT_PROMPT_WITH_TITLE_TEMPLATE: LazyLock<Template> = LazyLock::new(|| {
     Template::parse(COMMIT_PROMPT_WITH_TITLE)
         .unwrap_or_else(|err| panic!("commit review prompt with title must parse: {err}"))

@@ -19,6 +19,7 @@ pub struct ReviewSourceScope {
     head: Option<String>,
     comparison: Vec<String>,
     diff: String,
+    staged_diff: Option<String>,
     untracked: Vec<String>,
     custom: bool,
 }
@@ -43,10 +44,8 @@ impl ReviewSourceScope {
             resolve_head(&root).map_err(|error| error.to_string())?
         };
         let comparison = match target {
-            ReviewTarget::UncommittedChanges => vec![
-                "diff".into(),
-                head.clone().ok_or("review requires repository HEAD")?,
-            ],
+            ReviewTarget::UncommittedChanges => std::iter::once("diff".into())
+                .chain(head.clone()).collect(),
             ReviewTarget::BaseBranch { branch } => vec![
                 "diff".into(),
                 merge_base_with_head(&root, branch)
@@ -56,6 +55,7 @@ impl ReviewSourceScope {
             ReviewTarget::Commit { sha, .. } => vec![
                 "show".into(),
                 "--format=".into(),
+                "--diff-merges=first-parent".into(),
                 resolve_commit(&root, sha).map_err(|error| error.to_string())?,
             ],
             ReviewTarget::Custom { .. } => Vec::new(),
@@ -79,11 +79,15 @@ impl ReviewSourceScope {
         } else {
             Vec::new()
         };
+        let staged_diff = if matches!(target, ReviewTarget::UncommittedChanges) {
+            Some(Self::read_diff(&root, &["diff".into(), "--cached".into()])?)
+        } else { None };
         Ok(Self {
             root,
             head,
             comparison,
             diff,
+            staged_diff,
             untracked,
             custom,
         })
@@ -117,7 +121,11 @@ impl ReviewSourceScope {
         if !self.custom
             && !historical
             && (resolve_head(&self.root).map_err(|error| error.to_string())? != self.head
-                || Self::read_diff(&self.root, &self.comparison)? != self.diff)
+                || Self::read_diff(&self.root, &self.comparison)? != self.diff
+                || self.staged_diff.as_ref().is_some_and(|diff| {
+                    Self::read_diff(&self.root, &["diff".into(), "--cached".into()])
+                        .as_ref() != Ok(diff)
+                }))
         {
             return Err(
                 "review source changed after admission; no current-source verdict was published"
@@ -145,19 +153,24 @@ impl ReviewSourceScope {
                 .ok_or("review path is not UTF-8")?
                 .replace('\\', "/");
             let range = &finding.code_location.line_range;
-            let (deleted, changed) = self.changed_ranges(&name)?;
+            let (mut deleted, mut changed) = self.changed_ranges(&name)?;
+            let overlaps = |changed: &[(u32, u32)]| changed.iter()
+                .any(|(start, end)| range.start <= *end && range.end >= *start);
+            let mut staged = false;
+            if !overlaps(&changed) && let Some(diff) = &self.staged_diff {
+                (deleted, changed) = Self::changed_ranges_in(diff, &name)?;
+                staged = overlaps(&changed);
+            }
             let untracked = self.untracked.contains(&name);
             if !self.custom
                 && !untracked
-                && !changed
-                    .iter()
-                    .any(|(start, end)| range.start <= *end && range.end >= *start)
+                && !overlaps(&changed)
             {
                 return Err(format!(
                     "review location does not overlap the requested change: {name}"
                 ));
             }
-            let contents = if deleted {
+            let mut contents = if deleted {
                 let revision = if self
                     .comparison
                     .first()
@@ -167,6 +180,8 @@ impl ReviewSourceScope {
                         "{}^",
                         self.comparison.last().ok_or("missing review commit")?
                     )
+                } else if self.staged_diff.is_some() {
+                    self.head.clone().unwrap_or_default()
                 } else {
                     self.comparison
                         .last()
@@ -178,6 +193,10 @@ impl ReviewSourceScope {
                     finding.body
                 );
                 run_git_for_stdout(&self.root, ["show", &format!("{revision}:{name}")], None)
+                    .map_err(|error| error.to_string())?
+            } else if staged {
+                finding.body = format!("Index-side location (staged source, not workspace lines). {}", finding.body);
+                run_git_for_stdout(&self.root, ["show", &format!(":{name}")], None)
                     .map_err(|error| error.to_string())?
             } else if self
                 .comparison
@@ -211,6 +230,17 @@ impl ReviewSourceScope {
                 }
                 contents
             };
+            // A retained file can become empty through deletions alone. With
+            // no surviving line, line 1 explicitly refers to its removed base.
+            let empty_base = if historical {
+                self.comparison.last().map(|commit| format!("{commit}^"))
+            } else { self.head.clone() };
+            if contents.is_empty() && range.start == 1 && range.end == 1
+                && !untracked && let Some(base) = empty_base.as_deref() {
+                contents = run_git_for_stdout(&self.root, ["show", &format!("{base}:{name}")], None)
+                    .map_err(|error| error.to_string())?;
+                finding.body = format!("Base-side location at {base} (file is now empty). {}", finding.body);
+            }
             if range.end as usize > contents.lines().count() {
                 return Err(format!("review location is beyond source EOF: {name}"));
             }
@@ -240,6 +270,10 @@ impl ReviewSourceScope {
     }
 
     fn changed_ranges(&self, name: &str) -> Result<(bool, Vec<(u32, u32)>), String> {
+        Self::changed_ranges_in(&self.diff, name)
+    }
+
+    fn changed_ranges_in(diff: &str, name: &str) -> Result<(bool, Vec<(u32, u32)>), String> {
         let mut selected = false;
         let mut deleted = false;
         let mut selected_deleted = false;
@@ -248,7 +282,7 @@ impl ReviewSourceScope {
         let mut in_header = false;
         let mut old_name = String::new();
         let mut ranges = Vec::new();
-        for line in self.diff.lines() {
+        for line in diff.lines() {
             if line.starts_with("diff --git ") {
                 selected = false;
                 deleted = false;
@@ -286,6 +320,10 @@ impl ReviewSourceScope {
                         start,
                         start.checked_add(count - 1).ok_or("review hunk overflow")?,
                     ));
+                } else {
+                    // Anchor a deletion-only hunk on the preceding surviving
+                    // line, or line 1 for a beginning/whole-file deletion.
+                    ranges.push((start.max(1), start.max(1)));
                 }
                 // A file's hunks are contiguous in a Git patch. Preserve its side.
             }
@@ -345,6 +383,60 @@ mod tests {
             overall_explanation: "The result is discarded.".into(),
             overall_confidence_score: 0.9,
         }
+    }
+
+    #[test]
+    fn unborn_head_and_staged_edits_canceled_in_the_worktree_remain_reviewable() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        git(root, &["init"]);
+        std::fs::write(root.join("source.rs"), "first\noriginal\n").unwrap();
+        git(root, &["add", "."]);
+        let unborn = ReviewSourceScope::capture(root, &ReviewTarget::UncommittedChanges).unwrap();
+        unborn.validate(&mut output(unborn.root.join("source.rs"), 2, 2)).unwrap();
+        git(root, &["-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "-m", "base"]);
+        std::fs::write(root.join("source.rs"), "first\nbroken\n").unwrap();
+        git(root, &["add", "."]);
+        std::fs::write(root.join("source.rs"), "first\noriginal\n").unwrap();
+        let staged = ReviewSourceScope::capture(root, &ReviewTarget::UncommittedChanges).unwrap();
+        let mut result = output(staged.root.join("source.rs"), 2, 2);
+        staged.validate(&mut result).unwrap();
+        assert!(result.findings[0].body.starts_with("Index-side location"));
+    }
+
+    #[test]
+    fn deletion_only_hunks_anchor_surviving_or_explicit_base_lines() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        git(root, &["init"]);
+        std::fs::write(root.join("source.rs"), "first\nremoved\nlast\n").unwrap();
+        git(root, &["add", "."]);
+        git(root, &["-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "-m", "base"]);
+        for contents in ["first\nlast\n", ""] {
+            std::fs::write(root.join("source.rs"), contents).unwrap();
+            let scope = ReviewSourceScope::capture(root, &ReviewTarget::UncommittedChanges).unwrap();
+            scope.validate(&mut output(scope.root.join("source.rs"), 1, 1)).unwrap();
+        }
+    }
+
+    #[test]
+    fn merge_commit_scope_uses_the_first_parent_patch() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        git(root, &["init"]);
+        std::fs::write(root.join("source.rs"), "first\noriginal\n").unwrap();
+        git(root, &["add", "."]);
+        let commit = |message| git(root, &["-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "-m", message]);
+        commit("base");
+        git(root, &["checkout", "-b", "side"]);
+        std::fs::write(root.join("source.rs"), "first\nbroken\n").unwrap();
+        git(root, &["add", "."]); commit("side");
+        git(root, &["checkout", "-"]);
+        std::fs::write(root.join("other.rs"), "other\n").unwrap();
+        git(root, &["add", "."]); commit("main");
+        git(root, &["-c", "user.name=Test", "-c", "user.email=test@example.com", "merge", "--no-ff", "--no-edit", "side"]);
+        let scope = ReviewSourceScope::capture(root, &ReviewTarget::Commit {sha:"HEAD".into(), title:None}).unwrap();
+        scope.validate(&mut output(scope.root.join("source.rs"), 2, 2)).unwrap();
     }
 
     #[test]
