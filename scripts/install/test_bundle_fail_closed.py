@@ -27,7 +27,7 @@ class ReleaseProfileConfigurationTest(unittest.TestCase):
         profiles = tomllib.loads(manifest.read_text(encoding="utf-8"))["profile"]
         release = profiles["release"]
         for name, expected in {
-            "opt-level": 3, "lto": "fat", "codegen-units": 1, "incremental": False,
+            "opt-level": 3, "lto": "thin", "codegen-units": 4, "incremental": False,
         }.items():
             with self.subTest(setting=name):
                 self.assertEqual(release[name], expected)
@@ -102,7 +102,7 @@ class LocalBundleFailClosedTest(unittest.TestCase):
                 if (@($config | Where-Object { $_ -match 'rustc(-workspace)?-wrapper' }).Count -ne 0) {
                     throw "Final unexpectedly bypassed wrappers: $proof"
                 }
-                if (@($proof | Where-Object { $_ -like '*local-final:*fat LTO*codegen-units=1*' }).Count -ne 1) {
+                if (@($proof | Where-Object { $_ -like '*local-final:*thin LTO, codegen-units=4, dependency-codegen-units=1,*' }).Count -ne 1) {
                     throw "Final proof does not describe final-publish settings: $proof"
                 }
                 """,

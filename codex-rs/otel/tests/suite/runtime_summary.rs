@@ -200,7 +200,7 @@ async fn wrapper_counts_include_abandonment_exactly_once() -> Result<()> {
         &[],
         std::future::pending::<std::result::Result<(), &str>>,
         |_| true,
-        |_| panic!("abandonment must not render"),
+        |_| -> &'static str { panic!("abandonment must not render") },
     ));
     assert!(
         tool.as_mut()
@@ -218,7 +218,7 @@ async fn wrapper_counts_include_abandonment_exactly_once() -> Result<()> {
                 &[],
                 || async { if success { Ok(42) } else { Err("failed") } },
                 |_| true,
-                |_| "ok".into(),
+                |_| "ok",
             )
             .await;
         assert_eq!(result.is_ok(), success);

@@ -27,6 +27,11 @@ tokio::task_local! {
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct TransportTiming {
+    /// Concrete reqwest handoff, not proof of a socket write or provider receipt.
+    pub send_started_at: Option<std::time::Instant>,
+    pub response_headers_at: Option<std::time::Instant>,
+    /// First nonempty raw response-body chunk, before SSE framing/decoding.
+    pub first_response_body_byte_at: Option<std::time::Instant>,
     pub response_headers: Option<std::time::Duration>,
     pub proxy_resolution: Option<std::time::Duration>,
     pub client_pool_selection: Option<std::time::Duration>,
@@ -65,6 +70,48 @@ pub(crate) fn record_timing(update: impl FnOnce(&mut TransportTiming)) {
         update(&mut timing);
         slot.set(timing);
     });
+}
+
+pub(crate) fn record_send_started() {
+    record_timing(|timing| {
+        timing
+            .send_started_at
+            .get_or_insert_with(std::time::Instant::now);
+    });
+}
+
+pub(crate) fn record_headers_received() {
+    record_timing(|timing| {
+        timing
+            .response_headers_at
+            .get_or_insert_with(std::time::Instant::now);
+    });
+}
+
+/// Same-task scalar observations only: no locks, atomics, logging, or IO.
+pub fn record_first_response_body_byte() {
+    record_timing(|timing| {
+        timing
+            .first_response_body_byte_at
+            .get_or_insert_with(std::time::Instant::now);
+    });
+}
+
+pub fn current_transport_timing() -> TransportTiming {
+    TRANSPORT_TIMING
+        .try_with(std::cell::Cell::get)
+        .unwrap_or_default()
+}
+
+/// Reuses the request-local timing slot in a spawned stream owner. This wraps
+/// the already-polled future without spawning work or adding an async wait.
+pub fn with_transport_timing<F: std::future::Future>(
+    future: F,
+) -> impl std::future::Future<Output = F::Output> {
+    TRANSPORT_TIMING.scope(
+        std::cell::Cell::new(TransportTiming::default()),
+        future,
+    )
 }
 
 /// Collect a bounded diagnostic prefix under one deadline. Failure headers

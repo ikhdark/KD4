@@ -7226,6 +7226,43 @@ impl RequestTelemetry for ApiTelemetry {
         );
     }
 
+    fn on_transport_phase_with_timing(
+        &self,
+        attempt: u64,
+        observation: TransportPhaseObservation,
+        timing: &codex_http_client::TransportTiming,
+        headers: Option<&ApiHeaderMap>,
+    ) {
+        self.last_attempt.store(attempt, Ordering::Relaxed);
+        let identity = self.model_request.as_ref().map(|request| &request.identity);
+        let provider_request_id = headers
+            .and_then(|headers| headers.get("x-request-id"))
+            .and_then(|value| value.to_str().ok())
+            .filter(|value| {
+                !value.is_empty() && value.len() <= 256 && value.bytes().all(|byte| {
+                    byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.')
+                })
+            });
+        let response_start = codex_otel::ResponseStartTelemetry::from_transport_timing(
+            timing,
+            identity.map(|identity| identity.sampling_request_id.as_str()),
+            identity.map(|identity| identity.physical_attempt_id.as_str()),
+            provider_request_id,
+        );
+        // Replaces the existing phase emission: no extra event or lock.
+        self.session_telemetry
+            .record_transport_phase_with_response_start(
+                &self.logical_request_id,
+                attempt,
+                observation.phase.as_str(),
+                observation.duration,
+                observation.wire_bytes,
+                observation.provenance,
+                observation.unavailable_reason,
+                Some(&response_start),
+            );
+    }
+
     fn on_request(
         &self,
         attempt: u64,
@@ -7327,12 +7364,22 @@ impl SseTelemetry for ApiTelemetry {
     }
 
     fn on_sse_phase(&self, phase: SsePollPhase, ordinal: u64, duration: Duration) {
-        self.session_telemetry.record_sse_phase(
+        let identity = self.model_request.as_ref().map(|request| &request.identity);
+        let response_start = (ordinal == 0).then(|| {
+            codex_otel::ResponseStartTelemetry::from_transport_timing(
+                &codex_http_client::current_transport_timing(),
+                identity.map(|identity| identity.sampling_request_id.as_str()),
+                identity.map(|identity| identity.physical_attempt_id.as_str()),
+                None,
+            )
+        });
+        self.session_telemetry.record_sse_phase_with_response_start(
             &self.logical_request_id,
             self.last_attempt.load(Ordering::Relaxed),
             phase.as_str(),
             Some(ordinal),
             duration,
+            response_start.as_ref(),
         );
     }
 

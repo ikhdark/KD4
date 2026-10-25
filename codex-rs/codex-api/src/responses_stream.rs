@@ -257,6 +257,9 @@ impl ResponsesEventInterpreter {
                 .or_else(|| event.headers.as_ref().and_then(header_openai_model_value_from_json));
             tracing::info!(event.name = "codex.provider_reported_model",
                 response_id = response.id.as_ref().and_then(|value| value.as_str()).unwrap_or_default(),
+                reported_service_tier = response.service_tier.as_ref().and_then(|value| value.as_str())
+                    .filter(|tier| tier.len() <= 64 && tier.bytes().all(|byte|
+                        byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))),
                 reported_model, provenance = "response.model", header_model,
                 "provider-reported identity; not an inferred reroute reason");
         }
@@ -369,6 +372,7 @@ pub(crate) struct ResponsesStreamEvent<'a> {
 #[derive(Debug, Deserialize)]
 struct ResponseEnvelope {
     id: Option<Value>,
+    service_tier: Option<Value>,
     model: Option<Value>,
     usage: Option<Value>,
     end_turn: Option<Value>,

@@ -3065,7 +3065,7 @@ function Invoke-CodexBuild {
     $effectiveNoSccache = [bool]$NoSccache -or $null -ne $pgo
     $cargoConfigLines = @(Get-LocalPublishCargoConfigLines -Profile $Profile -DisableSccache $effectiveNoSccache -Pgo $pgo)
     if ($Profile -eq "local-release") {
-        Write-ProofLine "releaseProfile" "local-final: opt-level=3, fat LTO, codegen-units=1, dependency-codegen-units=1, incremental=false"
+        Write-ProofLine "releaseProfile" "local-final: opt-level=3, thin LTO, codegen-units=4, dependency-codegen-units=1, incremental=false"
     }
     if ($Profile -in @("local-release", "local-pgo-instrumented", "local-pgo")) {
         Write-ProofLine "linkerOptimization" "Windows MSVC: /OPT:REF, /OPT:ICF"

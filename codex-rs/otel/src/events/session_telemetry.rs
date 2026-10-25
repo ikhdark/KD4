@@ -439,6 +439,39 @@ pub struct ModelAttemptTelemetry {
     pub completed_us: u64,
 }
 
+/// Passive enrichment of existing phase records; never a separate log/metric.
+/// IDs identify the enclosing API attempt; the phase's `attempt` field identifies
+/// its lower HTTP retry. All timestamps use protocol::timing's process domain.
+pub struct ResponseStartTelemetry<'a> {
+    pub sampling_request_id: Option<&'a str>,
+    pub physical_attempt_id: Option<&'a str>,
+    pub provider_request_id: Option<&'a str>,
+    pub request_send_started_ns: Option<u64>,
+    pub response_headers_received_ns: Option<u64>,
+    pub first_response_body_byte_ns: Option<u64>,
+}
+
+impl<'a> ResponseStartTelemetry<'a> {
+    pub fn from_transport_timing(
+        timing: &codex_http_client::TransportTiming,
+        sampling_request_id: Option<&'a str>,
+        physical_attempt_id: Option<&'a str>,
+        provider_request_id: Option<&'a str>,
+    ) -> Self {
+        fn timestamp(at: Option<std::time::Instant>) -> Option<u64> {
+            u64::try_from(codex_protocol::timing::process_monotonic_ns_at(at?)?).ok()
+        }
+        Self {
+            sampling_request_id,
+            physical_attempt_id,
+            provider_request_id,
+            request_send_started_ns: timestamp(timing.send_started_at),
+            response_headers_received_ns: timestamp(timing.response_headers_at),
+            first_response_body_byte_ns: timestamp(timing.first_response_body_byte_at),
+        }
+    }
+}
+
 fn signed_u64_difference(lhs: u64, rhs: u64) -> i64 {
     i128::from(lhs)
         .saturating_sub(i128::from(rhs))
@@ -1061,6 +1094,24 @@ impl SessionTelemetry {
         provenance: &str,
         unavailable_reason: Option<&str>,
     ) {
+        self.record_transport_phase_with_response_start(
+            logical_request_id, attempt, phase, duration, wire_bytes,
+            provenance, unavailable_reason, None,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_transport_phase_with_response_start(
+        &self,
+        logical_request_id: &str,
+        attempt: u64,
+        phase: &str,
+        duration: Option<Duration>,
+        wire_bytes: Option<u64>,
+        provenance: &str,
+        unavailable_reason: Option<&str>,
+        response_start: Option<&ResponseStartTelemetry<'_>>,
+    ) {
         let available = unavailable_reason.is_none();
         let available_str = if available { "true" } else { "false" };
         let tags = [("phase", phase), ("available", available_str)];
@@ -1082,6 +1133,15 @@ impl SessionTelemetry {
             self,
             common: {
                 event.name = "codex.transport_phase",
+                clock_id = response_start.map(|_| codex_protocol::timing::process_clock_domain_id()),
+                sampling_request_id = response_start.and_then(|value| value.sampling_request_id),
+                physical_attempt_id = response_start.and_then(|value| value.physical_attempt_id),
+                provider_request_id = response_start.and_then(|value| value.provider_request_id),
+                requested_service_tier = self.metadata.service_tier.as_deref(),
+                request_send_started_ns = response_start.and_then(|value| value.request_send_started_ns),
+                request_send_completed_ns = None::<u64>,
+                send_completion_unavailable_reason = response_start.map(|_| "reqwest does not expose upload completion"),
+                response_headers_received_ns = response_start.and_then(|value| value.response_headers_received_ns),
                 logical_request_id = logical_request_id,
                 attempt = attempt,
                 phase = phase,
@@ -1103,6 +1163,21 @@ impl SessionTelemetry {
         ordinal: Option<u64>,
         duration: Duration,
     ) {
+        self.record_sse_phase_with_response_start(
+            logical_request_id, attempt, phase, ordinal, duration, None,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_sse_phase_with_response_start(
+        &self,
+        logical_request_id: &str,
+        attempt: u64,
+        phase: &str,
+        ordinal: Option<u64>,
+        duration: Duration,
+        response_start: Option<&ResponseStartTelemetry<'_>>,
+    ) {
         let tags = [("phase", phase)];
         self.record_count_and_duration(
             "codex.sse_phase.count",
@@ -1115,6 +1190,10 @@ impl SessionTelemetry {
             self,
             common: {
                 event.name = "codex.sse_phase",
+                clock_id = response_start.map(|_| codex_protocol::timing::process_clock_domain_id()),
+                sampling_request_id = response_start.and_then(|value| value.sampling_request_id),
+                physical_attempt_id = response_start.and_then(|value| value.physical_attempt_id),
+                first_response_body_byte_ns = response_start.and_then(|value| value.first_response_body_byte_ns),
                 logical_request_id = logical_request_id,
                 attempt = attempt,
                 phase = phase,

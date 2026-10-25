@@ -3,22 +3,22 @@ packages:
   - sdk/typescript
 
 overrides:
-  "@modelcontextprotocol/sdk": 1.26.0
+  "@modelcontextprotocol/sdk": 1.32.1
   braces: ^3.0.3
-  esbuild: 0.28.1
-  fast-uri: 3.1.1
-  flatted: 3.4.2
+  esbuild: 0.28.2
+  fast-uri: 3.1.8
+  flatted: 3.4.4
   "glob@10.4.5": 10.5.0
-  handlebars: 4.7.9
-  hono: 4.12.25
+  handlebars: 4.7.10
+  hono: 4.13.13
   micromatch: ^4.0.8
-  "minimatch@3.1.2": 3.1.4
-  "minimatch@9.0.5": 9.0.7
-  path-to-regexp: 8.4.0
+  "minimatch@3.1.2": 3.1.5
+  "minimatch@9.0.5": 9.0.9
+  path-to-regexp: 8.4.2
   "picomatch@2.3.1": 2.3.2
-  "picomatch@4.0.3": 4.0.4
+  "picomatch@4.0.3": 4.0.7
   punycode: ^2.3.1
-  rollup: 4.59.0
+  rollup: 4.64.8
   semver: ^7.7.1
 
 minimumReleaseAge: 10080

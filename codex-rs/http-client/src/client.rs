@@ -137,7 +137,12 @@ impl HttpClient {
         mut request: reqwest::Request,
     ) -> Result<reqwest::Response, reqwest::Error> {
         request.headers_mut().extend(trace_headers());
-        self.inner.execute(request).await
+        crate::transport::record_send_started();
+        let result = self.inner.execute(request).await;
+        if result.is_ok() {
+            crate::transport::record_headers_received();
+        }
+        result
     }
 
     pub(crate) fn log_response(&self, method: &Method, url: &str, response: &reqwest::Response) {
@@ -298,7 +303,12 @@ impl RequestBuilder {
         let result = match request {
             Ok(mut request) => {
                 apply_default_headers(request.headers_mut(), &self.default_headers);
-                client.execute(request).await
+                crate::transport::record_send_started();
+                let result = client.execute(request).await;
+                if result.is_ok() {
+                    crate::transport::record_headers_received();
+                }
+                result
             }
             Err(error) => Err(error),
         };

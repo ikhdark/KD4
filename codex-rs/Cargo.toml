@@ -296,7 +296,7 @@ keyring = { version = "3.6", default-features = false }
 libsqlite3-sys = { version = "0.37", default-features = false }
 libc = "0.2"
 log = "0.4"
-lru = "0.18.2"
+lru = "0.19.0"
 maplit = "1.0.2"
 memchr = "2.7.6"
 mime_guess = "2.0.5"
@@ -509,7 +509,7 @@ debug = "none"
 
 [profile.release]
 opt-level = 3
-lto = "fat"
+lto = "thin"
 debug = "line-tables-only"
 split-debuginfo = "off"
 # Release archives do not publish a separate symbol bundle. Strip symbols in
@@ -517,7 +517,7 @@ split-debuginfo = "off"
 strip = "symbols"
 
 # Final publish and ordinary release share one source of optimization settings.
-codegen-units = 1
+codegen-units = 4
 incremental = false
 
 [profile.release.package."*"]

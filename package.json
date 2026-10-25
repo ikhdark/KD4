@@ -11,7 +11,7 @@
   },
   "devDependencies": {
     "markdownlint-cli2": "0.18.1",
-    "prettier": "^3.9.6"
+    "prettier": "^3.9.10"
   },
   "engines": {
     "node": ">=22.22.2",

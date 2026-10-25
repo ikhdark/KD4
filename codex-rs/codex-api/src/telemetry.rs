@@ -110,6 +110,10 @@ pub trait WebsocketTelemetry: Send + Sync {
 
 pub(crate) trait WithStatus {
     fn status(&self) -> StatusCode;
+
+    fn headers(&self) -> Option<&http::HeaderMap> {
+        None
+    }
 }
 
 fn http_status(err: &TransportError) -> Option<StatusCode> {
@@ -123,11 +127,19 @@ impl WithStatus for Response {
     fn status(&self) -> StatusCode {
         self.status
     }
+
+    fn headers(&self) -> Option<&http::HeaderMap> {
+        Some(&self.headers)
+    }
 }
 
 impl WithStatus for StreamResponse {
     fn status(&self) -> StatusCode {
         self.status
+    }
+
+    fn headers(&self) -> Option<&http::HeaderMap> {
+        Some(&self.headers)
     }
 }
 
@@ -212,6 +224,11 @@ where
     let duration = start.elapsed();
     observation.telemetry = None;
     if let Some(t) = telemetry.as_ref() {
+        let headers = match &result {
+            Ok(response) => response.headers(),
+            Err(TransportError::Http { headers, .. }) => headers.as_ref(),
+            Err(_) => None,
+        };
         emit_transport_phases(t.as_ref(), attempt, &timing);
         t.on_transport_phase(
             attempt,
@@ -223,7 +240,7 @@ where
                 unavailable_reason: Some("upload timing is opaque inside reqwest"),
             },
         );
-        t.on_transport_phase(
+        t.on_transport_phase_with_timing(
             attempt,
             TransportPhaseObservation {
                 phase: TransportPhase::ResponseHeaders,
@@ -238,6 +255,8 @@ where
                     "attempt includes authentication and may include response body reads",
                 ),
             },
+            &timing,
+            headers,
         );
         let (status, err) = match &result {
             Ok(resp) => (Some(resp.status()), None),

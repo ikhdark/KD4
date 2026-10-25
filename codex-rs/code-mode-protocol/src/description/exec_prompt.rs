@@ -4,12 +4,12 @@ const LAZY_NESTED_TOOL_SCHEMA_GUIDANCE: &str = r#"Stable built-in contracts may 
 pub(crate) const EXEC_DESCRIPTION_TEMPLATE: &str = r#"Run raw JavaScript, not JSON/Markdown; no browser/Node globals or filesystem/network.
 - Nested tools: const r = await tools.exec_command({cmd:"..."}); text(r.output); console.log aliases text.
 - Edit via apply_patch: nested if registered, otherwise direct (*** Begin Patch envelope); never pipe patches through shell.
-- exec_command waits; one still running after the default wait returns a live `session_id` (see await_command). r.output is display text; r.exit_code is status; the host reports failed commands itself. For exact parsing use `r.stdout`, present when `r.streams_complete` is true.
+- exec_command waits; one still running after the default wait returns a live `session_id` (see await_command). r.output is display text; r.exit_code is status; the host reports failed commands itself. For exact parsing use `r.stdout`, present when `r.streams_complete` is true. Before parsing, concatenating, or indexing a result, verify success and the advertised representation, and finish its live handle or required continuations. A display string is not exact completed data.
 - Await every call: unawaited work is discarded, and an uncaught rejection ends the cell. Earlier effects survive failure; recover receipts, never replay them. Use `Promise.allSettled` for independent fallible calls. Batch independent reads and searches as one `text(await Promise.allSettled([tools.read_file({path:"a.rs"}), tools.exec_command({cmd:"rg -n x src"})]))`. Run builds and other commands that may write outside such batches; they hold the workspace exclusively.
 - Nested deadlines: { timeout_ms } overrides the host default. Expiry cancels the nested call and may return only an error, without a live handle. After expiry, check the outcome before retrying uncertain effects.
 - First-line // @exec: {"deliver": true} makes printed text the final answer, without a model call, when everything in the cell succeeded. For a settled answer, await closing work (including tools.update_plan), then print only that answer in this cell. Plan completion alone is not task completion. Delivery appears at cell end; use a normal final for long reports.
 - Output defaults to 10000 tokens; first-line // @exec: {"max_output_tokens": 40000} raises it (ceiling 40000). A truncated result names the `read_tool_output` call that returns the rest. Oversized: result_retained:true, outcome.recovery (possibly pending). Recover required recovery/canonical_recovery or outcome.recovery ranges with `await tools.read_tool_output(recipe.arguments)` in-cell before returning; consume pages; bound printing; never rerun producers.
-- JS bindings reset per exec; store(key,value)/load(key) retain JSON. Keep one body plus compact state/provenance; deleteStored(key) drops duplicates. Failed quota cells discard staged stores; check listKeys before resuming. listKeys({after?,limit?}): 1-64, default 32; continue next_after. First-line // @exec: {"persist":true} preserves completed values across host restart.
+- JS bindings reset per exec; store(key,value)/load(key) retain JSON. Load large JSON once per computation and compare stable keys, not object references across loads. Keep one working body, retiring obsolete copies before storing replacements. Summarize already-consumed machine data without reprinting it. Keep compact state/provenance; deleteStored(key) drops duplicates. Failed quota cells discard staged stores; check listKeys before resuming. listKeys({after?,limit?}): 1-64, default 32; continue next_after. First-line // @exec: {"persist":true} preserves completed values across host restart.
 - Deferred tools: ALL_TOOL_NAMES/ALL_TOOLS or tool_search; resolve_tool(name) retains full contracts. Resolve known followups in-cell; never infer arguments from names. Follow namespace_instructions_ref and operation rules, or resolve the full contract.
 
 Optional helpers:
@@ -82,9 +82,13 @@ mod tests {
         // to expand the existing contract on every model request. On a fixed
         // task the earlier ~8 KB rules contract cost about 1.4x the reasoning
         // per turn of a lean one, so restated tool details stay out of it.
+        // Storage and result-handling guidance adds 427 bytes to the base
+        // contract. Give it that explicit allowance, preserving the earlier
+        // headroom without compressing tool contracts or expanding helpers.
+        const DATA_HANDLING_GUIDANCE_ALLOWANCE: usize = 427;
         assert!(helpers_bytes < 1_500);
-        assert!(description.len() - helpers_bytes < 3_600);
-        assert!(description.len() < 4_500);
+        assert!(description.len() - helpers_bytes < 3_600 + DATA_HANDLING_GUIDANCE_ALLOWANCE);
+        assert!(description.len() < 4_500 + DATA_HANDLING_GUIDANCE_ALLOWANCE);
     }
 
     #[test]

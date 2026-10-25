@@ -3383,6 +3383,8 @@ impl Session {
                 if let Some(turn_id) = publication_turn_id {
                     tracing::info!(event.name = "codex.model_output_published", %turn_id,
                         endpoint = "post_filter_session_channel_acceptance", client_visible = false,
+                        clock_id = codex_protocol::timing::process_clock_domain_id(),
+                        server_publication_ns = u64::try_from(codex_protocol::timing::process_monotonic_ns()).ok(),
                         at_unix_ms = chrono::Utc::now().timestamp_millis(), clock = "unix_wall_ms",
                         "visible-content publication is separate from provider arrival and client rendering");
                 }

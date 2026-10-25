@@ -270,16 +270,22 @@ Object.defineProperty(globalThis, "run_graph", {
       );
     }
     function acquire({ claims }) {
-      for (const key of claims.read)
+      if (!claims.read.length && !claims.write.length) return null;
+      // Callback receivers expose normalized claims. Release the exact keys
+      // acquired here even if a callback later edits or replaces those claims.
+      const lease = { read: [...claims.read], write: [...claims.write] };
+      for (const key of lease.read)
         readers.set(key, (readers.get(key) ?? 0) + 1);
-      for (const key of claims.write) writers.add(key);
+      for (const key of lease.write) writers.add(key);
+      return lease;
     }
-    function release({ claims }) {
-      for (const key of claims.read) {
+    function release(lease) {
+      if (!lease) return;
+      for (const key of lease.read) {
         if (readers.get(key) === 1) readers.delete(key);
         else readers.set(key, readers.get(key) - 1);
       }
-      for (const key of claims.write) writers.delete(key);
+      for (const key of lease.write) writers.delete(key);
     }
     async function execute(id, node) {
       let value,
@@ -348,13 +354,13 @@ Object.defineProperty(globalThis, "run_graph", {
             continue;
           }
           pending.delete(id);
-          acquire(node);
+          const lease = acquire(node);
           // Defer callbacks until the task is registered, even when run throws.
           running.add(id);
           Promise.resolve()
             .then(() => execute(id, node))
             .finally(() => {
-              release(node);
+              release(lease);
               running.delete(id);
               settled(id);
             });

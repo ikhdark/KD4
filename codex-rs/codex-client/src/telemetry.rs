@@ -69,6 +69,17 @@ pub trait RequestTelemetry: Send + Sync {
     /// fabricated duration or reuse result.
     fn on_transport_phase(&self, _attempt: u64, _observation: TransportPhaseObservation) {}
 
+    /// Enriches an existing phase callback, not an additional telemetry event.
+    fn on_transport_phase_with_timing(
+        &self,
+        attempt: u64,
+        observation: TransportPhaseObservation,
+        _timing: &codex_http_client::TransportTiming,
+        _headers: Option<&http::HeaderMap>,
+    ) {
+        self.on_transport_phase(attempt, observation);
+    }
+
     /// Called once for each operation attempt.
     ///
     /// `attempt` is zero-based. The callback can observe failures before any

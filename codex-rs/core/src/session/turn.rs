@@ -2452,7 +2452,7 @@ const SCOPE_ESTIMATE_BYTES_PER_TOKEN: i64 = 4;
 /// Spawned agents always need their host-enforced budget, regardless of wording.
 fn spawned_agent_context_budget_notice(turn: &TurnContext) -> String {
     let mut notice = String::from(
-        "Before committing to an exhaustive review or full-read request, use the known file count, byte volume, and tool throughput to assess whether the requested coverage is feasible.",
+        "Before committing to an exhaustive review or full-read request, use the known file count, byte volume, and tool throughput to assess whether the requested coverage is feasible. Estimated total volume is a batching or splitting signal, not evidence that the current counted context budget is exhausted.",
     );
     if let Some(limit) = turn
         .model_info

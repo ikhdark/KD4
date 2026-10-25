@@ -26,6 +26,14 @@ pub fn process_monotonic_ns() -> u128 {
     process_clock().1.elapsed().as_nanos()
 }
 
+/// Convert a captured host instant into the existing process clock domain.
+/// An observation predating that domain is unavailable, never clamped to zero.
+pub fn process_monotonic_ns_at(observed_at: Instant) -> Option<u128> {
+    observed_at
+        .checked_duration_since(process_clock().1)
+        .map(|value| value.as_nanos())
+}
+
 #[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]

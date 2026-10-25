@@ -50,8 +50,8 @@ python -B scripts/build/benchmark_lto_runtime.py
 This builds **the actual `codex` CLI and `codex-code-mode-host`**, sequentially
 through the existing `lto-runtime` build lane: `baseline` and `fat`.
 The baseline inherits the frozen source's `local-release` profile without any
-profile overrides. Currently that means `lto = "fat"`, one codegen unit for
-workspace crates and dependencies, and incremental compilation enabled. Windows
+profile overrides. Currently that means `lto = "thin"`, eight codegen units for
+workspace crates, one for dependencies, and incremental compilation disabled. Windows
 target flags also enable `target-cpu=native` for every variant. There is no separate LTO-disabled
 candidate. The baseline is rebuilt from matched source, not taken from the
 installed executable. Ambient `CARGO_PROFILE_*` and `CARGO_INCREMENTAL` overrides

@@ -48,6 +48,7 @@ fn bound_sse_events(stream: ByteStream, limit: usize) -> ByteStream {
         after_cr: bool,
         finished: bool,
         since_yield: usize,
+        observed_body_byte: bool,
     }
     let state = Framing {
         stream,
@@ -58,6 +59,7 @@ fn bound_sse_events(stream: ByteStream, limit: usize) -> ByteStream {
         after_cr: false,
         finished: false,
         since_yield: 0,
+        observed_body_byte: false,
     };
     futures::stream::unfold(state, move |mut state| async move {
         if state.finished {
@@ -74,7 +76,13 @@ fn bound_sse_events(stream: ByteStream, limit: usize) -> ByteStream {
             }
             if state.pending.is_empty() {
                 match state.stream.next().await {
-                    Some(Ok(chunk)) => state.pending = chunk,
+                    Some(Ok(chunk)) => {
+                        if !state.observed_body_byte && !chunk.is_empty() {
+                            state.observed_body_byte = true;
+                            codex_http_client::record_first_response_body_byte();
+                        }
+                        state.pending = chunk;
+                    }
                     Some(Err(error)) => {
                         state.finished = true;
                         return Some((Err(error), state));
@@ -193,7 +201,7 @@ pub(crate) fn spawn_response_stream_with_dialect(
     let upstream_request_id = metadata.upstream_request_id().map(str::to_string);
     let (tx_event, rx_event) = response_event_channel::<ApiError>(1600);
     tokio::spawn(
-        async move {
+        codex_http_client::with_transport_timing(async move {
             for event in metadata.initial_events() {
                 if tx_event.send(Ok(event)).await.is_err() {
                     return;
@@ -208,7 +216,7 @@ pub(crate) fn spawn_response_stream_with_dialect(
                 turn_state,
             )
             .await;
-        }
+        })
         .in_current_span(),
     );
 
@@ -225,14 +233,14 @@ pub async fn process_sse(
     idle_timeout: Duration,
     telemetry: Option<Arc<dyn SseTelemetry>>,
 ) {
-    process_sse_with_metadata(
+    codex_http_client::with_transport_timing(process_sse_with_metadata(
         stream,
         tx_event,
         idle_timeout,
         telemetry,
         ResponsesStreamMetadata::default(),
         None,
-    )
+    ))
     .await;
 }
 

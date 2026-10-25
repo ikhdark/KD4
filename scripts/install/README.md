@@ -21,8 +21,8 @@ platform npm archive layout is not probed or installed.
 ## Final builds
 
 `release` and `local-release` share the same settings: optimization level 3,
-Fat LTO, one codegen unit for workspace crates and dependencies, and incremental
-compilation disabled. `release` owns these settings; `local-release` inherits them
+Thin LTO, eight codegen units for workspace crates, one for dependencies, and
+incremental compilation disabled. `release` owns these settings; `local-release` inherits them
 without overrides so they cannot drift. Windows builds retain native CPU tuning,
 the 8 MiB stack, and static CRT from the shared Cargo configuration.
 
@@ -51,7 +51,7 @@ just publish-local-codex-fast
 
 The `local-fast` profile inherits release behavior, uses optimization level 2,
 disables LTO, enables incremental compilation, and uses 16 workspace codegen units
-and four dependency codegen units rather than the final profile's single unit.
+and four dependency codegen units rather than the final profile's eight and one.
 It targets shorter rebuilds after local
 edits, at the cost of some runtime optimization. No speedup has been benchmarked.
 Only `icu_calendar` uses optimization level 0 in this profile to work around a
