@@ -43,9 +43,7 @@ use sqlx::Sqlite;
 use sqlx::SqliteConnection;
 use sqlx::SqlitePool;
 use sqlx::migrate::Migrator;
-use sqlx::sqlite::SqliteAutoVacuum;
 use sqlx::sqlite::SqliteConnectOptions;
-use sqlx::sqlite::SqliteJournalMode;
 use sqlx::sqlite::SqlitePoolOptions;
 use sqlx::sqlite::SqliteSynchronous;
 use std::collections::BTreeSet;
@@ -378,7 +376,6 @@ fn base_sqlite_options(path: &Path) -> SqliteConnectOptions {
     SqliteConnectOptions::new()
         .filename(path)
         .create_if_missing(true)
-        .journal_mode(SqliteJournalMode::Wal)
         .synchronous(SqliteSynchronous::Normal)
         .busy_timeout(Duration::from_secs(5))
         .log_statements(LevelFilter::Off)
@@ -434,9 +431,8 @@ async fn open_sqlite(
     spec: RuntimeDbSpec,
     telemetry_override: Option<&dyn DbTelemetry>,
 ) -> anyhow::Result<SqlitePool> {
-    let options = base_sqlite_options(path).auto_vacuum(SqliteAutoVacuum::Incremental);
     let started = Instant::now();
-    let pool_result = connect_sqlite_pool_with_retry(options, 5, started).await;
+    let pool_result = open_runtime_sqlite_pool(path, started).await;
     crate::telemetry::record_init_result(
         telemetry_override,
         spec.kind,
@@ -479,6 +475,66 @@ async fn open_sqlite(
         return Err(recovery::RuntimeDbInitError::new(spec.label, "migrate", path, source).into());
     }
     Ok(pool)
+}
+
+async fn open_runtime_sqlite_pool(path: &Path, started: Instant) -> anyhow::Result<SqlitePool> {
+    let options = base_sqlite_options(path);
+    loop {
+        let pool = connect_sqlite_pool_with_retry(options.clone(), 5, started).await?;
+        // The pool has one connection and is not published until initialization
+        // completes. Durable settings belong here, not on every lazy connection.
+        let initialized: anyhow::Result<()> = async {
+            let mut connection = pool.acquire().await?;
+            let empty = sqlx::query_scalar::<_, bool>(
+                "SELECT NOT EXISTS (SELECT 1 FROM sqlite_schema)",
+            )
+            .fetch_one(&mut *connection)
+            .await?;
+            if empty {
+                // A header left by interrupted initialization is not a schema.
+                // Set auto-vacuum before WAL writes the first database page.
+                let mode: i64 = sqlx::query_scalar("PRAGMA auto_vacuum")
+                    .fetch_one(&mut *connection)
+                    .await?;
+                if mode == 0 {
+                    sqlx::query("PRAGMA auto_vacuum = INCREMENTAL")
+                        .execute(&mut *connection)
+                        .await?;
+                }
+                sqlx::query("PRAGMA journal_mode = WAL")
+                    .execute(&mut *connection)
+                    .await?;
+            }
+            let journal: String = sqlx::query_scalar("PRAGMA journal_mode")
+                .fetch_one(&mut *connection)
+                .await?;
+            let (synchronous, pragma) = if journal == "delete" {
+                (SqliteSynchronous::Extra, "PRAGMA synchronous = EXTRA")
+            } else {
+                (SqliteSynchronous::Normal, "PRAGMA synchronous = NORMAL")
+            };
+            sqlx::query(pragma).execute(&mut *connection).await?;
+            // Match lazy connections without repeating journal/vacuum setters.
+            pool.set_connect_options(options.clone().synchronous(synchronous));
+            connection.return_to_pool().await;
+            Ok(())
+        }
+        .await;
+        match initialized {
+            Ok(()) => return Ok(pool),
+            Err(error) => {
+                // Release every worker before retrying, and preserve the actual
+                // initialization error rather than an after_connect timeout.
+                pool.close().await;
+                if !sqlite_error_detail_is_lock(&error.to_string())
+                    || started.elapsed() >= Duration::from_secs(5)
+                {
+                    return Err(error);
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        }
+    }
 }
 
 pub(super) async fn ensure_backfill_state_row_in_pool(

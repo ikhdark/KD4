@@ -366,6 +366,34 @@ impl ConfigManager {
         .await
     }
 
+    /// Catalog-wide settings must not inherit the server process's repository.
+    pub(crate) async fn load_non_project_config(&self) -> std::io::Result<Config> {
+        self.load_uncached_config(None, true).await
+    }
+
+    async fn load_uncached_config(
+        &self,
+        cwd: Option<PathBuf>,
+        ignore_project_config: bool,
+    ) -> std::io::Result<Config> {
+        let generation = self.policy_generation();
+        self.validate_policy_generation(generation)?;
+        let mut config = codex_core::config::ConfigBuilder::default()
+            .codex_home(self.codex_home.clone())
+            .cli_overrides(self.current_cli_overrides())
+            .loader_overrides(self.loader_overrides.clone())
+            .strict_config(self.strict_config)
+            .cloud_config_bundle(self.current_cloud_config_bundle())
+            .thread_config_loader(self.current_thread_config_loader())
+            .fallback_cwd(cwd)
+            .ignore_project_config(ignore_project_config)
+            .build()
+            .await?;
+        self.apply_runtime_feature_enablement(&mut config);
+        self.apply_arg0_paths(&mut config);
+        self.with_current_policy(generation, || config)
+    }
+
     pub(crate) async fn load_latest_config_for_thread(
         &self,
         thread_config: &Config,
@@ -570,6 +598,17 @@ impl ConfigManager {
         cwd: AbsolutePathBuf,
     ) -> std::io::Result<ConfigLayerStack> {
         self.load_config_layers(Some(cwd)).await
+    }
+
+    pub(crate) fn plugin_config_reload_for_cwd(
+        &self,
+        cwd: AbsolutePathBuf,
+    ) -> codex_core_plugins::marketplace_upgrade::ConfigLayerReload {
+        let manager = self.clone();
+        let runtime = tokio::runtime::Handle::current();
+        Arc::new(move || runtime
+            .block_on(manager.load_uncached_config(Some(cwd.to_path_buf()), false))
+            .map(|config| config.config_layer_stack.as_ref().clone()))
     }
 
     pub(crate) async fn load_config_layers(

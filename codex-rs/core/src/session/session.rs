@@ -718,7 +718,6 @@ pub(crate) struct SessionConfiguration {
     pub(super) model_reasoning_summary: Option<ReasoningSummaryConfig>,
     pub(super) service_tier: Option<String>,
     pub(super) validation_mode: codex_protocol::validation::ValidationMode,
-    pub(super) validation_full_budget: usize,
     pub(super) validation_root_turn: Option<(String, String)>,
     pub(super) validation_attempts: Vec<(String, String)>,
 
@@ -1681,7 +1680,13 @@ impl Session {
             if let Some(service_name) = session_configuration.metrics_service_name.as_deref() {
                 session_telemetry = session_telemetry.with_metrics_service_name(service_name);
             }
-            config.features.emit_metrics(&session_telemetry);
+            config.features.emit_metrics(|feature, enabled| {
+                session_telemetry.counter(
+                    "codex.feature.state",
+                    /*inc*/ 1,
+                    &[("feature", feature), ("value", &enabled.to_string())],
+                );
+            });
             session_telemetry.conversation_starts(
                 config.model_provider.name.as_str(),
                 session_configuration.collaboration_mode.reasoning_effort(),

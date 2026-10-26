@@ -147,9 +147,11 @@ pub struct ModelProviderInfo {
     pub stream_max_retries: Option<u64>,
     /// Idle timeout (in milliseconds) to wait for activity on a streaming response before treating
     /// the connection as lost.
+    #[schemars(range(min = 1))]
     pub stream_idle_timeout_ms: Option<u64>,
     /// Maximum time (in milliseconds) to wait for a websocket connection attempt before treating
     /// it as failed.
+    #[schemars(range(min = 1))]
     pub websocket_connect_timeout_ms: Option<u64>,
     /// Does this provider require an OpenAI API Key or ChatGPT login token? If true,
     /// user is presented with login screen on first run, and login preference and token/key

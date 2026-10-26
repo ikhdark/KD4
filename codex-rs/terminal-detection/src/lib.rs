@@ -290,6 +290,7 @@ fn detect_terminal_info_from_env(env: &dyn Environment) -> TerminalInfo {
     }
 
     if env.has("ALACRITTY_SOCKET")
+        || env.has_non_empty("ALACRITTY_LOG")
         || env
             .var("TERM")
             .map(|term| term == "alacritty")

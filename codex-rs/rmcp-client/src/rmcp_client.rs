@@ -96,10 +96,12 @@ enum PendingTransport {
     },
     StreamableHttp {
         transport: StreamableHttpClientTransport<StreamableHttpClientAdapter>,
+        initialize_deadline: Arc<StdMutex<Option<Instant>>>,
     },
     StreamableHttpWithOAuth {
         transport: StreamableHttpClientTransport<AuthClient<StreamableHttpClientAdapter>>,
         oauth_persistor: OAuthPersistor,
+        initialize_deadline: Arc<StdMutex<Option<Instant>>>,
     },
 }
 
@@ -1142,6 +1144,9 @@ impl RmcpClient {
                 auth_provider,
                 oauth_runtime,
             } => {
+                // Each transport/worker keeps its own deadline, even when a
+                // cancelled handshake outlives its caller or a retry starts.
+                let initialize_deadline = Arc::default();
                 let default_headers =
                     build_default_headers(http_headers.clone(), env_http_headers.clone())?;
                 let auth_provider =
@@ -1159,12 +1164,17 @@ impl RmcpClient {
                     && !default_headers.contains_key(AUTHORIZATION)
                     && let Some((auth_client, oauth_persistor)) = cached_oauth.as_ref()
                 {
+                    let mut auth_client = auth_client.clone();
+                    auth_client.http_client = auth_client
+                        .http_client
+                        .with_initialize_deadline(Arc::clone(&initialize_deadline));
                     return Ok(PendingTransport::StreamableHttpWithOAuth {
                         transport: StreamableHttpClientTransport::with_client(
-                            auth_client.clone(),
+                            auth_client,
                             StreamableHttpClientTransportConfig::with_uri(url.clone()),
                         ),
                         oauth_persistor: oauth_persistor.clone(),
+                        initialize_deadline,
                     });
                 }
                 let initial_oauth_tokens = if bearer_token.is_none()
@@ -1207,6 +1217,7 @@ impl RmcpClient {
                         keyring_backend_kind: *keyring_backend_kind,
                         default_headers: default_headers.clone(),
                         http_client: Arc::clone(http_client),
+                        initialize_deadline: Arc::clone(&initialize_deadline),
                     })
                     .await
                     {
@@ -1215,6 +1226,7 @@ impl RmcpClient {
                             Ok(PendingTransport::StreamableHttpWithOAuth {
                                 transport,
                                 oauth_persistor,
+                                initialize_deadline,
                             })
                         }
                         Err(err)
@@ -1239,10 +1251,14 @@ impl RmcpClient {
                                     Arc::clone(http_client),
                                     default_headers,
                                     /*auth_provider*/ None,
+                                    Arc::clone(&initialize_deadline),
                                 ),
                                 http_config,
                             );
-                            Ok(PendingTransport::StreamableHttp { transport })
+                            Ok(PendingTransport::StreamableHttp {
+                                transport,
+                                initialize_deadline,
+                            })
                         }
                         Err(err) => Err(err),
                     }
@@ -1258,10 +1274,14 @@ impl RmcpClient {
                             Arc::clone(http_client),
                             default_headers,
                             auth_provider,
+                            Arc::clone(&initialize_deadline),
                         ),
                         http_config,
                     );
-                    Ok(PendingTransport::StreamableHttp { transport })
+                    Ok(PendingTransport::StreamableHttp {
+                        transport,
+                        initialize_deadline,
+                    })
                 }
             }
         }
@@ -1276,23 +1296,35 @@ impl RmcpClient {
         Option<OAuthPersistor>,
     )> {
         let deadline = timeout.map(|duration| Instant::now() + duration);
-        let (transport, oauth_persistor) = match pending_transport {
+        let (transport, oauth_persistor, initialize_deadline) = match pending_transport {
             PendingTransport::Stdio { transport } => (
                 service::serve_client(client_service, transport).boxed(),
                 None,
+                None,
             ),
-            PendingTransport::StreamableHttp { transport } => (
+            PendingTransport::StreamableHttp {
+                transport,
+                initialize_deadline,
+            } => (
                 service::serve_client(client_service, transport).boxed(),
                 None,
+                Some(initialize_deadline),
             ),
             PendingTransport::StreamableHttpWithOAuth {
                 transport,
                 oauth_persistor,
+                initialize_deadline,
             } => (
                 service::serve_client(client_service, transport).boxed(),
                 Some(oauth_persistor),
+                Some(initialize_deadline),
             ),
         };
+        if let Some(initialize_deadline) = &initialize_deadline {
+            *initialize_deadline
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = deadline;
+        }
 
         let service_result = match timeout {
             Some(duration) => match time::timeout(duration, transport).await {
@@ -1328,6 +1360,15 @@ impl RmcpClient {
                 return Err(error);
             }
         };
+
+        // Clear only after this worker's handshake succeeds. On failure or
+        // caller cancellation, a delayed OAuth retry/bootstrap POST must retain
+        // this attempt's deadline, never None or a later transport's budget.
+        if let Some(initialize_deadline) = initialize_deadline {
+            *initialize_deadline
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        }
 
         // rmcp 3 caches responses and serves stale ones on errors by default; keep
         // every request fresh, as with rmcp 1.x.
@@ -1622,6 +1663,7 @@ struct OAuthTransportRuntimeParams<'a> {
     keyring_backend_kind: AuthKeyringBackendKind,
     default_headers: HeaderMap,
     http_client: Arc<dyn HttpClient>,
+    initialize_deadline: Arc<StdMutex<Option<Instant>>>,
 }
 
 async fn create_oauth_transport_and_runtime(
@@ -1640,6 +1682,7 @@ async fn create_oauth_transport_and_runtime(
         keyring_backend_kind,
         default_headers,
         http_client,
+        initialize_deadline,
     } = params;
     let oauth_http_client = Arc::new(
         OAuthHttpClientAdapter::new(http_client.clone(), url, default_headers.clone())
@@ -1672,7 +1715,12 @@ async fn create_oauth_transport_and_runtime(
     };
 
     let auth_client = AuthClient::new(
-        StreamableHttpClientAdapter::new(http_client, default_headers, /*auth_provider*/ None),
+        StreamableHttpClientAdapter::new(
+            http_client,
+            default_headers,
+            /*auth_provider*/ None,
+            initialize_deadline,
+        ),
         manager,
     );
 

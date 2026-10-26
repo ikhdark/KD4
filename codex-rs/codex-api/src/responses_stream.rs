@@ -234,6 +234,7 @@ impl ResponsesEventInterpreter {
         // Stage metadata until the entire frame is admitted. A rejected frame
         // must not poison caller-owned OnceLock state or model/treatment caches.
         let response_turn_state = event.turn_state();
+        let models_etag = event.models_etag();
         let updated_treatment = event.headers.as_ref().and_then(Value::as_object).and_then(|headers| {
             treatment_from_headers(&json_headers_to_http_headers(headers.iter().filter(|(name, _)| {
                 name.eq_ignore_ascii_case(X_CODEX_SAFETY_BUFFERING_ENABLED_HEADER)
@@ -324,6 +325,9 @@ impl ResponsesEventInterpreter {
             }
         }
         let interpreted = interpreted?;
+        if let Some(etag) = models_etag {
+            self.events.push(ResponseEvent::ModelsEtag(etag));
+        }
         if let Some(event) = interpreted {
             self.events.push(event);
         }
@@ -388,6 +392,7 @@ fn is_known_event(kind: &str) -> bool {
         "error"
             | "codex.rate_limits"
             | "response.metadata"
+            | "codex.response.metadata"
             | "response.created"
             | "response.in_progress"
             | "response.failed"
@@ -518,6 +523,12 @@ pub(crate) fn classify_provider_error(value: &Value) -> Option<ApiError> {
         .get("message")
         .and_then(Value::as_str)
         .unwrap_or_default();
+    let retry_after = value
+        .get("headers")
+        .and_then(Value::as_object)
+        .and_then(|headers| {
+            codex_http_client::RetryAfter::from_headers(&json_headers_to_http_headers(headers))
+        });
     // A provider-specific code can refine a stable type without being known to
     // this client. Prefer recognized codes, but do not let an unknown one hide
     // a recognized type (for example server_error).
@@ -536,7 +547,15 @@ pub(crate) fn classify_provider_error(value: &Value) -> Option<ApiError> {
                     message: cyber_policy_message(Some(message.to_owned())),
                 },
                 "server_is_overloaded" | "slow_down" => {
-                    ApiError::ServerOverloaded { retry_after: None }
+                    let delay = try_parse_retry_after(&Error {
+                        code: Some(code.to_owned()),
+                        message: Some(message.to_owned()),
+                    });
+                    ApiError::ServerOverloaded {
+                        retry_after: retry_after.or_else(|| {
+                            delay.and_then(codex_http_client::RetryAfter::from_delay)
+                        }),
+                    }
                 }
                 "server_error" | "internal_server_error" | "rate_limit_exceeded" => {
                     let delay = try_parse_retry_after(&Error {
@@ -545,7 +564,9 @@ pub(crate) fn classify_provider_error(value: &Value) -> Option<ApiError> {
                     });
                     ApiError::Retryable {
                         message: message.to_owned(),
-                        delay: delay.and_then(codex_http_client::RetryAfter::from_delay),
+                        delay: retry_after.or_else(|| {
+                            delay.and_then(codex_http_client::RetryAfter::from_delay)
+                        }),
                     }
                 }
                 "invalid_request_error"
@@ -620,6 +641,17 @@ impl ResponsesStreamEvent<'_> {
                     .and_then(header_turn_state_value_from_json)
             })
             .flatten()
+    }
+
+    fn models_etag(&self) -> Option<String> {
+        if !matches!(self.kind(), "response.metadata" | "codex.response.metadata") {
+            return None;
+        }
+        self.headers.as_ref()?.as_object()?.iter().find_map(|(name, value)| {
+            name.eq_ignore_ascii_case(X_MODELS_ETAG_HEADER)
+                .then(|| json_value_as_string(value).map(str::to_owned))
+                .flatten()
+        })
     }
 
     pub(crate) fn model_verifications(&self) -> Option<Vec<ModelVerification>> {
@@ -958,7 +990,7 @@ fn json_header_value(value: &Value) -> Option<HeaderValue> {
 }
 
 fn try_parse_retry_after(error: &Error) -> Option<Duration> {
-    if error.code.as_deref() != Some("rate_limit_exceeded") {
+    if !matches!(error.code.as_deref(), Some("rate_limit_exceeded" | "slow_down")) {
         return None;
     }
     let captures = rate_limit_regex().captures(error.message.as_ref()?)?;

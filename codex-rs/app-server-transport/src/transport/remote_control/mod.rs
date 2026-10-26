@@ -132,13 +132,19 @@ pub struct RemoteControlHandle {
 
 #[derive(Clone, Copy)]
 enum RemoteControlHttpClientSource<'a> {
-    Pool(&'a RouteAwareClientPool),
+    Pool(&'a RouteAwareClientPool, &'a RemoteControlEnrollmentState),
 }
 
-impl RemoteControlHttpClientSource<'_> {
+impl<'a> RemoteControlHttpClientSource<'a> {
+    fn request_state(self) -> &'a RemoteControlEnrollmentState {
+        match self {
+            Self::Pool(_, state) => state,
+        }
+    }
+
     async fn client_for_url(self, url: &str) -> io::Result<HttpClient> {
         match self {
-            Self::Pool(http_clients) => http_clients
+            Self::Pool(http_clients, _) => http_clients
                 .client_for_url(url)
                 .await
                 .map_err(io::Error::other),
@@ -161,6 +167,7 @@ struct RemoteControlEnrollmentState {
     enrollment: StdMutex<Option<RemoteControlEnrollment>>,
     lock: Semaphore,
     lifecycle: StdMutex<CancellationToken>,
+    retry_after: StdMutex<Option<time::OffsetDateTime>>,
 }
 
 impl RemoteControlEnrollmentState {
@@ -169,7 +176,39 @@ impl RemoteControlEnrollmentState {
             enrollment: StdMutex::new(enrollment),
             lock: Semaphore::new(1),
             lifecycle: StdMutex::new(CancellationToken::new()),
+            retry_after: StdMutex::new(None),
         }
+    }
+
+    fn retry_after(&self) -> Option<time::OffsetDateTime> {
+        self.retry_after
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .filter(|deadline| *deadline > time::OffsetDateTime::now_utc())
+    }
+
+    fn admit_request(&self) -> io::Result<()> {
+        if let Some(deadline) = self.retry_after() {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                format!("remote control request deferred until {deadline}"),
+            ));
+        }
+        Ok(())
+    }
+
+    fn record_retry_after(&self, status: axum::http::StatusCode, headers: &axum::http::HeaderMap) {
+        if status != axum::http::StatusCode::TOO_MANY_REQUESTS && !status.is_server_error() {
+            return;
+        }
+        let Some(deadline) = server_api::parse_retry_after(headers, time::OffsetDateTime::now_utc())
+        else {
+            return;
+        };
+        let mut retry_after = self.retry_after.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // An older in-flight response must not shorten another response's advice.
+        *retry_after = Some(retry_after.map_or(deadline, |previous| previous.max(deadline)));
     }
 
     async fn lock(&self) -> RemoteControlEnrollmentLease<'_> {
@@ -591,7 +630,7 @@ impl RemoteControlHandle {
                 return Err(Self::pairing_disabled_error());
             }
             self.start_pairing_with_source(
-                RemoteControlHttpClientSource::Pool(&self.http_clients),
+                RemoteControlHttpClientSource::Pool(&self.http_clients, &self.current_enrollment),
                 params,
                 app_server_client_name,
             )
@@ -881,7 +920,7 @@ impl RemoteControlHandle {
                 return Err(Self::pairing_disabled_error());
             }
             self.pairing_status_with_source(
-                RemoteControlHttpClientSource::Pool(&self.http_clients),
+                RemoteControlHttpClientSource::Pool(&self.http_clients, &self.current_enrollment),
                 params,
             )
             .await
@@ -1046,6 +1085,7 @@ impl RemoteControlHandle {
             self.ensure_remote_control_allowed_io()?;
             clients::list_remote_control_clients_with_pool(
                 &self.http_clients,
+                &self.current_enrollment,
                 &self.remote_control_url,
                 &self.auth_manager,
                 params,
@@ -1063,6 +1103,7 @@ impl RemoteControlHandle {
             self.ensure_remote_control_allowed_io()?;
             clients::revoke_remote_control_client_with_pool(
                 &self.http_clients,
+                &self.current_enrollment,
                 &self.remote_control_url,
                 &self.auth_manager,
                 params,
@@ -1123,6 +1164,7 @@ async fn enroll_pairing_server(
         .await?;
     match enroll_remote_control_server_with_client(
         &client,
+        http_clients.request_state(),
         remote_control_target,
         auth,
         installation_id,
@@ -1145,6 +1187,7 @@ async fn enroll_pairing_server(
     }
     enroll_remote_control_server_with_client(
         &client,
+        http_clients.request_state(),
         remote_control_target,
         auth,
         installation_id,
@@ -1185,8 +1228,14 @@ async fn refresh_pairing_enrollment(
     let client = http_clients
         .client_for_url(&enrollment.remote_control_target.refresh_url)
         .await?;
-    let mut refresh_result =
-        refresh_remote_control_server_with_client(&client, auth, installation_id, enrollment).await;
+    let mut refresh_result = refresh_remote_control_server_with_client(
+        &client,
+        http_clients.request_state(),
+        auth,
+        installation_id,
+        enrollment,
+    )
+    .await;
     if refresh_result
         .as_ref()
         .is_err_and(|err| err.kind() == io::ErrorKind::PermissionDenied)
@@ -1199,6 +1248,7 @@ async fn refresh_pairing_enrollment(
                     *auth = recovered_auth;
                     refresh_result = refresh_remote_control_server_with_client(
                         &client,
+                        http_clients.request_state(),
                         auth,
                         installation_id,
                         enrollment,
@@ -1235,7 +1285,9 @@ async fn start_pairing_request(
     let client = http_clients
         .client_for_url(&enrollment.remote_control_target.pair_url)
         .await?;
-    enrollment.start_pairing_with_client(&client, request).await
+    enrollment
+        .start_pairing_with_client(&client, http_clients.request_state(), request)
+        .await
 }
 
 async fn pairing_status_request_with_source(
@@ -1247,7 +1299,7 @@ async fn pairing_status_request_with_source(
         .client_for_url(&enrollment.remote_control_target.pair_status_url)
         .await?;
     enrollment
-        .pairing_status_with_client(&client, request)
+        .pairing_status_with_client(&client, http_clients.request_state(), request)
         .await
 }
 

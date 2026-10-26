@@ -2,6 +2,7 @@ use crate::context::CollaborationModeInstructions;
 use crate::context::PersonalitySpecInstructions;
 use crate::context::UserInstructions;
 use crate::context::world_state::AgentsMdState;
+use codex_context_fragments::ContextualUserFragment;
 use codex_protocol::ResponseItemId;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::ResponseItem;

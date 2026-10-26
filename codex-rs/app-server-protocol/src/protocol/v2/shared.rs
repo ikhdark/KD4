@@ -8,6 +8,7 @@ use codex_protocol::protocol::NonSteerableTurnKind as CoreNonSteerableTurnKind;
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde::Serialize;
+use serde_json::Value as JsonValue;
 use std::path::Path;
 use ts_rs::TS;
 
@@ -149,7 +150,51 @@ pub enum CodexErrorInfo {
         #[ts(rename = "turnKind")]
         turn_kind: NonSteerableTurnKind,
     },
+    #[serde(
+        untagged,
+        serialize_with = "serialize_other_codex_error_info",
+        deserialize_with = "deserialize_other_codex_error_info"
+    )]
+    #[ts(type = "\"other\" | string | { [key: string]: unknown }")]
     Other,
+}
+
+fn serialize_other_codex_error_info<S>(serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    serializer.serialize_str("other")
+}
+
+fn deserialize_other_codex_error_info<'de, D>(deserializer: D) -> Result<(), D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = JsonValue::deserialize(deserializer)?;
+    // Serde retries untagged variants after a known tagged payload fails too.
+    // Only additive unknown variants may fall back; malformed known errors stay errors.
+    match &value {
+        JsonValue::String(tag) if tag == "other" || !is_known_codex_error_info_tag(tag) => Ok(()),
+        JsonValue::Object(fields)
+            if fields.len() == 1
+                && !fields.keys().any(|tag| is_known_codex_error_info_tag(tag)) => Ok(()),
+        JsonValue::Object(fields) if fields.len() != 1 => {
+            Err(serde::de::Error::custom("expected a single externally tagged error variant"))
+        }
+        JsonValue::String(_) | JsonValue::Object(_) => {
+            Err(serde::de::Error::custom("invalid payload for known error variant"))
+        }
+        _ => Err(serde::de::Error::custom("expected an error string or object")),
+    }
+}
+
+fn is_known_codex_error_info_tag(tag: &str) -> bool {
+    matches!(tag,
+        "contextWindowExceeded" | "usageLimitExceeded" | "serverOverloaded"
+            | "cyberPolicy" | "httpConnectionFailed" | "responseStreamConnectionFailed"
+            | "internalServerError" | "unauthorized" | "badRequest"
+            | "threadRollbackFailed" | "sandboxError" | "responseStreamDisconnected"
+            | "responseTooManyFailedAttempts" | "activeTurnNotSteerable" | "other")
 }
 
 impl From<CoreCodexErrorInfo> for CodexErrorInfo {

@@ -54,7 +54,9 @@ pub(crate) fn available_skills_fragment(
     if skill_lines.is_empty() && omitted == 0 && !incomplete {
         return None;
     }
-    if incomplete {
+    if catalog.discovery_blocked() {
+        skill_lines.push("- Orchestrator skill discovery is incomplete and blocked by repeated pagination. Known skills remain available; undiscovered skills cannot be listed until the MCP resource generation changes.".to_string());
+    } else if incomplete {
         skill_lines.push("- Orchestrator skill discovery is incomplete; undiscovered skills may still be available. Continue discovery only if needed for this task.".to_string());
     }
     if omitted > 0 {

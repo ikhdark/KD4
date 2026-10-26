@@ -134,7 +134,17 @@ fn check(
         }
         // Flattening cannot prove the effective cwd/environment of a build.
         // A failed precise lowering must not turn a visible build into admission.
-        if args.iter().any(|script| visibly_builds(script))
+        // CMD owns the complete tail after /c or /k, not each launch argument
+        // separately. Cargo's program and subcommand can span those arguments.
+        let possible_build = if shell == ShellType::Cmd {
+            super::extract_cmd_command(command).map_or_else(
+                || args.iter().any(|script| visibly_builds_cmd(script)),
+                |script| visibly_builds_cmd(script.as_ref()),
+            )
+        } else {
+            args.iter().any(|script| visibly_builds(script))
+        };
+        if possible_build
             || parsed().as_ref().is_some_and(|stages| {
                 stages.iter().any(|stage| visibly_builds_argv(stage, 0))
             })
@@ -915,6 +925,12 @@ fn potential_build(argv: &[String]) -> bool {
 /// start a build, so a Cargo name appearing in their filters or arguments is
 /// data, not an invocation, and must not reach the build rejection.
 
+fn visibly_builds_cmd(script: &str) -> bool {
+    super::possible_cmd_commands(script).is_none_or(|commands| {
+        commands.iter().any(|argv| visibly_builds_argv(argv, 0))
+    })
+}
+
 fn visibly_builds(script: &str) -> bool {
     visibly_builds_at_depth(script, 0)
 }
@@ -939,13 +955,19 @@ fn visibly_builds_argv(argv: &[String], depth: usize) -> bool {
         return false;
     };
     let binary = program_name(program).to_ascii_lowercase();
-    if matches!(binary.as_str(), "env" | "command" | "time" | "exec") {
+    if matches!(binary.as_str(), "env" | "command" | "time" | "exec" | "rustup") {
         use codex_shell_command::validation::ExecutionWrapper;
         use codex_shell_command::validation::decode_execution_wrapper;
         return match decode_execution_wrapper(&binary, args) {
             ExecutionWrapper::Child(index) => visibly_builds_argv(&args[index..], depth + 1),
             ExecutionWrapper::NonExecution | ExecutionWrapper::Opaque => false,
         };
+    }
+    if binary == "call" {
+        return visibly_builds_argv(
+            args.strip_prefix(&["--".to_string()]).unwrap_or(args),
+            depth + 1,
+        );
     }
     matches!(binary.as_str(), "iex" | "invoke-expression")
         && args

@@ -76,9 +76,8 @@ type SuiteBudgets =
 pub(crate) struct ValidationTurnContext {
     pub(crate) scope: (String, String),
     pub(crate) mode: codex_protocol::validation::ValidationMode,
-    pub(crate) full_budget: usize,
-    /// Retains the allowance while child initialization can suspend after its
-    /// parent turn has stopped. This is the same ledger, not a child allowance.
+    /// Retains shared launch ownership while child initialization can suspend
+    /// after its parent turn has stopped.
     pub(crate) budget: Arc<codex_command_analysis::command_preflight::FullSuiteBudget>,
 }
 

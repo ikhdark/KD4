@@ -3573,8 +3573,7 @@
       "title": "ClientRequest"
     },
     "CodexErrorInfo": {
-      "description": "This translation layer make sure that we expose codex error code in camel case.\n\nWhen an upstream HTTP status is available (for example, from the Responses API or a provider), it is forwarded in `httpStatusCode` on the relevant `codexErrorInfo` variant.",
-      "oneOf": [
+      "anyOf": [
         {
           "enum": [
             "contextWindowExceeded",
@@ -3706,8 +3705,57 @@
           ],
           "title": "ActiveTurnNotSteerableCodexErrorInfo",
           "type": "object"
+        },
+        {
+          "not": {
+            "enum": [
+              "contextWindowExceeded",
+              "usageLimitExceeded",
+              "serverOverloaded",
+              "cyberPolicy",
+              "internalServerError",
+              "unauthorized",
+              "badRequest",
+              "threadRollbackFailed",
+              "sandboxError",
+              "other",
+              "httpConnectionFailed",
+              "responseStreamConnectionFailed",
+              "responseStreamDisconnected",
+              "responseTooManyFailedAttempts",
+              "activeTurnNotSteerable"
+            ]
+          },
+          "type": "string"
+        },
+        {
+          "maxProperties": 1,
+          "minProperties": 1,
+          "propertyNames": {
+            "not": {
+              "enum": [
+                "contextWindowExceeded",
+                "usageLimitExceeded",
+                "serverOverloaded",
+                "cyberPolicy",
+                "internalServerError",
+                "unauthorized",
+                "badRequest",
+                "threadRollbackFailed",
+                "sandboxError",
+                "other",
+                "httpConnectionFailed",
+                "responseStreamConnectionFailed",
+                "responseStreamDisconnected",
+                "responseTooManyFailedAttempts",
+                "activeTurnNotSteerable"
+              ]
+            }
+          },
+          "type": "object"
         }
-      ]
+      ],
+      "description": "This translation layer make sure that we expose codex error code in camel case.\n\nWhen an upstream HTTP status is available (for example, from the Responses API or a provider), it is forwarded in `httpStatusCode` on the relevant `codexErrorInfo` variant."
     },
     "CollabAgentState": {
       "properties": {
@@ -3855,7 +3903,8 @@
               "type": "string"
             },
             "path": {
-              "$ref": "#/definitions/AbsolutePathBuf"
+              "$ref": "#/definitions/LegacyAppPathString",
+              "description": "Absolute path in the executor's native path convention, not the host's."
             },
             "type": {
               "enum": [
@@ -9272,12 +9321,19 @@
       "type": "string"
     },
     "MessagePhase": {
-      "description": "Classifies an assistant message as interim commentary or final answer text.\n\nProviders do not emit this consistently, so callers must treat `None` as \"phase unknown\" and keep compatibility behavior for legacy models.",
+      "description": "Classifies assistant text as commentary, a partial answer, or a terminal answer.\n\nProviders do not emit this consistently, so callers must treat `None` as \"phase unknown\" and keep compatibility behavior for legacy models.",
       "oneOf": [
         {
           "description": "Mid-turn assistant text (for example preamble/progress narration).\n\nAdditional tool calls or assistant output may follow before turn completion.",
           "enum": [
             "commentary"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Stable answer text that may be followed by more assistant output or tools.",
+          "enum": [
+            "partial_answer"
           ],
           "type": "string"
         },

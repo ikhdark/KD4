@@ -1,5 +1,6 @@
 use anyhow::Context;
 use codex_config::CONFIG_TOML_FILE;
+use codex_config::is_multi_agent_v2_feature_path;
 use codex_config::serialize_mcp_server;
 use codex_config::serialize_mcp_server_for_edit;
 use codex_config::types::McpServerConfig;
@@ -57,7 +58,10 @@ pub enum ConfigEdit {
     /// Set trust_level under `[projects."<path>"]`,
     /// migrating inline tables to explicit tables.
     SetProjectTrustLevel { path: PathBuf, level: TrustLevel },
-    /// Set the value stored at the exact dotted path.
+    /// Toggle a feature without replacing its structured configuration.
+    SetFeatureEnabled { key: String, enabled: bool },
+    /// Set the value stored at the exact dotted path. Mixed multi-agent v2
+    /// representations preserve the enabled member and independent settings.
     SetPath {
         segments: Vec<String>,
         value: TomlItem,
@@ -256,7 +260,59 @@ impl ConfigDocument {
             ConfigEdit::SetSkillConfigByName { name, enabled } => {
                 Ok(self.set_skill_config(SkillConfigSelector::Name(name.clone()), *enabled))
             }
-            ConfigEdit::SetPath { segments, value } => Ok(self.insert(segments, value.clone())),
+            ConfigEdit::SetFeatureEnabled { key, enabled } => {
+                let mut segments = vec!["features".to_string(), key.clone()];
+                if self
+                    .doc
+                    .get("features")
+                    .and_then(TomlItem::as_table_like)
+                    .and_then(|features| features.get(key))
+                    .is_some_and(|feature| feature.as_table_like().is_some())
+                {
+                    segments.push("enabled".to_string());
+                }
+                Ok(self.insert(&segments, value(*enabled)))
+            }
+            ConfigEdit::SetPath { segments, value } => {
+                let mut value = value.clone();
+                if let Some((field, parents)) = segments.split_last()
+                    && field == "enabled"
+                    && is_multi_agent_v2_feature_path(parents)
+                    && value.as_bool().is_some()
+                    && self
+                        .doc
+                        .get("features")
+                        .and_then(TomlItem::as_table_like)
+                        .and_then(|features| features.get("multi_agent_v2"))
+                        .is_some_and(|feature| feature.as_bool().is_some())
+                {
+                    return Ok(self.insert(parents, value));
+                }
+                if is_multi_agent_v2_feature_path(segments) {
+                    let existing = self
+                        .doc
+                        .get("features")
+                        .and_then(TomlItem::as_table_like)
+                        .and_then(|features| features.get("multi_agent_v2"));
+                    if value.as_bool().is_some()
+                        && existing.is_some_and(|feature| feature.as_table_like().is_some())
+                    {
+                        let mut enabled_segments = segments.clone();
+                        enabled_segments.push("enabled".to_string());
+                        return Ok(self.insert(&enabled_segments, value));
+                    }
+                    if let Some(existing) = existing.filter(|feature| feature.as_bool().is_some())
+                        && let Some(feature) = value.as_table_like_mut()
+                    {
+                        if let Some(enabled) = feature.get_mut("enabled") {
+                            Self::preserve_decor(existing, enabled);
+                        } else {
+                            feature.insert("enabled", existing.clone());
+                        }
+                    }
+                }
+                Ok(self.insert(segments, value))
+            }
             ConfigEdit::ClearPath { segments } => Ok(self.remove(segments)),
             ConfigEdit::SetProjectTrustLevel { path, level } => {
                 // Delegate to the existing, tested logic in config.rs to
@@ -528,6 +584,18 @@ impl ConfigDocument {
             return false;
         };
 
+        if last == "enabled"
+            && is_multi_agent_v2_feature_path(parents)
+            && self
+                .doc
+                .get("features")
+                .and_then(TomlItem::as_table_like)
+                .and_then(|features| features.get("multi_agent_v2"))
+                .is_some_and(|feature| feature.as_bool().is_some())
+        {
+            return self.remove(parents);
+        }
+
         let Some(parent) = self.descend(parents, TraversalMode::Existing) else {
             return false;
         };
@@ -538,7 +606,7 @@ impl ConfigDocument {
     fn descend(&mut self, segments: &[String], mode: TraversalMode) -> Option<&mut TomlTable> {
         let mut current = self.doc.as_table_mut();
 
-        for segment in segments {
+        for (index, segment) in segments.iter().enumerate() {
             match mode {
                 TraversalMode::Create => {
                     if !current.contains_key(segment.as_str()) {
@@ -549,6 +617,13 @@ impl ConfigDocument {
                     }
 
                     let item = current.get_mut(segment.as_str())?;
+                    if is_multi_agent_v2_feature_path(&segments[..=index])
+                        && item.as_bool().is_some()
+                    {
+                        let mut feature = document_helpers::new_implicit_table();
+                        feature.insert("enabled", item.clone());
+                        *item = TomlItem::Table(feature);
+                    }
                     current = document_helpers::ensure_table_for_write(item)?;
                 }
                 TraversalMode::Existing => {
@@ -817,9 +892,9 @@ impl ConfigEditsBuilder {
     /// Persist an explicit value even when it matches the default, so a
     /// lower-precedence config layer cannot undo the requested toggle.
     pub fn set_feature_enabled(mut self, key: &str, enabled: bool) -> Self {
-        self.edits.push(ConfigEdit::SetPath {
-            segments: vec!["features".to_string(), key.to_string()],
-            value: value(enabled),
+        self.edits.push(ConfigEdit::SetFeatureEnabled {
+            key: key.to_string(),
+            enabled,
         });
         self
     }

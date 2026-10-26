@@ -100,7 +100,6 @@ fn session_configuration_to_lock_config_toml(
 
     save_config_resolved_fields(config, &mut lock_config)?;
     lock_config.validation_mode = Some(sc.validation_mode);
-    lock_config.validation_full_budget = Some(sc.validation_full_budget);
     drop_lockfile_inputs(&mut lock_config);
 
     Ok(lock_config)

@@ -227,19 +227,6 @@ impl CodeModeWaitHandler {
                 if keep_dispatch_open {
                     dispatch_lease.keep_open();
                 }
-                if matches!(&wait_response, codex_code_mode::WaitOutcome::LiveCell(_))
-                    && let Some(parent_call_id) = exec
-                        .session
-                        .services
-                        .code_mode_service
-                        .cell_parent_call_id(&cell_id)
-                {
-                    // Nested calls the cell finished after its exec result reach
-                    // the model through this wait's result.
-                    exec.turn
-                        .turn_timing_state
-                        .record_code_mode_wait_delivery(&call_id, &parent_call_id);
-                }
                 let mut terminal_parent_call_id = None;
                 if let codex_code_mode::WaitOutcome::LiveCell(response) = &wait_response
                     && super::runtime_response_is_terminal(response)
@@ -298,7 +285,7 @@ impl CodeModeWaitHandler {
                     .services
                     .code_mode_service
                     .delivery_for_response(&cell_id, &exec.turn, &response);
-                let mut output =
+                let (mut output, delivered_call_ids) =
                     handle_runtime_response(&exec, response, effective_max_tokens, started_at)
                         .map_err(FunctionCallError::RespondToModel)?;
                 exec.session
@@ -314,6 +301,9 @@ impl CodeModeWaitHandler {
                     output = super::merge_code_mode_signal(output, signal);
                 }
                 super::execute_handler::attach_delivery_decision(&mut output, delivery);
+                exec.turn
+                    .turn_timing_state
+                    .record_code_mode_projection_delivery(&call_id, &delivered_call_ids);
                 Ok(boxed_tool_output(output))
             }
             _ => Err(FunctionCallError::RespondToModel(format!(

@@ -925,7 +925,7 @@ pub const DEFAULT_IMAGE_DETAIL: ImageDetail = ImageDetail::High;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema, TS)]
 #[serde(rename_all = "snake_case")]
-/// Classifies an assistant message as interim commentary or final answer text.
+/// Classifies assistant text as commentary, a partial answer, or a terminal answer.
 ///
 /// Providers do not emit this consistently, so callers must treat `None` as
 /// "phase unknown" and keep compatibility behavior for legacy models.
@@ -935,6 +935,8 @@ pub enum MessagePhase {
     /// Additional tool calls or assistant output may follow before turn
     /// completion.
     Commentary,
+    /// Stable answer text that may be followed by more assistant output or tools.
+    PartialAnswer,
     /// The assistant's terminal answer text for the current turn.
     FinalAnswer,
 }

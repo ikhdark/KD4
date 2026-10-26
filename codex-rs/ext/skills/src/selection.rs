@@ -141,6 +141,7 @@ struct CanonicalSkillCatalogEntry<'a> {
     main_prompt: CanonicalSkillPath<'a>,
     id: CanonicalSkillPath<'a>,
     display_path: Option<CanonicalSkillPath<'a>>,
+    selection_paths: Vec<CanonicalSkillPath<'a>>,
 }
 
 impl<'a> CanonicalSkillCatalogEntry<'a> {
@@ -150,6 +151,11 @@ impl<'a> CanonicalSkillCatalogEntry<'a> {
             main_prompt: CanonicalSkillPath::new(entry.main_prompt.as_str()),
             id: CanonicalSkillPath::new(&entry.id.0),
             display_path: entry.display_path.as_deref().map(CanonicalSkillPath::new),
+            selection_paths: entry
+                .selection_paths
+                .iter()
+                .map(|path| CanonicalSkillPath::new(path))
+                .collect(),
         }
     }
 
@@ -159,6 +165,10 @@ impl<'a> CanonicalSkillCatalogEntry<'a> {
             || self
                 .display_path
                 .is_some_and(|candidate| candidate.0 == path.0)
+            || self
+                .selection_paths
+                .iter()
+                .any(|candidate| candidate.0 == path.0)
     }
 }
 

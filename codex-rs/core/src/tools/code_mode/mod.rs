@@ -1699,7 +1699,7 @@ pub(super) fn handle_runtime_response(
     response: RuntimeResponse,
     max_output_tokens: Option<usize>,
     started_at: std::time::Instant,
-) -> Result<FunctionToolOutput, String> {
+) -> Result<(FunctionToolOutput, Vec<String>), String> {
     // Nested tool results have already crossed their owning tool boundary. Keep
     // one coherent, model-safe exec packet here instead of applying the much
     // smaller generic per-tool diagnostic budget a second time.
@@ -1716,6 +1716,23 @@ pub(super) fn handle_runtime_response(
         cell_id,
         !runtime_response_is_terminal(&response),
     );
+    // Recovery contains every settled result, including results omitted from
+    // bounded inline diagnostics. Pending retention descriptors can also be
+    // present, so exclude the packet's exact unsettled-call snapshot.
+    let delivered_call_ids = {
+        let unsettled = packet
+            .unsettled_nested_calls
+            .iter()
+            .filter_map(|entry| entry["call_id"].as_str())
+            .collect::<std::collections::HashSet<_>>();
+        packet
+            .nested_recovery
+            .values()
+            .filter_map(|entry| entry["call_id"].as_str())
+            .filter(|call_id| !unsettled.contains(call_id))
+            .map(str::to_owned)
+            .collect()
+    };
     refresh_ready_command_states(exec, &mut packet);
     tracing::info!(
         target: "codex.code_mode.packet",
@@ -1915,7 +1932,7 @@ pub(super) fn handle_runtime_response(
     if let Some(calls) = cancelled_nested_calls {
         output.essential_inline.insert("cancelled_nested_calls".into(), calls);
     }
-    Ok(output)
+    Ok((output, delivered_call_ids))
 }
 
 /// Host observation is not a rollback. Route failure through packet formatting

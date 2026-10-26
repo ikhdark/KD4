@@ -2163,6 +2163,7 @@ async fn list_threads_from_files_desc_unfiltered(
                 model_providers,
                 cwd_filters,
                 default_provider,
+                include_empty_preview: true,
                 layout: ThreadListLayout::Flat,
             },
         )
@@ -2212,6 +2213,7 @@ async fn list_threads_from_files_asc(
                     model_providers,
                     cwd_filters,
                     default_provider,
+                    include_empty_preview: true,
                     layout: ThreadListLayout::Flat,
                 },
             )

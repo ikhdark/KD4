@@ -151,6 +151,7 @@ pub const WINDOWS_CORE_ENV_VARS: &[&str] = &[
     "SHELL",
     "COMSPEC",
     "SYSTEMROOT",
+    "WINDIR",
     "SYSTEMDRIVE",
     // User context and profiles
     "USERNAME",

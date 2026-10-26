@@ -691,6 +691,18 @@ def _normalize_nullable_typed_maps(schema: Any) -> None:
         ]
 
 
+def _normalize_open_ended_error_enum(definition: dict[str, Any]) -> None:
+    variants = definition.pop("oneOf", definition.get("anyOf", []))
+    definition["anyOf"] = [
+        variant
+        for variant in variants
+        if "enum" in variant or "properties" in variant
+    ]
+    object_fallback = {"type": "object", "additionalProperties": {}}
+    if object_fallback not in definition["anyOf"]:
+        definition["anyOf"].append(object_fallback)
+
+
 def _normalized_schema_bundle_text(schema_dir: Path) -> str:
     """Normalize the schema bundle before feeding it to the Python type generator."""
     schema = json.loads(schema_bundle_path(schema_dir).read_text())
@@ -698,8 +710,10 @@ def _normalized_schema_bundle_text(schema_dir: Path) -> str:
     _normalize_nullable_typed_maps(schema)
     definitions = schema.get("definitions", {})
     if isinstance(definitions, dict):
-        for definition in definitions.values():
+        for name, definition in definitions.items():
             if isinstance(definition, dict):
+                if name == "CodexErrorInfo":
+                    _normalize_open_ended_error_enum(definition)
                 _flatten_string_enum_one_of(definition)
     # Normalize the schema into something datamodel-code-generator can map to
     # stable class names instead of anonymous numbered helpers.
@@ -753,7 +767,76 @@ def generate_v2_all(schema_dir: Path) -> None:
         )
     _require_nullable_chatgpt_account_email(out_path)
     _preserve_retained_wire_contracts(out_path)
+    _preserve_open_error_enum(out_path, schema_dir)
     _normalize_generated_timestamps(out_path)
+
+
+def _preserve_open_error_enum(out_path: Path, schema_dir: Path) -> None:
+    """Keep known error constants while accepting newer-server error strings."""
+    source = out_path.read_text()
+    class_start = source.find("class CodexErrorInfoValue(Enum):")
+    if class_start == -1:
+        raise RuntimeError("Generated SDK is missing CodexErrorInfoValue")
+    class_end = source.find("\n\nclass ", class_start)
+    if class_end == -1:
+        class_end = len(source)
+    class_source = source[class_start:class_end].replace(
+        "class CodexErrorInfoValue(Enum):", "class CodexErrorInfoValue(str, Enum):", 1
+    ).rstrip()
+    class_source += '''
+
+    @classmethod
+    def _missing_(cls, value: object) -> CodexErrorInfoValue | None:
+        if not isinstance(value, str):
+            return None
+        member = str.__new__(cls, value)
+        member._name_ = value
+        member._value_ = value
+        return member
+'''
+    source = source[:class_start] + class_source + source[class_end:]
+    definition = json.loads(schema_bundle_path(schema_dir).read_text())["definitions"]["CodexErrorInfo"]
+    variants = definition.get("anyOf", definition.get("oneOf", []))
+    unit_tags = []
+    models = []
+    for variant in variants:
+        unit_tags.extend(variant.get("enum", []))
+        properties = variant.get("properties", {})
+        if len(properties) == 1:
+            model = variant["title"]
+            if not model.isidentifier():
+                raise RuntimeError("Invalid CodexErrorInfo model name")
+            models.append((next(iter(properties)), model))
+    model_map = "\n".join(f"            {tag!r}: {model}," for tag, model in models)
+    validator = f'''
+
+    @model_validator(mode="before")
+    @classmethod
+    def _validate_known_variant(cls, value: Any) -> Any:
+        known_models = {{
+{model_map}
+        }}
+        if isinstance(value, dict):
+            if len(value) != 1:
+                raise ValueError("expected a single externally tagged error variant")
+            for tag, model in known_models.items():
+                if tag in value:
+                    return model.model_validate(value)
+            if any(tag in value for tag in {tuple(unit_tags)!r}):
+                raise ValueError("invalid payload for known error variant")
+        elif isinstance(value, str) and value in known_models:
+            raise ValueError("invalid payload for known error variant")
+        return value
+'''
+    class_start = source.find("class CodexErrorInfo(")
+    if class_start == -1:
+        raise RuntimeError("Generated SDK is missing CodexErrorInfo")
+    class_end = source.find("\n\nclass ", class_start)
+    if class_end == -1:
+        class_end = len(source)
+    source = source[:class_end].rstrip() + validator + source[class_end:]
+    source = source.replace("from pydantic import ", "from pydantic import model_validator, ", 1)
+    out_path.write_text(source)
 
 
 def _preserve_retained_wire_contracts(out_path: Path) -> None:

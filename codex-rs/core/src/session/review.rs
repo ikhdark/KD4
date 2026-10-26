@@ -42,9 +42,30 @@ pub(super) async fn spawn_review_thread(
     let model_info = review_model_info.clone();
 
     // Build per‑turn client with the requested model/family.
-    let mut per_turn_config = (*config).clone();
+    let mut per_turn_config = (*parent_turn_context.config).clone();
     per_turn_config.model = Some(model.clone());
     per_turn_config.features = review_features.clone();
+    if review_model_info.slug != parent_turn_context.model_info.slug
+        && !review_model_info.used_fallback_model_metadata
+        && per_turn_config.model_reasoning_effort.is_some()
+    {
+        let request_effort = crate::client::request_effort_for_model(
+            &review_model_info,
+            per_turn_config.model_reasoning_effort.clone(),
+        );
+        if crate::client::validate_request_effort_for_model(
+            &review_model_info,
+            request_effort.as_ref(),
+        )
+        .is_err()
+        {
+            let supported = &review_model_info.supported_reasoning_levels;
+            per_turn_config.model_reasoning_effort = supported
+                .get(supported.len().saturating_sub(1) / 2)
+                .map(|preset| preset.effort.clone())
+                .or_else(|| review_model_info.default_reasoning_level.clone());
+        }
+    }
     per_turn_config.permissions.shell_environment_policy = parent_turn_context
         .config
         .permissions
@@ -133,7 +154,6 @@ pub(super) async fn spawn_review_thread(
         collaboration_mode: parent_turn_context.collaboration_mode.clone(),
         multi_agent_version: MultiAgentVersion::Disabled,
         validation_mode: parent_turn_context.validation_mode,
-        validation_full_budget: parent_turn_context.validation_full_budget,
         validation_root_turn: parent_turn_context.validation_root_turn.clone(),
         personality: parent_turn_context.personality,
         approval_policy: parent_turn_context.approval_policy.clone(),
@@ -154,6 +174,7 @@ pub(super) async fn spawn_review_thread(
         full_suite_budget: Arc::clone(&parent_turn_context.full_suite_budget),
         durable_history_completed_commits: Arc::new(Mutex::new(HashSet::new())),
         terminal_error: Arc::new(Mutex::new(None)),
+        post_tool_stop_reason: Arc::new(OnceLock::new()),
         agent_task_binding: Arc::new(std::sync::OnceLock::new()),
         server_model_warning_emitted: AtomicBool::new(false),
         model_verification_emitted: AtomicBool::new(false),

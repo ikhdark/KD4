@@ -1642,7 +1642,7 @@ pub(super) fn push_thread_filters<'a>(
     } else {
         builder.push(" AND threads.archived = 0");
     }
-    if !include_empty_preview {
+    if !include_empty_preview && !archived_only {
         builder.push(" AND threads.preview <> ''");
     }
     if !allowed_sources.is_empty() {

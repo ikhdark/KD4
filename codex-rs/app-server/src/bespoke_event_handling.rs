@@ -394,22 +394,11 @@ pub(crate) async fn apply_bespoke_event_handling(
                 parsed_cmd,
                 ..
             } = ev;
-            let has_foreign_cwd = cwd_uri
-                .as_ref()
-                .is_some_and(|uri| uri.to_abs_path().is_err());
-            let command_actions = parsed_cmd
-                .iter()
-                .cloned()
-                .map(|parsed| match parsed {
-                    codex_protocol::parse_command::ParsedCommand::Read { cmd, .. }
-                        if has_foreign_cwd =>
-                    {
-                        V2ParsedCommand::Unknown { command: cmd }
-                    }
-                    parsed => V2ParsedCommand::from_core_with_cwd(parsed, &cwd),
-                })
-                .collect::<Vec<_>>();
             let completion_cwd = cwd_uri.unwrap_or_else(|| PathUri::from_abs_path(&cwd));
+            let command_actions = codex_app_server_protocol::command_actions_for_path_uri(
+                &parsed_cmd,
+                &completion_cwd,
+            );
             let presentation = if let Some(network_approval_context) =
                 network_approval_context.map(V2NetworkApprovalContext::from)
             {

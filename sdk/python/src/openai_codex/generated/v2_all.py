@@ -2,7 +2,7 @@
 #   filename:  codex_app_server_protocol.v2.schemas.json
 
 from __future__ import annotations
-from pydantic import AliasChoices, BaseModel, ConfigDict, Field, RootModel
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field, RootModel, model_validator
 from typing import Annotated, Any, Literal
 from enum import Enum
 
@@ -432,7 +432,7 @@ class ClientInfo(BaseModel):
     version: str
 
 
-class CodexErrorInfoValue(Enum):
+class CodexErrorInfoValue(str, Enum):
     context_window_exceeded = "contextWindowExceeded"
     usage_limit_exceeded = "usageLimitExceeded"
     server_overloaded = "serverOverloaded"
@@ -443,6 +443,15 @@ class CodexErrorInfoValue(Enum):
     thread_rollback_failed = "threadRollbackFailed"
     sandbox_error = "sandboxError"
     other = "other"
+
+    @classmethod
+    def _missing_(cls, value: object) -> CodexErrorInfoValue | None:
+        if not isinstance(value, str):
+            return None
+        member = str.__new__(cls, value)
+        member._name_ = value
+        member._value_ = value
+        return member
 
 
 class HttpConnectionFailed(BaseModel):
@@ -541,7 +550,10 @@ class ReadCommandAction(BaseModel):
     )
     command: str
     name: str
-    path: AbsolutePathBuf
+    path: Annotated[
+        LegacyAppPathString,
+        Field(description="Absolute path in the executor's native path convention, not the host's."),
+    ]
     type: Annotated[Literal["read"], Field(title="ReadCommandActionType")]
 
 
@@ -2307,6 +2319,7 @@ class MergeStrategy(Enum):
 
 class MessagePhase(Enum):
     commentary = "commentary"
+    partial_answer = "partial_answer"
     final_answer = "final_answer"
 
 
@@ -6799,6 +6812,7 @@ class CodexErrorInfo(
         | ResponseStreamDisconnectedCodexErrorInfo
         | ResponseTooManyFailedAttemptsCodexErrorInfo
         | ActiveTurnNotSteerableCodexErrorInfo
+        | dict[str, Any]
     ]
 ):
     model_config = ConfigDict(
@@ -6810,11 +6824,39 @@ class CodexErrorInfo(
         | ResponseStreamConnectionFailedCodexErrorInfo
         | ResponseStreamDisconnectedCodexErrorInfo
         | ResponseTooManyFailedAttemptsCodexErrorInfo
-        | ActiveTurnNotSteerableCodexErrorInfo,
+        | ActiveTurnNotSteerableCodexErrorInfo
+        | dict[str, Any],
         Field(
             description="This translation layer make sure that we expose codex error code in camel case.\n\nWhen an upstream HTTP status is available (for example, from the Responses API or a provider), it is forwarded in `httpStatusCode` on the relevant `codexErrorInfo` variant."
         ),
     ]
+
+
+    @model_validator(mode="before")
+    @classmethod
+    def _validate_known_variant(cls, value: Any) -> Any:
+        known_models = {
+            "httpConnectionFailed": HttpConnectionFailedCodexErrorInfo,
+            "responseStreamConnectionFailed": ResponseStreamConnectionFailedCodexErrorInfo,
+            "responseStreamDisconnected": ResponseStreamDisconnectedCodexErrorInfo,
+            "responseTooManyFailedAttempts": ResponseTooManyFailedAttemptsCodexErrorInfo,
+            "activeTurnNotSteerable": ActiveTurnNotSteerableCodexErrorInfo,
+        }
+        if isinstance(value, dict):
+            if len(value) != 1:
+                raise ValueError("expected a single externally tagged error variant")
+            for tag, model in known_models.items():
+                if tag in value:
+                    return model.model_validate(value)
+            if any(tag in value for tag in (
+                "contextWindowExceeded", "usageLimitExceeded", "serverOverloaded",
+                "cyberPolicy", "internalServerError", "unauthorized", "badRequest",
+                "threadRollbackFailed", "sandboxError", "other",
+            )):
+                raise ValueError("invalid payload for known error variant")
+        elif isinstance(value, str) and value in known_models:
+            raise ValueError("invalid payload for known error variant")
+        return value
 
 
 class CollabAgentState(BaseModel):
@@ -8516,6 +8558,7 @@ class ImageGenerationThreadItem(BaseModel):
     model_config = ConfigDict(
         populate_by_name=True,
     )
+    error: Any | None = None
     id: str
     provider_usage: Annotated[
         ImageGenerationUsage | None,

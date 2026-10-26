@@ -93,6 +93,7 @@ use codex_protocol::approvals::NetworkPolicyRuleAction;
 use codex_protocol::config_types::AutoCompactTokenLimitScope;
 use codex_protocol::config_types::ModeKind;
 use codex_protocol::config_types::SERVICE_TIER_DEFAULT_REQUEST_VALUE;
+use codex_protocol::config_types::ServiceTier;
 use codex_protocol::config_types::Settings;
 use codex_protocol::config_types::WebSearchMode;
 use codex_protocol::dynamic_tools::DynamicToolResponse;
@@ -824,10 +825,6 @@ impl Codex {
                 .map(|context| context.mode)
                 .or_else(|| persisted_validation.and_then(|context| context.validation_mode))
                 .unwrap_or(config.validation_mode),
-            validation_full_budget: inherited_validation
-                .map(|context| context.full_budget)
-                .or_else(|| persisted_validation.and_then(|context| context.validation_full_budget))
-                .unwrap_or(config.validation_full_budget),
             validation_root_turn: inherited_validation
                 .map(|context| context.scope.clone())
                 .or_else(|| persisted_validation.and_then(|context| context.validation_root_turn.clone())),
@@ -1250,6 +1247,10 @@ pub(crate) fn get_service_tier(
     fast_mode_enabled: bool,
     model_info: &ModelInfo,
 ) -> Option<String> {
+    // Flex is an explicit routing choice, not a FastMode or catalog capability.
+    if configured_service_tier.as_deref() == Some(ServiceTier::Flex.request_value()) {
+        return configured_service_tier;
+    }
     if !fast_mode_enabled {
         return None;
     }
@@ -1267,6 +1268,7 @@ fn unsupported_service_tier_warning(
     let service_tier = configured_service_tier.filter(|service_tier| {
         fast_mode_enabled
             && *service_tier != SERVICE_TIER_DEFAULT_REQUEST_VALUE
+            && *service_tier != ServiceTier::Flex.request_value()
             && !model_info.supports_service_tier(service_tier)
     })?;
     Some(format!(

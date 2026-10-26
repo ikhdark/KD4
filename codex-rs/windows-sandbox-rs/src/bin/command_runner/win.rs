@@ -588,28 +588,32 @@ fn log_failed_wait(
     );
 }
 
-fn wait_for_terminated_root(process: HANDLE, log_dir: Option<&Path>) -> bool {
-    match wait_for_process(process, TERMINATION_WAIT_MS) {
-        ProcessWaitOutcome::Exited => true,
-        ProcessWaitOutcome::TimedOut => {
-            log_note(
-                "runner root process did not exit after termination",
-                log_dir,
-            );
-            false
-        }
-        ProcessWaitOutcome::Failed {
-            wait_result,
-            windows_error,
-        } => {
-            log_failed_wait(
-                "runner failed to wait for root process after termination",
+fn wait_for_terminated_root(process: HANDLE, job: &JobObject, log_dir: Option<&Path>) -> bool {
+    loop {
+        match wait_for_process(process, TERMINATION_WAIT_MS) {
+            ProcessWaitOutcome::Exited => return true,
+            ProcessWaitOutcome::TimedOut => {
+                log_note(
+                    "runner root process did not exit after termination",
+                    log_dir,
+                );
+            }
+            ProcessWaitOutcome::Failed {
                 wait_result,
                 windows_error,
-                log_dir,
-            );
-            false
+            } => {
+                log_failed_wait(
+                    "runner failed to wait for root process after termination",
+                    wait_result,
+                    windows_error,
+                    log_dir,
+                );
+            }
         }
+        // Keep this native owner and its handles alive until the root really
+        // stops. Failed waits can return immediately; pace those retries.
+        terminate_job_or_process(job, process, log_dir);
+        std::thread::sleep(std::time::Duration::from_millis(100));
     }
 }
 
@@ -992,7 +996,7 @@ pub fn main() -> Result<()> {
         }
         ProcessWaitOutcome::TimedOut => {
             terminate_job_or_process(&job, pi.hProcess, log_dir);
-            wait_for_terminated_root(pi.hProcess, log_dir)
+            wait_for_terminated_root(pi.hProcess, &job, log_dir)
         }
         ProcessWaitOutcome::Failed {
             wait_result,
@@ -1005,7 +1009,7 @@ pub fn main() -> Result<()> {
                 log_dir,
             );
             terminate_job_or_process(&job, pi.hProcess, log_dir);
-            wait_for_terminated_root(pi.hProcess, log_dir)
+            wait_for_terminated_root(pi.hProcess, &job, log_dir)
         }
     };
 

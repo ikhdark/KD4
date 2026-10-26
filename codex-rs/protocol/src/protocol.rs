@@ -5389,8 +5389,6 @@ pub struct TurnContextItem {
     /// Authoritative validation policy. Legacy contexts inherit configured defaults.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub validation_mode: Option<crate::validation::ValidationMode>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub validation_full_budget: Option<usize>,
     /// Root thread and turn whose validation attempts this context shares.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub validation_root_turn: Option<(String, String)>,

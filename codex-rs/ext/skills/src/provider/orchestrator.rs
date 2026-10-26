@@ -197,6 +197,7 @@ where
         };
         if !progress.seen_cursors.insert(next_cursor.clone()) {
             catalog.warnings.push("Orchestrator skill pagination repeated a cursor; discovery cannot advance on this provider response.".to_string());
+            progress.blocked = true;
             catalog.continuation = Some(progress);
             break;
         }
@@ -207,7 +208,9 @@ where
             break;
         }
     }
-    if catalog.continuation.is_some() {
+    if catalog.discovery_blocked() {
+        catalog.warnings.push("Orchestrator skill discovery is incomplete and blocked. Known skills remain available; discovery can retry after the MCP resource generation changes.".to_string());
+    } else if catalog.continuation.is_some() {
         catalog.warnings.push("Orchestrator skill discovery is incomplete. Follow skills.list next_cursor to continue discovery.".to_string());
     }
     if skipped_resources > 0 {
@@ -239,16 +242,18 @@ fn catalog_entry_from_resource(resource: &Resource) -> Option<SkillCatalogEntry>
     let description = normalized_description(resource.description.as_deref().unwrap_or_default())?;
     let main_prompt = main_prompt_uri(uri);
 
-    Some(
-        SkillCatalogEntry::new(
-            SkillPackageId(uri.to_string()),
-            SkillAuthority::new(SkillSourceKind::Orchestrator, CODEX_APPS_MCP_SERVER_NAME),
-            name,
-            description,
-            SkillResourceId::new(main_prompt),
-        )
-        .with_display_path(uri),
+    let mut entry = SkillCatalogEntry::new(
+        SkillPackageId(uri.to_string()),
+        SkillAuthority::new(SkillSourceKind::Orchestrator, CODEX_APPS_MCP_SERVER_NAME),
+        name,
+        description,
+        SkillResourceId::new(main_prompt),
     )
+    .with_display_path(uri);
+    if meta.get("allow_implicit_invocation").and_then(|value| value.as_bool()) == Some(false) {
+        entry = entry.hidden_from_prompt();
+    }
+    Some(entry)
 }
 
 fn validated_skill_uri(uri: &str, max_chars: usize) -> Option<&str> {

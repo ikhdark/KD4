@@ -720,21 +720,33 @@ impl McpConnectionManager {
     /// client owns its startup/tool-discovery deadlines and cancellation; join
     /// them concurrently rather than imposing a readiness-dependent short poll.
     pub async fn wait_for_startup(&self) {
-        futures::future::join_all(self.clients.iter().map(|(name, client)| {
-            let config = self
-                .server_definitions
-                .get(name)
-                .and_then(|server| server.configured_config());
-            let startup = config
-                .and_then(|config| config.startup_timeout_sec)
-                .unwrap_or(crate::rmcp_client::DEFAULT_STARTUP_TIMEOUT);
-            let discovery = config
-                .and_then(|config| config.tool_timeout_sec)
-                .unwrap_or(crate::rmcp_client::DEFAULT_TOOL_TIMEOUT);
-            // Bound setup preceding the client's own timers too. Do not cancel
-            // shared startup: a late server can enter the next turn's snapshot.
-            tokio::time::timeout(startup.saturating_add(discovery), client.client())
-        }))
+        let server_names = self.clients.keys().cloned().collect::<Vec<_>>();
+        self.wait_for_startup_for_servers(&server_names).await;
+    }
+
+    /// Explicit capability requests wait only for their servers, without making
+    /// unrelated optional discovery a prerequisite for the request.
+    pub async fn wait_for_startup_for_servers(&self, server_names: &[String]) {
+        futures::future::join_all(
+            self.clients
+                .iter()
+                .filter(|(name, _)| server_names.contains(name))
+                .map(|(name, client)| {
+                    let config = self
+                        .server_definitions
+                        .get(name)
+                        .and_then(|server| server.configured_config());
+                    let startup = config
+                        .and_then(|config| config.startup_timeout_sec)
+                        .unwrap_or(crate::rmcp_client::DEFAULT_STARTUP_TIMEOUT);
+                    let discovery = config
+                        .and_then(|config| config.tool_timeout_sec)
+                        .unwrap_or(crate::rmcp_client::DEFAULT_TOOL_TIMEOUT);
+                    // Bound setup preceding the client's own timers too. Do not cancel
+                    // shared startup: a late server can enter the next turn's snapshot.
+                    tokio::time::timeout(startup.saturating_add(discovery), client.client())
+                }),
+        )
         .await;
     }
 
@@ -1756,8 +1768,7 @@ impl McpConnectionManager {
         let client = self.clients
             .get(name)
             .ok_or_else(|| anyhow!("unknown MCP server '{name}'"))?;
-        client.reconnect_failed_startup().await;
-        client.client()
+        client.client_for_operation()
             .await
             .context("failed to get client")
     }

@@ -1,6 +1,9 @@
 # Repository guidance
 
-See [the instruction architecture](codex-rs/core/instruction-architecture.md) for instruction ownership, delivery, and maintenance.
+See [the instruction architecture](codex-rs/core/instruction-architecture.md) for instruction/prompt ownership, delivery, and maintenance.
+
+This is Windows only project.
+This is a local project.
 
 Upstream is https://github.com/openai/codex
 

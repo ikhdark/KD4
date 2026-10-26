@@ -54,12 +54,13 @@ where
     .map_err(|err| rollout_lookup_error(thread_id, /*archived*/ true, err))?
     .ok_or(ThreadStoreError::ThreadNotFound { thread_id })?;
 
-    let canonical_archived_path = resolve_archived_representation(
+    let canonical_archived_path = scoped_rollout_path_async(
         store
             .config
             .codex_home
             .join(codex_rollout::ARCHIVED_SESSIONS_SUBDIR),
         archived_path.clone(),
+        "archived",
     )
     .await?;
     let file_name = matching_rollout_file_name(
@@ -136,24 +137,4 @@ where
     Ok(thread)
 }
 
-async fn resolve_archived_representation(
-    root: std::path::PathBuf,
-    discovered: std::path::PathBuf,
-) -> ThreadStoreResult<std::path::PathBuf> {
-    match scoped_rollout_path_async(root.clone(), discovered.clone(), "archived").await {
-        Ok(path) => Ok(path),
-        Err(error) => {
-            // Compression may publish its sibling after lookup, before even
-            // path validation. Re-resolve once, preserving the same scope and
-            // identity checks; the move owner resolves again under its lock.
-            let Some(current) = codex_rollout::existing_rollout_path(&discovered).await else {
-                return Err(error);
-            };
-            if current == discovered {
-                return Err(error);
-            }
-            scoped_rollout_path_async(root, current, "archived").await
-        }
-    }
-}
 

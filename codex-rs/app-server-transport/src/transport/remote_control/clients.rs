@@ -70,6 +70,7 @@ struct ClientManagementResponse {
 
 pub(super) async fn list_remote_control_clients_with_client(
     client: &HttpClient,
+    request_state: &super::RemoteControlEnrollmentState,
     remote_control_url: &str,
     auth_manager: &Arc<AuthManager>,
     params: RemoteControlClientsListParams,
@@ -78,6 +79,7 @@ pub(super) async fn list_remote_control_clients_with_client(
     let url = environment_clients_url(remote_control_url, &params.environment_id)?;
     let response = send_client_management_request(
         client,
+        request_state,
         auth_manager,
         ClientManagementRequest::List {
             url: &url,
@@ -114,6 +116,7 @@ pub(super) async fn list_remote_control_clients_with_client(
 
 pub(super) async fn list_remote_control_clients_with_pool(
     http_clients: &RouteAwareClientPool,
+    request_state: &super::RemoteControlEnrollmentState,
     remote_control_url: &str,
     auth_manager: &Arc<AuthManager>,
     params: RemoteControlClientsListParams,
@@ -124,7 +127,10 @@ pub(super) async fn list_remote_control_clients_with_pool(
         .client_for_url(url.as_str())
         .await
         .map_err(io::Error::other)?;
-    list_remote_control_clients_with_client(&client, remote_control_url, auth_manager, params).await
+    list_remote_control_clients_with_client(
+        &client, request_state, remote_control_url, auth_manager, params,
+    )
+    .await
 }
 
 fn validate_client_list_params(params: &RemoteControlClientsListParams) -> io::Result<()> {
@@ -149,6 +155,7 @@ fn validate_client_list_params(params: &RemoteControlClientsListParams) -> io::R
 
 pub(super) async fn revoke_remote_control_client_with_client(
     client: &HttpClient,
+    request_state: &super::RemoteControlEnrollmentState,
     remote_control_url: &str,
     auth_manager: &Arc<AuthManager>,
     params: RemoteControlClientsRevokeParams,
@@ -165,6 +172,7 @@ pub(super) async fn revoke_remote_control_client_with_client(
         .push(&params.client_id);
     let response = send_client_management_request(
         client,
+        request_state,
         auth_manager,
         ClientManagementRequest::Revoke { url: &url },
         "revoke remote control client",
@@ -181,6 +189,7 @@ pub(super) async fn revoke_remote_control_client_with_client(
 
 pub(super) async fn revoke_remote_control_client_with_pool(
     http_clients: &RouteAwareClientPool,
+    request_state: &super::RemoteControlEnrollmentState,
     remote_control_url: &str,
     auth_manager: &Arc<AuthManager>,
     params: RemoteControlClientsRevokeParams,
@@ -199,8 +208,10 @@ pub(super) async fn revoke_remote_control_client_with_pool(
         .client_for_url(url.as_str())
         .await
         .map_err(io::Error::other)?;
-    revoke_remote_control_client_with_client(&client, remote_control_url, auth_manager, params)
-        .await
+    revoke_remote_control_client_with_client(
+        &client, request_state, remote_control_url, auth_manager, params,
+    )
+    .await
 }
 
 fn validate_client_revoke_params(params: &RemoteControlClientsRevokeParams) -> io::Result<()> {
@@ -221,6 +232,7 @@ fn validate_client_revoke_params(params: &RemoteControlClientsRevokeParams) -> i
 
 async fn send_client_management_request(
     client: &HttpClient,
+    request_state: &super::RemoteControlEnrollmentState,
     auth_manager: &Arc<AuthManager>,
     request: ClientManagementRequest<'_>,
     action: &str,
@@ -228,18 +240,20 @@ async fn send_client_management_request(
     let mut auth_recovery = auth_manager.unauthorized_recovery();
     let mut auth_change_rx = auth_manager.auth_change_receiver();
     let auth = load_remote_control_auth(auth_manager).await?;
-    let response = send_client_management_request_once(client, &auth, &request, action).await?;
+    let response =
+        send_client_management_request_once(client, request_state, &auth, &request, action).await?;
     if response.status.as_u16() != 401
         || !recover_remote_control_auth(&mut auth_recovery, &mut auth_change_rx).await
     {
         return Ok(response);
     }
     let auth = load_remote_control_auth(auth_manager).await?;
-    send_client_management_request_once(client, &auth, &request, action).await
+    send_client_management_request_once(client, request_state, &auth, &request, action).await
 }
 
 async fn send_client_management_request_once(
     client: &HttpClient,
+    request_state: &super::RemoteControlEnrollmentState,
     auth: &RemoteControlConnectionAuth,
     request: &ClientManagementRequest<'_>,
     action: &str,
@@ -268,6 +282,7 @@ async fn send_client_management_request_once(
         }
         ClientManagementRequest::Revoke { url } => client.delete((*url).clone()),
     };
+    request_state.admit_request()?;
     let response = request
         .timeout(REMOTE_CONTROL_CLIENT_MANAGEMENT_TIMEOUT)
         .headers(auth_headers)
@@ -276,6 +291,7 @@ async fn send_client_management_request_once(
         .map_err(|err| io::Error::other(format!("failed to {action}: {err}")))?;
     let headers = response.headers().clone();
     let status = response.status();
+    request_state.record_retry_after(status, &headers);
     let body = super::enroll::read_remote_control_response_body_for_status(response)
         .await
         .map_err(|err| io::Error::other(format!("failed to read {action} response: {err}")))?;

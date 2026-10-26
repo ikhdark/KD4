@@ -1,3 +1,4 @@
+use codex_extension_api::ContextualUserFragment;
 use codex_extension_api::PreviousWorldStateSection;
 use codex_extension_api::RenderedWorldStateFragment;
 use codex_extension_api::WorldStateSectionContribution;

@@ -123,6 +123,7 @@ async fn validate_final_response(
 ) -> codex_protocol::error::Result<()> {
     if result.surfaced_result.is_none()
         && result.required_tool_terminal.is_none()
+        && ctx.post_tool_stop_reason.get().is_none()
         && let Some(schema) = ctx.final_output_json_schema.as_ref()
         && ctx.terminal_error.lock().await.is_none()
     {

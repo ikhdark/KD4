@@ -145,10 +145,23 @@ fn merge_skill_root_snapshots(snapshots: Vec<SkillRootSnapshot>) -> SkillLoadOut
         outcome.errors.extend(errors);
     }
 
-    let mut seen = HashSet::new();
-    outcome
-        .skills
-        .retain(|skill| seen.insert((skill.path_to_skills_md.clone(), skill.source.clone())));
+    let mut seen = HashMap::new();
+    let mut skills = Vec::<crate::SkillMetadata>::new();
+    for skill in outcome.skills.drain(..) {
+        let key = (skill.path_to_skills_md.clone(), skill.source.clone());
+        if let Some(&index) = seen.get(&key) {
+            let existing: &mut crate::SkillMetadata = &mut skills[index];
+            for path in skill.discovery_paths {
+                if !existing.discovery_paths.contains(&path) {
+                    existing.discovery_paths.push(path);
+                }
+            }
+        } else {
+            seen.insert(key, skills.len());
+            skills.push(skill);
+        }
+    }
+    outcome.skills = skills;
     let retained_skill_paths = outcome
         .skills
         .iter()

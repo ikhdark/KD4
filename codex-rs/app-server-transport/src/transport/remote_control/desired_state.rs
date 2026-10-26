@@ -134,7 +134,7 @@ impl RemoteControlHandle {
             }).await?;
             let (enrollment, _) = self.run_with_lifecycle(&lifecycle, self
                 .load_or_enroll_server_with_source(
-                    super::RemoteControlHttpClientSource::Pool(&self.http_clients),
+                    super::RemoteControlHttpClientSource::Pool(&self.http_clients, &self.current_enrollment),
                     &current_enrollment,
                     &mut auth,
                     &status.installation_id,

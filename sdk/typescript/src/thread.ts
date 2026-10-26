@@ -230,6 +230,7 @@ export class Thread {
           if (
             event.item.type === "agent_message" &&
             event.item.phase !== "commentary" &&
+            event.item.phase !== "partial_answer" &&
             (!explicitFinalSeen || event.item.phase === "final_answer")
           ) {
             agentMessageSeen = true;

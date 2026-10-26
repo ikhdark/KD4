@@ -5,6 +5,7 @@ use crate::marketplace::validate_marketplace_root;
 use codex_config::CONFIG_TOML_FILE;
 use codex_config::MarketplaceConfigUpdate;
 use codex_config::record_user_marketplace;
+use codex_utils_absolute_path::paths_match_after_normalization;
 use std::fs;
 use std::io::ErrorKind;
 use std::path::Path;
@@ -190,8 +191,15 @@ impl MarketplaceInstallMetadata {
     fn matches_config(&self, marketplace: &toml::Value) -> bool {
         marketplace.get("source_type").and_then(toml::Value::as_str)
             == Some(self.config_source_type())
-            && marketplace.get("source").and_then(toml::Value::as_str)
-                == Some(self.config_source().as_str())
+            && marketplace
+                .get("source")
+                .and_then(toml::Value::as_str)
+                .is_some_and(|source| match &self.source {
+                    InstalledMarketplaceSource::Local { path } => {
+                        paths_match_after_normalization(source, path)
+                    }
+                    InstalledMarketplaceSource::Git { url, .. } => source == url,
+                })
             && match marketplace.get("ref") {
                 None => self.ref_name().is_none(),
                 Some(value) => value

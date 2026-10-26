@@ -4,6 +4,8 @@ use codex_protocol::protocol::HookOutputEntry;
 use codex_protocol::protocol::HookOutputEntryKind;
 use codex_protocol::protocol::HookRunStatus;
 use codex_protocol::protocol::HookRunSummary;
+use codex_utils_output_truncation::TruncationPolicy;
+use codex_utils_output_truncation::formatted_truncate_text;
 
 use crate::engine::ConfiguredHandler;
 use crate::engine::dispatcher;
@@ -53,6 +55,20 @@ pub(crate) fn trimmed_non_empty(text: &str) -> Option<String> {
         None
     } else {
         Some(trimmed.to_string())
+    }
+}
+
+pub(crate) fn exit_error_message(exit_code: Option<i32>, stderr: &str) -> String {
+    let message = match exit_code {
+        Some(exit_code) => format!("hook exited with code {exit_code}"),
+        None => "hook exited without a status code".to_string(),
+    };
+    match trimmed_non_empty(stderr) {
+        Some(stderr) => formatted_truncate_text(
+            &format!("{message}: {stderr}"),
+            TruncationPolicy::Tokens(1_024),
+        ),
+        None => message,
     }
 }
 

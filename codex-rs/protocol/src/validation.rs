@@ -17,9 +17,6 @@ pub enum ValidationMode {
     Full,
 }
 
-/// Maximum admitted Full .5/FULL runtime/tooling validation attempts in one root turn, including its children; excludes targeted compilation.
-pub const DEFAULT_VALIDATION_FULL_BUDGET: usize = 2;
-
 impl ValidationMode {
     /// Parse an exact command on the first line of trusted, top-level user input.
     /// A task may follow on subsequent lines. Arbitrary instruction or tool text

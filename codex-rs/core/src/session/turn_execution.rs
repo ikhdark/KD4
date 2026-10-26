@@ -2655,7 +2655,6 @@ impl DeliveredSourceCoverage {
 pub(crate) struct TurnExecutionControl {
     issued_directives: BTreeSet<String>,
     validation_mode: ValidationMode,
-    validation_budget_exhausted: bool,
 
 
 
@@ -2724,7 +2723,6 @@ impl TurnExecutionControl {
         Self {
             issued_directives: BTreeSet::new(),
             validation_mode: ValidationMode::Full,
-            validation_budget_exhausted: false,
 
 
 
@@ -2761,13 +2759,12 @@ impl TurnExecutionControl {
         }
     }
 
-    pub(crate) fn set_validation_policy(&mut self, mode: ValidationMode, exhausted: bool) {
+    pub(crate) fn set_validation_policy(&mut self, mode: ValidationMode) {
         self.validation_mode = mode;
-        self.validation_budget_exhausted = exhausted;
     }
 
     pub(crate) fn validation_repair_available(&self) -> bool {
-        self.validation_mode != ValidationMode::Off && !self.validation_budget_exhausted
+        self.validation_mode != ValidationMode::Off
     }
 
     pub(crate) fn with_active_plan(

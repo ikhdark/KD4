@@ -194,7 +194,10 @@ fn merge_checkpoint_entries(timing: &mut TurnTiming, previous: TurnTiming) {
     timing.tool_calls = merge_by_identity(
         previous.tool_calls,
         std::mem::take(&mut timing.tool_calls),
-        |call| call.call_id.clone(),
+        // Detailed legacy checkpoints can reuse a wire ID in a later
+        // generation. Keep those executions distinct while preserving the
+        // wire-ID fallback for older rows without an execution identity.
+        |call| (call.call_id.clone(), call.execution_id.clone()),
     );
     timing.deterministic_continuation_receipts = merge_by_identity(
         previous.deterministic_continuation_receipts,

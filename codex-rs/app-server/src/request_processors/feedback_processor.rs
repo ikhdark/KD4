@@ -85,7 +85,7 @@ impl FeedbackRequestProcessor {
         {
             tracing::info!(target: "feedback_tags", account_id);
         }
-        let snapshot = self.feedback.snapshot(conversation_id);
+        let mut snapshot = self.feedback.snapshot(conversation_id);
         let thread_id = snapshot.thread_id.clone();
         let prepare_logs = async {
             let feedback_thread_ids = if include_logs {
@@ -233,6 +233,22 @@ impl FeedbackRequestProcessor {
         };
         let ((attachment_paths, sqlite_feedback_logs), doctor_report) =
             tokio::join!(prepare_logs, prepare_doctor);
+
+        // A successful query can still return old rows after a batch was lost.
+        // Preserve the independent memory buffer rather than overriding it with incomplete logs.
+        let sqlite_feedback_logs = if self
+            .log_db
+            .as_ref()
+            .is_some_and(LogDbLayer::has_write_failure)
+        {
+            None
+        } else {
+            sqlite_feedback_logs
+        };
+        if include_logs {
+            // Flush/query failures can themselves produce diagnostics during collection.
+            snapshot.refresh_logs(&self.feedback);
+        }
 
         let mut extra_attachments = Vec::new();
         if let Some(doctor_report) = doctor_report {

@@ -1,3 +1,4 @@
+use std::pin::Pin;
 use std::time::Duration;
 
 use crate::AuthError;
@@ -27,7 +28,14 @@ const OPENAI_FILE_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 const OPENAI_FILE_UPLOAD_MIN_BYTES_PER_SECOND: u64 = 256 * 1024;
 const OPENAI_FILE_FINALIZE_TIMEOUT: Duration = Duration::from_secs(30);
 const OPENAI_FILE_FINALIZE_RETRY_DELAY: Duration = Duration::from_millis(250);
+const OPENAI_FILE_BLOB_MAX_RETRIES: u32 = 4;
+const OPENAI_FILE_BLOB_RETRY_DELAY: Duration = Duration::from_millis(250);
 const OPENAI_FILE_USE_CASE: &str = "codex";
+
+enum OpenAiFileContents {
+    Stream(Pin<Box<dyn Stream<Item = std::io::Result<Bytes>> + Send>>),
+    Replayable(Bytes),
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UploadedOpenAiFile {
@@ -218,7 +226,28 @@ pub async fn upload_openai_file_with_pool(
         http_clients,
         file_name,
         file_size_bytes,
-        contents,
+        OpenAiFileContents::Stream(Box::pin(contents)),
+        OPENAI_FILE_FINALIZE_TIMEOUT,
+    )
+    .await
+}
+
+/// Uploads immutable staged bytes, allowing bounded retries of the same blob PUT.
+/// File allocation and finalization are never replayed by the blob retry loop.
+pub async fn upload_openai_file_bytes_with_pool(
+    base_url: &str,
+    auth: &dyn AuthProvider,
+    http_clients: &RouteAwareClientPool,
+    file_name: String,
+    contents: Bytes,
+) -> Result<UploadedOpenAiFile, OpenAiFileError> {
+    upload_openai_file_with_pool_and_finalize_timeout(
+        base_url,
+        auth,
+        http_clients,
+        file_name,
+        u64::try_from(contents.len()).unwrap_or(u64::MAX),
+        OpenAiFileContents::Replayable(contents),
         OPENAI_FILE_FINALIZE_TIMEOUT,
     )
     .await
@@ -230,7 +259,7 @@ async fn upload_openai_file_with_pool_and_finalize_timeout(
     http_clients: &RouteAwareClientPool,
     file_name: String,
     file_size_bytes: u64,
-    contents: impl Stream<Item = std::io::Result<Bytes>> + Send + 'static,
+    contents: OpenAiFileContents,
     finalize_timeout: Duration,
 ) -> Result<UploadedOpenAiFile, OpenAiFileError> {
     if file_size_bytes > OPENAI_FILE_UPLOAD_LIMIT_BYTES {
@@ -268,23 +297,63 @@ async fn upload_openai_file_with_pool_and_finalize_timeout(
         })?;
     let file_id = create_payload.file_id.clone();
     let upload_result: Result<UploadedOpenAiFile, OpenAiFileError> = async {
-        let upload_response = http_clients
+        let upload_timeout = openai_file_upload_timeout(file_size_bytes);
+        let upload_deadline = Instant::now() + upload_timeout;
+        let request = http_clients
             .request(Method::PUT, &create_payload.upload_url)
-            .timeout(openai_file_upload_timeout(file_size_bytes))
+            .timeout(upload_timeout)
             .header("x-ms-blob-type", "BlockBlob")
-            .header(CONTENT_LENGTH, file_size_bytes)
-            .body_stream(contents)
-            .send()
-            .await
-            .map_err(|source| request_error(&create_payload.upload_url, source))?;
-        let upload_status = upload_response.status();
-        let upload_body = upload_response.text().await.unwrap_or_default();
-        if !upload_status.is_success() {
-            return Err(OpenAiFileError::UnexpectedStatus {
-                url: diagnostic_url(&create_payload.upload_url),
-                status: upload_status,
-                body: upload_body,
-            });
+            .header(CONTENT_LENGTH, file_size_bytes);
+        let (mut request, replayable_contents) = match contents {
+            OpenAiFileContents::Stream(contents) => (request.body_stream(contents), None),
+            OpenAiFileContents::Replayable(contents) => {
+                (request.body(contents.clone()), Some(contents))
+            }
+        };
+        let mut retries = 0;
+        loop {
+            let (error, retryable, server_advice) = match request.send().await {
+                Ok(response) => {
+                    let status = response.status();
+                    let server_advice = blob_upload_retry_after(response.headers());
+                    let body = response.text().await.unwrap_or_default();
+                    if status.is_success() {
+                        break;
+                    }
+                    (OpenAiFileError::UnexpectedStatus {
+                        url: diagnostic_url(&create_payload.upload_url),
+                        status,
+                        body,
+                    }, matches!(status, StatusCode::BAD_GATEWAY
+                        | StatusCode::SERVICE_UNAVAILABLE | StatusCode::GATEWAY_TIMEOUT), server_advice)
+                }
+                Err(source) => {
+                    let retryable = source.is_timeout() || source.is_connect()
+                        || source.is_body() || source.is_request();
+                    (request_error(&create_payload.upload_url, source), retryable, None)
+                }
+            };
+            let retry_at = server_advice.map(codex_http_client::RetryAfter::deadline)
+                .unwrap_or_else(|| Instant::now()
+                    + OPENAI_FILE_BLOB_RETRY_DELAY.saturating_mul(1 << retries));
+            if retryable
+                && retries < OPENAI_FILE_BLOB_MAX_RETRIES
+                && let Some(contents) = replayable_contents.as_ref()
+                && retry_at < upload_deadline
+            {
+                tokio::time::sleep_until(retry_at).await;
+                if let Some(remaining) = upload_deadline.checked_duration_since(Instant::now()) {
+                    request = http_clients
+                        .request(Method::PUT, &create_payload.upload_url)
+                        .timeout(remaining)
+                        .header("x-ms-blob-type", "BlockBlob")
+                        .header(CONTENT_LENGTH, file_size_bytes)
+                        .body(contents.clone());
+                    retries += 1;
+                    continue;
+                }
+            }
+            return Err(error);
         }
 
         let finalize_url = file_endpoint_url(base_url, Some(&create_payload.file_id), true)?;
@@ -399,6 +468,14 @@ fn openai_file_upload_timeout(file_size_bytes: u64) -> Duration {
     OPENAI_FILE_REQUEST_TIMEOUT.saturating_add(Duration::from_secs(
         file_size_bytes.div_ceil(OPENAI_FILE_UPLOAD_MIN_BYTES_PER_SECOND),
     ))
+}
+
+fn blob_upload_retry_after(headers: &http::HeaderMap) -> Option<codex_http_client::RetryAfter> {
+    headers.get("x-ms-retry-after-ms")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .and_then(|delay| codex_http_client::RetryAfter::from_delay(Duration::from_millis(delay)))
+        .or_else(|| codex_http_client::RetryAfter::from_headers(headers))
 }
 
 async fn authorized_request(

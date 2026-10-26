@@ -27,10 +27,6 @@ impl WebSocketPongWatchdog {
         self.deadline
     }
 
-    pub(crate) fn write_deadline(&self, now: Instant) -> Instant {
-        self.deadline.unwrap_or(now + self.timeout)
-    }
-
     pub(crate) fn received_pong(&mut self) {
         self.deadline = None;
     }

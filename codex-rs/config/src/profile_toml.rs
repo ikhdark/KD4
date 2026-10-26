@@ -36,7 +36,6 @@ pub struct ConfigProfile {
     pub model_reasoning_summary: Option<ReasoningSummary>,
     pub model_verbosity: Option<Verbosity>,
     pub validation_mode: Option<ValidationMode>,
-    pub validation_full_budget: Option<usize>,
     /// Optional path to a JSON model catalog (applied on startup only).
     pub model_catalog_json: Option<AbsolutePathBuf>,
     pub personality: Option<Personality>,

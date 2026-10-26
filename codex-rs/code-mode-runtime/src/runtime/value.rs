@@ -9,6 +9,7 @@ const REMOTE_IMAGE_URL_ERROR: &str = "Tool call failed: remote image URLs are no
 const INVALID_IMAGE_URL_ERROR: &str =
     "Tool call failed: invalid image output. Pass a base64 data URI instead";
 const CODEX_IMAGE_DETAIL_META_KEY: &str = "codex/imageDetail";
+const EXECUTION_TERMINATED_MESSAGE: &str = "JavaScript execution terminated";
 
 enum ImageOutputError {
     Discarded,
@@ -75,6 +76,9 @@ pub(super) fn serialize_output_text_with_limit(
     value: v8::Local<'_, v8::Value>,
     max_bytes: usize,
 ) -> Result<String, String> {
+    if scope.is_execution_terminating() {
+        return Err(EXECUTION_TERMINATED_MESSAGE.to_string());
+    }
     if value.is_undefined()
         || value.is_null()
         || value.is_boolean()
@@ -93,6 +97,9 @@ pub(super) fn serialize_output_text_with_limit(
     if let Some(stringified) = super::output_projection::stringify(&mut tc, value) {
         return bounded_string(&mut tc, stringified, max_bytes);
     }
+    if tc.is_execution_terminating() {
+        return Err(EXECUTION_TERMINATED_MESSAGE.to_string());
+    }
     if tc.has_caught() {
         return Err(tc
             .exception()
@@ -110,16 +117,29 @@ pub(super) fn serialize_console_text(
     value: v8::Local<'_, v8::Value>,
     max_bytes: usize,
 ) -> Result<String, String> {
+    if scope.is_execution_terminating() {
+        return Err(EXECUTION_TERMINATED_MESSAGE.to_string());
+    }
     let tc = std::pin::pin!(v8::TryCatch::new(scope));
     let mut tc = tc.init();
-    if value.is_native_error()
+    let has_evidence = if value.is_native_error()
         && let Ok(object) = v8::Local::<v8::Object>::try_from(value)
-        && ["results", "evidence", "missing_capabilities"].iter().any(|field| {
+    {
+        ["results", "evidence", "missing_capabilities"].iter().any(|field| {
+            if tc.is_execution_terminating() {
+                return false;
+            }
             v8::String::new(&tc, field)
                 .and_then(|key| object.get(&tc, key.into()))
                 .is_some_and(|value| !value.is_undefined())
         })
-    {
+    } else {
+        false
+    };
+    if tc.is_execution_terminating() {
+        return Err(EXECUTION_TERMINATED_MESSAGE.to_string());
+    }
+    if has_evidence {
         tc.reset();
         return serialize_output_text_with_limit(&mut tc, value, max_bytes);
     }
@@ -130,12 +150,21 @@ pub(super) fn serialize_console_text(
         && let Some(stack) = object.get(&tc, key.into())
         && let Ok(stack) = v8::Local::<v8::String>::try_from(stack)
     {
+        if tc.is_execution_terminating() {
+            return Err(EXECUTION_TERMINATED_MESSAGE.to_string());
+        }
         return bounded_string(&mut tc, stack, max_bytes);
+    }
+    if tc.is_execution_terminating() {
+        return Err(EXECUTION_TERMINATED_MESSAGE.to_string());
     }
     tc.reset();
     if value.is_object() {
         if let Some(stringified) = super::output_projection::stringify(&mut tc, value) {
             return bounded_string(&mut tc, stringified, max_bytes);
+        }
+        if tc.is_execution_terminating() {
+            return Err(EXECUTION_TERMINATED_MESSAGE.to_string());
         }
         if tc.has_caught() && max_bytes >= 24 {
             tc.reset();
@@ -341,9 +370,19 @@ pub(super) fn v8_value_to_json_with_limit(
     value: v8::Local<'_, v8::Value>,
     max_bytes: usize,
 ) -> Result<Option<JsonValue>, JsonConversionError> {
+    if scope.is_execution_terminating() {
+        return Err(JsonConversionError::Invalid(
+            EXECUTION_TERMINATED_MESSAGE.to_string(),
+        ));
+    }
     let tc = std::pin::pin!(v8::TryCatch::new(scope));
     let mut tc = tc.init();
     let encoded = super::output_projection::bounded_json_codec(&mut tc, value, max_bytes);
+    if tc.is_execution_terminating() {
+        return Err(JsonConversionError::Invalid(
+            EXECUTION_TERMINATED_MESSAGE.to_string(),
+        ));
+    }
     if encoded.is_some_and(|value| value.is_null()) {
         return Err(JsonConversionError::TooLarge);
     }
@@ -380,6 +419,9 @@ pub(super) fn serialized_json_to_v8<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     json: &str,
 ) -> Option<v8::Local<'s, v8::Value>> {
+    if scope.is_execution_terminating() {
+        return None;
+    }
     let json = v8::String::new(scope, json)?;
     super::output_projection::json_codec(scope, json.into(), "parse")
 }
@@ -401,6 +443,9 @@ pub(super) fn value_to_error_text(
     scope: &mut v8::PinScope<'_, '_>,
     value: v8::Local<'_, v8::Value>,
 ) -> String {
+    if scope.is_execution_terminating() {
+        return EXECUTION_TERMINATED_MESSAGE.to_string();
+    }
     // Captured before the TryCatch borrows the scope. Used only to repair a
     // call to a nested tool name that this cell's catalog does not contain.
     let enabled_tools = scope
@@ -413,8 +458,14 @@ pub(super) fn value_to_error_text(
         let key = v8::String::new(&tc, "stack")?;
         v8::Local::<v8::String>::try_from(object.get(&tc, key.into())?).ok()
     });
+    if tc.is_execution_terminating() {
+        return EXECUTION_TERMINATED_MESSAGE.to_string();
+    }
     tc.reset();
     let string = stack.or_else(|| value.to_string(&tc));
+    if tc.is_execution_terminating() {
+        return EXECUTION_TERMINATED_MESSAGE.to_string();
+    }
     tc.reset();
     let mut text = string
         .map(|string| diagnostic_string(&mut tc, string))
@@ -457,6 +508,9 @@ pub(super) fn value_to_error_text(
                 continue;
             };
             let attached = object.get(&tc, key.into());
+            if tc.is_execution_terminating() {
+                return EXECUTION_TERMINATED_MESSAGE.to_string();
+            }
             tc.reset();
             let Some(attached) = attached.filter(|value| !value.is_undefined()) else {
                 continue;
@@ -464,12 +518,18 @@ pub(super) fn value_to_error_text(
             let remaining = MAX_PAYLOAD_BYTES.saturating_sub(text.len() + field.len() + 32);
             let mut serialized = super::output_projection::stringify(&mut tc, attached)
                 .and_then(|json| bounded_string(&mut tc, json, remaining).ok());
+            if tc.is_execution_terminating() {
+                return EXECUTION_TERMINATED_MESSAGE.to_string();
+            }
             tc.reset();
             if serialized.is_none() {
                 serialized =
                     super::output_projection::json_codec(&mut tc, attached, "helper_evidence")
                         .and_then(|value| v8::Local::<v8::String>::try_from(value).ok())
                         .and_then(|json| bounded_string(&mut tc, json, remaining).ok());
+                if tc.is_execution_terminating() {
+                    return EXECUTION_TERMINATED_MESSAGE.to_string();
+                }
                 tc.reset();
             }
             text.push_str(&format!("\nHelper {field}:\n"));
@@ -482,6 +542,10 @@ pub(super) fn value_to_error_text(
 }
 
 pub(super) fn throw_type_error(scope: &mut v8::PinScope<'_, '_>, message: &str) {
+    // Allocating/throwing a catchable exception must not replace termination.
+    if scope.is_execution_terminating() {
+        return;
+    }
     if let Some(message) = v8::String::new(scope, message) {
         let error = v8::Exception::type_error(scope, message);
         scope.throw_exception(error);
@@ -492,6 +556,9 @@ pub(super) fn error_value<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     message: &str,
 ) -> v8::Local<'s, v8::Value> {
+    if scope.is_execution_terminating() {
+        return v8::undefined(scope).into();
+    }
     match v8::String::new(scope, message) {
         Some(message) => v8::Exception::error(scope, message),
         None => v8::undefined(scope).into(),

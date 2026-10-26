@@ -153,8 +153,8 @@ export type AgentMessageItem = {
   type: "agent_message";
   /** Either natural-language text or JSON when structured output is requested. */
   text: string;
-  /** Absent on legacy producers. Commentary is not an accepted final answer. */
-  phase?: "commentary" | "final_answer";
+  /** Absent on legacy producers. Commentary and partial answers are not terminal. */
+  phase?: "commentary" | "partial_answer" | "final_answer";
 };
 
 /** Canonical planning content; not a claim that the plan was implemented. */

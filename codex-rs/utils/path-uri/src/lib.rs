@@ -408,8 +408,8 @@ impl PathUri {
     /// Path text is interpreted using the POSIX or Windows convention inferred
     /// from the base URI. An absolute path replaces the base URI's path, while a
     /// relative path is appended lexically. Windows root-relative paths retain
-    /// the base drive or UNC share, while drive-relative paths and UNC prefixes
-    /// without a share are rejected.
+    /// the base drive or UNC share. Same-drive relative paths use the base;
+    /// other-drive relative paths and UNC prefixes without a share are rejected.
     /// Empty and `.` segments are ignored, while `..` removes one segment
     /// without escaping the POSIX root, Windows drive, or UNC share. Literal
     /// `%`, `?`, and `#` characters are percent-encoded as filename text. Paths
@@ -437,11 +437,33 @@ impl PathUri {
             return Ok(absolute);
         }
         let path_bytes = path.as_bytes();
+        let path = if convention == PathConvention::Windows
+            && matches!(path_bytes, [drive, b':', ..] if drive.is_ascii_alphabetic())
+        {
+            let same_drive = self.0.path_segments()
+                .and_then(|mut segments| segments.find(|segment| !segment.is_empty()))
+                .is_some_and(|segment| {
+                    let segment = urlencoding::decode_binary(segment.as_bytes());
+                    matches!(segment.as_ref(), [drive, b':']
+                        if drive.eq_ignore_ascii_case(&path_bytes[0]))
+                });
+            if !same_drive {
+                return Err(PathUriParseError::InvalidFileUriPath {
+                    path: path.to_string(),
+                });
+            }
+            &path[2..]
+        } else {
+            path
+        };
+        if path.is_empty() {
+            return Ok(self.clone());
+        }
+        let path_bytes = path.as_bytes();
         // A UNC prefix without a share, such as `\\server`, is not relative to the base either.
         if convention == PathConvention::Windows
-            && (matches!(path_bytes, [drive, b':', ..] if drive.is_ascii_alphabetic())
-                || matches!(path_bytes, [first, second, ..]
-                    if is_windows_separator_byte(*first) && is_windows_separator_byte(*second)))
+            && matches!(path_bytes, [first, second, ..]
+                if is_windows_separator_byte(*first) && is_windows_separator_byte(*second))
         {
             return Err(PathUriParseError::InvalidFileUriPath {
                 path: path.to_string(),

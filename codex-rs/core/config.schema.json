@@ -100,7 +100,7 @@
       "description": "Analytics settings loaded from config.toml. Fields are optional so we can apply defaults.",
       "properties": {
         "enabled": {
-          "description": "When `false`, disables analytics across Codex product surfaces in this profile.",
+          "description": "When `false`, disables built-in OpenAI analytics across Codex product surfaces in this profile. Explicit OTLP metrics collectors are controlled by `otel.metrics_exporter` instead.",
           "type": "boolean"
         }
       },
@@ -1113,7 +1113,7 @@
         "stream_idle_timeout_ms": {
           "description": "Idle timeout (in milliseconds) to wait for activity on a streaming response before treating the connection as lost.",
           "format": "uint64",
-          "minimum": 0.0,
+          "minimum": 1.0,
           "type": "integer"
         },
         "stream_max_retries": {
@@ -1135,7 +1135,7 @@
         "websocket_connect_timeout_ms": {
           "description": "Maximum time (in milliseconds) to wait for a websocket connection attempt before treating it as failed.",
           "format": "uint64",
-          "minimum": 0.0,
+          "minimum": 1.0,
           "type": "integer"
         },
         "wire_api": {
@@ -1363,7 +1363,7 @@
               "$ref": "#/definitions/OtelExporterKind"
             }
           ],
-          "description": "Optional metrics exporter"
+          "description": "Optional metrics exporter. Defaults to the built-in `statsig` exporter, which honors `analytics.enabled`. Explicit OTLP collectors are independent of that setting; use `none` to disable metrics export."
         },
         "span_attributes": {
           "additionalProperties": {
@@ -4287,19 +4287,13 @@
       ],
       "description": "Collection of settings that are specific to the TUI."
     },
-    "validation_full_budget": {
-      "description": "Maximum Full .5/FULL runtime/tooling validation attempts per root turn, including children; targeted compilation is excluded. Defaults to 2.",
-      "format": "uint",
-      "minimum": 0.0,
-      "type": "integer"
-    },
     "validation_mode": {
       "allOf": [
         {
           "$ref": "#/definitions/ValidationMode"
         }
       ],
-      "description": "Default validation execution policy. Defaults to `full.5` (Full .5): compile checks and other operations are allowed, but tests, full suites, and non-compilation checks in any language are not. Legacy `benchmark` settings remain accepted."
+      "description": "Default validation execution policy. Defaults to `full.5` (Full .5): compile checks and other operations are allowed, but tests/full test suites are not. Non-compilation checks are prohibited except in permitted non-test KD4 scripts workflows. Legacy `benchmark` settings remain accepted."
     },
     "web_search": {
       "allOf": [

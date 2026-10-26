@@ -1403,15 +1403,6 @@ impl ToolRegistry {
     }
 
 
-    {
-        let runtime = handler as Arc<dyn CoreToolRuntime>;
-        let registered = RegisteredTool::new(runtime, TypedToolClass::DynamicExternal);
-        Self::new(HashMap::from([(
-            registered.tool_name().clone(),
-            registered,
-        )]))
-    }
-
     fn tool(&self, name: &ToolName) -> Option<Arc<dyn CoreToolRuntime>> {
         self.tools.get(name).map(|tool| Arc::clone(tool.runtime()))
     }
@@ -1618,6 +1609,11 @@ impl ToolRegistry {
         &self,
         mut invocation: ToolInvocation,
     ) -> Result<(ToolInvocation, Option<String>), FunctionCallError> {
+        if let Some(reason) = invocation.step_context.turn.post_tool_stop_reason.get() {
+            return Err(FunctionCallError::RespondToModel(format!(
+                "Tool call not run: a PostToolUse hook stopped this turn: {reason}"
+            )));
+        }
         let original_name = invocation.tool_name.clone();
         if let Some(registered) = self.tools.get(&invocation.tool_name) {
             invocation = registered.runtime().prepare_invocation(invocation).await?;
@@ -1956,6 +1952,22 @@ impl ToolRegistry {
             })?;
         }
 
+        // Prepared calls may have waited for workspace admission while another
+        // tool's post hook stopped the turn. Do not enter their handler now.
+        if let Some(reason) = invocation.step_context.turn.post_tool_stop_reason.get() {
+            let error = FunctionCallError::RespondToModel(format!(
+                "Tool call not run: a PostToolUse hook stopped this turn: {reason}"
+            ));
+            notify_tool_finish_if_unclaimed(
+                &invocation,
+                dispatch_state.as_ref(),
+                &error,
+                ToolCallOutcome::Blocked,
+            )
+            .await?;
+            return Err(error);
+        }
+
         let invocation_for_tool = invocation.clone();
         let handler_dispatch_state = Arc::clone(&dispatch_state);
         let log_payload = invocation.payload.log_payload();
@@ -2049,6 +2061,7 @@ impl ToolRegistry {
                 .unwrap_or_else(|error| PostToolUseOutcome {
                     hook_events: Vec::new(),
                     should_block: true,
+                    stop_reason: None,
                     additional_contexts: Vec::new(),
                     feedback_message: Some(format!("PostToolUse could not finish: {error}")),
                 });

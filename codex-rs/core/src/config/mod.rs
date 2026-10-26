@@ -108,7 +108,6 @@ use codex_protocol::permissions::NetworkSandboxPolicy;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::MultiAgentVersion;
 use codex_protocol::protocol::SandboxPolicy;
-use codex_protocol::validation::DEFAULT_VALIDATION_FULL_BUDGET;
 use codex_protocol::validation::ValidationMode;
 pub use codex_thread_store::ExtraConfig;
 use codex_utils_absolute_path::AbsolutePathBuf;
@@ -242,7 +241,7 @@ Apply the base instructions for audit/review scope, evidence, validation, and co
 
 Root owns the consolidated audit/review report and user delivery under the base instructions. Assign per-worker `.json` or `.txt` report paths; these files are complete internal handoffs, not competing user-facing reports. Keep review source edits prohibited and honor report-write permissions.
 
-Before assigning execution evidence, coordinate effective validation mode, user restrictions, worker capabilities, one owning runner, remaining budget, and evidence route. When execution is permitted, use an execution-authorized worker for scoped verification where beneficial rather than funneling every benchmark to root. Route `Verification requests` to an authorized parent or subagent assigned to verification; delegation never lifts execution restrictions.
+Before assigning execution evidence, coordinate effective validation mode, user restrictions, worker capabilities, one owning runner, explicit workload limits, and evidence route. When execution is permitted, use an execution-authorized worker for scoped verification where beneficial rather than funneling every benchmark to root. Route `Verification requests` to an authorized parent or subagent assigned to verification; delegation never lifts execution restrictions.
 "#;
 fn default_multi_agent_v2_usage_hint_text(usage_hint_text: &str, max_concurrency: usize) -> String {
     format!(
@@ -788,8 +787,6 @@ pub struct Config {
 
     /// Authoritative default validation execution policy.
     pub validation_mode: ValidationMode,
-    /// Maximum Full .5/FULL runtime/tooling attempts in a root turn and its descendants; excludes targeted compilation.
-    pub validation_full_budget: usize,
 
     /// Project consumed completed textual tool outputs into retrievable receipts
     /// for manually managed history. Canonical rollout items are never changed.
@@ -1096,6 +1093,7 @@ pub struct ConfigBuilder {
     cloud_config_bundle: CloudConfigBundleLoader,
     thread_config_loader: Option<Arc<dyn ThreadConfigLoader>>,
     fallback_cwd: Option<PathBuf>,
+    ignore_project_config: bool,
 }
 
 impl ConfigBuilder {
@@ -1142,6 +1140,12 @@ impl ConfigBuilder {
         self
     }
 
+    /// Load home/system/session configuration without discovering a project.
+    pub fn ignore_project_config(mut self, ignore_project_config: bool) -> Self {
+        self.ignore_project_config = ignore_project_config;
+        self
+    }
+
     pub async fn build(mut self) -> std::io::Result<Config> {
         let loader = self.cloud_config_bundle.for_load();
         self.cloud_config_bundle = loader.clone();
@@ -1165,6 +1169,7 @@ impl ConfigBuilder {
             cloud_config_bundle,
             thread_config_loader,
             fallback_cwd,
+            ignore_project_config,
         } = self;
         let codex_home = match codex_home {
             Some(codex_home) => AbsolutePathBuf::from_absolute_path(codex_home)?,
@@ -1182,7 +1187,7 @@ impl ConfigBuilder {
         let config_layer_stack = load_config_layers_state(
             LOCAL_FS.as_ref(),
             &codex_home,
-            Some(cwd),
+            (!ignore_project_config).then_some(cwd),
             &cli_overrides,
             ConfigLoadOptions {
                 loader_overrides,
@@ -3478,9 +3483,6 @@ impl Config {
                 .collect(),
             tool_output_token_limit: cfg.tool_output_token_limit,
             validation_mode: cfg.validation_mode.unwrap_or_default(),
-            validation_full_budget: cfg
-                .validation_full_budget
-                .unwrap_or(DEFAULT_VALIDATION_FULL_BUDGET),
             completed_tool_history_projection: cfg
                 .completed_tool_history_projection
                 .unwrap_or(true),

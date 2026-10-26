@@ -144,6 +144,17 @@ fn catalog_entry_from_skill(skill: &SkillMetadata, enabled: bool) -> SkillCatalo
     .with_dependencies(skill.dependencies.clone())
     .with_source_scope(skill.scope);
 
+    entry.selection_paths = skill
+        .discovery_paths
+        .iter()
+        .flat_map(|path| {
+            let path = path.to_string_lossy().into_owned();
+            // Accept both native paths and the slash form used by skill links.
+            let normalized = path.replace('\\', "/");
+            let normalized = (normalized != path).then_some(normalized);
+            std::iter::once(path).chain(normalized)
+        })
+        .collect();
     if !enabled {
         entry = entry.disabled();
     }

@@ -10,6 +10,7 @@ use codex_app_server_protocol::PluginShareTargetRole;
 use codex_config::types::McpServerConfig;
 use codex_core_plugins::OPENAI_CURATED_MARKETPLACE_NAME;
 use codex_core_plugins::PluginListBackgroundTaskOptions;
+use codex_core_plugins::PluginMarketplaceScope;
 use codex_core_plugins::is_openai_curated_marketplace_name;
 use codex_core_plugins::remote::REMOTE_CREATED_BY_ME_MARKETPLACE_NAME;
 use codex_core_plugins::remote::REMOTE_GLOBAL_MARKETPLACE_NAME;
@@ -278,6 +279,9 @@ async fn hydrate_remote_plugin_local_versions(
 
 fn remote_installed_plugin_visible_marketplaces(config: &Config) -> Vec<&'static str> {
     let mut marketplaces = Vec::new();
+    if !config.features.enabled(Feature::Plugins) {
+        return marketplaces;
+    }
     if config.features.enabled(Feature::RemotePlugin) {
         marketplaces.push(REMOTE_GLOBAL_MARKETPLACE_NAME);
         marketplaces.push(REMOTE_CREATED_BY_ME_MARKETPLACE_NAME);
@@ -622,6 +626,31 @@ impl PluginRequestProcessor {
             .map_config_load_error()
     }
 
+    async fn load_marketplace_scopes(
+        &self,
+        roots: &[AbsolutePathBuf],
+        global_config: &Config,
+    ) -> (Vec<PluginMarketplaceScope>, Vec<codex_app_server_protocol::MarketplaceLoadErrorInfo>) {
+        if roots.is_empty() {
+            return (vec![PluginMarketplaceScope {
+                config: global_config.plugins_config_input(), roots: Vec::new(),
+            }], Vec::new());
+        }
+        let mut scopes = Vec::new();
+        let mut errors = Vec::new();
+        for cwd in roots {
+            match self.load_latest_config(Some(cwd.to_path_buf())).await {
+                Ok(config) => scopes.push(PluginMarketplaceScope {
+                    config: config.plugins_config_input(), roots: vec![cwd.clone()],
+                }),
+                Err(err) => errors.push(codex_app_server_protocol::MarketplaceLoadErrorInfo {
+                    marketplace_path: cwd.clone(), message: err.message,
+                }),
+            }
+        }
+        (scopes, errors)
+    }
+
     async fn plugin_list_response(
         &self,
         params: PluginListParams,
@@ -636,15 +665,18 @@ impl PluginRequestProcessor {
         let marketplace_kinds =
             marketplace_kinds.unwrap_or_else(|| vec![PluginListMarketplaceKind::Local]);
         let include_local = marketplace_kinds.contains(&PluginListMarketplaceKind::Local);
-        let include_vertical = marketplace_kinds.contains(&PluginListMarketplaceKind::Vertical);
-
-        let config = self.load_latest_config(/*fallback_cwd*/ None).await?;
+        let config = self.config_manager.load_non_project_config().await.map_config_load_error()?;
+        let (scopes, scope_load_errors) = self.load_marketplace_scopes(&roots, &config).await;
+        let global_plugins_enabled = config.features.enabled(Feature::Plugins);
+        let include_vertical = global_plugins_enabled
+            && marketplace_kinds.contains(&PluginListMarketplaceKind::Vertical);
         let empty_response = || PluginListResponse {
             marketplaces: Vec::new(),
             marketplace_load_errors: Vec::new(),
             featured_plugin_ids: Vec::new(),
         };
-        if !config.features.enabled(Feature::Plugins) {
+        if !global_plugins_enabled && !scopes.iter().any(|scope| scope.config.plugins_enabled)
+            && scope_load_errors.is_empty() {
             return Ok(empty_response());
         }
         let auth = self.auth_manager.auth().await;
@@ -660,13 +692,13 @@ impl PluginRequestProcessor {
         let auth_mode = auth.as_ref().map(CodexAuth::api_auth_mode);
         plugins_manager.set_auth_mode(auth_mode);
         let plugins_input = config.plugins_config_input();
-        let include_shared_with_me =
+        let include_shared_with_me = global_plugins_enabled &&
             marketplace_kinds.contains(&PluginListMarketplaceKind::SharedWithMe);
-        let include_created_by_me_remote = marketplace_kinds
+        let include_created_by_me_remote = global_plugins_enabled && marketplace_kinds
             .contains(&PluginListMarketplaceKind::CreatedByMeRemote)
             && config.features.enabled(Feature::RemotePlugin);
         let include_global_remote =
-            !explicit_marketplace_kinds && config.features.enabled(Feature::RemotePlugin);
+            global_plugins_enabled && !explicit_marketplace_kinds && config.features.enabled(Feature::RemotePlugin);
         let use_remote_global_catalog =
             include_global_remote && auth_mode.is_some_and(DomainAuthMode::uses_codex_backend);
         let remote_plugin_service_config = RemotePluginServiceConfig::new(
@@ -675,16 +707,14 @@ impl PluginRequestProcessor {
         );
         let local = async {
             let outcome = if include_local {
-            let config_for_marketplace_listing = plugins_input.clone();
+            let scopes_for_marketplace_listing = scopes.clone();
             let plugins_manager_for_marketplace_listing = plugins_manager.clone();
-            let roots_for_marketplace_listing = roots.clone();
             let shared_plugin_ids_by_local_path =
                 load_shared_plugin_ids_by_local_path(&config).await?;
             match tokio::task::spawn_blocking(move || {
                 let outcome = plugins_manager_for_marketplace_listing
-                    .list_marketplaces_for_config(
-                        &config_for_marketplace_listing,
-                        &roots_for_marketplace_listing,
+                    .list_marketplaces_for_scopes(
+                        &scopes_for_marketplace_listing,
                         /*include_openai_curated*/ !use_remote_global_catalog,
                     )?;
                 Ok::<
@@ -791,7 +821,7 @@ impl PluginRequestProcessor {
         if include_created_by_me_remote {
             remote_sources.push(RemoteMarketplaceSource::CreatedByMeRemote);
         }
-        if marketplace_kinds.contains(&PluginListMarketplaceKind::WorkspaceDirectory) {
+        if global_plugins_enabled && marketplace_kinds.contains(&PluginListMarketplaceKind::WorkspaceDirectory) {
             remote_sources.push(RemoteMarketplaceSource::WorkspaceDirectory);
         }
         if include_shared_with_me && config.features.enabled(Feature::PluginSharing) {
@@ -846,8 +876,9 @@ impl PluginRequestProcessor {
             observed.is_cached_for(config.codex_home.as_path(), &remote_plugin_service_config, auth.as_ref()));
         Ok::<_, JSONRPCErrorError>((data, refresh_global_remote_catalog_cache))
         };
-        let ((mut data, marketplace_load_errors), (remote_data, refresh_global_remote_catalog_cache)) =
+        let ((mut data, mut marketplace_load_errors), (remote_data, refresh_global_remote_catalog_cache)) =
             join_plugin_listing_reads(local, remote).await?;
+        marketplace_load_errors.extend(scope_load_errors);
         data.extend(remote_data);
 
         if include_local
@@ -858,7 +889,7 @@ impl PluginRequestProcessor {
             plugins_manager.maybe_start_plugin_list_background_tasks_for_config(
                 &plugins_input,
                 auth.clone(),
-                &roots,
+                &scopes,
                 PluginListBackgroundTaskOptions {
                     refresh_global_remote_catalog_cache,
                 },
@@ -923,8 +954,11 @@ impl PluginRequestProcessor {
             marketplaces: Vec::new(),
             marketplace_load_errors: Vec::new(),
         };
-        let config = self.load_latest_config(/*fallback_cwd*/ None).await?;
-        if !config.features.enabled(Feature::Plugins) {
+        let config = self.config_manager.load_non_project_config().await.map_config_load_error()?;
+        let (scopes, scope_load_errors) = self.load_marketplace_scopes(&roots, &config).await;
+        if !config.features.enabled(Feature::Plugins)
+            && !scopes.iter().any(|scope| scope.config.plugins_enabled)
+            && scope_load_errors.is_empty() {
             return Ok(empty_response());
         }
         let auth = self.auth_manager.auth().await;
@@ -952,8 +986,7 @@ impl PluginRequestProcessor {
             self.load_local_installed_and_suggested_plugins(
                 plugins_manager.clone(),
                 &config,
-                &plugins_input,
-                roots,
+                scopes,
                 install_suggestion_plugin_names,
             ),
             self.load_remote_installed_plugins(
@@ -963,7 +996,8 @@ impl PluginRequestProcessor {
                 auth.as_ref(),
             ),
         );
-        let (mut data, marketplace_load_errors) = local?;
+        let (mut data, mut marketplace_load_errors) = local?;
+        marketplace_load_errors.extend(scope_load_errors);
         data.extend(remote);
         filter_openai_curated_installed_conflicts(
             &mut data,
@@ -987,8 +1021,7 @@ impl PluginRequestProcessor {
         &self,
         plugins_manager: Arc<codex_core_plugins::PluginsManager>,
         config: &Config,
-        plugins_input: &codex_core_plugins::PluginsConfigInput,
-        roots: Vec<AbsolutePathBuf>,
+        scopes: Vec<PluginMarketplaceScope>,
         install_suggestion_plugin_names: HashSet<String>,
     ) -> Result<
         (
@@ -997,12 +1030,10 @@ impl PluginRequestProcessor {
         ),
         JSONRPCErrorError,
     > {
-        let config_for_marketplace_listing = plugins_input.clone();
         let shared_plugin_ids_by_local_path = load_shared_plugin_ids_by_local_path(config).await?;
         match tokio::task::spawn_blocking(move || {
-            let outcome = plugins_manager.list_marketplaces_for_config(
-                &config_for_marketplace_listing,
-                &roots,
+            let outcome = plugins_manager.list_marketplaces_for_scopes(
+                &scopes,
                 /*include_openai_curated*/ true,
             )?;
             Ok::<
@@ -1073,6 +1104,9 @@ impl PluginRequestProcessor {
         visible_marketplaces: &[&str],
         auth: Option<&CodexAuth>,
     ) -> Vec<PluginMarketplaceEntry> {
+        if !plugins_input.plugins_enabled || visible_marketplaces.is_empty() {
+            return Vec::new();
+        }
         let remote_marketplaces = if let Some(remote_marketplaces) = plugins_manager
             .build_remote_installed_plugin_marketplaces_from_cache(visible_marketplaces)
         {

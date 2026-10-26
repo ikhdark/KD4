@@ -1001,6 +1001,7 @@ fn map_ws_error(err: WsError, url: &Url) -> ApiError {
 struct WrappedWebsocketError {
     code: Option<String>,
     message: Option<String>,
+    headers: Option<Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1033,10 +1034,21 @@ fn map_wrapped_websocket_error_event(
         headers,
         ..
     } = event;
-    let headers = headers.as_ref().map(json_headers_to_http_headers);
-    let retry_after = headers
+    // Nested error headers describe this rejection, not the surrounding frame.
+    // Keep top-level headers as a compatibility fallback.
+    let mut headers = headers.as_ref().map(json_headers_to_http_headers);
+    let mut retry_after = headers
         .as_ref()
         .and_then(codex_http_client::RetryAfter::from_headers);
+    if let Some(nested) = error.as_ref()
+        .and_then(|error| error.headers.as_ref())
+        .and_then(Value::as_object)
+    {
+        let nested = json_headers_to_http_headers(nested);
+        retry_after = codex_http_client::RetryAfter::from_headers(&nested).or(retry_after);
+        headers.get_or_insert_with(HeaderMap::new)
+            .extend(nested);
+    }
 
     if let Some(error) = error.as_ref()
         && let Some(code) = error.code.as_deref()

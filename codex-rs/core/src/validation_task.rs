@@ -23,15 +23,6 @@ pub(crate) fn policy_refusal(
     output
 }
 
-/// Runtime/tooling allowance; targeted compilation is admitted separately.
-pub(crate) fn policy_limit(turn: &TurnContext) -> usize {
-    use codex_protocol::validation::ValidationMode;
-    match turn.validation_mode {
-        ValidationMode::Off | ValidationMode::Compile => 0,
-        ValidationMode::FullHalf | ValidationMode::Full => turn.validation_full_budget,
-    }
-}
-
 pub(crate) fn mode_refusal(
     turn: &TurnContext,
     classification: codex_command_analysis::validation::ValidationPolicyClassification,
@@ -47,7 +38,7 @@ pub(crate) fn mode_refusal(
         ValidationMode::Compile if classification != Class::TargetedCompilation =>
             "COMPILE permits only targeted compile checks, not tests, gates, formatting, non-compilation checks, or full builds. No command was launched.",
         ValidationMode::FullHalf if matches!(classification, Class::Tests | Class::Checks) =>
-            "Full .5 allows compile checks and other task-authorized operations, but not tests, full suites, or non-compilation checks in any language. Select FULL explicitly for those checks or tests. No command was launched.",
+            "Full .5 allows compile checks, permitted non-test KD4 scripts workflows, and other task-authorized operations, but not tests/full test suites or other non-compilation checks in any language. Select FULL explicitly for those checks or tests. No command was launched.",
         _ => return None,
     };
     Some(policy_refusal(turn, reason))
@@ -70,36 +61,18 @@ pub(crate) async fn reserve_policy(
     if !declared && !classification.is_validation() {
         return Ok(None);
     }
-    // Count executions, not shell envelopes: a compound script must not hide
-    // multiple checks in one reservation. A runner's own batch is one leaf.
-    if serde_json::from_str::<Vec<Vec<String>>>(&selection).is_ok_and(|commands| {
-        commands.iter().filter(|argv| argv.split_first().is_some_and(|(program, args)| {
-            crate::validation::classify_validation_policy(
-                &crate::tools::handlers::command_shape::CommandInvocation::Argv {
-                    program: program.clone(), args: args.to_vec(),
-                },
-            ).is_validation()
-        })).count() > 1
-    }) {
-        return Err(policy_refusal(turn, "Multiple validation launches in one shell command are not permitted; use one targeted check or one authorized runner batch."));
-    }
-    // Detached worktrees and disabled workspace capture can lack a content
-    // fingerprint. Do not collapse their tracked source edits to one sentinel.
-    // This fallback invalidates admission only; it is not source-byte evidence.
-    let revision = match source_revision {
-        Some(revision) => revision.to_owned(),
-        None => {
-            // Both real command handlers already observed the tracker revision.
-            // Observing zero reads that monotonic epoch without invalidating it.
-            let epoch = session.services.command_execution
-                .observe_repository_revision(&turn.sub_id, 0).await;
-            format!("tracked-source-epoch:{epoch}")
-        }
-    };
+    // A workspace identity can describe only the repository root. Always
+    // include tracked mutations so that an unchanged root cannot hide edits.
+    // These tokens invalidate admission; they do not prove source equivalence.
+    // Both command handlers already observed the tracker revision. Observing
+    // zero reads that monotonic epoch without invalidating it.
+    let epoch = session.services.command_execution
+        .observe_repository_revision(&turn.sub_id, 0).await;
+    let revision = serde_json::json!([source_revision, epoch]).to_string();
     turn.full_suite_budget.reserve_policy(
         reservation_owner(session, turn, call_id),
         serde_json::json!([execution_scope, selection]).to_string(), revision,
-        policy_limit(turn), classification == Class::TargetedCompilation,
+        classification == Class::TargetedCompilation,
     ).map(Some).map_err(|reason| policy_refusal(turn, reason))
 }
 

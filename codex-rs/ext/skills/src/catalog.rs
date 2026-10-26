@@ -132,6 +132,8 @@ pub struct SkillCatalogEntry {
     pub short_description: Option<String>,
     pub main_prompt: SkillResourceId,
     pub display_path: Option<String>,
+    /// Discovery aliases accepted for selection, never used to route reads.
+    pub selection_paths: Vec<String>,
     pub dependencies: Option<SkillDependencies>,
     pub enabled: bool,
     pub prompt_visible: bool,
@@ -154,6 +156,7 @@ impl SkillCatalogEntry {
             short_description: None,
             main_prompt,
             display_path: None,
+            selection_paths: Vec::new(),
             dependencies: None,
             enabled: true,
             prompt_visible: true,
@@ -212,9 +215,15 @@ pub struct SkillDiscoveryContinuation {
     pub cursor: Option<String>,
     pub resource_offset: usize,
     pub seen_cursors: HashSet<String>,
+    /// No further discovery is possible in this MCP resource generation.
+    pub blocked: bool,
 }
 
 impl SkillCatalog {
+    pub(crate) fn discovery_blocked(&self) -> bool {
+        self.continuation.as_ref().is_some_and(|progress| progress.blocked)
+    }
+
     /// Merge an immutable snapshot, cloning only entries that survive precedence.
     pub(crate) fn extend_ref(&mut self, other: &Self) {
         let mut seen: HashSet<_> = self.entries.iter()

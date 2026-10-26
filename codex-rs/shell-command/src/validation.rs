@@ -2428,7 +2428,7 @@ fn policy_cargo(args: &[String]) -> ValidationPolicyClassification {
                 if matches!(flag, "--workspace" | "--all" | "-a" | "--exclude" | "--") {
                     return Policy::Restricted;
                 }
-                if benchmark && flag == "--bench" {
+                if flag == "--bench" {
                     let literal = inline.or_else(|| args.get(cursor + 1).map(String::as_str))
                         .is_some_and(literal_package_selector);
                     named_benchmark |= literal;
@@ -2447,7 +2447,9 @@ fn policy_cargo(args: &[String]) -> ValidationPolicyClassification {
                 }
                 cursor += if inline.is_none() && CARGO_VALUE_OPTIONS.contains(&flag) { 2 } else { 1 };
             }
-            if !targeted && !(benchmark && named_benchmark && !other_targets) { Policy::Restricted }
+            // A named bench also scopes `cargo check --manifest-path ... --bench ...`;
+            // it compiles that target without executing or budgeting a benchmark.
+            if !targeted && !(named_benchmark && !other_targets) { Policy::Restricted }
             else if benchmark { Policy::Benchmark }
             else { Policy::TargetedCompilation }
         }
@@ -2552,7 +2554,14 @@ fn policy_just(args: &[String], runners: &[RepositoryRunner], depth: usize, leav
     let tail = args.get(index..).unwrap_or_default();
     let Some(recipe) = tail.first() else { return Policy::Opaque; };
     if !changed_owner && let Some(child) = just_lane_child(tail) && let Some((program, args)) = child.split_first() {
-        return policy_argv(program, args, runners, depth + 1, leaves);
+        let policy = policy_argv(program, args, runners, depth + 1, leaves);
+        if policy == Policy::Checks && runners.iter().any(|runner| {
+            runner.admission_runner.as_deref() == Some("rust_build_status")
+                && runner.matches("just", tail)
+        }) {
+            return Policy::Tooling;
+        }
+        return policy;
     }
     if !changed_owner && recipe == "check-lane" && tail.get(1).is_some_and(|package| literal_package_selector(package)) {
         let child = [vec!["check".to_owned(), "-p".to_owned(), tail[1].clone()], tail[2..].to_vec()].concat();
@@ -2560,7 +2569,17 @@ fn policy_just(args: &[String], runners: &[RepositoryRunner], depth: usize, leav
     }
     if !changed_owner && matches!(recipe.as_str(), "clippy" | "clippy-lane" | "cargo-shear" | "lint-rust") {
         leaves.push(std::iter::once("just".to_owned()).chain(tail.iter().cloned()).collect());
-        return policy_lint(&tail[1..]);
+        let policy = policy_lint(&tail[1..]);
+        // Only these recipes delegate the whole check to the permitted lane
+        // script; cargo-shear and the mixed lint-rust recipe are not exempt.
+        return if policy == Policy::Checks && matches!(recipe.as_str(), "clippy" | "clippy-lane") {
+            Policy::Tooling
+        } else { policy };
+    }
+    if !changed_owner && matches!(recipe.as_str(), "fmt-check" | "fmt-check-fast") {
+        // These repository recipes invoke scripts/maintenance/format.py.
+        leaves.push(std::iter::once("just".to_owned()).chain(tail.iter().cloned()).collect());
+        return Policy::Tooling;
     }
     if !changed_owner && matches!(recipe.as_str(), "core-test-plan" | "core-test-list") {
         let arity = if recipe == "core-test-plan" { 2 } else { 1 };
@@ -2615,7 +2634,23 @@ fn policy_repository_script(script: &str, args: &[String], runners: &[Repository
     }
     let command = args.get(index)?.as_str();
     if kind == 1 && command == "run-lane" {
-        return Some(args.iter().position(|arg| arg == "--").and_then(|index| args[index + 1..].split_first()).map_or(Policy::Opaque, |(program, args)| policy_argv(program, args, runners, depth + 1, leaves)));
+        let policy = args.iter().position(|arg| arg == "--")
+            .and_then(|index| args[index + 1..].split_first())
+            .map_or(Policy::Opaque, |(program, args)| policy_argv(program, args, runners, depth + 1, leaves));
+        if policy == Policy::Checks {
+            let invocation = std::iter::once(script.clone()).chain(args.iter().cloned()).collect::<Vec<_>>();
+            // The permitted repository script owns this non-test check. Reuse
+            // trusted runner/path matching, never an arbitrary script suffix.
+            if runners.iter().any(|runner| {
+                runner.admission_runner.as_deref() == Some("rust_build_status")
+                    && runner.passthrough_after.as_deref() == Some("--")
+                    && runner.matches("python", &invocation)
+            }) {
+                return Some(Policy::Tooling);
+            }
+        }
+        // A script wrapper must never erase a test or full-test-suite child.
+        return Some(policy);
     }
     let script = match kind {
         0 => "scripts/build/rust_test_runner.py",

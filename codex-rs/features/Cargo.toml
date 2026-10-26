@@ -17,7 +17,6 @@ path = "src/bin/export.rs"
 workspace = true
 
 [dependencies]
-codex-otel = { workspace = true }
 codex-protocol = { workspace = true }
 schemars = { workspace = true }
 serde = { workspace = true, features = ["derive"] }

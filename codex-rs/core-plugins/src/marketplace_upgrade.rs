@@ -12,6 +12,7 @@ use crate::marketplace_add::MarketplaceSource;
 use crate::marketplace_add::canonicalize_configured_git_source;
 use crate::marketplace_policy::MarketplacePolicy;
 use codex_config::CONFIG_TOML_FILE;
+use codex_config::ConfigLayerSource;
 use codex_config::ConfigLayerStack;
 use codex_config::MarketplaceConfigUpdate;
 use codex_config::record_user_marketplace;
@@ -20,7 +21,11 @@ use codex_config::types::MarketplaceSourceType;
 use codex_plugin::validate_plugin_segment;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use std::path::Path;
+use std::sync::Arc;
 use std::time::Duration;
+
+/// Reload the initiating operation's layers and overrides, from a blocking worker.
+pub type ConfigLayerReload = Arc<dyn Fn() -> std::io::Result<ConfigLayerStack> + Send + Sync>;
 
 const MARKETPLACE_UPGRADE_GIT_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -61,6 +66,7 @@ pub fn upgrade_configured_git_marketplaces(
     codex_home: &Path,
     config_layer_stack: &ConfigLayerStack,
     marketplace_name: Option<&str>,
+    reload_config: &ConfigLayerReload,
 ) -> ConfiguredMarketplaceUpgradeOutcome {
     let loaded = load_configured_git_marketplaces(config_layer_stack);
     let marketplaces = loaded
@@ -95,7 +101,17 @@ pub fn upgrade_configured_git_marketplaces(
             });
             continue;
         }
-        match upgrade_configured_git_marketplace(codex_home, &install_root, &marketplace) {
+        let base_config = AbsolutePathBuf::resolve_path_against_base(CONFIG_TOML_FILE, codex_home);
+        let record_in_base_config = config_layer_stack.layers_high_to_low().into_iter()
+            .find(|layer| layer.config.get("marketplaces")
+                .and_then(|marketplaces| marketplaces.get(&marketplace.name)).is_some())
+            .is_some_and(|layer| matches!(
+                &layer.name,
+                ConfigLayerSource::User { file, profile: None } if file == &base_config
+            ));
+        match upgrade_configured_git_marketplace(
+            codex_home, &install_root, &marketplace, reload_config, record_in_base_config,
+        ) {
             Ok(Some(upgraded_root)) => upgraded_roots.push(upgraded_root),
             Ok(None) => {}
             Err(err) => {
@@ -139,9 +155,7 @@ pub(crate) fn write_added_git_marketplace_metadata(
 fn load_configured_git_marketplaces(
     config_layer_stack: &ConfigLayerStack,
 ) -> ConfiguredGitMarketplaceLoadOutcome {
-    let Some(user_config) = config_layer_stack.effective_user_config() else {
-        return ConfiguredGitMarketplaceLoadOutcome::default();
-    };
+    let user_config = config_layer_stack.effective_config();
     let Some(marketplaces) = user_config
         .get("marketplaces")
         .and_then(toml::Value::as_table)
@@ -207,17 +221,18 @@ fn upgrade_configured_git_marketplace(
     codex_home: &Path,
     install_root: &Path,
     marketplace: &ConfiguredGitMarketplace,
+    reload_config: &ConfigLayerReload,
+    record_in_base_config: bool,
 ) -> Result<Option<AbsolutePathBuf>, String> {
     validate_plugin_segment(&marketplace.name, "marketplace name")?;
     let _operation = crate::installed_marketplaces::try_lock_marketplace_operation(codex_home, &marketplace.name)
         .map_err(|err| format!("marketplace operation is busy or unavailable: {err}"))?;
-    ensure_configured_git_marketplace_unchanged(codex_home, marketplace)?;
+    ensure_configured_git_marketplace_unchanged(reload_config, marketplace)?;
     let (source, ref_name) = marketplace.git_source();
     let remote_revision = git_remote_revision(source, ref_name, MARKETPLACE_UPGRADE_GIT_TIMEOUT)?;
     let destination = install_root.join(&marketplace.name);
     if validate_marketplace_root(&destination)
         .is_ok_and(|marketplace_name| marketplace_name == marketplace.name)
-        && marketplace.last_revision.as_deref() == Some(remote_revision.as_str())
         && installed_marketplace_metadata_matches(&destination, marketplace, &remote_revision)
     {
         return Ok(None);
@@ -267,7 +282,12 @@ fn upgrade_configured_git_marketplace(
         sparse_paths: &marketplace.sparse_paths,
     };
     activate_marketplace_root(&destination, staged_dir, || {
-        ensure_configured_git_marketplace_unchanged(codex_home, marketplace)?;
+        ensure_configured_git_marketplace_unchanged(reload_config, marketplace)?;
+        // Profiles and non-user layers own their source settings. The installed
+        // metadata above already records the revision without creating a user override.
+        if !record_in_base_config {
+            return Ok(());
+        }
         record_user_marketplace(codex_home, &marketplace.name, &update).map_err(|err| {
             format!(
                 "failed to record upgraded marketplace `{}` in user config.toml: {err}",
@@ -292,10 +312,10 @@ impl ConfiguredGitMarketplace {
     }
 }
 fn ensure_configured_git_marketplace_unchanged(
-    codex_home: &Path,
+    reload_config: &ConfigLayerReload,
     expected: &ConfiguredGitMarketplace,
 ) -> Result<(), String> {
-    let current = read_configured_git_marketplace(codex_home, &expected.name)?;
+    let current = read_configured_git_marketplace(reload_config, &expected.name)?;
     match current {
         Some(current) if current == *expected => Ok(()),
         Some(_) => Err(format!(
@@ -310,26 +330,12 @@ fn ensure_configured_git_marketplace_unchanged(
 }
 
 fn read_configured_git_marketplace(
-    codex_home: &Path,
+    reload_config: &ConfigLayerReload,
     marketplace_name: &str,
 ) -> Result<Option<ConfiguredGitMarketplace>, String> {
-    let config_path = codex_home.join(CONFIG_TOML_FILE);
-    let raw_config = match std::fs::read_to_string(&config_path) {
-        Ok(raw_config) => raw_config,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(err) => {
-            return Err(format!(
-                "failed to read user config {} while checking marketplace auto-upgrade: {err}",
-                config_path.display()
-            ));
-        }
-    };
-    let config: toml::Value = toml::from_str(&raw_config).map_err(|err| {
-        format!(
-            "failed to parse user config {} while checking marketplace auto-upgrade: {err}",
-            config_path.display()
-        )
-    })?;
+    let stack = reload_config()
+        .map_err(|err| format!("failed to reload config while checking marketplace upgrade: {err}"))?;
+    let config = stack.effective_config();
     let Some(marketplace) = config
         .get("marketplaces")
         .and_then(toml::Value::as_table)
@@ -337,5 +343,9 @@ fn read_configured_git_marketplace(
     else {
         return Ok(None);
     };
-    parse_configured_git_marketplace(marketplace_name, marketplace)
+    let marketplace = parse_configured_git_marketplace(marketplace_name, marketplace)?;
+    if let Some(marketplace) = &marketplace {
+        MarketplacePolicy::from_requirements(stack.requirements()).validate_source(&marketplace.source)?;
+    }
+    Ok(marketplace)
 }

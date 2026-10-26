@@ -374,7 +374,6 @@ pub struct TurnContext {
     pub(crate) collaboration_mode: CollaborationMode,
     pub(crate) multi_agent_version: MultiAgentVersion,
     pub(crate) validation_mode: codex_protocol::validation::ValidationMode,
-    pub(crate) validation_full_budget: usize,
     pub(crate) validation_root_turn: (String, String),
     pub(crate) personality: Option<Personality>,
     pub(crate) approval_policy: Constrained<AskForApproval>,
@@ -400,6 +399,9 @@ pub struct TurnContext {
     /// Remembers completed ordered-history commit retry keys for this turn only.
     pub(crate) durable_history_completed_commits: Arc<Mutex<HashSet<String>>>,
     pub(crate) terminal_error: Arc<Mutex<Option<ErrorEvent>>>,
+    /// A PostToolUse workflow stop is sticky across model switches, but does not
+    /// cancel or undo tools already executing. The first stopping hook wins.
+    pub(crate) post_tool_stop_reason: Arc<OnceLock<String>>,
     /// Identity captured at turn entry, before terminal callbacks can outlive this attempt.
     pub(crate) agent_task_binding: Arc<OnceLock<Option<codex_agent_task_store::AgentTaskBinding>>>,
     pub(crate) server_model_warning_emitted: AtomicBool,
@@ -445,7 +447,6 @@ fn same_turn_config_projection(left: &Config, right: &Config) -> bool {
         && left.model_reasoning_summary == right.model_reasoning_summary
         && left.service_tier == right.service_tier
         && left.validation_mode == right.validation_mode
-        && left.validation_full_budget == right.validation_full_budget
         && left.personality == right.personality
         && left.web_search_mode == right.web_search_mode
         && left.features == right.features
@@ -808,7 +809,6 @@ impl TurnContext {
             collaboration_mode,
             multi_agent_version: self.multi_agent_version,
             validation_mode: self.validation_mode,
-            validation_full_budget: self.validation_full_budget,
             validation_root_turn: self.validation_root_turn.clone(),
             personality: self.personality,
             approval_policy: self.approval_policy.clone(),
@@ -828,6 +828,7 @@ impl TurnContext {
             full_suite_budget: Arc::clone(&self.full_suite_budget),
             durable_history_completed_commits: Arc::clone(&self.durable_history_completed_commits),
             terminal_error: Arc::clone(&self.terminal_error),
+            post_tool_stop_reason: Arc::clone(&self.post_tool_stop_reason),
             agent_task_binding: Arc::clone(&self.agent_task_binding),
             server_model_warning_emitted: AtomicBool::new(
                 self.server_model_warning_emitted.load(Ordering::Relaxed),
@@ -986,7 +987,6 @@ impl TurnContext {
             multi_agent_mode: super::multi_agents::effective_multi_agent_mode(self)
                 .map(|mode| mode.to_persisted_mode()),
             validation_mode: Some(self.validation_mode),
-            validation_full_budget: Some(self.validation_full_budget),
             validation_root_turn: Some(self.validation_root_turn.clone()),
             validation_attempts: self.full_suite_budget.persisted_attempts(),
             effort: self.reasoning_effort.clone(),
@@ -1067,7 +1067,6 @@ impl Session {
                 && candidate.model_reasoning_summary == session_configuration.model_reasoning_summary
                 && candidate.service_tier == session_configuration.service_tier
                 && candidate.validation_mode == session_configuration.validation_mode
-                && candidate.validation_full_budget == session_configuration.validation_full_budget
                 && candidate.personality == session_configuration.personality
                 && candidate.web_search_mode == web_search_mode
                 && candidate.features == config.features
@@ -1089,7 +1088,6 @@ impl Session {
         per_turn_config.model_reasoning_summary = session_configuration.model_reasoning_summary;
         per_turn_config.service_tier = session_configuration.service_tier.clone();
         per_turn_config.validation_mode = session_configuration.validation_mode;
-        per_turn_config.validation_full_budget = session_configuration.validation_full_budget;
         per_turn_config.personality = session_configuration.personality;
         per_turn_config.web_search_mode = web_search_mode;
         Arc::new(per_turn_config)
@@ -1204,7 +1202,6 @@ impl Session {
             collaboration_mode: session_configuration.collaboration_mode.clone(),
             multi_agent_version,
             validation_mode: session_configuration.validation_mode,
-            validation_full_budget: session_configuration.validation_full_budget,
             validation_root_turn,
             personality: session_configuration.personality,
             approval_policy: session_configuration.approval_policy.clone(),
@@ -1226,6 +1223,7 @@ impl Session {
             full_suite_budget: Arc::default(),
             durable_history_completed_commits: Arc::new(Mutex::new(HashSet::new())),
             terminal_error: Arc::new(Mutex::new(None)),
+            post_tool_stop_reason: Arc::new(OnceLock::new()),
             agent_task_binding: Arc::new(OnceLock::new()),
             server_model_warning_emitted: AtomicBool::new(false),
             model_verification_emitted: AtomicBool::new(false),

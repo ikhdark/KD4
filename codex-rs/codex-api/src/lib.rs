@@ -75,6 +75,7 @@ pub use crate::files::delete_openai_file;
 pub use crate::files::delete_openai_file_with_pool;
 pub use crate::files::openai_file_http_client_pool;
 pub use crate::files::upload_openai_file;
+pub use crate::files::upload_openai_file_bytes_with_pool;
 pub use crate::files::upload_openai_file_with_pool;
 pub use crate::images::ImageBackground;
 pub use crate::images::ImageData;

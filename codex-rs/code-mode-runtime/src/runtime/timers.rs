@@ -10,7 +10,7 @@ use std::time::Instant;
 
 use super::RuntimeCommand;
 use super::RuntimeState;
-use super::module_loader::is_exit_exception;
+use super::module_loader::exit_requested;
 use super::value::value_to_error_text;
 
 const MAX_PENDING_TIMEOUTS_PER_CELL: usize = 128;
@@ -190,6 +190,10 @@ pub(super) fn schedule_timeout(
     };
     let delay_ms = normalize_delay_ms(delay);
 
+    if scope.is_execution_terminating() || exit_requested(scope) {
+        return Ok(None);
+    }
+
     let callback = v8::Global::new(scope, callback);
     let state = scope
         .get_slot_mut::<RuntimeState>()
@@ -223,6 +227,10 @@ pub(super) fn clear_timeout(
         return Ok(());
     };
 
+    if scope.is_execution_terminating() || exit_requested(scope) {
+        return Ok(());
+    }
+
     let Some(state) = scope.get_slot_mut::<RuntimeState>() else {
         return Err("runtime state unavailable".to_string());
     };
@@ -251,12 +259,10 @@ pub(super) fn invoke_timeout_callback(
     let callback = v8::Local::new(&tc, &callback.callback);
     let receiver = v8::undefined(&tc).into();
     let _ = callback.call(&tc, receiver, &[]);
+    if exit_requested(&tc) {
+        return Ok(ControlFlow::Break(()));
+    }
     if tc.has_caught() {
-        if let Some(exception) = tc.exception()
-            && is_exit_exception(&mut tc, exception)
-        {
-            return Ok(ControlFlow::Break(()));
-        }
         return Err(tc
             .exception()
             .map(|exception| value_to_error_text(&mut tc, exception))

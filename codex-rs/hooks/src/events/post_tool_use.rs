@@ -51,6 +51,7 @@ impl PostToolUsePlan {
 pub struct PostToolUseOutcome {
     pub hook_events: Vec<HookCompletedEvent>,
     pub should_block: bool,
+    pub stop_reason: Option<String>,
     pub additional_contexts: Vec<String>,
     pub feedback_message: Option<String>,
 }
@@ -58,6 +59,7 @@ pub struct PostToolUseOutcome {
 #[derive(Debug, Default, PartialEq, Eq)]
 struct PostToolUseHandlerData {
     should_block: bool,
+    stop_reason: Option<String>,
     additional_contexts_for_model: Vec<String>,
     feedback_messages_for_model: Vec<String>,
 }
@@ -102,6 +104,7 @@ pub(crate) async fn run(
         return PostToolUseOutcome {
             hook_events: Vec::new(),
             should_block: false,
+            stop_reason: None,
             additional_contexts: Vec::new(),
             feedback_message: None,
         };
@@ -134,6 +137,9 @@ pub(crate) async fn run(
     .await;
 
     let should_block = results.iter().any(|result| result.data.should_block);
+    let stop_reason = results
+        .iter()
+        .find_map(|result| result.data.stop_reason.clone());
 
     let mut additional_contexts = Vec::new();
     let mut feedback_messages = Vec::new();
@@ -147,6 +153,7 @@ pub(crate) async fn run(
             })
             .collect(),
         should_block,
+        stop_reason,
         additional_contexts,
         feedback_message: common::join_text_chunks(feedback_messages),
     }
@@ -185,6 +192,7 @@ fn parse_completed(
     let mut entries = Vec::new();
     let mut status = HookRunStatus::Completed;
     let mut should_block = false;
+    let mut stop_reason = None;
     let mut additional_contexts_for_model = Vec::new();
     let mut feedback_messages_for_model = Vec::new();
 
@@ -224,6 +232,7 @@ fn parse_completed(
                             .universal
                             .stop_reason
                             .unwrap_or_else(|| "PostToolUse hook stopped execution".to_string());
+                        stop_reason = Some(stop_text.clone());
                         entries.push(HookOutputEntry {
                             kind: HookOutputEntryKind::Stop,
                             text: stop_text.clone(),
@@ -308,6 +317,7 @@ fn parse_completed(
         completed,
         data: PostToolUseHandlerData {
             should_block,
+            stop_reason,
             additional_contexts_for_model,
             feedback_messages_for_model,
         },
@@ -319,6 +329,7 @@ fn serialization_failure_outcome(hook_events: Vec<HookCompletedEvent>) -> PostTo
     PostToolUseOutcome {
         hook_events,
         should_block: false,
+        stop_reason: None,
         additional_contexts: Vec::new(),
         feedback_message: None,
     }

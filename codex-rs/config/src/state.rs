@@ -623,6 +623,11 @@ impl ConfigLayerStack {
     ) -> HashMap<String, ConfigLayerMetadata> {
         let mut origins = HashMap::new();
         let mut path = Vec::new();
+        let has_feature_enabled_leaf = effective_config
+            .get("features")
+            .and_then(|features| features.get("multi_agent_v2"))
+            .and_then(|feature| feature.get("enabled"))
+            .is_some();
 
         for layer in self.get_layers(
             ConfigLayerStackOrdering::LowestPrecedenceFirst,
@@ -630,6 +635,15 @@ impl ConfigLayerStack {
         ) {
             let metadata = layer.metadata();
             record_origins(&layer.config, &metadata, &mut path, &mut origins);
+            if has_feature_enabled_leaf
+                && layer
+                    .config
+                    .get("features")
+                    .and_then(|features| features.get("multi_agent_v2"))
+                    .is_some_and(|feature| feature.as_bool().is_some())
+            {
+                origins.insert("features.multi_agent_v2.enabled".to_string(), metadata);
+            }
         }
 
         // Arrays and type-changing overlays replace whole subtrees, unlike

@@ -781,7 +781,7 @@ impl EventProcessorWithJsonOutput {
                                 .iter()
                                 .rev()
                                 .find(|item| matches!(item, ThreadItem::AgentMessage { text, phase, .. }
-                                    if *phase != Some(codex_protocol::models::MessagePhase::Commentary)
+                                    if matches!(phase, None | Some(codex_protocol::models::MessagePhase::FinalAnswer))
                                         && Some(text) == self.final_message.as_ref()))
                                 .or_else(|| notification.turn.items.iter().rev()
                                     .find(|item| matches!(item, ThreadItem::Plan { text, .. }

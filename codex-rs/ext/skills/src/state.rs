@@ -214,6 +214,9 @@ impl SkillsThreadState {
         let Some(continuation) = catalog.continuation.clone() else {
             return catalog.clone();
         };
+        if continuation.blocked {
+            return catalog.clone();
+        }
         query.continuation = Some(continuation);
         match providers.list_orchestrator_for_turn(query).await {
             Ok(next) => {

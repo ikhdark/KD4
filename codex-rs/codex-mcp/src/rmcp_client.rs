@@ -183,7 +183,7 @@ pub(crate) type ManagedClientFuture =
 #[derive(Default)]
 struct CodexAppsStartupReconnectState {
     current_client: Option<ManagedClient>,
-    reconnect_in_flight: bool,
+    pending_client: Option<ManagedClientFuture>,
     consecutive_failures: u32,
     retry_not_before: Option<TokioInstant>,
 }
@@ -244,12 +244,12 @@ impl CodexAppsStartupReconnect {
     }
 
     fn reconnect_in_background(self: &Arc<Self>) {
-        {
+        let pending_client = {
             let mut state = self
                 .state
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if state.current_client.is_some() || state.reconnect_in_flight {
+            if state.current_client.is_some() || state.pending_client.is_some() {
                 return;
             }
             if state
@@ -258,8 +258,10 @@ impl CodexAppsStartupReconnect {
             {
                 return;
             }
-            state.reconnect_in_flight = true;
-        }
+            let pending_client = (self.factory)();
+            state.pending_client = Some(pending_client.clone());
+            pending_client
+        };
 
         let reconnect = Arc::clone(self);
         tokio::spawn(async move {
@@ -268,14 +270,14 @@ impl CodexAppsStartupReconnect {
                 .as_ref()
                 .and_then(CodexAppsToolsCacheContext::current_tools)
                 .map(|tools| filter_tools(tools, &reconnect.tool_filter));
-            let result = (reconnect.factory)().await;
+            let result = pending_client.await;
             let startup_status_context = reconnect.startup_status_context.clone();
             let recovered = {
                 let mut state = reconnect
                     .state
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
-                state.reconnect_in_flight = false;
+                state.pending_client = None;
                 match result {
                     Ok(client) => {
                         state.current_client = Some(client.clone());
@@ -316,6 +318,14 @@ impl CodexAppsStartupReconnect {
                 .await;
             }
         });
+    }
+
+    fn pending_client(&self) -> Option<ManagedClientFuture> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .pending_client
+            .clone()
     }
 }
 
@@ -654,6 +664,20 @@ impl AsyncManagedClient {
         if matches!(self.client().await, Err(StartupOutcomeError::Failed { .. })) {
             startup_reconnect.reconnect_in_background();
         }
+    }
+
+    /// Calls to an advertised cached capability join the shared recovery, while
+    /// catalog inspection remains nonblocking through `client` and cached tools.
+    pub(crate) async fn client_for_operation(&self) -> Result<ManagedClient, StartupOutcomeError> {
+        self.reconnect_failed_startup().await;
+        if let Some(pending_client) = self
+            .startup_reconnect
+            .as_ref()
+            .and_then(|reconnect| reconnect.pending_client())
+        {
+            return pending_client.await;
+        }
+        self.client().await
     }
 
     pub(crate) async fn shutdown(&self) -> Result<()> {

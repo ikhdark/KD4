@@ -1145,7 +1145,6 @@ impl AgentControl {
                         super::super::task_coordinator::ValidationTurnContext {
                             scope: turn.validation_root_turn.clone(),
                             mode: turn.validation_mode,
-                            full_budget: turn.validation_full_budget,
                             budget: Arc::clone(&turn.full_suite_budget),
                         }
                     })
@@ -1157,7 +1156,6 @@ impl AgentControl {
         }
         if let Some(validation) = child_control.inherited_validation_context.as_ref() {
             config.validation_mode = validation.mode;
-            config.validation_full_budget = validation.full_budget;
         }
         if options.fork_mode.is_some() {
             if options.fork_parent_spawn_call_id.is_none() {

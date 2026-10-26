@@ -11,6 +11,7 @@ use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::io;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::time::Duration;
 use std::time::SystemTime;
 
@@ -45,6 +46,7 @@ use rmcp::transport::streamable_http_client::StreamableHttpError;
 use rmcp::transport::streamable_http_client::StreamableHttpPostResponse;
 use sse_stream::Sse;
 use sse_stream::SseStream;
+use tokio::time::Instant;
 use url::Url;
 
 mod www_authenticate;
@@ -64,6 +66,7 @@ pub(crate) struct StreamableHttpClientAdapter {
     http_client: Arc<dyn HttpClient>,
     default_headers: HeaderMap,
     auth_provider: Option<SharedAuthProvider>,
+    initialize_deadline: Arc<Mutex<Option<Instant>>>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -88,12 +91,22 @@ impl StreamableHttpClientAdapter {
         http_client: Arc<dyn HttpClient>,
         default_headers: HeaderMap,
         auth_provider: Option<SharedAuthProvider>,
+        initialize_deadline: Arc<Mutex<Option<Instant>>>,
     ) -> Self {
         Self {
             http_client,
             default_headers,
             auth_provider,
+            initialize_deadline,
         }
+    }
+
+    pub(crate) fn with_initialize_deadline(
+        mut self,
+        initialize_deadline: Arc<Mutex<Option<Instant>>>,
+    ) -> Self {
+        self.initialize_deadline = initialize_deadline;
+        self
     }
 }
 
@@ -142,6 +155,23 @@ impl StreamableHttpClient for StreamableHttpClientAdapter {
             )?;
         }
 
+        // RMCP's bootstrap worker can outlive a dropped handshake future. Pass
+        // its remaining budget to the HTTP owner, including remote executors.
+        let timeout_ms = if matches!(
+            mcp_method.as_deref(),
+            Some("initialize" | "notifications/initialized" | "server/discover")
+        ) {
+            self.initialize_deadline
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .map(|deadline| {
+                    u64::try_from(deadline.saturating_duration_since(Instant::now()).as_millis())
+                        .unwrap_or(u64::MAX)
+                        .max(1)
+                })
+        } else {
+            None
+        };
         let body = serde_json::to_vec(&message).map_err(StreamableHttpError::Deserialize)?;
         let has_authorization_header = headers.contains_key(AUTHORIZATION);
         let response = self
@@ -151,7 +181,7 @@ impl StreamableHttpClient for StreamableHttpClientAdapter {
                 url: uri.to_string(),
                 headers: protocol_headers(&headers)?,
                 body: Some(body.into()),
-                timeout_ms: None,
+                timeout_ms,
                 redirect_policy: HttpRedirectPolicy::Follow,
                 request_id: "buffered-request".to_string(),
                 stream_response: true,

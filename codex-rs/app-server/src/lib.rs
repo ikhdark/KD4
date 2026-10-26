@@ -754,16 +754,25 @@ pub async fn run_main(
     // Install a simple subscriber so `tracing` output is visible. Users can
     // control the log level with `RUST_LOG` and switch to JSON logs with
     // `LOG_FORMAT=json`.
+    // SQLx enters the caller's span for every worker command. Avoid synchronous
+    // stderr writes on entry/exit while that worker may hold a write transaction.
+    // Keep span boundaries, busy/idle timings, and explicit events.
     let stderr_fmt: StderrLogLayer = match log_format_from_env() {
         LogFormat::Json => tracing_subscriber::fmt::layer()
             .json()
             .with_writer(std::io::stderr)
-            .with_span_events(tracing_subscriber::fmt::format::FmtSpan::FULL)
+            .with_span_events(
+                tracing_subscriber::fmt::format::FmtSpan::NEW
+                    | tracing_subscriber::fmt::format::FmtSpan::CLOSE,
+            )
             .with_filter(stderr_log_filter())
             .boxed(),
         LogFormat::Default => tracing_subscriber::fmt::layer()
             .with_writer(std::io::stderr)
-            .with_span_events(tracing_subscriber::fmt::format::FmtSpan::FULL)
+            .with_span_events(
+                tracing_subscriber::fmt::format::FmtSpan::NEW
+                    | tracing_subscriber::fmt::format::FmtSpan::CLOSE,
+            )
             .with_filter(stderr_log_filter())
             .boxed(),
     };

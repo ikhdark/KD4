@@ -111,7 +111,7 @@ impl MarketplacePolicy {
             return Ok(());
         }
         self.validate_install_with_user_config(
-            config_layer_stack.effective_user_config().as_ref(),
+            Some(&config_layer_stack.effective_config()),
             codex_home,
             marketplace_path,
             marketplace_name,
@@ -208,7 +208,7 @@ pub(crate) fn project_effective_user_config(
     config_layer_stack: &ConfigLayerStack,
     codex_home: &Path,
 ) -> Option<toml::Value> {
-    let mut user_config = config_layer_stack.effective_user_config()?;
+    let mut user_config = config_layer_stack.effective_config();
     let policy = MarketplacePolicy::from_requirements(config_layer_stack.requirements());
     if !policy.is_restricted() {
         return Some(user_config);
@@ -248,9 +248,7 @@ pub fn allowed_configured_marketplace_names(
     config_layer_stack: &ConfigLayerStack,
     codex_home: &Path,
 ) -> HashSet<String> {
-    let Some(user_config) = config_layer_stack.effective_user_config() else {
-        return HashSet::new();
-    };
+    let user_config = config_layer_stack.effective_config();
     let policy = MarketplacePolicy::from_requirements(config_layer_stack.requirements());
     allowed_configured_marketplace_names_with_policy(&user_config, &policy, codex_home)
 }

@@ -858,7 +858,7 @@ function Test-PackageContentsAreComplete {
         }
         if ($relative.EndsWith(".exe", [StringComparison]::OrdinalIgnoreCase)) {
             $machine = Get-PeMachine -Path $path
-            if ($null -ne $machine -and $machine -ne $expectedMachine) {
+            if ($null -eq $machine -or $machine -ne $expectedMachine) {
                 return $false
             }
         }

@@ -628,6 +628,7 @@ pub(super) struct RemoteControlConnectOptions<'a> {
     desired_state_tx: &'a watch::Sender<RemoteControlDesiredState>,
     desired_state_persistence_lock: &'a Semaphore,
     http_clients: &'a RouteAwareClientPool,
+    request_state: &'a super::RemoteControlEnrollmentState,
     /// Managed-requirements decision that must admit the current identity before any backend
     /// contact for its account.
     policy: Option<&'a watch::Receiver<RemoteControlPolicyDecision>>,
@@ -1053,6 +1054,7 @@ impl RemoteControlWebsocket {
                 desired_state_tx: &self.desired_state_tx,
                 desired_state_persistence_lock: &self.desired_state_persistence_lock,
                 http_clients: &self.http_clients,
+                request_state: &self.current_enrollment,
                 policy: self.policy_rx.as_ref(),
             };
             let auth_context = RemoteControlAuthContext {
@@ -1117,7 +1119,9 @@ impl RemoteControlWebsocket {
                     if take_repaired_retry(&err, &mut repaired_retry_available) {
                         continue;
                     }
-                    let reconnect_delay = if err.kind() == ErrorKind::WouldBlock {
+                    let reconnect_delay = if let Some(deadline) = self.current_enrollment.retry_after() {
+                        (deadline - time::OffsetDateTime::now_utc()).try_into().unwrap_or_default()
+                    } else if err.kind() == ErrorKind::WouldBlock {
                         self.current_enrollment
                             .snapshot()
                             .and_then(|enrollment| enrollment.next_refresh_at)
@@ -1772,6 +1776,7 @@ pub(super) async fn connect_remote_control_websocket(
             .map(|(_, cursor)| cursor),
     )?;
 
+    current_enrollment.admit_request()?;
     let websocket_connect_result = tokio::time::timeout(
         REMOTE_CONTROL_WEBSOCKET_CONNECT_TIMEOUT,
         connect_async_tls_with_config(
@@ -1794,6 +1799,9 @@ pub(super) async fn connect_remote_control_websocket(
             Ok((websocket_stream, response.map(|_| ()), enrollment))
         }
         Err(err) => {
+            if let tungstenite::Error::Http(response) = &err {
+                current_enrollment.record_retry_after(response.status(), response.headers());
+            }
             match &err {
                 tungstenite::Error::Http(response)
                     if websocket_response_reports_missing_remote_app_server(response) =>
@@ -1996,6 +2004,7 @@ async fn prepare_remote_control_enrollment(
             .map_err(io::Error::other)?;
         match refresh_remote_control_server_with_client(
             &client,
+            connect_options.request_state,
             &auth,
             connect_options.installation_id,
             enrollment_ref,
@@ -2188,6 +2197,7 @@ async fn enroll_and_persist_remote_control_server(
         .map_err(io::Error::other)?;
     let new_enrollment = match enroll_remote_control_server_with_client(
         &client,
+        connect_options.request_state,
         remote_control_target,
         auth_context.auth,
         connect_options.installation_id,

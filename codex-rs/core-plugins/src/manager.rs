@@ -39,6 +39,7 @@ use crate::marketplace_policy::MarketplacePolicy;
 use crate::marketplace_policy::configured_plugins_from_stack;
 use crate::marketplace_upgrade::ConfiguredMarketplaceUpgradeError;
 use crate::marketplace_upgrade::ConfiguredMarketplaceUpgradeOutcome;
+use crate::marketplace_upgrade::ConfigLayerReload;
 use crate::marketplace_upgrade::upgrade_configured_git_marketplaces;
 use crate::remote::REMOTE_GLOBAL_MARKETPLACE_NAME;
 use crate::remote::RecommendedPluginsMode;
@@ -221,8 +222,7 @@ pub struct PluginListBackgroundTaskOptions {
 
 #[derive(Clone, PartialEq, Eq)]
 struct NonCuratedCacheRefreshRequest {
-    roots: Vec<AbsolutePathBuf>,
-    config_layer_stack: ConfigLayerStackIdentity,
+    scopes: Vec<(ConfigLayerStackIdentity, Vec<AbsolutePathBuf>)>,
     mode: NonCuratedCacheRefreshMode,
 }
 
@@ -391,6 +391,12 @@ pub struct ConfiguredMarketplaceListOutcome {
     pub errors: Vec<MarketplaceListError>,
 }
 
+#[derive(Debug, Clone)]
+pub struct PluginMarketplaceScope {
+    pub config: PluginsConfigInput,
+    pub roots: Vec<AbsolutePathBuf>,
+}
+
 impl From<PluginDetail> for PluginCapabilitySummary {
     fn from(value: PluginDetail) -> Self {
         let has_skills = value.skills.iter().any(|skill| {
@@ -457,6 +463,7 @@ struct CachedPluginSkillRoots {
     auth_mode: Option<AuthMode>,
     snapshot_generation: u64,
     roots: Vec<PluginSkillRoot>,
+    plugin_roots: Vec<(String, AbsolutePathBuf)>,
     snapshots: PluginSkillSnapshots,
 }
 
@@ -675,6 +682,9 @@ impl PluginsManager {
 
         let remote_global_catalog_active = self.remote_global_catalog_active(config);
         let cache_key = PluginLoadCacheKey::from_config(config, remote_global_catalog_active);
+        if !force_reload {
+            self.invalidate_changed_plugin_roots(&cache_key).await;
+        }
         if !force_reload && let Some(outcome) = self.cached_plugin_outcome(&cache_key) {
             return outcome;
         }
@@ -683,6 +693,9 @@ impl PluginsManager {
             warn!("plugin load semaphore closed");
             return PluginLoadOutcome::default();
         };
+        if !force_reload {
+            self.invalidate_changed_plugin_roots(&cache_key).await;
+        }
         if !force_reload && let Some(outcome) = self.cached_plugin_outcome(&cache_key) {
             return outcome;
         }
@@ -880,6 +893,7 @@ impl PluginsManager {
             config_layer_stack: ConfigLayerStackIdentity(Arc::new(config_layer_stack.clone())),
             remote_global_catalog_active,
         };
+        self.invalidate_changed_plugin_roots(&key).await;
         if let Some(cached) = self.cached_skill_roots(&key, snapshot_generation) {
             return cached;
         }
@@ -887,6 +901,7 @@ impl PluginsManager {
             warn!("plugin load semaphore closed");
             return (Vec::new(), None);
         };
+        self.invalidate_changed_plugin_roots(&key).await;
         if let Some(cached) = self.cached_skill_roots(&key, snapshot_generation) {
             return cached;
         }
@@ -904,6 +919,9 @@ impl PluginsManager {
             Err(_) => return (Vec::new(), Some(snapshots)),
         };
         let auth_mode = self.auth_mode();
+        let plugin_roots = plugins.iter()
+            .map(|plugin| (plugin.config_name.clone(), plugin.root.clone()))
+            .collect();
         let roots = resolve_loaded_plugins_for_auth_mode(plugins, auth_mode)
             .effective_plugin_skill_roots();
         if let Some(snapshot_generation) = snapshot_generation {
@@ -917,11 +935,39 @@ impl PluginsManager {
                 }
                 cache.skill_roots.push(CachedPluginSkillRoots {
                     key, auth_mode, snapshot_generation,
-                    roots: roots.clone(), snapshots: snapshots.clone(),
+                    roots: roots.clone(), plugin_roots, snapshots: snapshots.clone(),
                 });
             }
         }
         (roots, Some(snapshots))
+    }
+
+    async fn invalidate_changed_plugin_roots(&self, key: &PluginLoadCacheKey) {
+        let plugin_roots = {
+            let cache = self.loaded_plugins_cache.read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            cache.entries.iter().filter(|entry| entry.key == *key)
+                .flat_map(|entry| entry.plugins.iter()
+                    .map(|plugin| (plugin.config_name.clone(), plugin.root.clone())))
+                .chain(cache.skill_roots.iter().filter(|entry| entry.key == *key)
+                    .flat_map(|entry| entry.plugin_roots.iter().cloned()))
+                .collect::<Vec<_>>()
+        };
+        if plugin_roots.is_empty() {
+            return;
+        }
+        // A second process can activate a different version without publishing an
+        // invalidation here. Do filesystem work off-runtime and outside cache locks.
+        let store = self.store.clone();
+        let changed = tokio::task::spawn_blocking(move || plugin_roots.into_iter()
+            .any(|(name, root)| {
+                let Ok(id) = PluginId::parse(&name) else { return false; };
+                store.active_plugin_root(&id)
+                    .unwrap_or_else(|| store.plugin_base_root(&id)) != root
+            })).await.unwrap_or(true);
+        if changed {
+            self.clear_loaded_plugins_cache();
+        }
     }
 
     fn cached_skill_roots(
@@ -1483,13 +1529,12 @@ impl PluginsManager {
         self: &Arc<Self>,
         config: &PluginsConfigInput,
         auth: Option<CodexAuth>,
-        roots: &[AbsolutePathBuf],
+        scopes: &[PluginMarketplaceScope],
         options: PluginListBackgroundTaskOptions,
         on_effective_plugins_changed: Option<Arc<dyn Fn() + Send + Sync + 'static>>,
     ) {
-        self.maybe_start_non_curated_plugin_cache_refresh(
-            config,
-            roots,
+        self.maybe_start_non_curated_plugin_cache_refresh_for_scopes(
+            scopes,
             on_effective_plugins_changed.clone(),
         );
         if options.refresh_global_remote_catalog_cache {
@@ -2081,6 +2126,52 @@ impl PluginsManager {
         )
     }
 
+    /// Preserve request order and first source identity while combining activation
+    /// state for the same plugin advertised by more than one repository.
+    pub fn list_marketplaces_for_scopes(
+        &self,
+        scopes: &[PluginMarketplaceScope],
+        include_openai_curated: bool,
+    ) -> Result<ConfiguredMarketplaceListOutcome, MarketplaceError> {
+        let mut combined = ConfiguredMarketplaceListOutcome::default();
+        let mut seen = HashMap::<String, (usize, usize)>::new();
+        for scope in scopes {
+            let outcome = self.list_marketplaces_for_config(
+                &scope.config, &scope.roots, include_openai_curated,
+            )?;
+            combined.errors.extend(outcome.errors);
+            for mut marketplace in outcome.marketplaces {
+                let marketplace_index = combined.marketplaces.len();
+                let had_plugins = !marketplace.plugins.is_empty();
+                let mut plugins = Vec::new();
+                for plugin in marketplace.plugins {
+                    if let Some(&(marketplace_index, plugin_index)) = seen.get(&plugin.id) {
+                        let previous = &mut combined.marketplaces[marketplace_index].plugins[plugin_index];
+                        if !previous.installed && plugin.installed && previous.source.is_install_materialized() {
+                            previous.local_version = plugin.local_version.clone();
+                        }
+                        previous.installed |= plugin.installed;
+                        previous.enabled |= plugin.enabled;
+                        if previous.installed_version.is_none() {
+                            previous.installed_version = plugin.installed_version;
+                        }
+                    } else {
+                        seen.insert(plugin.id.clone(), (marketplace_index, plugins.len()));
+                        plugins.push(plugin);
+                    }
+                }
+                marketplace.plugins = plugins;
+                if !marketplace.plugins.is_empty()
+                    || (!had_plugins && !combined.marketplaces.iter()
+                        .any(|previous| previous.path == marketplace.path))
+                {
+                    combined.marketplaces.push(marketplace);
+                }
+            }
+        }
+        Ok(combined)
+    }
+
     pub(crate) async fn list_marketplaces_for_config_async(
         &self,
         config: &PluginsConfigInput,
@@ -2530,6 +2621,7 @@ impl PluginsManager {
         self: &Arc<Self>,
         config: &PluginsConfigInput,
         auth_manager: Arc<AuthManager>,
+        reload_config: ConfigLayerReload,
         on_effective_plugins_changed: Option<Arc<dyn Fn() + Send + Sync + 'static>>,
     ) {
         if config.plugins_enabled {
@@ -2564,6 +2656,7 @@ impl PluginsManager {
                         let outcome = manager.upgrade_configured_marketplaces(
                             &config,
                             /*marketplace_name*/ None,
+                            &reload_config,
                             local_cache_refresh_notifier.as_ref(),
                         );
                         match outcome {
@@ -2628,10 +2721,12 @@ impl PluginsManager {
         &self,
         config: &PluginsConfigInput,
         marketplace_name: Option<&str>,
+        reload_config: &ConfigLayerReload,
     ) -> Result<ConfiguredMarketplaceUpgradeOutcome, String> {
         self.upgrade_configured_marketplaces(
             config,
             marketplace_name,
+            reload_config,
             /*on_effective_plugins_changed*/ None,
         )
     }
@@ -2640,12 +2735,14 @@ impl PluginsManager {
         &self,
         config: &PluginsConfigInput,
         marketplace_name: Option<&str>,
+        reload_config: &ConfigLayerReload,
         on_effective_plugins_changed: Option<&EffectivePluginsChangedNotifier>,
     ) -> Result<ConfiguredMarketplaceUpgradeOutcome, String> {
         let mut outcome = upgrade_configured_git_marketplaces(
             self.codex_home.as_path(),
             &config.config_layer_stack,
             marketplace_name,
+            reload_config,
         );
         if let Some(marketplace_name) = marketplace_name
             && outcome.selected_marketplaces.is_empty()
@@ -2704,10 +2801,19 @@ impl PluginsManager {
         on_effective_plugins_changed: Option<Arc<dyn Fn() + Send + Sync + 'static>>,
     ) {
         self.schedule_non_curated_plugin_cache_refresh(
-            config,
-            roots,
+            &[PluginMarketplaceScope { config: config.clone(), roots: roots.to_vec() }],
             NonCuratedCacheRefreshMode::IfVersionChanged,
             on_effective_plugins_changed,
+        );
+    }
+
+    pub fn maybe_start_non_curated_plugin_cache_refresh_for_scopes(
+        self: &Arc<Self>,
+        scopes: &[PluginMarketplaceScope],
+        on_effective_plugins_changed: Option<Arc<dyn Fn() + Send + Sync + 'static>>,
+    ) {
+        self.schedule_non_curated_plugin_cache_refresh(
+            scopes, NonCuratedCacheRefreshMode::IfVersionChanged, on_effective_plugins_changed,
         );
     }
 
@@ -2792,20 +2898,20 @@ impl PluginsManager {
 
     fn schedule_non_curated_plugin_cache_refresh(
         self: &Arc<Self>,
-        config: &PluginsConfigInput,
-        roots: &[AbsolutePathBuf],
+        scopes: &[PluginMarketplaceScope],
         mode: NonCuratedCacheRefreshMode,
         on_effective_plugins_changed: Option<Arc<dyn Fn() + Send + Sync + 'static>>,
     ) {
-        if !config.plugins_enabled {
-            return;
-        }
-        let mut roots = roots.to_vec();
-        roots.sort_unstable();
-        roots.dedup();
+        let scopes = scopes.iter().filter(|scope| scope.config.plugins_enabled)
+            .map(|scope| {
+                let mut roots = scope.roots.clone();
+                roots.sort_unstable();
+                roots.dedup();
+                (ConfigLayerStackIdentity(Arc::clone(&scope.config.config_layer_stack)), roots)
+            }).collect::<Vec<_>>();
+        if scopes.is_empty() { return; }
         let mut request = NonCuratedCacheRefreshRequest {
-            roots,
-            config_layer_stack: ConfigLayerStackIdentity(Arc::clone(&config.config_layer_stack)),
+            scopes,
             mode,
         };
         let on_effective_plugins_changed =
@@ -2819,8 +2925,7 @@ impl PluginsManager {
             if request.mode == NonCuratedCacheRefreshMode::IfVersionChanged
                 && state.requested.as_ref().is_some_and(|requested| {
                     requested.mode == NonCuratedCacheRefreshMode::ForceReinstall
-                        && requested.roots == request.roots
-                        && requested.config_layer_stack == request.config_layer_stack
+                        && requested.scopes == request.scopes
                 })
             {
                 request.mode = NonCuratedCacheRefreshMode::ForceReinstall;
@@ -3050,22 +3155,32 @@ impl PluginsManager {
             };
 
             let refresh_result = (|| {
-                let config = PluginsConfigInput::new(
-                    Arc::clone(&request.config_layer_stack.0),
-                    true,
-                    false,
-                    String::new(),
-                );
-                let roots = self.marketplace_roots(&config, &request.roots, false);
-                let outcome = self
-                    .list_marketplaces_with_policy(&config, &roots)
-                    .map_err(|err| err.to_string())?;
-                let keys = configured_plugins_from_stack(
-                    &request.config_layer_stack.0,
-                    self.codex_home.as_path(),
-                )
-                .into_keys()
-                .collect::<Vec<_>>();
+                let scopes = request.scopes.iter().map(|(stack, roots)| PluginMarketplaceScope {
+                    config: PluginsConfigInput::new(Arc::clone(&stack.0), true, false, String::new()),
+                    roots: roots.clone(),
+                }).collect::<Vec<_>>();
+                // Cache refresh trusts already-admitted plugins, unlike catalog
+                // display's product filter. Merge raw source declarations in the
+                // same scope order without routing through display metadata.
+                let mut outcome = MarketplaceListOutcome::default();
+                let mut seen = HashSet::new();
+                for scope in &scopes {
+                    let roots = self.marketplace_roots(&scope.config, &scope.roots, false);
+                    let discovered = self.list_marketplaces_with_policy(&scope.config, &roots)
+                        .map_err(|err| err.to_string())?;
+                    outcome.errors.extend(discovered.errors);
+                    for mut marketplace in discovered.marketplaces {
+                        marketplace.plugins.retain(|plugin| seen.insert(
+                            format!("{}@{}", plugin.name, marketplace.name),
+                        ));
+                        outcome.marketplaces.push(marketplace);
+                    }
+                }
+                let mut keys = scopes.iter().flat_map(|scope| configured_plugins_from_stack(
+                    &scope.config.config_layer_stack, self.codex_home.as_path(),
+                ).into_keys()).collect::<Vec<_>>();
+                keys.sort_unstable();
+                keys.dedup();
                 let refreshed = refresh_non_curated_plugin_cache_from_marketplaces(
                     self.codex_home.as_path(),
                     &keys,
@@ -3213,11 +3328,11 @@ impl PluginsManager {
         if !policy.is_restricted() {
             return Ok(outcome);
         }
-        let user_config = config.config_layer_stack.effective_user_config();
+        let user_config = config.config_layer_stack.effective_config();
         outcome.marketplaces.retain(|marketplace| {
             policy
                 .validate_install_with_user_config(
-                    user_config.as_ref(),
+                    Some(&user_config),
                     codex_home,
                     &marketplace.path,
                     &marketplace.name,

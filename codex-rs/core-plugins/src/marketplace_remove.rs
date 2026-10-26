@@ -1,8 +1,15 @@
 use crate::installed_marketplaces::marketplace_install_root;
+use crate::installed_marketplaces::resolve_configured_marketplace_root;
+use crate::marketplace_upgrade::ConfigLayerReload;
+use codex_config::CONFIG_TOML_FILE;
+use codex_config::ConfigLayerSource;
+use codex_config::ConfigLayerStack;
 use codex_config::RemoveMarketplaceConfigOutcome;
+use codex_config::format_config_layer_source;
 use codex_config::remove_user_marketplace_config;
 use codex_plugin::validate_plugin_segment;
 use codex_utils_absolute_path::AbsolutePathBuf;
+use codex_utils_absolute_path::paths_match_after_normalization;
 use std::fs;
 use std::path::Path;
 use std::path::PathBuf;
@@ -29,9 +36,12 @@ pub enum MarketplaceRemoveError {
 
 pub async fn remove_marketplace(
     codex_home: PathBuf,
+    reload_config: ConfigLayerReload,
     request: MarketplaceRemoveRequest,
 ) -> Result<MarketplaceRemoveOutcome, MarketplaceRemoveError> {
-    tokio::task::spawn_blocking(move || remove_marketplace_sync(codex_home.as_path(), request))
+    tokio::task::spawn_blocking(move || {
+        remove_marketplace_sync(codex_home.as_path(), &reload_config, request)
+    })
         .await
         .map_err(|err| {
             MarketplaceRemoveError::Internal(format!("failed to remove marketplace: {err}"))
@@ -40,6 +50,7 @@ pub async fn remove_marketplace(
 
 fn remove_marketplace_sync(
     codex_home: &Path,
+    reload_config: &ConfigLayerReload,
     request: MarketplaceRemoveRequest,
 ) -> Result<MarketplaceRemoveOutcome, MarketplaceRemoveError> {
     let marketplace_name = request.marketplace_name;
@@ -48,9 +59,15 @@ fn remove_marketplace_sync(
     let _operation = crate::installed_marketplaces::try_lock_marketplace_operation(codex_home, &marketplace_name)
         .map_err(|err| MarketplaceRemoveError::Internal(format!("marketplace operation is busy or unavailable: {err}")))?;
 
+    let reload_layers = || reload_config().map_err(|err| MarketplaceRemoveError::Internal(
+        format!("failed to reload config while removing marketplace: {err}"),
+    ));
+    ensure_no_other_layer_references(codex_home, &reload_layers()?, &marketplace_name)?;
+
     let destination = marketplace_install_root(codex_home).join(&marketplace_name);
     let staged_root = stage_marketplace_root(&destination)?;
     let removed_installed_root = staged_root.removed_root().cloned();
+    ensure_no_other_layer_references(codex_home, &reload_layers()?, &marketplace_name)?;
     let config_outcome =
         remove_user_marketplace_config(codex_home, &marketplace_name).map_err(|err| {
             MarketplaceRemoveError::Internal(format!(
@@ -71,12 +88,51 @@ fn remove_marketplace_sync(
         )));
     }
 
+    if let Err(err) = ensure_no_other_layer_references(codex_home, &reload_layers()?, &marketplace_name) {
+        // A layer added during the base edit now owns this snapshot. The base
+        // removal succeeded, but dropping the stage must restore the in-use root.
+        if removed_config {
+            return Ok(MarketplaceRemoveOutcome { marketplace_name, removed_installed_root: None });
+        }
+        return Err(err);
+    }
     staged_root.commit();
 
     Ok(MarketplaceRemoveOutcome {
         marketplace_name,
         removed_installed_root,
     })
+}
+
+fn ensure_no_other_layer_references(
+    codex_home: &Path,
+    config_layer_stack: &ConfigLayerStack,
+    marketplace_name: &str,
+) -> Result<(), MarketplaceRemoveError> {
+    // This command edits only the base user config. Do not remove a shared snapshot
+    // while a profile, project, system, or session layer still references its name.
+    let user_config_file = AbsolutePathBuf::resolve_path_against_base(CONFIG_TOML_FILE, codex_home);
+    let install_root = marketplace_install_root(codex_home);
+    let destination = install_root.join(marketplace_name);
+    if let Some(layer) = config_layer_stack.layers_high_to_low().into_iter().find(|layer| {
+        let is_base_user = matches!(
+            &layer.name,
+            ConfigLayerSource::User { file, profile: None } if file == &user_config_file
+        );
+        layer.config.get("marketplaces").and_then(toml::Value::as_table)
+            .is_some_and(|marketplaces| marketplaces.iter().any(|(name, marketplace)| {
+                let same_name = name.eq_ignore_ascii_case(marketplace_name);
+                if is_base_user && same_name { return false; }
+                same_name || resolve_configured_marketplace_root(name, marketplace, &install_root)
+                    .is_some_and(|root| paths_match_after_normalization(root, &destination))
+            }))
+    }) {
+        let source = format_config_layer_source(&layer.name, CONFIG_TOML_FILE);
+        return Err(MarketplaceRemoveError::InvalidRequest(format!(
+            "marketplace `{marketplace_name}` is configured in {source}; remove it from that configuration source instead"
+        )));
+    }
+    Ok(())
 }
 
 struct StagedMarketplaceRoot {

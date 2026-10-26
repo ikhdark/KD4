@@ -67,6 +67,7 @@ impl RemoteControlEnrollment {
     pub(super) async fn start_pairing_with_client(
         &self,
         client: &HttpClient,
+        request_state: &super::RemoteControlEnrollmentState,
         request: StartRemoteControlPairingRequest,
     ) -> io::Result<RemoteControlPairingStartResponse> {
         if self.server_token_refresh_requirement()
@@ -79,6 +80,7 @@ impl RemoteControlEnrollment {
             .as_deref()
             .ok_or_else(pairing_unavailable_error)?;
 
+        request_state.admit_request()?;
         let response = client
             .post(&self.remote_control_target.pair_url)
             .timeout(REMOTE_CONTROL_PAIRING_TIMEOUT)
@@ -94,6 +96,7 @@ impl RemoteControlEnrollment {
             })?;
         let headers = response.headers().clone();
         let status = response.status();
+        request_state.record_retry_after(status, &headers);
         let body = read_remote_control_response_body_for_status(response)
             .await
             .map_err(|err| {
@@ -170,6 +173,7 @@ impl RemoteControlEnrollment {
     pub(super) async fn pairing_status_with_client(
         &self,
         client: &HttpClient,
+        request_state: &super::RemoteControlEnrollmentState,
         request: RemoteControlPairingStatusRequest,
     ) -> io::Result<RemoteControlPairingStatusResponse> {
         if self.server_token_refresh_requirement()
@@ -182,6 +186,7 @@ impl RemoteControlEnrollment {
             .as_deref()
             .ok_or_else(pairing_unavailable_error)?;
 
+        request_state.admit_request()?;
         let response = client
             .post(&self.remote_control_target.pair_status_url)
             .timeout(REMOTE_CONTROL_PAIRING_TIMEOUT)
@@ -197,6 +202,7 @@ impl RemoteControlEnrollment {
             })?;
         let headers = response.headers().clone();
         let status = response.status();
+        request_state.record_retry_after(status, &headers);
         let body = read_remote_control_response_body_for_status(response)
             .await
             .map_err(|err| {

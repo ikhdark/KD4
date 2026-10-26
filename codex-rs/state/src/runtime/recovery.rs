@@ -338,12 +338,17 @@ async fn backup_blocking_sqlite_home(sqlite_home: &Path) -> std::io::Result<Vec<
 }
 
 fn sqlite_paths(db_path: &Path) -> Vec<PathBuf> {
+    // Existing rollback-journal databases retain DELETE mode on reopen. Preserve
+    // their journal with the database rather than leaving a stale sidecar behind.
+    let mut journal_path = db_path.as_os_str().to_os_string();
+    journal_path.push("-journal");
     let mut wal_path = db_path.as_os_str().to_os_string();
     wal_path.push("-wal");
     let mut shm_path = db_path.as_os_str().to_os_string();
     shm_path.push("-shm");
     vec![
         db_path.to_path_buf(),
+        PathBuf::from(journal_path),
         PathBuf::from(wal_path),
         PathBuf::from(shm_path),
     ]

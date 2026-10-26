@@ -1057,6 +1057,21 @@ pub(crate) fn run_turn(
                             defer_pending_input: false,
                         });
                     }
+                    if let Some(stop_reason) = turn_context.post_tool_stop_reason.get() {
+                        // Tool outcomes are already drained and retained. A workflow
+                        // stop must not invite another generation or completion repair.
+                        last_agent_message =
+                            sampling_request_last_agent_message.or(last_agent_message);
+                        defer_pending_input = true;
+                        emit_hook_stop_reason(
+                            &sess,
+                            &turn_context,
+                            "PostToolUse",
+                            Some(stop_reason),
+                        )
+                        .await;
+                        break 'sampling_loop;
+                    }
                     refresh_validation_policy(&turn_context, &mut turn_execution);
                     let terminal_feedback = sess
                         .settle_extension_terminal_intents(&turn_extension_data)
@@ -1791,7 +1806,8 @@ pub(crate) fn run_turn(
                     return Err(err);
                 }
                 Err(CodexErr::ContextWindowExceeded)
-                    if unsampled_overflow_relief != Some(ContextPressureRelief::Compaction)
+                    if turn_context.post_tool_stop_reason.get().is_none()
+                        && unsampled_overflow_relief != Some(ContextPressureRelief::Compaction)
                         && (admission_refusal.is_some()
                             || !provider_overflow_recovery_attempted) =>
                 {
@@ -1916,18 +1932,14 @@ pub(crate) fn run_turn(
             surfaced_result,
             completion_assessment,
             required_tool_terminal: None,
-            defer_pending_input,
+            defer_pending_input: defer_pending_input
+                || turn_context.post_tool_stop_reason.get().is_some(),
         })
     })
 }
 
-fn validation_attempt_limit(turn: &TurnContext) -> usize {
-    crate::validation_task::policy_limit(turn)
-}
-
 fn refresh_validation_policy(turn: &TurnContext, execution: &mut TurnExecutionControl) {
-    let policy = turn.full_suite_budget.policy_snapshot(validation_attempt_limit(turn));
-    execution.set_validation_policy(turn.validation_mode, policy.exhausted);
+    execution.set_validation_policy(turn.validation_mode);
 }
 
 fn validation_mode_base_instructions(turn: &TurnContext) -> Arc<BaseInstructions> {
@@ -1937,14 +1949,13 @@ fn validation_mode_base_instructions(turn: &TurnContext) -> Arc<BaseInstructions
         codex_protocol::validation::ValidationMode::Compile =>
             "COMPILE: Only task-authorized targeted compilation; no tests, formatting, or other validation.",
         codex_protocol::validation::ValidationMode::FullHalf =>
-            "Full .5: Compile checks and all other task-authorized operations are allowed except tests, full suites, and non-compilation checks in any language. Do not create tests of any type, including new cases in existing files. Builds, formatting/editing, benchmarks, and KDA/KDR operations remain allowed unless they execute a prohibited workload. The base instructions define authorization, benchmark routing, and restrictions.",
+            "Full .5: Compile checks and other task-authorized operations are allowed; tests, full test suites, and test creation remain forbidden in every language. Non-test KD4 scripts/ workflows, including their non-compilation checks and just publish-local-codex-final, are explicitly permitted after inspecting their current options and delegated workload. Other non-compilation checks remain prohibited. Builds, formatting/editing, benchmarks, and KDA/KDR operations remain allowed unless they execute a prohibited workload. Preserve permissions and built-in safeguards. The base instructions define authorization, benchmark routing, and restrictions.",
         codex_protocol::validation::ValidationMode::Full =>
-            "FULL: Only task-authorized validation using existing tests; do not create tests of any type. The configured runtime/tooling attempt budget excludes targeted compilation.",
+            "FULL: Only task-authorized validation using existing tests; do not create tests of any type.",
     };
     let mut instructions = (*turn.base_instructions).clone();
     instructions.text.push_str(&format!(
-        "\n\n<validation_mode>\n{directive}\nFollow the base instructions for validation authorization, retry, evidence, and completion rules.\nRuntime/tooling attempt limit: {} (compilation excluded). When compilation is authorized, repair recompiles have no fixed attempt limit but require changed relevant inputs. A limit is not permission to validate; explicit user restrictions still apply. Consume already-running work through its owner without launching duplicates.\n</validation_mode>",
-        validation_attempt_limit(turn),
+        "\n\n<validation_mode>\n{directive}\nFollow the base instructions for validation authorization, retry, evidence, and completion rules.\nThere is no validation attempt cap. When compilation is authorized, repair recompiles require changed relevant inputs. Explicit user restrictions still apply. Consume already-running work through its owner without launching duplicates.\n</validation_mode>",
     ));
     Arc::new(instructions)
 }
@@ -3195,6 +3206,27 @@ async fn build_pure_pending_turn_plan(
         }),
         time_planning_step("mcp_catalog", || async {
             if turn_context.apps_enabled() || !mentioned_plugins.is_empty() {
+                if !mentioned_plugins.is_empty() {
+                    let mentioned_server_names = step_context
+                        .mcp
+                        .config()
+                        .mcp_server_catalog
+                        .plugin_attributions_by_server_name()
+                        .into_iter()
+                        .filter_map(|(name, attribution)| {
+                            mentioned_plugins
+                                .iter()
+                                .any(|plugin| plugin.config_name == attribution.plugin_id())
+                                .then_some(name)
+                        })
+                        .collect::<Vec<_>>();
+                    step_context
+                        .mcp
+                        .manager()
+                        .wait_for_startup_for_servers(&mentioned_server_names)
+                        .or_cancel(cancellation_token)
+                        .await?;
+                }
                 step_context.mcp_tools().or_cancel(cancellation_token).await
             } else {
                 Ok(&[][..])
@@ -3937,15 +3969,18 @@ async fn build_extension_turn_input_items(
         return Ok(Vec::new());
     }
 
-    let environments = turn_context
+    let primary_environment_id = step_context
+        .environments
+        .primary()
+        .map(|environment| environment.environment_id.as_str());
+    let environments = step_context
         .environments
         .turn_environments
         .iter()
-        .enumerate()
-        .map(|(index, environment)| TurnInputEnvironment {
+        .map(|environment| TurnInputEnvironment {
             environment_id: environment.environment_id.clone(),
             cwd: environment.cwd().clone(),
-            is_primary: index == 0,
+            is_primary: primary_environment_id == Some(environment.environment_id.as_str()),
         })
         .collect::<Vec<_>>();
 
@@ -5639,6 +5674,9 @@ fn run_sampling_request<'a>(
                 Ok(output) => {
                     return Ok((output, accepted_attempt_input));
                 }
+                Err(err) if turn_context.post_tool_stop_reason.get().is_some() => {
+                    return Err(err);
+                }
                 Err(CodexErr::ContextWindowExceeded) => {
                     sess.set_total_tokens_full(&turn_context).await;
                     return Err(CodexErr::ContextWindowExceeded);
@@ -6361,7 +6399,9 @@ fn final_message_candidate_from_output(
 ) -> Option<codex_protocol::protocol::AcceptedFinalMessage> {
     use codex_protocol::models::MessagePhase;
     use codex_protocol::protocol::AcceptedFinalMessageOrigin;
-    if output.phase == Some(MessagePhase::Commentary) || output.text.trim().is_empty() {
+    if matches!(output.phase, Some(MessagePhase::Commentary | MessagePhase::PartialAnswer))
+        || output.text.trim().is_empty()
+    {
         return None;
     }
     Some(codex_protocol::protocol::AcceptedFinalMessage {

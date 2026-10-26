@@ -1270,7 +1270,11 @@ impl ThreadManager {
         &self,
         rollout_path: PathBuf,
     ) -> CodexResult<InitialHistory> {
-        let requested_rollout_path = rollout_path.clone();
+        let requested_rollout_path = if self.state.thread_store.as_any().is::<LocalThreadStore>() {
+            codex_rollout::plain_rollout_path(&rollout_path)
+        } else {
+            rollout_path.clone()
+        };
         let stored_thread = self
             .state
             .thread_store

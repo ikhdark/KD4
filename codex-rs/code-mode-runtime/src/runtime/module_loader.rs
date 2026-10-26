@@ -1,7 +1,6 @@
 use serde_json::Value as JsonValue;
 
 use super::CompletionState;
-use super::EXIT_SENTINEL;
 use super::RuntimeState;
 use super::value::json_to_v8;
 use super::value::value_to_error_text;
@@ -31,10 +30,10 @@ pub(super) fn evaluate_main_module(
     let result = match module.evaluate(&tc) {
         Some(result) => result,
         None => {
+            if exit_requested(&tc) {
+                return Ok(None);
+            }
             if let Some(exception) = tc.exception() {
-                if is_exit_exception(&mut tc, exception) {
-                    return Ok(None);
-                }
                 return Err(value_to_error_text(&mut tc, exception));
             }
             return Err("unknown code mode exception".to_string());
@@ -51,16 +50,11 @@ pub(super) fn evaluate_main_module(
     Ok(None)
 }
 
-pub(super) fn is_exit_exception(
-    scope: &mut v8::PinScope<'_, '_>,
-    exception: v8::Local<'_, v8::Value>,
-) -> bool {
+pub(super) fn exit_requested(scope: &v8::PinScope<'_, '_>) -> bool {
     scope
         .get_slot::<RuntimeState>()
         .map(|state| state.exit_requested)
         .unwrap_or(false)
-        && exception.is_string()
-        && exception.to_rust_string_lossy(scope) == EXIT_SENTINEL
 }
 
 pub(super) fn resolve_tool_response(
@@ -202,6 +196,18 @@ pub(super) fn completion_state(
     scope: &mut v8::PinScope<'_, '_>,
     pending_promise: Option<&v8::Global<v8::Promise>>,
 ) -> CompletionState {
+    // Uncatchable exit can leave a top-level promise pending. This isolate
+    // belongs to this cell, so never await or pump it again after exit.
+    if exit_requested(scope) {
+        let stored_value_writes = scope
+            .get_slot_mut::<RuntimeState>()
+            .map(RuntimeState::stored_value_completion)
+            .unwrap_or_default();
+        return CompletionState::Completed {
+            stored_value_writes,
+            error_text: None,
+        };
+    }
     let unhandled = scope.get_slot::<RuntimeState>().and_then(|state| {
         state
             .unhandled_rejections
@@ -212,14 +218,10 @@ pub(super) fn completion_state(
     let async_error = if let Some(unhandled) = unhandled {
         let promise = v8::Local::new(scope, &unhandled);
         let reason = promise.result(scope);
-        if is_exit_exception(scope, reason) {
-            None
-        } else {
-            Some(format!(
-                "Unhandled promise rejection: {}",
-                value_to_error_text(scope, reason)
-            ))
-        }
+        Some(format!(
+            "Unhandled promise rejection: {}",
+            value_to_error_text(scope, reason)
+        ))
     } else if scope
         .get_slot::<RuntimeState>()
         .is_some_and(|state| state.untracked_rejections != 0)
@@ -248,11 +250,7 @@ pub(super) fn completion_state(
             v8::PromiseState::Fulfilled => None,
             v8::PromiseState::Rejected => {
                 let result = promise.result(scope);
-                if is_exit_exception(scope, result) {
-                    None
-                } else {
-                    Some(value_to_error_text(scope, result))
-                }
+                Some(value_to_error_text(scope, result))
             }
         }
     } else {

@@ -87,6 +87,8 @@ const OPENAI_CURATED_REMOTE_COLLECTION_KEY: &str = "vertical";
 const OAI_PRODUCT_SKU_HEADER: &str = "OAI-Product-Sku";
 const CODEX_PRODUCT_SKU: &str = "codex";
 const REMOTE_PLUGIN_CATALOG_TIMEOUT: Duration = Duration::from_secs(30);
+const REMOTE_INSTALLED_PLUGIN_INVENTORY_TIMEOUT: Duration = Duration::from_secs(60);
+const MAX_REMOTE_INSTALLED_PLUGIN_INVENTORY_PAGES: usize = 100;
 const RECOMMENDED_PLUGINS_TIMEOUT: Duration = Duration::from_secs(5);
 const REMOTE_PLUGIN_LIST_PAGE_LIMIT: u32 = 200;
 const MAX_RECOMMENDED_PLUGINS: usize = 50;
@@ -348,6 +350,9 @@ pub enum RemotePluginCatalogError {
         source: codex_http_client::HttpError,
     },
 
+    #[error("remote installed plugin inventory timed out")]
+    InventoryTimeout,
+
     #[error("remote plugin catalog request to {url} failed with status {status}: {body}")]
     UnexpectedStatus {
         url: String,
@@ -433,6 +438,7 @@ impl RemotePluginCatalogError {
             Self::AuthToken(_) => "remote_catalog_auth_token",
             Self::Request { .. } => "remote_catalog_request",
             Self::Body { .. } => "remote_catalog_body",
+            Self::InventoryTimeout => "remote_catalog_timeout",
             Self::UnexpectedStatus { .. } => "remote_catalog_unexpected_status",
             Self::Decode { .. } => "remote_catalog_decode",
             Self::InvalidBaseUrl(_) => "remote_catalog_invalid_base_url",
@@ -468,7 +474,9 @@ impl RemotePluginCatalogError {
             Self::UnexpectedStatus { status, .. } if *status == http::StatusCode::NOT_FOUND => {
                 PluginRemoteErrorReason::NotFound
             }
-            Self::Request { .. } | Self::Body { .. } => PluginRemoteErrorReason::Transient,
+            Self::Request { .. } | Self::Body { .. } | Self::InventoryTimeout => {
+                PluginRemoteErrorReason::Transient
+            }
             Self::UnexpectedStatus { status, .. }
                 if *status == http::StatusCode::REQUEST_TIMEOUT
                     || *status == http::StatusCode::TOO_MANY_REQUESTS
@@ -2032,31 +2040,37 @@ async fn fetch_installed_plugins_for_scope_with_download_url_with_client(
     scope: RemotePluginScope,
     include_download_urls: bool,
 ) -> Result<Vec<RemotePluginInstalledItem>, RemotePluginCatalogError> {
-    let mut plugins = Vec::new();
-    let mut page_token = None;
-    let mut seen_page_tokens = HashSet::new();
-    loop {
-        let response = get_remote_plugin_installed_page(
-            client,
-            config,
-            auth,
-            scope,
-            page_token.as_deref(),
-            include_download_urls,
-        )
-        .await?;
-        plugins.extend(response.plugins);
-        let Some(next_page_token) = response.pagination.next_page_token else {
-            break;
-        };
-        if !seen_page_tokens.insert(next_page_token.clone()) {
-            return Err(RemotePluginCatalogError::UnexpectedResponse(
-                "remote plugin catalog returned a repeated pagination token".to_string(),
-            ));
+    tokio::time::timeout(REMOTE_INSTALLED_PLUGIN_INVENTORY_TIMEOUT, async {
+        let mut plugins = Vec::new();
+        let mut page_token = None;
+        let mut seen_page_tokens = HashSet::new();
+        for _ in 0..MAX_REMOTE_INSTALLED_PLUGIN_INVENTORY_PAGES {
+            let response = get_remote_plugin_installed_page(
+                client,
+                config,
+                auth,
+                scope,
+                page_token.as_deref(),
+                include_download_urls,
+            )
+            .await?;
+            plugins.extend(response.plugins);
+            let Some(next_page_token) = response.pagination.next_page_token else {
+                return Ok(plugins);
+            };
+            if !seen_page_tokens.insert(next_page_token.clone()) {
+                return Err(RemotePluginCatalogError::UnexpectedResponse(
+                    "remote plugin catalog returned a repeated pagination token".to_string(),
+                ));
+            }
+            page_token = Some(next_page_token);
         }
-        page_token = Some(next_page_token);
-    }
-    Ok(plugins)
+        Err(RemotePluginCatalogError::UnexpectedResponse(format!(
+            "remote installed plugin inventory exceeded {MAX_REMOTE_INSTALLED_PLUGIN_INVENTORY_PAGES} pages"
+        )))
+    })
+    .await
+    .map_err(|_| RemotePluginCatalogError::InventoryTimeout)?
 }
 
 async fn get_remote_plugin_list_page(

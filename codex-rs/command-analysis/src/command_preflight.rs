@@ -5,7 +5,6 @@ use std::path::Path;
 mod full_suite;
 pub use full_suite::FullSuiteBudget;
 pub use full_suite::FullSuitePermit;
-pub use full_suite::ValidationPolicySnapshot;
 
 #[path = "managed_cargo_lane.rs"]
 mod managed_cargo_lane;
@@ -704,7 +703,12 @@ fn extract_cmd_command(command: &[String]) -> Option<Cow<'_, str>> {
             return command_tail(command, index + 2);
         }
         if let Some(script) = cmd_switch_inline_script(trimmed) {
-            return Some(Cow::Borrowed(script));
+            // Inline /c and /k start the same command-line tail as a separate
+            // switch. Later launch arguments remain part of that source.
+            return Some(match command_tail(command, index + 2) {
+                Some(tail) => Cow::Owned(format!("{script} {tail}")),
+                None => Cow::Borrowed(script),
+            });
         }
     }
     None
@@ -904,6 +908,16 @@ fn possible_powershell_commands(script: &str) -> Vec<Vec<String>> {
 }
 
 fn split_cmd_plain_commands(script: &str) -> Option<Vec<Vec<String>>> {
+    split_cmd_commands(script, true)
+}
+
+/// Keep CMD command boundaries for possible-build admission even when shell
+/// state cannot be lowered precisely. This is not an argv or environment proof.
+fn possible_cmd_commands(script: &str) -> Option<Vec<Vec<String>>> {
+    split_cmd_commands(script, false)
+}
+
+fn split_cmd_commands(script: &str, require_plain: bool) -> Option<Vec<Vec<String>>> {
     let mut commands = Vec::new();
     let mut words = Vec::new();
     let mut word = String::new();
@@ -914,7 +928,7 @@ fn split_cmd_plain_commands(script: &str) -> Option<Vec<Vec<String>>> {
         match ch {
             // Expansion, blocks, CALL and non-plain builtins need a native
             // grammar/state proof, not literal path or lint authority.
-            '%' | '!' | '(' | ')' => return None,
+            '%' | '!' | '(' | ')' if require_plain => return None,
             '"' => {
                 quoted = !quoted;
                 started = true;
@@ -922,13 +936,33 @@ fn split_cmd_plain_commands(script: &str) -> Option<Vec<Vec<String>>> {
             '^' if !quoted => {
                 let escaped = chars.next()?;
                 if matches!(escaped, '\r' | '\n') {
-                    return None;
+                    if require_plain {
+                        return None;
+                    }
+                    if escaped == '\r' && chars.peek() == Some(&'\n') {
+                        chars.next();
+                    }
+                    continue;
                 }
                 word.push(escaped);
                 started = true;
             }
-            '<' | '>' if !quoted => return None,
-            '&' | '|' | '\r' | '\n' if !quoted => {
+            '<' | '>' if !quoted && require_plain => return None,
+            '<' | '>' if !quoted => {
+                if started {
+                    if word.chars().all(|ch| ch.is_ascii_digit()) {
+                        word.clear();
+                    } else {
+                        words.push(std::mem::take(&mut word));
+                    }
+                    started = false;
+                }
+                if chars.peek() == Some(&ch) {
+                    chars.next();
+                }
+                skip_cmd_redirection_target(&mut chars)?;
+            }
+            '&' | '|' | '(' | ')' | '\r' | '\n' if !quoted => {
                 if started {
                     words.push(std::mem::take(&mut word));
                     started = false;
@@ -961,17 +995,55 @@ fn split_cmd_plain_commands(script: &str) -> Option<Vec<Vec<String>>> {
     if !words.is_empty() {
         commands.push(words);
     }
-    if commands.iter().any(|argv| {
-        argv.first().is_some_and(|program| {
-            matches!(
-                program.to_ascii_lowercase().as_str(),
-                "call" | "for" | "if" | "rem" | "set" | "cmd"
-            ) || program.starts_with('@')
+    if require_plain
+        && commands.iter().any(|argv| {
+            argv.first().is_some_and(|program| {
+                matches!(
+                    program.to_ascii_lowercase().as_str(),
+                    "call" | "for" | "if" | "rem" | "set" | "cmd"
+                ) || program.starts_with('@')
+            })
         })
-    }) {
+    {
         return None;
     }
+    if !require_plain {
+        for argv in &mut commands {
+            if let Some(program) = argv.first_mut() {
+                *program = program.trim_start_matches('@').to_string();
+            }
+        }
+    }
     Some(commands)
+}
+
+fn skip_cmd_redirection_target(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) -> Option<()> {
+    while chars.peek().is_some_and(|ch| matches!(*ch, ' ' | '\t')) {
+        chars.next();
+    }
+    // Descriptor duplication, such as `2>&1`, is not a command separator.
+    if chars.peek() == Some(&'&') {
+        chars.next();
+    }
+    let mut started = false;
+    let mut quoted = false;
+    while let Some(&ch) = chars.peek() {
+        match ch {
+            '"' => quoted = !quoted,
+            '^' if !quoted => {
+                chars.next();
+                chars.next()?;
+                started = true;
+                continue;
+            }
+            '&' | '|' | '(' | ')' | '<' | '>' | '\r' | '\n' if !quoted => break,
+            ch if ch.is_whitespace() && !quoted => break,
+            _ => {}
+        }
+        chars.next();
+        started = true;
+    }
+    (started && !quoted).then_some(())
 }
 
 fn lint_known_flag_typos(argv: &[String]) -> Result<(), CommandPreflightIssue> {

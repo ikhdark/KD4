@@ -105,12 +105,20 @@ pub(super) async fn search_threads(
                     matching_rollouts.remove(path);
                 }
             } else {
-                if let Ok(header) = codex_rollout::read_session_meta_line(path).await
-                    && !params.allowed_sources.is_empty()
-                    && !params.allowed_sources.contains(&header.meta.source)
-                {
-                    matching_rollouts.remove(path);
-                    continue;
+                if let Ok(header) = codex_rollout::read_session_meta_line(path).await {
+                    if !params.allowed_sources.is_empty()
+                        && !params.allowed_sources.contains(&header.meta.source)
+                    {
+                        matching_rollouts.remove(path);
+                        continue;
+                    }
+                    // Valid empty-preview archives are listable; snippetless hits
+                    // have no visible result for either discovery policy.
+                    if params.archived
+                        || matching_rollouts.get(path).is_some_and(Option::is_none)
+                    {
+                        continue;
+                    }
                 }
                 return Err(ThreadStoreError::Internal {
                     message: format!(
@@ -124,7 +132,7 @@ pub(super) async fn search_threads(
     if let Some(runtime) = state_db.as_deref() {
         // These paths were already discovered by content search. Missing or
         // stale index rows must not silently exclude canonical matches.
-        for path in matching_rollouts.keys() {
+        for (path, snippet) in &matching_rollouts {
             if !codex_rollout::state_integration::reconcile_rollout(
                 Some(runtime),
                 path,
@@ -160,7 +168,11 @@ pub(super) async fn search_threads(
                     )
                     .is_ok_and(|source| params.allowed_sources.contains(&source))
             });
+            // Archived discovery accepts empty previews. A metadata-only hit has no
+            // visible result to represent, even under the active preview policy.
             if eligible
+                && !params.archived
+                && snippet.is_some()
                 && row.as_ref().is_none_or(|row| {
                     row.preview
                         .as_ref()

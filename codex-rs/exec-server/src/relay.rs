@@ -446,7 +446,7 @@ where
         let mut pong_watchdog = WebSocketPongWatchdog::new(WEBSOCKET_PONG_TIMEOUT);
         let pong_deadline = tokio::time::sleep(WEBSOCKET_PONG_TIMEOUT);
         tokio::pin!(pong_deadline);
-        loop {
+        'writer: loop {
             let message = tokio::select! {
                 pong = pong_rx.recv() => {
                     let Some(()) = pong else {
@@ -480,22 +480,54 @@ where
                 }
             };
             let is_keepalive_ping = matches!(message, Message::Ping(_));
-            let write_deadline = pong_watchdog.write_deadline(tokio::time::Instant::now());
-            match tokio::time::timeout_at(write_deadline, websocket_sink.send(message)).await {
-                Ok(Ok(())) => {
-                    if is_keepalive_ping {
+            // Keep the send future alive while acknowledging pongs. A valid pong
+            // clears the old keepalive deadline, not this write's bounded budget.
+            let send = websocket_sink.send(message);
+            tokio::pin!(send);
+            let write_timeout = tokio::time::sleep(WEBSOCKET_PONG_TIMEOUT);
+            tokio::pin!(write_timeout);
+            let mut pong_received_during_send = false;
+            let result = loop {
+                tokio::select! {
+                    pong = pong_rx.recv() => {
+                        let Some(()) = pong else {
+                            break 'writer RendezvousDisconnectReason::LocalShutdown;
+                        };
+                        pong_watchdog.received_pong();
+                        pong_received_during_send = true;
+                    }
+                    _ = &mut pong_deadline, if pong_watchdog.deadline().is_some() => {
+                        match pong_rx.try_recv() {
+                            Ok(()) => {
+                                pong_watchdog.received_pong();
+                                pong_received_during_send = true;
+                            }
+                            Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {
+                                break 'writer RendezvousDisconnectReason::PongTimeout;
+                            }
+                            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                                break 'writer RendezvousDisconnectReason::LocalShutdown;
+                            }
+                        }
+                    }
+                    result = &mut send => break result,
+                    _ = &mut write_timeout => {
+                        warn!("Noise multiplexed environment websocket write timed out");
+                        break 'writer RendezvousDisconnectReason::WriteError;
+                    }
+                }
+            };
+            match result {
+                Ok(()) => {
+                    if is_keepalive_ping && !pong_received_during_send {
                         pong_watchdog.ping_sent(tokio::time::Instant::now());
                         if let Some(deadline) = pong_watchdog.deadline() {
                             pong_deadline.as_mut().reset(deadline);
                         }
                     }
                 }
-                Ok(Err(error)) => {
+                Err(error) => {
                     warn!("Noise multiplexed environment websocket write failed: {error}");
-                    break RendezvousDisconnectReason::WriteError;
-                }
-                Err(_) => {
-                    warn!("Noise multiplexed environment websocket write timed out");
                     break RendezvousDisconnectReason::WriteError;
                 }
             }

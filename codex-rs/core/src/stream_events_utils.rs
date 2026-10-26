@@ -394,8 +394,8 @@ pub(crate) async fn finalize_non_tool_response_item(
                 Some(combined)
             };
             let defers_mailbox_delivery_to_next_turn =
-                !matches!(agent_message.phase, Some(MessagePhase::Commentary))
-                    && last_agent_message.is_some();
+                matches!(agent_message.phase, Some(MessagePhase::FinalAnswer))
+                    || (agent_message.phase.is_none() && last_agent_message.is_some());
             (last_agent_message, defers_mailbox_delivery_to_next_turn)
         }
         _ => (None, false),
@@ -805,12 +805,14 @@ fn completed_item_defers_mailbox_delivery_to_next_turn(
 ) -> bool {
     match item {
         ResponseItem::Message { role, phase, .. } => {
-            if role != "assistant" || matches!(phase, Some(MessagePhase::Commentary)) {
+            if role != "assistant" {
                 return false;
             }
-            // Treat `None` like final-answer text so untagged providers default
-            // to the safer "defer mailbox mail" behavior.
-            last_assistant_message_from_item(item, plan_mode).is_some()
+            // An explicit final closes mailbox delivery even without visible text.
+            // Untagged providers retain the nonempty-text fallback.
+            matches!(phase, Some(MessagePhase::FinalAnswer))
+                || (phase.is_none()
+                    && last_assistant_message_from_item(item, plan_mode).is_some())
         }
         _ => false,
     }

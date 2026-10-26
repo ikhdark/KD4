@@ -917,7 +917,7 @@ async fn run_script_with_timeout_with_args(
     handler.kill_on_drop(true);
     handler.stdout(Stdio::piped());
     handler.stderr(Stdio::piped());
-    handler.creation_flags(WINDOWS_CREATE_SUSPENDED);
+    handler.creation_flags(WINDOWS_CREATE_SUSPENDED | 0x0800_0000); // CREATE_NO_WINDOW
 
     let managed = timeout_at(timeout_deadline, ManagedRootProcess::reserve_with_reclaim())
         .await

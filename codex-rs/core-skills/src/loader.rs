@@ -233,6 +233,23 @@ pub(crate) async fn load_skill_root(root: SkillRoot) -> SkillRootSnapshot {
         &mut outcome,
     )
     .await;
+    if path != root {
+        for skill in &mut outcome.skills {
+            let logical_paths = skill
+                .discovery_paths
+                .iter()
+                .chain(std::iter::once(&skill.path_to_skills_md))
+                .filter_map(|discovered| {
+                    discovered
+                        .as_path()
+                        .strip_prefix(root.as_path())
+                        .ok()
+                        .map(|relative| path.join(relative))
+                })
+                .collect::<Vec<_>>();
+            skill.discovery_paths.extend(logical_paths);
+        }
+    }
     if !file_system.uses_host_native_paths() {
         for skill in &mut outcome.skills {
             skill.source = Some(crate::model::SkillSource {
@@ -746,6 +763,13 @@ async fn parse_skill_file(
             dependencies,
             policy,
             path_to_skills_md: path.clone(),
+            discovery_paths: skill
+                .path
+                .to_abs_path()
+                .ok()
+                .filter(|discovered| discovered != path)
+                .into_iter()
+                .collect(),
             scope,
             plugin_id: plugin_id.map(str::to_string),
         },

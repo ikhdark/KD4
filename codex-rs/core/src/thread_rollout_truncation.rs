@@ -156,8 +156,22 @@ pub(crate) fn filter_rollout_preserving_rollbacks(
     keep: impl FnMut(&RolloutItem) -> bool,
 ) -> Vec<RolloutItem> {
     let decisions = rollout_filter_decisions(&items, keep);
-    items.into_iter().zip(decisions)
-        .filter_map(|(item, decision)| apply_rollout_filter_decision(item, decision)).collect()
+    // The owned source is consumed below. Retain only global diagnostics from
+    // discarded records so rollback cannot erase evidence of source gaps.
+    let notices = items.iter().zip(&decisions)
+        .filter(|(_, decision)| !decision.0)
+        .flat_map(|(item, _)| match item {
+            RolloutItem::ResponseItem(item) => std::slice::from_ref(item),
+            RolloutItem::Compacted(item) => item.replacement_history.as_deref().unwrap_or_default(),
+            _ => &[],
+        })
+        .filter(|item| codex_rollout::is_rollout_reconstruction_notice(item))
+        .cloned()
+        .map(RolloutItem::ResponseItem)
+        .collect::<Vec<_>>();
+    let retained = items.into_iter().zip(decisions)
+        .filter_map(|(item, decision)| apply_rollout_filter_decision(item, decision)).collect();
+    carry_source_integrity_notice(&notices, retained)
 }
 
 /// Borrow a shared parent until selection is known; clone retained payloads only.
@@ -167,10 +181,11 @@ pub(crate) fn filter_borrowed_rollout_preserving_rollbacks(
     mut clone_retained: impl FnMut(&RolloutItem) -> RolloutItem,
 ) -> Vec<RolloutItem> {
     let decisions = rollout_filter_decisions(items, keep);
-    items.iter().zip(decisions).filter_map(|(item, decision)| {
+    let retained = items.iter().zip(decisions).filter_map(|(item, decision)| {
         decision.0.then(|| clone_retained(item))
             .and_then(|item| apply_rollout_filter_decision(item, decision))
-    }).collect()
+    }).collect();
+    carry_source_integrity_notice(items, retained)
 }
 
 fn rollout_filter_decisions(
@@ -179,19 +194,66 @@ fn rollout_filter_decisions(
 ) -> Vec<(bool, Option<u32>)> {
     let mut legacy_mail = LegacyInterAgentMailReader::default();
     let mut instruction_turns = Vec::new();
-    let mut decisions = Vec::with_capacity(items.len());
+    let mut active_turn: Option<(&str, usize)> = None;
+    let mut replay_effects: Vec<usize> = Vec::new();
+    let mut decisions: Vec<(bool, Option<u32>)> = Vec::with_capacity(items.len());
     for (index, item) in items.iter().enumerate() {
         let legacy = legacy_mail.observe(item).is_some();
         let retained = keep(item);
-        if is_rollback_instruction_turn_boundary(items, index, item, legacy) {
-            instruction_turns.push(retained);
+        let instruction_boundary =
+            is_rollback_instruction_turn_boundary(items, index, item, legacy);
+        match item {
+            RolloutItem::EventMsg(EventMsg::TurnStarted(event)) => {
+                active_turn = Some((event.turn_id.as_str(), index));
+            }
+            RolloutItem::EventMsg(
+                EventMsg::TurnComplete(event) | EventMsg::ImportedTurnClosed(event),
+            ) if active_turn.is_some_and(|(id, _)| id == event.turn_id.as_str()) => {
+                active_turn = None;
+            }
+            RolloutItem::EventMsg(EventMsg::TurnAborted(event))
+                if event.turn_id.as_deref().is_none_or(|id| {
+                    active_turn.is_some_and(|(active_id, _)| active_id == id)
+                }) =>
+            {
+                active_turn = None;
+            }
+            RolloutItem::TurnContext(_)
+            | RolloutItem::WorldState(_)
+            | RolloutItem::Compacted(_)
+            | RolloutItem::SamplingBoundary(_)
+            | RolloutItem::AdditionalContextState { .. }
+            | RolloutItem::ResponseItem(_) if retained && !instruction_boundary => {
+                replay_effects.push(index);
+            }
+            _ => {}
+        }
+        if instruction_boundary {
+            instruction_turns.push((retained, active_turn.map_or(index, |(_, start)| start)));
         }
         let rollback = if let RolloutItem::EventMsg(EventMsg::ThreadRolledBack(event)) = item {
             let count = usize::try_from(event.num_turns).unwrap_or(usize::MAX);
             let start = instruction_turns.len().saturating_sub(count);
+            let context_start = if count > instruction_turns.len() {
+                Some(0)
+            } else {
+                instruction_turns.get(start).map(|(_, start)| *start)
+            };
+            if let Some(context_start) = context_start {
+                // Retire rollback-owned context and model history before filtering
+                // away mail boundaries or zero-count markers. Retained instruction
+                // boundaries stay until the repaired marker consumes them.
+                while let Some(&effect_index) = replay_effects.last() {
+                    if effect_index < context_start {
+                        break;
+                    }
+                    replay_effects.pop();
+                    decisions[effect_index].0 = false;
+                }
+            }
             let retained_count = instruction_turns[start..]
                 .iter()
-                .filter(|keep| **keep)
+                .filter(|(keep, _)| *keep)
                 .count();
             instruction_turns.truncate(start);
             // This cannot exceed the original u32 rollback count.

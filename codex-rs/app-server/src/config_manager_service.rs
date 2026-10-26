@@ -19,7 +19,9 @@ use codex_config::ConfigLayerStack;
 use codex_config::ConfigLayerStackOrdering;
 use codex_config::ConfigRequirementsToml;
 use codex_config::config_toml::ConfigToml;
-use codex_config::merge_toml_values;
+use codex_config::is_multi_agent_v2_feature_path;
+use codex_config::merge_owned_config_values;
+use codex_config::normalize_multi_agent_v2_feature_value;
 use codex_core::config::deserialize_config_toml_with_base;
 use codex_core::config::edit::ConfigApplyOutcome;
 use codex_core::config::edit::ConfigEdit;
@@ -229,7 +231,20 @@ impl ConfigManager {
         // Capture the exact on-disk representation before loading the migrated
         // config layer. The client version fingerprints the migrated layer,
         // while the atomic writer compares the raw TOML under its file lock.
-        let writer_expected_version = if expected_version.is_some() {
+        // Feature normalization preserves intent against the latest document.
+        // Reject an intervening write rather than validate/report an older view.
+        let preserves_feature_intent = edits.iter().any(|(key_path, value, _)| {
+            parse_key_path(key_path).is_ok_and(|segments| match segments.as_slice() {
+                [features, feature, ..] => {
+                    features == "features" && feature == "multi_agent_v2"
+                }
+                [features] if features == "features" => value
+                    .as_object()
+                    .is_some_and(|features| features.contains_key("multi_agent_v2")),
+                _ => false,
+            })
+        });
+        let writer_expected_version = if expected_version.is_some() || preserves_feature_intent {
             Some(read_raw_user_config_version(&provided_path).await?)
         } else {
             None
@@ -277,7 +292,7 @@ impl ConfigManager {
                     _ => {}
                 }
             }
-            let original_value = value_at_path(&user_config, &segments).cloned();
+            let original_value = value_at_semantic_path(&user_config, &segments).cloned();
             let parsed_value = parse_value(value).map_err(|message| {
                 ConfigManagerError::write(ConfigWriteErrorCode::ConfigValidationError, message)
             })?;
@@ -291,15 +306,26 @@ impl ConfigManager {
                 },
             )?;
 
-            let updated_value = value_at_path(&user_config, &segments).cloned();
+            let updated_value = value_at_semantic_path(&user_config, &segments).cloned();
             if original_value != updated_value {
                 let edit = match updated_value {
-                    Some(value) => ConfigEdit::SetPath {
-                        segments: segments.clone(),
-                        value: toml_value_to_item(&value).map_err(|err| {
-                            ConfigManagerError::anyhow("failed to build config edits", err)
-                        })?,
-                    },
+                    Some(value) => {
+                        // Preserve mixed-form intent for the writer's current document,
+                        // rather than persisting settings copied from this earlier view.
+                        let value = match (&parsed_value, &original_value) {
+                            (Some(parsed @ TomlValue::Boolean(_)), _)
+                                if is_multi_agent_v2_feature_path(&segments) => parsed,
+                            (Some(parsed @ TomlValue::Table(_)), Some(TomlValue::Boolean(_)))
+                                if is_multi_agent_v2_feature_path(&segments) => parsed,
+                            _ => &value,
+                        };
+                        ConfigEdit::SetPath {
+                            segments: segments.clone(),
+                            value: toml_value_to_item(value).map_err(|err| {
+                                ConfigManagerError::anyhow("failed to build config edits", err)
+                            })?,
+                        }
+                    }
                     None => ConfigEdit::ClearPath {
                         segments: segments.clone(),
                     },
@@ -307,7 +333,13 @@ impl ConfigManager {
                 config_edits.push(edit);
             }
 
-            parsed_segments.push(segments);
+            let mut semantic_segments = segments;
+            if is_multi_agent_v2_feature_path(&semantic_segments)
+                && parsed_value.as_ref().is_some_and(|value| value.as_bool().is_some())
+            {
+                semantic_segments.push("enabled".to_string());
+            }
+            parsed_segments.push(semantic_segments);
         }
 
         validate_config(&user_config).map_err(|err| {
@@ -532,9 +564,36 @@ fn apply_merge(
         ));
     };
 
+    if last == "enabled"
+        && is_multi_agent_v2_feature_path(parents)
+        && value.as_bool().is_some()
+        && value_at_path(root, parents).is_some_and(|feature| feature.as_bool().is_some())
+    {
+        return apply_merge(root, parents, Some(value), strategy);
+    }
+
+    let existing = value_at_path(root, segments);
+    let preserves_feature_shape = is_multi_agent_v2_feature_path(segments)
+        && matches!(
+            (existing, value),
+            (Some(TomlValue::Table(_)), TomlValue::Boolean(_))
+                | (Some(TomlValue::Boolean(_)), TomlValue::Table(_))
+        );
+    if preserves_feature_shape
+        || matches!(strategy, MergeStrategy::Upsert)
+            && matches!(existing, Some(TomlValue::Table(_)))
+            && matches!(value, TomlValue::Table(_))
+    {
+        // Merge at the real config root, not at an opaque subtree that happens
+        // to contain keys named features.multi_agent_v2.
+        merge_owned_config_values(root, sparse_overlay(segments, value));
+        return Ok(true);
+    }
+
     let mut current = root;
 
-    for segment in parents {
+    for (index, segment) in parents.iter().enumerate() {
+        normalize_multi_agent_v2_feature_value(&parents[..index], current);
         match current {
             TomlValue::Table(table) => {
                 current = table
@@ -552,22 +611,20 @@ fn apply_merge(
         }
     }
 
+    normalize_multi_agent_v2_feature_value(parents, current);
     let table = current.as_table_mut().ok_or_else(|| {
         MergeError::Validation("cannot set value on non-table parent".to_string())
     })?;
 
-    if matches!(strategy, MergeStrategy::Upsert)
-        && let Some(existing) = table.get_mut(last)
-        && matches!(existing, TomlValue::Table(_))
-        && matches!(value, TomlValue::Table(_))
-    {
-        merge_toml_values(existing, value);
-        return Ok(true);
-    }
-
     let changed = table.get(last) != Some(value);
     table.insert(last.clone(), value.clone());
     Ok(changed)
+}
+
+fn sparse_overlay(segments: &[String], value: &TomlValue) -> TomlValue {
+    segments.iter().rev().fold(value.clone(), |value, segment| {
+        TomlValue::Table(toml::map::Map::from_iter([(segment.clone(), value)]))
+    })
 }
 
 fn clear_path(root: &mut TomlValue, segments: &[String]) -> Result<bool, MergeError> {
@@ -576,6 +633,13 @@ fn clear_path(root: &mut TomlValue, segments: &[String]) -> Result<bool, MergeEr
             "keyPath must not be empty".to_string(),
         ));
     };
+
+    if last == "enabled"
+        && is_multi_agent_v2_feature_path(parents)
+        && value_at_path(root, parents).is_some_and(|value| value.as_bool().is_some())
+    {
+        return clear_path(root, parents);
+    }
 
     let mut current = root;
     for segment in parents {
@@ -658,6 +722,17 @@ fn value_at_path<'a>(root: &'a TomlValue, segments: &[String]) -> Option<&'a Tom
     Some(current)
 }
 
+fn value_at_semantic_path<'a>(root: &'a TomlValue, segments: &[String]) -> Option<&'a TomlValue> {
+    value_at_path(root, segments).or_else(|| {
+        let (field, parents) = segments.split_last()?;
+        if field != "enabled" || !is_multi_agent_v2_feature_path(parents) {
+            return None;
+        }
+        let feature = value_at_path(root, parents)?;
+        feature.as_bool().is_some().then_some(feature)
+    })
+}
+
 fn override_message(layer: &ConfigLayerSource) -> String {
     match layer {
         ConfigLayerSource::Mdm { domain, key: _ } => {
@@ -695,8 +770,8 @@ fn compute_override_metadata(
     segments: &[String],
 ) -> Option<OverriddenMetadata> {
     let user_layer = layers.get_active_user_layer()?;
-    let user_value = value_at_path(&user_layer.config, segments);
-    let effective_value = value_at_path(effective, segments);
+    let user_value = value_at_semantic_path(&user_layer.config, segments);
+    let effective_value = value_at_semantic_path(effective, segments);
 
     if user_value.is_some() && user_value == effective_value {
         return None;
@@ -736,7 +811,7 @@ fn find_effective_layer(
     segments: &[String],
 ) -> Option<ConfigLayerMetadata> {
     for layer in layers.layers_high_to_low() {
-        if let Some(meta) = value_at_path(&layer.config, segments).map(|_| layer.metadata()) {
+        if let Some(meta) = value_at_semantic_path(&layer.config, segments).map(|_| layer.metadata()) {
             return Some(meta);
         }
     }

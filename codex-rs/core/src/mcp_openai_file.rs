@@ -16,7 +16,7 @@ use crate::session::step_context::StepContext;
 use codex_api::OPENAI_FILE_UPLOAD_LIMIT_BYTES;
 use codex_api::delete_openai_file_with_pool;
 use codex_api::openai_file_http_client_pool;
-use codex_api::upload_openai_file_with_pool;
+use codex_api::upload_openai_file_bytes_with_pool;
 use codex_utils_path_uri::PathConvention;
 use futures::StreamExt;
 use futures::stream::FuturesUnordered;
@@ -464,16 +464,12 @@ async fn upload_staged_openai_file(
         }
         None => format!("failed to upload `{file_path}` for `{field_name}`: {error}"),
     };
-    let file_size_bytes = u64::try_from(contents.len())
-        .map_err(|error| (contextualize_error(error.to_string()), None))?;
-    let contents = futures::stream::once(async move { Ok::<_, std::io::Error>(contents.into()) });
-    let uploaded = upload_openai_file_with_pool(
+    let uploaded = upload_openai_file_bytes_with_pool(
         base_url,
         auth,
         http_clients,
         file_name,
-        file_size_bytes,
-        contents,
+        contents.into(),
     )
     .await
     .map_err(|error| {

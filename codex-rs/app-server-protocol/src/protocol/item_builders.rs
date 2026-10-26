@@ -150,13 +150,15 @@ pub fn command_display_string(command: &[String]) -> String {
     }
 }
 
-pub(crate) fn command_actions_for_path_uri(
+/// Projects display actions using the executor's cwd and path convention.
+pub fn command_actions_for_path_uri(
     parsed_cmd: &[ParsedCommand],
     cwd: &PathUri,
 ) -> Vec<CommandAction> {
-    // TODO(anp): Carry PathUri into CommandAction so foreign Read actions retain resolved paths.
-    // Until then, omit those actions rather than project a foreign cwd onto the host.
-    let native_cwd = if cwd.infer_path_convention() == Some(PathConvention::native()) {
+    // Preserve native non-UTF-8 paths; foreign paths must be resolved using the
+    // executor's convention rather than the app-server host's filesystem.
+    let is_native = cwd.infer_path_convention() == Some(PathConvention::native());
+    let native_cwd = if is_native {
         match cwd.to_abs_path() {
             Ok(path) => Some(path),
             Err(error) => {
@@ -173,10 +175,21 @@ pub(crate) fn command_actions_for_path_uri(
         .cloned()
         .filter_map(|parsed| match parsed {
             ParsedCommand::Read { cmd, name, path } => {
-                native_cwd.as_ref().map(|native_cwd| CommandAction::Read {
+                let resolved = if is_native {
+                    native_cwd.as_ref()?.join(&path).into()
+                } else {
+                    match cwd.join(path.to_string_lossy().as_ref()) {
+                        Ok(path) => path.into(),
+                        Err(error) => {
+                            warn!(%cwd, %error, "cannot resolve executor read command path");
+                            return None;
+                        }
+                    }
+                };
+                Some(CommandAction::Read {
                     command: cmd,
                     name,
-                    path: native_cwd.join(path),
+                    path: resolved,
                 })
             }
             ParsedCommand::ListFiles { cmd, path } => {

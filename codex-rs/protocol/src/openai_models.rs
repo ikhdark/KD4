@@ -701,7 +701,8 @@ impl ModelInfo {
     pub fn service_tier_for_request(&self, service_tier: Option<String>) -> Option<String> {
         service_tier.filter(|service_tier| {
             service_tier != SERVICE_TIER_DEFAULT_REQUEST_VALUE
-                && self.supports_service_tier(service_tier)
+                && (service_tier == ServiceTier::Flex.request_value()
+                    || self.supports_service_tier(service_tier))
         })
     }
 }

@@ -260,18 +260,29 @@ async fn resolve_requested_rollout_path(
         }
         _ => {}
     }
-    let Some(path) = codex_rollout::existing_rollout_path(path.as_path()).await else {
-        return Err(ThreadStoreError::RolloutNotMaterialized {
-            path,
-            reason: "file does not exist".to_string(),
-        });
-    };
-    tokio::fs::canonicalize(path.as_path())
-        .await
-        .map_err(|err| ThreadStoreError::RolloutNotMaterialized {
-            path,
-            reason: err.to_string(),
-        })
+    let mut retries = 3;
+    loop {
+        let Some(resolved_path) = codex_rollout::existing_rollout_path(path.as_path()).await else {
+            return Err(ThreadStoreError::RolloutNotMaterialized {
+                path,
+                reason: "file does not exist".to_string(),
+            });
+        };
+        match tokio::fs::canonicalize(resolved_path.as_path()).await {
+            Ok(path) => return Ok(path),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound && retries > 0 => {
+                // Compression/materialization can replace the physical spelling after lookup.
+                // Resolve the logical rollout again instead of retrying the vanished file.
+                retries -= 1;
+            }
+            Err(err) => {
+                return Err(ThreadStoreError::RolloutNotMaterialized {
+                    path: resolved_path,
+                    reason: err.to_string(),
+                });
+            }
+        }
+    }
 }
 
 async fn attach_history_if_requested(

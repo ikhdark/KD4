@@ -661,7 +661,37 @@ impl CatalogRequestProcessor {
                         }
                     };
                     let (effective_skill_roots, plugin_skill_snapshots) = if workspace_codex_plugins_enabled {
-                        let plugins_input = config.plugins_config_input();
+                        // The discovery stack belongs to this cwd; its feature
+                        // gates must not come from the server process's project.
+                        let cwd_features = (|| -> Result<_, String> {
+                            let effective = config_layer_stack.effective_config();
+                            let feature_config = codex_config::config_toml::ConfigToml {
+                                features: effective.get("features").cloned()
+                                    .map(toml::Value::try_into).transpose()
+                                    .map_err(|err| format!("invalid configuration features: {err}"))?,
+                                ..Default::default()
+                            };
+                            let mut features = codex_core::config::resolve_configured_features(
+                                &feature_config,
+                                config_layer_stack.requirements().feature_requirements.as_ref(),
+                            ).map_err(|err| err.to_string())?;
+                            self.config_manager.apply_runtime_feature_enablement_to_features(
+                                &mut features, &config_layer_stack,
+                            );
+                            Ok(features)
+                        })();
+                        let features = match cwd_features {
+                            Ok(features) => features,
+                            Err(message) => return (index, codex_app_server_protocol::SkillsListEntry {
+                                cwd: cwd.clone(), skills: Vec::new(),
+                                errors: vec![codex_app_server_protocol::SkillErrorInfo {
+                                    path: cwd, message,
+                                }],
+                            }),
+                        };
+                        let mut plugins_input = config.plugins_config_input();
+                        plugins_input.plugins_enabled = features.enabled(Feature::Plugins);
+                        plugins_input.remote_plugin_enabled = features.enabled(Feature::RemotePlugin);
                         plugins_manager
                             .effective_skill_roots_with_snapshots_for_layer_stack(
                                 &config_layer_stack,

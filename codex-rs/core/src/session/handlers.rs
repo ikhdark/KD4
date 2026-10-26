@@ -345,17 +345,13 @@ pub(super) async fn user_input_or_turn_inner(
             }
         };
     }
-    // A fresh top-level user turn gets a fresh allowance. Child input and
+    // A fresh top-level user turn gets a new launch scope. Child input and
     // resumed/internal contexts keep the captured root turn and shared ledger.
     if !session_configuration.session_source.is_non_root_agent() {
         let scope = Some((sess.thread_id().to_string(), sub_id.clone()));
-        session_configuration.validation_full_budget =
-            session_configuration.original_config_do_not_use.validation_full_budget;
         session_configuration.validation_root_turn = scope.clone();
         session_configuration.validation_attempts.clear();
         let mut state = sess.state.lock().await;
-        state.session_configuration.validation_full_budget =
-            session_configuration.validation_full_budget;
         state.session_configuration.validation_root_turn = scope;
         state.session_configuration.validation_attempts.clear();
     }

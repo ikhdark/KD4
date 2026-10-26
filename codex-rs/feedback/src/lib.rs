@@ -447,6 +447,16 @@ pub struct FeedbackUploadOptions<'a> {
 }
 
 impl FeedbackSnapshot {
+    /// Refresh log bytes without changing the captured metadata or thread identity.
+    pub fn refresh_logs(&mut self, feedback: &CodexFeedback) {
+        self.bytes = feedback
+            .inner
+            .ring
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .snapshot_bytes();
+    }
+
     pub(crate) fn as_bytes(&self) -> &[u8] {
         &self.bytes
     }

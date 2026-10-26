@@ -504,7 +504,13 @@ pub fn collect_explicit_skill_mentions(
             if let Some(skill) = selection_context
                 .skills
                 .iter()
-                .find(|skill| skill.path_to_skills_md == path)
+                .find(|skill| {
+                    (skill.path_to_skills_md == path || skill.discovery_paths.contains(&path))
+                        && !selection_context
+                            .disabled_paths
+                            .contains(&skill.path_to_skills_md)
+                        && !seen_paths.contains(&skill.path_to_skills_md)
+                })
             {
                 seen_paths.insert(skill.path_to_skills_md.clone());
                 seen_names.insert(skill.name.clone());
@@ -612,8 +618,10 @@ pub fn app_id_from_path(path: &str) -> Option<&str> {
         .filter(|value| !value.is_empty())
 }
 
+/// Ignore app/browser targeting parameters when matching the plugin identity.
 pub fn plugin_config_name_from_path(path: &str) -> Option<&str> {
     path.strip_prefix(PLUGIN_PATH_PREFIX)
+        .map(|value| value.split_once('?').map_or(value, |(identity, _)| identity))
         .filter(|value| !value.is_empty())
 }
 
@@ -786,7 +794,13 @@ fn select_skills_from_mentions(
         }
 
         let path_str = skill.path_to_skills_md.to_string_lossy();
-        if mention_skill_paths.contains(path_str.as_ref()) {
+        if mention_skill_paths.contains(path_str.as_ref())
+            || skill.discovery_paths.iter().any(|path| {
+                let path = path.to_string_lossy();
+                mention_skill_paths.contains(path.as_ref())
+                    || mention_skill_paths.contains(path.replace('\\', "/").as_str())
+            })
+        {
             seen_paths.insert(skill.path_to_skills_md.clone());
             seen_names.insert(skill.name.clone());
             selected.push(skill.clone());

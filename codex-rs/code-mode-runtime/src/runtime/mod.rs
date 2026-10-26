@@ -32,7 +32,6 @@ use tokio::sync::mpsc;
 use crate::TaskFailureHandler;
 use crate::v8_init::ensure_v8_initialized;
 
-const EXIT_SENTINEL: &str = "__codex_code_mode_exit__";
 const RUNTIME_STARTUP_TIMEOUT: Duration = Duration::from_secs(60);
 /// Frame room for everything a runtime response carries besides its content
 /// items: envelope, cell ID, bounded error text (escaping can grow it
@@ -874,6 +873,9 @@ impl RuntimeState {
     }
 
     pub(super) fn emit_output(&self, item: FunctionCallOutputContentItem) {
+        if self.exit_requested {
+            return;
+        }
         if let Some(event) = self.output_admission.admit(item) {
             let _ = self.event_tx.send(event);
         }
@@ -1107,6 +1109,11 @@ fn send_result(
 ) {
     // Timer exit bypasses completion_state. Every terminal path must reject
     // abandoned tools, including exit(), without replacing an earlier error.
+    // Exception rendering may itself call exit(); do not turn that exit into
+    // a formatting failure. Outstanding tools still retain their error below.
+    let error_text = error_text.filter(|_| {
+        !scope.get_slot::<RuntimeState>().is_some_and(|state| state.exit_requested)
+    });
     let error_text = error_text.or_else(|| unawaited_tool_error(scope));
     // Catching an admission error and completing successfully can compact and
     // commit retained evidence. A failed quota-exceeding cell is transactional:

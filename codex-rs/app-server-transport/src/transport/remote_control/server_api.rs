@@ -79,6 +79,7 @@ impl std::error::Error for RemoteControlServerRequestError {}
 
 pub(super) async fn enroll_remote_control_server_with_client(
     client: &HttpClient,
+    request_state: &super::RemoteControlEnrollmentState,
     remote_control_target: &RemoteControlTarget,
     auth: &RemoteControlConnectionAuth,
     installation_id: &str,
@@ -94,6 +95,7 @@ pub(super) async fn enroll_remote_control_server_with_client(
     };
     let enrollment_response = send_remote_control_server_request::<_, EnrollRemoteServerResponse>(
         client,
+        request_state,
         enroll_url,
         auth,
         installation_id,
@@ -124,6 +126,7 @@ pub(super) async fn enroll_remote_control_server_with_client(
 
 pub(super) async fn refresh_remote_control_server_with_client(
     client: &HttpClient,
+    request_state: &super::RemoteControlEnrollmentState,
     auth: &RemoteControlConnectionAuth,
     installation_id: &str,
     enrollment: &mut RemoteControlEnrollment,
@@ -149,6 +152,7 @@ pub(super) async fn refresh_remote_control_server_with_client(
     };
     let refreshed = match send_remote_control_server_request::<_, EnrollRemoteServerResponse>(
         client,
+        request_state,
         &refresh_url,
         auth,
         installation_id,
@@ -220,6 +224,7 @@ pub(super) async fn refresh_remote_control_server_with_client(
 #[allow(clippy::too_many_arguments)]
 async fn send_remote_control_server_request<Request, Response>(
     client: &HttpClient,
+    request_state: &super::RemoteControlEnrollmentState,
     url: &str,
     auth: &RemoteControlConnectionAuth,
     installation_id: &str,
@@ -233,6 +238,7 @@ where
     Response: DeserializeOwned,
 {
     let auth_headers = auth.request_headers()?;
+    request_state.admit_request()?;
     let response = client
         .post(url)
         .timeout(timeout)
@@ -253,6 +259,7 @@ where
         })?;
     let headers = response.headers().clone();
     let status = response.status();
+    request_state.record_retry_after(status, &headers);
     let retry_at = parse_retry_after(&headers, OffsetDateTime::now_utc());
     let body = super::enroll::read_remote_control_response_body_for_status(response)
         .await
@@ -314,7 +321,10 @@ fn remote_control_server_request_error(
     err.get_ref()?.downcast_ref()
 }
 
-fn parse_retry_after(headers: &HeaderMap, received_at: OffsetDateTime) -> Option<OffsetDateTime> {
+pub(super) fn parse_retry_after(
+    headers: &HeaderMap,
+    received_at: OffsetDateTime,
+) -> Option<OffsetDateTime> {
     let retry_after = headers
         .get(axum::http::header::RETRY_AFTER)?
         .to_str()

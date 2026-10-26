@@ -19,7 +19,10 @@
 //! # }
 //! ```
 
+use std::sync::Arc;
 use std::sync::OnceLock;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
@@ -49,6 +52,7 @@ use crate::runtime::LogRetentionScope;
 const LOG_QUEUE_CAPACITY: usize = 512;
 const LOG_BATCH_SIZE: usize = 128;
 const LOG_FLUSH_INTERVAL: Duration = Duration::from_secs(2);
+const SQLX_LOG_TARGETS: [&str; 3] = ["sqlx", "sqlx_core", "sqlx_sqlite"];
 // Span records are diagnostic history, not an unbounded event log. Retain the
 // newest UTF-8 suffix; thread identity is stored separately in SpanLogContext.
 const MAX_SPAN_FIELDS_BYTES: usize = 16 * 1024;
@@ -56,6 +60,7 @@ const MAX_SPAN_FIELDS_BYTES: usize = 16 * 1024;
 pub fn default_filter() -> Targets {
     Targets::new()
         .with_default(LevelFilter::TRACE)
+        .with_targets(SQLX_LOG_TARGETS.map(|target| (format!("{target}::"), LevelFilter::OFF)))
         .with_target("codex_http_client::transport", LevelFilter::OFF)
         .with_target("hyper_util", LevelFilter::WARN)
         .with_target("log", LevelFilter::OFF)
@@ -98,6 +103,7 @@ impl LogSinkQueueConfig {
 
 pub struct LogDbLayer {
     sender: mpsc::Sender<LogDbCommand>,
+    has_write_failure: Arc<AtomicBool>,
     process_uuid: String,
 }
 
@@ -109,6 +115,7 @@ impl Clone for LogDbLayer {
     fn clone(&self) -> Self {
         Self {
             sender: self.sender.clone(),
+            has_write_failure: self.has_write_failure.clone(),
             process_uuid: self.process_uuid.clone(),
         }
     }
@@ -125,11 +132,24 @@ impl LogDbLayer {
     ) -> Self {
         let config = config.normalized();
         let (sender, receiver) = mpsc::channel(config.queue_capacity);
-        tokio::spawn(run_inserter(state_db, receiver, config));
+        let has_write_failure = Arc::new(AtomicBool::new(false));
+        tokio::spawn(run_inserter(
+            state_db,
+            receiver,
+            config,
+            has_write_failure.clone(),
+        ));
         Self {
             sender,
+            has_write_failure,
             process_uuid: current_process_log_uuid().to_string(),
         }
+    }
+
+    /// Whether this writer has lost logs or stopped, making SQLite incomplete for feedback.
+    /// This remains true after subsequent successful writes and explicit flushes.
+    pub fn has_write_failure(&self) -> bool {
+        self.has_write_failure.load(Ordering::Relaxed) || self.sender.is_closed()
     }
 
     /// Wait for queued inserts and report any insertion failure since the last flush.
@@ -195,6 +215,16 @@ where
 
     fn on_event(&self, event: &Event<'_>, ctx: tracing_subscriber::layer::Context<'_, S>) {
         let metadata = event.metadata();
+        // The inserter and SQLx worker threads must never feed their diagnostics
+        // back into the same database, even without an outer target filter.
+        if metadata
+            .target()
+            .split("::")
+            .next()
+            .is_some_and(|target| SQLX_LOG_TARGETS.contains(&target))
+        {
+            return;
+        }
         // `tracing-log` checks filters with the original log target before
         // dispatching an event whose tracing target is `log`, so the outer
         // target filter cannot reliably reject these bridged events.
@@ -214,6 +244,7 @@ where
         }
 
         let Ok(permit) = self.sender.try_reserve() else {
+            self.has_write_failure.store(true, Ordering::Relaxed);
             return;
         };
         let mut visitor = SpanFieldVisitor::default();
@@ -396,6 +427,7 @@ async fn run_inserter(
     state_db: std::sync::Arc<StateRuntime>,
     mut receiver: mpsc::Receiver<LogDbCommand>,
     config: LogSinkQueueConfig,
+    has_write_failure: Arc<AtomicBool>,
 ) {
     let mut buffer = Vec::with_capacity(config.batch_size);
     let mut insert_error = None;
@@ -416,7 +448,7 @@ async fn run_inserter(
                             merge_pending_retention(
                                 &state_db,
                                 &mut pending_retention,
-                                flush(&state_db, &mut buffer, &mut insert_error).await,
+                                flush(&state_db, &mut buffer, &mut insert_error, &has_write_failure).await,
                             );
                         }
                     }
@@ -424,7 +456,7 @@ async fn run_inserter(
                         merge_pending_retention(
                             &state_db,
                             &mut pending_retention,
-                            flush(&state_db, &mut buffer, &mut insert_error).await,
+                            flush(&state_db, &mut buffer, &mut insert_error, &has_write_failure).await,
                         );
                         if let Err(Err(error)) = reply.send(insert_error.take().map_or(Ok(()), Err)) {
                             // Cancellation must not acknowledge an error that
@@ -436,7 +468,7 @@ async fn run_inserter(
                         merge_pending_retention(
                             &state_db,
                             &mut pending_retention,
-                            flush(&state_db, &mut buffer, &mut insert_error).await,
+                            flush(&state_db, &mut buffer, &mut insert_error, &has_write_failure).await,
                         );
                         break;
                     }
@@ -447,7 +479,7 @@ async fn run_inserter(
                 merge_pending_retention(
                     &state_db,
                     &mut pending_retention,
-                    flush(&state_db, &mut buffer, &mut insert_error).await,
+                    flush(&state_db, &mut buffer, &mut insert_error, &has_write_failure).await,
                 );
             }
             maintenance_result = async {
@@ -548,6 +580,7 @@ async fn flush(
     state_db: &StateRuntime,
     buffer: &mut Vec<LogEntry>,
     insert_error: &mut Option<anyhow::Error>,
+    has_write_failure: &AtomicBool,
 ) -> Option<LogRetentionScope> {
     if buffer.is_empty() {
         return None;
@@ -561,6 +594,7 @@ async fn flush(
     match result {
         Ok(scope) => Some(scope),
         Err(error) => {
+            has_write_failure.store(true, Ordering::Relaxed);
             if insert_error.is_none() {
                 *insert_error = Some(error);
             }

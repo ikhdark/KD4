@@ -163,6 +163,8 @@ async fn matching_payload_patterns(
         return Ok(Some(Vec::new()));
     }
     let mut command = Command::new(rg_command);
+    #[cfg(windows)]
+    command.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
     command
         .arg("--files-with-matches")
         .arg("--fixed-strings")
@@ -300,6 +302,8 @@ fn rollout_ripgrep_command(
     payload_patterns: &[String],
 ) -> Command {
     let mut command = Command::new(rg_command);
+    #[cfg(windows)]
+    command.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
     command
         .arg("--json")
         .arg("--max-count=1")

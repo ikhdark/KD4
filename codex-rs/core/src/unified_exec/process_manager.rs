@@ -266,12 +266,9 @@ async fn exec_server_params_for_request(
     tty: bool,
 ) -> Result<codex_exec_server::ExecParams, UnifiedExecError> {
     let (env_policy, env) = exec_server_env_for_request(request).await?;
-    // Sandbox retries reuse the unified-exec ID but start a distinct executor process.
-    let exec_server_process_id = if request.exec_server_sandbox.is_some() {
-        format!("{process_id}-{}", Uuid::new_v4())
-    } else {
-        process_id.to_string()
-    };
+    // Public handles are manager-local; a shared executor needs a fresh ID for
+    // every start, including unsandboxed requests and sandbox retries.
+    let exec_server_process_id = format!("{process_id}-{}", Uuid::new_v4());
     Ok(codex_exec_server::ExecParams {
         process_id: exec_server_process_id.into(),
         argv: request.command.clone(),

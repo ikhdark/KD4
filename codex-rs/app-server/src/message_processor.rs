@@ -489,6 +489,7 @@ impl MessageProcessor {
                 .maybe_start_plugin_startup_tasks_for_config(
                     &config.plugins_config_input(),
                     auth_manager,
+                    config_manager.plugin_config_reload_for_cwd(config.cwd.clone()),
                     Some(on_effective_plugins_changed),
                 );
         }

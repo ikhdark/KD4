@@ -130,6 +130,8 @@ pub struct ThreadListConfig<'a> {
     pub model_providers: Option<&'a [String]>,
     pub cwd_filters: Option<&'a [PathBuf]>,
     pub default_provider: &'a str,
+    /// Archived listings retain materialized sessions even before a preview exists.
+    pub include_empty_preview: bool,
     pub layout: ThreadListLayout,
 }
 
@@ -224,6 +226,7 @@ struct FilesByCreatedAtVisitor<'a> {
     provider_matcher: Option<&'a ProviderMatcher<'a>>,
     cwd_filters: Option<&'a [PathBuf]>,
     default_provider: &'a str,
+    include_empty_preview: bool,
 }
 
 impl<'a> RolloutFileVisitor for FilesByCreatedAtVisitor<'a> {
@@ -246,6 +249,7 @@ impl<'a> RolloutFileVisitor for FilesByCreatedAtVisitor<'a> {
             self.cwd_filters,
             updated_at,
             self.default_provider,
+            self.include_empty_preview,
         )
         .await
         {
@@ -339,6 +343,7 @@ pub async fn get_threads(
             model_providers,
             cwd_filters,
             default_provider,
+            include_empty_preview: false,
             layout: ThreadListLayout::NestedByDate,
         },
     )
@@ -372,6 +377,7 @@ pub async fn get_threads_ascending(
             model_providers,
             cwd_filters,
             default_provider,
+            include_empty_preview: false,
             layout: ThreadListLayout::NestedByDate,
         },
     )
@@ -416,6 +422,7 @@ pub async fn get_threads_in_root(
                 provider_matcher.as_ref(),
                 config.cwd_filters,
                 config.default_provider,
+                config.include_empty_preview,
             )
             .await?
         }
@@ -429,6 +436,7 @@ pub async fn get_threads_in_root(
                 provider_matcher.as_ref(),
                 config.cwd_filters,
                 config.default_provider,
+                config.include_empty_preview,
             )
             .await?
         }
@@ -472,6 +480,7 @@ async fn get_threads_in_root_by_summary(
                     provider_matcher.as_ref(),
                     config.cwd_filters,
                     config.default_provider,
+                    config.include_empty_preview,
                     ascending,
                 )
                 .await
@@ -485,6 +494,7 @@ async fn get_threads_in_root_by_summary(
                     provider_matcher.as_ref(),
                     config.cwd_filters,
                     config.default_provider,
+                    config.include_empty_preview,
                     ascending,
                 )
                 .await
@@ -537,6 +547,7 @@ async fn get_threads_in_root_by_summary(
                 candidate.path, config.allowed_sources, provider_matcher.as_ref(),
                 config.cwd_filters, candidate.updated_at.and_then(format_rfc3339),
                 config.default_provider,
+                config.include_empty_preview,
             ).await {
                 // Probe the next *matching* summary so filtering/damaged files
                 // cannot manufacture a next-page cursor.
@@ -563,6 +574,7 @@ async fn get_threads_in_root_by_summary(
             config.cwd_filters,
             updated_at,
             config.default_provider,
+            config.include_empty_preview,
         )
         .await
         else {
@@ -631,6 +643,7 @@ async fn traverse_directories_for_paths(
     provider_matcher: Option<&ProviderMatcher<'_>>,
     cwd_filters: Option<&[PathBuf]>,
     default_provider: &str,
+    include_empty_preview: bool,
 ) -> io::Result<ThreadsPage> {
     match sort_key {
         ThreadSortKey::CreatedAt => {
@@ -642,6 +655,7 @@ async fn traverse_directories_for_paths(
                 provider_matcher,
                 cwd_filters,
                 default_provider,
+                include_empty_preview,
                 false,
             )
             .await
@@ -655,6 +669,7 @@ async fn traverse_directories_for_paths(
                 provider_matcher,
                 cwd_filters,
                 default_provider,
+                include_empty_preview,
             )
             .await
         }
@@ -674,6 +689,7 @@ async fn traverse_flat_paths(
     provider_matcher: Option<&ProviderMatcher<'_>>,
     cwd_filters: Option<&[PathBuf]>,
     default_provider: &str,
+    include_empty_preview: bool,
 ) -> io::Result<ThreadsPage> {
     match sort_key {
         ThreadSortKey::CreatedAt => {
@@ -685,6 +701,7 @@ async fn traverse_flat_paths(
                 provider_matcher,
                 cwd_filters,
                 default_provider,
+                include_empty_preview,
                 false,
             )
             .await
@@ -698,6 +715,7 @@ async fn traverse_flat_paths(
                 provider_matcher,
                 cwd_filters,
                 default_provider,
+                include_empty_preview,
             )
             .await
         }
@@ -722,6 +740,7 @@ async fn traverse_directories_for_paths_created(
     provider_matcher: Option<&ProviderMatcher<'_>>,
     cwd_filters: Option<&[PathBuf]>,
     default_provider: &str,
+    include_empty_preview: bool,
     ascending: bool,
 ) -> io::Result<ThreadsPage> {
     let mut items: Vec<ThreadItem> = Vec::with_capacity(page_size);
@@ -736,6 +755,7 @@ async fn traverse_directories_for_paths_created(
         provider_matcher,
         cwd_filters,
         default_provider,
+        include_empty_preview,
     };
     walk_rollout_files(
         &root,
@@ -776,6 +796,7 @@ async fn traverse_directories_for_paths_updated(
     provider_matcher: Option<&ProviderMatcher<'_>>,
     cwd_filters: Option<&[PathBuf]>,
     default_provider: &str,
+    include_empty_preview: bool,
 ) -> io::Result<ThreadsPage> {
     let mut items: Vec<ThreadItem> = Vec::with_capacity(page_size);
     let mut scanned_files = 0usize;
@@ -806,6 +827,7 @@ async fn traverse_directories_for_paths_updated(
             cwd_filters,
             updated_at_fallback,
             default_provider,
+            include_empty_preview,
         )
         .await
         {
@@ -838,6 +860,7 @@ async fn traverse_flat_paths_created(
     provider_matcher: Option<&ProviderMatcher<'_>>,
     cwd_filters: Option<&[PathBuf]>,
     default_provider: &str,
+    include_empty_preview: bool,
     ascending: bool,
 ) -> io::Result<ThreadsPage> {
     let mut items: Vec<ThreadItem> = Vec::with_capacity(page_size);
@@ -867,6 +890,7 @@ async fn traverse_flat_paths_created(
             cwd_filters,
             updated_at,
             default_provider,
+            include_empty_preview,
         )
         .await
         {
@@ -895,6 +919,7 @@ async fn traverse_flat_paths_updated(
     provider_matcher: Option<&ProviderMatcher<'_>>,
     cwd_filters: Option<&[PathBuf]>,
     default_provider: &str,
+    include_empty_preview: bool,
 ) -> io::Result<ThreadsPage> {
     let mut items: Vec<ThreadItem> = Vec::with_capacity(page_size);
     let mut scanned_files = 0usize;
@@ -925,6 +950,7 @@ async fn traverse_flat_paths_updated(
             cwd_filters,
             updated_at_fallback,
             default_provider,
+            include_empty_preview,
         )
         .await
         {
@@ -1017,6 +1043,7 @@ async fn build_thread_item(
     cwd_filters: Option<&[PathBuf]>,
     updated_at: Option<String>,
     default_provider: &str,
+    include_empty_preview: bool,
 ) -> Option<ThreadItem> {
     // Read head and detect preview-bearing events; goal previews can appear before
     // the first normal user message.
@@ -1047,7 +1074,7 @@ async fn build_thread_item(
     }
     // A damaged metadata payload can still leave a filename identity and
     // useful history. Do not fabricate missing creation-only metadata.
-    if (summary.saw_session_meta && summary.preview.is_some())
+    if (summary.saw_session_meta && (include_empty_preview || summary.preview.is_some()))
         || (!summary.saw_session_meta && summary.thread_id.is_some())
     {
         let HeadTailSummary {
@@ -1113,6 +1140,7 @@ pub async fn read_thread_item_from_rollout(path: PathBuf) -> Option<ThreadItem> 
         /*cwd_filters*/ None,
         updated_at,
         /*default_provider*/ "",
+        /*include_empty_preview*/ false,
     )
     .await
 }

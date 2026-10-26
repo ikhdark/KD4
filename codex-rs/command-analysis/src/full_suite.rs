@@ -1,4 +1,4 @@
-//! Root-turn validation mode budgets.
+//! Root-turn validation launch ownership.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::sync::Mutex;
 
 
-/// Shared launch ownership and validation allowance for one root turn.
+/// Shared launch ownership and duplicate suppression for one root turn.
 #[derive(Debug, Default)]
 pub struct FullSuiteBudget(
     Mutex<HashMap<String, SuiteReservation>>,
@@ -23,18 +23,11 @@ struct SuiteReservation {
 
 /// Compilation kind travels inside the opaque selection, preserving the
 /// existing (selection, revision) checkpoint wire shape. Legacy entries remain
-/// budgeted; new compilation repairs never consume runtime/tooling attempts.
+/// non-compilation identities; compilation repairs use stricter freshness checks.
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PersistedCompilationSelection {
     compilation_selection_v1: String,
-}
-
-#[derive(Debug, Clone, Copy, Default)]
-pub struct ValidationPolicySnapshot {
-    /// Started, budgeted runtime/tooling attempts; excludes compilation.
-    pub admitted: usize,
-    pub exhausted: bool,
 }
 
 /// Dropping a prelaunch reservation releases that call's reservation only.
@@ -85,14 +78,13 @@ impl FullSuiteBudget {
     }
 
     /// Admission is atomic with in-flight reservations. Dropped prelaunch calls
-    /// refund their slot; only the runtime owner can mark possible execution.
-    /// Compilation repairs have no count limit, but require changed inputs.
+    /// release their identity; only the runtime owner can mark possible execution.
+    /// There is no attempt cap. Compilation repairs require changed inputs.
     pub fn reserve_policy(
         self: &Arc<Self>,
         owner: String,
         selection: String,
         source_revision: String,
-        limit: usize,
         compilation_only: bool,
     ) -> Result<FullSuitePermit, String> {
         let mut state = self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -102,9 +94,6 @@ impl FullSuiteBudget {
         let attempts = state.values().filter_map(|entry|
             entry.policy.as_ref().map(|attempt| (entry.compilation_only, attempt))
         ).collect::<Vec<_>>();
-        if !compilation_only && attempts.iter().filter(|attempt| !attempt.0).count() >= limit {
-            return Err("runtime/tooling validation execution budget exhausted; no further budgeted validation may run; authorized compilation repairs remain available after relevant input changes".into());
-        }
         if attempts.iter().any(|(previous_compilation, (previous_selection, revision))|
             *previous_compilation == compilation_only && revision == &source_revision
                 && (compilation_only || previous_selection == &selection)) {
@@ -117,14 +106,6 @@ impl FullSuiteBudget {
             compilation_only,
         });
         Ok(FullSuitePermit { budget: Arc::clone(self), owner, generation })
-    }
-
-    pub fn policy_snapshot(&self, limit: usize) -> ValidationPolicySnapshot {
-        let state = self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        let admitted = state.values().filter(|entry|
-            entry.started && entry.policy.is_some() && !entry.compilation_only
-        ).count();
-        ValidationPolicySnapshot { admitted, exhausted: admitted >= limit }
     }
 
     /// These are admission facts, never passing validation evidence.

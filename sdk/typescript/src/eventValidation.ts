@@ -44,6 +44,7 @@ function validItem(value: unknown): boolean {
         text(value.text) &&
         (value.phase === undefined ||
           value.phase === "commentary" ||
+          value.phase === "partial_answer" ||
           value.phase === "final_answer")
       );
     case "plan":

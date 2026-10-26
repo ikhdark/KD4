@@ -1119,6 +1119,16 @@ pub async fn resolve_root_git_project_for_trust_from_checkout(
     {
         return None;
     }
+    // A symlink to another checkout's .git file has the same marker identity,
+    // but does not make this directory that worktree. Authenticate its parent
+    // separately, while still accepting aliases of the whole checkout.
+    let backlink_root = backlink.parent()?;
+    let checkout_root = PathUri::from_abs_path(repo_root);
+    if fs.canonicalize(&backlink_root, None).await.ok()?
+        != fs.canonicalize(&checkout_root, None).await.ok()?
+    {
+        return None;
+    }
     let commondir = fs.read_file_text(&git_dir_uri.join("commondir").ok()?, None).await.ok()?;
     let commondir = git_dir_uri.join(commondir.trim()).ok()?;
     if fs.canonicalize(&commondir, None).await.ok()?

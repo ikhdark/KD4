@@ -46,8 +46,10 @@ pub struct SkillMetadata {
     pub interface: Option<SkillInterface>,
     pub dependencies: Option<SkillDependencies>,
     pub policy: Option<SkillPolicy>,
-    /// Path to the SKILLS.md file that declares this skill.
+    /// Canonical path to the SKILL.md file, used for identity and reads.
     pub path_to_skills_md: AbsolutePathBuf,
+    /// Logical paths observed during discovery, retained only for explicit selection.
+    pub discovery_paths: Vec<AbsolutePathBuf>,
     pub scope: SkillScope,
     pub plugin_id: Option<String>,
 }

@@ -1223,7 +1223,10 @@ class CodexClient:
         with self._lifecycle_lock:
             epoch = self._process_epoch
 
-        def reply(payload: JsonObject, *, wait_for_write: bool = True) -> None:
+        def reply(
+            payload: JsonObject, *, wait_for_write: bool = True,
+            serialized_result: str | None = None,
+        ) -> None:
             # Never send an old approval onto a replacement transport. Recheck
             # at the write owner as well, since restart can race this snapshot.
             with self._operation(control=True) as operation:
@@ -1240,7 +1243,10 @@ class CodexClient:
                     # The callback (e.g. a human approval) may outlive the
                     # operation budget; its reply still gets a full write budget.
                     operation.deadline = time.monotonic() + self.config.operation_timeout_s
-                self._write_message(payload, proc=proc, wait_for_write=wait_for_write)
+                self._write_message(
+                    payload, proc=proc, wait_for_write=wait_for_write,
+                    serialized_result=serialized_result,
+                )
 
         if not self._server_request_slots.acquire(blocking=False):
             reply(
@@ -1271,6 +1277,7 @@ class CodexClient:
                             or self._closing
                         ):
                             return
+                    serialized_result = None
                     try:
                         response = self._handle_server_request(msg)
                         if not isinstance(response, dict):
@@ -1278,11 +1285,13 @@ class CodexClient:
                         # Reject malformed callback output before any bytes are
                         # admitted to the transport, so an error reply is safe.
                         encoded = json.dumps(response, allow_nan=False)
-                        if len(encoded.encode("utf-8")) + 128 > self.config.max_message_bytes:
+                        # Default ensure_ascii=True makes this an exact byte count.
+                        if len(encoded) + 128 > self.config.max_message_bytes:
                             raise ValueError(
                                 "server-request callback response exceeds message limit"
                             )
                         payload = {"id": msg["id"], "result": response}
+                        serialized_result = encoded
                     except BaseException as error:
                         payload = {
                             "id": msg["id"],
@@ -1291,7 +1300,7 @@ class CodexClient:
                                 "message": f"server-request callback failed: {error}"[:1024],
                             },
                         }
-                    reply(payload)
+                    reply(payload, serialized_result=serialized_result)
             except BaseException as error:
                 if proc is not None:
                     self._abort_transport(proc, router, error)
@@ -1350,9 +1359,15 @@ class CodexClient:
     def _write_message(
         self, payload: JsonObject, *, proc: subprocess.Popen[str] | None = None,
         wait_for_write: bool = True,
+        serialized_result: str | None = None,
     ) -> None:
         with self._operation() as operation:
-            line = json.dumps(payload) + "\n"
+            if serialized_result is None:
+                line = json.dumps(payload) + "\n"
+            else:
+                # Only callback success replies supply their strictly validated
+                # result. Keep envelope encoding, admission and delivery here.
+                line = '{"id": ' + json.dumps(payload["id"]) + ', "result": ' + serialized_result + '}\n'
             if len(line.encode("utf-8")) > self.config.max_message_bytes:
                 raise CodexError("outbound message size limit exceeded")
             pending = _Write(line)

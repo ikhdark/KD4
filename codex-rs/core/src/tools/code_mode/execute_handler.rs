@@ -620,7 +620,7 @@ impl CodeModeExecuteHandler {
             .services
             .code_mode_service
             .delivery_for_response(&cell_id, &exec.turn, &response);
-        let mut output =
+        let (mut output, delivered_call_ids) =
             handle_runtime_response(&exec, response, max_output_tokens, started_at)
                 .map_err(FunctionCallError::RespondToModel)?;
         exec.session
@@ -638,6 +638,9 @@ impl CodeModeExecuteHandler {
         })?.map_err(|error| {
             FunctionCallError::RespondToModel(format!("code-mode started publication failed: {error}"))
         })?;
+        exec.turn
+            .turn_timing_state
+            .record_code_mode_projection_delivery(&call_id, &delivered_call_ids);
         Ok(attach_drained_wait_evidence(
             &exec,
             output,

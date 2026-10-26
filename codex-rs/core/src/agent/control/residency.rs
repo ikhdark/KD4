@@ -514,10 +514,10 @@ async fn is_unloadable(thread: &CodexThread) -> bool {
     }
     // Drop the active-turn observation before the queue's atomic recheck takes
     // that lock. Recovered user input is work too, not just mailbox traffic.
+    // Non-trigger mail stays with the registry-retained InputQueue across eviction.
     !session
         .input_queue
         .has_pending_input(&session.active_turn)
         .await
-        && !session.input_queue.has_pending_mailbox_items().await
 }
 

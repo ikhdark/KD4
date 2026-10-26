@@ -1498,6 +1498,34 @@ where
         } else if file_stem == "ServerNotification" {
             strip_v1_server_notification_variants_from_json_schema(&mut schema_value);
         }
+        if let Some(Value::Object(error_schema)) =
+            schema_value.pointer_mut("/definitions/CodexErrorInfo")
+            // Internal RolloutLine schemas use core's strict snake_case enum
+            // with the same schema name. Only the app-server wire enum is open.
+            && error_schema.get("oneOf").and_then(Value::as_array).is_some_and(|variants| {
+                variants.iter().any(|variant| {
+                    variant.get("enum").and_then(Value::as_array).is_some_and(|tags| {
+                        tags.iter().any(|tag| tag.as_str() == Some("contextWindowExceeded"))
+                    })
+                })
+            })
+            && let Some(Value::Array(mut variants)) = error_schema.remove("oneOf")
+        {
+            let known_tags: Vec<Value> = variants.iter().flat_map(|variant| {
+                variant.get("enum").and_then(Value::as_array).cloned()
+                    .unwrap_or_else(|| variant.get("properties").and_then(Value::as_object)
+                        .map(|properties| properties.keys().cloned().map(Value::String).collect())
+                        .unwrap_or_default())
+            }).collect();
+            variants.push(serde_json::json!({
+                "type": "string", "not": { "enum": known_tags }
+            }));
+            variants.push(serde_json::json!({
+                "type": "object", "minProperties": 1, "maxProperties": 1,
+                "propertyNames": { "not": { "enum": known_tags } }
+            }));
+            error_schema.insert("anyOf".to_string(), Value::Array(variants));
+        }
         enforce_numbered_definition_collision_overrides(file_stem, &mut schema_value);
         annotate_schema(&mut schema_value, Some(file_stem));
     }

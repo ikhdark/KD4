@@ -1,3 +1,4 @@
+use codex_context_fragments::ContextualUserFragment;
 use codex_protocol::AgentPath;
 use codex_protocol::ThreadId;
 use codex_protocol::protocol::AgentStatus;

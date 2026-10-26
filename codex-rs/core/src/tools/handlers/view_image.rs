@@ -8,11 +8,14 @@ use codex_protocol::models::ImageDetail;
 use codex_protocol::models::ResponseInputItem;
 use codex_protocol::openai_models::InputModality;
 use codex_utils_image::MAX_PROMPT_IMAGE_SOURCE_BYTES;
+use codex_utils_image::PromptImageMode;
 use codex_utils_image::data_url_from_bytes;
+use codex_utils_image::load_for_prompt_bytes;
 use serde::Deserialize;
 use std::sync::Arc;
 
 use crate::FunctionCallError;
+use crate::tools::context::ToolCallSource;
 use crate::tools::context::ToolInvocation;
 use crate::tools::context::ToolOutput;
 use crate::tools::context::ToolPayload;
@@ -124,6 +127,7 @@ impl ViewImageHandler {
             cancellation_token,
             payload,
             call_id,
+            source,
             ..
         } = invocation;
         let turn = Arc::clone(&step_context.turn);
@@ -200,7 +204,7 @@ impl ViewImageHandler {
                 metadata.size
             )));
         }
-        let file_bytes = fs
+        let mut file_bytes = fs
             .read_file_bounded(&path_uri, MAX_PROMPT_IMAGE_SOURCE_BYTES, Some(&sandbox))
             .await
             .map_err(|error| {
@@ -213,6 +217,32 @@ impl ViewImageHandler {
                     "unable to read image at `{model_visible_path}`: the file changed while being read or exceeds the view_image limit of {MAX_PROMPT_IMAGE_SOURCE_BYTES} bytes"
                 ))
             })?;
+
+        if matches!(source, ToolCallSource::CodeMode { .. }) {
+            // Nested results can be inspected without entering image history.
+            // Validate before reporting success, while preserving source bytes;
+            // direct output already decodes once in the history insertion path.
+            let validation_path = model_visible_path.clone();
+            file_bytes = tokio::task::spawn_blocking(move || {
+                load_for_prompt_bytes(
+                    std::path::Path::new(&validation_path),
+                    file_bytes.clone(),
+                    PromptImageMode::Original,
+                )
+                .map(|_| file_bytes)
+            })
+            .await
+            .map_err(|error| {
+                FunctionCallError::RespondToModel(format!(
+                    "unable to validate image at `{model_visible_path}`: {error}"
+                ))
+            })?
+            .map_err(|error| {
+                FunctionCallError::RespondToModel(format!(
+                    "unable to decode image at `{model_visible_path}`: {error}"
+                ))
+            })?;
+        }
 
         let can_request_original_detail = can_request_original_image_detail(&turn.model_info);
         let use_original_detail =

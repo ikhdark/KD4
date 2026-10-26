@@ -280,83 +280,95 @@ fn write_all_handle(handle: HANDLE, mut bytes: &[u8]) -> Result<()> {
 fn finalize_exit(
     exit_tx: oneshot::Sender<i32>,
     process_handle: Arc<StdMutex<Option<SendableHandle>>>,
+    job: &JobObject,
     thread_handle: SendableHandle,
     output_join: std::thread::JoinHandle<()>,
     logs_base_dir: Option<&Path>,
     command: Vec<String>,
     termination_requested: bool,
 ) {
-    let wait_timeout = if termination_requested {
+    let mut wait_timeout = if termination_requested {
         TERMINATION_WAIT_MS
     } else {
         INFINITE
     };
-    let (exit_code, root_exited) = match process_handle.lock() {
-        Ok(guard) => match guard.as_ref() {
-            Some(handle) => {
-                let handle = raw_handle(*handle);
-                // SAFETY: The process-handle mutex guard prevents finalization from taking and
-                // closing the handle during this synchronous wait.
-                let wait_result = unsafe { WaitForSingleObject(handle, wait_timeout) };
-                match wait_result {
-                    WAIT_OBJECT_0 => {
-                        let mut raw_exit = 1u32;
-                        // SAFETY: The guard still protects the process handle after the successful
-                        // wait, and raw_exit is a writable output slot.
-                        if unsafe { GetExitCodeProcess(handle, &mut raw_exit) } == 0 {
+    let (exit_code, root_exited) = loop {
+        let observation = match process_handle.lock() {
+            Ok(guard) => match guard.as_ref() {
+                Some(handle) => {
+                    let handle = raw_handle(*handle);
+                    // SAFETY: The process-handle mutex guard prevents finalization from taking and
+                    // closing the handle during this synchronous wait.
+                    let wait_result = unsafe { WaitForSingleObject(handle, wait_timeout) };
+                    match wait_result {
+                        WAIT_OBJECT_0 => {
+                            let mut raw_exit = 1u32;
+                            // SAFETY: The guard still protects the process handle after the successful
+                            // wait, and raw_exit is a writable output slot.
+                            if unsafe { GetExitCodeProcess(handle, &mut raw_exit) } == 0 {
+                                log_note(
+                                    &format!(
+                                        "legacy spawn failed to read root process exit code: {}",
+                                        unsafe { GetLastError() }
+                                    ),
+                                    logs_base_dir,
+                                );
+                                (None, true)
+                            } else {
+                                (Some(raw_exit as i32), true)
+                            }
+                        }
+                        WAIT_TIMEOUT => {
+                            log_note(
+                                "legacy root process did not exit after termination",
+                                logs_base_dir,
+                            );
+                            (None, false)
+                        }
+                        WAIT_FAILED => {
                             log_note(
                                 &format!(
-                                    "legacy spawn failed to read root process exit code: {}",
+                                    "legacy spawn failed final root process wait: Windows error {}",
                                     unsafe { GetLastError() }
                                 ),
                                 logs_base_dir,
                             );
-                            (None, true)
-                        } else {
-                            (Some(raw_exit as i32), true)
+                            (None, false)
+                        }
+                        unexpected => {
+                            log_note(
+                                &format!(
+                                    "legacy spawn received unexpected final root wait result \
+                                     0x{unexpected:08x}"
+                                ),
+                                logs_base_dir,
+                            );
+                            (None, false)
                         }
                     }
-                    WAIT_TIMEOUT => {
-                        log_note(
-                            "legacy root process did not exit after termination",
-                            logs_base_dir,
-                        );
-                        (None, false)
-                    }
-                    WAIT_FAILED => {
-                        log_note(
-                            &format!(
-                                "legacy spawn failed final root process wait: Windows error {}",
-                                unsafe { GetLastError() }
-                            ),
-                            logs_base_dir,
-                        );
-                        (None, false)
-                    }
-                    unexpected => {
-                        log_note(
-                            &format!(
-                                "legacy spawn received unexpected final root wait result \
-                                 0x{unexpected:08x}"
-                            ),
-                            logs_base_dir,
-                        );
-                        (None, false)
-                    }
                 }
-            }
-            None => {
-                log_note("legacy spawn lost its root process handle", logs_base_dir);
+                None => {
+                    log_note("legacy spawn lost its root process handle", logs_base_dir);
+                    (None, false)
+                }
+            },
+            Err(_) => {
+                log_note(
+                    "legacy spawn root process handle lock poisoned",
+                    logs_base_dir,
+                );
                 (None, false)
             }
-        },
-        Err(_) => {
-            log_note(
-                "legacy spawn root process handle lock poisoned",
-                logs_base_dir,
-            );
-            (None, false)
+        };
+        if observation.1 {
+            break observation;
         }
+        // An unconfirmed stop must retain the native waiter, handles and job.
+        // Release the process-handle lock before retrying termination so the
+        // job/control path cannot deadlock with this reconciliation owner.
+        let _ = terminate_job_or_process(job, &process_handle, logs_base_dir);
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        wait_timeout = TERMINATION_WAIT_MS;
     };
 
     // Preserved descendants can keep inherited output handles open indefinitely; readers left
@@ -668,6 +680,7 @@ fn spawn_windows_sandbox_session_legacy_blocking(
         finalize_exit(
             exit_tx,
             wait_handle,
+            &job_for_wait,
             thread_handle_addr,
             output_join,
             wait_logs_base_dir.as_deref(),

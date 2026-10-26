@@ -2,7 +2,6 @@ use codex_code_mode_protocol::FunctionCallOutputContentItem;
 use codex_code_mode_protocol::MAX_TOOL_TIMEOUT_MS;
 
 use super::DEFAULT_LIST_KEYS_LIMIT;
-use super::EXIT_SENTINEL;
 use super::MAX_LIST_KEYS_LIMIT;
 use super::MAX_OUTSTANDING_CALLBACKS_PER_CELL;
 use super::MAX_SESSION_STORED_VALUE_BYTES;
@@ -52,6 +51,11 @@ pub(super) fn tool_callback(
             return;
         }
     };
+
+    // Serialization and option getters can call exit() reentrantly.
+    if reject_unavailable_callback(scope, &mut retval) {
+        return;
+    }
 
     let Some(resolver) = v8::PromiseResolver::new(scope) else {
         throw_type_error(scope, "failed to create tool promise");
@@ -395,7 +399,13 @@ pub(super) fn store_callback(
         }
     };
     let presentation = super::output_projection::capture_stored_presentation(scope, value);
+    if scope.is_execution_terminating() {
+        return;
+    }
     let limit_error = scope.get_slot_mut::<RuntimeState>().and_then(|state| {
+        if state.exit_requested {
+            return None;
+        }
         let plain = StoredValue::new(&key, serialized);
         let mut stored = plain.clone().with_presentation(presentation);
         let previous_bytes = state.stored_values.get(&key).map(|previous| previous.bytes);
@@ -437,6 +447,9 @@ pub(super) fn store_callback(
 }
 
 fn reject_storage_limit(scope: &mut v8::PinScope<'_, '_>) {
+    if scope.is_execution_terminating() {
+        return;
+    }
     if let Some(state) = scope.get_slot_mut::<RuntimeState>() {
         state.storage_limit_rejected = true;
     }
@@ -667,6 +680,9 @@ pub(super) fn notify_callback(
         throw_type_error(scope, "notify expects non-empty text");
         return;
     }
+    if reject_unavailable_callback(scope, &mut retval) {
+        return;
+    }
     let Some(resolver) = v8::PromiseResolver::new(scope) else {
         throw_type_error(scope, "failed to create notification promise");
         return;
@@ -706,6 +722,11 @@ fn skip_output_conversion(
     scope: &mut v8::PinScope<'_, '_>,
     value: v8::Local<'_, v8::Value>,
 ) -> bool {
+    if scope.is_execution_terminating()
+        || scope.get_slot::<RuntimeState>().is_some_and(|state| state.exit_requested)
+    {
+        return true;
+    }
     let bytes = v8::Local::<v8::String>::try_from(value)
         .map(|value| value.utf8_length(scope))
         .unwrap_or(0);
@@ -725,9 +746,10 @@ fn reject_unavailable_callback(
     scope: &mut v8::PinScope<'_, '_>,
     retval: &mut v8::ReturnValue<v8::Value>,
 ) -> bool {
-    if scope
-        .get_slot::<RuntimeState>()
-        .is_some_and(|state| state.event_tx.is_closed())
+    if scope.is_execution_terminating()
+        || scope
+            .get_slot::<RuntimeState>()
+            .is_some_and(|state| state.exit_requested || state.event_tx.is_closed())
     {
         scope.terminate_execution();
         return true;
@@ -890,6 +912,7 @@ pub(super) fn yield_control_callback(
     _retval: v8::ReturnValue<v8::Value>,
 ) {
     if let Some(state) = scope.get_slot::<RuntimeState>()
+        && !state.exit_requested
         && let Some(event) = state.output_admission.admit_yield()
     {
         let _ = state.event_tx.send(event);
@@ -904,7 +927,5 @@ pub(super) fn exit_callback(
     if let Some(state) = scope.get_slot_mut::<RuntimeState>() {
         state.exit_requested = true;
     }
-    if let Some(error) = v8::String::new(scope, EXIT_SENTINEL) {
-        scope.throw_exception(error.into());
-    }
+    scope.terminate_execution();
 }

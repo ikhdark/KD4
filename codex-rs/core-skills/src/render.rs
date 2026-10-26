@@ -1,5 +1,6 @@
 use std::borrow::Cow;
 
+use crate::model::SKILL_CATALOG_LOCATOR_PREFIX;
 use crate::model::SkillLoadOutcome;
 use crate::model::SkillMetadata;
 use crate::model::skill_catalog_id;

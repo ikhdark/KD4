@@ -49,11 +49,31 @@ pub(super) async fn scoped_rollout_path_async(
     rollout_path: PathBuf,
     root_name: &'static str,
 ) -> ThreadStoreResult<PathBuf> {
-    tokio::task::spawn_blocking(move || scoped_rollout_path(root, &rollout_path, root_name))
+    let original_path = rollout_path.clone();
+    let retry_root = root.clone();
+    let result = tokio::task::spawn_blocking(move || scoped_rollout_path(root, &rollout_path, root_name))
         .await
         .map_err(|err| ThreadStoreError::Internal {
             message: format!("rollout path validation worker failed: {err}"),
-        })?
+        })?;
+    match result {
+        Ok(path) => Ok(path),
+        Err(error) => {
+            // Compression can replace the discovered spelling before canonicalization.
+            // Retry only a changed representation, with the same directory scope check.
+            let Some(current) = codex_rollout::existing_rollout_path(&original_path).await else {
+                return Err(error);
+            };
+            if current == original_path {
+                return Err(error);
+            }
+            tokio::task::spawn_blocking(move || scoped_rollout_path(retry_root, &current, root_name))
+            .await
+            .map_err(|err| ThreadStoreError::Internal {
+                message: format!("rollout path validation worker failed: {err}"),
+            })?
+        }
+    }
 }
 
 pub(super) fn scoped_rollout_path(
