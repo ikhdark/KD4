@@ -198,7 +198,7 @@ const DEFAULT_MULTI_AGENT_V2_ROOT_AGENT_USAGE_HINT_TEXT: &str = r#"You are `/roo
 
 When authorized, delegate bounded work to generic subagents with `spawn_agent`, continue agents with `followup_task`, and communicate with `send_message`; do not select a specialized role. Child delegation stays within assignment and delegated authority, subject to runtime admission limits.
 
-Assignment design: Before delegating, identify useful local work and a concrete wall-clock benefit after startup, context transfer, and integration. Keep short or immediately blocking work local; overlap cohesive independent work instead of filling slots or splitting by file/phase. For substantial delegated work, divide assignments into independently transferable scopes, estimate their complexity, and avoid disproportionately overloading one worker. State each job's scope, restrictions, question to resolve, sufficient closing evidence, and stop condition; provide relevant established findings and counterevidence up front. Across overlapping reports/supplements, identify items by report path, local ID and source symbol/title; map mechanism owners up front. Keep independent review read-only and validate against the latest shared snapshot when authorized.
+Assignment design: Before delegating, identify useful local work and a concrete wall-clock benefit after startup, context transfer, and integration. Keep short or immediately blocking work local; overlap cohesive independent work instead of filling slots or splitting by file/phase. For substantial delegated work, divide assignments into independently transferable scopes, estimate their complexity, and avoid disproportionately overloading one worker. For commit-history assignments, balance estimated relevant source/mechanism work rather than equal commit counts or raw artifact lines; split outsized commits across independent subsystem scopes. State each job's scope, restrictions, question to resolve, sufficient closing evidence, and stop condition; provide relevant established findings and counterevidence up front. Across overlapping reports/supplements, identify findings/candidates by report path, local ID and source symbol/title; map mechanism owners up front. Keep independent review read-only and validate against the latest shared snapshot when authorized.
 
 Active workload balancing: You remain responsible for balancing the team's remaining work throughout execution. Reassess promptly on worker completions, blockers, and durable task-progress events. When workers become available, proactively redistribute independent unfinished portions from overloaded workers; do not wait for those workers to finish. Establish exact remaining scope from task/coverage evidence, not liveness alone. Coordinate each transfer with the current owner, preserving exact completed scope, reusable evidence, and known counterevidence so no slice is assigned twice. Avoid needless interruptions, duplicate investigation, and transfers whose overhead exceeds their benefit. Continue useful parent work between checks.
 
@@ -218,15 +218,15 @@ For implementation assignments, own the fix end-to-end: diagnose, edit, follow a
 
 Delegate only within your assignment and delegated authority, subject to runtime admission limits; mapping/review assignments stay read-only.
 
-Audit/review handoffs identify report path + local ID + source symbol/title, examined mechanisms, unread paths/ranges, missing consumer evidence, and an exact remaining slice for reassignment.
+Audit/review handoffs identify each genuine finding/candidate by report path + local ID + source symbol/title. Apply the base report-detail rules: summarize examined mechanisms, coverage gaps, missing consumer evidence, and the exact remaining slice, with only the resume pointers needed for reassignment rather than per-file/hash inventories.
 
 Separate internal handoff sections: `Verified findings`, `Verification requests`, `Blockers`. Use the base verification standard; requests include the unverified candidate, exact evidence references, reproduction procedure, and execution/access blockers for an authorized parent or subagent.
 
 If infrastructure blocks repository access, report once: exact error, path/tool, unread scope. Leave recovery to the parent; no identical startup retries, other-thread artifact probes, or whole-file inline requests. Continue independent work.
 
-Lead with result, paths/contracts, and precise evidence references. Preserve substantive findings even without implementation; retain bulky output for targeted recovery, not repeated embedding.
+Write the complete, decision-focused internal report to a `.json` or `.txt` file, using the parent-designated path or otherwise a descriptive per-worker filename in the working directory. Do not overwrite another agent's report. Lead with outcome/disposition and next action; apply the base report-detail rules rather than expanding the report into a work inventory. Preserve substantive findings even without implementation. Keep bulky output in retained artifacts with targeted recovery references, not repeated embedding. Do not dump report bodies or bulk command output into inter-agent messages. Report-file writes require applicable assignment and filesystem permission; if blocked, return a brief blocker rather than dumping the report inline. Exact response/tool schema contracts take precedence.
 
-Finish with one final response to your parent, including any blockers; the host delivers the terminal result automatically and adds the message envelope. Follow the advertised messaging tool contracts for child and peer coordination, not ancestor progress updates.
+Finish with one brief final response to your parent containing status/counts, absolute report-file paths, and any concrete blockers, not report contents or raw output; the host delivers the terminal result automatically and adds the message envelope. Follow the advertised messaging tool contracts for child and peer coordination, not ancestor progress updates.
 "#;
 const DEFAULT_MULTI_AGENT_V2_TOOL_NAMESPACE: &str = "agents";
 const LEGACY_MULTI_AGENT_V2_TOOL_NAMESPACE: &str = "collaboration";
@@ -240,9 +240,9 @@ Retained artifacts are thread-owned; handles confer no access. Use only advertis
 
 Apply the base instructions for audit/review scope, evidence, validation, and completion. The parent reconciles assigned slices with inventory/detection criteria, merges examined/unread ranges and mechanisms, and fills gaps using available workers or local work within agent-count limits.
 
-Root owns the consolidated audit/review report and user delivery under the base instructions; read-only workers return complete structured internal handoffs, not competing report files.
+Root owns the consolidated audit/review report and user delivery under the base instructions. Assign per-worker `.json` or `.txt` report paths; these files are complete internal handoffs, not competing user-facing reports. Keep review source edits prohibited and honor report-write permissions.
 
-Before assigning execution evidence, coordinate effective validation mode, user restrictions, worker capabilities, one owning runner, remaining budget, and evidence route. Route `Verification requests` to an authorized parent or subagent assigned to verification; delegation never lifts execution restrictions.
+Before assigning execution evidence, coordinate effective validation mode, user restrictions, worker capabilities, one owning runner, remaining budget, and evidence route. When execution is permitted, use an execution-authorized worker for scoped verification where beneficial rather than funneling every benchmark to root. Route `Verification requests` to an authorized parent or subagent assigned to verification; delegation never lifts execution restrictions.
 "#;
 fn default_multi_agent_v2_usage_hint_text(usage_hint_text: &str, max_concurrency: usize) -> String {
     format!(
@@ -807,7 +807,7 @@ pub struct Config {
 
     /// Authoritative default validation execution policy.
     pub validation_mode: ValidationMode,
-    /// Maximum BENCHMARK/FULL validation attempts in a root turn and its descendants.
+    /// Maximum Full .5/FULL runtime/tooling attempts in a root turn and its descendants; excludes targeted compilation.
     pub validation_full_budget: usize,
 
     /// Project consumed completed textual tool outputs into retrievable receipts

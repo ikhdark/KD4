@@ -290,13 +290,13 @@ async fn load_config_normalizes_relative_cwd_override() -> std::io::Result<()> {
 }
 
 #[tokio::test]
-async fn validation_policy_uses_benchmark_and_two_attempts_by_default() -> std::io::Result<()> {
+async fn validation_policy_uses_full_half_and_two_attempts_by_default() -> std::io::Result<()> {
     let config = Config::load_from_base_config_with_overrides(
         ConfigToml::default(),
         ConfigOverrides::default(),
         tempdir()?.abs(),
     ).await?;
-    assert_eq!(config.validation_mode, codex_protocol::validation::ValidationMode::Benchmark);
+    assert_eq!(config.validation_mode, codex_protocol::validation::ValidationMode::FullHalf);
     assert_eq!(config.validation_full_budget, 2);
 
     let config = Config::load_from_base_config_with_overrides(
@@ -9136,11 +9136,10 @@ fn multi_agent_v2_resolved_usage_hint_projection_preserves_disabled_hints() {
                 subagent_usage_hint_text: worker.map(str::to_string),
                 ..Default::default()
             };
+            let mut source_features = FeaturesToml::default();
+            source_features.multi_agent_v2 = Some(FeatureToml::Config(raw));
             let source = ConfigToml {
-                features: Some(FeaturesToml {
-                    multi_agent_v2: Some(FeatureToml::Config(raw)),
-                    ..Default::default()
-                }),
+                features: Some(source_features),
                 ..Default::default()
             };
             let resolved = resolve_multi_agent_v2_config(&source);
@@ -9158,11 +9157,10 @@ fn multi_agent_v2_resolved_usage_hint_projection_preserves_disabled_hints() {
                 projected.subagent_usage_hint_text.as_deref(),
                 Some(resolved.subagent_usage_hint_text.as_deref().unwrap_or_default())
             );
+            let mut replay_features = FeaturesToml::default();
+            replay_features.multi_agent_v2 = Some(FeatureToml::Config(projected));
             let replay = ConfigToml {
-                features: Some(FeaturesToml {
-                    multi_agent_v2: Some(FeatureToml::Config(projected)),
-                    ..Default::default()
-                }),
+                features: Some(replay_features),
                 ..Default::default()
             };
             assert_eq!(resolve_multi_agent_v2_config(&replay), resolved);

@@ -7,7 +7,17 @@ export type TurnTimingRequestTokenCategories = {
 /**
  * Exact content hashes from prompt provenance, not the state fingerprint.
  */
-promptSectionSha256?: { [key in string]?: string }, accountingBasis: TurnTimingTokenCategoryBasis, baseInstructions: bigint, toolSchemas: bigint, conversationHistory: bigint, currentInput: bigint, repositoryContext: bigint, skills: bigint, otherInjectedContext: bigint,
+promptSectionSha256?: { [key in string]?: string }, accountingBasis: TurnTimingTokenCategoryBasis, baseInstructions: bigint, toolSchemas: bigint, conversationHistory: bigint,
+/**
+ * Serialized tool-result bytes in this request's full logical input,
+ * including retained results. Subset of conversation_history; not transport bytes.
+ */
+toolOutputSerializedBytes?: bigint,
+/**
+ * Native tool-result token estimate for this request's full logical input,
+ * including retained results. Subset of conversation_history; not provider usage.
+ */
+toolOutputTokensEstimate?: bigint, currentInput: bigint, repositoryContext: bigint, skills: bigint, otherInjectedContext: bigint,
 /**
  * Sum of the mutually exclusive category estimates above.
  */

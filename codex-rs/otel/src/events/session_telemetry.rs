@@ -436,6 +436,8 @@ pub struct ModelAttemptTelemetry {
     /// Pre-filter arrival at the internal response queue. Actual post-filter
     /// publication is recorded by codex.model_output_published; neither is UI rendering.
     pub first_visible_output_us: Option<u64>,
+    /// Versioned content-free chunk summary; absent before stream observation.
+    pub stream_delivery_json: Option<String>,
     pub completed_us: u64,
 }
 
@@ -449,6 +451,8 @@ pub struct ResponseStartTelemetry<'a> {
     pub request_send_started_ns: Option<u64>,
     pub response_headers_received_ns: Option<u64>,
     pub first_response_body_byte_ns: Option<u64>,
+    /// Value of openai-processing-ms, not a server inference/queue partition.
+    pub provider_processing_us: Option<u64>,
 }
 
 impl<'a> ResponseStartTelemetry<'a> {
@@ -468,6 +472,7 @@ impl<'a> ResponseStartTelemetry<'a> {
             request_send_started_ns: timestamp(timing.send_started_at),
             response_headers_received_ns: timestamp(timing.response_headers_at),
             first_response_body_byte_ns: timestamp(timing.first_response_body_byte_at),
+            provider_processing_us: None,
         }
     }
 }
@@ -1142,6 +1147,8 @@ impl SessionTelemetry {
                 request_send_completed_ns = None::<u64>,
                 send_completion_unavailable_reason = response_start.map(|_| "reqwest does not expose upload completion"),
                 response_headers_received_ns = response_start.and_then(|value| value.response_headers_received_ns),
+                provider_processing_us = response_start.and_then(|value| value.provider_processing_us),
+                provider_processing_source = response_start.and_then(|value| value.provider_processing_us.map(|_| "openai-processing-ms")),
                 logical_request_id = logical_request_id,
                 attempt = attempt,
                 phase = phase,
@@ -1689,6 +1696,7 @@ impl SessionTelemetry {
                 first_model_output_us = record.first_model_output_us,
                 first_actionable_output_us = record.first_actionable_output_us,
                 first_visible_output_us = record.first_visible_output_us,
+                stream_delivery_json = record.stream_delivery_json.as_deref(),
                 completed_us = record.completed_us,
         );
     }

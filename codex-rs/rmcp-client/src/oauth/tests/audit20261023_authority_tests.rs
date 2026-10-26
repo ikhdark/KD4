@@ -2,6 +2,7 @@ use super::*;
 use crate::oauth::{delete_oauth_tokens_from_keyring_and_file, load_oauth_tokens_coordinated, save_oauth_tokens_coordinated};
 use codex_config::types::OAuthCredentialsStoreMode;
 use codex_keyring_store::{CredentialStoreError, KeyringStore};
+use pretty_assertions::assert_eq;
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 

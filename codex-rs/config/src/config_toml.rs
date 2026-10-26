@@ -371,10 +371,10 @@ pub struct ConfigToml {
     /// Token budget applied when storing tool/function outputs in the context manager.
     pub tool_output_token_limit: Option<usize>,
 
-    /// Default validation execution policy. Defaults to `benchmark` (targeted compilation and benchmark-only workloads, not tests).
+    /// Default validation execution policy. Defaults to `full.5` (Full .5): compile checks and other operations are allowed, but tests, full suites, and non-compilation checks in any language are not. Legacy `benchmark` settings remain accepted.
     pub validation_mode: Option<ValidationMode>,
 
-    /// Maximum BENCHMARK/FULL validation attempts per root turn, including children. Defaults to 2.
+    /// Maximum Full .5/FULL runtime/tooling validation attempts per root turn, including children; targeted compilation is excluded. Defaults to 2.
     pub validation_full_budget: Option<usize>,
 
     /// Whether completed textual tool outputs may be represented by bounded,

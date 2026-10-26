@@ -9964,33 +9964,38 @@ async fn plugin_recommendation_and_mcp_tool_reads_start_concurrently() {
 }
 
 #[tokio::test]
-async fn projected_prompt_state_reads_start_concurrently() {
-    let barrier = Arc::new(tokio::sync::Barrier::new(3));
-    let active_barrier = Arc::clone(&barrier);
-    let history_barrier = Arc::clone(&barrier);
-    let compact_barrier = Arc::clone(&barrier);
+async fn projected_prompt_state_reads_share_consistent_snapshot() {
+    let (session, turn) = crate::session::tests::make_session_and_context().await;
+    session
+        .state
+        .lock()
+        .await
+        .set_auto_compact_window_estimated_prefill(123);
+    let expected_active = session.get_total_token_usage().await;
+    let expected_history = session.get_estimated_token_count(&turn).await;
 
-    let values = tokio::time::timeout(
+    // Prompt state now comes from one history/window snapshot, rather than
+    // three independent futures. Exercise the real owner, including concurrent
+    // callers and the optional compaction-window projection.
+    let (with_window, without_window) = tokio::time::timeout(
         Duration::from_millis(200),
-        collect_projected_prompt_state(
-            async move {
-                active_barrier.wait().await;
-                "active"
-            },
-            async move {
-                history_barrier.wait().await;
-                "history"
-            },
-            async move {
-                compact_barrier.wait().await;
-                "compact"
-            },
-        ),
+        async {
+            tokio::join!(
+                session.projected_prompt_state(&turn, false, true),
+                session.projected_prompt_state(&turn, false, false),
+            )
+        },
     )
     .await
-    .expect("independent prompt-pressure state reads should overlap");
+    .expect("concurrent prompt-state readers must both complete");
 
-    assert_eq!(values, ("active", "history", "compact"));
+    assert_eq!(with_window.0, expected_active);
+    assert_eq!(with_window.1, expected_history);
+    assert_eq!(
+        with_window.2.map(|window| window.prefill_input_tokens),
+        Some(Some(123))
+    );
+    assert_eq!(without_window, (expected_active, expected_history, None));
 }
 
 #[test]

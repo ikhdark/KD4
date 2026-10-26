@@ -102,8 +102,8 @@ fn controlled_compile_replay_counts_admission_refusal_and_terminal_boundaries() 
     let budget = Arc::new(FullSuiteBudget::default());
     let mut control = TurnExecutionControl::new();
     let mut refused = 0;
-    // The same failure is attempted repeatedly; only a changed input permits
-    // its second execution. Further changed inputs cannot reopen the budget.
+    // Recompilation after each changed input is allowed beyond the old cap;
+    // repeating the same input remains refused.
     for (index, revision) in ["source-0", "source-0", "source-1", "source-2"].into_iter().enumerate() {
         let owner = format!("replay-{index}");
         match budget.reserve_policy(owner.clone(), "cargo check -p example".into(), revision.into(), 2, true) {
@@ -117,16 +117,17 @@ fn controlled_compile_replay_counts_admission_refusal_and_terminal_boundaries() 
             Err(_) => {
                 refused += 1;
                 settle_result(&mut control, json!({"validation_policy_refusal":true,
-                    "validation_mode":"compile", "reason":"bounded replay refusal"}), true, false);
+                    "validation_mode":"compile", "reason":"unchanged-input replay refusal"}), true, false);
             }
         }
         control.set_validation_policy(ValidationMode::Compile, budget.policy_snapshot(2).exhausted);
 
     }
-    let admitted = budget.policy_snapshot(2).admitted;
+    let admitted = budget.persisted_attempts().len();
+    assert_eq!(budget.policy_snapshot(2).admitted, 0);
     let terminal_reports = usize::from(control.completion_readiness(0).remaining(false, &[]).is_empty()
         && !control.completion_assessment(0).failed_checks.is_empty());
-    assert_eq!((admitted, refused, terminal_reports), (2, 2, 1));
+    assert_eq!((admitted, refused, terminal_reports), (3, 1, 1));
     assert_eq!(control.failed_validation_checks.len(), 1);
     println!("controlled_compile_replay admitted={admitted} refused={refused} terminal_reports={terminal_reports} elapsed_us={}", started.elapsed().as_micros());
 }

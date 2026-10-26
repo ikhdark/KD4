@@ -421,6 +421,9 @@ impl ModelRequestMeasurements {
     }
 
     fn request_token_categories(&self) -> TurnTimingRequestTokenCategories {
+        let tool_outputs = self.prompt_context_categories.iter().find(|measurement| {
+            measurement.category == PromptContextCategory::ToolOutputs.as_str()
+        });
         let other_injected_context = [
             PromptContextCategory::AgentRole,
             PromptContextCategory::Plugins,
@@ -488,6 +491,8 @@ impl ModelRequestMeasurements {
             conversation_history: self
                 .tokens(PromptContextCategory::History)
                 .saturating_add(self.tokens(PromptContextCategory::ToolOutputs)),
+            tool_output_serialized_bytes: tool_outputs.map(|measurement| measurement.serialized_bytes),
+            tool_output_tokens_estimate: tool_outputs.map(|measurement| measurement.estimated_tokens),
             current_input: self.tokens(PromptContextCategory::TaskInput),
             repository_context: self.tokens(PromptContextCategory::Repository),
             skills: self
@@ -1445,6 +1450,12 @@ fn measure_responses_request_after_dispatch(
 
 #[derive(Debug, Default)]
 struct ModelAttemptOffsets {
+    stream_delivery_json: Option<String>,
+    transport_attempt: u64,
+    request_send_started_ns: Option<u64>,
+    response_headers_received_ns: Option<u64>,
+    first_response_body_byte_ns: Option<u64>,
+    provider_processing_us: Option<u64>,
     queue_started_us: Option<u64>,
     queue_us: u64,
     connection_setup_started_us: Option<u64>,
@@ -1469,6 +1480,25 @@ struct ModelAttemptClock {
 }
 
 impl ModelAttemptClock {
+    fn record_response_start(&self, response: &codex_otel::ResponseStartTelemetry<'_>) {
+        let mut offsets = self
+            .offsets
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if response.request_send_started_ns.is_some() {
+            offsets.request_send_started_ns = response.request_send_started_ns;
+        }
+        if response.response_headers_received_ns.is_some() {
+            offsets.response_headers_received_ns = response.response_headers_received_ns;
+        }
+        if response.first_response_body_byte_ns.is_some() {
+            offsets.first_response_body_byte_ns = response.first_response_body_byte_ns;
+        }
+        if response.provider_processing_us.is_some() {
+            offsets.provider_processing_us = response.provider_processing_us;
+        }
+    }
+
     fn new() -> Self {
         Self {
             started_at_us: u64::try_from(codex_protocol::timing::process_monotonic_ns() / 1_000)
@@ -1494,12 +1524,13 @@ impl ModelAttemptClock {
     }
 
     /// A later safe pre-dispatch transport try of the same attempt.
-    fn mark_redispatch_ready(&self) {
+    fn mark_redispatch_ready(&self, transport_attempt: u64) {
         let now_us = self.elapsed_us();
         let mut offsets = self
             .offsets
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        offsets.transport_attempt = transport_attempt;
         redispatch_offsets(&mut offsets, now_us);
     }
 
@@ -1602,6 +1633,171 @@ impl ModelAttemptClock {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .first_visible_output_us
             .get_or_insert_with(|| self.elapsed_us());
+    }
+}
+
+const MODEL_STREAM_GAP_BOUNDS_US: [u64; 13] = [
+    0, 1_000, 5_000, 10_000, 25_000, 50_000, 100_000,
+    250_000, 500_000, 1_000_000, 2_000_000, 5_000_000, 10_000_000,
+];
+
+/// Constant-space mapper observations: deltas are chunks, never provider tokens.
+/// No per-delta mutex, allocation, logging or extra task is introduced.
+#[derive(Default, serde::Serialize)]
+struct ModelStreamDelivery {
+    version: u32,
+    physical_attempt_id: String,
+    clock_id: &'static str,
+    dispatch_ready_us: Option<u64>,
+    completed_us: u64,
+    connection_setup_us: u64,
+    request_send_started_ns: Option<u64>,
+    response_headers_received_ns: Option<u64>,
+    first_response_body_byte_ns: Option<u64>,
+    provider_processing_us: Option<u64>,
+    first_output_chunk_us: Option<u64>,
+    last_output_chunk_us: Option<u64>,
+    output_chunk_count: u64,
+    payload_measurement_version: u32,
+    output_chunk_utf8_bytes: u64,
+    first_output_chunk_utf8_bytes: Option<u64>,
+    gap_histogram_version: u32,
+    gap_histogram_upper_bounds_us: [u64; 13],
+    gap_histogram_counts: [u64; 14],
+    max_inter_chunk_gap_us: Option<u64>,
+    inter_chunk_stall_count: u64,
+    inter_chunk_stall_us: u64,
+    stall_threshold_us: u64,
+    complete: bool,
+    downstream_backpressured: bool,
+    saturated: bool,
+}
+
+struct ModelStreamDeliveryObserver {
+    identity: Option<ResponseAttemptIdentity>,
+    clock: Option<ModelAttemptClock>,
+    turn_timing: Option<Arc<TurnTimingState>>,
+    summary: ModelStreamDelivery,
+    published: bool,
+}
+
+impl ModelStreamDeliveryObserver {
+    fn new(
+        identity: Option<ResponseAttemptIdentity>,
+        clock: Option<ModelAttemptClock>,
+        turn_timing: Option<Arc<TurnTimingState>>,
+    ) -> Self {
+        Self {
+            identity,
+            clock,
+            turn_timing,
+            summary: ModelStreamDelivery {
+                version: 1,
+                clock_id: codex_protocol::timing::process_clock_domain_id(),
+                stall_threshold_us: 1_000_000,
+                payload_measurement_version: 1,
+                gap_histogram_version: 1,
+                gap_histogram_upper_bounds_us: MODEL_STREAM_GAP_BOUNDS_US,
+                ..Default::default()
+            },
+            published: false,
+        }
+    }
+
+    fn observe(&mut self, event: &ResponseEvent) {
+        let delta = match event {
+            ResponseEvent::OutputTextDelta(delta)
+            | ResponseEvent::ReasoningSummaryDelta { delta, .. }
+            | ResponseEvent::ReasoningContentDelta { delta, .. }
+            | ResponseEvent::ToolCallInputDelta { delta, .. } => delta,
+            // Done/items can repeat previously delivered content. Do not count
+            // them as another generated chunk or invent a token count.
+            _ => return,
+        };
+        let Some(clock) = self.clock.as_ref().filter(|_| !delta.is_empty()) else {
+            return;
+        };
+        let now_us = clock.elapsed_us();
+        let payload_bytes = u64::try_from(delta.len()).unwrap_or(u64::MAX);
+        let summary = &mut self.summary;
+        if let Some(previous) = summary.last_output_chunk_us {
+            let gap = now_us.saturating_sub(previous);
+            let bucket = MODEL_STREAM_GAP_BOUNDS_US.partition_point(|bound| gap > *bound);
+            summary.gap_histogram_counts[bucket] = summary.gap_histogram_counts[bucket].saturating_add(1);
+            summary.saturated |= summary.gap_histogram_counts[bucket] == u64::MAX;
+            summary.max_inter_chunk_gap_us =
+                Some(summary.max_inter_chunk_gap_us.unwrap_or(0).max(gap));
+            if gap >= summary.stall_threshold_us {
+                summary.inter_chunk_stall_count = summary.inter_chunk_stall_count.saturating_add(1);
+                summary.inter_chunk_stall_us = summary.inter_chunk_stall_us.saturating_add(gap);
+            }
+        }
+        summary.first_output_chunk_us.get_or_insert(now_us);
+        summary.first_output_chunk_utf8_bytes.get_or_insert(payload_bytes);
+        summary.output_chunk_utf8_bytes = summary.output_chunk_utf8_bytes.saturating_add(payload_bytes);
+        summary.last_output_chunk_us = Some(now_us);
+        summary.output_chunk_count = summary.output_chunk_count.saturating_add(1);
+        summary.saturated |= now_us == u64::MAX
+            || payload_bytes == u64::MAX
+            || summary.output_chunk_utf8_bytes == u64::MAX
+            || summary.output_chunk_count == u64::MAX
+            || summary.inter_chunk_stall_count == u64::MAX
+            || summary.inter_chunk_stall_us == u64::MAX;
+    }
+
+    fn publish(&mut self, complete: bool) {
+        if self.published {
+            return;
+        }
+        self.published = true;
+        let (Some(identity), Some(clock)) = (&self.identity, &self.clock) else {
+            return;
+        };
+        self.summary.complete = complete;
+        let mut offsets = clock
+            .offsets
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.summary.dispatch_ready_us = offsets.dispatch_ready_us;
+        self.summary.completed_us = offsets.completed_us.unwrap_or_else(|| clock.elapsed_us());
+        self.summary.connection_setup_us = offsets.connection_setup_us;
+        self.summary.request_send_started_ns = offsets.request_send_started_ns;
+        self.summary.response_headers_received_ns = offsets.response_headers_received_ns;
+        self.summary.first_response_body_byte_ns = offsets.first_response_body_byte_ns;
+        self.summary.provider_processing_us = offsets.provider_processing_us;
+        self.summary.physical_attempt_id = if offsets.transport_attempt == 0 {
+            identity.physical_attempt_id.clone()
+        } else {
+            format!("{}:http-{}", identity.physical_attempt_id, offsets.transport_attempt)
+        };
+        let json = serde_json::to_string(&self.summary).unwrap_or_default();
+        offsets.stream_delivery_json = Some(json.clone());
+        drop(offsets);
+        // Never hold the clock mutex while acquiring turn state. This reuses
+        // bounded physical-attempt retention and checkpoint persistence.
+        if let Some(timing) = self.turn_timing.as_ref() {
+            timing.record_model_stream_delivery(
+                &identity.sampling_request_id,
+                &self.summary.physical_attempt_id,
+                &json,
+            );
+        }
+        tracing::info!(
+            event.name = "codex.model_stream_delivery",
+            sampling_request_id = %identity.sampling_request_id,
+            attempt_id = %identity.physical_attempt_id,
+            clock_id = codex_protocol::timing::process_clock_domain_id(),
+            stream_delivery_json = %json,
+            "content-free model stream delivery summary"
+        );
+    }
+}
+
+impl Drop for ModelStreamDeliveryObserver {
+    fn drop(&mut self) {
+        // Cancellation, dropped consumers and early transport exits preserve
+        // observed partial evidence rather than asserting a complete stream.
+        self.publish(false);
     }
 }
 
@@ -1933,6 +2129,7 @@ impl ModelAttemptGuard {
                 first_model_output_us: offsets.first_model_output_us,
                 first_actionable_output_us: offsets.first_actionable_output_us,
                 first_visible_output_us: offsets.first_visible_output_us,
+                stream_delivery_json: offsets.stream_delivery_json.clone(),
                 completed_us,
             });
         for receipt in self.measurements.stable_context_manifest.filtering_receipts() {
@@ -1981,6 +2178,10 @@ fn finish_queue_span(offsets: &mut ModelAttemptOffsets, now_us: u64) {
 /// backoff into connection setup and move dispatch-ready to the retry, so post-dispatch
 /// offsets (TTFT included) exclude client-side recovery. Phase totals are unchanged.
 fn redispatch_offsets(offsets: &mut ModelAttemptOffsets, now_us: u64) {
+    offsets.request_send_started_ns = None;
+    offsets.response_headers_received_ns = None;
+    offsets.first_response_body_byte_ns = None;
+    offsets.provider_processing_us = None;
     finish_queue_span(offsets, now_us);
     if let Some(previous_us) = offsets.dispatch_ready_us.replace(now_us) {
         offsets.connection_setup_us = offsets
@@ -6529,10 +6730,22 @@ where
     let consumer_dropped_for_stream = consumer_dropped.clone();
     let dispatched_at = Instant::now();
     let terminal_delivery_identity = attempt_identity.clone();
+    let delivery_turn_timing = attempt.as_ref().and_then(|attempt| {
+        let guard = match attempt {
+            ModelAttemptState::Ready(guard) => guard.as_ref(),
+            ModelAttemptState::Pending(pending) => pending.essential.as_ref(),
+        };
+        guard.turn_timing.clone()
+    });
 
     tokio::spawn(
         async move {
             let mut tx_last_response = Some(tx_last_response);
+            let mut delivery = ModelStreamDeliveryObserver::new(
+                terminal_delivery_identity.clone(),
+                attempt_clock.clone(),
+                delivery_turn_timing,
+            );
             let mut items_added: Vec<ResponseItem> = Vec::new();
             let mut ttft_ms = None;
             // First-event telemetry is one-shot. Once recorded, later deltas must
@@ -6589,6 +6802,7 @@ where
                         clock.mark_first_model_output();
                         first_model_output_recorded = true;
                     }
+                    delivery.observe(response_event);
                     if ttft_ms.is_none() && response_event_records_model_content(response_event) {
                         ttft_ms.get_or_insert_with(|| {
                             let offsets = clock
@@ -6624,6 +6838,7 @@ where
                     && tx_event.is_backpressured(queued_payload_bytes)
                 {
                     downstream_backpressured = true;
+                    delivery.summary.downstream_backpressured = true;
                 }
                 match event.event() {
                     Ok(ResponseEvent::OutputItemDone(item)) => {
@@ -6645,6 +6860,7 @@ where
                         token_usage,
                         ..
                     }) => {
+                        delivery.publish(true);
                         let response_id = response_id.clone();
                         let token_usage = token_usage.clone();
                         if let Some(throughput) = stream_throughput.as_ref() {
@@ -6768,6 +6984,7 @@ where
                         }
                     }
                     Err(_) => {
+                        delivery.publish(false);
                         let Err(err) = event.into_event() else { unreachable!() };
                         if let Some(attempt) = attempt.as_ref() {
                             attempt.clock().mark_completed();
@@ -7166,7 +7383,7 @@ impl RequestTelemetry for ApiTelemetry {
             if transport_attempt == 0 {
                 context.clock.mark_dispatch_ready();
             } else {
-                context.clock.mark_redispatch_ready();
+                context.clock.mark_redispatch_ready(transport_attempt);
             }
             // Safe pre-dispatch transport retries share the enclosing API
             // request but are distinct physical entries. Keep their identity
@@ -7243,13 +7460,26 @@ impl RequestTelemetry for ApiTelemetry {
                     byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.')
                 })
             });
-        let response_start = codex_otel::ResponseStartTelemetry::from_transport_timing(
+        let mut response_start = codex_otel::ResponseStartTelemetry::from_transport_timing(
             timing,
             identity.map(|identity| identity.sampling_request_id.as_str()),
             identity.map(|identity| identity.physical_attempt_id.as_str()),
             provider_request_id,
         );
-        // Replaces the existing phase emission: no extra event or lock.
+        // A provider-reported processing duration is not isolated inference or
+        // queue time. Preserve only a bounded numeric value, never raw headers.
+        response_start.provider_processing_us = headers
+            .and_then(|headers| headers.get("openai-processing-ms"))
+            .and_then(|value| value.to_str().ok())
+            .filter(|value| value.len() <= 64)
+            .and_then(|value| value.parse::<f64>().ok())
+            .and_then(|ms| Duration::try_from_secs_f64(ms / 1000.0).ok())
+            .and_then(|duration| u64::try_from(duration.as_micros()).ok())
+            .filter(|value| *value < u64::MAX);
+        if let Some(request) = self.model_request.as_ref() {
+            request.clock.record_response_start(&response_start);
+        }
+        // Reuse the existing phase event; retain its numeric receipt above.
         self.session_telemetry
             .record_transport_phase_with_response_start(
                 &self.logical_request_id,
@@ -7373,6 +7603,9 @@ impl SseTelemetry for ApiTelemetry {
                 None,
             )
         });
+        if let (Some(request), Some(response_start)) = (&self.model_request, &response_start) {
+            request.clock.record_response_start(response_start);
+        }
         self.session_telemetry.record_sse_phase_with_response_start(
             &self.logical_request_id,
             self.last_attempt.load(Ordering::Relaxed),

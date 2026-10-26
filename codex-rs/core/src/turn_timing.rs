@@ -689,6 +689,7 @@ impl TurnTimingSnapshot {
                         categories
                     });
                 TurnTimingModelRequest {
+                    stream_delivery_by_attempt: request.stream_delivery_by_attempt.clone(),
                     response_queue_timing_by_attempt: request
                         .response_queue_timing_by_attempt
                         .clone(),
@@ -997,6 +998,7 @@ pub(crate) struct TurnTimingProfile {
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct ModelRequestTiming {
+    stream_delivery_by_attempt: BTreeMap<String, String>,
     response_queue_timing_by_attempt:
         BTreeMap<String, BTreeMap<String, codex_protocol::timing::ResponseQueueTiming>>,
     setup_phases: Option<ClientCriticalPhaseTiming>,
@@ -2486,6 +2488,7 @@ impl TurnTimingState {
                 request.request_section_sha256_by_attempt.remove(&evicted);
                 request.response_id_by_attempt.remove(&evicted);
                 request.response_queue_timing_by_attempt.remove(&evicted);
+                request.stream_delivery_by_attempt.remove(&evicted);
                 detail_evicted = true;
             }
             request
@@ -3587,6 +3590,29 @@ impl TurnTimingState {
                 request_diagnostics_status = "unavailable",
                 "late model request diagnostics"
             );
+        }
+        state.refresh_completed_request_diagnostics();
+    }
+
+    pub(crate) fn record_model_stream_delivery(
+        &self,
+        sampling_request_id: &str,
+        physical_attempt_id: &str,
+        summary: &str,
+    ) {
+        // One constant-size summary per retained attempt. No new retention
+        // lifecycle, IO under the state lock, or model/transport work is added.
+        if summary.len() > 16 * 1024 {
+            return;
+        }
+        let mut state = self.state();
+        if let Some(request) = state.model_requests.iter_mut().find(|request| {
+            request.sampling_request_id.as_deref() == Some(sampling_request_id)
+                && request.physical_attempt_ids.iter().any(|id| id == physical_attempt_id)
+        }) {
+            request
+                .stream_delivery_by_attempt
+                .insert(physical_attempt_id.to_string(), summary.to_string());
         }
         state.refresh_completed_request_diagnostics();
     }
@@ -5272,6 +5298,8 @@ impl TurnTimingStateInner {
                     request.request_diagnostics_status = current.request_diagnostics_status;
                     request.response_queue_timing_by_attempt =
                         current.response_queue_timing_by_attempt.clone();
+                    request.stream_delivery_by_attempt =
+                        current.stream_delivery_by_attempt.clone();
                     request.fixed_prefix_reuse_eligible = current.fixed_prefix_reuse_eligible;
                     request.prompt_cache_key_fingerprint =
                         current.prompt_cache_key_fingerprint.clone();

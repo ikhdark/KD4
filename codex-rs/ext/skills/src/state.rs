@@ -805,7 +805,7 @@ mod tests {
             ..Default::default()
         };
         let cache = state.orchestrator_cache(None);
-        *cache.continued_catalog.lock().await = Some(continued.clone());
+        *cache.continued_catalog.lock().await = Some(Arc::new(continued.clone()));
 
         for _ in 0..2 {
             let preview = state
@@ -815,7 +815,7 @@ mod tests {
                 .await;
             assert_eq!(preview, continued);
         }
-        assert_eq!(cache.catalog.get(), Some(&Ok(initial)));
+        assert_eq!(cache.catalog.get(), Some(&Ok(Arc::new(initial))));
         assert_eq!(
             state
                 .orchestrator_catalog_snapshot(None, async {

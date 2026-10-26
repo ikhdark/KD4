@@ -279,8 +279,25 @@ async fn send_message_to_connection(
                 bytes: Arc::new(tokio::sync::Semaphore::new(STDIO_DELIVERY_BYTES)),
             }
         });
-        let bytes = match queued_message.encode_json(STDIO_DELIVERY_BYTES) {
-            Ok(bytes) => bytes.max(1) as u32,
+        let bytes = match queued_message.prepare_stdio_json(STDIO_DELIVERY_BYTES) {
+            Ok(bytes) => {
+                if bytes > STDIO_DELIVERY_BYTES {
+                    let (message_kind, request_id) = match &queued_message.message {
+                        OutgoingMessage::Response(response) => ("response", Some(&response.id)),
+                        OutgoingMessage::Error(error) => ("error", Some(&error.id)),
+                        OutgoingMessage::Request(_) => ("request", None),
+                        OutgoingMessage::AppServerNotification(_) => ("notification", None),
+                    };
+                    warn!(
+                        ?connection_id,
+                        message_kind,
+                        ?request_id,
+                        encoded_bytes = bytes,
+                        "streaming stdio output larger than the staging budget"
+                    );
+                }
+                bytes.clamp(1, STDIO_DELIVERY_BYTES) as u32
+            }
             Err(error) => {
                 warn!(?connection_id, %error, "failed to encode bounded stdio output");
                 return disconnect_connection(connections, connection_id);
@@ -288,6 +305,8 @@ async fn send_message_to_connection(
         };
         // Both admission waits remain interruptible. Credits stay attached to
         // the frame until its physical write completes, preserving the byte cap.
+        // A streamed frame reserves the entire budget so large frames cannot
+        // accumulate behind a slow writer or wait for impossible permit counts.
         let credit = tokio::select! {
             biased;
             _ = shutdown.cancelled() => None,

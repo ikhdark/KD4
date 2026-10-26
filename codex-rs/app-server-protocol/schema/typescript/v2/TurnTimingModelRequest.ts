@@ -13,6 +13,11 @@ import type { TurnTimingRequestTokenCategories } from "./TurnTimingRequestTokenC
 
 export type TurnTimingModelRequest = {
 /**
+ * Versioned content-free JSON delivery summaries by retained physical
+ * attempt. Chunks are decoded deltas, not individual provider tokens.
+ */
+streamDeliveryByAttempt?: { [key in string]?: string },
+/**
  * Host queue observations by physical attempt, then api_to_mapper or
  * mapper_to_turn stage. Missing stages are unknown, not zero. Queue sums
  * overlap provider work and each other; never subtract them from model wait

@@ -2583,6 +2583,16 @@ pub struct TurnTimingRequestTokenCategories {
     pub tool_schemas: u64,
     #[serde(default)]
     pub conversation_history: u64,
+    /// Serialized tool-result bytes in this request's full logical input,
+    /// including retained results. Subset of conversation_history; not transport bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub tool_output_serialized_bytes: Option<u64>,
+    /// Native tool-result token estimate for this request's full logical input,
+    /// including retained results. Subset of conversation_history; not provider usage.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub tool_output_tokens_estimate: Option<u64>,
     #[serde(default)]
     pub current_input: u64,
     #[serde(default)]
@@ -2664,6 +2674,10 @@ pub enum TurnTimingRequestDiagnosticsStatus {
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]
 pub struct TurnTimingModelRequest {
+    /// Versioned content-free JSON delivery summaries by retained physical
+    /// attempt. Chunks are decoded deltas, not individual provider tokens.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub stream_delivery_by_attempt: BTreeMap<String, String>,
     /// Host queue observations by physical attempt, then api_to_mapper or
     /// mapper_to_turn stage. Missing stages are unknown, not zero. Queue sums
     /// overlap provider work and each other; never subtract them from model wait
@@ -9332,12 +9346,19 @@ mod tests {
         .expect("historical request timing");
         assert!(historical.request_token_categories.is_none());
 
+        let legacy_categories: TurnTimingRequestTokenCategories =
+            serde_json::from_value(serde_json::json!({})).expect("historical prompt categories");
+        assert_eq!(legacy_categories.tool_output_serialized_bytes, None);
+        assert_eq!(legacy_categories.tool_output_tokens_estimate, None);
+
         let current = TurnTimingModelRequest {
             request_token_categories: Some(TurnTimingRequestTokenCategories {
                 accounting_basis: TurnTimingTokenCategoryBasis::FullLogicalPrompt,
                 base_instructions: 10,
                 tool_schemas: 20,
                 conversation_history: 30,
+                tool_output_serialized_bytes: Some(80),
+                tool_output_tokens_estimate: Some(20),
                 logical_total: 60,
                 local_input_estimate: 62,
                 local_reconciliation_residual: 2,
@@ -9354,6 +9375,8 @@ mod tests {
             "full_logical_prompt"
         );
         assert_eq!(value["requestTokenCategories"]["toolSchemas"], 20);
+        assert_eq!(value["requestTokenCategories"]["toolOutputSerializedBytes"], 80);
+        assert_eq!(value["requestTokenCategories"]["toolOutputTokensEstimate"], 20);
         assert_eq!(
             value["requestTokenCategories"]["providerReconciliationResidual"],
             4

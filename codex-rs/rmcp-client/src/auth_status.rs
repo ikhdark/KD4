@@ -843,19 +843,17 @@ mod tests {
         .unwrap()
         .with_buffered_responses();
 
-        rmcp::transport::auth::OAuthHttpClient::execute(
-            &client,
-            rmcp::transport::auth::OAuthHttpRequest {
-                request: oauth2::http::Request::builder()
+        client
+            .execute_request(
+                oauth2::http::Request::builder()
                     .uri(&url)
                     .body(Vec::new())
                     .unwrap(),
-                timeout: Some(Duration::from_millis(200)),
-                redirect_policy: rmcp::transport::auth::OAuthHttpRedirectPolicy::Follow,
-            },
-        )
-        .await
-        .expect_err("request should use its shorter timeout");
+                rmcp::transport::auth::OAuthHttpRedirectPolicy::Follow,
+                Some(Duration::from_millis(200)),
+            )
+            .await
+            .expect_err("request should use its shorter timeout");
         assert_eq!(
             tokio::time::timeout(Duration::from_secs(1), observed_header_rx.recv())
                 .await

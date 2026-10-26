@@ -13,6 +13,11 @@ pub enum CodexStatus {
 }
 
 pub(crate) trait EventProcessor {
+    /// Host observations only: neither hook acknowledges provider acceptance or client rendering.
+    fn record_turn_submission(&mut self) {}
+
+    fn record_server_notification_received(&mut self) {}
+
     /// Print summary of effective configuration and user prompt.
     fn print_config_summary(
         &mut self,

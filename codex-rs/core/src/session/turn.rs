@@ -1938,14 +1938,14 @@ fn validation_mode_base_instructions(turn: &TurnContext) -> Arc<BaseInstructions
             "OFF: No validation or validation-only continuation.",
         codex_protocol::validation::ValidationMode::Compile =>
             "COMPILE: Only task-authorized targeted compilation; no tests, formatting, or other validation.",
-        codex_protocol::validation::ValidationMode::Benchmark =>
-            "BENCHMARK: Only task-authorized targeted compilation and scoped, non-destructive performance-audit benchmarks; no tests, formatting, Clippy, or full builds. The base instructions define the default benchmark authorization and its restrictions.",
+        codex_protocol::validation::ValidationMode::FullHalf =>
+            "Full .5: Compile checks and all other task-authorized operations are allowed except tests, full suites, and non-compilation checks in any language. Do not create tests of any type, including new cases in existing files. Builds, formatting/editing, benchmarks, and KDA/KDR operations remain allowed unless they execute a prohibited workload. The base instructions define authorization, benchmark routing, and restrictions.",
         codex_protocol::validation::ValidationMode::Full =>
-            "FULL: Only task-authorized validation within the configured attempt budget.",
+            "FULL: Only task-authorized validation using existing tests; do not create tests of any type. The configured runtime/tooling attempt budget excludes targeted compilation.",
     };
     let mut instructions = (*turn.base_instructions).clone();
     instructions.text.push_str(&format!(
-        "\n\n<validation_mode>\n{directive}\nFollow the base instructions for validation authorization, retry, evidence, and completion rules.\nAttempt limit: {}. A limit is not permission to validate; explicit user restrictions still apply. Consume already-running work through its owner without launching duplicates.\n</validation_mode>",
+        "\n\n<validation_mode>\n{directive}\nFollow the base instructions for validation authorization, retry, evidence, and completion rules.\nRuntime/tooling attempt limit: {} (compilation excluded). When compilation is authorized, repair recompiles have no fixed attempt limit but require changed relevant inputs. A limit is not permission to validate; explicit user restrictions still apply. Consume already-running work through its owner without launching duplicates.\n</validation_mode>",
         validation_attempt_limit(turn),
     ));
     Arc::new(instructions)
@@ -1961,8 +1961,8 @@ mod validation_mode_prompt_tests {
         turn.validation_full_budget = 3;
         for (mode, expected, limit) in [
             (codex_protocol::validation::ValidationMode::Off, "OFF:", 0),
-            (codex_protocol::validation::ValidationMode::Compile, "COMPILE:", 2),
-            (codex_protocol::validation::ValidationMode::Benchmark, "BENCHMARK:", 3),
+            (codex_protocol::validation::ValidationMode::Compile, "COMPILE:", 0),
+            (codex_protocol::validation::ValidationMode::FullHalf, "Full .5:", 3),
             (codex_protocol::validation::ValidationMode::Full, "FULL:", 3),
         ] {
             turn.validation_mode = mode;
@@ -1970,13 +1970,19 @@ mod validation_mode_prompt_tests {
             assert!(instructions.text.starts_with(&turn.base_instructions.text));
             assert_eq!(instructions.text.matches("<validation_mode>").count(), 1);
             assert!(instructions.text.contains(expected));
-            assert!(instructions.text.contains(&format!("Attempt limit: {limit}.")));
+            assert!(instructions.text.contains(&format!("Runtime/tooling attempt limit: {limit} (compilation excluded).")));
+            assert!(instructions.text.contains("repair recompiles have no fixed attempt limit"));
             let overlay = instructions.text.strip_prefix(&turn.base_instructions.text).unwrap();
             assert!(overlay.contains("Follow the base instructions for validation authorization, retry, evidence, and completion rules."));
             assert!(!overlay.contains("perform one targeted cargo check"));
             assert!(!overlay.contains("test authoring requires an explicit user request"));
             if mode == codex_protocol::validation::ValidationMode::Compile {
                 assert!(overlay.contains("Only task-authorized targeted compilation"));
+            }
+            if mode == codex_protocol::validation::ValidationMode::FullHalf {
+                assert!(overlay.contains("Compile checks"));
+                assert!(overlay.contains("tests, full suites, and non-compilation checks in any language"));
+                assert!(overlay.contains("KDA/KDR operations remain allowed unless they execute a prohibited workload"));
             }
         }
     }

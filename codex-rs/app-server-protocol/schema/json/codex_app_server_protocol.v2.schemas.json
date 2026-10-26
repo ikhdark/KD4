@@ -21041,6 +21041,13 @@
           "description": "Named setup-phase union durations in nanoseconds, frozen at dispatch. Measured from request preparation (or attempt start for retries), not cumulative across the turn. Phases can overlap and must not be summed. Empty for older records or attempts that never dispatched.",
           "type": "object"
         },
+        "streamDeliveryByAttempt": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "description": "Versioned content-free JSON delivery summaries by retained physical attempt. Chunks are decoded deltas, not individual provider tokens.",
+          "type": "object"
+        },
         "tokenUsage": {
           "anyOf": [
             {
@@ -21369,6 +21376,24 @@
           "format": "uint64",
           "minimum": 0.0,
           "type": "integer"
+        },
+        "toolOutputSerializedBytes": {
+          "description": "Serialized tool-result bytes in this request's full logical input, including retained results. Subset of conversation_history; not transport bytes.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "toolOutputTokensEstimate": {
+          "description": "Native tool-result token estimate for this request's full logical input, including retained results. Subset of conversation_history; not provider usage.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
         },
         "toolSchemas": {
           "default": 0,

@@ -65,7 +65,8 @@ async fn full_untyped_no_recovery_projection_fits_once_and_is_equivalent() {
     );
     let input = ModelProjectionInput {
         fragments: vec![],
-        spillable_text: text.clone(),
+        non_text_tokens: 0,
+        non_text_bytes: 0,
         outcome: ToolOutputOutcome::Success,
         essential_inline: serde_json::json!({"exit_code": 0}),
         origin_call_id: "fixture".into(),
@@ -1466,7 +1467,8 @@ async fn projection_source_dependency_decision_records_reuse_and_fallback() {
     let canonical = CanonicalToolResult::text(output.clone());
     let projection = project_model_output(ModelProjectionInput {
         fragments: Vec::new(),
-        spillable_text: output.clone(),
+        non_text_tokens: 0,
+        non_text_bytes: 0,
         outcome: ToolOutputOutcome::Success,
         essential_inline: serde_json::json!({}),
         origin_call_id: "source-dependencies-call".to_string(),
@@ -1719,7 +1721,8 @@ async fn structured_projection_artifact_recovers_original_bytes() {
 
     let projection = project_model_output(ModelProjectionInput {
         fragments: Vec::new(),
-        spillable_text: full_output.clone(),
+        non_text_tokens: 0,
+        non_text_bytes: 0,
         outcome: ToolOutputOutcome::Failure,
         essential_inline: serde_json::json!({"coverage_status": "partial"}),
         origin_call_id: "structured-call".to_string(),
@@ -1787,7 +1790,8 @@ async fn canonical_projection_reuses_existing_artifact_id() {
 
     let projection = project_model_output(ModelProjectionInput {
         fragments: Vec::new(),
-        spillable_text: full_output.clone(),
+        non_text_tokens: 0,
+        non_text_bytes: 0,
         outcome: ToolOutputOutcome::Success,
         essential_inline: serde_json::json!({
             "raw_output_artifact_id": artifact_id,
@@ -2004,7 +2008,8 @@ async fn projection_owner_recovery_drains_exact_json_pointer_in_original_return(
     let canonical = CanonicalToolResult::json(value.clone());
     let projection = project_model_output(ModelProjectionInput {
         fragments: Vec::new(),
-        spillable_text: value.to_string(),
+        non_text_tokens: 0,
+        non_text_bytes: 0,
         outcome: ToolOutputOutcome::Success,
         essential_inline: serde_json::json!({"summary": "bounded"}),
         origin_call_id: "json-pointer-call".to_string(),
@@ -2095,7 +2100,8 @@ async fn one_predetermined_range_is_recovered_in_the_original_return() {
     }];
     let projection = project_model_output(ModelProjectionInput {
         fragments: Vec::new(),
-        spillable_text: full_output.clone(),
+        non_text_tokens: 0,
+        non_text_bytes: 0,
         outcome: ToolOutputOutcome::Success,
         essential_inline: serde_json::json!({}),
         origin_call_id: "single-predetermined-call".to_string(),
@@ -2207,7 +2213,8 @@ async fn three_predetermined_artifact_ranges_are_drained_in_original_return() {
     let original_output_tokens = canonical.approximate_tokens;
     let projection = project_model_output(ModelProjectionInput {
         fragments: Vec::new(),
-        spillable_text: full_output.clone(),
+        non_text_tokens: 0,
+        non_text_bytes: 0,
         outcome: ToolOutputOutcome::Success,
         essential_inline: serde_json::json!({}),
         origin_call_id: "predetermined-call".to_string(),
@@ -2320,7 +2327,8 @@ async fn small_code_mode_owner_result_uses_artifact_free_inline_carrier() {
     let canonical = CanonicalToolResult::text(outer_text.clone());
     let mut projection = project_model_output(ModelProjectionInput {
         fragments: Vec::new(),
-        spillable_text: outer_text.clone(),
+        non_text_tokens: 0,
+        non_text_bytes: 0,
         outcome: ToolOutputOutcome::Success,
         essential_inline: serde_json::json!({}),
         origin_call_id: "outer-call".to_string(),
@@ -2470,7 +2478,8 @@ async fn projection_owner_recovery_mixed_selectors_survive_code_mode_continuatio
     let inner_text = String::from_utf8(inner_canonical.bytes.clone()).expect("canonical JSON text");
     let inner_projection = project_model_output(ModelProjectionInput {
         fragments: Vec::new(),
-        spillable_text: inner_text.clone(),
+        non_text_tokens: 0,
+        non_text_bytes: 0,
         outcome: ToolOutputOutcome::Success,
         essential_inline: serde_json::json!({}),
         origin_call_id: "nested-call".to_string(),
@@ -2581,7 +2590,8 @@ async fn projection_owner_recovery_mixed_selectors_survive_code_mode_continuatio
     let outer_canonical = CanonicalToolResult::text(outer_text.clone());
     let outer_projection = project_model_output(ModelProjectionInput {
         fragments: Vec::new(),
-        spillable_text: outer_text.clone(),
+        non_text_tokens: 0,
+        non_text_bytes: 0,
         outcome: ToolOutputOutcome::Success,
         essential_inline: serde_json::json!({}),
         origin_call_id: "outer-call".to_string(),
@@ -2693,7 +2703,8 @@ async fn fresh_corpus_replays_real_producer_handler_and_functions_exec_carrier()
     let outer_canonical = CanonicalToolResult::text(outer_text.clone());
     let mut outer_projection = project_model_output(ModelProjectionInput {
         fragments: Vec::new(),
-        spillable_text: outer_text.clone(),
+        non_text_tokens: 0,
+        non_text_bytes: 0,
         outcome: ToolOutputOutcome::Success,
         essential_inline: serde_json::json!({}),
         origin_call_id: "fresh-functions-exec".to_string(),
@@ -4980,7 +4991,8 @@ async fn admission_only_projection_preserves_original_response_and_registers_can
         let invocation_sha256 = crate::tool_history::sha256(b"normalized invocation");
         let projection = project_model_output(ModelProjectionInput {
             fragments: Vec::new(),
-            spillable_text: output.clone(),
+            non_text_tokens: 0,
+            non_text_bytes: 0,
             outcome,
             essential_inline: serde_json::json!({}),
             origin_call_id: call_id,
@@ -5073,7 +5085,8 @@ async fn admission_only_projection_names_the_artifact_for_truncated_code_mode_ou
         serde_json::json!({"kind":"lines","start":2,"end":399});
     let projection = project_model_output(ModelProjectionInput {
         fragments: Vec::new(),
-        spillable_text: canonical_text.clone(),
+        non_text_tokens: 0,
+        non_text_bytes: 0,
         outcome: ToolOutputOutcome::Success,
         essential_inline,
         origin_call_id: "exec-call".to_string(),
@@ -5197,7 +5210,8 @@ async fn truncated_cell_recovery_pages_each_fit_a_default_cell() {
         serde_json::json!({"kind":"lines","start":2,"end":4999});
     let projection = project_model_output(ModelProjectionInput {
         fragments: Vec::new(),
-        spillable_text: canonical_text.clone(),
+        non_text_tokens: 0,
+        non_text_bytes: 0,
         outcome: ToolOutputOutcome::Success,
         essential_inline,
         origin_call_id: "exec-call".to_string(),
@@ -5325,7 +5339,8 @@ async fn admission_only_storage_failure(visible_output_truncated: bool) {
 
     let projection = project_model_output(ModelProjectionInput {
         fragments: Vec::new(),
-        spillable_text: output.clone(),
+        non_text_tokens: 0,
+        non_text_bytes: 0,
         outcome: ToolOutputOutcome::Success,
         essential_inline: serde_json::json!({
             (crate::tools::code_mode::VISIBLE_OUTPUT_TRUNCATED_KEY): visible_output_truncated,

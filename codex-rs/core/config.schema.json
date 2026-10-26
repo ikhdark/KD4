@@ -3512,7 +3512,7 @@
       "enum": [
         "off",
         "compile",
-        "benchmark",
+        "full.5",
         "full"
       ],
       "type": "string"
@@ -4288,7 +4288,7 @@
       "description": "Collection of settings that are specific to the TUI."
     },
     "validation_full_budget": {
-      "description": "Maximum BENCHMARK/FULL validation attempts per root turn, including children. Defaults to 2.",
+      "description": "Maximum Full .5/FULL runtime/tooling validation attempts per root turn, including children; targeted compilation is excluded. Defaults to 2.",
       "format": "uint",
       "minimum": 0.0,
       "type": "integer"
@@ -4299,7 +4299,7 @@
           "$ref": "#/definitions/ValidationMode"
         }
       ],
-      "description": "Default validation execution policy. Defaults to `benchmark` (targeted compilation and benchmark-only workloads, not tests)."
+      "description": "Default validation execution policy. Defaults to `full.5` (Full .5): compile checks and other operations are allowed, but tests, full suites, and non-compilation checks in any language are not. Legacy `benchmark` settings remain accepted."
     },
     "web_search": {
       "allOf": [

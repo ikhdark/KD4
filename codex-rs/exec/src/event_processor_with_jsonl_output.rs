@@ -74,6 +74,38 @@ pub struct EventProcessorWithJsonOutput {
     output_error: Option<std::io::Error>,
     emit_final_message_on_shutdown: bool,
     terminal_emitted: bool,
+    processor_started_at_ns: Option<u64>,
+    request_submitted_at_ns: Option<u64>,
+    notification_received_at_ns: Option<u64>,
+    observation_thread_id: Option<String>,
+    observation_turn_id: Option<String>,
+}
+
+/// Additive JSONL metadata, not a new lifecycle event or a core timing mutation.
+/// Emission starts before serialization/stdout write; it is NOT a flush, read, or render receipt.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ClientObservation<'a> {
+    schema_version: u8,
+    clock_domain_id: &'static str,
+    thread_id: Option<&'a str>,
+    turn_id: Option<&'a str>,
+    processor_started_at_ns: Option<u64>,
+    request_submitted_at_ns: Option<u64>,
+    notification_received_at_ns: Option<u64>,
+    emission_started_at_ns: Option<u64>,
+}
+
+#[derive(serde::Serialize)]
+struct ObservedThreadEvent<'a> {
+    #[serde(flatten)]
+    event: &'a ThreadEvent,
+    #[serde(rename = "clientObservation")]
+    observation: ClientObservation<'a>,
+}
+
+fn observation_time_ns() -> Option<u64> {
+    u64::try_from(codex_protocol::timing::process_monotonic_ns()).ok()
 }
 
 #[derive(Debug, Clone)]
@@ -104,6 +136,11 @@ impl EventProcessorWithJsonOutput {
             output_error: None,
             emit_final_message_on_shutdown: false,
             terminal_emitted: false,
+            processor_started_at_ns: observation_time_ns(),
+            request_submitted_at_ns: None,
+            notification_received_at_ns: None,
+            observation_thread_id: None,
+            observation_turn_id: None,
         }
     }
 
@@ -119,7 +156,27 @@ impl EventProcessorWithJsonOutput {
         if self.output_error.is_some() {
             return;
         }
-        let result = serde_json::to_string(&event)
+        // Bound telemetry to lifecycle/error records, not every streamed delta.
+        let serialized = if matches!(&event, ThreadEvent::ThreadStarted(_)
+            | ThreadEvent::TurnStarted(_) | ThreadEvent::TurnCompleted(_)
+            | ThreadEvent::TurnFailed(_) | ThreadEvent::Error(_)) {
+            serde_json::to_string(&ObservedThreadEvent {
+                event: &event,
+                observation: ClientObservation {
+                    schema_version: 1,
+                    clock_domain_id: codex_protocol::timing::process_clock_domain_id(),
+                    thread_id: self.observation_thread_id.as_deref(),
+                    turn_id: self.observation_turn_id.as_deref(),
+                    processor_started_at_ns: self.processor_started_at_ns,
+                    request_submitted_at_ns: self.request_submitted_at_ns,
+                    notification_received_at_ns: self.notification_received_at_ns,
+                    emission_started_at_ns: observation_time_ns(),
+                },
+            })
+        } else {
+            serde_json::to_string(&event)
+        };
+        let result = serialized
             .map_err(std::io::Error::other)
             .and_then(|record| writeln!(self.output, "{record}"));
         if let Err(error) = result {
@@ -854,6 +911,16 @@ fn bounded_progress_text(mut text: String) -> (String, bool) {
 }
 
 impl EventProcessor for EventProcessorWithJsonOutput {
+    fn record_turn_submission(&mut self) {
+        self.request_submitted_at_ns = observation_time_ns();
+        self.notification_received_at_ns = None;
+        self.observation_turn_id = None;
+    }
+
+    fn record_server_notification_received(&mut self) {
+        self.notification_received_at_ns = observation_time_ns();
+    }
+
     fn take_output_error(&mut self) -> Option<std::io::Error> {
         self.output_error.take()
     }
@@ -864,10 +931,22 @@ impl EventProcessor for EventProcessorWithJsonOutput {
         _: &str,
         session_configured: &SessionConfiguredEvent,
     ) {
+        self.observation_thread_id = Some(session_configured.thread_id.to_string());
         self.emit(Self::thread_started_event(session_configured));
     }
 
     fn process_server_notification(&mut self, notification: ServerNotification) -> CodexStatus {
+        match &notification {
+            ServerNotification::TurnStarted(payload) => {
+                self.observation_thread_id = Some(payload.thread_id.clone());
+                self.observation_turn_id = Some(payload.turn.id.clone());
+            }
+            ServerNotification::TurnCompleted(payload) => {
+                self.observation_thread_id = Some(payload.thread_id.clone());
+                self.observation_turn_id = Some(payload.turn.id.clone());
+            }
+            _ => {}
+        }
         let collected = self.collect_thread_events(notification);
         for event in collected.events {
             self.emit(event);
@@ -882,6 +961,7 @@ impl EventProcessor for EventProcessorWithJsonOutput {
     }
 
     fn process_warning(&mut self, message: String) -> CodexStatus {
+        self.notification_received_at_ns = None;
         let collected = self.collect_warning(message);
         for event in collected.events {
             self.emit(event);
@@ -890,6 +970,7 @@ impl EventProcessor for EventProcessorWithJsonOutput {
     }
 
     fn process_event_stream_error(&mut self, message: String) {
+        self.notification_received_at_ns = None;
         for event in self.collect_event_stream_error(message) {
             self.emit(event);
         }
@@ -908,6 +989,7 @@ impl EventProcessor for EventProcessorWithJsonOutput {
     }
 
     fn process_invocation_error(&mut self, message: String) {
+        self.notification_received_at_ns = None;
         self.emit(ThreadEvent::Error(ThreadErrorEvent {
             message,
             code: Some("session_persistence_unconfirmed".to_string()),

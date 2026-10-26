@@ -11,7 +11,7 @@ async fn cumulative_raw_identity_does_not_suppress_a_suffix_or_capped_packet() {
         canonical.complete = !incomplete_packet;
         let text = "process result and bounded useful suffix".to_string();
         let projection = project_model_output(ModelProjectionInput {
-            fragments:vec![], spillable_text:text.clone(), outcome:ToolOutputOutcome::Success,
+            fragments:vec![], non_text_tokens:0, non_text_bytes:0, outcome:ToolOutputOutcome::Success,
             essential_inline:serde_json::json!({"raw_output_artifact_id":raw_id,"session_id":42,"exit_code":0}),
             origin_call_id:"poll".into(), selection_facts:ProjectionSelectionFacts {
                 mode:"all", available_fragments:0, selected_fragments:0, exact_duplicates_removed:0,

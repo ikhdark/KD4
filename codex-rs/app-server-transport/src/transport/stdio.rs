@@ -3,6 +3,7 @@ use super::ConnectionOrigin;
 use super::TransportEvent;
 use super::enqueue_incoming_message;
 use super::next_connection_id;
+use crate::outgoing_message::OutgoingMessage;
 use crate::outgoing_message::QueuedOutgoingMessage;
 use codex_app_server_protocol::InitializeParams;
 use codex_app_server_protocol::JSONRPCMessage;
@@ -30,6 +31,7 @@ const MAX_STDIN_LINE_BYTES: usize = 32 * 1024 * 1024;
 const STDIN_READ_AHEAD: usize = 1;
 const MAX_STDOUT_BATCH_MESSAGES: usize = 64;
 const STDOUT_BATCH_TARGET_BYTES: usize = 64 * 1024;
+const STDOUT_STREAM_CHUNK_BYTES: usize = 64 * 1024;
 
 pub async fn start_stdio_connection(
     transport_event_tx: mpsc::Sender<TransportEvent>,
@@ -349,14 +351,56 @@ where
     let connection_closed_for_writer = Arc::clone(&connection_closed);
     stdio_handles.push(tokio::spawn(async move {
         let mut batch = Vec::new();
+        let mut pending_message = None;
         'writer: loop {
-            let queued_message = tokio::select! {
-                _ = cancellation_for_writer.cancelled() => break,
-                queued_message = writer_rx.recv() => queued_message,
+            let queued_message = if pending_message.is_some() {
+                pending_message.take()
+            } else {
+                tokio::select! {
+                    _ = cancellation_for_writer.cancelled() => break,
+                    queued_message = writer_rx.recv() => queued_message,
+                }
             };
             let Some(mut queued_message) = queued_message else {
                 break;
             };
+            if let Some(streamed_len) = queued_message
+                .encoded_json
+                .as_ref()
+                .and_then(|encoded| encoded.streamed_len)
+            {
+                // Hold the exclusive admission credit through the physical
+                // write/flush. Never mix a streamed frame into a buffered batch.
+                let encoded = queued_message.encoded_json.take();
+                batch = Vec::new();
+                let write_result = tokio::select! {
+                    _ = cancellation_for_writer.cancelled() => break 'writer,
+                    result = write_streamed_message(
+                        &mut stdout,
+                        queued_message.message,
+                        streamed_len,
+                    ) => result,
+                };
+                if let Err(err) = write_result {
+                    error!("Failed to stream outgoing message to stdout: {err}");
+                    break;
+                }
+                if queued_message.write_complete_tx.is_some() {
+                    let flush_result = tokio::select! {
+                        _ = cancellation_for_writer.cancelled() => break 'writer,
+                        result = stdout.flush() => result,
+                    };
+                    if let Err(err) = flush_result {
+                        error!("Failed to flush stdout: {err}");
+                        break;
+                    }
+                }
+                drop(encoded);
+                if let Some(write_complete_tx) = queued_message.write_complete_tx {
+                    let _ = write_complete_tx.send(std::time::Instant::now());
+                }
+                continue;
+            }
             batch.clear();
             let mut byte_credits = Vec::new();
             let mut write_complete_tx = None;
@@ -388,6 +432,15 @@ where
                     break;
                 }
                 match writer_rx.try_recv() {
+                    Ok(next)
+                        if next
+                            .encoded_json
+                            .as_ref()
+                            .is_some_and(|encoded| encoded.streamed_len.is_some()) =>
+                    {
+                        pending_message = Some(next);
+                        break;
+                    }
                     Ok(next) => queued_message = next,
                     Err(_) => break,
                 }
@@ -432,6 +485,85 @@ where
     }));
 
     Ok(())
+}
+
+async fn write_streamed_message<W: AsyncWrite + Unpin>(
+    stdout: &mut W,
+    message: OutgoingMessage,
+    expected_len: usize,
+) -> IoResult<()> {
+    struct ChunkWriter {
+        sender: mpsc::Sender<IoResult<Vec<u8>>>,
+        buffer: Vec<u8>,
+    }
+
+    impl std::io::Write for ChunkWriter {
+        fn write(&mut self, mut bytes: &[u8]) -> IoResult<usize> {
+            let len = bytes.len();
+            while !bytes.is_empty() {
+                let count = bytes.len().min(STDOUT_STREAM_CHUNK_BYTES - self.buffer.len());
+                self.buffer.extend_from_slice(&bytes[..count]);
+                bytes = &bytes[count..];
+                if self.buffer.len() == STDOUT_STREAM_CHUNK_BYTES {
+                    self.flush()?;
+                }
+            }
+            Ok(len)
+        }
+
+        fn flush(&mut self) -> IoResult<()> {
+            if !self.buffer.is_empty() {
+                let chunk = std::mem::replace(
+                    &mut self.buffer,
+                    Vec::with_capacity(STDOUT_STREAM_CHUNK_BYTES),
+                );
+                self.sender.blocking_send(Ok(chunk)).map_err(|_| {
+                    std::io::Error::new(ErrorKind::BrokenPipe, "stdio streaming cancelled")
+                })?;
+            }
+            Ok(())
+        }
+    }
+
+    // serde's writer is synchronous. A single frame-owned native worker and
+    // one queued chunk keep blocking serialization off the async runtime. When
+    // cancellation drops the receiver, even a backpressured worker can exit;
+    // it is not a Tokio blocking task that runtime shutdown must wait for.
+    let (sender, mut chunks) = mpsc::channel(1);
+    std::thread::Builder::new()
+        .name("codex-app-server-json".to_string())
+        .spawn(move || {
+            let mut writer = ChunkWriter {
+                sender,
+                buffer: Vec::with_capacity(STDOUT_STREAM_CHUNK_BYTES),
+            };
+            let result = serde_json::to_writer(&mut writer, &message)
+                .map_err(std::io::Error::other)
+                .and_then(|()| std::io::Write::flush(&mut writer));
+            if let Err(error) = result {
+                let _ = writer.sender.blocking_send(Err(error));
+            }
+        })?;
+
+    let mut remaining = expected_len;
+    while let Some(chunk) = chunks.recv().await {
+        let chunk = chunk?;
+        if chunk.len() > remaining {
+            return Err(std::io::Error::new(
+                ErrorKind::InvalidData,
+                "streamed stdio message exceeded its validated length",
+            ));
+        }
+        stdout.write_all(&chunk).await?;
+        remaining -= chunk.len();
+    }
+    if remaining != 0 {
+        return Err(std::io::Error::new(
+            ErrorKind::UnexpectedEof,
+            "streamed stdio message ended before its validated length",
+        ));
+    }
+    stdout.write_all(b"\n").await
 }
 
 async fn close_stdio_connection(

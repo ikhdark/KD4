@@ -2026,6 +2026,54 @@ fn history_test_provenance(request: &ResponsesApiRequest) -> PromptProvenanceSid
 }
 
 #[test]
+fn request_tool_output_telemetry_tracks_retained_and_removed_results() {
+    let output = history_test_tool_output("result", "retained tool result");
+    let expected_bytes = u64::try_from(serde_json::to_vec(&output).unwrap().len()).unwrap();
+    let request = history_test_request(vec![
+        output.clone(),
+        history_test_item("first task", Some("turn-1")),
+    ]);
+    let first = ModelRequestMeasurements::for_responses_request(
+        &request,
+        &history_test_provenance(&request),
+        &request.instructions,
+    )
+    .unwrap()
+    .request_token_categories();
+    assert_eq!(first.tool_output_serialized_bytes, Some(expected_bytes));
+    assert!(first.tool_output_tokens_estimate.is_some_and(|tokens| tokens > 0));
+    assert!(first.tool_output_tokens_estimate.unwrap() <= first.conversation_history);
+
+    let request = history_test_request(vec![
+        output,
+        history_test_item("second task", Some("turn-2")),
+    ]);
+    let retained = ModelRequestMeasurements::for_responses_request(
+        &request,
+        &history_test_provenance(&request),
+        &request.instructions,
+    )
+    .unwrap()
+    .request_token_categories();
+    assert_eq!(retained.tool_output_serialized_bytes, Some(expected_bytes));
+    assert_eq!(retained.tool_output_tokens_estimate, first.tool_output_tokens_estimate);
+
+    let request = history_test_request(vec![history_test_item("no result", Some("turn-3"))]);
+    let empty = ModelRequestMeasurements::for_responses_request(
+        &request,
+        &history_test_provenance(&request),
+        &request.instructions,
+    )
+    .unwrap()
+    .request_token_categories();
+    assert_eq!(empty.tool_output_serialized_bytes, Some(0));
+    assert_eq!(empty.tool_output_tokens_estimate, Some(0));
+    let unavailable = ModelRequestMeasurements::default().request_token_categories();
+    assert_eq!(unavailable.tool_output_serialized_bytes, None);
+    assert_eq!(unavailable.tool_output_tokens_estimate, None);
+}
+
+#[test]
 fn model_attempt_ids_are_opaque_per_lifecycle_not_content_derived() {
     let sensitive_payload = "UNIQUE_PROMPT_SENTINEL_42";
     let sampling_request_id = new_sampling_request_id();

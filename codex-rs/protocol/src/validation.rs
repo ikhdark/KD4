@@ -11,11 +11,13 @@ pub enum ValidationMode {
     Off,
     Compile,
     #[default]
-    Benchmark,
+    #[serde(rename = "full.5", alias = "benchmark")]
+    #[ts(rename = "full.5")]
+    FullHalf,
     Full,
 }
 
-/// Maximum admitted BENCHMARK/FULL validation attempts in one root turn, including its children.
+/// Maximum admitted Full .5/FULL runtime/tooling validation attempts in one root turn, including its children; excludes targeted compilation.
 pub const DEFAULT_VALIDATION_FULL_BUDGET: usize = 2;
 
 impl ValidationMode {
@@ -28,7 +30,7 @@ impl ValidationMode {
         match first_line {
             "/validation off" => Some(Self::Off),
             "/validation compile" => Some(Self::Compile),
-            "/validation benchmark" => Some(Self::Benchmark),
+            "/validation full.5" | "/validation full .5" | "/validation benchmark" => Some(Self::FullHalf),
             "/validation full" => Some(Self::Full),
             _ => None,
         }
@@ -214,21 +216,25 @@ mod tests {
 
     #[test]
     fn validation_mode_defaults_and_wire_values_are_exact() {
-        assert_eq!(ValidationMode::default(), ValidationMode::Benchmark);
+        assert_eq!(ValidationMode::default(), ValidationMode::FullHalf);
         for (mode, wire) in [
             (ValidationMode::Off, "off"),
             (ValidationMode::Compile, "compile"),
-            (ValidationMode::Benchmark, "benchmark"),
+            (ValidationMode::FullHalf, "full.5"),
             (ValidationMode::Full, "full"),
         ] {
             assert_eq!(serde_json::to_value(mode).unwrap(), json!(wire));
             assert_eq!(serde_json::from_value::<ValidationMode>(json!(wire)).unwrap(), mode);
         }
         assert!(serde_json::from_value::<ValidationMode>(json!("Full")).is_err());
+        assert_eq!(serde_json::from_value::<ValidationMode>(json!("benchmark")).unwrap(), ValidationMode::FullHalf);
     }
 
     #[test]
     fn validation_command_requires_an_exact_first_line() {
+        for command in ["/validation full.5", "/validation full .5", "/validation benchmark"] {
+            assert_eq!(ValidationMode::from_user_command(command), Some(ValidationMode::FullHalf));
+        }
         assert_eq!(
             ValidationMode::from_user_command("/validation off"),
             Some(ValidationMode::Off)

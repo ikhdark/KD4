@@ -277,13 +277,19 @@ pub enum ValidationPolicyClassification {
     ReadOnly,
     TargetedCompilation,
     Benchmark,
+    /// Other tooling operations; this is admission classification, not receipt proof.
+    Tooling,
+    /// Test execution and full-suite runners, in any language.
+    Tests,
+    /// Non-compilation checks, including diagnostic-only lint/format/schema checks.
+    Checks,
     Restricted,
     Opaque,
 }
 
 impl ValidationPolicyClassification {
     pub fn is_validation(self) -> bool {
-        matches!(self, Self::TargetedCompilation | Self::Benchmark | Self::Restricted)
+        matches!(self, Self::TargetedCompilation | Self::Benchmark | Self::Tooling | Self::Tests | Self::Checks | Self::Restricted)
     }
 
     pub fn is_compile_eligible(self) -> bool {
@@ -296,14 +302,18 @@ fn combine_policy_classifications(
 ) -> ValidationPolicyClassification {
     use ValidationPolicyClassification as Policy;
     classifications.into_iter().reduce(|left, right| {
-        // Benchmark permission must not cover an unclassified sibling workload.
-        if (left == Policy::Benchmark && matches!(right, Policy::Opaque | Policy::Unrelated))
-            || (right == Policy::Benchmark && matches!(left, Policy::Opaque | Policy::Unrelated))
+        // Preserve prohibited work even beside opaque, benchmark or tooling leaves.
+        for prohibited in [Policy::Tests, Policy::Checks] {
+            if left == prohibited || right == prohibited { return prohibited; }
+        }
+        // Benchmark/tooling permission must not cover an unclassified sibling workload.
+        if (matches!(left, Policy::Benchmark | Policy::Tooling) && matches!(right, Policy::Opaque | Policy::Unrelated))
+            || (matches!(right, Policy::Benchmark | Policy::Tooling) && matches!(left, Policy::Opaque | Policy::Unrelated))
         {
             return Policy::Restricted;
         }
         // Never lose a recognized prohibited command behind an opaque sibling.
-        for candidate in [Policy::Restricted, Policy::Benchmark, Policy::TargetedCompilation, Policy::Opaque, Policy::ReadOnly] {
+        for candidate in [Policy::Restricted, Policy::Benchmark, Policy::Tooling, Policy::TargetedCompilation, Policy::Opaque, Policy::ReadOnly] {
             if left == candidate || right == candidate {
                 return candidate;
             }
@@ -933,13 +943,23 @@ fn option_flags<'a>(args: &'a [String], value_options: &[&str]) -> Vec<&'a str> 
 
 /// Resolve only an interpreter's actual script operand, never `-c` program data.
 pub fn python_script_index(args: &[String]) -> Option<usize> {
+    python_operand_index(args, false)
+}
+
+fn python_operand_index(args: &[String], module: bool) -> Option<usize> {
     let mut index = 0;
     while let Some(arg) = args.get(index) {
-        if arg == "--" {
+        if module && arg == "-m" {
             return args.get(index + 1).map(|_| index + 1);
         }
-        if !arg.starts_with('-') {
+        if module && arg.starts_with("-m") && arg.len() > 2 {
             return Some(index);
+        }
+        if arg == "--" {
+            return args.get(index + 1).and_then(|_| (!module).then_some(index + 1));
+        }
+        if !arg.starts_with('-') {
+            return (!module).then_some(index);
         }
         if matches!(arg.as_str(), "-W" | "-X" | "--check-hash-based-pycs") {
             index += 2;
@@ -2243,6 +2263,20 @@ fn policy_argv_inner(
     if binary == "just" {
         return policy_just(args, runners, depth, leaves);
     }
+    if matches!(binary.as_str(), "npx" | "bunx") {
+        let mut index = 0;
+        while let Some(arg) = args.get(index) {
+            if matches!(arg.as_str(), "--package" | "-p") { index += 2; }
+            else if matches!(arg.as_str(), "--call" | "-c") {
+                return args.get(index + 1).map_or(Policy::Opaque, |script| policy_script(script, runners, false, depth + 1, leaves));
+            } else if arg.starts_with('-') { index += 1; }
+            else {
+                let program = arg.split_once('@').filter(|(name, _)| !name.is_empty()).map_or(arg.as_str(), |(name, _)| name);
+                return policy_argv(program, &args[index + 1..], runners, depth + 1, leaves);
+            }
+        }
+        return Policy::Opaque;
+    }
     if matches!(binary.as_str(), "npm" | "pnpm" | "yarn")
         && let Some(index) = node_command_index(&binary, args)
         && args[index] == "exec"
@@ -2290,6 +2324,29 @@ fn policy_argv_inner(
     if binary == "cargo" {
         return policy_cargo(args);
     }
+    if let Some(subcommand) = binary.strip_prefix("cargo-")
+        .filter(|subcommand| matches!(*subcommand, "nextest" | "llvm-cov" | "miri"))
+    {
+        let tail = if args.first().is_some_and(|arg| arg == subcommand) { &args[1..] } else { args };
+        return policy_cargo(&std::iter::once(subcommand.to_owned()).chain(tail.iter().cloned()).collect::<Vec<_>>());
+    }
+    if matches!(binary.as_str(), "cargo-kda" | "kda") {
+        return policy_kda(args);
+    }
+    if matches!(binary.as_str(), "kdr" | "rolloutdetect") {
+        return policy_kdr(args);
+    }
+    if is_python_launcher(&binary) && !python_interactive(args)
+        && let Some(policy) = policy_kdr_python(args)
+    {
+        return policy;
+    }
+    if matches!(binary.as_str(), "cargo-clippy" | "cargo-shear") {
+        return policy_lint(args);
+    }
+    if let Some(policy) = policy_language_tool(&binary, args) {
+        return policy;
+    }
     let help_options = if is_python_launcher(&binary) || binary == "pytest" {
         option_flags(args, &["-m", "-W", "-X", "-k", "--override-ini", "-o", "--rootdir", "--basetemp", "--ignore", "--deselect"])
     } else {
@@ -2303,6 +2360,9 @@ fn policy_argv_inner(
         return Policy::ReadOnly;
     }
     let classification = classify_argv_with_runners(program, args, runners);
+    if let Some(policy) = policy_test_or_check(&classification) {
+        return policy;
+    }
     if matches!(&classification, ValidationClassification::Validation { .. }) {
         return if benchmark_only(&classification) { Policy::Benchmark } else { Policy::Restricted };
     }
@@ -2317,6 +2377,85 @@ fn policy_argv_inner(
         return Policy::ReadOnly;
     }
     if is_python_launcher(&binary) { Policy::Opaque } else { Policy::Unrelated }
+}
+
+fn policy_test_or_check(classification: &ValidationClassification) -> Option<ValidationPolicyClassification> {
+    let ValidationClassification::Validation { leaves, .. } = classification else { return None; };
+    if leaves.iter().any(|leaf| matches!(leaf.operation, ValidationOperation::Test | ValidationOperation::Fuzz)
+        && matches!(leaf.mode, ValidationExecutionMode::Execution | ValidationExecutionMode::Unknown))
+    {
+        Some(ValidationPolicyClassification::Tests)
+    } else if leaves.iter().any(|leaf| matches!(leaf.operation, ValidationOperation::Check | ValidationOperation::Lint)
+        && matches!(leaf.mode, ValidationExecutionMode::Checking | ValidationExecutionMode::Unknown))
+    {
+        Some(ValidationPolicyClassification::Checks)
+    } else { None }
+}
+
+fn policy_language_tool(binary: &str, args: &[String]) -> Option<ValidationPolicyClassification> {
+    use ValidationPolicyClassification as Policy;
+    let has = |flags: &[&str]| args.iter().any(|arg| flags.contains(&arg.as_str()));
+    let named = matches!(binary, "tsc" | "vue-tsc" | "javac" | "eslint" | "jsonlint" | "ajv" | "deno" | "bun"
+        | "shellcheck" | "pylint" | "mypy" | "pyright" | "prettier" | "ruff" | "ctest" | "mocha" | "ava" | "tap");
+    if named && has(&["--help", "-h", "--version"]) { return Some(Policy::ReadOnly); }
+    if matches!(binary, "tsc" | "vue-tsc" | "javac")
+        || binary == "node" && has(&["--check", "-c"])
+        || binary == "deno" && args.first().is_some_and(|arg| arg == "check")
+    { return Some(Policy::TargetedCompilation); }
+    if matches!(binary, "deno" | "bun") && args.first().is_some_and(|arg| arg == "test") {
+        return Some(Policy::Tests);
+    }
+    if matches!(binary, "deno" | "vitest") && args.first().is_some_and(|arg| arg == "bench") {
+        return Some(Policy::Benchmark);
+    }
+    if binary == "go" && args.first().is_some_and(|arg| arg == "test") {
+        let value = |flag: &str| args.iter().enumerate().filter_map(|(index, arg)| {
+            if arg == flag { args.get(index + 1).map(String::as_str) }
+            else { arg.split_once('=').filter(|(key, _)| *key == flag).map(|(_, value)| value) }
+        }).last();
+        if value("-run") == Some("^$") && value("-bench").is_some_and(|value| !value.is_empty()) && value("-fuzz").is_none()
+            && !args.iter().any(|arg| matches!(arg.as_str(), "--" | "-args" | "-test.run") || arg.starts_with("-test.run="))
+        {
+            return Some(Policy::Benchmark);
+        }
+    }
+    if is_python_launcher(binary) && !python_interactive(args)
+        && let Some(index) = python_operand_index(args, true)
+    {
+        let module = args[index].strip_prefix("-m").unwrap_or(&args[index]);
+        return match module {
+            "py_compile" | "compileall" => Some(Policy::TargetedCompilation),
+            "json.tool" => Some(if args[index + 1..].iter().any(|arg| matches!(arg.as_str(), "--help" | "-h")) { Policy::ReadOnly } else { Policy::Checks }),
+            _ => None,
+        };
+    }
+    if matches!(binary, "ctest" | "mocha" | "ava" | "tap")
+        || binary == "node" && has(&["--test"])
+        || binary == "dotnet" && args.first().is_some_and(|arg| arg == "vstest")
+        || binary == "java" && args.iter().any(|arg| matches!(arg.as_str(), "org.junit.runner.JUnitCore" | "org.junit.platform.console.ConsoleLauncher" | "org.testng.TestNG" | "junit.textui.TestRunner"))
+    { return Some(Policy::Tests); }
+    if matches!(binary, "mvn" | "mvnw" | "gradle" | "gradlew")
+        && args.iter().any(|arg| {
+            let task = arg.rsplit(':').next().unwrap_or(arg);
+            if matches!(binary, "mvn" | "mvnw") {
+                matches!(task, "verify" | "integration-test" | "package" | "install" | "deploy")
+            } else { matches!(task, "build" | "check") || (task.starts_with("test") || task.ends_with("Test")) && !task.ends_with("Classes") }
+        })
+        && matches!(execution_mode(binary, args, ValidationOperation::Test), ValidationExecutionMode::Execution | ValidationExecutionMode::Unknown)
+    { return Some(Policy::Tests); }
+    if matches!(binary, "eslint" | "jsonlint" | "ajv" | "shellcheck" | "pylint" | "mypy" | "pyright") {
+        return Some(if has(&["--fix", "--write"]) { Policy::Tooling } else { Policy::Checks });
+    }
+    if binary == "prettier" {
+        return Some(if has(&["--check", "-c", "--list-different", "-l"]) { Policy::Checks } else { Policy::Tooling });
+    }
+    if binary == "ruff" {
+        return Some(if has(&["--check"]) || args.first().is_some_and(|arg| arg == "check") && !has(&["--fix", "--fix-only"]) {
+            Policy::Checks
+        } else { Policy::Tooling });
+    }
+    if binary == "go" && args.first().is_some_and(|arg| arg == "vet") { return Some(Policy::Checks); }
+    None
 }
 
 fn benchmark_only(classification: &ValidationClassification) -> bool {
@@ -2334,6 +2473,27 @@ fn policy_cargo(args: &[String]) -> ValidationPolicyClassification {
         Ok(None) => return Policy::ReadOnly,
         Err(()) => return Policy::Opaque,
     };
+    let classification = classify_argv("cargo", args);
+    if matches!(&classification, ValidationClassification::Validation { leaves, .. }
+        if leaves.iter().any(|leaf| matches!(leaf.operation, ValidationOperation::Test | ValidationOperation::Fuzz)
+            && !matches!(leaf.mode, ValidationExecutionMode::Listing | ValidationExecutionMode::DryRun | ValidationExecutionMode::CompilationOnly)))
+    {
+        return Policy::Tests;
+    }
+    // Coverage and Miri can execute Rust tests without a `cargo test` leaf.
+    if (args[index] == "miri" && args.get(index + 1).is_some_and(|arg| arg == "test")
+        || args[index] == "llvm-cov" && !args.get(index + 1).is_some_and(|arg|
+            matches!(arg.as_str(), "show-env" | "report" | "clean" | "export" | "demangle")))
+        && matches!(execution_mode("cargo", args, ValidationOperation::Test), ValidationExecutionMode::Execution | ValidationExecutionMode::Unknown)
+        && !args.iter().any(|arg| matches!(arg.as_str(), "--help" | "-h" | "--version"))
+    {
+        return Policy::Tests;
+    }
+    if matches!(&classification, ValidationClassification::Validation { leaves, .. }
+        if !leaves.is_empty() && leaves.iter().all(|leaf| leaf.mode == ValidationExecutionMode::Listing))
+    {
+        return Policy::ReadOnly;
+    }
     match args[index].as_str() {
         "check" | "c" | "bench" => {
             let benchmark = args[index] == "bench";
@@ -2341,6 +2501,8 @@ fn policy_cargo(args: &[String]) -> ValidationPolicyClassification {
                 return Policy::Restricted;
             }
             let mut targeted = false;
+            let mut named_benchmark = false;
+            let mut other_targets = false;
             let mut cursor = index + 1;
             while let Some(arg) = args.get(cursor) {
                 let (flag, inline) = arg.split_once('=').map_or((arg.as_str(), None), |(flag, value)| (flag, Some(value)));
@@ -2348,6 +2510,14 @@ fn policy_cargo(args: &[String]) -> ValidationPolicyClassification {
                 if matches!(flag, "--workspace" | "--all" | "-a" | "--exclude" | "--") {
                     return Policy::Restricted;
                 }
+                if benchmark && flag == "--bench" {
+                    let literal = inline.or_else(|| args.get(cursor + 1).map(String::as_str))
+                        .is_some_and(literal_package_selector);
+                    named_benchmark |= literal;
+                    // A wildcard or missing selector must not piggyback on a named one.
+                    other_targets |= !literal;
+                }
+                other_targets |= matches!(flag, "--lib" | "--bins" | "--bin" | "--examples" | "--example" | "--tests" | "--test" | "--benches" | "--all-targets");
                 if matches!(flag, "-p" | "--package") || arg.starts_with("-p") && arg.len() > 2 {
                     let value = if matches!(flag, "-p" | "--package") {
                         inline.or_else(|| args.get(cursor + 1).map(String::as_str))
@@ -2359,18 +2529,81 @@ fn policy_cargo(args: &[String]) -> ValidationPolicyClassification {
                 }
                 cursor += if inline.is_none() && CARGO_VALUE_OPTIONS.contains(&flag) { 2 } else { 1 };
             }
-            if !targeted { Policy::Restricted }
+            if !targeted && !(benchmark && named_benchmark && !other_targets) { Policy::Restricted }
             else if benchmark { Policy::Benchmark }
             else { Policy::TargetedCompilation }
         }
+        "clippy" | "shear" => policy_lint(&args[index + 1..]),
+        "fmt" if args[index + 1..].iter().any(|arg| arg == "--check") => Policy::Checks,
+        "kda" => policy_kda(&args[index + 1..]),
         "help" | "version" | "metadata" | "tree" | "locate-project" | "pkgid" | "search" => Policy::ReadOnly,
-        "test" | "t" | "build" | "b" | "run" | "r" | "clippy" | "fmt" | "doc" | "fix" | "nextest" | "fuzz" | "llvm-cov" | "miri" => Policy::Restricted,
+        "test" | "t" | "build" | "b" | "run" | "r" | "fmt" | "doc" | "fix" | "nextest" | "fuzz" | "llvm-cov" | "miri" => Policy::Restricted,
         _ => Policy::Opaque,
     }
 }
 
 fn literal_package_selector(value: &str) -> bool {
     !value.is_empty() && !value.starts_with('-') && !value.contains(['*', '?', '[', ']', '$', '`'])
+}
+
+fn policy_lint(args: &[String]) -> ValidationPolicyClassification {
+    if args.iter().any(|arg| arg == "--fix" || arg.starts_with("--fix=")) {
+        ValidationPolicyClassification::Restricted
+    } else {
+        ValidationPolicyClassification::Checks
+    }
+}
+
+fn policy_kdr(args: &[String]) -> ValidationPolicyClassification {
+    if args.iter().take_while(|arg| arg.as_str() != "--")
+        .any(|arg| matches!(arg.as_str(), "--help" | "-h" | "--version"))
+    { ValidationPolicyClassification::ReadOnly } else { ValidationPolicyClassification::Tooling }
+}
+
+fn policy_kdr_python(args: &[String]) -> Option<ValidationPolicyClassification> {
+    // Use the actual interpreter operand, not a later argument or -c payload.
+    let index = if let Some(index) = python_operand_index(args, true) {
+        let module = args[index].strip_prefix("-m").unwrap_or(&args[index]);
+        matches!(module, "kdr" | "rolloutdetect" | "tools.kdr_session_suite"
+            | "tools.benchmark_frozen_analysis" | "tools.rollout_analysis.benchmark_scan")
+            .then_some(index)?
+    } else {
+        let index = python_script_index(args)?;
+        let script = args[index].replace('\\', "/");
+        ["tools/kdr_session_suite.py", "tools/benchmark_frozen_analysis.py",
+            "tools/rollout_analysis/benchmark_scan.py"].iter().any(|path| {
+                script == *path || script.strip_suffix(*path).is_some_and(|prefix| prefix.ends_with('/'))
+            }).then_some(index)?
+    };
+    Some(policy_kdr(&args[index + 1..]))
+}
+
+fn policy_kda(mut args: &[String]) -> ValidationPolicyClassification {
+    use ValidationPolicyClassification as Policy;
+    // Cargo's external-subcommand transport repeats the subcommand name.
+    if args.first().is_some_and(|arg| arg == "kda") { args = &args[1..]; }
+    // Keep documented discovery out of the validation-attempt budget. Other
+    // operations are classified by their own workload, not an unrestricted alias.
+    if args.first().is_some_and(|arg| matches!(arg.as_str(), "lints" | "explain" | "config-schema")) {
+        return Policy::ReadOnly;
+    }
+    if args.first().is_some_and(|arg| arg == "op") {
+        let json = args.windows(2).find(|pair| pair[0] == "--json").map(|pair| pair[1].as_str())
+            .or_else(|| args.iter().find_map(|arg| arg.strip_prefix("--json=")));
+        if let Some(op) = json.and_then(|json| serde_json::from_str::<serde_json::Value>(json).ok())
+            .and_then(|request| request.get("op")?.as_str().map(str::to_owned))
+        {
+            return match op.as_str() {
+                "status" | "catalog" => Policy::ReadOnly,
+                "test" | "tests" | "suite" => Policy::Tests,
+                "gate" | "check" | "lint" | "validate" => Policy::Checks,
+                _ => Policy::Tooling,
+            };
+        }
+    }
+    if args.first().is_some_and(|arg| matches!(arg.as_str(), "test" | "tests" | "suite")) { return Policy::Tests; }
+    if args.first().is_some_and(|arg| matches!(arg.as_str(), "check" | "lint" | "gate" | "validate")) { return Policy::Checks; }
+    Policy::Tooling
 }
 
 fn policy_just(args: &[String], runners: &[RepositoryRunner], depth: usize, leaves: &mut Vec<Vec<String>>) -> ValidationPolicyClassification {
@@ -2407,6 +2640,10 @@ fn policy_just(args: &[String], runners: &[RepositoryRunner], depth: usize, leav
         let child = [vec!["check".to_owned(), "-p".to_owned(), tail[1].clone()], tail[2..].to_vec()].concat();
         return policy_argv("cargo", &child, runners, depth + 1, leaves);
     }
+    if !changed_owner && matches!(recipe.as_str(), "clippy" | "clippy-lane" | "cargo-shear" | "lint-rust") {
+        leaves.push(std::iter::once("just".to_owned()).chain(tail.iter().cloned()).collect());
+        return policy_lint(&tail[1..]);
+    }
     if !changed_owner && matches!(recipe.as_str(), "core-test-plan" | "core-test-list") {
         let arity = if recipe == "core-test-plan" { 2 } else { 1 };
         if tail.len() > arity {
@@ -2420,6 +2657,20 @@ fn policy_just(args: &[String], runners: &[RepositoryRunner], depth: usize, leav
         return Policy::ReadOnly;
     }
     let classification = classify_argv_with_runners("just", args, runners);
+    if let Some(policy) = policy_test_or_check(&classification) {
+        leaves.push(std::iter::once("just".to_owned()).chain(tail.iter().cloned()).collect());
+        return policy;
+    }
+    if !changed_owner && matches!(recipe.as_str(),
+        "test" | "test-fast" | "test-fast-nosccache" | "test-timings"
+        | "test-lane" | "test-lane-main" | "test-lane-fast" | "test-lane-package"
+        | "_test-lane-local-reserved" | "_test-lane-fast-reserved" | "_test-lane-package-reserved"
+        | "core-test" | "core-test-fast" | "core-gate" | "hooks-schema-check")
+        && matches!(execution_mode("just", &tail[1..], ValidationOperation::Test), ValidationExecutionMode::Execution | ValidationExecutionMode::Unknown)
+    {
+        leaves.push(std::iter::once("just".to_owned()).chain(tail.iter().cloned()).collect());
+        return Policy::Tests;
+    }
     if matches!(recipe.as_str(), "core-gate" | "check-lane" | "release-lane" | "build" | "test-compile")
         || matches!(&classification, ValidationClassification::Validation { .. })
     {
@@ -2459,7 +2710,8 @@ fn policy_repository_script(script: &str, args: &[String], runners: &[Repository
     leaves.push(std::iter::once(script.to_owned()).chain(args.iter().cloned()).collect());
     Some(match (kind, command) {
         (0, "plan" | "plan-batch" | "list-targets" | "gates-for" | "required-for") | (1, "lanes" | "doctor" | "disk") => Policy::ReadOnly,
-        (0, "run-target" | "run-gate" | "rerun-inventory" | "check-gates" | "check-manifest") | (2, "test-python" | "lint-python" | "audit-scripts") => Policy::Restricted,
+        (0, "run-target" | "run-gate" | "rerun-inventory" | "check-gates") | (2, "test-python") => Policy::Tests,
+        (0, "check-manifest") | (2, "lint-python" | "audit-scripts") => Policy::Checks,
         _ => Policy::Opaque,
     })
 }
@@ -2629,10 +2881,10 @@ fn policy_python_code(
         } else {
             Policy::Opaque
         };
-        policies.push(if safe_options || policy == Policy::Restricted {
+        policies.push(if safe_options || matches!(policy, Policy::Restricted | Policy::Tests | Policy::Checks) {
             policy
-        } else if matches!(policy, Policy::TargetedCompilation | Policy::Benchmark) {
-            // Effectful/unknown keyword expressions are not compile/benchmark-only.
+        } else if matches!(policy, Policy::TargetedCompilation | Policy::Benchmark | Policy::Tooling) {
+            // Effectful/unknown keyword expressions are not compile/benchmark/tooling-only.
             Policy::Restricted
         } else {
             Policy::Opaque
@@ -2704,35 +2956,150 @@ mod validation_policy_tests {
             ("cargo", vec!["check", "-p", "codex-core", "--workspace"]),
             ("cargo", vec!["check", "--all", "-p", "codex-core"]),
             ("cargo", vec!["test", "--no-run", "-p", "codex-core"]),
-            ("cargo", vec!["nextest", "list", "-p", "codex-core"]),
-            ("cargo", vec!["clippy", "-p", "codex-core"]),
             ("cargo", vec!["build", "-p", "codex-core"]),
-            ("cargo", vec!["fmt", "--check"]),
             ("just", vec!["check-lane", "codex-core", "--workspace"]),
-            ("just", vec!["core-gate", "command-analysis"]),
             ("just", vec!["core-test-fast", "core_lib", "--no-run"]),
         ] {
             assert_eq!(analyze(program, &args).0, Policy::Restricted, "{program} {args:?}");
         }
+        assert_eq!(analyze("cargo", &["nextest", "list", "-p", "codex-core"]).0, Policy::ReadOnly);
+        assert_eq!(analyze("cargo", &["fmt", "--check"]).0, Policy::Checks);
+        assert_eq!(analyze("just", &["core-gate", "command-analysis"]).0, Policy::Tests);
+        for (program, args) in [
+            ("tsc", vec!["--noEmit", "--project", "tsconfig.json"]),
+            ("javac", vec!["Example.java"]),
+            ("python", vec!["-B", "-m", "py_compile", "example.py"]),
+            ("node", vec!["--check", "example.js"]),
+        ] {
+            assert_eq!(analyze(program, &args).0, Policy::TargetedCompilation, "{program} {args:?}");
+        }
     }
 
     #[test]
-    fn literal_wrappers_cannot_hide_restricted_work() {
+    fn named_benchmarks_are_scoped_without_a_redundant_package_selector() {
+        for args in [
+            vec!["bench", "--bench", "c9_cursor_benchmark"],
+            vec!["bench", "--bench=c9_cursor_benchmark", "--", "--expect-loop", "before.json"],
+            vec!["bench", "--offline", "--manifest-path", r"C:\audit\Cargo.toml", "--bench", "c9_cursor_benchmark"],
+            vec!["bench", "-p", "codex-core", "--benches"],
+        ] {
+            assert_eq!(analyze("cargo", &args).0, Policy::Benchmark, "{args:?}");
+        }
+        // The previously refused owning path, including its lane/timing envelope.
+        assert_eq!(analyze("python", &[
+            r"..\scripts\build\rust_build_status.py", "run-lane", "--lane", "auto",
+            "--warm-wait-seconds", "0", "--timing-json", r"C:\audit\timing.json", "--",
+            "cargo", "bench", "--offline", "--manifest-path", r"C:\audit\Cargo.toml",
+            "--bench", "c9_cursor_benchmark", "--", "--expect-loop", r"C:\audit\before.json",
+        ]).0, Policy::Benchmark);
+        for args in [
+            vec!["bench"],
+            vec!["bench", "--manifest-path", "Cargo.toml"],
+            vec!["bench", "--bench", "*"],
+            vec!["bench", "--bench", "named", "--bench", "*"],
+            vec!["bench", "--bench", "named", "--bench"],
+            vec!["bench", "--bench", "named", "--benches"],
+            vec!["bench", "--bench", "named", "--all-targets"],
+            vec!["bench", "--bench", "named", "--tests"],
+            vec!["bench", "--bench", "named", "--workspace"],
+            vec!["bench", "--bench", "named", "--all"],
+            vec!["bench", "--bench", "named", "--no-run"],
+            vec!["check", "--bench", "named"],
+            vec!["run", "--manifest-path", "Cargo.toml"],
+        ] {
+            assert_eq!(analyze("cargo", &args).0, Policy::Restricted, "{args:?}");
+        }
+        assert_eq!(analyze("cargo", &["bench", "--bench", "named", "--", "--test"]).0, Policy::Tests);
+        assert_eq!(analyze("go", &["test", "-run=^$", "-bench=.", "./..."]).0, Policy::Benchmark);
+    }
+
+    #[test]
+    fn tooling_distinguishes_non_compile_checks_from_other_operations() {
+        for (program, args, expected) in [
+            ("cargo", vec!["clippy", "--workspace", "--all-targets", "--", "-D", "warnings"], Policy::Checks),
+            ("cargo", vec!["shear", "--deny-warnings"], Policy::Checks),
+            ("cargo-clippy.exe", vec!["clippy", "-p", "codex-core"], Policy::Checks),
+            ("cargo-shear", vec!["--deny-warnings"], Policy::Checks),
+            ("just", vec!["clippy", "-p", "codex-core"], Policy::Checks),
+            ("just", vec!["clippy-lane", "codex-core"], Policy::Checks),
+            ("just", vec!["cargo-shear"], Policy::Checks),
+            ("just", vec!["lint-rust", "-p", "codex-core"], Policy::Checks),
+            ("cargo", vec!["kda", "op", "--json", r#"{"op":"gate","execute_workspace":true}"#], Policy::Checks),
+            ("cargo-kda.exe", vec!["kda", "rename"], Policy::Tooling),
+            ("kda", vec!["op", "--json", r#"{"op":"edit"}"#], Policy::Tooling),
+            (r"C:\Users\kuh\Desktop\KDR\kdr.cmd", vec!["tools", "latency", "session.jsonl"], Policy::Tooling),
+            ("kdr.exe", vec!["scan"], Policy::Tooling),
+            ("cmd", vec!["/c", r"C:\Users\kuh\Desktop\KDR\kdr.cmd tools latency session.jsonl"], Policy::Tooling),
+        ] {
+            let policy = analyze(program, &args).0;
+            assert_eq!(policy, expected, "{program} {args:?}");
+            assert!(policy.is_validation());
+            assert!(!policy.is_compile_eligible());
+        }
         for (program, args) in [
-            ("bash", vec!["-lc", "cargo test -p codex-core"]),
-            ("cmd.exe", vec!["/d", "/s", "/c", "cargo test -p codex-core"]),
-            ("cmd", vec!["/c", "call cargo fmt --check"]),
-            ("cmd", vec!["/c", "@cargo test"]),
-            ("just", vec!["cargo-lane", "core-tests", "cargo", "test"]),
-            ("just", vec!["--command", "cargo", "test"]),
-            ("python", vec!["-I", "-B", "scripts/build/rust_build_status.py", "run-lane", "--lane", "core-tests", "--", "cargo", "test"]),
-            ("python", vec!["-c", "import subprocess; subprocess.run(['cargo', 'test'], check=True)"]),
-            ("python", vec!["-c", "import subprocess; result = subprocess.run(['cargo', 'test'])"]),
-            ("python", vec!["-c", "import subprocess; subprocess.run('cargo test', shell=True)"]),
-            ("python", vec!["-c", "import subprocess as sp; sp.check_call(['cargo', 'test'])"]),
-            ("python", vec!["-c", "from subprocess import run as launch; launch(['cargo', 'test'])"]),
+            ("cargo", vec!["clippy", "--fix"]),
+            ("cargo", vec!["shear", "--fix"]),
+            ("cargo-shear", vec!["--fix=true"]),
+            ("just", vec!["clippy", "--fix"]),
+            ("just", vec!["lint-rust", "--fix"]),
+            ("just", vec!["cargo-shear", "--fix"]),
         ] {
             assert_eq!(analyze(program, &args).0, Policy::Restricted, "{program} {args:?}");
+        }
+        for (program, args) in [
+            ("cargo", vec!["kda", "op", "--json", r#"{"op":"status"}"#]),
+            ("cargo-kda.exe", vec!["kda", "op", r#"--json={"op":"catalog"}"#]),
+            ("kda", vec!["config-schema"]),
+            ("cargo", vec!["kda", "lints"]),
+            ("kdr.cmd", vec!["--help"]),
+            ("kdr", vec!["tools", "--help"]),
+        ] {
+            let policy = analyze(program, &args).0;
+            assert_eq!(policy, Policy::ReadOnly, "{program} {args:?}");
+            assert!(!policy.is_validation());
+        }
+        for (script, expected) in [
+            ("cargo bench --bench named; cargo test", Policy::Tests),
+            ("cargo clippy; cargo test", Policy::Tests),
+            ("cargo shear; unknown-workload", Policy::Checks),
+            ("cargo kda op; cargo build", Policy::Restricted),
+            ("kdr tools latency session.jsonl; cargo test", Policy::Tests),
+        ] {
+            assert_eq!(classify_validation_policy_script_with_runners(script, &[]), expected, "{script}");
+        }
+        assert_eq!(analyze("python", &[
+            "-c", "import subprocess; subprocess.run(['cargo', 'clippy'], check=unknown())",
+        ]).0, Policy::Checks);
+    }
+
+    #[test]
+    fn literal_wrappers_cannot_hide_tests_or_checks() {
+        for (program, args, expected) in [
+            ("bash", vec!["-lc", "cargo test -p codex-core"], Policy::Tests),
+            ("cmd.exe", vec!["/d", "/s", "/c", "cargo test -p codex-core"], Policy::Tests),
+            ("cmd", vec!["/c", "call cargo fmt --check"], Policy::Checks),
+            ("cmd", vec!["/c", "@cargo test"], Policy::Tests),
+            ("just", vec!["cargo-lane", "core-tests", "cargo", "test"], Policy::Tests),
+            ("just", vec!["--command", "cargo", "test"], Policy::Tests),
+            ("python", vec!["-I", "-B", "scripts/build/rust_build_status.py", "run-lane", "--lane", "core-tests", "--", "cargo", "test"], Policy::Tests),
+            ("python", vec!["-c", "import subprocess; subprocess.run(['cargo', 'test'], check=True)"], Policy::Tests),
+            ("python", vec!["-c", "import subprocess; result = subprocess.run(['cargo', 'test'])"], Policy::Tests),
+            ("python", vec!["-c", "import subprocess; subprocess.run('cargo test', shell=True)"], Policy::Tests),
+            ("python", vec!["-c", "import subprocess as sp; sp.check_call(['cargo', 'test'])"], Policy::Tests),
+            ("python", vec!["-c", "from subprocess import run as launch; launch(['cargo', 'test'])"], Policy::Tests),
+            ("pytest", vec!["tests/test_example.py"], Policy::Tests),
+            ("npm", vec!["test"], Policy::Tests),
+            ("npx", vec!["--no-install", "vitest", "run"], Policy::Tests),
+            ("go", vec!["test", "./..."], Policy::Tests),
+            ("mvn", vec!["verify"], Policy::Tests),
+            ("gradlew", vec!["build"], Policy::Tests),
+            ("dotnet", vec!["test"], Policy::Tests),
+            ("node", vec!["--test"], Policy::Tests),
+            ("python", vec!["-B", "-m", "json.tool", "data.json"], Policy::Checks),
+            ("jsonlint", vec!["data.json"], Policy::Checks),
+            ("prettier", vec!["--check", "data.json"], Policy::Checks),
+        ] {
+            assert_eq!(analyze(program, &args).0, expected, "{program} {args:?}");
         }
     }
 
@@ -2754,7 +3121,7 @@ mod validation_policy_tests {
         }
         assert_eq!(
             analyze("just", &["core-test-list", "test-release-tooling"]).0,
-            Policy::Restricted,
+            Policy::Tests,
         );
     }
 

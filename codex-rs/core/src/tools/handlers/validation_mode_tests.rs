@@ -147,16 +147,19 @@ async fn off_refuses_validation_wrappers_for_direct_and_code_mode_calls() {
 }
 
 #[tokio::test]
-async fn compile_refuses_tests_and_admits_targeted_check() {
-    for shell in [false, true] {
-        let fixture = Fixture::new(ValidationMode::Compile).await;
+async fn compile_and_full_half_refuse_tests_and_admit_targeted_check() {
+    for (mode, wire, shell) in [
+        (ValidationMode::Compile, "compile", false), (ValidationMode::Compile, "compile", true),
+        (ValidationMode::FullHalf, "full.5", false), (ValidationMode::FullHalf, "full.5", true),
+    ] {
+        let fixture = Fixture::new(mode).await;
         for (index, arguments) in [
             json!({"program": fixture.cargo, "args": ["test", "-p", "codex-core"]}),
             json!({"program": fixture.just, "args": ["test"]}),
         ].into_iter().enumerate() {
             let output = fixture.call(shell, arguments, false, &format!("compile-refused-{shell}-{index}")).await
                 .expect("policy refusal transport");
-            fixture.assert_refusal(output, "compile");
+            fixture.assert_refusal(output, wire);
         }
         let output = fixture.call(shell,
             json!({"program": fixture.cargo, "args": ["check", "-p", "codex-core"]}),
@@ -164,7 +167,8 @@ async fn compile_refuses_tests_and_admits_targeted_check() {
         ).await.expect("the fixture command executes");
         assert_eq!(output.outcome_for_logging(), codex_tools::ToolOutputOutcome::Failure);
         assert!(fixture.marker.exists());
-        assert_eq!(fixture.turn.full_suite_budget.policy_snapshot(2).admitted, 1);
+        assert_eq!(fixture.turn.full_suite_budget.policy_snapshot(2).admitted, 0);
+        assert_eq!(fixture.turn.full_suite_budget.persisted_attempts().len(), 1);
     }
 }
 
@@ -188,8 +192,8 @@ async fn full_refuses_a_third_attempt_after_two_started_validations() {
 #[tokio::test]
 async fn compile_refuses_unchanged_inputs_even_for_a_different_selection() {
     let fixture = Fixture::new(ValidationMode::Compile).await;
-    // This non-Git fixture has no source identity: the launch owner uses a stable sentinel.
-    fixture.seed_started("previous", "a-different-target", "source-identity-unavailable");
+    // Without a workspace fingerprint, unchanged tracked inputs retain epoch zero.
+    fixture.seed_started("previous", "a-different-target", "tracked-source-epoch:0");
     for shell in [false, true] {
         let output = fixture.call(shell,
             json!({"program": fixture.cargo, "args": ["check", "-p", "codex-core"], "force_fresh": true}),
@@ -197,7 +201,8 @@ async fn compile_refuses_unchanged_inputs_even_for_a_different_selection() {
         ).await.expect("unchanged-input refusal transport");
         assert!(fixture.assert_refusal(output, "compile").contains("unchanged inputs"));
     }
-    assert_eq!(fixture.turn.full_suite_budget.policy_snapshot(2).admitted, 1);
+    assert_eq!(fixture.turn.full_suite_budget.policy_snapshot(2).admitted, 0);
+    assert_eq!(fixture.turn.full_suite_budget.persisted_attempts().len(), 1);
 }
 
 #[tokio::test]

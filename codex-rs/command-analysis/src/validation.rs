@@ -1369,7 +1369,7 @@ mod validation_policy_tests {
         assert_eq!(direct, wrapped);
         assert_eq!(
             classify_validation_policy(&CommandInvocation::Script("cargo fmt --check".into())),
-            ValidationPolicyClassification::Restricted,
+            ValidationPolicyClassification::Checks,
         );
     }
 
@@ -1383,7 +1383,7 @@ mod validation_policy_tests {
                 Some(codex_shell_command::shell_detect::ShellType::PowerShell),
                 None,
             ).await,
-            ValidationPolicyClassification::Restricted,
+            ValidationPolicyClassification::Tests,
         );
     }
 }

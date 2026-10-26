@@ -863,6 +863,7 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<bool> {
             items,
             output_schema,
         } => {
+            event_processor.record_turn_submission();
             let response: TurnStartResponse = send_request_with_response(
                 &client,
                 ClientRequest::TurnStart {
@@ -965,6 +966,7 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<bool> {
                 ) {
                     continue;
                 }
+                event_processor.record_server_notification_received();
                 recovery_state.backfill_complete_stream(&mut notification);
                 if should_backfill_turn_completed_items(thread_ephemeral, &notification) {
                     let read_request_id = request_ids.next();
