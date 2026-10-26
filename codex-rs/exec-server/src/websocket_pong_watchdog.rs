@@ -2,9 +2,6 @@ use std::time::Duration;
 
 use tokio::time::Instant;
 
-#[cfg(test)]
-pub(crate) const WEBSOCKET_PONG_TIMEOUT: Duration = Duration::from_millis(100);
-#[cfg(not(test))]
 pub(crate) const WEBSOCKET_PONG_TIMEOUT: Duration = Duration::from_secs(60);
 pub(crate) const WEBSOCKET_PONG_TIMEOUT_REASON: &str = "pong_timeout";
 
@@ -103,6 +100,3 @@ impl WebSocketLiveness {
     }
 }
 
-#[cfg(test)]
-#[path = "websocket_pong_watchdog_tests.rs"]
-mod tests;

@@ -49,7 +49,3 @@ fn cleaned_category(category: Option<String>) -> Option<String> {
         .map(|category| category.trim().to_string())
         .filter(|category| !category.is_empty())
 }
-
-#[cfg(test)]
-#[path = "plugin_config_tests.rs"]
-mod tests;

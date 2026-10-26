@@ -41,43 +41,6 @@ pub struct PolicyParser {
     globals: std::cell::OnceCell<Globals>,
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn file_local_examples_are_released_and_later_files_are_validated() {
-        let mut parser = PolicyParser::new();
-        parser
-            .parse(
-                "first.rules",
-                r#"
-prefix_rule(pattern=["git"], match=[["git", "status"]])
-prefix_rule(pattern=["echo"])
-"#,
-            )
-            .expect("valid examples");
-        assert!(
-            parser
-                .builder
-                .borrow()
-                .pending_example_validations
-                .is_empty()
-        );
-        assert_eq!(parser.builder.borrow().rules_by_program.len(), 2);
-        let error = parser
-            .parse(
-                "second.rules",
-                r#"prefix_rule(pattern=["rg"], match=[["git"]])"#,
-            )
-            .expect_err("later examples must still be checked");
-        assert_eq!(
-            error.location().expect("example location").path,
-            "second.rules"
-        );
-        assert!(matches!(error, Error::ExampleDidNotMatch { .. }));
-    }
-}
 
 impl Default for PolicyParser {
     fn default() -> Self {

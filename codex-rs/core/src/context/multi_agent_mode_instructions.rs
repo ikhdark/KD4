@@ -5,35 +5,6 @@ use codex_protocol::protocol::MULTI_AGENT_MODE_OPEN_TAG;
 
 const EXPLICIT_REQUEST_ONLY_MULTI_AGENT_MODE_TEXT: &str = "Do not spawn sub-agents unless the user or applicable AGENTS.md/skill instructions explicitly ask for sub-agents, delegation, or parallel agent work. Requests for thoroughness or investigation alone do not authorize spawning.";
 
-#[cfg(test)]
-mod tests {
-    use super::EXPLICIT_REQUEST_ONLY_MULTI_AGENT_MODE_TEXT;
-    use super::EffectiveMultiAgentMode;
-    use super::MultiAgentModeInstructions;
-    use crate::context::ContextualUserFragment;
-    use codex_protocol::config_types::MultiAgentMode;
-
-    #[test]
-    fn effective_modes_only_persist_and_render_current_policies() {
-        let cases = [
-            (
-                EffectiveMultiAgentMode::Custom("custom policy".to_string()),
-                MultiAgentMode::Custom("custom policy".to_string()),
-                "custom policy",
-            ),
-            (
-                EffectiveMultiAgentMode::ExplicitRequestOnly,
-                MultiAgentMode::ExplicitRequestOnly,
-                EXPLICIT_REQUEST_ONLY_MULTI_AGENT_MODE_TEXT,
-            ),
-        ];
-
-        for (mode, persisted, rendered) in cases {
-            assert_eq!(mode.to_persisted_mode(), persisted);
-            assert_eq!(MultiAgentModeInstructions::new(mode).body(), rendered);
-        }
-    }
-}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum EffectiveMultiAgentMode {

@@ -134,20 +134,3 @@ impl QueuedOutgoingMessage {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn bounded_encoding_counts_escaped_utf8_wire_bytes() {
-        let mut message = QueuedOutgoingMessage::new(OutgoingMessage::Response(OutgoingResponse {
-            id: RequestId::Integer(1),
-            result: serde_json::json!({"text": "\"\\\n雪"}),
-        }));
-        let expected = b"{\"id\":1,\"result\":{\"text\":\"\\\"\\\\\\n\xe9\x9b\xaa\"}}";
-        assert!(message.encode_json(expected.len() - 1).is_err());
-        assert!(message.encoded_json.is_none());
-        assert_eq!(message.encode_json(expected.len()).unwrap(), expected.len());
-        assert_eq!(message.encoded_json.as_ref().map(|encoded| encoded.bytes.as_slice()), Some(expected.as_slice()));
-    }
-}

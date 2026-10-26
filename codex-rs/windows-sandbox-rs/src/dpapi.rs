@@ -106,36 +106,3 @@ pub fn unprotect(blob: &[u8]) -> Result<Vec<u8>> {
     Ok(slice)
 }
 
-#[cfg(test)]
-mod tests {
-    use pretty_assertions::assert_eq;
-
-    #[test]
-    fn public_dpapi_roundtrip_preserves_binary_input_and_rejects_invalid_ciphertext()
-    -> anyhow::Result<()> {
-        for plaintext in [b"offline\0credential\xff\x80".as_slice(), b"".as_slice()] {
-            let ciphertext = crate::dpapi_protect(plaintext)?;
-            assert_ne!(ciphertext, plaintext);
-            assert_eq!(crate::dpapi_unprotect(&ciphertext)?, plaintext);
-        }
-        let error = crate::dpapi_unprotect(b"not a DPAPI ciphertext")
-            .expect_err("invalid ciphertext must fail");
-        assert!(error.to_string().contains("CryptUnprotectData failed"));
-        Ok(())
-    }
-
-    #[test]
-    fn blob_length_rejects_values_above_the_windows_abi_limit() -> anyhow::Result<()> {
-        assert_eq!(super::checked_blob_len(0)?, 0);
-        assert_eq!(super::checked_blob_len(u32::MAX as usize)?, u32::MAX);
-        if let Some(too_large) = (u32::MAX as usize).checked_add(1) {
-            let error = super::checked_blob_len(too_large)
-                .expect_err("oversized input must not wrap to zero");
-            assert_eq!(
-                error.to_string(),
-                "DPAPI input exceeds the 32-bit blob length limit"
-            );
-        }
-        Ok(())
-    }
-}

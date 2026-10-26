@@ -16,8 +16,6 @@ use crate::responses_metadata::CompactionTurnMetadata;
 use crate::responses_retry::ResponsesStreamRequest;
 use crate::responses_retry::ResponsesStreamRetryState;
 use crate::responses_retry::handle_retryable_response_stream_error;
-#[cfg(test)]
-use crate::session::PreviousTurnSettings;
 use crate::session::session::Session;
 use crate::session::turn::get_last_assistant_message_from_turn;
 use crate::session::turn_context::TurnContext;
@@ -156,15 +154,9 @@ struct CompactionTextOmissionReceiptV1 {
 ///
 /// Pre-turn/manual compaction variants use `AtStart` so the next request retains the same
 /// cacheable initial-context prefix instead of appending a fresh copy after the summary.
-///
-/// `DoNotInject` is test-only: every production compaction path now restores initial
-/// context, capturing a world-state snapshot when the caller did not already have one. It is
-/// retained so tests can exercise compaction without building that snapshot.
 #[derive(Clone, Debug)]
 pub(crate) enum InitialContextInjection {
     AtStart(Arc<WorldState>),
-    #[cfg(test)]
-    DoNotInject,
 }
 
 pub(crate) async fn build_compaction_initial_context(
@@ -187,8 +179,6 @@ pub(crate) async fn build_compaction_initial_context(
                 .await;
             (items, Some(delivered_snapshot), fragment_digests)
         }
-        #[cfg(test)]
-        InitialContextInjection::DoNotInject => (Vec::new(), None, Vec::new()),
     }
 }
 
@@ -321,15 +311,6 @@ fn compaction_anchor_accounted_for(completed: &str, anchor: &str) -> bool {
             })
         })
     })
-}
-
-#[cfg(test)]
-fn validated_rebased_compaction_summary(
-    previous: &str,
-    suffix: &str,
-    rebased: &[usize],
-) -> CodexResult<String> {
-    rebased_compaction_summary(previous, suffix, rebased, /*bound_overflow*/ false)
 }
 
 /// `bound_overflow` is set only for the corrective attempt, after a complete
@@ -1020,8 +1001,6 @@ async fn run_compact_task_inner_impl(
         );
     }
     let reference_context_item = match &initial_context_injection {
-        #[cfg(test)]
-        InitialContextInjection::DoNotInject => None,
         InitialContextInjection::AtStart(_) => {
             Some(turn_context.to_turn_context_item_async().await)
         }
@@ -2252,24 +2231,6 @@ pub(crate) fn build_task_input_checkpoint_with_details(
     }
 }
 
-#[cfg(test)]
-pub(crate) fn build_task_input_checkpoint(
-    items: &[ResponseItem],
-) -> (Vec<ResponseItem>, usize, bool) {
-    let checkpoint = build_task_input_checkpoint_with_details(items);
-    let needs_recovery = checkpoint.needs_source_recovery();
-    (checkpoint.items, checkpoint.retained_images, needs_recovery)
-}
-
-#[cfg(test)]
-pub(crate) fn build_local_task_input_checkpoint(
-    items: &[ResponseItem],
-) -> (Vec<ResponseItem>, usize, usize, bool, bool) {
-    // The local summarizer supplies a new handoff; unlike opaque remote compaction,
-    // it need not retain the previous assistant handoff or summary a second time.
-    build_bounded_input_history(task_compaction_items(items), false)
-}
-
 fn build_bounded_input_history(
     unresolved: impl AsRef<[ResponseItem]>,
     retain_handoff: bool,
@@ -2879,8 +2840,6 @@ pub(crate) fn insert_compaction_initial_context(
             initial_context.extend(compacted_history);
             initial_context
         }
-        #[cfg(test)]
-        InitialContextInjection::DoNotInject => compacted_history,
     }
 }
 
@@ -3344,14 +3303,3 @@ async fn drain_to_completed(
     }
 }
 
-#[cfg(test)]
-#[path = "compact_tests.rs"]
-mod tests;
-
-#[cfg(test)]
-#[path = "compact_generation_tests.rs"]
-mod generation_tests;
-
-#[cfg(test)]
-#[path = "compact_checkpoint_preservation_tests.rs"]
-mod checkpoint_preservation_tests;

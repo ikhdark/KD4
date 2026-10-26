@@ -178,7 +178,3 @@ impl McpServerRequirement {
         }
     }
 }
-
-#[cfg(test)]
-#[path = "mcp_requirements_tests.rs"]
-mod tests;

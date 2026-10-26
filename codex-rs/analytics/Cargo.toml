@@ -31,8 +31,3 @@ tokio = { workspace = true, features = [
 ] }
 tracing = { workspace = true, features = ["log"] }
 
-[dev-dependencies]
-codex-utils-absolute-path = { workspace = true }
-codex-utils-path-uri = { workspace = true }
-pretty_assertions = { workspace = true }
-wiremock = { workspace = true }

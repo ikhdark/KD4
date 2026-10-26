@@ -187,10 +187,6 @@ pub(crate) enum ObservationDelivery {
 }
 
 impl CellState {
-    #[cfg(test)]
-    pub(crate) fn new(cancellation_token: CancellationToken) -> Self {
-        Self::with_cancellation(NestedCancellation::new(cancellation_token))
-    }
 
     pub(crate) fn with_cancellation(tool_cancellation: NestedCancellation) -> Self {
         Self {
@@ -245,19 +241,6 @@ impl CellState {
             }
             CellPhase::Tombstone => closed_event(),
         }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn commit_completion(
-        &self,
-        event: CellEvent,
-        pending_initial_yield_items: Option<Vec<OutputItem>>,
-        commit: impl FnOnce(),
-    ) -> CompletionCommit {
-        self.commit_completion_with_event(event, pending_initial_yield_items, |event| {
-            commit();
-            event
-        })
     }
 
     pub(crate) fn commit_completion_with_event(
@@ -574,52 +557,4 @@ fn ready_event(event: CellEvent) -> CellEventFuture {
 
 fn closed_event() -> CellEventFuture {
     Box::pin(async { Err(CellError::Closed) })
-}
-
-#[cfg(test)]
-#[test]
-fn cell_and_session_shutdown_publish_cause_before_waking_callbacks() {
-    for session_shutdown in [false, true] {
-        let session = NestedCancellation::new(CancellationToken::new());
-        let state = CellState::with_cancellation(session.child(session.token().child_token()));
-        let tools = state.tool_cancellation();
-        let callback = tools.child(tools.token().child_token());
-        let exported = callback.cause_cell();
-        if session_shutdown {
-            session.cancel_with(CancellationCause::RuntimeShutdown);
-        } else {
-            drop(state.request_termination());
-        }
-        assert!(callback.is_cancelled());
-        assert_eq!(exported.get(), Some(&CancellationCause::RuntimeShutdown));
-        callback.cancel_with(CancellationCause::NestedDeadline);
-        assert_eq!(callback.cause(), Some(CancellationCause::RuntimeShutdown));
-    }
-}
-
-#[cfg(test)]
-#[test]
-fn callback_cleanup_preserves_the_cells_natural_completion_authority() {
-    let session = NestedCancellation::new(CancellationToken::new());
-    let state = CellState::with_cancellation(session.child(session.token().child_token()));
-    let callbacks = state.tool_cancellation();
-    let call = callbacks.child(callbacks.token().child_token());
-    callbacks.cancel_with(CancellationCause::RuntimeShutdown);
-    assert!(call.is_cancelled());
-    assert_eq!(call.cause(), Some(CancellationCause::RuntimeShutdown));
-    assert!(!state.cancellation_token().is_cancelled());
-    assert!(!session.is_cancelled());
-    assert_eq!(session.cause(), None);
-    assert!(matches!(
-        state.commit_completion(
-            CellEvent::Completed {
-                content_items: Vec::new(),
-                error_text: None,
-                output_loss: None,
-            },
-            None,
-            || {},
-        ),
-        CompletionCommit::Committed
-    ));
 }

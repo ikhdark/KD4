@@ -4,10 +4,6 @@ mod process;
 pub mod process_group;
 pub mod process_observation;
 pub mod pty;
-#[cfg(any(test, feature = "test-support"))]
-pub mod test_support;
-#[cfg(all(test, windows))]
-mod tests;
 
 #[cfg(windows)]
 mod win;

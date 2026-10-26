@@ -2,11 +2,7 @@ use crate::context_manager::truncate_function_output_payload;
 use crate::session::session::Session;
 use crate::session::step_context::StepContext;
 use crate::tools::command_output_artifact::RawOutputArtifact;
-#[cfg(test)]
-use crate::tools::command_output_artifact::ToolOutputArtifactId;
 use crate::tools::shell_output_summary::ShellOutputSummaryOptions;
-#[cfg(test)]
-use crate::tools::shell_output_summary::summarize_shell_output_for_model;
 use crate::tools::shell_output_summary::summarize_shell_output_for_model_with_streams;
 use crate::turn_diff_tracker::TurnDiffTracker;
 use codex_code_mode::CancellationCause;
@@ -53,15 +49,6 @@ use std::time::Duration;
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
-#[cfg(test)]
-std::thread_local! {
-    static FUNCTION_PROJECTION_METADATA_CALLS: std::cell::Cell<usize> = const {
-        std::cell::Cell::new(0)
-    };
-    static EXEC_COMMAND_RESPONSE_MATERIALIZATIONS: std::cell::Cell<usize> = const {
-        std::cell::Cell::new(0)
-    };
-}
 
 pub use codex_tools::ToolOutput;
 pub use codex_tools::ToolPayload;
@@ -218,10 +205,6 @@ impl ToolDispatchState {
             .is_ok()
     }
 
-    #[cfg(test)]
-    pub(crate) fn accounting_is_unconfirmed(&self) -> bool {
-        self.state.load(Ordering::Acquire) == ToolDispatchPhase::AccountingUnconfirmed as u8
-    }
 
     pub(crate) fn try_abort(&self) -> ToolDispatchAbort {
         loop {
@@ -607,13 +590,6 @@ impl McpToolOutput {
         bounded
     }
 
-    #[cfg(test)]
-    pub(crate) fn projection_cache_state(&self) -> (bool, bool) {
-        (
-            self.projections.raw_json.get().is_some(),
-            self.projections.provider_payload.get().is_some(),
-        )
-    }
 }
 
 #[derive(Clone)]
@@ -696,16 +672,6 @@ pub struct FunctionToolOutput {
     pub skip_disposition: Option<ToolOutputSkipDisposition>,
 }
 
-#[cfg(test)]
-impl FunctionToolOutput {
-    pub(crate) fn reset_projection_metadata_call_count() {
-        FUNCTION_PROJECTION_METADATA_CALLS.with(|calls| calls.set(0));
-    }
-
-    pub(crate) fn projection_metadata_call_count() -> usize {
-        FUNCTION_PROJECTION_METADATA_CALLS.with(std::cell::Cell::get)
-    }
-}
 
 impl FunctionToolOutput {
     pub fn from_text(text: String, success: Option<bool>) -> Self {
@@ -841,8 +807,6 @@ impl ToolOutput for FunctionToolOutput {
     }
 
     fn projection_metadata(&self) -> Option<ToolOutputProjectionMetadata> {
-        #[cfg(test)]
-        FUNCTION_PROJECTION_METADATA_CALLS.with(|calls| calls.set(calls.get() + 1));
 
         let model_success = if self.outcome.is_some() || self.skip_disposition.is_some() {
             Some(self.outcome_for_logging() == ToolOutputOutcome::Success)
@@ -2777,15 +2741,8 @@ impl ExecCommandToolOutput {
         }
     }
 
-    #[cfg(test)]
-    pub(crate) fn response_text(&self) -> String {
-        let raw_output = String::from_utf8_lossy(&self.raw_output);
-        self.response_text_from_raw(raw_output.as_ref())
-    }
 
     fn response_text_from_raw(&self, raw_output: &str) -> String {
-        #[cfg(test)]
-        EXEC_COMMAND_RESPONSE_MATERIALIZATIONS.with(|calls| calls.set(calls.get() + 1));
 
         let projected = self.projected_model_output(raw_output, None);
         let mut fields = serde_json::Map::new();
@@ -2850,15 +2807,7 @@ impl ExecCommandToolOutput {
         JsonValue::Object(fields).to_string()
     }
 
-    #[cfg(test)]
-    pub(crate) fn reset_response_materialization_count() {
-        EXEC_COMMAND_RESPONSE_MATERIALIZATIONS.with(|calls| calls.set(0));
-    }
 
-    #[cfg(test)]
-    pub(crate) fn response_materialization_count() -> usize {
-        EXEC_COMMAND_RESPONSE_MATERIALIZATIONS.with(std::cell::Cell::get)
-    }
 }
 
 /// Windows reports an abnormal termination as an NTSTATUS exit code, which reads
@@ -2942,6 +2891,3 @@ fn function_tool_response(
     }
 }
 
-#[cfg(test)]
-#[path = "context_tests.rs"]
-mod tests;

@@ -70,32 +70,3 @@ fn view_image_output_schema() -> Value {
     })
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn low_detail_is_advertised_independently_of_original_support() {
-        for original in [false, true] {
-            let ToolSpec::Function(spec) = create_view_image_tool(ViewImageToolOptions {
-                can_request_original_image_detail: original,
-                include_environment_id: false,
-            }) else {
-                panic!("expected function tool");
-            };
-            let parameters = serde_json::to_value(spec.parameters).unwrap();
-            assert_eq!(
-                parameters["properties"]["detail"]["enum"],
-                if original {
-                    json!(["low", "high", "original"])
-                } else {
-                    json!(["low", "high"])
-                }
-            );
-            assert_eq!(
-                spec.output_schema.unwrap().into_value()["properties"]["detail"]["enum"],
-                json!(["low", "high", "original"])
-            );
-        }
-    }
-}

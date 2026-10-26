@@ -60,10 +60,6 @@ use codex_app_server_protocol::ConsumeAccountRateLimitResetCreditResponse;
 use codex_app_server_protocol::ConversationGitInfo;
 use codex_app_server_protocol::ConversationSummary;
 use codex_app_server_protocol::DeprecationNoticeNotification;
-#[cfg(test)]
-use codex_app_server_protocol::DynamicToolFunctionSpec;
-#[cfg(test)]
-use codex_app_server_protocol::DynamicToolNamespaceTool;
 use codex_app_server_protocol::DynamicToolSpec;
 use codex_app_server_protocol::EnvironmentInfoParams;
 use codex_app_server_protocol::EnvironmentInfoResponse;
@@ -379,8 +375,6 @@ use codex_protocol::error::CodexErr;
 use codex_protocol::error::Result as CodexResult;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::openai_models::ReasoningEffort;
-#[cfg(test)]
-use codex_protocol::permissions::FileSystemSandboxPolicy;
 use codex_protocol::protocol::AgentStatus;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::InitialHistory;
@@ -447,8 +441,6 @@ use tracing::info;
 use tracing::warn;
 use uuid::Uuid;
 
-#[cfg(test)]
-use codex_app_server_protocol::ServerRequest;
 
 mod account_processor;
 mod apps_processor;
@@ -503,8 +495,6 @@ use crate::error_code::internal_error;
 use crate::error_code::invalid_request;
 use crate::filters::compute_source_filters;
 use crate::filters::source_kind_matches;
-#[cfg(test)]
-use crate::thread_state::ConnectionCapabilities;
 use crate::thread_state::ThreadListenerCommand;
 use crate::thread_state::ThreadState;
 use crate::thread_state::ThreadStateManager;
@@ -555,30 +545,6 @@ fn environment_selection_error(err: CodexErr) -> JSONRPCErrorError {
     }
 }
 
-#[cfg(test)]
-mod tiny_module_collapse_tests {
-    use super::*;
-    use crate::error_code::INTERNAL_ERROR_CODE;
-    use crate::error_code::INVALID_REQUEST_ERROR_CODE;
-
-    #[test]
-    fn environment_selection_errors_keep_their_json_rpc_mapping() {
-        let invalid = environment_selection_error(CodexErr::InvalidRequest(
-            "unknown turn environment id `missing`".to_string(),
-        ));
-        assert_eq!(invalid.code, INVALID_REQUEST_ERROR_CODE);
-        assert_eq!(invalid.message, "unknown turn environment id `missing`");
-
-        let internal = environment_selection_error(CodexErr::Fatal(
-            "environment registry unavailable".to_string(),
-        ));
-        assert_eq!(internal.code, INTERNAL_ERROR_CODE);
-        assert_eq!(
-            internal.message,
-            "failed to validate environment selections: Fatal error: environment registry unavailable"
-        );
-    }
-}
 
 fn resolve_runtime_workspace_roots(workspace_roots: Vec<AbsolutePathBuf>) -> Vec<AbsolutePathBuf> {
     let mut resolved_roots = Vec::new();

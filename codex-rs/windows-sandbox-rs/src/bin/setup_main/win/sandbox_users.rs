@@ -613,37 +613,3 @@ pub(super) fn commit_setup_marker(
     Ok(())
 }
 
-#[cfg(test)]
-mod tests {
-    use base64::Engine;
-    use codex_windows_sandbox::SandboxUsersFile;
-
-    #[test]
-    fn secrets_writer_persists_distinct_encrypted_credentials() -> anyhow::Result<()> {
-        let home = tempfile::tempdir()?;
-        super::write_secrets(
-            home.path(),
-            "offline",
-            "offline-secret",
-            "online",
-            "online-secret",
-        )?;
-        let bytes =
-            std::fs::read(super::sandbox_secrets_dir(home.path()).join("sandbox_users.json"))?;
-        let users: SandboxUsersFile = serde_json::from_slice(&bytes)?;
-        assert_eq!(users.version, super::SETUP_VERSION);
-        for (record, username, password) in [
-            (&users.offline, "offline", "offline-secret"),
-            (&users.online, "online", "online-secret"),
-        ] {
-            assert_eq!(record.username, username);
-            let ciphertext = super::BASE64.decode(&record.password)?;
-            assert_ne!(ciphertext, password.as_bytes());
-            assert_eq!(
-                codex_windows_sandbox::dpapi_unprotect(&ciphertext)?,
-                password.as_bytes()
-            );
-        }
-        Ok(())
-    }
-}

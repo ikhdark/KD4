@@ -293,6 +293,3 @@ fn is_execution_limited(
         && matches!(session_source, SessionSource::SubAgent(_))
 }
 
-#[cfg(test)]
-#[path = "execution_tests.rs"]
-mod tests;

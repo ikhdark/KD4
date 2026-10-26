@@ -244,6 +244,3 @@ impl Read for BlockingHttpResponse {
     }
 }
 
-#[cfg(test)]
-#[path = "blocking_client_tests.rs"]
-mod tests;

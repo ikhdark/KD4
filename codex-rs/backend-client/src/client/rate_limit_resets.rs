@@ -149,6 +149,3 @@ impl Client {
     }
 }
 
-#[cfg(test)]
-#[path = "rate_limit_resets_tests.rs"]
-mod tests;

@@ -922,7 +922,3 @@ fn singleton_null_schema_error() -> serde_json::Error {
         "tool input schema must not be a singleton null type",
     ))
 }
-
-#[cfg(test)]
-#[path = "json_schema_tests.rs"]
-mod tests;

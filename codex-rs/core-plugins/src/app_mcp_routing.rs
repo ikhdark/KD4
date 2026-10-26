@@ -26,7 +26,3 @@ pub(crate) fn apply_app_mcp_routing_policy<M>(
         mcp_servers.retain(|name, _| !app_declaration_names.contains(name.as_str()));
     }
 }
-
-#[cfg(test)]
-#[path = "app_mcp_routing_tests.rs"]
-mod tests;

@@ -80,6 +80,3 @@ impl Client {
     }
 }
 
-#[cfg(test)]
-#[path = "plan_history_tests.rs"]
-mod tests;

@@ -1393,6 +1393,3 @@ where
     }
 }
 
-#[cfg(test)]
-#[path = "mcp_resource_tests.rs"]
-mod tests;

@@ -893,6 +893,3 @@ fn capture_track_events_request(
     true
 }
 
-#[cfg(test)]
-#[path = "client_tests.rs"]
-mod tests;

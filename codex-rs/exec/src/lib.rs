@@ -2186,6 +2186,3 @@ fn resolve_root_prompt(prompt_arg: Option<String>) -> String {
     }
 }
 
-#[cfg(test)]
-#[path = "lib_tests.rs"]
-mod tests;

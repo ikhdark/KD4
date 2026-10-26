@@ -23,13 +23,3 @@ windows-sys = { workspace = true, features = [
     "Win32_Storage_FileSystem",
     "Win32_System_SystemServices",
 ] }
-
-[dev-dependencies]
-pretty_assertions = { workspace = true }
-tempfile = { workspace = true }
-tokio = { workspace = true, features = [
-    "io-util",
-    "macros",
-    "rt-multi-thread",
-    "time",
-] }

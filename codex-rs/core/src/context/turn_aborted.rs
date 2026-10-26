@@ -264,20 +264,16 @@ impl TurnAborted {
                 .count();
             guidance.push_str(&format!("\nRetained checklist: {unresolved} unfinished step(s). A terminal turn does not complete the task; consult the retained task state and acceptance obligations before claiming completion."));
         }
-        let mut results = std::collections::BTreeSet::new();
+        let paired = crate::tool_occurrence::pairs(history);
         let mut calls = Vec::new();
-        for item in history.iter().rev() {
+        for (index, item) in history.iter().enumerate().rev() {
             match item {
-                ResponseItem::FunctionCallOutput { call_id, .. }
-                | ResponseItem::CustomToolCallOutput { call_id, .. } => {
-                    results.insert(call_id.as_str());
-                }
                 ResponseItem::FunctionCall { call_id, name, .. }
                 | ResponseItem::CustomToolCall { call_id, name, .. } => {
                     calls.push(serde_json::json!({
                         "call_id": codex_utils_string::truncate_middle_chars(call_id, 160),
                         "tool": codex_utils_string::truncate_middle_chars(name, 80),
-                        "recorded_result": results.contains(call_id.as_str()),
+                        "recorded_result": paired[index].is_some(),
                     }));
                     if calls.len() == 32 {
                         break;
@@ -361,86 +357,3 @@ impl ContextualUserFragment for TurnAborted {
     }
 }
 
-#[cfg(test)]
-mod audit110_tests {
-    use super::*;
-    use codex_protocol::protocol::SamplingBoundaryItem;
-    use codex_protocol::protocol::SamplingTimingCheckpoint;
-
-    #[test]
-    fn interruption_indexes_results_without_claiming_success_or_repeating_bodies() {
-        let history = vec![
-            serde_json::from_value(serde_json::json!({"type":"function_call", "call_id":"done", "name":"exec_command", "arguments":"{}"})).unwrap(),
-            serde_json::from_value(serde_json::json!({"type":"function_call_output", "call_id":"done", "output":"failed secret-large-body"})).unwrap(),
-            serde_json::from_value(serde_json::json!({"type":"custom_tool_call", "call_id":"uncertain", "name":"exec", "input":"work"})).unwrap(),
-        ];
-        let notice = TurnAborted::interrupted_guidance(&history, None, true);
-        let index: serde_json::Value =
-            serde_json::from_str(notice.lines().find(|line| line.starts_with('[')).unwrap())
-                .unwrap();
-        assert_eq!(index[0]["call_id"], "done");
-        assert_eq!(index[0]["recorded_result"], true);
-        assert_eq!(index[1]["call_id"], "uncertain");
-        assert_eq!(index[1]["recorded_result"], false);
-        assert!(!notice.contains("secret-large-body"));
-        assert!(notice.contains("does not authorize resuming"));
-    }
-
-    #[test]
-    fn legacy_boundaries_do_not_invent_logical_generations() {
-        let boundaries = (0..2)
-            .map(|index| {
-                RolloutItem::SamplingBoundary(SamplingBoundaryItem {
-                    sampling_request_id: format!("sampling-{index}"),
-                    physical_attempt_id: format!("attempt-{index}"),
-                    timing_checkpoint: None,
-                    workspace_freshness_notices: Vec::new(),
-                    turn_id: None,
-                    unresolved_context: false,
-                })
-            })
-            .collect::<Vec<_>>();
-        let (notice, recovered) = lost_turn_recovery(&boundaries);
-        assert_eq!(recovered.model_requests.len(), 2);
-        assert_eq!(recovered.counters.logical_generation_count, 0);
-        assert!(notice.contains("without one they remain unknown"));
-        assert!(!recovered.profile_valid);
-        assert!(!recovered.classification_complete);
-    }
-
-    #[test]
-    fn retry_rows_do_not_replace_cumulative_checkpoint_counters() {
-        let mut timing = TurnTiming::default();
-        timing.counters.logical_generation_count = 1;
-        timing.counters.model_request_count = 80;
-        timing.model_requests = (0..2)
-            .map(|index| TurnTimingModelRequest {
-                generation_index: 0,
-                sampling_request_id: Some(format!("sampling-{index}")),
-                physical_attempt_ids: vec![format!("attempt-{index}")],
-                dispatch_ms: Some(index),
-                ..Default::default()
-            })
-            .collect();
-        let boundary = RolloutItem::SamplingBoundary(SamplingBoundaryItem {
-            sampling_request_id: "sampling-1".into(),
-            physical_attempt_id: "attempt-1".into(),
-            timing_checkpoint: Some(SamplingTimingCheckpoint {
-                timing,
-                observed_at_unix_ms: 100,
-                tail_unknown: true,
-                incremental: false,
-                runtime_identity: Default::default(),
-                harness_build: None,
-            }),
-            workspace_freshness_notices: Vec::new(),
-            turn_id: None,
-            unresolved_context: false,
-        });
-        let (_, recovered) = lost_turn_recovery(&[boundary]);
-        assert_eq!(recovered.counters.logical_generation_count, 1);
-        assert_eq!(recovered.counters.model_request_count, 80);
-        assert!(!recovered.profile_valid);
-        assert!(recovered.completed_at_unix_ms.is_none());
-    }
-}

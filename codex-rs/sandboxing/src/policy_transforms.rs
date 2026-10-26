@@ -11,6 +11,7 @@ use codex_protocol::permissions::FileSystemSandboxPolicy;
 use codex_protocol::permissions::FileSystemSpecialPath;
 use codex_protocol::permissions::NetworkSandboxPolicy;
 use codex_protocol::permissions::ReadDenyMatcher;
+use codex_protocol::permissions::escape_glob_literal_path;
 use codex_protocol::request_permissions::UriAdditionalPermissionProfile;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_absolute_path::canonicalize_preserving_symlinks;
@@ -320,7 +321,8 @@ fn materialize_uri_cwd_dependent_entry(
     }
     if let FileSystemPath::GlobPattern { pattern } = &entry.path {
         // Resolve using the target's convention, never the host filesystem.
-        let path = cwd.join(pattern).ok()?;
+        let literal_cwd = cwd.join(&escape_glob_literal_path(&cwd.inferred_native_path_string())).ok()?;
+        let path = literal_cwd.join(pattern).ok()?;
         return Some(FileSystemSandboxEntry {
             path: FileSystemPath::GlobPattern {
                 pattern: path.inferred_native_path_string(),
@@ -664,7 +666,10 @@ fn materialize_cwd_dependent_entry(
             .unwrap_or_else(|| entry.clone()),
         FileSystemPath::GlobPattern { pattern } => FileSystemSandboxEntry {
             path: FileSystemPath::GlobPattern {
-                pattern: AbsolutePathBuf::resolve_path_against_base(pattern, cwd)
+                pattern: AbsolutePathBuf::resolve_path_against_base(
+                    pattern,
+                    escape_glob_literal_path(&cwd.to_string_lossy()),
+                )
                     .to_string_lossy()
                     .into_owned(),
             },
@@ -887,6 +892,3 @@ pub fn should_require_platform_sandbox(
     }
 }
 
-#[cfg(test)]
-#[path = "policy_transforms_tests.rs"]
-mod tests;

@@ -124,6 +124,3 @@ pub async fn detect_fsmonitor_override(
     }
 }
 
-#[cfg(test)]
-#[path = "fsmonitor_tests.rs"]
-mod tests;

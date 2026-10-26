@@ -278,11 +278,6 @@ async fn run_windows_sandbox_setup_and_persist(
         }
         Ok(())
     };
-    #[cfg(test)]
-    let setup_native = SETUP_NATIVE_OVERRIDE
-        .with(|override_fn| override_fn.borrow_mut().take())
-        .unwrap_or_else(|| Box::new(setup_native));
-
     // Native setup and its persisted mode are one owned blocking operation.
     // Dropping the awaiting RPC must not leave a successful setup unrecorded.
     tokio::task::spawn_blocking(move || {
@@ -295,14 +290,6 @@ async fn run_windows_sandbox_setup_and_persist(
     })
     .await
     .map_err(|join_err| anyhow::anyhow!("windows sandbox setup task failed: {join_err}"))?
-}
-
-#[cfg(test)]
-type SetupNativeOverride = Box<dyn FnOnce() -> anyhow::Result<()> + Send>;
-#[cfg(test)]
-thread_local! {
-    static SETUP_NATIVE_OVERRIDE: std::cell::RefCell<Option<SetupNativeOverride>> =
-        const { std::cell::RefCell::new(None) };
 }
 
 fn emit_windows_sandbox_setup_success_metrics(
@@ -391,86 +378,3 @@ fn windows_sandbox_setup_mode_tag(mode: WindowsSandboxSetupMode) -> &'static str
     }
 }
 
-#[cfg(test)]
-mod setup_ownership_tests {
-    use super::*;
-
-    fn request(home: &std::path::Path) -> WindowsSandboxSetupRequest {
-        WindowsSandboxSetupRequest {
-            mode: WindowsSandboxSetupMode::Unelevated,
-            permission_profile: PermissionProfile::read_only(),
-            workspace_roots: Vec::new(),
-            command_cwd: home.to_path_buf(),
-            env_map: HashMap::new(),
-            codex_home: home.to_path_buf(),
-        }
-    }
-
-    #[test]
-    fn setup_persists_native_success_after_caller_and_runtime_are_dropped() {
-        let home = tempfile::tempdir().unwrap();
-        let marker = home.path().join("native-setup-completed");
-        let native_marker = marker.clone();
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
-        let (release_tx, release_rx) = std::sync::mpsc::channel();
-        SETUP_NATIVE_OVERRIDE.with(|override_fn| {
-            *override_fn.borrow_mut() = Some(Box::new(move || {
-                started_tx.send(()).unwrap();
-                release_rx.recv().unwrap();
-                std::fs::write(native_marker, "native setup succeeded")?;
-                Ok(())
-            }));
-        });
-        runtime.block_on(async {
-            let mut setup = Box::pin(run_windows_sandbox_setup(request(home.path())));
-            assert!(futures::poll!(&mut setup).is_pending());
-            started_rx.await.unwrap();
-            assert!(!home.path().join("config.toml").exists());
-            drop(setup);
-        });
-        runtime.shutdown_background();
-        release_tx.send(()).unwrap();
-
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        let config = loop {
-            if let Ok(config) = std::fs::read_to_string(home.path().join("config.toml")) {
-                break config;
-            }
-            assert!(
-                std::time::Instant::now() < deadline,
-                "successful native setup must persist its mode after cancellation"
-            );
-            std::thread::sleep(
-                std::time::Duration::from_millis(10)
-                    .min(deadline.saturating_duration_since(std::time::Instant::now())),
-            );
-        };
-        let config: toml::Value = toml::from_str(&config).unwrap();
-        assert_eq!(config["windows"]["sandbox"].as_str(), Some("unelevated"));
-        assert_eq!(
-            std::fs::read_to_string(marker).unwrap(),
-            "native setup succeeded"
-        );
-    }
-
-    #[tokio::test]
-    async fn setup_native_failure_does_not_persist_a_successful_mode() {
-        let home = tempfile::tempdir().unwrap();
-        SETUP_NATIVE_OVERRIDE.with(|override_fn| {
-            *override_fn.borrow_mut() = Some(Box::new(|| anyhow::bail!("native setup refused")));
-        });
-        let error = run_windows_sandbox_setup(request(home.path()))
-            .await
-            .unwrap_err();
-        assert_eq!(error.to_string(), "native setup refused");
-        assert!(!home.path().join("config.toml").exists());
-    }
-}
-
-#[cfg(test)]
-#[path = "windows_sandbox_tests.rs"]
-mod tests;

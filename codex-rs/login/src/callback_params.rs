@@ -24,6 +24,3 @@ pub(crate) fn login_callback_result_from_state(
         })
 }
 
-#[cfg(test)]
-#[path = "callback_params_tests.rs"]
-mod tests;

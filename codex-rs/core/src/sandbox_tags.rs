@@ -58,7 +58,3 @@ pub(crate) fn permission_profile_policy_tag(
         }
     }
 }
-
-#[cfg(test)]
-#[path = "sandbox_tags_tests.rs"]
-mod tests;

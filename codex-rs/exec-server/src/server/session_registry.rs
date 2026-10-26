@@ -14,9 +14,6 @@ use crate::rpc::session_already_attached;
 use crate::server::process_handler::ProcessHandler;
 use crate::telemetry::ExecServerTelemetry;
 
-#[cfg(test)]
-const DETACHED_SESSION_TTL: Duration = Duration::from_millis(200);
-#[cfg(not(test))]
 const DETACHED_SESSION_TTL: Duration = Duration::from_secs(30);
 
 pub(crate) struct SessionRegistry {
@@ -124,16 +121,6 @@ impl SessionRegistry {
         })
     }
 
-    #[cfg(test)]
-    pub(crate) async fn process_for_test(&self, session_id: &str) -> ProcessHandler {
-        self.sessions
-            .lock()
-            .await
-            .get(session_id)
-            .expect("registered session")
-            .process
-            .clone()
-    }
 
     pub(crate) async fn shutdown(&self) {
         let sessions = std::mem::take(&mut *self.sessions.lock().await);

@@ -784,6 +784,3 @@ fn trace_client_selection(duration: Duration, client_cache_hit: bool) {
     );
 }
 
-#[cfg(test)]
-#[path = "route_aware_client_pool_tests.rs"]
-mod tests;

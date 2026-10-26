@@ -124,6 +124,3 @@ impl AnalyticsSession {
     }
 }
 
-#[cfg(test)]
-#[path = "analytics_session_tests.rs"]
-mod tests;

@@ -189,7 +189,3 @@ pub fn parse_dynamic_tool(
         defer_loading: tool.defer_loading,
     })
 }
-
-#[cfg(test)]
-#[path = "dynamic_tool_tests.rs"]
-mod tests;

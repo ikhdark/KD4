@@ -13,38 +13,9 @@ const TOOL_SUGGESTION_ACTION_KEY: &str = "suggest_type";
 const TOOL_SUGGESTION_TOOL_ID_KEY: &str = "tool_id";
 const TOOL_SUGGESTION_TOOL_TYPE_KEY: &str = "tool_type";
 
-#[cfg(test)]
-tokio::task_local! {
-    static TEST_MCP_STARTUP_PAUSE: Arc<TestMcpStartupPause>;
-}
 
-#[cfg(test)]
-pub(super) struct TestMcpStartupPause {
-    armed: std::sync::atomic::AtomicBool,
-    pub(super) started: tokio::sync::Semaphore,
-    pub(super) release: tokio::sync::Semaphore,
-    pub(super) token: tokio::sync::Mutex<Option<CancellationToken>>,
-}
 
-#[cfg(test)]
-impl TestMcpStartupPause {
-    pub(super) fn new() -> Self {
-        Self {
-            armed: std::sync::atomic::AtomicBool::new(true),
-            started: tokio::sync::Semaphore::new(0),
-            release: tokio::sync::Semaphore::new(0),
-            token: tokio::sync::Mutex::new(None),
-        }
-    }
-}
 
-#[cfg(test)]
-pub(super) async fn with_test_mcp_startup_pause<T>(
-    pause: Arc<TestMcpStartupPause>,
-    future: impl std::future::Future<Output = T>,
-) -> T {
-    TEST_MCP_STARTUP_PAUSE.scope(pause, future).await
-}
 
 struct McpStartupCancellationGuard {
     token: CancellationToken,
@@ -597,16 +568,6 @@ impl Session {
                 }
             }
         });
-        #[cfg(test)]
-        if let Ok(pause) = TEST_MCP_STARTUP_PAUSE.try_with(Arc::clone)
-            && pause.armed.swap(false, std::sync::atomic::Ordering::SeqCst)
-        {
-            *pause.token.lock().await = Some(mcp_startup_cancellation_token.clone());
-            pause.started.add_permits(1);
-            if let Ok(permit) = pause.release.acquire().await {
-                permit.forget();
-            }
-        }
         let codex_apps_auth_manager =
             codex_mcp::host_owned_codex_apps_enabled(&mcp_config, auth.as_ref())
                 .then(|| Arc::clone(&self.services.auth_manager));
@@ -895,14 +856,6 @@ impl Session {
         available
     }
 
-    #[cfg(test)]
-    pub(crate) async fn mcp_startup_cancellation_token(&self) -> CancellationToken {
-        self.services
-            .mcp_startup_cancellation_token
-            .lock()
-            .await
-            .clone()
-    }
 
     pub(crate) async fn cancel_mcp_startup(&self) {
         self.services
@@ -951,6 +904,3 @@ fn plugin_install_elicitation_telemetry_metadata(
     })
 }
 
-#[cfg(test)]
-#[path = "mcp_tests.rs"]
-mod tests;

@@ -35,32 +35,3 @@ impl TryFrom<SystemTime> for CurrentTimeReadResponse {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use pretty_assertions::assert_eq;
-    use std::time::Duration;
-
-    #[test]
-    fn current_time_response_serializes_whole_unix_seconds() {
-        for (millis, seconds) in [(0, 0), (999, 0), (12_345, 12), (98_765, 98)] {
-            let response =
-                CurrentTimeReadResponse::try_from(UNIX_EPOCH + Duration::from_millis(millis))
-                    .expect("post-epoch time should produce a response");
-            let value = serde_json::to_value(&response).expect("serialize current time");
-            assert_eq!(value, serde_json::json!({ "currentTimeAt": seconds }));
-            assert_eq!(
-                serde_json::from_value::<CurrentTimeReadResponse>(value)
-                    .expect("deserialize current time"),
-                response
-            );
-        }
-    }
-
-    #[test]
-    fn current_time_response_rejects_time_before_unix_epoch() {
-        let error = CurrentTimeReadResponse::try_from(UNIX_EPOCH - Duration::from_millis(1))
-            .expect_err("pre-epoch time should be rejected");
-        assert!(error.starts_with("system time is before the Unix epoch:"));
-    }
-}

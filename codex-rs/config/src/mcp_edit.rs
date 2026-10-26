@@ -380,7 +380,3 @@ where
     }
     TomlItem::Table(table)
 }
-
-#[cfg(test)]
-#[path = "mcp_edit_tests.rs"]
-mod tests;

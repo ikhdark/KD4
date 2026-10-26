@@ -47,15 +47,6 @@ windows-sys = { workspace = true, features = [
 [lints]
 workspace = true
 
-[dev-dependencies]
-codex-utils-cargo-bin = { workspace = true }
-hex = { workspace = true }
-opentelemetry_sdk = { workspace = true }
-pretty_assertions = { workspace = true }
-rcgen = { workspace = true }
-tempfile = { workspace = true }
-tokio = { workspace = true, features = ["test-util"] }
-tracing-subscriber = { workspace = true }
 
 [lib]
 doctest = false

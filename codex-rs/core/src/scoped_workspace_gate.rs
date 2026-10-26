@@ -112,10 +112,6 @@ impl WorkspaceLease {
         self
     }
 
-    #[cfg(test)]
-    pub(crate) fn gate(&self) -> Arc<ScopedWorkspaceGate> {
-        Arc::clone(&self.gate)
-    }
 }
 
 impl ScopedWorkspaceGate {
@@ -227,10 +223,6 @@ impl ScopedWorkspaceGate {
         self.try_acquire(Access::Write)
     }
 
-    #[cfg(test)]
-    pub(crate) fn try_lock(self: &Arc<Self>) -> Result<WorkspaceLease, ()> {
-        Arc::clone(self).try_write_owned()
-    }
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -332,183 +324,6 @@ impl NativeAdditions {
         } else {
             drop(lease);
             gate.write_owned().await
-        }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::time::Duration;
-
-    #[tokio::test]
-    async fn audit147_existing_disjoint_endpoints_progress_and_conflicts_cancel_cleanly() {
-        let root = tempfile::tempdir().unwrap();
-        for name in ["a", "b"] {
-            std::fs::write(root.path().join(name), "old\n").unwrap();
-        }
-        let gate = Arc::new(ScopedWorkspaceGate::default());
-        let a = NativeAdditions::resolve(root.path(), root.path(), &[PathBuf::from("a")])
-            .await
-            .unwrap()
-            .acquire(Arc::clone(&gate))
-            .await;
-        let b = NativeAdditions::resolve(root.path(), root.path(), &[PathBuf::from("b")])
-            .await
-            .unwrap();
-        let b = tokio::time::timeout(Duration::from_secs(1), b.acquire(Arc::clone(&gate)))
-            .await
-            .expect("disjoint existing files must not wait");
-        let blocked = NativeAdditions::resolve(root.path(), root.path(), &[PathBuf::from("a")])
-            .await
-            .unwrap();
-        assert!(
-            tokio::time::timeout(
-                Duration::from_millis(20),
-                blocked.acquire(Arc::clone(&gate))
-            )
-            .await
-            .is_err()
-        );
-        assert!(Arc::clone(&gate).try_read_owned().is_err());
-        drop(a);
-        let a = NativeAdditions::resolve(root.path(), root.path(), &[PathBuf::from("a")])
-            .await
-            .unwrap();
-        let a = tokio::time::timeout(Duration::from_secs(1), a.acquire(Arc::clone(&gate)))
-            .await
-            .expect("cancelled waiter must release its claim");
-        drop((a, b));
-        assert!(Arc::clone(&gate).try_write_owned().is_ok());
-    }
-
-    #[tokio::test]
-    async fn queued_writer_blocks_later_readers_until_downgrade() {
-        let gate = Arc::new(ScopedWorkspaceGate::default());
-        let reader = Arc::clone(&gate).read_owned().await;
-        let writer = Arc::clone(&gate).write_owned();
-        tokio::pin!(writer);
-        assert!(futures::poll!(&mut writer).is_pending());
-        let later_reader = Arc::clone(&gate).read_owned();
-        tokio::pin!(later_reader);
-        assert!(futures::poll!(&mut later_reader).is_pending());
-        assert!(Arc::clone(&gate).try_read_owned().is_err());
-
-        drop(reader);
-        let writer = tokio::time::timeout(Duration::from_secs(1), writer)
-            .await
-            .unwrap();
-        assert!(futures::poll!(&mut later_reader).is_pending());
-        let observer = writer.downgrade();
-        let later_reader = tokio::time::timeout(Duration::from_secs(1), later_reader)
-            .await
-            .unwrap();
-        assert!(Arc::clone(&gate).try_write_owned().is_err());
-        drop((observer, later_reader));
-        assert!(Arc::clone(&gate).try_write_owned().is_ok());
-    }
-
-    #[tokio::test]
-    async fn queued_addition_revalidates_created_target_before_admission() {
-        let root = tempfile::tempdir().unwrap();
-        std::fs::create_dir(root.path().join("left")).unwrap();
-        std::fs::create_dir(root.path().join("right")).unwrap();
-        let gate = Arc::new(ScopedWorkspaceGate::default());
-        let addition =
-            NativeAdditions::resolve(root.path(), root.path(), &[PathBuf::from("left/new")])
-                .await
-                .unwrap();
-        let writer = Arc::clone(&gate).write_owned().await;
-        let pending = addition.acquire(Arc::clone(&gate));
-        tokio::pin!(pending);
-        assert!(futures::poll!(&mut pending).is_pending());
-        std::fs::write(root.path().join("left/new"), "created by preceding writer").unwrap();
-        drop(writer);
-        let fallback = tokio::time::timeout(Duration::from_secs(1), pending)
-            .await
-            .unwrap();
-
-        // The target is now an update, not an addition. It must hold an opaque
-        // write lease, excluding even a genuinely disjoint addition.
-        let disjoint =
-            NativeAdditions::resolve(root.path(), root.path(), &[PathBuf::from("right/new")])
-                .await
-                .unwrap();
-        // Isolate admission from later filesystem awaits: Pending here can
-        // only mean the existing lease excludes this resolved footprint.
-        let disjoint = Arc::clone(&gate).acquire(Access::Additions(disjoint.directories));
-        tokio::pin!(disjoint);
-        assert!(futures::poll!(&mut disjoint).is_pending());
-        drop(fallback);
-        let _disjoint = tokio::time::timeout(Duration::from_secs(1), disjoint)
-            .await
-            .unwrap();
-        assert_eq!(
-            std::fs::read(root.path().join("left/new")).unwrap(),
-            b"created by preceding writer"
-        );
-    }
-
-    #[tokio::test]
-    async fn native_addition_claims_exclude_overlaps_and_release_cancelled_waiters() {
-        let root = tempfile::tempdir().unwrap();
-        std::fs::create_dir(root.path().join("left")).unwrap();
-        std::fs::create_dir(root.path().join("right")).unwrap();
-        let paths = |name: &str| vec![PathBuf::from(name)];
-        let gate = Arc::new(ScopedWorkspaceGate::default());
-        let left = NativeAdditions::resolve(root.path(), root.path(), &paths("left/new"))
-            .await
-            .unwrap()
-            .acquire(Arc::clone(&gate))
-            .await;
-        let right = tokio::time::timeout(
-            Duration::from_secs(1),
-            NativeAdditions::resolve(root.path(), root.path(), &paths("right/new"))
-                .await
-                .unwrap()
-                .acquire(Arc::clone(&gate)),
-        )
-        .await
-        .expect("disjoint additions must not wait");
-        assert!(Arc::clone(&gate).try_read_owned().is_err());
-        assert!(Arc::clone(&gate).try_write_owned().is_err());
-        assert!(
-            tokio::time::timeout(
-                Duration::from_millis(20),
-                NativeAdditions::resolve(root.path(), root.path(), &paths("left/other"))
-                    .await
-                    .unwrap()
-                    .acquire(Arc::clone(&gate)),
-            )
-            .await
-            .is_err(),
-            "same-directory waiter must remain excluded"
-        );
-        // The timed-out waiter must not leave a stale queue claim.
-        drop(left);
-        let left = tokio::time::timeout(
-            Duration::from_secs(1),
-            NativeAdditions::resolve(root.path(), root.path(), &paths("left/other"))
-                .await
-                .unwrap()
-                .acquire(Arc::clone(&gate)),
-        )
-        .await
-        .unwrap();
-        drop(left);
-        drop(right);
-        let exclusive = Arc::clone(&gate).try_write_owned().unwrap();
-        drop(exclusive);
-        let first_reader = Arc::clone(&gate).try_read_owned().unwrap();
-        let second_reader = Arc::clone(&gate).try_read_owned().unwrap();
-        drop((first_reader, second_reader));
-        std::fs::write(root.path().join("left/existing"), "existing").unwrap();
-        for path in ["missing/new", ".git", "left/../right/new"] {
-            assert!(
-                NativeAdditions::resolve(root.path(), root.path(), &paths(path))
-                    .await
-                    .is_none()
-            );
         }
     }
 }

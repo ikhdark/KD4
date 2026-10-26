@@ -4,7 +4,6 @@ use codex_protocol::models::FunctionCallOutputContentItem;
 use codex_protocol::models::FunctionCallOutputPayload;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::openai_models::InputModality;
-use std::collections::HashSet;
 use uuid::Uuid;
 
 use crate::invariants::error_or_panic;
@@ -16,9 +15,6 @@ pub(super) const MISSING_TOOL_RESULT: &str = "Result unavailable. Execution outc
 // Changing this value would change model-visible IDs and invalidate prompt caches.
 const SYNTHETIC_OUTPUT_ID_NAMESPACE: Uuid = Uuid::from_u128(0x90d38d3e_6a5b_4d52_bfe2_2f1e634bfac4);
 
-#[cfg(test)]
-#[path = "assembly_normalization_tests.rs"]
-mod assembly_normalization_tests;
 
 pub(crate) fn ensure_call_outputs_present(items: &mut Vec<ResponseItem>) {
     let missing_outputs_to_insert = collect_missing_call_outputs(items, true);
@@ -164,40 +160,16 @@ fn synthetic_output_id(prefix: &str, item_id: Option<&str>) -> Option<ResponseIt
 }
 
 pub(crate) fn remove_orphan_outputs(items: &mut Vec<ResponseItem>) {
-    let mut function_call_ids = HashSet::new();
-    let mut tool_search_call_ids = HashSet::new();
-    let mut custom_tool_call_ids = HashSet::new();
-    for item in items.iter() {
-        match item {
-            ResponseItem::FunctionCall { call_id, .. }
-            | ResponseItem::LocalShellCall {
-                call_id: Some(call_id),
-                ..
-            } => {
-                function_call_ids.insert(call_id.as_str());
-            }
-            ResponseItem::ToolSearchCall {
-                call_id: Some(call_id),
-                ..
-            } => {
-                tool_search_call_ids.insert(call_id.as_str());
-            }
-            ResponseItem::CustomToolCall { call_id, .. } => {
-                custom_tool_call_ids.insert(call_id.as_str());
-            }
-            _ => {}
-        }
-    }
+    let paired = crate::tool_occurrence::pairs(items);
 
-    // Find the orphan positions while IDs can still borrow from the history.
-    // Retaining by position then avoids cloning every call ID before mutation.
+    // Find unmatched output occurrences before mutating their positions.
     let orphan_indexes: Vec<usize> = items
         .iter()
         .enumerate()
         .filter_map(|(index, item)| {
             let keep = match item {
                 ResponseItem::FunctionCallOutput { call_id, .. } => {
-                    let has_match = function_call_ids.contains(call_id.as_str());
+                    let has_match = paired[index].is_some();
                     if !has_match {
                         error_or_panic(format!(
                             "Orphan function call output for call id: {call_id}"
@@ -206,7 +178,7 @@ pub(crate) fn remove_orphan_outputs(items: &mut Vec<ResponseItem>) {
                     has_match
                 }
                 ResponseItem::CustomToolCallOutput { call_id, .. } => {
-                    let has_match = custom_tool_call_ids.contains(call_id.as_str());
+                    let has_match = paired[index].is_some();
                     if !has_match {
                         error_or_panic(format!(
                             "Orphan custom tool call output for call id: {call_id}"
@@ -219,7 +191,7 @@ pub(crate) fn remove_orphan_outputs(items: &mut Vec<ResponseItem>) {
                     call_id: Some(call_id),
                     ..
                 } => {
-                    let has_match = tool_search_call_ids.contains(call_id.as_str());
+                    let has_match = paired[index].is_some();
                     if !has_match {
                         error_or_panic(format!("Orphan tool search output for call id: {call_id}"));
                     }

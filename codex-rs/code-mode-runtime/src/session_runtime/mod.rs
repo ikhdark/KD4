@@ -63,20 +63,6 @@ const TERMINAL_SPILL_JOBS: usize = 2;
 const TERMINAL_SPILL_BYTES: usize = 128 * 1024 * 1024;
 const SNAPSHOT_COMMIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
 
-#[cfg(test)]
-struct StorageTestGate {
-    entered: tokio::sync::Notify,
-    release: StdMutex<std::sync::mpsc::Receiver<()>>,
-}
-
-#[cfg(test)]
-impl StorageTestGate {
-    fn wait(&self) {
-        self.entered.notify_one();
-        let _ = self.release.lock().unwrap().recv();
-    }
-}
-
 fn cell_admission_slots(input_bytes: usize, capacity: usize) -> u32 {
     // Charge known input pressure, not a model's claimed workload or an
     // estimate of JS execution time. Retain a hard isolate-count ceiling.
@@ -169,18 +155,8 @@ impl TerminalCellCache {
             })
     }
 
-    #[cfg(test)]
-    fn get(&self, cell_id: &CellId) -> Option<CellEvent> {
-        self.entry(cell_id).and_then(|event| event.read().ok())
-    }
-
     fn entry(&self, cell_id: &CellId) -> Option<Arc<CachedCellEvent>> {
         self.events.get(cell_id).map(|(event, _)| Arc::clone(event))
-    }
-
-    #[cfg(test)]
-    fn insert(&mut self, cell_id: CellId, event: CellEvent) {
-        self.insert_cached(cell_id, CachedCellEvent::new(event));
     }
 
     fn insert_cached(&mut self, cell_id: CellId, (event, bytes): (Arc<CachedCellEvent>, usize)) {
@@ -262,8 +238,6 @@ struct Inner<D: SessionRuntimeDelegate> {
     // Serialize snapshot revisions without locking readers or the cell phase
     // during I/O. A blocking transaction keeps this guard after wait expiry.
     commit_gate: Arc<Mutex<()>>,
-    #[cfg(test)]
-    spill_gate: StdMutex<Option<Arc<StorageTestGate>>>,
     durable_state: tokio::sync::OnceCell<Arc<snapshot::DurableState>>,
     restored_cell_ids: StdMutex<std::collections::HashSet<CellId>>,
     // Initialization excludes only snapshot/permit admission, never native
@@ -319,8 +293,6 @@ impl<D: SessionRuntimeDelegate> SessionRuntime<D> {
             inner: Arc::new(Inner {
                 stored_values: Mutex::new(HashMap::new()),
                 commit_gate: Arc::new(Mutex::new(())),
-                #[cfg(test)]
-                spill_gate: StdMutex::new(None),
                 durable_state: tokio::sync::OnceCell::new(),
                 restored_cell_ids: StdMutex::new(std::collections::HashSet::new()),
                 state_admission: Arc::new(tokio::sync::RwLock::new(())),
@@ -1161,14 +1133,8 @@ impl<D: SessionRuntimeDelegate> CellHost for RuntimeCellHost<D> {
                 Arc::clone(&self.inner.spill_bytes).try_acquire_many_owned(weight)
         {
             let source = Arc::clone(&inline);
-            #[cfg(test)]
-            let gate = self.inner.spill_gate.lock().unwrap().clone();
             let spill = self.inner.storage_tasks.spawn_blocking(move || {
                 let _admission = (job, admitted_bytes);
-                #[cfg(test)]
-                if let Some(gate) = gate {
-                    gate.wait();
-                }
                 let CachedCellEvent::Inline(event) = source.as_ref() else {
                     unreachable!()
                 };
@@ -1256,10 +1222,3 @@ fn actor_error(cell_id: &CellId, error: CellError) -> Error {
         )),
     }
 }
-
-#[cfg(test)]
-#[path = "tests.rs"]
-mod tests;
-
-#[cfg(test)]
-mod read_only_completion_tests;

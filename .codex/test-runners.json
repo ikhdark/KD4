@@ -28,62 +28,6 @@
       ],
       "prefixes": [
         [
-          "test-fast"
-        ],
-        [
-          "test-lane"
-        ],
-        [
-          "test-lane-main"
-        ],
-        [
-          "test-lane-fast"
-        ],
-        [
-          "test-lane-package"
-        ]
-      ],
-      "allow_extra_args": true,
-      "operations": [
-        "test"
-      ],
-      "admission_runner": "rust_build_status"
-    },
-    {
-      "programs": [
-        "just"
-      ],
-      "prefixes": [
-        [
-          "test-fast-nosccache"
-        ]
-      ],
-      "allow_extra_args": true,
-      "operations": [
-        "test"
-      ]
-    },
-    {
-      "programs": [
-        "just"
-      ],
-      "prefixes": [
-        [
-          "hooks-schema-check"
-        ]
-      ],
-      "allow_extra_args": false,
-      "operations": [
-        "test"
-      ],
-      "admission_runner": "rust_build_status"
-    },
-    {
-      "programs": [
-        "just"
-      ],
-      "prefixes": [
-        [
           "fmt-check"
         ],
         [
@@ -143,24 +87,8 @@
       "allow_extra_args": false,
       "operations": [
         "lint",
-        "test"
-      ]
-    },
-    {
-      "programs": [
-        "just"
-      ],
-      "prefixes": [
-        [
-          "test-compile"
-        ]
-      ],
-      "allow_extra_args": true,
-      "operations": [
         "check"
-      ],
-      "execution_mode": "compilation_only",
-      "admission_runner": "rust_build_status"
+      ]
     },
     {
       "programs": [

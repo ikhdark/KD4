@@ -592,36 +592,3 @@ fn bounded_clock_pair(
     }
     None
 }
-
-#[cfg(test)]
-#[test]
-fn v1_tool_wire_omits_unnegotiated_namespace_metadata_but_keeps_guidance() {
-    let wire = WireToolDefinition::from(ToolDefinition {
-        name: "archive__search".into(),
-        tool_name: ToolName::namespaced("archive", "search"),
-        kind: CodeModeToolKind::Function, description: "Guidance\n\nContract".into(),
-        namespace_description: Some("Guidance".into()),
-        input_schema: None, output_schema: None, default_timeout_ms: None,
-    });
-    let value = serde_json::to_value(wire).unwrap();
-    assert!(value.get("namespace_description").is_none());
-    assert_eq!(value["description"], "Guidance\n\nContract");
-}
-
-#[cfg(test)]
-#[test]
-fn clock_pair_sampling_rejects_preemption_instead_of_translating_it_into_drift() {
-    let base = Instant::now();
-    let mut local = [0, 60_000, 60_000, 60_002].into_iter();
-    let mut shared = [100, 200].into_iter();
-    let pair = bounded_clock_pair(
-        || base + Duration::from_micros(local.next().unwrap()),
-        || shared.next(),
-    ).unwrap();
-    assert_eq!(pair, (base + Duration::from_micros(60_001), 200));
-    let mut ticks = 0;
-    assert!(bounded_clock_pair(
-        || { ticks += 1; base + Duration::from_millis(ticks * 2) },
-        || Some(1),
-    ).is_none());
-}

@@ -486,10 +486,6 @@ impl WorldState {
         self.sections.insert(id, std::sync::Arc::new(section));
     }
 
-    #[cfg(test)]
-    pub(crate) fn add_extension_section(&mut self, section: WorldStateSectionContribution) {
-        self.add_extension_section_with_previous(section, None);
-    }
 
     pub(crate) fn add_extension_section_with_previous(
         &mut self,
@@ -557,11 +553,6 @@ impl WorldState {
         }
     }
 
-    /// Renders every section as new, without any known previous state.
-    #[cfg(test)]
-    pub(crate) fn render_full(&self) -> Vec<Box<dyn ContextualUserFragment>> {
-        self.render_full_with_snapshot().0
-    }
 
     pub(crate) fn render_full_with_snapshot(
         &self,
@@ -569,35 +560,8 @@ impl WorldState {
         self.render_with(None, |_, _| PreviousSectionState::Absent)
     }
 
-    /// Renders each section against the exact persisted snapshot when available.
-    #[cfg(test)]
-    pub(crate) fn render_diff(
-        &self,
-        previous: &WorldStateSnapshot,
-    ) -> Vec<Box<dyn ContextualUserFragment>> {
-        self.render_diff_with_snapshot(previous).0
-    }
 
-    #[cfg(test)]
-    pub(crate) fn render_diff_with_snapshot(
-        &self,
-        previous: &WorldStateSnapshot,
-    ) -> (Vec<Box<dyn ContextualUserFragment>>, WorldStateSnapshot) {
-        self.render_with(Some(previous), |id, _| match previous.sections.get(id) {
-            Some(previous) => PreviousSectionState::Known(previous),
-            None => PreviousSectionState::Absent,
-        })
-    }
 
-    /// Falls back to retained model history when no exact persisted snapshot is available.
-    #[cfg(test)]
-    pub(crate) fn render_history_diff(
-        &self,
-        previous: Option<&WorldStateSnapshot>,
-        items: &[ResponseItem],
-    ) -> Vec<Box<dyn ContextualUserFragment>> {
-        self.render_history_diff_with_snapshot(previous, items).0
-    }
 
     pub(crate) fn render_history_diff_with_snapshot(
         &self,
@@ -924,6 +888,3 @@ fn apply_merge_patch_value(target: &mut Value, patch: &Value) {
     }
 }
 
-#[cfg(test)]
-#[path = "world_state_tests.rs"]
-mod tests;

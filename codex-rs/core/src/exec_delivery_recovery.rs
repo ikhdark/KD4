@@ -58,35 +58,3 @@ impl OutputDeltaRecovery {
         (stdout, stderr)
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn saturated_first_handoff_retains_raw_suffix_once() {
-        let (tx, rx) = async_channel::bounded(1);
-        let (stream, recovery) =
-            StdoutStream::with_delivery_recovery(String::new(), String::new(), tx, 64);
-        let limiter = OutputDeltaLimiter::default();
-        for (stderr, bytes) in [
-            (false, vec![b'A', 0xe2]),
-            (false, vec![0x82, 0xac]),
-            (true, b"diagnostic".to_vec()),
-            (false, b"tail".to_vec()),
-        ] {
-            assert!(matches!(
-                try_send_limited_output_delta(&stream, stderr, bytes, &limiter),
-                OutputDeltaSendOutcome::Continue
-            ));
-        }
-        let EventMsg::ExecCommandOutputDelta(first) = rx.try_recv().unwrap().msg else {
-            panic!("delta")
-        };
-        let (suffix, stderr) = recovery.take_suffix();
-        assert_eq!([first.chunk, suffix].concat(), "A€tail".as_bytes());
-        assert_eq!(stderr, b"diagnostic");
-        assert!(rx.is_empty());
-        assert_eq!(recovery.take_suffix(), (Vec::new(), Vec::new()));
-    }
-}

@@ -200,7 +200,7 @@ When authorized, delegate bounded work to generic subagents with `spawn_agent`, 
 
 Assignment design: Before delegating, identify useful local work and a concrete wall-clock benefit after startup, context transfer, and integration. Keep short or immediately blocking work local; overlap cohesive independent work instead of filling slots or splitting by file/phase. For substantial delegated work, divide assignments into independently transferable scopes, estimate their complexity, and avoid disproportionately overloading one worker. For commit-history assignments, balance estimated relevant source/mechanism work rather than equal commit counts or raw artifact lines; split outsized commits across independent subsystem scopes. State each job's scope, restrictions, question to resolve, sufficient closing evidence, and stop condition; provide relevant established findings and counterevidence up front. Across overlapping reports/supplements, identify findings/candidates by report path, local ID and source symbol/title; map mechanism owners up front. Keep independent review read-only and validate against the latest shared snapshot when authorized.
 
-Active workload balancing: You remain responsible for balancing the team's remaining work throughout execution. Reassess promptly on worker completions, blockers, and durable task-progress events. When workers become available, proactively redistribute independent unfinished portions from overloaded workers; do not wait for those workers to finish. Establish exact remaining scope from task/coverage evidence, not liveness alone. Coordinate each transfer with the current owner, preserving exact completed scope, reusable evidence, and known counterevidence so no slice is assigned twice. Avoid needless interruptions, duplicate investigation, and transfers whose overhead exceeds their benefit. Continue useful parent work between checks.
+Active workload balancing: You remain responsible for balancing the team's remaining work throughout execution. Reassess promptly on worker completions, blockers, and durable task-progress events. When a subagent finishes its assignment, use `followup_task` to have it help subagents still working by taking a bounded, independent portion of their unfinished work; do not wait for the remaining subagents to finish. Prefer reusing completed subagents over spawning replacements when doing so has a concrete wall-clock benefit. Establish exact remaining scope from task/coverage evidence, not liveness alone. Coordinate each transfer with the current owner, preserving exact completed scope, reusable evidence, and known counterevidence so no slice is assigned twice. Avoid needless interruptions, duplicate investigation, and transfers whose overhead exceeds their benefit. Continue useful parent work between checks.
 
 During prolonged execution with no relevant event, use approximately five-minute fallback reassessments only where existing runtime wake mechanisms support them, through existing wait deadlines. Never delay event-driven reassessment for that interval or assume a blocking tool can be preempted. Do not add model calls, polling infrastructure, or timers for these checks.
 
@@ -308,25 +308,6 @@ fn resolve_mcp_oauth_credentials_store_mode(
     }
 }
 
-#[cfg(test)]
-pub(crate) async fn test_config() -> Config {
-    let codex_home = tempfile::tempdir().expect("create temp dir");
-    let mut config = Config::load_from_base_config_with_overrides(
-        ConfigToml {
-            model: Some("gpt-5.5".to_string()),
-            ..Default::default()
-        },
-        ConfigOverrides::default(),
-        AbsolutePathBuf::from_absolute_path(codex_home.path()).expect("temp dir should resolve"),
-    )
-    .await
-    .expect("load default test config");
-    // Most core unit tests exercise the legacy collaboration baseline. Keep
-    // that baseline explicit now that multi-agent V2 is enabled by default;
-    // V2-specific tests opt in at their setup boundary.
-    let _ = config.features.disable(Feature::MultiAgentV2);
-    config
-}
 
 /// Application configuration loaded from disk and merged with overrides.
 #[derive(Debug, Clone, PartialEq)]
@@ -1284,10 +1265,6 @@ impl ConfigBuilder {
         .await
     }
 
-    #[cfg(test)]
-    pub(crate) fn without_managed_config_for_tests() -> Self {
-        Self::default().loader_overrides(LoaderOverrides::without_managed_config_for_tests())
-    }
 }
 
 impl Config {
@@ -2672,23 +2649,6 @@ fn validate_multi_agent_v2_tool_namespace(namespace: Option<&str>) -> std::io::R
 }
 
 impl Config {
-    #[cfg(test)]
-    async fn load_from_base_config_with_overrides(
-        cfg: ConfigToml,
-        overrides: ConfigOverrides,
-        codex_home: AbsolutePathBuf,
-    ) -> std::io::Result<Self> {
-        // Note this ignores requirements.toml enforcement for tests.
-        let config_layer_stack = ConfigLayerStack::default();
-        Self::load_config_with_layer_stack(
-            LOCAL_FS.as_ref(),
-            cfg,
-            overrides,
-            codex_home,
-            config_layer_stack,
-        )
-        .await
-    }
 
     pub(crate) async fn load_config_with_layer_stack(
         fs: &dyn ExecutorFileSystem,
@@ -2697,7 +2657,7 @@ impl Config {
         codex_home: AbsolutePathBuf,
         config_layer_stack: ConfigLayerStack,
     ) -> std::io::Result<Self> {
-        // Keep the large config-construction future off small test thread stacks.
+        // Keep the large config-construction future off small caller stacks.
         Box::pin(async move {
         if cfg.experimental_thread_store_endpoint.is_some() {
             return Err(std::io::Error::new(
@@ -3942,10 +3902,4 @@ pub fn log_dir(cfg: &Config) -> std::io::Result<PathBuf> {
     Ok(cfg.log_dir.clone())
 }
 
-#[cfg(test)]
-#[path = "config_tests.rs"]
-mod tests;
 
-#[cfg(test)]
-#[path = "config_loader_tests.rs"]
-mod config_loader_tests;

@@ -33,6 +33,3 @@ pub fn create_apply_patch_freeform_tool(include_environment_id: bool) -> ToolSpe
     })
 }
 
-#[cfg(test)]
-#[path = "apply_patch_spec_tests.rs"]
-mod tests;

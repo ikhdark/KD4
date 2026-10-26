@@ -15,8 +15,5 @@ codex-utils-cache = { workspace = true }
 mime_guess = { workspace = true }
 thiserror = { workspace = true }
 
-[dev-dependencies]
-tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros"] }
-
 [lib]
 doctest = false

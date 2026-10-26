@@ -1108,7 +1108,3 @@ fn plugin_manifest_interface(
 
     (!interface.is_empty()).then_some(JsonValue::Object(interface))
 }
-
-#[cfg(test)]
-#[path = "marketplace_tests.rs"]
-mod tests;

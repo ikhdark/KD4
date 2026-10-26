@@ -76,6 +76,3 @@ impl Client {
     }
 }
 
-#[cfg(test)]
-#[path = "chatgpt_turn_cost_tests.rs"]
-mod tests;

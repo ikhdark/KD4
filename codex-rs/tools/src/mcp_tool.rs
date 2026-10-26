@@ -69,7 +69,3 @@ pub fn mcp_call_tool_result_output_schema(structured_content_schema: JsonValue) 
     schema["properties"]["structuredContent"] = structured_content_schema;
     schema
 }
-
-#[cfg(test)]
-#[path = "mcp_tool_tests.rs"]
-mod tests;

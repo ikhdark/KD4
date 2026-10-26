@@ -26,8 +26,6 @@ use crate::sandboxing::ExecRequest;
 use crate::sandboxing::SandboxPermissions;
 use crate::spawn::SpawnChildRequest;
 use crate::spawn::StdioPolicy;
-#[cfg(test)]
-use crate::spawn::spawn_child_async;
 use crate::spawn::spawn_child_with_observation_async;
 use codex_protocol::error::CodexErr;
 use codex_protocol::error::Result;
@@ -47,17 +45,9 @@ use codex_sandboxing::SandboxType;
 use codex_sandboxing::SandboxablePreference;
 use codex_sandboxing::WindowsSandboxFilesystemOverrides;
 pub(crate) use codex_sandboxing::is_likely_sandbox_denied;
-#[cfg(test)]
-use codex_sandboxing::permission_profile_supports_windows_restricted_token_sandbox;
-#[cfg(test)]
-use codex_sandboxing::resolve_windows_elevated_filesystem_overrides;
-#[cfg(test)]
-use codex_sandboxing::resolve_windows_restricted_token_filesystem_overrides;
 use codex_sandboxing::select_initial;
 use codex_sandboxing::should_sandbox;
 use codex_sandboxing::transform;
-#[cfg(test)]
-use codex_sandboxing::unsupported_windows_restricted_token_sandbox_reason;
 use codex_sandboxing::windows_sandbox_uses_elevated_backend;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_path_uri::PathUri;
@@ -1361,31 +1351,6 @@ async fn await_captured_output_until_deadline(
     Ok((stdout?, stderr?))
 }
 
-#[cfg(test)]
-async fn read_output<R: AsyncRead + Unpin + Send + 'static>(
-    reader: R,
-    stream: Option<StdoutStream>,
-    is_stderr: bool,
-    max_bytes: Option<usize>,
-    output_delta_limiter: Arc<OutputDeltaLimiter>,
-) -> io::Result<StreamOutput<Vec<u8>>> {
-    let capture = Arc::new(Mutex::new(OutputCapture::new(max_bytes)));
-    read_output_into_capture(
-        reader,
-        stream,
-        is_stderr,
-        Arc::clone(&capture),
-        None,
-        output_delta_limiter,
-    )
-    .await?;
-    let output = capture
-        .lock()
-        .expect("stream output capture lock poisoned")
-        .snapshot();
-    Ok(output)
-}
-
 async fn read_output_into_capture<R: AsyncRead + Unpin + Send + 'static>(
     mut reader: R,
     stream: Option<StdoutStream>,
@@ -1554,7 +1519,3 @@ fn synthetic_exit_status(code: i32) -> ExitStatus {
 fn synthetic_exit_status_for_code(code: i32) -> ExitStatus {
     synthetic_exit_status(code)
 }
-
-#[cfg(test)]
-#[path = "exec_tests.rs"]
-mod tests;

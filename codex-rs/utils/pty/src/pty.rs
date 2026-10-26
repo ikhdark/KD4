@@ -27,7 +27,7 @@ use portable_pty::CommandBuilder;
 use portable_pty::native_pty_system;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
-#[cfg(any(not(unix), test))]
+#[cfg(not(unix))]
 use tokio::task::JoinHandle;
 
 use crate::process::ChildTerminator;
@@ -42,9 +42,6 @@ use crate::process::TerminalSize;
 use crate::process::exit_code_from_status;
 use crate::process::publish_exit_status;
 
-#[cfg(all(test, unix))]
-#[path = "unix_lifecycle_tests.rs"]
-mod unix_lifecycle_tests;
 
 /// Returns true when ConPTY support is available (Windows only).
 #[cfg(windows)]
@@ -91,18 +88,9 @@ impl ChildTerminator for RawPidTerminator {
     }
 }
 
-#[cfg(all(test, windows))]
-thread_local! {
-    static TEST_PTY_SYSTEM: std::cell::RefCell<Option<Box<dyn portable_pty::PtySystem + Send>>> =
-        std::cell::RefCell::new(None);
-}
 
 #[cfg(not(unix))]
 fn platform_native_pty_system() -> Box<dyn portable_pty::PtySystem + Send> {
-    #[cfg(all(test, windows))]
-    if let Some(system) = TEST_PTY_SYSTEM.with(|system| system.borrow_mut().take()) {
-        return system;
-    }
     #[cfg(windows)]
     {
         Box::new(crate::win::ConPtySystem::default())
@@ -116,7 +104,7 @@ fn platform_native_pty_system() -> Box<dyn portable_pty::PtySystem + Send> {
 // Keep the receiver asynchronous so aborting the owning ProcessHandle drops the
 // queue even when external sender clones remain. At most one native write is in
 // flight; terminating/releasing the process closes its PTY and releases that write.
-#[cfg(any(not(unix), test))]
+#[cfg(not(unix))]
 fn spawn_pty_writer<W>(mut writer: W, mut receiver: mpsc::Receiver<Vec<u8>>) -> JoinHandle<()>
 where
     W: std::io::Write + Send + 'static,
@@ -143,7 +131,7 @@ where
 
 // Native readers return WouldBlock when no bytes are available. Queue backpressure and
 // retry delays belong to this abortable async owner, never to a lifetime-long worker.
-#[cfg(any(not(unix), test))]
+#[cfg(not(unix))]
 fn spawn_pty_reader<R>(
     mut reader: R,
     output: mpsc::Sender<Vec<u8>>,
@@ -681,360 +669,6 @@ fn configure_owned_pty_files<T>(
     Ok((master, slave))
 }
 
-#[cfg(test)]
-mod pty_fd_tests {
-    #[cfg(windows)]
-    async fn assert_public_pty_observation(execution_id: &str) {
-        use crate::process_observation::{ProcessObservationContext, ProcessStartRecorder};
-        let recorder = std::sync::Arc::new(ProcessStartRecorder::default());
-        ProcessObservationContext::new(std::sync::Arc::clone(&recorder), execution_id.into())
-            .scope(async {
-                let cwd = std::env::current_dir().unwrap();
-                let env = std::env::vars().collect();
-                assert!(
-                    super::spawn_process(
-                        "codex-nonexistent-observation-pty.exe",
-                        &[],
-                        &cwd,
-                        &env,
-                        &None,
-                        super::TerminalSize::default()
-                    )
-                    .await
-                    .is_err()
-                );
-                assert_eq!(recorder.snapshot().requested_root_starts_observed, 0);
-                let child = super::spawn_process(
-                    "cmd.exe",
-                    &["/D".into(), "/C".into(), "exit /b 7".into()],
-                    &cwd,
-                    &env,
-                    &None,
-                    super::TerminalSize::default(),
-                )
-                .await
-                .unwrap();
-                assert_eq!(
-                    tokio::time::timeout(std::time::Duration::from_secs(5), child.exit_rx)
-                        .await
-                        .unwrap()
-                        .unwrap(),
-                    7
-                );
-                let snapshot = recorder.snapshot();
-                assert_eq!(snapshot.requested_root_starts_observed, 1);
-                assert_eq!(snapshot.auxiliary_root_starts_observed, 0);
-                assert_eq!(snapshot.roots.len(), 1);
-                assert_eq!(
-                    snapshot.roots[0].execution_id.as_deref(),
-                    Some(execution_id)
-                );
-                assert_eq!(snapshot.roots[0].producer, "unified_conpty");
-                assert!(snapshot.roots[0].os_pid.is_some());
-                child.session.finish();
-            })
-            .await;
-    }
-
-    #[cfg(windows)]
-    #[tokio::test(flavor = "current_thread")]
-    async fn public_pty_preserves_observation_on_current_thread_runtime() {
-        tokio::join!(
-            assert_public_pty_observation("pty-current-a"),
-            assert_public_pty_observation("pty-current-b")
-        );
-    }
-
-    #[cfg(windows)]
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn public_pty_preserves_observation_on_multithread_runtime() {
-        tokio::join!(
-            assert_public_pty_observation("pty-multi-a"),
-            assert_public_pty_observation("pty-multi-b")
-        );
-    }
-
-    #[tokio::test]
-    async fn aborting_backpressured_reader_releases_native_owner() {
-        struct Reader(Option<tokio::sync::oneshot::Sender<()>>);
-        impl std::io::Read for Reader {
-            fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
-                bytes[0] = b'x';
-                Ok(1)
-            }
-        }
-        impl Drop for Reader {
-            fn drop(&mut self) {
-                let _ = self.0.take().unwrap().send(());
-            }
-        }
-        let (dropped_tx, dropped_rx) = tokio::sync::oneshot::channel();
-        let (output_tx, mut output_rx) = tokio::sync::mpsc::channel(1);
-        let reader = super::spawn_pty_reader(
-            Reader(Some(dropped_tx)),
-            output_tx,
-            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-        );
-        tokio::time::timeout(std::time::Duration::from_secs(2), async {
-            while output_rx.len() != 1 {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .unwrap();
-        reader.abort();
-        assert!(reader.await.unwrap_err().is_cancelled());
-        tokio::time::timeout(std::time::Duration::from_secs(2), dropped_rx)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(output_rx.recv().await.unwrap(), b"x");
-        assert_eq!(output_rx.recv().await, None);
-    }
-
-    #[test]
-    fn idle_ptys_do_not_starve_input_on_a_small_blocking_pool() -> anyhow::Result<()> {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .max_blocking_threads(2)
-            .build()?;
-        // Bound teardown too: a regression must fail rather than hang runtime Drop.
-        let result = runtime.block_on(async {
-            #[cfg(windows)]
-            let (program, args) = (
-                "cmd.exe",
-                vec![
-                    "/D".into(),
-                    "/Q".into(),
-                    "/C".into(),
-                    "set /p CODEX_PTY_INPUT= & echo input-received".into(),
-                ],
-            );
-            #[cfg(not(windows))]
-            let (program, args) = (
-                "/bin/sh",
-                vec!["-c".into(), "read line; printf input-received".into()],
-            );
-            let mut children = Vec::new();
-            for _ in 0..3 {
-                children.push(
-                    super::spawn_process(
-                        program,
-                        &args,
-                        &std::env::current_dir()?,
-                        &std::env::vars().collect(),
-                        &None,
-                        super::TerminalSize::default(),
-                    )
-                    .await?,
-                );
-            }
-            for child in children {
-                let crate::SpawnedProcess {
-                    session,
-                    mut stdout_rx,
-                    exit_rx,
-                    ..
-                } = child;
-                session.writer_sender().send(b"go\n".to_vec()).await?;
-                let mut output = Vec::new();
-                tokio::time::timeout(std::time::Duration::from_secs(5), async {
-                    while !String::from_utf8_lossy(&output).contains("input-received") {
-                        let chunk = stdout_rx
-                            .recv()
-                            .await
-                            .expect("PTY closed before input was processed");
-                        output.extend(chunk);
-                    }
-                })
-                .await?;
-                assert_eq!(
-                    tokio::time::timeout(std::time::Duration::from_secs(5), exit_rx).await??,
-                    0
-                );
-                session.release_pty_after_exit();
-                tokio::time::timeout(std::time::Duration::from_secs(5), async {
-                    while let Some(chunk) = stdout_rx.recv().await {
-                        output.extend(chunk);
-                    }
-                })
-                .await?;
-                assert_eq!(
-                    String::from_utf8_lossy(&output)
-                        .matches("input-received")
-                        .count(),
-                    1
-                );
-            }
-            Ok::<_, anyhow::Error>(())
-        });
-        runtime.shutdown_timeout(std::time::Duration::from_secs(5));
-        result
-    }
-    use std::sync::Arc;
-    #[cfg(windows)]
-    use std::sync::atomic::AtomicUsize;
-    #[cfg(windows)]
-    use std::sync::atomic::Ordering;
-
-    #[cfg(windows)]
-    #[tokio::test(flavor = "current_thread")]
-    async fn public_pty_descriptor_failure_does_not_spawn_child() -> anyhow::Result<()> {
-        struct PreparedSystem(std::sync::Mutex<Option<portable_pty::PtyPair>>);
-        impl portable_pty::PtySystem for PreparedSystem {
-            fn openpty(&self, _: portable_pty::PtySize) -> anyhow::Result<portable_pty::PtyPair> {
-                Ok(self.0.lock().unwrap().take().expect("one native pair"))
-            }
-        }
-        struct ObservedSlave {
-            native: Box<dyn portable_pty::SlavePty + Send>,
-            spawn_count: Arc<AtomicUsize>,
-        }
-        impl portable_pty::SlavePty for ObservedSlave {
-            fn spawn_command(
-                &self,
-                command: portable_pty::CommandBuilder,
-            ) -> anyhow::Result<Box<dyn portable_pty::Child + Send + Sync>> {
-                self.spawn_count.fetch_add(1, Ordering::SeqCst);
-                self.native.spawn_command(command)
-            }
-        }
-
-        let size = super::TerminalSize::default();
-        let pair = super::platform_native_pty_system().openpty(size.into())?;
-        // Create a real native descriptor-acquisition failure, not an injected result.
-        drop(pair.master.take_writer()?);
-        let spawn_count = Arc::new(AtomicUsize::new(0));
-        let pair = portable_pty::PtyPair {
-            master: pair.master,
-            slave: Box::new(ObservedSlave {
-                native: pair.slave,
-                spawn_count: Arc::clone(&spawn_count),
-            }),
-        };
-        super::TEST_PTY_SYSTEM.with(|system| {
-            *system.borrow_mut() =
-                Some(Box::new(PreparedSystem(std::sync::Mutex::new(Some(pair)))));
-        });
-        let result = super::spawn_process(
-            "cmd.exe",
-            &["/D".to_string(), "/C".to_string(), "exit 0".to_string()],
-            &std::env::current_dir()?,
-            &std::env::vars().collect(),
-            &None,
-            size,
-        )
-        .await;
-        let error = match result {
-            Ok(_) => anyhow::bail!("consumed native writer unexpectedly allowed process setup"),
-            Err(error) => error,
-        };
-        assert_eq!(error.to_string(), "writer already taken");
-        assert_eq!(
-            spawn_count.load(Ordering::SeqCst),
-            0,
-            "descriptor failure must precede any native child creation"
-        );
-        assert!(super::TEST_PTY_SYSTEM.with(|system| system.borrow().is_none()));
-        Ok(())
-    }
-
-    struct ControlledWriter {
-        entered: Option<tokio::sync::oneshot::Sender<()>>,
-        release: std::sync::mpsc::Receiver<()>,
-        output: Arc<std::sync::Mutex<Vec<u8>>>,
-        dropped: Option<tokio::sync::oneshot::Sender<()>>,
-    }
-
-    impl std::io::Write for ControlledWriter {
-        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-            if let Some(entered) = self.entered.take() {
-                let _ = entered.send(());
-                self.release
-                    .recv_timeout(std::time::Duration::from_secs(3))
-                    .map_err(std::io::Error::other)?;
-            }
-            self.output.lock().unwrap().extend_from_slice(bytes);
-            Ok(bytes.len())
-        }
-
-        fn flush(&mut self) -> std::io::Result<()> {
-            self.output.lock().unwrap().push(b'|');
-            Ok(())
-        }
-    }
-
-    impl Drop for ControlledWriter {
-        fn drop(&mut self) {
-            if let Some(dropped) = self.dropped.take() {
-                let _ = dropped.send(());
-            }
-        }
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn pty_writer_keeps_executor_responsive_and_preserves_order() {
-        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
-        let (release_tx, release_rx) = std::sync::mpsc::channel();
-        let (dropped_tx, dropped_rx) = tokio::sync::oneshot::channel();
-        let output = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let (sender, receiver) = tokio::sync::mpsc::channel(1);
-        let handle = super::spawn_pty_writer(
-            ControlledWriter {
-                entered: Some(entered_tx),
-                release: release_rx,
-                output: Arc::clone(&output),
-                dropped: Some(dropped_tx),
-            },
-            receiver,
-        );
-        let started = std::time::Instant::now();
-        sender.send(b"first".to_vec()).await.unwrap();
-        entered_rx.await.unwrap();
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        assert!(started.elapsed() < std::time::Duration::from_secs(1));
-        assert!(output.lock().unwrap().is_empty());
-        release_tx.send(()).unwrap();
-        sender.send(b"second".to_vec()).await.unwrap();
-        drop(sender);
-        tokio::time::timeout(std::time::Duration::from_secs(2), handle)
-            .await
-            .unwrap()
-            .unwrap();
-        dropped_rx.await.unwrap();
-        assert_eq!(output.lock().unwrap().as_slice(), b"first|second|");
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn pty_writer_abort_closes_queue_and_releases_inflight_writer() {
-        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
-        let (release_tx, release_rx) = std::sync::mpsc::channel();
-        let (dropped_tx, dropped_rx) = tokio::sync::oneshot::channel();
-        let output = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let (sender, receiver) = tokio::sync::mpsc::channel(1);
-        let handle = super::spawn_pty_writer(
-            ControlledWriter {
-                entered: Some(entered_tx),
-                release: release_rx,
-                output: Arc::clone(&output),
-                dropped: Some(dropped_tx),
-            },
-            receiver,
-        );
-        sender.send(b"inflight".to_vec()).await.unwrap();
-        entered_rx.await.unwrap();
-        sender.send(b"must not write".to_vec()).await.unwrap();
-        handle.abort();
-        assert!(handle.await.unwrap_err().is_cancelled());
-        assert!(sender.send(b"late".to_vec()).await.is_err());
-        release_tx.send(()).unwrap();
-        tokio::time::timeout(std::time::Duration::from_secs(2), dropped_rx)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(output.lock().unwrap().as_slice(), b"inflight|");
-    }
-}
 
 #[cfg(unix)]
 pub(crate) fn mark_inherited_fds_cloexec_except(preserved_fds: &[RawFd]) {

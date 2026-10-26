@@ -26,7 +26,3 @@ codex-model-provider = { workspace = true }
 codex-protocol = { workspace = true }
 tokio = { workspace = true, features = ["time"] }
 
-[dev-dependencies]
-pretty_assertions = "1"
-tokio = { workspace = true, features = ["macros", "rt"] }
-wiremock = { workspace = true }

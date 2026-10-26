@@ -22,6 +22,3 @@ codex-mcp-extension = { workspace = true }
 codex-protocol = { workspace = true }
 codex-skills-extension = { workspace = true }
 codex-web-search-extension = { workspace = true }
-
-[dev-dependencies]
-pretty_assertions = { workspace = true }

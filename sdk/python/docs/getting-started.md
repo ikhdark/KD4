@@ -152,8 +152,8 @@ python -m pydoc openai_codex
 
 ## Developing From This Repository
 
-Contributors working from a checkout can install development dependencies from
-the repository:
+Contributors working from a checkout can install the code-generation and
+formatting tools from the repository:
 
 ```bash
 cd sdk/python

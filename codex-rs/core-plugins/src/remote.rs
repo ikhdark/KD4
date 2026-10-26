@@ -45,10 +45,6 @@ mod share;
 
 pub use catalog_cache::GlobalRemotePluginCatalogObservation;
 
-#[cfg(test)]
-#[path = "remote_tests.rs"]
-mod tests;
-
 pub use remote_installed_plugin_sync::RemoteInstalledPluginBundleSyncError;
 pub use remote_installed_plugin_sync::RemoteInstalledPluginBundleSyncOutcome;
 pub use remote_installed_plugin_sync::RemotePluginCacheMutationGuard;

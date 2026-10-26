@@ -21,12 +21,8 @@ use std::sync::Mutex as StdMutex;
 use std::sync::OnceLock;
 use std::sync::Weak;
 use std::sync::atomic::AtomicBool;
-#[cfg(test)]
-use std::sync::atomic::AtomicU8;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
-#[cfg(test)]
-use std::time::Instant;
 use std::time::SystemTime;
 
 use base64::Engine;
@@ -38,8 +34,6 @@ use codex_tools::CanonicalByteRange;
 use codex_tools::CanonicalJsonPointer;
 use codex_tools::CanonicalToolResult;
 use codex_tools::CanonicalToolResultKind;
-#[cfg(test)]
-use codex_tools::ToolProjectionInclusion;
 use codex_tools::ToolProjectionSection;
 use codex_utils_string::TokenCountEstimate;
 use codex_utils_string::approx_token_count_exceeds;
@@ -89,13 +83,7 @@ pub(crate) const ARTIFACT_SEARCH_MAX_CONTEXT_LINES: usize = 20;
 pub(crate) const ARTIFACT_SEARCH_MAX_QUERY_BYTES: usize = 1_024;
 const LOGICAL_ARTIFACT_METADATA_VERSION: u8 = 1;
 
-#[cfg(test)]
-#[path = "command_output_artifact_recovery_fidelity_tests.rs"]
-mod recovery_fidelity_tests;
 
-#[cfg(test)]
-#[path = "command_output_artifact_deferred_retention_tests.rs"]
-mod deferred_retention_tests;
 const LOGICAL_ARTIFACT_TRANSACTION_EXTENSION: &str = "transaction";
 const LOGICAL_ARTIFACT_CREATE_TRANSACTION_BYTES: &[u8] =
     b"KD4_LOGICAL_ARTIFACT_CREATE_TRANSACTION_V1\n";
@@ -441,37 +429,8 @@ impl CanonicalOutputArtifact {
     }
 }
 
-#[cfg(test)]
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-struct RetentionDiagnostics {
-    scans: u64,
-    scan_wall_nanos: u64,
-    directories_visited: u64,
-    candidates_visited: u64,
-    logical_mutations: u64,
-    streaming_size_updates: u64,
-    stale_delta_rejections: u64,
-    dirty_transitions: u64,
-    reconciliations: u64,
-    creates: u64,
-    deletes: u64,
-    protection_changes: u64,
-    evictions: u64,
-    oversized_root_fallbacks: u64,
-    scan_only_operations: u64,
-    scan_only_entries: u64,
-    scan_only_exits: u64,
-}
 
-#[cfg(test)]
-macro_rules! record_retention_diagnostics {
-    ($($body:tt)*) => {{ $($body)* }};
-}
 
-#[cfg(not(test))]
-macro_rules! record_retention_diagnostics {
-    ($($body:tt)*) => {{}};
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RetentionModeKind {
@@ -646,10 +605,6 @@ struct RetentionRootState {
     /// When this process last scheduled a rescan for other processes' writes.
     /// Kept outside the index, which each rescan replaces.
     last_external_reconciliation: Option<std::time::Instant>,
-    #[cfg(test)]
-    diagnostics: RetentionDiagnostics,
-    #[cfg(test)]
-    index_capacity_override: Option<usize>,
 }
 
 #[derive(Debug, Default)]
@@ -675,10 +630,6 @@ enum LogicalRetentionMutation {
     Delete,
     AppendReplace,
     Protection,
-    #[cfg(test)]
-    ProtectionReconcile,
-    #[cfg(test)]
-    StreamComplete,
     Cleanup,
 }
 
@@ -811,10 +762,6 @@ fn insert_dirty_root(registry: &mut RetentionRegistry, root: PathBuf) -> Option<
             mode: RetentionRootMode::Dirty,
             last_access: registry.access_clock,
             last_external_reconciliation: None,
-            #[cfg(test)]
-            diagnostics: RetentionDiagnostics::default(),
-            #[cfg(test)]
-            index_capacity_override: None,
         },
     );
     Some(generation)
@@ -868,22 +815,12 @@ fn transition_current_root_to_dirty_for_conflict(registry: &mut RetentionRegistr
 fn transition_root_to_dirty(
     registry: &mut RetentionRegistry,
     root: &Path,
-    #[cfg_attr(not(test), allow(unused_variables))] stale_delta_rejected: bool,
+    #[allow(unused_variables)] stale_delta_rejected: bool,
 ) {
     let Some(state) = registry.roots.get_mut(root) else {
         let _ = insert_dirty_root(registry, root.to_path_buf());
-        #[cfg(test)]
-        if let Some(state) = registry.roots.get_mut(root) {
-            state.diagnostics.stale_delta_rejections = u64::from(stale_delta_rejected);
-            state.diagnostics.dirty_transitions = 1;
-        }
         return;
     };
-    #[cfg(test)]
-    if stale_delta_rejected {
-        state.diagnostics.stale_delta_rejections =
-            state.diagnostics.stale_delta_rejections.saturating_add(1);
-    }
     match &mut state.mode {
         RetentionRootMode::Dirty => {
             if let Some(generation) = next_index_generation() {
@@ -900,10 +837,6 @@ fn transition_root_to_dirty(
             };
             state.generation = generation;
             state.mode = RetentionRootMode::Dirty;
-            record_retention_diagnostics! {
-                state.diagnostics.dirty_transitions =
-                    state.diagnostics.dirty_transitions.saturating_add(1);
-            }
         }
         RetentionRootMode::Indexed(_) => {
             let Some(generation) = next_index_generation() else {
@@ -912,10 +845,6 @@ fn transition_root_to_dirty(
             };
             state.generation = generation;
             state.mode = RetentionRootMode::Dirty;
-            record_retention_diagnostics! {
-                state.diagnostics.dirty_transitions =
-                    state.diagnostics.dirty_transitions.saturating_add(1);
-            }
         }
     }
 }
@@ -996,13 +925,6 @@ fn retention_protection_marker_status(marker: &Path, expected: &[u8]) -> std::io
     }
 }
 
-#[cfg(test)]
-async fn artifact_retention_record(
-    path: &Path,
-) -> std::io::Result<Option<ArtifactRetentionRecord>> {
-    let path = path.to_path_buf();
-    run_blocking_artifact_io(move || artifact_retention_record_blocking(&path)).await
-}
 
 fn artifact_retention_record_blocking(
     path: &Path,
@@ -1265,9 +1187,6 @@ fn scan_retention_root_blocking(
     root: &Path,
     capacity: usize,
 ) -> std::io::Result<(RetentionScanCandidate, u64, u64, Vec<PathBuf>)> {
-    #[cfg(test)]
-    // Test barriers wait only on their peer; they schedule no filesystem work.
-    tokio::runtime::Handle::current().block_on(wait_at_reconciliation_barrier(root));
 
     let mut index = Some(RetentionIndex::default());
     let mut directories_visited = 0_u64;
@@ -1423,8 +1342,6 @@ impl Eq for RawOutputArtifact {}
 
 
 
-#[cfg(test)]
-static STREAMING_FINALIZE_SYNC_FAILURE_FOR_TEST: AtomicU8 = AtomicU8::new(0);
 
 fn defer_artifact_sync(path: &Path) {
     let mut registry = lock_retention_registry();
@@ -1517,12 +1434,6 @@ pub(crate) async fn sync_tool_output_artifacts(
         // immutable returned bytes survive, but later reads reauthenticate.
         #[cfg(windows)]
         let _cache_mutation = immutable_snapshot_cache::shared().mutating(&directory);
-        #[cfg(test)]
-        if STREAMING_FINALIZE_SYNC_FAILURE_FOR_TEST.swap(0, Ordering::AcqRel) != 0 {
-            return Err(std::io::Error::other(
-                "injected artifact barrier sync failure",
-            ));
-        }
         sync_artifact_files(&pending, |path| {
             match std::fs::OpenOptions::new()
                 .read(true)
@@ -1579,10 +1490,6 @@ fn sync_artifact_files(
     })
 }
 
-#[cfg(test)]
-fn inject_streaming_finalize_sync_failure_for_test() {
-    STREAMING_FINALIZE_SYNC_FAILURE_FOR_TEST.store(1, Ordering::Release);
-}
 
 
 
@@ -1612,18 +1519,9 @@ impl Drop for LockedOutputFile {
 
 async fn lock_output_file(file: tokio::fs::File) -> std::io::Result<tokio::fs::File> {
     let file = file.into_std().await;
-    #[cfg(test)]
-    let barrier = RAW_OUTPUT_LOCK_BARRIER_FOR_TEST.try_with(Arc::clone).ok();
     let file = run_blocking_artifact_io(move || {
         file.try_lock()?;
         let file = LockedOutputFile(Some(file));
-        #[cfg(test)]
-        if let Some(barrier) = barrier {
-            tokio::runtime::Handle::current().block_on(async {
-                barrier.wait().await;
-                barrier.wait().await;
-            });
-        }
         Ok(file)
     })
     .await?;
@@ -1660,17 +1558,8 @@ async fn lock_artifact_handle(handle: &Arc<File>, position: SeekFrom) -> std::io
     .await
 }
 
-#[cfg(test)]
-tokio::task_local! {
-    static CREATION_UNLOCK_FAILURE_FOR_TEST: ();
-    static RAW_OUTPUT_LOCK_BARRIER_FOR_TEST: Arc<tokio::sync::Barrier>;
-}
 
 async fn unlock_created_output_file(file: File) -> std::io::Result<File> {
-    #[cfg(test)]
-    if CREATION_UNLOCK_FAILURE_FOR_TEST.try_with(|()| ()).is_ok() {
-        return Err(std::io::Error::other("injected creation unlock failure"));
-    }
     run_blocking_artifact_io(move || {
         file.unlock()?;
         Ok(file)
@@ -1696,14 +1585,6 @@ impl RawOutputArtifact {
         )
     }
 
-    #[cfg(test)]
-    pub(crate) fn artifact_id(&self) -> Option<ToolOutputArtifactId> {
-        match self {
-            Self::Pending { .. } => None,
-            Self::Stored { id, .. } => Some(*id),
-            Self::Failed { id, .. } => *id,
-        }
-    }
 
     pub(crate) fn pending(codex_home: &Path, thread_id: &str) -> Self {
         Self::Pending {
@@ -2080,9 +1961,6 @@ fn finish_logical_artifact_transaction(path: &Path) -> std::io::Result<()> {
     }
 }
 
-#[cfg(all(test, any(unix, windows)))]
-static TRANSACTION_MARKER_REPLACEMENT_FOR_TEST: StdMutex<Option<(PathBuf, PathBuf)>> =
-    StdMutex::new(None);
 
 fn reconcile_logical_artifact_transaction(path: &Path) -> std::io::Result<()> {
     let transaction_path = logical_transaction_path(path);
@@ -2104,31 +1982,6 @@ fn reconcile_logical_artifact_transaction(path: &Path) -> std::io::Result<()> {
         Err(err) => return Err(err),
     };
     let metadata = file.metadata()?;
-    #[cfg(all(test, any(unix, windows)))]
-    {
-        let replacement = {
-            let mut pending = TRANSACTION_MARKER_REPLACEMENT_FOR_TEST
-                .lock()
-                .map_err(|_| {
-                    std::io::Error::other("transaction marker replacement lock poisoned")
-                })?;
-            if pending
-                .as_ref()
-                .is_some_and(|(marker, _)| marker == &transaction_path)
-            {
-                pending.take()
-            } else {
-                None
-            }
-        };
-        if let Some((marker, target)) = replacement {
-            std::fs::rename(&marker, marker.with_extension("displaced-marker"))?;
-            #[cfg(windows)]
-            std::os::windows::fs::symlink_file(target, marker)?;
-            #[cfg(unix)]
-            std::os::unix::fs::symlink(target, marker)?;
-        }
-    }
     let max_marker_bytes = LOGICAL_ARTIFACT_CREATE_TRANSACTION_BYTES
         .len()
         .max(LOGICAL_ARTIFACT_ATTACH_TRANSACTION_BYTES.len());
@@ -2311,21 +2164,12 @@ const ARTIFACT_STAGE_BYTE_CAPACITY: u32 = 1024 * 1024 * 1024;
 // Well inside the default nested tool timeout; staging itself is short.
 const ARTIFACT_STAGE_ADMISSION_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 
-#[cfg(test)]
-tokio::task_local! {
-    static TEST_STAGE_ADMISSION: (Arc<Semaphore>, Arc<Semaphore>);
-}
 
 // Separate from retention admission: slow staging does not hold the global
 // retention lock. Reserve both worker count and body/metadata workspace before cloning.
 async fn admit_artifact_stage(
     canonical: &CanonicalToolResult,
 ) -> Result<((OwnedSemaphorePermit, OwnedSemaphorePermit), CanonicalMetadataBudget), String> {
-    #[cfg(test)]
-    if let Ok((count, bytes)) = TEST_STAGE_ADMISSION.try_with(Clone::clone) {
-        return admit_artifact_stage_from(&count, &bytes, ARTIFACT_STAGE_BYTE_CAPACITY,
-            canonical, ARTIFACT_STAGE_ADMISSION_WAIT).await;
-    }
     static COUNT: OnceLock<Arc<Semaphore>> = OnceLock::new();
     static BYTES: OnceLock<Arc<Semaphore>> = OnceLock::new();
     admit_artifact_stage_from(
@@ -2605,13 +2449,6 @@ fn cleanup_stage_generation(
     }
 }
 
-#[cfg(test)]
-fn stage_tag_overrides() -> &'static std::sync::Mutex<std::collections::HashMap<PathBuf, uuid::Uuid>>
-{
-    static OVERRIDES: OnceLock<std::sync::Mutex<std::collections::HashMap<PathBuf, uuid::Uuid>>> =
-        OnceLock::new();
-    OVERRIDES.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
-}
 
 struct StageOwner {
     directory: PathBuf,
@@ -2627,12 +2464,6 @@ struct StageOwner {
 impl StageOwner {
     fn acquire(directory: &Path, id: ToolOutputArtifactId, create: bool) -> std::io::Result<Self> {
         let tag = uuid::Uuid::new_v4();
-        #[cfg(test)]
-        let tag = stage_tag_overrides()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(&directory.join(format!("{id}.log")))
-            .unwrap_or(tag);
         Self::open(directory, id, tag, create)
     }
 
@@ -3014,13 +2845,6 @@ impl CanonicalMetadataBudget {
     }
 }
 
-#[cfg(test)]
-fn canonical_metadata_budget(
-    canonical: &CanonicalToolResult,
-    segments: usize,
-) -> Result<u64, String> {
-    CanonicalMetadataBudget::new(canonical)?.for_segments(segments)
-}
 
 fn canonical_invariant_metadata_bytes(
     canonical: &CanonicalToolResult,
@@ -3069,10 +2893,6 @@ fn canonical_line_starts_with_capacity(bytes: &[u8], capacity: usize) -> Vec<u64
     starts
 }
 
-#[cfg(test)]
-fn response_fits_recovery_ceiling(value: &impl Serialize) -> bool {
-    response_fits_recovery_token_ceiling(value, RECOVERY_AGGREGATE_TOKEN_CEILING)
-}
 
 fn response_fits_recovery_token_ceiling(value: &impl Serialize, token_ceiling: usize) -> bool {
     serde_json::to_string(value)
@@ -3437,12 +3257,6 @@ async fn create_canonical_output_artifact_inner(
     create_canonical_output_artifact_with_backing(codex_home, thread_id, canonical, id, protect_history, None, std::future::ready).await
 }
 
-#[cfg(test)]
-pub(crate) async fn create_source_snapshot_artifact(
-    codex_home: &Path, thread_id: &str, canonical: &CanonicalToolResult, backing: Option<String>,
-) -> CanonicalOutputArtifact {
-    create_source_snapshot_artifact_with_completion(codex_home, thread_id, canonical, backing, std::future::ready).await
-}
 
 pub(crate) async fn create_source_snapshot_artifact_with_completion<F, Fut>(
     codex_home: &Path, thread_id: &str, canonical: &CanonicalToolResult,
@@ -4578,10 +4392,7 @@ pub(crate) async fn remint_tool_history_artifact_for_thread(
             .clone()
             .unwrap_or_else(|| "artifact remint failed".to_string())
     })?;
-    // Tests can pause after the actual target commit to inject a filesystem
-    // failure or hold the real retention registry before rollback starts.
-    #[cfg(test)]
-    wait_at_reconciliation_barrier(&normalized_retention_path(&target_path)).await;
+    // Roll back a reminted target unless its canonical bytes are complete.
     if !reminted.complete
         || reminted.retained_bytes != expected_bytes
         || !reminted.unavailable_ranges.is_empty()
@@ -4678,33 +4489,6 @@ fn create_new_protection_marker(marker: &Path, contents: &[u8]) -> std::io::Resu
     Ok(())
 }
 
-/// Verifies an exact artifact without creating a retention protection marker.
-#[cfg(test)]
-pub(crate) async fn verify_tool_history_artifact(
-    codex_home: &Path,
-    thread_id: &str,
-    artifact_id: &str,
-    expected_bytes: u64,
-    expected_sha256: &str,
-) -> Result<(), String> {
-    let id = artifact_id
-        .parse::<ToolOutputArtifactId>()
-        .map_err(|_| "invalid tool-output artifact id".to_string())?;
-    if id.to_string() != artifact_id {
-        return Err("non-canonical tool-output artifact id".to_string());
-    }
-    let path = codex_home
-        .join("tool-output")
-        .join(thread_id)
-        .join(format!("{id}.log"));
-    let expected_sha256 = expected_sha256.to_string();
-    tokio::task::spawn_blocking(move || {
-        verify_tool_history_artifact_blocking(&path, expected_bytes, &expected_sha256)
-            .map_err(ArtifactVerificationError::message)
-    })
-    .await
-    .map_err(|error| format!("artifact verification worker failed: {error}"))?
-}
 
 #[derive(Debug)]
 enum ArtifactVerificationError {
@@ -4791,10 +4575,6 @@ pub(crate) async fn created_source_snapshot_is_protected(
         .map_err(|error| format!("failed to inspect new source protection: {error}"))
 }
 
-#[cfg(test)]
-thread_local! {
-    pub(crate) static PROTECTION_VERIFICATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-}
 
 /// Protects an artifact only after confinement, size, and digest checks succeed.
 pub(crate) async fn protect_active_tool_history_artifact(
@@ -4804,8 +4584,6 @@ pub(crate) async fn protect_active_tool_history_artifact(
     expected_bytes: u64,
     expected_sha256: &str,
 ) -> Result<(), String> {
-    #[cfg(test)]
-    PROTECTION_VERIFICATIONS.with(|count| count.set(count.get() + 1));
     protect_active_tool_history_artifacts(
         codex_home,
         thread_id,
@@ -6485,8 +6263,6 @@ fn search_logical_artifact(
         }) else {
             break;
         };
-        #[cfg(test)]
-        SEARCH_MATCH_STEPS.with(|count| count.set(count.get() + 1));
         let relative_match_start = cursor + offset;
         let relative_match_end = relative_match_start.saturating_add(query_bytes.len());
         cursor = relative_match_end;
@@ -6607,8 +6383,6 @@ fn search_logical_artifact(
                 let start = usize::try_from(range.start).ok()?;
                 let end = usize::try_from(range.end).ok()?;
                 let exact = snapshot.get(start..end)?;
-                #[cfg(test)]
-                SEARCH_HYDRATED_BYTES.with(|count| count.set(count.get() + exact.len()));
                 let mut hydrated = serde_json::json!({
                     "selector": child,
                     "canonical_range": range,
@@ -6693,8 +6467,6 @@ fn search_logical_artifact(
     // again for every growing prefix. Keep the reference path for binary and
     // cross-selector sharing, whose split/merge presentation has separate costs.
     let incremental = previous_results.is_empty() && std::str::from_utf8(snapshot).is_ok();
-    #[cfg(test)]
-    let incremental = incremental && !SEARCH_REFERENCE_FITTER.with(std::cell::Cell::get);
     let mut escaped_offsets = BTreeMap::new();
     if incremental {
         let mut boundaries = BTreeSet::new();
@@ -6883,8 +6655,6 @@ fn successful_exact_selector_result(
     children: Vec<ToolOutputSelector>,
     bytes: &[u8],
 ) -> ToolOutputSelectorResult {
-    #[cfg(test)]
-    recovery_fidelity_tests::MATERIALIZED_BYTES.with(|count| count.set(count.get() + bytes.len()));
     if matches!(selector, ToolOutputSelector::Bytes { .. }) {
         return successful_byte_selector_result(range, bytes);
     }
@@ -7025,9 +6795,6 @@ fn select_logical_artifact(
     // Exact text and base64 cannot serialize to fewer bytes than their source.
     // Validate the range before this lower-bound rejection; semantic JSON
     // values and directories intentionally retain their ordinary path.
-    #[cfg(test)]
-    let preflight = !recovery_fidelity_tests::REFERENCE_SELECTION.with(std::cell::Cell::get);
-    #[cfg(not(test))]
     let preflight = true;
     if preflight && !matches!(selector, ToolOutputSelector::JsonPointer { .. })
         && let Ok((Some(range), children, _)) = selector_range_and_children(&selector, metadata)
@@ -7067,17 +6834,6 @@ fn select_logical_artifact(
     result
 }
 
-#[cfg(test)]
-pub(crate) async fn read_tool_output_selectors(
-    codex_home: &Path,
-    thread_id: &str,
-    artifact_id: &str,
-    selectors: Vec<ToolOutputSelector>,
-) -> Result<ReadToolOutputResult, ReadToolOutputError> {
-    read_tool_output_selectors_with_reuse(codex_home, thread_id, artifact_id, selectors)
-        .await
-        .map(|(result, _)| result)
-}
 
 /// Host-side exact read for transformations of retained evidence. Reuses the
 /// selector reader's identity, confinement, integrity, and writer-lock checks;
@@ -7129,41 +6885,7 @@ pub(crate) async fn read_complete_canonical_snapshot(
     .map_err(|err| ReadToolOutputError::Io(format!("failed to read artifact: {err}")))?
 }
 
-#[cfg(test)]
-pub(crate) async fn read_tool_output_selectors_with_reuse(
-    codex_home: &Path,
-    thread_id: &str,
-    artifact_id: &str,
-    selectors: Vec<ToolOutputSelector>,
-) -> Result<(ReadToolOutputResult, bool), ReadToolOutputError> {
-    read_tool_output_selectors_with_ceiling_and_reuse(
-        codex_home,
-        thread_id,
-        artifact_id,
-        selectors,
-        RECOVERY_AGGREGATE_TOKEN_CEILING,
-    )
-    .await
-}
 
-#[cfg(test)]
-pub(crate) async fn read_tool_output_selectors_with_ceiling(
-    codex_home: &Path,
-    thread_id: &str,
-    artifact_id: &str,
-    selectors: Vec<ToolOutputSelector>,
-    token_ceiling: usize,
-) -> Result<ReadToolOutputResult, ReadToolOutputError> {
-    read_tool_output_selectors_with_ceiling_and_reuse(
-        codex_home,
-        thread_id,
-        artifact_id,
-        selectors,
-        token_ceiling,
-    )
-    .await
-    .map(|(result, _)| result)
-}
 
 pub(crate) async fn read_tool_output_selectors_with_ceiling_and_reuse(
     codex_home: &Path,
@@ -7299,7 +7021,7 @@ pub(crate) async fn load_tool_output_snapshot(
     .map_err(|err| ReadToolOutputError::Io(format!("failed to read artifact: {err}")))?
 }
 
-#[cfg(any(not(windows), test))]
+#[cfg(not(windows))]
 fn load_tool_output_snapshot_uncached(
     path: &Path,
     id: ToolOutputArtifactId,
@@ -7609,20 +7331,6 @@ pub(crate) fn select_producer_snapshot(
     )
 }
 
-/// The default file read delivers a useful page immediately; explicit selectors
-/// retain their exact-selection contract. The temporary identity is used only
-/// for response sizing and is replaced or removed before model delivery.
-#[cfg(test)]
-pub(crate) fn select_file_snapshot(
-    canonical: &CanonicalToolResult,
-    selectors: Option<Vec<ToolOutputSelector>>,
-) -> Result<(ReadToolOutputResult, Option<ToolOutputSelector>), ReadToolOutputError> {
-    select_file_snapshot_with_ceiling(
-        canonical,
-        selectors,
-        RECOVERY_AGGREGATE_TOKEN_CEILING.saturating_sub(1_000),
-    )
-}
 
 /// Script consumers get exact data independently of the cell's display budget.
 /// Bound the serialized payload, including escaping, rather than its token estimate.
@@ -7925,59 +7633,10 @@ pub(crate) fn bounded_page_selectors(
     pages
 }
 
-/// Read the exact retained artifact bytes for crate-private deterministic
-/// tool-history replay. This keeps the same UUID, thread confinement, regular-file,
-/// retention, and writer-lock protections as the model-visible line reader.
-#[cfg(test)]
-pub(crate) async fn read_exact_tool_output_artifact(
-    codex_home: &Path,
-    thread_id: &str,
-    artifact_id: &str,
-) -> Result<Vec<u8>, ReadToolOutputError> {
-    let id = artifact_id
-        .parse::<ToolOutputArtifactId>()
-        .map_err(|_| ReadToolOutputError::InvalidArtifactId)?;
-    if id.to_string() != artifact_id {
-        return Err(ReadToolOutputError::InvalidArtifactId);
-    }
-    let path = codex_home
-        .join("tool-output")
-        .join(thread_id)
-        .join(format!("{id}.log"));
-    tokio::task::spawn_blocking(move || read_exact_tool_output_artifact_blocking(&path))
-        .await
-        .map_err(|err| ReadToolOutputError::Io(format!("failed to read artifact: {err}")))?
-}
 
-#[cfg(test)]
-fn read_exact_tool_output_artifact_blocking(path: &Path) -> Result<Vec<u8>, ReadToolOutputError> {
-    let (mut file, total_bytes) = open_regular_artifact(path)?;
-    if total_bytes > MAX_RAW_OUTPUT_ARTIFACT_BYTES as u64 {
-        return Err(ReadToolOutputError::Io(
-            "artifact exceeds the exact replay safety limit".to_string(),
-        ));
-    }
-    file.try_lock_shared()
-        .map_err(|_| ReadToolOutputError::StillWriting)?;
-    let mut bytes = Vec::with_capacity(total_bytes as usize);
-    let result = file
-        .read_to_end(&mut bytes)
-        .map_err(|err| ReadToolOutputError::Io(format!("failed to read artifact: {err}")));
-    let _ = file.unlock();
-    result.map(|_| bytes)
-}
 
-#[cfg(test)]
-thread_local! {
-    static REGULAR_ARTIFACT_OPEN_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-    static SEARCH_MATCH_STEPS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-    static SEARCH_HYDRATED_BYTES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-    static SEARCH_REFERENCE_FITTER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-}
 
 fn open_regular_artifact(path: &Path) -> Result<(File, u64), ReadToolOutputError> {
-    #[cfg(test)]
-    REGULAR_ARTIFACT_OPEN_COUNT.with(|count| count.set(count.get() + 1));
     let mut options = std::fs::OpenOptions::new();
     options.read(true);
     configure_no_follow_open(&mut options);
@@ -8100,47 +7759,18 @@ fn artifact_is_protected_blocking(artifact_path: &Path) -> std::io::Result<bool>
     )
 }
 
-#[cfg(test)]
-fn note_logical_mutation_diagnostics(
-    diagnostics: &mut RetentionDiagnostics,
-    mutation: LogicalRetentionMutation,
-) {
-    diagnostics.logical_mutations = diagnostics.logical_mutations.saturating_add(1);
-    match mutation {
-        LogicalRetentionMutation::Create => {
-            diagnostics.creates = diagnostics.creates.saturating_add(1);
-        }
-        LogicalRetentionMutation::Delete | LogicalRetentionMutation::Cleanup => {
-            diagnostics.deletes = diagnostics.deletes.saturating_add(1);
-        }
-        LogicalRetentionMutation::Protection | LogicalRetentionMutation::ProtectionReconcile => {
-            diagnostics.protection_changes = diagnostics.protection_changes.saturating_add(1);
-        }
-        LogicalRetentionMutation::AppendReplace | LogicalRetentionMutation::StreamComplete => {}
-    }
-}
 
 fn note_completed_protection_reconciliation(root: &Path, installed_mode: RetentionModeKind) {
     let mut registry = lock_retention_registry();
     let Some(state) = registry.roots.get_mut(root) else {
         return;
     };
-    record_retention_diagnostics! {
-        note_logical_mutation_diagnostics(
-            &mut state.diagnostics,
-            LogicalRetentionMutation::ProtectionReconcile,
-        );
-    }
     if installed_mode != RetentionModeKind::Indexed
         && let RetentionRootMode::ScanOnly {
             operations_since_probe,
         } = &mut state.mode
     {
         *operations_since_probe = operations_since_probe.saturating_add(1);
-        record_retention_diagnostics! {
-            state.diagnostics.scan_only_operations =
-                state.diagnostics.scan_only_operations.saturating_add(1);
-        }
     }
 }
 
@@ -8163,11 +7793,7 @@ fn publish_known_record(
         transition_current_root_to_dirty(&mut registry, &token.root);
         return;
     }
-    #[cfg(not(test))]
     let _ = mutation;
-    record_retention_diagnostics! {
-        note_logical_mutation_diagnostics(&mut state.diagnostics, mutation);
-    }
     match disposition {
         RetentionDeltaDisposition::ApplyIndexed => {}
         RetentionDeltaDisposition::IgnoreScanOnly => return,
@@ -8221,15 +7847,7 @@ fn publish_known_remove(
         transition_current_root_to_dirty(&mut registry, &token.root);
         return;
     }
-    #[cfg(not(test))]
     let _ = mutation;
-    record_retention_diagnostics! {
-        if eviction {
-            state.diagnostics.evictions = state.diagnostics.evictions.saturating_add(1);
-        } else {
-            note_logical_mutation_diagnostics(&mut state.diagnostics, mutation);
-        }
-    }
     match disposition {
         RetentionDeltaDisposition::ApplyIndexed => {}
         RetentionDeltaDisposition::IgnoreScanOnly => return,
@@ -8303,16 +7921,6 @@ fn publish_streaming_size(
         transition_current_root_to_dirty(&mut registry, &token.root);
         return;
     }
-    record_retention_diagnostics! {
-        state.diagnostics.streaming_size_updates =
-            state.diagnostics.streaming_size_updates.saturating_add(1);
-        if completed {
-            note_logical_mutation_diagnostics(
-                &mut state.diagnostics,
-                LogicalRetentionMutation::StreamComplete,
-            );
-        }
-    }
     match disposition {
         RetentionDeltaDisposition::ApplyIndexed => {}
         RetentionDeltaDisposition::IgnoreScanOnly => return,
@@ -8362,12 +7970,6 @@ fn publish_streaming_abandonment(token: &RetentionIndexToken) {
         transition_current_root_to_dirty(&mut registry, &token.root);
         return;
     }
-    record_retention_diagnostics! {
-        note_logical_mutation_diagnostics(
-            &mut state.diagnostics,
-            LogicalRetentionMutation::Cleanup,
-        );
-    }
     match disposition {
         RetentionDeltaDisposition::ApplyIndexed => {}
         RetentionDeltaDisposition::IgnoreScanOnly => return,
@@ -8384,20 +7986,7 @@ fn publish_streaming_abandonment(token: &RetentionIndexToken) {
     }
 }
 
-#[cfg(test)]
-async fn prepare_retention_mode(root: &Path, force_reconciliation: bool) -> RetentionModeKind {
-    let root = root.to_path_buf();
-    tokio::task::spawn_blocking(move || {
-        prepare_retention_mode_blocking(&root, force_reconciliation)
-    })
-    .await
-    .unwrap_or(RetentionModeKind::Dirty)
-}
 
-#[cfg(test)]
-fn reconcile_retention_root_blocking(root: &Path) -> RetentionModeKind {
-    reconcile_retention_root_listing_transactions_blocking(root, &mut Vec::new())
-}
 
 /// Rebuilds the root's index from a full scan, and reports the artifacts
 /// whose transaction markers the scan listed.
@@ -8428,38 +8017,21 @@ fn reconcile_retention_root_listing_transactions_blocking(
         state.generation = generation;
         state.mode = RetentionRootMode::Reconciling { invalidated: false };
         state.last_access = access;
-        record_retention_diagnostics! {
-            state.diagnostics.reconciliations =
-                state.diagnostics.reconciliations.saturating_add(1);
-            state.diagnostics.scans = state.diagnostics.scans.saturating_add(1);
-        }
         let capacity = {
-            #[cfg(test)]
-            {
-                state
-                    .index_capacity_override
-                    .unwrap_or(MAX_RETENTION_INDEX_RECORDS)
-            }
-            #[cfg(not(test))]
             {
                 MAX_RETENTION_INDEX_RECORDS
             }
         };
         (generation, capacity, was_scan_only)
     };
-    #[cfg(not(test))]
     let _ = was_scan_only;
 
-    #[cfg(test)]
-    let started = Instant::now();
     let scan = scan_retention_root_blocking(&root, capacity).map(
         |(candidate, directories, candidates, listed)| {
             *transactions = listed;
             (candidate, directories, candidates)
         },
     );
-    #[cfg(test)]
-    let elapsed_nanos = started.elapsed().as_nanos().min(u64::MAX as u128) as u64;
     let mut registry = lock_retention_registry();
     let Some(state) = registry.roots.get_mut(&root) else {
         let _ = insert_dirty_root(&mut registry, root);
@@ -8467,12 +8039,6 @@ fn reconcile_retention_root_listing_transactions_blocking(
     };
     if state.generation != generation {
         return root_mode_kind(&state.mode);
-    }
-    record_retention_diagnostics! {
-        state.diagnostics.scan_wall_nanos = state
-            .diagnostics
-            .scan_wall_nanos
-            .saturating_add(elapsed_nanos);
     }
     let invalidated = matches!(
         state.mode,
@@ -8483,63 +8049,26 @@ fn reconcile_retention_root_listing_transactions_blocking(
             state.generation = generation;
         }
         state.mode = RetentionRootMode::Dirty;
-        record_retention_diagnostics! {
-            state.diagnostics.dirty_transitions =
-                state.diagnostics.dirty_transitions.saturating_add(1);
-        }
         return RetentionModeKind::Dirty;
     }
     match scan {
         Ok((candidate, directories, candidates)) => {
-            record_retention_diagnostics! {
-                state.diagnostics.directories_visited = state
-                    .diagnostics
-                    .directories_visited
-                    .saturating_add(directories);
-                state.diagnostics.candidates_visited = state
-                    .diagnostics
-                    .candidates_visited
-                    .saturating_add(candidates);
-            }
-            #[cfg(not(test))]
             let _ = (directories, candidates);
             match candidate {
                 RetentionScanCandidate::Indexed(index) => {
                     state.mode = RetentionRootMode::Indexed(index);
-                    #[cfg(test)]
-                    if was_scan_only {
-                        record_retention_diagnostics! {
-                            state.diagnostics.scan_only_exits =
-                                state.diagnostics.scan_only_exits.saturating_add(1);
-                        }
-                    }
                     RetentionModeKind::Indexed
                 }
                 RetentionScanCandidate::Oversized => {
                     state.mode = RetentionRootMode::ScanOnly {
                         operations_since_probe: 0,
                     };
-                    record_retention_diagnostics! {
-                        state.diagnostics.oversized_root_fallbacks =
-                            state.diagnostics.oversized_root_fallbacks.saturating_add(1);
-                    }
-                    #[cfg(test)]
-                    if !was_scan_only {
-                        record_retention_diagnostics! {
-                            state.diagnostics.scan_only_entries =
-                                state.diagnostics.scan_only_entries.saturating_add(1);
-                        }
-                    }
                     RetentionModeKind::ScanOnly
                 }
             }
         }
         Err(_) => {
             state.mode = RetentionRootMode::Dirty;
-            record_retention_diagnostics! {
-                state.diagnostics.dirty_transitions =
-                    state.diagnostics.dirty_transitions.saturating_add(1);
-            }
             RetentionModeKind::Dirty
         }
     }
@@ -8581,10 +8110,6 @@ fn prepare_retention_mode_blocking(root: &Path, force_reconciliation: bool) -> R
                         RetentionModeKind::Dirty
                     } else {
                         *operations_since_probe = operations_since_probe.saturating_add(1);
-                        record_retention_diagnostics! {
-                            state.diagnostics.scan_only_operations =
-                                state.diagnostics.scan_only_operations.saturating_add(1);
-                        }
                         RetentionModeKind::ScanOnly
                     }
                 }
@@ -8607,13 +8132,6 @@ fn prepare_retention_mode_blocking(root: &Path, force_reconciliation: bool) -> R
     }
     if reconciled != RetentionModeKind::Indexed {
         if reconciled == RetentionModeKind::ScanOnly {
-            #[cfg(test)]
-            let mut registry = lock_retention_registry();
-            #[cfg(test)]
-            if let Some(state) = registry.roots.get_mut(&root) {
-                state.diagnostics.scan_only_operations =
-                    state.diagnostics.scan_only_operations.saturating_add(1);
-            }
         }
         return reconciled;
     }
@@ -8632,13 +8150,6 @@ fn schedule_background_retention_reconciliation(root: &Path) -> bool {
 }
 
 fn retention_index_capacity(state: &RetentionRootState) -> usize {
-    #[cfg(test)]
-    {
-        state
-            .index_capacity_override
-            .unwrap_or(MAX_RETENTION_INDEX_RECORDS)
-    }
-    #[cfg(not(test))]
     {
         let _ = state;
         MAX_RETENTION_INDEX_RECORDS
@@ -8672,8 +8183,6 @@ async fn refresh_indexed_retention_root(root: PathBuf) {
     else {
         return;
     };
-    #[cfg(test)]
-    wait_at_reconciliation_barrier(&root).await;
     let mut candidates = 0_u64;
     let mut transactions = Vec::new();
     let directory_count = directories.len() as u64;
@@ -8793,8 +8302,8 @@ fn refresh_retention_directory_step_blocking(
 fn finish_retention_refresh_blocking(
     root: &Path,
     generation: u64,
-    #[cfg_attr(not(test), allow(unused_variables))] directories: u64,
-    #[cfg_attr(not(test), allow(unused_variables))] candidates: u64,
+    #[allow(unused_variables)] directories: u64,
+    #[allow(unused_variables)] candidates: u64,
 ) {
     let mut registry = lock_retention_registry();
     let Some(state) = registry.roots.get_mut(root) else {
@@ -8810,14 +8319,6 @@ fn finish_retention_refresh_blocking(
     index.near_limit_reconciled = index.is_near_limit();
     index.near_limit_pending = false;
     index.background_reconciliation_pending = false;
-    record_retention_diagnostics! {
-        state.diagnostics.reconciliations = state.diagnostics.reconciliations.saturating_add(1);
-        state.diagnostics.scans = state.diagnostics.scans.saturating_add(1);
-        state.diagnostics.directories_visited =
-            state.diagnostics.directories_visited.saturating_add(directories);
-        state.diagnostics.candidates_visited =
-            state.diagnostics.candidates_visited.saturating_add(candidates);
-    }
 }
 
 /// Replaces one thread directory's records with its listing. A record that a
@@ -8997,35 +8498,6 @@ fn defer_external_retention_reconciliation(root: &Path) -> bool {
     true
 }
 
-/// Builds the index before a process's first artifact write would scan the
-/// whole root inline on a tool result's way back to the model.
-#[cfg(test)]
-pub(crate) fn spawn_retention_index_prewarm(codex_home: &Path) {
-    let Ok(runtime) = tokio::runtime::Handle::try_current() else {
-        return;
-    };
-    let root = codex_home.join("tool-output");
-    runtime.spawn(async move {
-        // Only a root this process has not indexed yet needs the scan.
-        let unindexed = tokio::task::spawn_blocking(move || {
-            let root = normalized_tool_output_root(&root);
-            (root.is_dir() && !lock_retention_registry().roots.contains_key(&root)).then_some(root)
-        })
-        .await;
-        let Ok(Some(root)) = unindexed else {
-            return;
-        };
-        // Holding this process's admission makes its first commit wait for
-        // the index instead of scanning the root itself.
-        let Some((root, process_permit)) = retention_process_admission(&root).await else {
-            return;
-        };
-        let _ = tokio::task::spawn_blocking(move || {
-            reconcile_external_retention_changes_blocking(&root, process_permit, true);
-        })
-        .await;
-    });
-}
 
 fn invalidate_root_after_ambiguous_failure(root: &Path) {
     let mut registry = lock_retention_registry();
@@ -9045,10 +8517,6 @@ fn invalidate_root_after_ambiguous_failure(root: &Path) {
             if let Some(generation) = next_index_generation() {
                 state.generation = generation;
                 state.mode = RetentionRootMode::Dirty;
-                record_retention_diagnostics! {
-                    state.diagnostics.dirty_transitions =
-                        state.diagnostics.dirty_transitions.saturating_add(1);
-                }
             }
         }
     }
@@ -9600,15 +9068,13 @@ fn run_scan_only_retention_blocking(
     reserved_bytes: u64,
     reserved_artifacts: usize,
 ) {
-    #[cfg(test)]
-    let started = Instant::now();
     let thread_scan = enforce_retention_scan_locked_blocking(
         directory,
         keep_path,
         reserved_bytes,
         reserved_artifacts,
     );
-    #[cfg_attr(not(test), allow(unused_variables))]
+    #[allow(unused_variables)]
     let global_scan = if thread_scan.complete {
         enforce_global_retention_scan_locked_blocking(
             root,
@@ -9619,26 +9085,6 @@ fn run_scan_only_retention_blocking(
     } else {
         RetentionScanProgress::default()
     };
-    #[cfg(test)]
-    let elapsed = started.elapsed().as_nanos().min(u64::MAX as u128) as u64;
-    #[cfg(test)]
-    let mut registry = lock_retention_registry();
-    #[cfg(test)]
-    if let Some(state) = registry.roots.get_mut(root) {
-        state.diagnostics.scans = state.diagnostics.scans.saturating_add(1);
-        state.diagnostics.scan_wall_nanos =
-            state.diagnostics.scan_wall_nanos.saturating_add(elapsed);
-        state.diagnostics.directories_visited = state
-            .diagnostics
-            .directories_visited
-            .saturating_add(thread_scan.directories_visited)
-            .saturating_add(global_scan.directories_visited);
-        state.diagnostics.candidates_visited = state
-            .diagnostics
-            .candidates_visited
-            .saturating_add(thread_scan.candidates_visited)
-            .saturating_add(global_scan.candidates_visited);
-    }
 }
 
 fn enforce_retention_scan_locked_blocking(
@@ -9719,26 +9165,6 @@ fn enforce_retention_scan_locked_blocking(
     progress
 }
 
-#[cfg(test)]
-async fn enforce_global_retention(tool_output_root: &Path, keep_path: &Path) {
-    let root = normalized_tool_output_root(tool_output_root);
-    let keep_path = keep_path.to_path_buf();
-    let permit = retention_sweep_permit(&root).await;
-    tokio::task::spawn_blocking(move || {
-        let _permit = permit;
-        match prepare_retention_mode_blocking(&root, true) {
-            RetentionModeKind::Indexed => {
-                let _ = enforce_indexed_global_retention_blocking(&root, &keep_path, 0, 0);
-            }
-            RetentionModeKind::ScanOnly | RetentionModeKind::Disabled => {
-                let _ = enforce_global_retention_scan_locked_blocking(&root, &keep_path, 0, 0);
-            }
-            RetentionModeKind::Dirty | RetentionModeKind::Reconciling => {}
-        }
-    })
-    .await
-    .expect("global retention worker");
-}
 
 fn enforce_global_retention_scan_locked_blocking(
     tool_output_root: &Path,
@@ -9977,8 +9403,6 @@ fn without_shared_retention_lock<R>(root: &Path, pass: impl FnOnce() -> R) -> R 
 
 static RETENTION_SWEEP_PERMIT_FAILURES: AtomicU64 = AtomicU64::new(0);
 
-#[cfg(test)]
-static RETENTION_SWEEP_PERMIT_FAILURE_FOR_TEST: AtomicU8 = AtomicU8::new(0);
 
 fn record_retention_sweep_permit_failure(root: &Path, error: &dyn fmt::Display) {
     RETENTION_SWEEP_PERMIT_FAILURES.fetch_add(1, Ordering::Relaxed);
@@ -10162,17 +9586,6 @@ fn retention_sweep_permit_blocking(
 ) -> std::io::Result<RetentionSweepPermit> {
     // The OS lock acquisition can outlive its awaiter. Move admission into this
     // worker before the first filesystem wait, including on error and panic.
-    #[cfg(test)]
-    match RETENTION_SWEEP_PERMIT_FAILURE_FOR_TEST.swap(0, Ordering::AcqRel) {
-        1 => {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::PermissionDenied,
-                "injected retention lock acquisition failure",
-            ));
-        }
-        2 => panic!("injected retention lock task failure"),
-        _ => {}
-    }
     let lock_target = retention_interprocess_lock_target(root);
     let interprocess_lock = acquire_atomic_write_lock(&lock_target)?;
     advance_retention_interprocess_generation(root, &lock_target)?;
@@ -10188,15 +9601,7 @@ async fn retention_sweep_permit_for_directory(directory: &Path) -> Option<Retent
     retention_sweep_permit(directory.parent().unwrap_or_else(|| Path::new("."))).await
 }
 
-#[cfg(test)]
-fn inject_retention_sweep_permit_failure_for_test(kind: u8) {
-    RETENTION_SWEEP_PERMIT_FAILURE_FOR_TEST.store(kind, Ordering::Release);
-}
 
-#[cfg(test)]
-fn retention_sweep_permit_failures_for_test() -> u64 {
-    RETENTION_SWEEP_PERMIT_FAILURES.load(Ordering::Relaxed)
-}
 
 async fn retention_sweep_admission(
     root: &Path,
@@ -10233,93 +9638,15 @@ fn retention_sweep_semaphore(root: &Path) -> Arc<Semaphore> {
     semaphore
 }
 
-#[cfg(test)]
-fn reconciliation_barriers() -> &'static StdMutex<BTreeMap<PathBuf, Arc<tokio::sync::Barrier>>> {
-    static BARRIERS: OnceLock<StdMutex<BTreeMap<PathBuf, Arc<tokio::sync::Barrier>>>> =
-        OnceLock::new();
-    BARRIERS.get_or_init(|| StdMutex::new(BTreeMap::new()))
-}
 
-#[cfg(test)]
-async fn wait_at_reconciliation_barrier(root: &Path) {
-    let barrier = reconciliation_barriers()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .remove(root);
-    if let Some(barrier) = barrier {
-        barrier.wait().await;
-        barrier.wait().await;
-    }
-}
 
-#[cfg(test)]
-fn set_reconciliation_barrier(root: &Path, barrier: Arc<tokio::sync::Barrier>) {
-    reconciliation_barriers()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .insert(normalized_tool_output_root(root), barrier);
-}
 
-#[cfg(test)]
-fn set_retention_index_capacity_for_test(root: &Path, capacity: usize) {
-    let root = normalized_tool_output_root(root);
-    let directory = root.join("test-thread");
-    let _ = capture_retention_token(&directory);
-    let mut registry = lock_retention_registry();
-    if let Some(state) = registry.roots.get_mut(&root) {
-        state.index_capacity_override = Some(capacity);
-        if !matches!(state.mode, RetentionRootMode::Dirty) {
-            state.mode = RetentionRootMode::Dirty;
-        }
-    }
-}
 
-#[cfg(test)]
-fn retention_diagnostics_for_test(root: &Path) -> RetentionDiagnostics {
-    lock_retention_registry()
-        .roots
-        .get(&normalized_tool_output_root(root))
-        .map_or_else(RetentionDiagnostics::default, |state| state.diagnostics)
-}
 
-#[cfg(test)]
-fn retention_mode_for_test(root: &Path) -> RetentionModeKind {
-    lock_retention_registry()
-        .roots
-        .get(&normalized_tool_output_root(root))
-        .map_or(RetentionModeKind::Dirty, |state| {
-            root_mode_kind(&state.mode)
-        })
-}
 
-#[cfg(test)]
-fn retention_generation_for_test(root: &Path) -> Option<u64> {
-    lock_retention_registry()
-        .roots
-        .get(&normalized_tool_output_root(root))
-        .map(|state| state.generation)
-}
 
-#[cfg(test)]
-fn retention_registry_mutex_is_available_for_test() -> bool {
-    retention_registry().try_lock().is_ok()
-}
 
-#[cfg(test)]
-pub(crate) async fn force_retention_reconciliation_for_test(root: &Path) -> RetentionModeKind {
-    let permit = retention_sweep_permit(root).await;
-    let root = root.to_path_buf();
-    tokio::task::spawn_blocking(move || {
-        let _permit = permit;
-        reconcile_retention_root_blocking(&root)
-    })
-    .await
-    .expect("retention reconciliation worker")
-}
 
-#[cfg(test)]
-#[path = "command_output_artifact_tests.rs"]
-mod hardening_tests;
 
 fn remove_inactive_output_path_blocking(path: PathBuf) -> InactiveRemovalOutcome {
     // Release completed recovery residency before the existing writer/retention
@@ -10419,813 +9746,3 @@ fn logical_artifact_disk_bytes(path: &Path) -> std::io::Result<u64> {
     Ok(bytes)
 }
 
-#[cfg(test)]
-mod tests {
-    use pretty_assertions::assert_eq;
-
-    use super::*;
-
-    #[test]
-    fn independent_search_pages_reuse_authenticated_suffix_counts() {
-        let canonical = CanonicalToolResult::bytes(b"x\n".repeat(10_000));
-        let artifact_id = uuid::Uuid::new_v4().to_string();
-        SEARCH_MATCH_STEPS.with(|count| count.set(0));
-        let mut selector = ToolOutputSelector::Search { query: "x".into(), start_byte: 0,
-            max_results: 100, context_lines: 0, case_insensitive: false, enclosing: false };
-        let mut delivered = 0;
-        loop {
-            // Each invocation starts a separate selection transaction.
-            let page = select_producer_snapshot(&canonical, &artifact_id, vec![selector], RECOVERY_AGGREGATE_TOKEN_CEILING).unwrap();
-            let result = &page.results[0];
-            let value = result.value.as_ref().unwrap();
-            assert_eq!(value["total_matches"], 10_000 - delivered);
-            delivered += value["matches_returned"].as_u64().unwrap();
-            match result.continuation.clone() { Some(next) => selector = next, None => break }
-        }
-        assert_eq!(delivered, 10_000);
-        SEARCH_MATCH_STEPS.with(|count| assert_eq!(count.get(), 19_900));
-        // Reusing a handle with different authenticated bytes cannot reuse a count.
-        let changed = CanonicalToolResult::bytes(b"x\n".repeat(3));
-        let page = select_producer_snapshot(&changed, &artifact_id, vec![ToolOutputSelector::Search {
-            query: "x".into(), start_byte: 0, max_results: 100, context_lines: 0,
-            case_insensitive: false, enclosing: false,
-        }], RECOVERY_AGGREGATE_TOKEN_CEILING).unwrap();
-        assert_eq!(page.results[0].value.as_ref().unwrap()["total_matches"], 3);
-    }
-
-    #[test]
-    fn script_default_page_fills_serialized_budget_without_splitting_utf8() {
-        for bytes in [b"a".repeat(1024 * 1024), "λx".repeat(400_000).into_bytes()] {
-            let canonical = CanonicalToolResult::bytes(bytes.clone());
-            let (page, continuation) = select_file_snapshot_for_script(&canonical, None).unwrap();
-            let end = page.results[0].canonical_range.unwrap().end as usize;
-            assert!(end > 850_000, "default page must not halve an otherwise available budget");
-            assert_eq!(page.results[0].text.as_ref().unwrap().as_bytes(), &bytes[..end]);
-            assert!(std::str::from_utf8(&bytes[..end]).is_ok());
-            assert!(serde_json::to_vec(&page).unwrap().len() <= 896 * 1024);
-            assert_eq!(continuation, Some(ToolOutputSelector::Bytes { start: end as u64, end: bytes.len() as u64 }));
-        }
-    }
-
-    #[test]
-    fn binary_default_page_keeps_a_nonempty_exact_prefix() {
-        let bytes = vec![0xff; 1024 * 1024 + 1];
-        let canonical = CanonicalToolResult::bytes(bytes.clone());
-        let (page, continuation) = select_file_snapshot_for_script(&canonical, None).unwrap();
-        let result = &page.results[0];
-        let range = result.canonical_range.unwrap();
-        let end = range.end as usize;
-
-        assert_eq!(range.start, 0);
-        assert!(end > 0 && end < bytes.len(), "binary paging must advance");
-        assert_eq!(result.status, ToolOutputSelectorStatus::Ok);
-        assert_eq!(result.exact_bytes, Some(range.len()));
-        assert!(result.text.is_none());
-        let decoded = BASE64_STANDARD.decode(result.data_base64.as_ref().unwrap()).unwrap();
-        assert_eq!(decoded.as_slice(), &bytes[..end]);
-        assert!(serde_json::to_vec(&page).unwrap().len() <= 896 * 1024);
-        assert_eq!(
-            continuation,
-            Some(ToolOutputSelector::Bytes {
-                start: range.end,
-                end: bytes.len() as u64,
-            })
-        );
-    }
-
-    #[test]
-    fn oversized_search_checks_later_prefixes_when_enclosing_ranges_merge() {
-        let canonical = CanonicalToolResult::bytes(format!("x\n\nx\n\nx\n{}x\n", "z".repeat(4000)).into_bytes());
-        let mut metadata = producer_snapshot_metadata(&canonical, uuid::Uuid::new_v4().to_string()).unwrap();
-        let section = |id: &str, range: Option<CanonicalByteRange>| codex_tools::ToolProjectionSection {
-            id: id.into(), value: None, exact_bytes: range.map_or(0, |range| range.len()),
-            inclusion: codex_tools::ToolProjectionInclusion::Included, canonical_range: range,
-            children: vec![], recovery_chunk_bytes: None,
-        };
-        // The third hit's enclosing item bridges the two earlier hydration
-        // ranges; the fourth introduces a large, separately enclosed body.
-        metadata.sections = vec![section("outline", None),
-            section("code:first", Some(CanonicalByteRange::new(0, 2))),
-            section("code:second", Some(CanonicalByteRange::new(3, 5))),
-            section("code:outer", Some(CanonicalByteRange::new(0, 8))),
-            section("code:large", Some(CanonicalByteRange::new(8, canonical.exact_bytes)))];
-        let selector = |max_results| ToolOutputSelector::Search { query: "x".into(), start_byte: 0,
-            max_results, context_lines: 0, case_insensitive: false, enclosing: true };
-        let full = |count| search_logical_artifact(&metadata, &canonical.bytes, selector(count),
-            SearchBudget::SelectorBytes(usize::MAX), &[], None);
-        // A partial candidate has `complete:false`, one byte longer than true.
-        let budget = serde_json::to_vec(&full(3)).unwrap().len() + 1;
-        assert!(serde_json::to_vec(&full(2)).unwrap().len() > budget,
-            "fixture must contain an oversized prefix before a later fitting prefix");
-        assert!(serde_json::to_vec(&full(4)).unwrap().len() > budget);
-        let result = search_logical_artifact(&metadata, &canonical.bytes, selector(4),
-            SearchBudget::SelectorBytes(budget), &[], None);
-        assert_eq!(result.value.as_ref().unwrap()["matches_returned"], 3);
-        assert!(serde_json::to_vec(&result).unwrap().len() <= budget);
-        assert!(matches!(result.continuation, Some(ToolOutputSelector::Search { start_byte: 7, .. })));
-    }
-
-    #[test]
-    fn native_staging_slots_bound_independent_owners_and_recover_dead_generations() {
-        let home = tempfile::tempdir().unwrap();
-        let mut slots = (0..4)
-            .map(|_| NativeStageSlot::acquire(home.path()).unwrap())
-            .collect::<Vec<_>>();
-        assert!(
-            matches!(NativeStageSlot::acquire(home.path()), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock)
-        );
-        let directory = home.path().join("tool-output/thread");
-        std::fs::create_dir_all(&directory).unwrap();
-        let id = ToolOutputArtifactId::new();
-        let mut owner = StageOwner::acquire(&directory, id, true).unwrap();
-        let mut slot = slots.pop().unwrap();
-        slot.record(&directory, id, owner.tag).unwrap();
-        owner._shared_slot = Some(slot);
-        let pending = staged_logical_segment_path(&owner, 0);
-        std::fs::write(&pending, b"pending").unwrap();
-        let next = owner._shared_slot.as_ref().unwrap().next_path.clone();
-        std::fs::write(&next, b"{partial next generation").unwrap();
-        assert!(NativeStageSlot::acquire(home.path()).is_err());
-        // Simulate process death: release native handles without running the
-        // owner's pending-file cleanup. The durable slot record must do it.
-        drop(owner._file.take());
-        drop(owner._shared_slot.take());
-        let recovered = NativeStageSlot::acquire(home.path()).unwrap();
-        assert!(!pending.exists());
-        assert!(
-            !next.exists(),
-            "a partial next record must not replace the acknowledged generation"
-        );
-        assert!(NativeStageSlot::acquire(home.path()).is_err());
-        drop(recovered);
-        drop(slots);
-        drop(owner);
-        assert_eq!(
-            std::fs::read_dir(home.path().join("tool-output-staging"))
-                .unwrap()
-                .count(),
-            4,
-            "shared admission uses a fixed-size native namespace"
-        );
-    }
-
-    #[tokio::test]
-    async fn saturated_stage_admission_waits_for_a_release_instead_of_dropping_evidence() {
-        let count = Arc::new(Semaphore::new(1));
-        let bytes = Arc::new(Semaphore::new(ARTIFACT_STAGE_BYTE_CAPACITY as usize));
-        let canonical = CanonicalToolResult::text("retained evidence");
-        let wait = std::time::Duration::from_secs(30);
-        let held = admit_artifact_stage_from(
-            &count,
-            &bytes,
-            ARTIFACT_STAGE_BYTE_CAPACITY,
-            &canonical,
-            wait,
-        )
-        .await
-        .expect("idle admission");
-        let queued = admit_artifact_stage_from(
-            &count,
-            &bytes,
-            ARTIFACT_STAGE_BYTE_CAPACITY,
-            &canonical,
-            wait,
-        );
-        tokio::pin!(queued);
-        assert!(
-            tokio::time::timeout(std::time::Duration::from_millis(50), &mut queued)
-                .await
-                .is_err(),
-            "a saturated stage must wait for a worker, not reject the artifact"
-        );
-        drop(held);
-        drop(queued.await.expect("a released worker admits the queued stage"));
-        assert_eq!(count.available_permits(), 1);
-        assert_eq!(bytes.available_permits(), ARTIFACT_STAGE_BYTE_CAPACITY as usize);
-
-        // A holder that never releases still ends the wait at its bound.
-        let _held = admit_artifact_stage_from(
-            &count,
-            &bytes,
-            ARTIFACT_STAGE_BYTE_CAPACITY,
-            &canonical,
-            wait,
-        )
-        .await
-        .expect("idle admission");
-        let error = admit_artifact_stage_from(
-            &count,
-            &bytes,
-            ARTIFACT_STAGE_BYTE_CAPACITY,
-            &canonical,
-            std::time::Duration::from_millis(10),
-        )
-        .await
-        .expect_err("bounded admission wait");
-        assert!(error.starts_with("artifact staging worker limit reached"), "{error}");
-    }
-
-    #[test]
-    fn unreclaimable_stage_keeps_its_native_slot_unavailable() {
-        let home = tempfile::tempdir().unwrap();
-        let mut slots = (0..4)
-            .map(|_| NativeStageSlot::acquire(home.path()).unwrap())
-            .collect::<Vec<_>>();
-        let directory = home.path().join("tool-output/thread");
-        std::fs::create_dir_all(&directory).unwrap();
-        let id = ToolOutputArtifactId::new();
-        let tag = uuid::Uuid::new_v4();
-        let mut slot = slots.pop().unwrap();
-        slot.record(&directory, id, tag).unwrap();
-        let blocked = staged_segment_path_for_tag(&directory, id, tag, 0);
-        std::fs::create_dir(&blocked).unwrap();
-        drop(slot);
-        assert!(
-            NativeStageSlot::acquire(home.path()).is_err(),
-            "unknown failed cleanup must not refund disk admission"
-        );
-        assert!(
-            blocked.is_dir(),
-            "recovery cannot erase the failure fixture"
-        );
-        std::fs::remove_dir(&blocked).unwrap();
-        assert!(NativeStageSlot::acquire(home.path()).is_ok());
-    }
-
-    #[test]
-    fn abandoned_stages_are_reclaimed_but_live_stage_and_committed_data_survive() {
-        let home = tempfile::tempdir().unwrap();
-        let directory = home.path().join("tool-output/thread");
-        std::fs::create_dir_all(&directory).unwrap();
-        let _residency = artifact_residency_file(home.path(), "thread", false).unwrap();
-        let committed = directory.join("retained.log");
-        std::fs::write(&committed, b"retained").unwrap();
-        for _ in 0..20 {
-            let id = ToolOutputArtifactId::new();
-            let mut owner = StageOwner::acquire(&directory, id, true).unwrap();
-            let path = staged_logical_segment_path(&owner, 0);
-            std::fs::write(&path, b"pending").unwrap();
-            recover_abandoned_stages(&directory);
-            assert!(
-                path.exists(),
-                "live OS ownership must protect a pending stage"
-            );
-            // Closing the native lock models owner death without running Drop cleanup.
-            drop(owner._file.take());
-            recover_abandoned_stages(&directory);
-            assert!(
-                !path.exists(),
-                "normal recovery must reclaim an abandoned stage"
-            );
-            assert_eq!(std::fs::read(&committed).unwrap(), b"retained");
-        }
-        assert_eq!(std::fs::read_dir(&directory).unwrap().count(), 1);
-    }
-
-    #[tokio::test]
-    async fn replacement_data_reenters_durable_barrier_after_initial_sync() {
-        let home = tempfile::tempdir().unwrap();
-        let raw = create_raw_output_artifact(home.path(), "replacement", b"old").await;
-        sync_tool_output_artifacts(home.path(), "replacement")
-            .await
-            .unwrap();
-        let replaced = replace_raw_output_artifact(&raw, b"new").await;
-        let RawOutputArtifact::Stored { path, .. } = replaced else {
-            panic!("stored replacement");
-        };
-        assert!(lock_retention_registry().pending_sync.contains_key(&path));
-        assert!(
-            lock_retention_registry()
-                .pending_sync
-                .contains_key(&logical_metadata_path(&path))
-        );
-        let moved = path.with_extension("moved");
-        std::fs::rename(&path, &moved).unwrap();
-        assert!(
-            sync_tool_output_artifacts(home.path(), "replacement")
-                .await
-                .is_err()
-        );
-        assert!(lock_retention_registry().pending_sync.contains_key(&path));
-        std::fs::rename(&moved, &path).unwrap();
-        sync_tool_output_artifacts(home.path(), "replacement")
-            .await
-            .unwrap();
-        assert_eq!(std::fs::read(&path).unwrap(), b"new");
-        // An actual owner-confirmed removal, unlike a missing file, retires
-        // that family's durability obligations without poisoning later flushes.
-        let _ = replace_raw_output_artifact(&raw, b"discarded").await;
-        assert!(lock_retention_registry().pending_sync.contains_key(&path));
-        remove_logical_artifact_files(&path).unwrap();
-        assert!(!lock_retention_registry().pending_sync.contains_key(&path));
-        assert!(
-            !lock_retention_registry()
-                .pending_sync
-                .contains_key(&logical_metadata_path(&path))
-        );
-        sync_tool_output_artifacts(home.path(), "replacement")
-            .await
-            .unwrap();
-    }
-
-
-
-    #[tokio::test]
-    async fn durable_audit_23_live_and_external_owners_survive_idle_reclamation() {
-        let home = tempfile::tempdir().unwrap();
-        let live = codex_protocol::ThreadId::new().to_string();
-        let external = codex_protocol::ThreadId::new().to_string();
-        let dead = codex_protocol::ThreadId::new().to_string();
-        for id in [&live, &external, &dead] {
-            let directory = home.path().join("tool-output").join(id);
-            std::fs::create_dir_all(&directory).unwrap();
-            std::fs::write(directory.join("evidence"), b"retained evidence").unwrap();
-        }
-        let owner = acquire_artifact_residency(home.path(), &live)
-            .await
-            .unwrap();
-        retain_external_rollout_ownership(
-            home.path(),
-            &external,
-            &home.path().join("outside/rollout.jsonl"),
-        )
-        .await
-        .unwrap();
-        let now = SystemTime::now()
-            + UNRESUMABLE_THREAD_ARTIFACT_GRACE
-            + std::time::Duration::from_secs(1);
-        let removed = reclaim_unresumable_thread_artifacts(home.path(), "other", now, |_| async {
-            Ok(false)
-        })
-        .await
-        .unwrap();
-        assert_eq!(removed, 1);
-        assert!(
-            home.path()
-                .join("tool-output")
-                .join(&live)
-                .join("evidence")
-                .exists()
-        );
-        assert!(
-            home.path()
-                .join("tool-output")
-                .join(&external)
-                .join("evidence")
-                .exists()
-        );
-        assert!(!home.path().join("tool-output").join(&dead).exists());
-        drop(owner);
-        let evidence = home.path().join("tool-output").join(&live).join("evidence");
-        File::options()
-            .write(true)
-            .open(&evidence)
-            .unwrap()
-            .set_times(
-                std::fs::FileTimes::new().set_modified(now - std::time::Duration::from_secs(1)),
-            )
-            .unwrap();
-        assert_eq!(
-            reclaim_unresumable_thread_artifacts(home.path(), "other", now, |_| async {
-                Ok(false)
-            })
-            .await
-            .unwrap(),
-            0
-        );
-        assert!(
-            evidence.exists(),
-            "a newly completed output gets its own retention grace"
-        );
-        File::options()
-            .write(true)
-            .open(&evidence)
-            .unwrap()
-            .set_times(std::fs::FileTimes::new().set_modified(
-                now - UNRESUMABLE_THREAD_ARTIFACT_GRACE - std::time::Duration::from_secs(1),
-            ))
-            .unwrap();
-        assert_eq!(
-            reclaim_unresumable_thread_artifacts(home.path(), "other", now, |_| async {
-                Ok(false)
-            })
-            .await
-            .unwrap(),
-            1
-        );
-    }
-
-    #[test]
-    fn durable_audit_12_dense_line_index_has_a_finite_admission_bound() {
-        assert_eq!(canonical_line_starts(b"\na\n").unwrap(), vec![0, 1]);
-        assert_eq!(canonical_line_starts(b"").unwrap(), vec![0]);
-        assert!(canonical_line_starts(&vec![b'\n'; 32 * 1024 * 1024]).is_err());
-    }
-
-    #[tokio::test]
-    async fn artifact_creation_unlock_failure_does_not_publish_stored_handle() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let output = b"retained after unlock failure\n";
-        let failed = CREATION_UNLOCK_FAILURE_FOR_TEST
-            .scope(
-                (),
-                create_raw_output_artifact(temp.path(), "thread", output),
-            )
-            .await;
-        let RawOutputArtifact::Failed {
-            id: Some(_),
-            owned_path: Some(path),
-            bytes,
-            message,
-        } = &failed
-        else {
-            panic!("unlock failure must not publish a stored artifact: {failed:?}");
-        };
-        assert_eq!(*bytes, output.len() as u64);
-        assert!(message.contains("after creation: injected creation unlock failure"));
-        assert_eq!(
-            failed.model_projection(),
-            (
-                None,
-                None,
-                Some("raw output artifact storage failed".to_string())
-            )
-        );
-        assert!(failed.render_for_model().contains("unavailable"));
-        assert_eq!(tokio::fs::read(path).await.expect("retained bytes"), output);
-        // Keep the returned Failed value alive: it must not retain the locked
-        // writer handle. An independent open must acquire the real OS lock.
-        let reopened = File::options()
-            .read(true)
-            .write(true)
-            .open(path)
-            .expect("open");
-        reopened
-            .try_lock()
-            .expect("failed creation released its writer");
-        reopened.unlock().expect("release independent lock");
-        let recovered = create_raw_output_artifact(temp.path(), "thread", b"recovered\n").await;
-        let RawOutputArtifact::Stored { id, .. } = recovered else {
-            panic!("subsequent creation must recover");
-        };
-        assert_eq!(
-            read_exact_tool_output_artifact(temp.path(), "thread", &id.to_string())
-                .await
-                .expect("read recovered artifact"),
-            b"recovered\n"
-        );
-    }
-
-
-
-
-
-    #[tokio::test]
-    async fn artifact_creation_truncates_at_the_per_artifact_byte_limit() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let oversized = vec![b'x'; MAX_RAW_OUTPUT_ARTIFACT_BYTES + 1];
-
-        let artifact = create_raw_output_artifact(temp.path(), "thread", &oversized).await;
-        assert_eq!(
-            artifact.retention_limit_reason(),
-            Some("per_artifact_safety_limit")
-        );
-
-        let RawOutputArtifact::Stored {
-            path,
-            bytes,
-            truncated,
-            ..
-        } = artifact
-        else {
-            panic!("expected stored artifact");
-        };
-        assert_eq!(bytes, MAX_RAW_OUTPUT_ARTIFACT_BYTES as u64);
-        assert!(truncated);
-        assert_eq!(
-            tokio::fs::metadata(path)
-                .await
-                .expect("artifact metadata")
-                .len(),
-            MAX_RAW_OUTPUT_ARTIFACT_BYTES as u64
-        );
-    }
-
-
-
-    #[test]
-    fn failed_artifact_render_does_not_disclose_the_owned_path_or_message() {
-        let artifact = RawOutputArtifact::Failed {
-            id: None,
-            message: "flush failed".to_string(),
-            owned_path: Some(PathBuf::from("C:/codex/tool-output/partial.log")),
-            bytes: 17,
-        };
-
-        assert_eq!(
-            artifact.render_for_model(),
-            "Raw output artifact unavailable"
-        );
-    }
-
-    #[test]
-    fn active_tool_history_protection_marker_rejects_oversized_contents() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let marker = temp.path().join("artifact.active-tool-history");
-        create_new_protection_marker(&marker, ACTIVE_TOOL_HISTORY_PROTECTION_MARKER_BYTES)
-            .expect("create active tool-history marker");
-        assert!(
-            protection_marker_status(&marker, ACTIVE_TOOL_HISTORY_PROTECTION_MARKER_BYTES)
-                .expect("read active tool-history marker")
-        );
-
-        let mut file = std::fs::OpenOptions::new()
-            .append(true)
-            .open(&marker)
-            .expect("open active tool-history marker for append");
-        file.write_all(b"x").expect("append trailing marker byte");
-
-        assert!(
-            !protection_marker_status(&marker, ACTIVE_TOOL_HISTORY_PROTECTION_MARKER_BYTES)
-                .expect("read oversized active tool-history marker")
-        );
-    }
-
-    #[tokio::test]
-    async fn canonical_creation_rejects_invalid_transaction_without_removing_existing_output() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let existing = create_raw_output_artifact(temp.path(), "thread", b"preserved output").await;
-        let RawOutputArtifact::Stored { path, .. } = &existing else {
-            panic!("expected stored artifact");
-        };
-        let marker = logical_transaction_path(path);
-        let canonical = CanonicalToolResult::bytes(b"new canonical output".to_vec());
-        // Empty, trailing-byte and oversized markers must all fail before
-        // recovery can treat this existing family as an uncommitted creation.
-        for marker_len in [0, 44, 64 * 1024 * 1024] {
-            let mut file = File::create(&marker).expect("create transaction marker");
-            file.write_all(LOGICAL_ARTIFACT_CREATE_TRANSACTION_BYTES)
-                .expect("write marker prefix");
-            file.set_len(marker_len).expect("set invalid marker length");
-            drop(file);
-
-            let rejected =
-                create_canonical_output_artifact(temp.path(), "thread", &canonical).await;
-
-            assert!(!rejected.complete);
-            assert_eq!(rejected.retained_bytes, 0);
-            assert!(
-                rejected
-                    .error
-                    .as_deref()
-                    .expect("rejection reason")
-                    .contains("invalid logical artifact transaction marker")
-            );
-            assert_eq!(
-                std::fs::read(path).expect("preserved family"),
-                b"preserved output"
-            );
-            assert_eq!(
-                std::fs::metadata(&marker).expect("preserved marker").len(),
-                marker_len
-            );
-        }
-        std::fs::remove_file(&marker).expect("remove invalid marker");
-        #[cfg(any(unix, windows))]
-        {
-            // Substitute a real link after metadata inspection. Reopening the
-            // path would accept the valid create marker and delete the old
-            // output as an uncommitted family; the original handle is invalid.
-            let invalid = b"invalid transaction marker";
-            std::fs::write(&marker, invalid).expect("write invalid original marker");
-            let target = temp.path().join("substitute-marker");
-            std::fs::write(&target, LOGICAL_ARTIFACT_CREATE_TRANSACTION_BYTES)
-                .expect("write valid substitute marker");
-            *TRANSACTION_MARKER_REPLACEMENT_FOR_TEST
-                .lock()
-                .expect("replacement lock") = Some((marker.clone(), target.clone()));
-
-            let rejected =
-                create_canonical_output_artifact(temp.path(), "thread", &canonical).await;
-
-            assert!(
-                TRANSACTION_MARKER_REPLACEMENT_FOR_TEST
-                    .lock()
-                    .expect("replacement lock")
-                    .is_none()
-            );
-            assert!(!rejected.complete);
-            assert_eq!(rejected.retained_bytes, 0);
-            assert!(
-                rejected
-                    .error
-                    .as_deref()
-                    .expect("rejection reason")
-                    .contains("invalid logical artifact transaction marker")
-            );
-            assert_eq!(
-                std::fs::read(path).expect("preserved output after substitution"),
-                b"preserved output"
-            );
-            assert_eq!(
-                std::fs::read(marker.with_extension("displaced-marker")).expect("original marker"),
-                invalid
-            );
-            assert_eq!(
-                std::fs::read(&target).expect("untouched external target"),
-                LOGICAL_ARTIFACT_CREATE_TRANSACTION_BYTES
-            );
-            assert!(
-                std::fs::symlink_metadata(&marker)
-                    .expect("replacement link")
-                    .file_type()
-                    .is_symlink()
-            );
-            std::fs::remove_file(&marker).expect("remove replacement link");
-        }
-        let recovered = create_canonical_output_artifact(temp.path(), "thread", &canonical).await;
-        assert!(recovered.complete);
-        assert!(recovered.error.is_none());
-        assert_eq!(
-            read_exact_tool_output_artifact(
-                temp.path(),
-                "thread",
-                &recovered.id.expect("recovered id").to_string(),
-            )
-            .await
-            .expect("read recovered artifact"),
-            b"new canonical output"
-        );
-    }
-
-    fn stored_id(artifact: &RawOutputArtifact) -> ToolOutputArtifactId {
-        let RawOutputArtifact::Stored { id, .. } = artifact else {
-            panic!("expected stored artifact");
-        };
-        *id
-    }
-
-    #[tokio::test]
-    async fn read_returns_exact_range_and_treats_crlf_as_one_break() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let bytes = b"one\r\ntwo\r\nthree\r\nfour\r\n";
-        let artifact = create_raw_output_artifact(temp.path(), "thread", bytes).await;
-        let id = stored_id(&artifact);
-
-        let output = read_tool_output_selectors(
-            temp.path(),
-            "thread",
-            &id.to_string(),
-            vec![ToolOutputSelector::Lines { start: 2, end: 3 }],
-        )
-        .await
-        .expect("read artifact");
-
-        assert!(output.complete);
-        assert_eq!(output.results[0].text.as_deref(), Some("two\r\nthree\r\n"));
-        assert_eq!(output.canonical_bytes, bytes.len() as u64);
-
-        let through_eof = read_tool_output_selectors(
-            temp.path(),
-            "thread",
-            &id.to_string(),
-            vec![ToolOutputSelector::Lines { start: 1, end: 200 }],
-        )
-        .await
-        .expect("read through eof");
-        assert!(through_eof.complete);
-        assert_eq!(
-            through_eof.results[0].text.as_deref(),
-            Some(std::str::from_utf8(bytes).unwrap())
-        );
-    }
-
-    #[tokio::test]
-    async fn read_rejects_invalid_uuid_and_traversal() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        for invalid in ["not-a-uuid", "../019fa782-f8e1-7533-a3f7-60d3f9a42997"] {
-            let error = read_tool_output_selectors(
-                temp.path(),
-                "thread",
-                invalid,
-                vec![ToolOutputSelector::Lines { start: 1, end: 1 }],
-            )
-            .await
-            .expect_err("invalid id should fail");
-            assert_eq!(error, ReadToolOutputError::InvalidArtifactId);
-        }
-    }
-
-    #[cfg(windows)]
-    #[tokio::test]
-    async fn read_rejects_uuid_named_reparse_point_outside_thread_directory() {
-        use std::os::windows::fs::symlink_file;
-
-        let temp = tempfile::tempdir().expect("tempdir");
-        let thread_directory = temp.path().join("tool-output").join("thread");
-        std::fs::create_dir_all(&thread_directory).expect("create thread directory");
-        let outside = temp.path().join("outside.log");
-        std::fs::write(&outside, b"outside secret\n").expect("write outside artifact");
-        let id = ToolOutputArtifactId::new();
-        symlink_file(&outside, thread_directory.join(format!("{id}.log")))
-            .expect("native file-symlink support is required to verify reparse rejection");
-
-        let error = read_tool_output_selectors(
-            temp.path(),
-            "thread",
-            &id.to_string(),
-            vec![ToolOutputSelector::Lines { start: 1, end: 1 }],
-        )
-        .await
-        .expect_err("reparse artifact should fail");
-
-        assert_eq!(error, ReadToolOutputError::Expired);
-    }
-
-    #[tokio::test]
-    async fn read_rejects_artifact_from_other_thread() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let artifact = create_raw_output_artifact(temp.path(), "thread-a", b"secret\n").await;
-        let id = stored_id(&artifact);
-
-        let error = read_tool_output_selectors(
-            temp.path(),
-            "thread-b",
-            &id.to_string(),
-            vec![ToolOutputSelector::Lines { start: 1, end: 1 }],
-        )
-        .await
-        .expect_err("cross-thread read should fail");
-
-        assert_eq!(error, ReadToolOutputError::Expired);
-        assert_eq!(error.for_model(), ARTIFACT_EXPIRED_MESSAGE);
-    }
-
-    #[tokio::test]
-    async fn read_reports_evicted_artifact() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let artifact = create_raw_output_artifact(temp.path(), "thread", b"old\n").await;
-        let id = stored_id(&artifact);
-        let RawOutputArtifact::Stored { path, .. } = artifact else {
-            unreachable!();
-        };
-        tokio::fs::remove_file(path).await.expect("evict artifact");
-
-        let error = read_tool_output_selectors(
-            temp.path(),
-            "thread",
-            &id.to_string(),
-            vec![ToolOutputSelector::Lines { start: 1, end: 1 }],
-        )
-        .await
-        .expect_err("evicted artifact should fail");
-
-        assert_eq!(error, ReadToolOutputError::Expired);
-    }
-
-
-
-
-
-    #[tokio::test]
-    async fn retention_removes_oldest_inactive_artifacts() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let mut paths = Vec::new();
-        for index in 0..(max_retained_artifacts_per_thread() + 3) {
-            let artifact = create_raw_output_artifact(
-                temp.path(),
-                "thread",
-                format!("artifact-{index}").as_bytes(),
-            )
-            .await;
-            let RawOutputArtifact::Stored { path, .. } = artifact else {
-                panic!("expected stored artifact");
-            };
-            paths.push(path);
-        }
-
-        let mut retained = tokio::fs::read_dir(temp.path().join("tool-output").join("thread"))
-            .await
-            .expect("read artifact directory");
-        // Each raw artifact is its log plus a capture-status sidecar, and
-        // retention removes whole families.
-        let mut retained_count = 0;
-        let mut sidecar_count = 0;
-        while let Some(entry) = retained.next_entry().await.expect("read retained artifact") {
-            match entry
-                .path()
-                .extension()
-                .and_then(|extension| extension.to_str())
-            {
-                Some("log") => retained_count += 1,
-                Some("json") => sidecar_count += 1,
-                _ => panic!("unexpected artifact file: {}", entry.path().display()),
-            }
-        }
-        assert_eq!(retained_count, max_retained_artifacts_per_thread());
-        assert_eq!(sidecar_count, retained_count);
-        assert!(!paths[0].exists());
-        assert!(!paths[0].with_extension("meta.json").exists());
-        assert!(paths.last().expect("newest path").exists());
-    }
-}

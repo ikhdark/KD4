@@ -9,11 +9,6 @@ workspace = true
 
 [dependencies]
 anyhow = { workspace = true }
-axum = { workspace = true, default-features = false, features = [
-    "http1",
-    "json",
-    "tokio",
-] }
 base64 = { workspace = true }
 codex-api = { workspace = true }
 codex-config = { workspace = true }
@@ -65,13 +60,6 @@ urlencoding = { workspace = true }
 webbrowser = { workspace = true }
 which = { workspace = true }
 
-[dev-dependencies]
-tokio = { workspace = true, features = ["test-util"] }
-codex-utils-cargo-bin = { workspace = true }
-keyring = { workspace = true }
-pretty_assertions = { workspace = true }
-serial_test = { workspace = true }
-wiremock = { workspace = true }
 
 [lib]
 doctest = false

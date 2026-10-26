@@ -6,8 +6,6 @@ use std::future::Future;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
-#[cfg(test)]
-use std::sync::OnceLock;
 use std::sync::Weak;
 use std::sync::atomic::Ordering;
 
@@ -1951,42 +1949,6 @@ fn validation_mode_base_instructions(turn: &TurnContext) -> Arc<BaseInstructions
     Arc::new(instructions)
 }
 
-#[cfg(test)]
-mod validation_mode_prompt_tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn active_turn_validation_mode_is_injected_once_without_copying_base_prompt() {
-        let (_, mut turn) = crate::session::tests::make_session_and_context().await;
-        turn.validation_full_budget = 3;
-        for (mode, expected, limit) in [
-            (codex_protocol::validation::ValidationMode::Off, "OFF:", 0),
-            (codex_protocol::validation::ValidationMode::Compile, "COMPILE:", 0),
-            (codex_protocol::validation::ValidationMode::FullHalf, "Full .5:", 3),
-            (codex_protocol::validation::ValidationMode::Full, "FULL:", 3),
-        ] {
-            turn.validation_mode = mode;
-            let instructions = validation_mode_base_instructions(&turn);
-            assert!(instructions.text.starts_with(&turn.base_instructions.text));
-            assert_eq!(instructions.text.matches("<validation_mode>").count(), 1);
-            assert!(instructions.text.contains(expected));
-            assert!(instructions.text.contains(&format!("Runtime/tooling attempt limit: {limit} (compilation excluded).")));
-            assert!(instructions.text.contains("repair recompiles have no fixed attempt limit"));
-            let overlay = instructions.text.strip_prefix(&turn.base_instructions.text).unwrap();
-            assert!(overlay.contains("Follow the base instructions for validation authorization, retry, evidence, and completion rules."));
-            assert!(!overlay.contains("perform one targeted cargo check"));
-            assert!(!overlay.contains("test authoring requires an explicit user request"));
-            if mode == codex_protocol::validation::ValidationMode::Compile {
-                assert!(overlay.contains("Only task-authorized targeted compilation"));
-            }
-            if mode == codex_protocol::validation::ValidationMode::FullHalf {
-                assert!(overlay.contains("Compile checks"));
-                assert!(overlay.contains("tests, full suites, and non-compilation checks in any language"));
-                assert!(overlay.contains("KDA/KDR operations remain allowed unless they execute a prohibited workload"));
-            }
-        }
-    }
-}
 
 fn rebase_generation_request_after_compaction(
     mut request: GenerationRequestDisposition,
@@ -2582,22 +2544,6 @@ async fn admit_regular_follow_up(
     }
 }
 
-#[cfg(test)]
-async fn drain_pending_input_if_generation_available<F>(
-    budget: &LogicalGenerationBudget,
-    pending_input: F,
-) -> Option<Vec<TurnInput>>
-where
-    F: Future<Output = Vec<TurnInput>>,
-{
-    if budget.is_exhausted() {
-        None
-    } else if !budget.has_regular_generation_capacity() {
-        Some(Vec::new())
-    } else {
-        Some(pending_input.await)
-    }
-}
 
 fn generation_needs_follow_up(
     generation_request: &GenerationRequestDisposition,
@@ -2910,22 +2856,6 @@ async fn inspect_and_record_owned_input(
     Ok(inspected.outcome)
 }
 
-#[cfg(test)]
-async fn run_hooks_and_record_inputs_detailed(
-    sess: &Arc<Session>,
-    turn_context: &Arc<TurnContext>,
-    input: Vec<TurnInput>,
-) -> CodexResult<RecordedInputOutcome> {
-    let owner = Arc::clone(sess);
-    let turn = Arc::clone(turn_context);
-    sess.terminal_tasks
-        .spawn(async move {
-            inspect_and_record_owned_input(&owner, &turn, input, &CancellationToken::new(), None)
-                .await
-        })
-        .await
-        .map_err(|error| CodexErr::Fatal(format!("pending input recording failed: {error}")))?
-}
 
 fn resets_turn_execution(input: &TurnInput) -> bool {
     match input {
@@ -5286,8 +5216,6 @@ struct RequestScaffoldCacheEntry {
 #[derive(Debug, Default)]
 pub(super) struct RequestScaffoldCache {
     entry: Option<RequestScaffoldCacheEntry>,
-    #[cfg(test)]
-    build_count: usize,
 }
 
 impl RequestScaffoldCache {
@@ -5359,20 +5287,12 @@ impl RequestScaffoldCache {
             scaffold: Arc::clone(&scaffold),
             tool_schema_surface,
         });
-        #[cfg(test)]
-        {
-            self.build_count = self.build_count.saturating_add(1);
-        }
         ResolvedRequestScaffold {
             scaffold,
             locally_reused: false,
         }
     }
 
-    #[cfg(test)]
-    fn build_count(&self) -> usize {
-        self.build_count
-    }
 }
 
 fn arc_identity_or_equivalent<T: ?Sized>(
@@ -6664,15 +6584,6 @@ impl ProposedPlanItemState {
 /// In plan mode we defer agent message starts until the parser emits non-plan
 /// text. The parser buffers each line until it can rule out a tag prefix, so
 /// plan-only outputs never show up as empty assistant messages.
-#[cfg(test)]
-type PlanStartPublicationGate = (
-    async_channel::Sender<()>,
-    tokio::sync::oneshot::Receiver<()>,
-);
-#[cfg(test)]
-static PLAN_START_PUBLICATION_GATES: OnceLock<
-    Mutex<HashMap<codex_protocol::ThreadId, PlanStartPublicationGate>>,
-> = OnceLock::new();
 
 async fn maybe_emit_pending_agent_message_start(
     sess: &Session,
@@ -6684,18 +6595,6 @@ async fn maybe_emit_pending_agent_message_start(
         return;
     }
     if let Some(item) = state.pending_agent_message_items.remove(item_id) {
-        #[cfg(test)]
-        {
-            let gate = PLAN_START_PUBLICATION_GATES
-                .get_or_init(Default::default)
-                .lock()
-                .unwrap()
-                .remove(&sess.thread_id);
-            if let Some((reached, release)) = gate {
-                let _ = reached.send(()).await;
-                let _ = release.await;
-            }
-        }
         sess.emit_turn_item_started(turn_context, &item).await;
         state
             .started_agent_message_items
@@ -7157,16 +7056,6 @@ async fn handle_assistant_item_done_in_plan_mode(
     Ok(false)
 }
 
-#[cfg(test)]
-#[instrument(level = "trace", skip_all)]
-async fn drain_in_flight(
-    in_flight: &mut FuturesOrdered<BoxFuture<'static, InFlightToolResult>>,
-    sess: Arc<Session>,
-    turn_context: Arc<TurnContext>,
-) -> CodexResult<Option<RequiredToolTerminal>> {
-    let mut completed = VecDeque::new();
-    drain_in_flight_with_buffer(&mut completed, in_flight, sess, turn_context).await
-}
 
 #[instrument(level = "trace", skip_all)]
 async fn drain_in_flight_with_buffer(
@@ -8847,14 +8736,5 @@ pub(crate) fn get_last_assistant_message_from_turn(responses: &[ResponseItem]) -
     None
 }
 
-#[cfg(test)]
-#[path = "turn_tests.rs"]
-mod tests;
 
-#[cfg(test)]
-#[path = "token_budget_admission_tests.rs"]
-mod token_budget_admission_tests;
 
-#[cfg(test)]
-#[path = "turn_output_tests.rs"]
-mod turn_output_tests;

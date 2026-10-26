@@ -210,35 +210,3 @@ pub(crate) fn extension_tool_call_source(source: ToolCallSource) -> ExtensionToo
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use pretty_assertions::assert_eq;
-
-    #[test]
-    fn extension_source_preserves_correlation_and_deadline() {
-        assert_eq!(
-            extension_tool_call_source(ToolCallSource::Direct),
-            ExtensionToolCallSource::Direct
-        );
-        for nested_deadline in [None, Some(std::time::Instant::now())] {
-            for parent_call_id in [None, Some("exec-parent".to_string())] {
-                assert_eq!(
-                    extension_tool_call_source(ToolCallSource::CodeMode {
-                        cell_id: "cell".to_string(),
-                        parent_call_id: parent_call_id.clone(),
-                        runtime_tool_call_id: "runtime-call".to_string(),
-                        nested_deadline,
-                        cancellation_cause: None,
-                    }),
-                    ExtensionToolCallSource::CodeMode {
-                        cell_id: "cell".to_string(),
-                        parent_call_id,
-                        runtime_tool_call_id: "runtime-call".to_string(),
-                        nested_deadline,
-                    }
-                );
-            }
-        }
-    }
-}

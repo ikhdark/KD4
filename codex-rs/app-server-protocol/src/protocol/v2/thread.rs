@@ -844,18 +844,6 @@ pub struct ThreadMetadataUpdateResponse {
     pub thread: Thread,
 }
 
-#[cfg(test)]
-mod mode_mirror_tests {
-    use super::ThreadHistoryMode;
-    use codex_protocol::protocol::ThreadHistoryMode as CoreThreadHistoryMode;
-
-    #[test]
-    fn thread_history_mode_defaults_to_legacy() {
-        let history: CoreThreadHistoryMode = ThreadHistoryMode::default();
-
-        assert_eq!(history, CoreThreadHistoryMode::Legacy);
-    }
-}
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
 #[serde(rename_all = "camelCase")]
@@ -1413,60 +1401,6 @@ impl From<TokenUsageBreakdown> for CoreTokenUsage {
     }
 }
 
-#[cfg(test)]
-mod token_usage_conversion_tests {
-    use super::*;
-
-    #[test]
-    fn app_server_token_usage_round_trips_through_the_core_contract() {
-        let core = CoreTokenUsageInfo {
-            estimated_context_tokens: Some(500),
-            total_token_usage: CoreTokenUsage {
-                input_tokens: 100,
-                cached_input_tokens: 40,
-                output_tokens: 20,
-                reasoning_output_tokens: 5,
-                total_tokens: 120,
-                coverage: None,
-            },
-            last_token_usage: CoreTokenUsage {
-                input_tokens: 60,
-                cached_input_tokens: 10,
-                output_tokens: 15,
-                reasoning_output_tokens: 3,
-                total_tokens: 75,
-                coverage: None,
-            },
-            model_context_window: Some(200_000),
-        };
-
-        let app_server = ThreadTokenUsage::from(core.clone());
-        assert_eq!(
-            app_server,
-            ThreadTokenUsage {
-                estimated_context_tokens: Some(500),
-                total: TokenUsageBreakdown {
-                    input_tokens: 100,
-                    cached_input_tokens: 40,
-                    output_tokens: 20,
-                    reasoning_output_tokens: 5,
-                    total_tokens: 120,
-                    coverage: None,
-                },
-                last: TokenUsageBreakdown {
-                    input_tokens: 60,
-                    cached_input_tokens: 10,
-                    output_tokens: 15,
-                    reasoning_output_tokens: 3,
-                    total_tokens: 75,
-                    coverage: None,
-                },
-                model_context_window: Some(200_000),
-            }
-        );
-        assert_eq!(CoreTokenUsageInfo::from(app_server), core);
-    }
-}
 
 // Thread/Turn lifecycle notifications and item progress events
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]

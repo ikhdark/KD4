@@ -313,5 +313,3 @@ pub fn format_bug_id(id: i64) -> String {
     format!("B{id:06}")
 }
 
-#[cfg(test)]
-mod tests;

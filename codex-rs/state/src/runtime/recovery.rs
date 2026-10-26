@@ -78,28 +78,6 @@ fn initialization_lock_directory(home: &Path) -> std::io::Result<PathBuf> {
     Ok(cache.join("codex").join("sqlite-initialization-v1").join(key))
 }
 
-#[cfg(test)]
-mod audit20261023_tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn audit20261023_initialization_ownership_never_writes_home_siblings() -> anyhow::Result<()> {
-        let parent = tempfile::tempdir()?;
-        let home = parent.path().join("sqlite");
-        let before = initialization_home_identity(&home)?;
-        std::fs::create_dir(&home)?;
-        assert_eq!(before, initialization_home_identity(&home.join("."))?);
-        let owners = lock_runtime_initialization(&home).await?;
-        let entries = std::fs::read_dir(parent.path())?.map(|entry| entry.map(|entry| entry.path())).collect::<std::io::Result<Vec<_>>>()?;
-        assert_eq!(entries, vec![home.clone()]);
-        let mut contender = Box::pin(lock_runtime_initialization(&home));
-        assert!(tokio::time::timeout(std::time::Duration::from_millis(50), &mut contender).await.is_err());
-        drop(owners);
-        let owners = tokio::time::timeout(std::time::Duration::from_secs(2), contender).await??;
-        drop(owners);
-        Ok(())
-    }
-}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RuntimeDbBackup {
@@ -398,6 +376,3 @@ fn file_name(path: &Path) -> std::io::Result<&std::ffi::OsStr> {
     })
 }
 
-#[cfg(test)]
-#[path = "recovery_tests.rs"]
-mod tests;

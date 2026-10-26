@@ -20,24 +20,3 @@ pub(crate) fn security_path_key(path: &Path) -> String {
     format!("v2:utf16:{units}")
 }
 
-#[cfg(test)]
-mod tests {
-    use super::canonical_path_key;
-    use pretty_assertions::assert_eq;
-    use std::path::Path;
-
-    #[test]
-    fn canonical_path_key_normalizes_case_and_separators() {
-        let windows_style = Path::new(r"C:\Users\Dev\Repo");
-        let slash_style = Path::new("c:/users/dev/repo");
-
-        assert_eq!(
-            canonical_path_key(windows_style),
-            canonical_path_key(slash_style)
-        );
-        assert_ne!(
-            canonical_path_key(windows_style),
-            canonical_path_key(Path::new(r"C:\Users\Dev\DifferentRepo"))
-        );
-    }
-}

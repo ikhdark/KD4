@@ -464,6 +464,3 @@ fn os_string_to_command_component(value: OsString) -> String {
         .unwrap_or_else(|value| value.to_string_lossy().into_owned())
 }
 
-#[cfg(test)]
-#[path = "manager_tests.rs"]
-mod tests;

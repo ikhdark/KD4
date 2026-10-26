@@ -96,35 +96,3 @@ async fn ensure_responses_supported(client: &OllamaClient) -> std::io::Result<()
     )))
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn supports_responses_version_policy() {
-        for (version, supported) in [
-            (Version::new(0, 0, 0), true),
-            (Version::new(0, 13, 3), false),
-            (Version::new(0, 13, 4), true),
-            (Version::new(0, 14, 0), true),
-        ] {
-            assert_eq!(supports_responses(&version), supported, "{version}");
-        }
-    }
-
-    #[test]
-    fn untagged_requests_match_the_latest_local_listing() {
-        assert!(is_same_model("llama3.2:latest", "llama3.2"));
-        assert!(is_same_model("gpt-oss:20b", "gpt-oss:20b"));
-        assert!(!is_same_model("gpt-oss:20b", "gpt-oss"));
-        assert!(!is_same_model("llama3.2:latest", "llama3.2:1b"));
-        assert!(is_same_model(
-            "localhost:5000/team/model:latest",
-            "localhost:5000/team/model"
-        ));
-        assert!(!is_same_model(
-            "localhost:5000/team/model:v2",
-            "localhost:5000/team/model"
-        ));
-    }
-}

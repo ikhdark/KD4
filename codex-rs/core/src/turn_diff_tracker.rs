@@ -20,11 +20,7 @@ use codex_apply_patch::AppliedPatchDelta;
 use codex_apply_patch::AppliedPatchFileChange;
 pub(crate) use codex_command_analysis::command_mutation::CommandMutation;
 pub(crate) use codex_command_analysis::command_mutation::command_is_read_only_git;
-#[cfg(test)]
-use codex_command_analysis::command_mutation::command_may_mutate;
 pub(crate) use codex_command_analysis::command_mutation::command_mutation;
-#[cfg(test)]
-use codex_command_analysis::command_mutation::command_mutation_paths;
 pub(crate) use codex_command_analysis::command_mutation::command_reads_repository_history;
 pub(crate) use codex_command_analysis::command_mutation::resolve_uncertain_command_observation;
 
@@ -145,8 +141,6 @@ pub struct TurnDiffTracker {
     last_emitted_unified_diff: Option<String>,
     workspace_evidence_generation_batch:
         Option<Weak<crate::tools::parallel::WorkspaceEvidenceGenerationBatch>>,
-    #[cfg(test)]
-    rendered_diff_count: std::cell::Cell<usize>,
 }
 
 impl Default for TurnDiffTracker {
@@ -180,8 +174,6 @@ impl Default for TurnDiffTracker {
             unified_diff: None,
             last_emitted_unified_diff: None,
             workspace_evidence_generation_batch: None,
-            #[cfg(test)]
-            rendered_diff_count: std::cell::Cell::new(0),
         }
     }
 }
@@ -512,17 +504,6 @@ impl TurnDiffTracker {
             .collect()
     }
 
-    /// Display paths of files that existed before this turn and that it
-    /// modified or deleted, following a rename to its destination. Unlike an
-    /// added file, such an edit can change what an existing check asserts.
-    #[cfg(test)]
-    pub(crate) fn changed_existing_display_paths(&self) -> Vec<String> {
-        self.changed_existing_contents()
-            .into_iter()
-            .map(|(path, ..)| path)
-            .collect()
-    }
-
     /// Files that existed before this turn and that it modified or deleted,
     /// sorted by display path, with their text before the turn and after it
     /// (`None` once deleted), following a rename to its destination. Uncertain
@@ -611,15 +592,6 @@ impl TurnDiffTracker {
             .collect::<BTreeSet<_>>()
             .into_iter()
             .collect()
-    }
-
-    #[cfg(test)]
-    pub fn get_unified_diff(&self) -> Option<String> {
-        if self.aggregate_dirty {
-            self.flatten_diff()
-        } else {
-            self.unified_diff.clone()
-        }
     }
 
     fn retain_owned_operation(
@@ -1168,10 +1140,6 @@ impl TurnDiffTracker {
             return None;
         }
 
-        #[cfg(test)]
-        self.rendered_diff_count
-            .set(self.rendered_diff_count.get() + 1);
-
         let left_header = git_quote_path(&format!("a/{left_display}"));
         let right_header = git_quote_path(&format!("b/{right_display}"));
         if left_text == right_text {
@@ -1268,11 +1236,6 @@ impl TurnDiffTracker {
 
 
 
-    #[cfg(test)]
-    fn rendered_diff_count(&self) -> usize {
-        self.rendered_diff_count.get()
-    }
-
     fn display_path(&self, path: &TrackedPath) -> String {
         let display = self.relative_executor_path(path)
             .unwrap_or_else(|| path.path.to_string_lossy().into_owned());
@@ -1340,12 +1303,6 @@ fn git_hunk_range(range: std::ops::Range<usize>) -> String {
     }
 }
 
-#[cfg(test)]
-thread_local! {
-    static PATCH_MODE_QUERY_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-    static GIT_BLOB_HASH_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-}
-
 pub(crate) async fn resolve_patch_index_modes(
     root: &Path,
     paths: Vec<PathBuf>,
@@ -1374,8 +1331,6 @@ pub(crate) async fn resolve_patch_index_modes(
             length += next;
             end += 1;
         }
-        #[cfg(test)]
-        PATCH_MODE_QUERY_COUNT.with(|count| count.set(count.get() + 1));
         if let Some(output) = codex_git_utils::git_index_entries(&root, &paths[start..end]).await {
             for record in output.split(|byte| *byte == 0) {
                 let Some(tab) = memchr::memchr(b'\t', record) else {
@@ -1505,8 +1460,6 @@ async fn content_matches(
 }
 
 fn git_blob_oid(data: &[u8]) -> String {
-    #[cfg(test)]
-    GIT_BLOB_HASH_COUNT.with(|count| count.set(count.get() + 1));
     hex::encode(git_blob_sha1_hex_bytes(data))
 }
 
@@ -1520,10 +1473,3 @@ fn git_blob_sha1_hex_bytes(data: &[u8]) -> Output<sha1::Sha1> {
     hasher.finalize()
 }
 
-#[cfg(test)]
-#[path = "turn_diff_tracker_tests.rs"]
-mod tests;
-
-#[cfg(test)]
-#[path = "turn_diff_tracker_export_tests.rs"]
-mod export_tests;

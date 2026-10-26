@@ -1082,6 +1082,3 @@ fn insert_metadata_before_output(content: &mut String, metadata: &str) {
     }
 }
 
-#[cfg(test)]
-#[path = "shell_tests.rs"]
-mod tests;

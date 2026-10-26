@@ -25,28 +25,6 @@ const TOOL_SEARCH_RECEIPT_KIND: &str = "tool_search_receipt";
 const TOOL_SEARCH_RECEIPT_MAX_TOKENS: usize = 256;
 const TOOL_SEARCH_ARGUMENT_VALUE_MAX_TOKENS: usize = 64;
 
-#[cfg(test)]
-pub(crate) async fn process_compacted_history(
-    sess: &Session,
-    turn_context: &TurnContext,
-    compacted_history: Vec<ResponseItem>,
-    initial_context_injection: &InitialContextInjection,
-) -> (
-    Vec<ResponseItem>,
-    Option<WorldStateSnapshot>,
-    Vec<codex_protocol::protocol::ContextFragmentDigest>,
-) {
-    process_compacted_history_with_retained_input(
-        sess,
-        turn_context,
-        compacted_history,
-        Vec::new(),
-        initial_context_injection,
-    )
-    .await
-    .expect("test compaction must retain its artifacts")
-}
-
 pub(crate) async fn process_compacted_history_with_retained_input(
     sess: &Session,
     turn_context: &TurnContext,
@@ -622,7 +600,3 @@ fn rewritten_output_for_context_window(
         _ => return None,
     })
 }
-
-#[cfg(test)]
-#[path = "compact_remote_tests.rs"]
-mod tests;

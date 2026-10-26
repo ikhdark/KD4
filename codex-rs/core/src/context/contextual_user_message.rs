@@ -246,6 +246,3 @@ pub(crate) fn parse_visible_hook_prompt_message(
     Some(HookPromptItem::from_fragments(id, fragments))
 }
 
-#[cfg(test)]
-#[path = "contextual_user_message_tests.rs"]
-mod tests;

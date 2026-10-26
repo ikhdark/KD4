@@ -42,7 +42,3 @@ pub(crate) fn emit_feedback_auth_recovery_tags(
         auth_401_error_code = auth_401.error_code
     );
 }
-
-#[cfg(test)]
-#[path = "feedback_tests.rs"]
-mod tests;

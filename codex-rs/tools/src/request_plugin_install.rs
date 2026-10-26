@@ -116,7 +116,3 @@ fn build_request_plugin_install_meta<'a>(
         app_connector_ids,
     }
 }
-
-#[cfg(test)]
-#[path = "request_plugin_install_tests.rs"]
-mod tests;

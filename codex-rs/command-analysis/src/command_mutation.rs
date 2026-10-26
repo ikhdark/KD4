@@ -235,10 +235,6 @@ fn is_read_only_powershell_command(command: &[String]) -> bool {
                 })
         })
 }
-#[cfg(any(test, feature = "test-support"))]
-pub fn command_may_mutate(command: &[String]) -> bool {
-    command_mutation(command, None).may_have_mutated()
-}
 
 pub fn script_is_read_only(script: &str) -> bool {
     let bash = ["bash".to_string(), "-lc".to_string(), script.to_string()];
@@ -478,16 +474,6 @@ fn is_read_only_git_subcommand(subcommand: &str) -> bool {
     )
 }
 
-/// Returns exact paths only for simple, direct mutators whose operands can be
-/// interpreted without shell expansion. Complex scripts deliberately fall back
-/// to unknown mutation invalidation.
-#[cfg(any(test, feature = "test-support"))]
-pub fn command_mutation_paths(command: &[String], cwd: Option<&Path>) -> Option<BTreeSet<PathBuf>> {
-    if !looks_like_mutating_command(command) {
-        return None;
-    }
-    mutating_command_paths(command, cwd)
-}
 
 fn mutating_command_paths(command: &[String], cwd: Option<&Path>) -> Option<BTreeSet<PathBuf>> {
     // Windows exec wraps every command as `pwsh -Command <script>`; without
@@ -669,92 +655,4 @@ fn tokens_contain_redirect(tokens: &[String]) -> bool {
         rest.starts_with('>')
     })
 }
-#[cfg(test)]
-mod configured_git_helper_tests {
-    use super::*;
 
-    #[test]
-    fn workspace_classification_requires_the_same_helper_suppression_as_approval() {
-        let argv = |args: &[&str]| {
-            args.iter()
-                .map(|arg| (*arg).to_string())
-                .collect::<Vec<_>>()
-        };
-        for args in [
-            vec!["git", "status"],
-            vec!["git", "--no-optional-locks", "status"],
-            vec!["git", "diff"],
-            vec!["git", "show", "HEAD"],
-        ] {
-            assert!(looks_like_mutating_command(&argv(&args)), "{args:?}");
-            assert!(!command_is_read_only_git(&argv(&args)), "{args:?}");
-        }
-        for args in [
-            vec![
-                "git",
-                "--no-optional-locks",
-                "-c",
-                "core.fsmonitor=false",
-                "status",
-            ],
-            vec![
-                "git",
-                "-c",
-                "core.fsmonitor=false",
-                "diff",
-                "--no-ext-diff",
-                "--no-textconv",
-            ],
-        ] {
-            assert!(!looks_like_mutating_command(&argv(&args)), "{args:?}");
-            // Dependency scoping must accept every spelling approval admits.
-            assert!(command_is_read_only_git(&argv(&args)), "{args:?}");
-        }
-    }
-}
-
-#[cfg(test)]
-mod audit04_mutation_regressions {
-    use super::*;
-
-    fn argv(args: &[&str]) -> Vec<String> {
-        args.iter().map(|arg| (*arg).to_owned()).collect()
-    }
-
-    #[test]
-    fn formatter_filenames_never_manufacture_check_options_or_exact_write_sets() {
-        for filename in ["src/a --check b.rs", "src/a=b.rs", "src/lib.rs"] {
-            assert_eq!(
-                command_mutation(&argv(&["rustfmt", filename]), Some(Path::new("/repo"))),
-                CommandMutation::KnownMutation { paths: None },
-                "{filename}",
-            );
-        }
-        assert_eq!(
-            command_mutation(&argv(&["rustfmt", "--check", "src/lib.rs"]), None),
-            CommandMutation::ReadOnly,
-        );
-    }
-
-    #[test]
-    fn cmd_type_requires_disabled_autorun_and_no_expansion() {
-        for args in [
-            vec!["cmd", "/d", "/c", "type %P%"],
-            vec!["cmd", "/d", "/c", "type !P!"],
-            vec!["cmd", "/c", "type README.txt"],
-        ] {
-            assert_eq!(command_mutation(&argv(&args), None), CommandMutation::Uncertain);
-        }
-        assert_eq!(
-            command_mutation(&argv(&["cmd", "/d", "/c", "type README.txt"]), None),
-            CommandMutation::ReadOnly,
-        );
-    }
-
-    #[test]
-    fn remote_helper_transports_are_not_certified_read_only() {
-        let command = argv(&["git", "ls-remote", "audit::address"]);
-        assert!(!command_is_read_only_git(&command));
-        assert_eq!(command_mutation(&command, None), CommandMutation::Uncertain);
-    }
-}

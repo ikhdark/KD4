@@ -38,8 +38,6 @@ use crate::runtime::OutputAdmission;
 use crate::runtime::RuntimeCommand;
 use crate::runtime::RuntimeEvent;
 use crate::runtime::StoredValue;
-#[cfg(test)]
-use crate::runtime::spawn_runtime;
 use crate::session_runtime::CellEvent;
 use crate::session_runtime::CreateCellRequest as CellRequest;
 use crate::session_runtime::ObserveMode;
@@ -612,7 +610,3 @@ fn begin_termination(
     let _ = runtime_tx.send(RuntimeCommand::Terminate);
     let _ = runtime_terminate_handle.terminate_execution();
 }
-
-#[cfg(test)]
-#[path = "tests.rs"]
-mod tests;

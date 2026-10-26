@@ -4,6 +4,13 @@ See [the instruction architecture](codex-rs/core/instruction-architecture.md) fo
 
 Upstream is https://github.com/openai/codex
 
+## Repository test state
+
+- Repository-owned test-only files have been removed across all languages, including suites, fixtures, snapshots, test-only helpers/configuration, and dedicated runners. Do not recreate them as incidental maintenance or validation.
+- Production examples, schema/protobuf generators, build/lint tooling, and runtime support for testing user projects are not repository tests. Classify files by their consumers and purpose, not names such as `spec`, `snapshot`, or `fixture`.
+- Historical audit captures and source snapshots are evidence, not active test suites. Preserve their recorded provenance; do not treat old test commands or paths as current instructions.
+- Inspect current manifests before naming validation targets. Follow the active validation and test-creation policies; documentation and remaining mixed-purpose runner registrations do not authorize execution.
+
 ## Session context
 
 - At session start, read `.codex/CONTEXT.md`. Check its last-updated date and committed repository HEAD marker. Treat entries as historical context, never as proof of current implementation behavior or completed work; verify relevant claims against current source and evidence before relying on them.

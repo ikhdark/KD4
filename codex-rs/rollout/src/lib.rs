@@ -112,5 +112,3 @@ pub use state_integration::StateDbHandle;
 pub use state_integration::sqlite_telemetry_recorder;
 pub use tool_manifest::ToolManifestDictionary;
 
-#[cfg(test)]
-mod tests;

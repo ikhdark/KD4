@@ -13,19 +13,7 @@ use codex_protocol::error::Result as CodexResult;
 use codex_protocol::items::TurnItem;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::EventMsg;
-#[cfg(test)]
-use codex_protocol::protocol::InitialHistory;
 use codex_protocol::protocol::RolloutItem;
-
-#[cfg(test)]
-pub(crate) fn initial_history_has_prior_user_turns(conversation_history: &InitialHistory) -> bool {
-    let items = conversation_history.get_rollout_items();
-    let mut tracker = PriorUserTurnTracker::default();
-    for (idx, item) in items.iter().enumerate() {
-        tracker.observe(items, idx, item);
-    }
-    tracker.has_prior_user_turns()
-}
 
 #[derive(Default)]
 pub(crate) struct PriorUserTurnTracker {
@@ -447,7 +435,7 @@ pub(crate) fn truncate_rollout_to_last_n_fork_turns(
         .iter()
         .any(|item| matches!(item, RolloutItem::Compacted(_)))
     {
-        return Ok(retained);
+        return Ok(carry_source_integrity_notice(items, retained));
     }
     let cannot_bound_checkpoint = || {
         CodexErr::InvalidRequest(
@@ -518,7 +506,7 @@ pub(crate) fn truncate_rollout_to_last_n_fork_turns(
             });
         }
     }
-    Ok(retained)
+    Ok(carry_source_integrity_notice(items, retained))
 }
 
 fn is_real_user_message_boundary(item: &ResponseItem) -> bool {
@@ -537,7 +525,3 @@ fn is_checkpoint_handoff(item: &ResponseItem) -> bool {
             ResponseItem::Compaction { .. } | ResponseItem::ContextCompaction { .. }
         )
 }
-
-#[cfg(test)]
-#[path = "thread_rollout_truncation_tests.rs"]
-mod tests;

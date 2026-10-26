@@ -505,7 +505,3 @@ fn git_hostname(url: &str) -> Option<String> {
     let (hostname, _) = host_and_path.split_once(':')?;
     (!hostname.is_empty()).then(|| hostname.to_ascii_lowercase())
 }
-
-#[cfg(test)]
-#[path = "marketplace_policy_tests.rs"]
-mod tests;

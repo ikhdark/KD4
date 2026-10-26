@@ -167,6 +167,3 @@ pub struct RequestUserInputEvent {
     pub auto_resolution_ms: Option<u64>,
 }
 
-#[cfg(test)]
-#[path = "request_user_input_tests.rs"]
-mod tests;

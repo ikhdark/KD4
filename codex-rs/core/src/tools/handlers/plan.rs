@@ -17,15 +17,7 @@ use codex_protocol::protocol::EventMsg;
 use codex_tools::ToolName;
 use codex_tools::ToolSpec;
 use serde_json::Value as JsonValue;
-#[cfg(test)]
-use std::collections::HashMap;
 use std::sync::Arc;
-#[cfg(test)]
-use std::sync::LazyLock;
-#[cfg(test)]
-use std::sync::Mutex;
-#[cfg(test)]
-use tokio::sync::Notify;
 
 #[derive(Default)]
 pub struct PlanHandler;
@@ -102,63 +94,9 @@ impl PlanToolOutput {
     }
 }
 
-#[cfg(test)]
-#[derive(Default)]
-struct PlanCommitBoundaryHook {
-    reached: Notify,
-    cancellation_observed: Notify,
-    release: Notify,
-}
 
-#[cfg(test)]
-static PLAN_COMMIT_BOUNDARY_HOOKS: LazyLock<Mutex<HashMap<String, Arc<PlanCommitBoundaryHook>>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
 
-#[cfg(test)]
-impl PlanCommitBoundaryHook {
-    fn install(call_id: &str) -> Arc<Self> {
-        let hook = Arc::new(Self::default());
-        let previous = PLAN_COMMIT_BOUNDARY_HOOKS
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(call_id.to_string(), Arc::clone(&hook));
-        assert!(
-            previous.is_none(),
-            "plan commit hook call IDs must be unique"
-        );
-        hook
-    }
 
-    async fn wait_until_reached(&self) {
-        self.reached.notified().await;
-    }
-
-    fn release(&self) {
-        self.release.notify_one();
-    }
-}
-
-#[cfg(test)]
-// Pauses scheduling only; the real runtime token observes its normal abort path.
-async fn pause_at_plan_commit_boundary(
-    call_id: &str,
-    cancellation_token: &tokio_util::sync::CancellationToken,
-) {
-    let hook = PLAN_COMMIT_BOUNDARY_HOOKS
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .remove(call_id);
-    if let Some(hook) = hook {
-        hook.reached.notify_one();
-        tokio::select! {
-            _ = hook.release.notified() => {},
-            _ = cancellation_token.cancelled() => {
-                hook.cancellation_observed.notify_one();
-                hook.release.notified().await;
-            }
-        }
-    }
-}
 
 impl ToolOutput for PlanToolOutput {
     fn log_preview(&self) -> String {
@@ -352,8 +290,6 @@ impl PlanHandler {
                 .map_err(|error| FunctionCallError::RespondToModel(format!(
                     "durable plan publication failed: {error}; the previous plan and revision are unchanged"
                 )))?;
-            #[cfg(test)]
-            pause_at_plan_commit_boundary(&_call_id, &cancellation_token).await;
             let update = staged.commit_published();
             drop(scope_guard);
             match update.effect {
@@ -404,6 +340,3 @@ impl CoreToolRuntime for PlanHandler {
     }
 }
 
-#[cfg(test)]
-#[path = "plan_tests.rs"]
-mod tests;

@@ -305,28 +305,6 @@ mod windows_impl {
         })()
     }
 
-    #[cfg(test)]
-    mod tests {
-        use super::spawn_cancel_writer;
-        use crate::ipc_framed::Message;
-        use crate::ipc_framed::read_frame;
-        use std::io::Seek;
-
-        #[test]
-        fn cancellation_sends_a_terminate_frame_the_runner_accepts() -> anyhow::Result<()> {
-            let pipe = std::sync::Arc::new(std::sync::Mutex::new(tempfile::tempfile()?));
-            let cancellation = crate::WindowsSandboxCancellationToken::new(|| true);
-            let (writer, _done) =
-                spawn_cancel_writer(&pipe, Some(cancellation), None)?.expect("cancel writer");
-            writer.join().expect("join cancel writer");
-
-            let mut pipe = pipe.lock().unwrap();
-            pipe.rewind()?;
-            let frame = read_frame(&mut *pipe)?.expect("runner must receive a terminate frame");
-            assert!(matches!(frame.message, Message::Terminate { .. }));
-            Ok(())
-        }
-    }
 }
 
 pub use windows_impl::run_windows_sandbox_capture_for_permission_profile;

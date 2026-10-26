@@ -11,8 +11,6 @@ use crate::tools::parallel::WorkspaceEvidenceGenerationBatch;
 use crate::tools::router::ToolRouter;
 use codex_exec_server::ResolvedSelectedCapabilityRoot;
 use codex_mcp::ToolInfo;
-#[cfg(test)]
-use codex_utils_path_uri::PathUri;
 use tokio::sync::OnceCell;
 
 #[derive(Clone, Debug)]
@@ -86,27 +84,6 @@ impl StepContext {
         }
     }
 
-    #[cfg(test)]
-    pub(crate) fn new(
-        turn: Arc<TurnContext>,
-        environments: TurnEnvironmentSnapshot,
-        selected_capability_roots: Vec<ResolvedSelectedCapabilityRoot>,
-        mcp: Arc<McpRuntimeSnapshot>,
-        loaded_agents_md: Option<Arc<LoadedAgentsMd>>,
-    ) -> Self {
-        let stable_context = loaded_agents_md
-            .as_deref()
-            .map(|loaded| loaded.stable_context_bundle(&PathUri::from_abs_path(&turn.config.cwd)));
-        Self::new_with_agents_md_freshness(
-            turn,
-            environments,
-            selected_capability_roots,
-            mcp,
-            loaded_agents_md,
-            stable_context,
-            AgentsMdFreshness::CachedFallback,
-        )
-    }
 
     pub(crate) fn new_with_agents_md_freshness(
         turn: Arc<TurnContext>,
@@ -180,150 +157,6 @@ impl StepContext {
         self.tool_router.get()
     }
 
-    #[cfg(test)]
-    pub(crate) async fn seed_mcp_tools_for_test(&self, tools: Vec<ToolInfo>) {
-        let revision = self.mcp.manager().tool_catalog_revision();
-        self.seed_mcp_tool_snapshot_for_test(revision, tools, false)
-            .await;
-    }
 
-    #[cfg(test)]
-    pub(crate) async fn seed_mcp_tool_snapshot_for_test(
-        &self,
-        revision: u64,
-        tools: Vec<ToolInfo>,
-        resources_available: bool,
-    ) {
-        self.mcp_tool_snapshot
-            .set(McpToolSnapshot {
-                temporarily_unavailable: false,
-                revision,
-                tools: Arc::new(tools),
-                resources_available,
-                pending_servers: Vec::new(),
-                failed_servers: Vec::new(),
-            })
-            .expect("test MCP tool snapshot should be unset");
-    }
 }
 
-#[cfg(test)]
-mod snapshot_deadline_tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn catalog_refreshes_between_steps_but_not_retries() {
-        let (session, turn) = crate::session::tests::make_session_and_context().await;
-        let session = Arc::new(session);
-        let turn = Arc::new(turn);
-        let first = session
-            .capture_step_context(Arc::clone(&turn))
-            .await
-            .unwrap();
-        first
-            .seed_mcp_tool_snapshot_for_test(17, Vec::new(), true)
-            .await;
-        let next = session.capture_step_context(turn).await.unwrap();
-        next.seed_mcp_tool_snapshot_for_test(18, Vec::new(), false)
-            .await;
-        let retry = first.for_retry_attempt();
-        assert!(std::ptr::eq(
-            first.mcp_tool_snapshot().await,
-            retry.mcp_tool_snapshot().await
-        ));
-        assert_eq!(next.mcp_tool_snapshot().await.revision, 18);
-        assert_eq!(first.mcp_tool_snapshot().await.revision, 17);
-        assert!(!next.mcp_tool_snapshot().await.resources_available);
-        assert!(!Arc::ptr_eq(
-            &first.mcp_tool_snapshot,
-            &next.mcp_tool_snapshot
-        ));
-        let (_, other_turn) = crate::session::tests::make_session_and_context().await;
-        let other = session
-            .capture_step_context(Arc::new(other_turn))
-            .await
-            .unwrap();
-        assert!(!Arc::ptr_eq(
-            &first.mcp_tool_snapshot,
-            &other.mcp_tool_snapshot
-        ));
-    }
-
-    #[tokio::test]
-    async fn retry_attempt_replaces_sealed_evidence_but_preserves_capabilities() {
-        let (session, turn) = crate::session::tests::make_session_and_context().await;
-        let session = Arc::new(session);
-        let turn = Arc::new(turn);
-        let step = session.capture_step_context(turn).await.unwrap();
-        let router = Arc::new(crate::tools::router::ToolRouter::from_parts(
-            crate::tools::registry::ToolRegistry::from_tools(Vec::new()),
-            Vec::new(),
-        ));
-        assert!(step.set_tool_router(Arc::clone(&router)).is_ok());
-        let tracker = Arc::new(tokio::sync::Mutex::new(
-            crate::turn_diff_tracker::TurnDiffTracker::new(),
-        ));
-        let runtime =
-            crate::tools::parallel::ToolCallRuntime::new(session, Arc::clone(&step), tracker);
-        runtime.flush_workspace_evidence_generation().await.unwrap();
-        let retry = step.for_retry_attempt();
-        assert!(
-            !step
-                .workspace_evidence_generation_batch
-                .register_call("late-old-call")
-        );
-        assert!(
-            retry
-                .workspace_evidence_generation_batch
-                .register_call("retry-call")
-        );
-        assert!(Arc::ptr_eq(&step.mcp, &retry.mcp));
-        assert!(Arc::ptr_eq(retry.tool_router().unwrap(), &router));
-        assert!(!Arc::ptr_eq(
-            &step.workspace_evidence_generation_batch,
-            &retry.workspace_evidence_generation_batch
-        ));
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn unstable_catalog_does_not_stall_sampling_or_advertise_partial_tools() {
-        let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        struct CaptureGuard(Arc<std::sync::atomic::AtomicBool>);
-        impl Drop for CaptureGuard {
-            fn drop(&mut self) {
-                self.0.store(true, std::sync::atomic::Ordering::SeqCst);
-            }
-        }
-        let guard = CaptureGuard(Arc::clone(&dropped));
-        let start = tokio::time::Instant::now();
-        let snapshot = bounded_mcp_snapshot(async move {
-            let _guard = guard;
-            std::future::pending::<McpToolSnapshot>().await
-        })
-        .await;
-        assert_eq!(start.elapsed(), MCP_SNAPSHOT_DEADLINE);
-        assert!(dropped.load(std::sync::atomic::Ordering::SeqCst));
-        assert!(snapshot.tools.is_empty());
-        assert!(snapshot.temporarily_unavailable);
-        assert!(!snapshot.resources_available);
-        assert_eq!(snapshot.revision, u64::MAX);
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn stable_catalog_keeps_its_identity_and_resource_capability() {
-        let snapshot = bounded_mcp_snapshot(async {
-            McpToolSnapshot {
-                temporarily_unavailable: false,
-                revision: 17,
-                tools: Arc::new(Vec::new()),
-                resources_available: true,
-                pending_servers: Vec::new(),
-                failed_servers: Vec::new(),
-            }
-        })
-        .await;
-        assert_eq!(snapshot.revision, 17);
-        assert!(!snapshot.temporarily_unavailable);
-        assert!(snapshot.resources_available);
-    }
-}

@@ -86,5 +86,3 @@ features = [
     "Win32_System_Registry",
 ]
 
-[dev-dependencies]
-pretty_assertions = { workspace = true }

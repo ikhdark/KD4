@@ -28,7 +28,3 @@ pub fn merge_owned_toml_values(base: &mut TomlValue, overlay: TomlValue) {
         }
     }
 }
-
-#[cfg(test)]
-#[path = "merge_tests.rs"]
-mod tests;

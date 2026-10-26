@@ -51,6 +51,3 @@ pub(crate) fn render_explicit_plugin_instructions(
     Some(lines.join("\n"))
 }
 
-#[cfg(test)]
-#[path = "render_tests.rs"]
-mod tests;

@@ -1,5 +1,4 @@
 use std::collections::VecDeque;
-use std::ffi::OsString;
 use std::fs;
 use std::fs::OpenOptions;
 use std::io::BufRead;
@@ -24,13 +23,11 @@ use clap::ArgAction;
 use clap::Parser;
 use clap::Subcommand;
 use codex_app_server_protocol::AccountLoginCompletedNotification;
-use codex_app_server_protocol::AskForApproval;
 use codex_app_server_protocol::ClientInfo;
 use codex_app_server_protocol::ClientRequest;
 use codex_app_server_protocol::CommandExecutionApprovalDecision;
 use codex_app_server_protocol::CommandExecutionRequestApprovalParams;
 use codex_app_server_protocol::CommandExecutionRequestApprovalResponse;
-use codex_app_server_protocol::CommandExecutionStatus;
 use codex_app_server_protocol::DynamicToolSpec;
 use codex_app_server_protocol::FileChangeApprovalDecision;
 use codex_app_server_protocol::FileChangeRequestApprovalParams;
@@ -46,9 +43,7 @@ use codex_app_server_protocol::JSONRPCResponse;
 use codex_app_server_protocol::LoginAccountResponse;
 use codex_app_server_protocol::ModelListParams;
 use codex_app_server_protocol::ModelListResponse;
-use codex_app_server_protocol::PatchApplyStatus;
 use codex_app_server_protocol::RequestId;
-use codex_app_server_protocol::SandboxPolicy;
 use codex_app_server_protocol::ServerNotification;
 use codex_app_server_protocol::ServerRequest;
 use codex_app_server_protocol::ThreadDecrementElicitationParams;
@@ -70,7 +65,6 @@ use codex_core::config::Config;
 use codex_otel::OtelProvider;
 use codex_otel::current_span_w3c_trace_context;
 use codex_protocol::dynamic_tools::normalize_dynamic_tool_specs;
-use codex_protocol::openai_models::ReasoningEffort;
 use codex_protocol::protocol::W3cTraceContext;
 use codex_utils_cli::CliConfigOverrides;
 use futures::SinkExt;
@@ -85,10 +79,6 @@ use tracing_subscriber::util::SubscriberInitExt;
 use url::Url;
 use uuid::Uuid;
 
-mod loopback_responses_server;
-mod plugin_analytics_capture;
-mod plugin_analytics_mutation_smoke;
-mod plugin_analytics_smoke;
 mod process;
 mod request_user_input;
 
@@ -96,7 +86,6 @@ use process::add_codex_parent_to_path;
 use process::build_serve_command;
 use process::listener_pids_on_port;
 use process::listeners_after_grace;
-use process::powershell_quote;
 use process::preflight_serve_restart;
 use process::runtime_dir;
 use process::start_prepared_serve;
@@ -111,7 +100,6 @@ const NOTIFICATIONS_TO_OPT_OUT: &[&str] = &[
     "item/reasoning/textDelta",
 ];
 const APP_SERVER_GRACEFUL_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
-const APP_SERVER_STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
 const APP_SERVER_RESTART_TIMEOUT: Duration = Duration::from_secs(30);
 const APP_SERVER_GRACEFUL_SHUTDOWN_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const RPC_TIMEOUT: Duration = Duration::from_secs(30);
@@ -218,28 +206,6 @@ enum CliCommand {
     ///
     /// This command does not auto-exit; stop it with Ctrl+C or terminate the process.
     Watch,
-    /// Start a V2 turn that elicits an ExecCommand approval.
-    #[command(name = "trigger-cmd-approval")]
-    TriggerCmdApproval {
-        /// Optional prompt; defaults to creating a file with touch.
-        user_message: Option<String>,
-    },
-    /// Start a V2 turn that elicits an ApplyPatch approval.
-    #[command(name = "trigger-patch-approval")]
-    TriggerPatchApproval {
-        /// Optional prompt; defaults to creating a file via apply_patch.
-        user_message: Option<String>,
-    },
-    /// Start a V2 turn that should not elicit an ExecCommand approval.
-    #[command(name = "no-trigger-cmd-approval")]
-    NoTriggerCmdApproval,
-    /// Send two sequential V2 turns in the same thread to test follow-up behavior.
-    SendFollowUpV2 {
-        /// Initial user message for the first turn.
-        first_message: String,
-        /// Follow-up user message for the second turn.
-        follow_up_message: String,
-    },
     /// Trigger the ChatGPT login flow and wait for completion.
     TestLogin {
         /// Use the device-code login flow instead of the browser callback flow.
@@ -280,57 +246,6 @@ enum CliCommand {
         /// Number of seconds to retain the lease before releasing it.
         #[arg(long)]
         hold_seconds: u64,
-    },
-    /// Run the live websocket harness that proves elicitation pause prevents a
-    /// 10s unified exec timeout from killing a 15s helper script.
-    #[command(name = "live-elicitation-timeout-pause")]
-    LiveElicitationTimeoutPause {
-        /// Model passed to `thread/start`.
-        #[arg(long, env = "CODEX_E2E_MODEL", default_value = "gpt-6-astra")]
-        model: String,
-        /// Existing workspace path used as the turn cwd.
-        #[arg(long, value_name = "path", default_value = ".")]
-        workspace: PathBuf,
-        /// Helper script to run from the model; defaults to the repo-local
-        /// live elicitation hold script.
-        #[arg(long, value_name = "path")]
-        script: Option<PathBuf>,
-        /// Seconds the helper script should sleep while the timeout is paused.
-        #[arg(long, default_value_t = 15)]
-        hold_seconds: u64,
-    },
-    /// Exercise remote plugin analytics through production app-server RPC paths.
-    #[command(name = "plugin-analytics-smoke")]
-    PluginAnalyticsSmoke {
-        /// Installed local plugin id, such as `linear@openai-curated-remote`.
-        #[arg(long)]
-        plugin_id: String,
-        /// JSONL output path. Defaults to a PID-specific file under the system temp directory.
-        #[arg(long)]
-        capture_file: Option<PathBuf>,
-    },
-    /// Install and uninstall one remote plugin while validating analytics capture.
-    #[command(name = "plugin-analytics-mutation-smoke")]
-    PluginAnalyticsMutationSmoke {
-        /// Backend remote plugin id. The plugin must be initially uninstalled.
-        #[arg(long)]
-        remote_plugin_id: String,
-        /// Acknowledge that this command mutates the active account's plugin state.
-        #[arg(long)]
-        confirm_account_mutation: bool,
-        /// JSONL output path. Defaults to a PID-specific file under the system temp directory.
-        #[arg(long)]
-        capture_file: Option<PathBuf>,
-    },
-    /// Best-effort recovery command that uninstalls one remote plugin.
-    #[command(name = "plugin-remote-uninstall")]
-    PluginRemoteUninstall {
-        /// Backend remote plugin id to uninstall.
-        #[arg(long)]
-        remote_plugin_id: String,
-        /// Acknowledge that this command mutates the active account's plugin state.
-        #[arg(long)]
-        confirm_account_mutation: bool,
     },
 }
 
@@ -405,32 +320,6 @@ pub async fn run() -> Result<()> {
             let endpoint = resolve_endpoint(codex_bin, url)?;
             watch(&endpoint, &config_overrides).await
         }
-        CliCommand::TriggerCmdApproval { user_message } => {
-            let endpoint = resolve_endpoint(codex_bin, url)?;
-            trigger_cmd_approval(&endpoint, &config_overrides, user_message, &dynamic_tools).await
-        }
-        CliCommand::TriggerPatchApproval { user_message } => {
-            let endpoint = resolve_endpoint(codex_bin, url)?;
-            trigger_patch_approval(&endpoint, &config_overrides, user_message, &dynamic_tools).await
-        }
-        CliCommand::NoTriggerCmdApproval => {
-            let endpoint = resolve_endpoint(codex_bin, url)?;
-            no_trigger_cmd_approval(&endpoint, &config_overrides, &dynamic_tools).await
-        }
-        CliCommand::SendFollowUpV2 {
-            first_message,
-            follow_up_message,
-        } => {
-            let endpoint = resolve_endpoint(codex_bin, url)?;
-            send_follow_up_v2(
-                &endpoint,
-                &config_overrides,
-                first_message,
-                follow_up_message,
-                &dynamic_tools,
-            )
-            .await
-        }
         CliCommand::TestLogin { device_code } => {
             ensure_dynamic_tools_unused(&dynamic_tools, "test-login")?;
             let endpoint = resolve_endpoint(codex_bin, url)?;
@@ -472,76 +361,6 @@ pub async fn run() -> Result<()> {
             let url = resolve_shared_websocket_url(codex_bin, url, "thread-hold-elicitation")?;
             thread_hold_elicitation(&url, thread_id, hold_seconds)
         }
-        CliCommand::LiveElicitationTimeoutPause {
-            model,
-            workspace,
-            script,
-            hold_seconds,
-        } => {
-            ensure_dynamic_tools_unused(&dynamic_tools, "live-elicitation-timeout-pause")?;
-            live_elicitation_timeout_pause(
-                codex_bin,
-                url,
-                &config_overrides,
-                model,
-                workspace,
-                script,
-                hold_seconds,
-                command_timeout,
-            )
-        }
-        CliCommand::PluginAnalyticsSmoke {
-            plugin_id,
-            capture_file,
-        } => {
-            ensure_dynamic_tools_unused(&dynamic_tools, "plugin-analytics-smoke")?;
-            if url.is_some() {
-                bail!("plugin-analytics-smoke requires --codex-bin and does not support --url");
-            }
-            let codex_bin = codex_bin.context("plugin-analytics-smoke requires --codex-bin")?;
-            plugin_analytics_smoke::run(&codex_bin, &config_overrides, &plugin_id, capture_file)
-        }
-        CliCommand::PluginAnalyticsMutationSmoke {
-            remote_plugin_id,
-            confirm_account_mutation,
-            capture_file,
-        } => {
-            ensure_dynamic_tools_unused(&dynamic_tools, "plugin-analytics-mutation-smoke")?;
-            if url.is_some() {
-                bail!(
-                    "plugin-analytics-mutation-smoke requires --codex-bin and does not support --url"
-                );
-            }
-            let codex_bin =
-                codex_bin.context("plugin-analytics-mutation-smoke requires --codex-bin")?;
-            plugin_analytics_mutation_smoke::run(
-                &codex_bin,
-                &config_overrides,
-                &remote_plugin_id,
-                plugin_analytics_mutation_smoke::AccountMutationConfirmation::from_flag(
-                    confirm_account_mutation,
-                ),
-                capture_file,
-            )
-        }
-        CliCommand::PluginRemoteUninstall {
-            remote_plugin_id,
-            confirm_account_mutation,
-        } => {
-            ensure_dynamic_tools_unused(&dynamic_tools, "plugin-remote-uninstall")?;
-            if url.is_some() {
-                bail!("plugin-remote-uninstall requires --codex-bin and does not support --url");
-            }
-            let codex_bin = codex_bin.context("plugin-remote-uninstall requires --codex-bin")?;
-            plugin_analytics_mutation_smoke::run_cleanup(
-                &codex_bin,
-                &config_overrides,
-                &remote_plugin_id,
-                plugin_analytics_mutation_smoke::AccountMutationConfirmation::from_flag(
-                    confirm_account_mutation,
-                ),
-            )
-        }
     }
 }
 
@@ -551,10 +370,6 @@ enum Endpoint {
     Budgeted(Box<Endpoint>, Duration),
 }
 
-struct BackgroundAppServer {
-    process: Child,
-    url: String,
-}
 
 fn validate_endpoint_options(cli: &Cli) -> Result<()> {
     if cli.command_timeout_seconds.is_some()
@@ -563,14 +378,9 @@ fn validate_endpoint_options(cli: &Cli) -> Result<()> {
             CliCommand::SendMessage { .. }
                 | CliCommand::SendMessageV2 { .. }
                 | CliCommand::ResumeMessageV2 { .. }
-                | CliCommand::TriggerCmdApproval { .. }
-                | CliCommand::TriggerPatchApproval { .. }
-                | CliCommand::NoTriggerCmdApproval
-                | CliCommand::SendFollowUpV2 { .. }
                 | CliCommand::GetAccountRateLimits
                 | CliCommand::ModelList
                 | CliCommand::ThreadList { .. }
-                | CliCommand::LiveElicitationTimeoutPause { .. }
         )
     {
         bail!("--command-timeout-seconds requires a finite noninteractive command");
@@ -635,107 +445,8 @@ fn resolve_shared_websocket_url(
     Ok(url.unwrap_or_else(|| "ws://127.0.0.1:4222".to_string()))
 }
 
-impl BackgroundAppServer {
-    fn command(codex_bin: &Path, config_overrides: &[String]) -> Result<Command> {
-        let mut cmd = Command::new(codex_bin);
-        add_codex_parent_to_path(&mut cmd, codex_bin)?;
-        for override_kv in config_overrides {
-            cmd.arg("--config").arg(override_kv);
-        }
-        cmd.arg("app-server")
-            .arg("--listen")
-            .arg("ws://127.0.0.1:0")
-            .env("NO_COLOR", "1")
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped());
-        Ok(cmd)
-    }
 
-    fn spawn(mut cmd: Command) -> Result<Self> {
-        let process = cmd
-            .spawn()
-            .context("failed to start websocket app-server")?;
 
-        // Own the child before waiting so every startup error kills and reaps it.
-        let mut server = Self {
-            process,
-            url: String::new(),
-        };
-        let stderr = server
-            .process
-            .stderr
-            .take()
-            .context("missing app-server stderr")?;
-        let (ready_tx, ready_rx) = mpsc::channel();
-        relay_app_server_diagnostics(BufReader::new(stderr), std::io::stderr(), ready_tx);
-        server.url = ready_rx
-            .recv_timeout(APP_SERVER_STARTUP_TIMEOUT)
-            .context("app-server did not report its websocket listening address")?;
-        if let Some(status) = server.process.try_wait()? {
-            bail!("app-server exited during startup: {status}");
-        }
-        Ok(server)
-    }
-}
-
-fn relay_app_server_diagnostics(
-    reader: impl BufRead + Send + 'static,
-    mut diagnostics: impl Write + Send + 'static,
-    ready_tx: mpsc::Sender<String>,
-) -> thread::JoinHandle<()> {
-    // Presentation must never gate readiness or draining the child's pipe.
-    // Overflow drops diagnostic presentation only, and is reported on recovery.
-    let (log_tx, log_rx) = mpsc::sync_channel::<String>(128);
-    let dropped = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let dropped_for_writer = dropped.clone();
-    thread::spawn(move || {
-        for line in log_rx {
-            let count = dropped_for_writer.swap(0, std::sync::atomic::Ordering::Relaxed);
-            if count > 0 {
-                let _ = writeln!(diagnostics, "[dropped {count} app-server diagnostic lines]");
-            }
-            let _ = writeln!(diagnostics, "{line}");
-        }
-    });
-    // Neither worker is joined by server teardown: a blocked viewer cannot hold
-    // startup, child cleanup, or process shutdown hostage.
-    thread::spawn(move || {
-        let mut ready_tx = Some(ready_tx);
-        for line in reader.lines() {
-            let Ok(mut line) = line else { break };
-            if let Some(url) = line.trim().strip_prefix("listening on: ")
-                && let Some(ready_tx) = ready_tx.take()
-            {
-                let _ = ready_tx.send(url.to_owned());
-            }
-            // Bound presentation storage in bytes as well as line count.
-            if line.len() > 64 * 1024 {
-                let mut end = 64 * 1024;
-                while !line.is_char_boundary(end) {
-                    end -= 1;
-                }
-                line.truncate(end);
-                line.push_str(" [diagnostic line truncated]");
-            }
-            if matches!(log_tx.try_send(line), Err(mpsc::TrySendError::Full(_))) {
-                dropped.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            }
-        }
-    })
-}
-
-impl Drop for BackgroundAppServer {
-    fn drop(&mut self) {
-        if let Ok(Some(status)) = self.process.try_wait() {
-            println!("[background app-server exited: {status}]");
-            return;
-        }
-
-        let _ = self.process.kill();
-        let _ = self.process.wait();
-    }
-}
 
 fn serve(codex_bin: &Path, config_overrides: &[String], listen: &str, kill: bool) -> Result<()> {
     let runtime_path = runtime_dir();
@@ -827,10 +538,7 @@ fn kill_listeners_on_same_port(listen: &str, deadline: Instant) -> Result<()> {
 
 struct SendMessagePolicies<'a> {
     command_name: &'static str,
-    approval_expectation: Option<ApprovalExpectation>,
     experimental_api: bool,
-    approval_policy: Option<AskForApproval>,
-    sandbox_policy: Option<SandboxPolicy>,
     dynamic_tools: &'a Option<Vec<DynamicToolSpec>>,
 }
 
@@ -846,10 +554,7 @@ async fn send_message(
         user_message,
         SendMessagePolicies {
             command_name: "send-message",
-            approval_expectation: None,
             experimental_api: false,
-            approval_policy: None,
-            sandbox_policy: None,
             dynamic_tools: &dynamic_tools,
         },
     )
@@ -890,10 +595,7 @@ async fn send_message_v2_endpoint(
         user_message,
         SendMessagePolicies {
             command_name: "send-message-v2",
-            approval_expectation: None,
             experimental_api,
-            approval_policy: None,
-            sandbox_policy: None,
             dynamic_tools,
         },
     )
@@ -969,81 +671,8 @@ async fn watch(endpoint: &Endpoint, config_overrides: &[String]) -> Result<()> {
     .await
 }
 
-async fn trigger_cmd_approval(
-    endpoint: &Endpoint,
-    config_overrides: &[String],
-    user_message: Option<String>,
-    dynamic_tools: &Option<Vec<DynamicToolSpec>>,
-) -> Result<()> {
-    let default_prompt =
-        "Run `touch /tmp/should-trigger-approval` so I can confirm the file exists.";
-    let message = user_message.unwrap_or_else(|| default_prompt.to_string());
-    send_message_v2_with_policies(
-        endpoint,
-        config_overrides,
-        message,
-        SendMessagePolicies {
-            command_name: "trigger-cmd-approval",
-            approval_expectation: Some(ApprovalExpectation::Command),
-            experimental_api: true,
-            approval_policy: Some(AskForApproval::OnRequest),
-            sandbox_policy: Some(SandboxPolicy::ReadOnly {
-                network_access: false,
-            }),
-            dynamic_tools,
-        },
-    )
-    .await
-}
 
-async fn trigger_patch_approval(
-    endpoint: &Endpoint,
-    config_overrides: &[String],
-    user_message: Option<String>,
-    dynamic_tools: &Option<Vec<DynamicToolSpec>>,
-) -> Result<()> {
-    let default_prompt =
-        "Create a file named APPROVAL_DEMO.txt containing a short hello message using apply_patch.";
-    let message = user_message.unwrap_or_else(|| default_prompt.to_string());
-    send_message_v2_with_policies(
-        endpoint,
-        config_overrides,
-        message,
-        SendMessagePolicies {
-            command_name: "trigger-patch-approval",
-            approval_expectation: Some(ApprovalExpectation::FileChange),
-            experimental_api: true,
-            approval_policy: Some(AskForApproval::OnRequest),
-            sandbox_policy: Some(SandboxPolicy::ReadOnly {
-                network_access: false,
-            }),
-            dynamic_tools,
-        },
-    )
-    .await
-}
 
-async fn no_trigger_cmd_approval(
-    endpoint: &Endpoint,
-    config_overrides: &[String],
-    dynamic_tools: &Option<Vec<DynamicToolSpec>>,
-) -> Result<()> {
-    let prompt = "Run `touch should_not_trigger_approval.txt`";
-    send_message_v2_with_policies(
-        endpoint,
-        config_overrides,
-        prompt.to_string(),
-        SendMessagePolicies {
-            command_name: "no-trigger-cmd-approval",
-            approval_expectation: Some(ApprovalExpectation::NoCommand),
-            experimental_api: true,
-            approval_policy: None,
-            sandbox_policy: None,
-            dynamic_tools,
-        },
-    )
-    .await
-}
 
 async fn send_message_v2_with_policies(
     endpoint: &Endpoint,
@@ -1064,7 +693,7 @@ async fn send_message_v2_with_policies(
                 ..Default::default()
             })?;
             println!("< thread/start: {}", thread_response.thread.id);
-            let mut turn_params = TurnStartParams {
+            let turn_params = TurnStartParams {
                 thread_id: thread_response.thread.id.clone(),
                 client_user_message_id: None,
                 input: vec![V2UserInput::Text {
@@ -1074,10 +703,7 @@ async fn send_message_v2_with_policies(
                 }],
                 ..Default::default()
             };
-            turn_params.approval_policy = policies.approval_policy;
-            turn_params.sandbox_policy = policies.sandbox_policy;
 
-            client.approval_expectation = policies.approval_expectation;
             let turn_response = client.turn_start(turn_params)?;
             println!("< turn/start: {}", turn_response.turn.id);
 
@@ -1089,55 +715,6 @@ async fn send_message_v2_with_policies(
     .await
 }
 
-async fn send_follow_up_v2(
-    endpoint: &Endpoint,
-    config_overrides: &[String],
-    first_message: String,
-    follow_up_message: String,
-    dynamic_tools: &Option<Vec<DynamicToolSpec>>,
-) -> Result<()> {
-    with_client("send-follow-up-v2", endpoint, config_overrides, |client| {
-        let initialize = client.initialize()?;
-        println!("< initialize response: {initialize:?}");
-
-        let thread_response = client.thread_start(ThreadStartParams {
-            dynamic_tools: dynamic_tools.clone(),
-            ..Default::default()
-        })?;
-        println!("< thread/start: {}", thread_response.thread.id);
-
-        let first_turn_params = TurnStartParams {
-            thread_id: thread_response.thread.id.clone(),
-            client_user_message_id: None,
-            input: vec![V2UserInput::Text {
-                text: first_message,
-                // Test client sends plain text without UI element ranges.
-                text_elements: Vec::new(),
-            }],
-            ..Default::default()
-        };
-        let first_turn_response = client.turn_start(first_turn_params)?;
-        println!("< turn/start response (initial): {first_turn_response:?}");
-        client.stream_turn(&thread_response.thread.id, &first_turn_response.turn.id)?;
-
-        let follow_up_params = TurnStartParams {
-            thread_id: thread_response.thread.id.clone(),
-            client_user_message_id: None,
-            input: vec![V2UserInput::Text {
-                text: follow_up_message,
-                // Test client sends plain text without UI element ranges.
-                text_elements: Vec::new(),
-            }],
-            ..Default::default()
-        };
-        let follow_up_response = client.turn_start(follow_up_params)?;
-        println!("< turn/start response (follow-up): {follow_up_response:?}");
-        client.stream_turn(&thread_response.thread.id, &follow_up_response.turn.id)?;
-
-        Ok(())
-    })
-    .await
-}
 
 async fn test_login(
     endpoint: &Endpoint,
@@ -1333,164 +910,6 @@ fn thread_hold_elicitation(url: &str, thread_id: String, hold_seconds: u64) -> R
     Ok(())
 }
 
-fn live_elicitation_timeout_pause(
-    codex_bin: Option<PathBuf>,
-    url: Option<String>,
-    config_overrides: &[String],
-    model: String,
-    workspace: PathBuf,
-    script: Option<PathBuf>,
-    hold_seconds: u64,
-    command_timeout: Option<Duration>,
-) -> Result<()> {
-    if hold_seconds <= 10 {
-        bail!("--hold-seconds must be greater than 10 to exceed the unified exec timeout");
-    }
-
-    let mut _background_server = None;
-    let websocket_url = match (codex_bin, url) {
-        (Some(_), Some(_)) => bail!("--codex-bin and --url are mutually exclusive"),
-        (Some(codex_bin), None) => {
-            let server = BackgroundAppServer::spawn(BackgroundAppServer::command(
-                &codex_bin,
-                config_overrides,
-            )?)?;
-            let websocket_url = server.url.clone();
-            _background_server = Some(server);
-            websocket_url
-        }
-        (None, Some(url)) => url,
-        (None, None) => "ws://127.0.0.1:4222".to_string(),
-    };
-
-    let script_path = script.unwrap_or_else(|| {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("scripts")
-            .join("live_elicitation_hold.ps1")
-    });
-    if !script_path.is_file() {
-        bail!("helper script not found: {}", script_path.display());
-    }
-
-    let script_path = script_path
-        .canonicalize()
-        .context("resolve helper script path")?;
-    let workspace = workspace
-        .canonicalize()
-        .with_context(|| format!("failed to resolve workspace `{}`", workspace.display()))?;
-    let app_server_test_client_bin = std::env::current_exe()
-        .context("failed to resolve codex-app-server-test-client binary path")?;
-    let endpoint = Endpoint::ConnectWs(websocket_url.clone());
-    let mut client = CodexClient::connect(&endpoint, &[])?;
-    let endpoint = match command_timeout {
-        Some(timeout) => Endpoint::Budgeted(Box::new(endpoint), timeout),
-        None => endpoint,
-    };
-    run_client_command(&mut client, &endpoint, |client| {
-        let initialize = client.initialize()?;
-        println!("< initialize response: {initialize:?}");
-
-        let thread_response = client.thread_start(ThreadStartParams {
-            model: Some(model),
-            ..Default::default()
-        })?;
-        println!("< thread/start: {}", thread_response.thread.id);
-
-        let thread_id = thread_response.thread.id;
-        let command = format!(
-            "$env:APP_SERVER_URL={}; $env:APP_SERVER_TEST_CLIENT_BIN={}; \
-         $env:ELICITATION_HOLD_SECONDS={}; \
-         powershell -NoProfile -ExecutionPolicy Bypass -File {}",
-            powershell_quote(&websocket_url),
-            powershell_quote(&app_server_test_client_bin.display().to_string()),
-            powershell_quote(&hold_seconds.to_string()),
-            powershell_quote(&script_path.display().to_string()),
-        );
-        let prompt = format!(
-            "Use the `exec_command` tool exactly once. Set its `cmd` field to the exact shell command below. Do not rewrite it, do not split it, do not call any other tool, do not set `yield_time_ms`, and wait for the command to finish before replying.\n\n{command}\n\nAfter the command finishes, reply with exactly `DONE`."
-        );
-
-        client.helper_command = Some(command);
-        let turn_response = client.turn_start(TurnStartParams {
-            thread_id: thread_id.clone(),
-            client_user_message_id: None,
-            input: vec![V2UserInput::Text {
-                text: prompt,
-                text_elements: Vec::new(),
-            }],
-            approval_policy: Some(AskForApproval::Never),
-            sandbox_policy: Some(SandboxPolicy::DangerFullAccess),
-            effort: Some(ReasoningEffort::High),
-            cwd: Some(workspace),
-            ..Default::default()
-        })?;
-        println!("< turn/start: {}", turn_response.turn.id);
-
-        let stream_result = client.stream_turn(&thread_id, &turn_response.turn.id);
-        let elapsed = client.helper_duration.unwrap_or_default();
-
-        let validation_result = (|| -> Result<()> {
-            stream_result?;
-
-            let helper_output = client
-                .command_execution_outputs
-                .iter()
-                .find(|output| output.contains("[elicitation-hold]"))
-                .cloned()
-                .ok_or_else(|| {
-                    anyhow::anyhow!("expected helper script markers in command output")
-                })?;
-            let minimum_elapsed = Duration::from_secs(hold_seconds.saturating_sub(1));
-
-            if client.last_turn_status != Some(TurnStatus::Completed) {
-                bail!(
-                    "expected completed turn, got {:?} (last error: {:?})",
-                    client.last_turn_status,
-                    client.last_turn_error_message
-                );
-            }
-            if !client
-                .command_execution_statuses
-                .contains(&CommandExecutionStatus::Completed)
-            {
-                bail!(
-                    "expected a completed command execution, got {:?}",
-                    client.command_execution_statuses
-                );
-            }
-            if !client.helper_done_seen || !helper_output.contains("[elicitation-hold] done") {
-                bail!(
-                    "expected helper script completion marker in command output, got: {helper_output:?}"
-                );
-            }
-            if !client.unexpected_items_before_helper_done.is_empty() {
-                bail!(
-                    "turn started new items before helper completion: {:?}",
-                    client.unexpected_items_before_helper_done
-                );
-            }
-            if client.turn_completed_before_helper_done {
-                bail!("turn completed before helper script finished");
-            }
-            if elapsed < minimum_elapsed {
-                bail!(
-                    "helper execution completed too quickly to prove timeout pause worked: elapsed={elapsed:?}, expected at least {minimum_elapsed:?}"
-                );
-            }
-
-            Ok(())
-        })();
-
-        validation_result?;
-
-        println!(
-            "[live elicitation timeout pause summary] thread_id={thread_id}, turn_id={}, elapsed={elapsed:?}, command_statuses={:?}",
-            turn_response.turn.id, client.command_execution_statuses
-        );
-
-        Ok(())
-    })
-}
 
 fn ensure_dynamic_tools_unused(
     dynamic_tools: &Option<Vec<DynamicToolSpec>>,
@@ -1818,19 +1237,6 @@ struct CodexClient {
     pending_notifications: VecDeque<JSONRPCNotification>,
     command_approval_behavior: CommandApprovalBehavior,
     command_approval_count: usize,
-    approval_expectation: Option<ApprovalExpectation>,
-    approval_requests: Vec<(String, String, ApprovalExpectation)>,
-    command_execution_statuses: Vec<CommandExecutionStatus>,
-    command_execution_outputs: Vec<String>,
-    command_output_stream: String,
-    helper_command: Option<String>,
-    helper_item_id: Option<String>,
-    helper_duration: Option<Duration>,
-    command_item_started: bool,
-    helper_done_seen: bool,
-    turn_completed_before_helper_done: bool,
-    unexpected_items_before_helper_done: Vec<ThreadItem>,
-    last_turn_status: Option<TurnStatus>,
     last_turn_error_message: Option<String>,
 }
 
@@ -1839,24 +1245,7 @@ enum CommandApprovalBehavior {
     AlwaysAccept,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ApprovalExpectation {
-    Command,
-    FileChange,
-    NoCommand,
-}
 
-fn item_started_before_helper_done_is_unexpected(
-    item: &ThreadItem,
-    command_item_started: bool,
-    helper_done_seen: bool,
-) -> bool {
-    if !command_item_started || helper_done_seen {
-        return false;
-    }
-
-    !matches!(item, ThreadItem::UserMessage { .. })
-}
 
 impl CodexClient {
     fn connect(endpoint: &Endpoint, config_overrides: &[String]) -> Result<Self> {
@@ -1867,23 +1256,16 @@ impl CodexClient {
         }
     }
 
-    fn spawn_stdio(codex_bin: &Path, config_overrides: &[String]) -> Result<Self> {
-        Self::spawn_stdio_with_env(codex_bin, config_overrides, &[])
-    }
 
-    fn spawn_stdio_with_env(
+    fn spawn_stdio(
         codex_bin: &Path,
         config_overrides: &[String],
-        environment: &[(OsString, OsString)],
     ) -> Result<Self> {
         let codex_bin_display = codex_bin.display();
         let mut cmd = Command::new(codex_bin);
         add_codex_parent_to_path(&mut cmd, codex_bin)?;
         for override_kv in config_overrides {
             cmd.arg("--config").arg(override_kv);
-        }
-        for (name, value) in environment {
-            cmd.env(name, value);
         }
         let mut codex_app_server = cmd
             .arg("app-server")
@@ -1931,35 +1313,12 @@ impl CodexClient {
             pending_notifications: VecDeque::new(),
             command_approval_behavior: CommandApprovalBehavior::AlwaysAccept,
             command_approval_count: 0,
-            approval_expectation: None,
-            approval_requests: Vec::new(),
-            command_execution_statuses: Vec::new(),
-            command_execution_outputs: Vec::new(),
-            command_output_stream: String::new(),
-            helper_command: None,
-            helper_item_id: None,
-            helper_duration: None,
-            command_item_started: false,
-            helper_done_seen: false,
-            turn_completed_before_helper_done: false,
-            unexpected_items_before_helper_done: Vec::new(),
-            last_turn_status: None,
             last_turn_error_message: None,
         }
     }
 
-    fn child_exit_status(&mut self) -> Result<Option<std::process::ExitStatus>> {
-        match &self.transport {
-            ClientTransport::Stdio { child, .. } => child
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .try_wait()
-                .context("inspect app-server child exit status"),
-            ClientTransport::WebSocket { .. } => Ok(None),
-        }
-    }
 
-    /// Bounds a smoke polling operation, including its synchronous child RPC/turn IO.
+    /// Bounds a finite client operation, including its synchronous child RPC/turn IO.
     /// Expiry terminates this owned stdio server; callers must not treat its remote state as known.
     fn with_operation_deadline<T>(
         &mut self,
@@ -2031,27 +1390,6 @@ impl CodexClient {
         Ok(())
     }
 
-    fn note_helper_output(&mut self, output: &str) {
-        if self.helper_command.is_none() || self.helper_done_seen {
-            return;
-        }
-        self.command_output_stream.push_str(output);
-        if self
-            .command_output_stream
-            .contains("[elicitation-hold] done")
-        {
-            self.helper_done_seen = true;
-        }
-        // Retain only enough bytes to recognize a marker split across deltas.
-        let mut start = self
-            .command_output_stream
-            .len()
-            .saturating_sub("[elicitation-hold] done".len() - 1);
-        while !self.command_output_stream.is_char_boundary(start) {
-            start += 1;
-        }
-        self.command_output_stream.drain(..start);
-    }
 
     fn initialize(&mut self) -> Result<InitializeResponse> {
         self.initialize_with_experimental_api(/*experimental_api*/ true)
@@ -2126,9 +1464,6 @@ impl CodexClient {
     }
 
     fn turn_start(&mut self, params: TurnStartParams) -> Result<TurnStartResponse> {
-        // Approvals may arrive before the turn/start response, so reset here,
-        // not when stream_turn begins consuming queued notifications.
-        self.approval_requests.clear();
         let request_id = self.request_id();
         let request = ClientRequest::TurnStart {
             request_id: request_id.clone(),
@@ -2247,18 +1582,7 @@ impl CodexClient {
     }
 
     fn stream_turn(&mut self, thread_id: &str, turn_id: &str) -> Result<()> {
-        let mut approval_operation_succeeded = None;
-        self.last_turn_status = None;
         self.last_turn_error_message = None;
-        self.command_execution_statuses.clear();
-        self.command_execution_outputs.clear();
-        self.command_output_stream.clear();
-        self.helper_item_id = None;
-        self.helper_duration = None;
-        self.command_item_started = false;
-        self.helper_done_seen = false;
-        self.turn_completed_before_helper_done = false;
-        self.unexpected_items_before_helper_done.clear();
         loop {
             let notification = self.next_notification()?;
 
@@ -2288,9 +1612,6 @@ impl CodexClient {
                     if delta.thread_id != thread_id || delta.turn_id != turn_id {
                         continue;
                     }
-                    if self.helper_item_id.as_deref() == Some(delta.item_id.as_str()) {
-                        self.note_helper_output(&delta.delta);
-                    }
                     print!("{}", delta.delta);
                     std::io::stdout().flush().ok();
                 }
@@ -2305,70 +1626,17 @@ impl CodexClient {
                     if payload.thread_id != thread_id || payload.turn_id != turn_id {
                         continue;
                     }
-                    if let Some(expected_command) = self.helper_command.as_ref() {
-                        if let ThreadItem::CommandExecution { id, command, .. } = &payload.item {
-                            if self.command_item_started
-                                || !is_helper_command(command, expected_command)
-                            {
-                                self.unexpected_items_before_helper_done
-                                    .push(payload.item.clone());
-                            } else {
-                                self.command_item_started = true;
-                                self.helper_item_id = Some(id.clone());
-                            }
-                        } else if item_started_before_helper_done_is_unexpected(
-                            &payload.item,
-                            self.command_item_started,
-                            self.helper_done_seen,
-                        ) {
-                            self.unexpected_items_before_helper_done
-                                .push(payload.item.clone());
-                        }
-                    }
                     println!("\n< item started: {}", payload.item.id());
                 }
                 ServerNotification::ItemCompleted(payload) => {
                     if payload.thread_id != thread_id || payload.turn_id != turn_id {
                         continue;
                     }
-                    let operation_succeeded = match (&payload.item, self.approval_expectation) {
-                        (
-                            ThreadItem::CommandExecution {
-                                status, exit_code, ..
-                            },
-                            Some(ApprovalExpectation::Command | ApprovalExpectation::NoCommand),
-                        ) => Some(
-                            *status == CommandExecutionStatus::Completed && *exit_code == Some(0),
-                        ),
-                        (
-                            ThreadItem::FileChange { status, .. },
-                            Some(ApprovalExpectation::FileChange),
-                        ) => Some(*status == PatchApplyStatus::Completed),
-                        _ => None,
-                    };
-                    if let Some(succeeded) = operation_succeeded {
-                        approval_operation_succeeded =
-                            Some(approval_operation_succeeded.unwrap_or(true) && succeeded);
-                    }
                     if let ThreadItem::CommandExecution {
-                        id,
-                        status,
                         aggregated_output,
-                        duration_ms,
                         ..
                     } = &payload.item
                     {
-                        if self.helper_item_id.as_deref() == Some(id.as_str()) {
-                            self.command_execution_statuses.push(status.clone());
-                            self.helper_duration = duration_ms
-                                .and_then(|ms| u64::try_from(ms).ok())
-                                .map(Duration::from_millis);
-                            if let Some(output) = aggregated_output {
-                                // Aggregated output is a separate complete representation, not another delta.
-                                self.helper_done_seen |= output.contains("[elicitation-hold] done");
-                                self.command_execution_outputs.push(output.clone());
-                            }
-                        }
                         if let Some(output) = aggregated_output {
                             println!("{output}");
                         }
@@ -2379,10 +1647,6 @@ impl CodexClient {
                 }
                 ServerNotification::TurnCompleted(payload) => {
                     if payload.thread_id == thread_id && payload.turn.id == turn_id {
-                        self.last_turn_status = Some(payload.turn.status.clone());
-                        if self.command_item_started && !self.helper_done_seen {
-                            self.turn_completed_before_helper_done = true;
-                        }
                         self.last_turn_error_message = payload
                             .turn
                             .error
@@ -2420,40 +1684,9 @@ impl CodexClient {
             }
         }
 
-        if let Some(expectation) = self.approval_expectation {
-            if approval_operation_succeeded != Some(true) {
-                bail!(
-                    "approval smoke {expectation:?} did not observe successful tool execution for thread {thread_id}, turn {turn_id}"
-                );
-            }
-            self.verify_approval_expectation(thread_id, turn_id, expectation)?;
-        }
         Ok(())
     }
 
-    fn verify_approval_expectation(
-        &self,
-        thread_id: &str,
-        turn_id: &str,
-        expectation: ApprovalExpectation,
-    ) -> Result<()> {
-        let requested = |kind| {
-            self.approval_requests.iter().any(|(thread, turn, actual)| {
-                thread == thread_id && turn == turn_id && *actual == kind
-            })
-        };
-        let satisfied = match expectation {
-            ApprovalExpectation::Command => requested(ApprovalExpectation::Command),
-            ApprovalExpectation::FileChange => requested(ApprovalExpectation::FileChange),
-            ApprovalExpectation::NoCommand => !requested(ApprovalExpectation::Command),
-        };
-        if !satisfied {
-            bail!(
-                "approval expectation {expectation:?} was not met for thread {thread_id}, turn {turn_id}"
-            );
-        }
-        Ok(())
-    }
 
     fn stream_notifications_forever(&mut self) -> Result<()> {
         self.wire_dump = true;
@@ -2627,10 +1860,6 @@ impl CodexClient {
             approval_id.as_deref().unwrap_or("<none>")
         );
         self.command_approval_count += 1;
-        if self.approval_expectation.is_some() {
-            self.approval_requests
-                .push((thread_id, turn_id, ApprovalExpectation::Command));
-        }
         if let Some(environment_id) = environment_id.as_deref() {
             println!("< environment: {environment_id}");
         }
@@ -2692,13 +1921,6 @@ impl CodexClient {
             grant_root,
         } = params;
 
-        if self.approval_expectation.is_some() {
-            self.approval_requests.push((
-                thread_id.clone(),
-                turn_id.clone(),
-                ApprovalExpectation::FileChange,
-            ));
-        }
         println!(
             "\n< fileChange approval requested for thread {thread_id}, turn {turn_id}, item {item_id}"
         );
@@ -2785,26 +2007,6 @@ impl CodexClient {
     }
 }
 
-fn is_helper_command(command: &str, expected: &str) -> bool {
-    if command == expected {
-        return true;
-    }
-    // The protocol renders the shell argv, rather than just exec_command's cmd.
-    // Use its formatter for both Windows and POSIX quoting of the final script argument.
-    [
-        r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe",
-        "powershell",
-    ]
-    .into_iter()
-    .any(|shell| {
-        let rendered = codex_app_server_protocol::command_display_string(&[
-            shell.to_string(),
-            "-Command".to_string(),
-            expected.to_string(),
-        ]);
-        command.ends_with(&rendered[shell.len()..])
-    })
-}
 
 // Answer contents never belong in diagnostics, even with explicit wire logging.
 fn wire_diagnostic(message: &JSONRPCMessage, enabled: bool) -> Result<Option<String>> {
@@ -2945,857 +2147,4 @@ impl Drop for CodexClient {
     }
 }
 
-#[cfg(test)]
-mod transport_audit_tests;
 
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn endpoint_options_reject_ineffective_overrides_before_startup() {
-        use super::*;
-        // No connections, tracing setup or child starts occur in validation.
-        for command in [
-            vec!["watch"],
-            vec!["send-message-v2", "hello"],
-            vec!["model-list"],
-            vec!["thread-list"],
-            vec!["thread-increment-elicitation", "id"],
-            vec!["thread-hold-elicitation", "id", "--hold-seconds", "1"],
-            vec!["thread-decrement-elicitation", "id", "lease"],
-            vec!["live-elicitation-timeout-pause"],
-        ] {
-            for url in [None, Some("ws://127.0.0.1:4222")] {
-                for config_after_command in [false, true] {
-                    let mut args = vec!["client"];
-                    if let Some(url) = url {
-                        args.extend(["--url", url]);
-                    }
-                    if !config_after_command {
-                        args.extend(["-c", "model=chosen"]);
-                    }
-                    args.extend(command.iter().copied());
-                    if config_after_command {
-                        args.extend(["-c", "model=chosen"]);
-                    }
-                    let cli = Cli::try_parse_from(args).unwrap();
-                    let error = validate_endpoint_options(&cli).unwrap_err();
-                    assert!(
-                        error.to_string().contains("configure the existing"),
-                        "{error}"
-                    );
-                }
-            }
-        }
-        for args in [
-            vec!["client", "--url", "ws://127.0.0.1:4222", "serve"],
-            vec!["client", "serve", "--url", "ws://127.0.0.1:4222"],
-        ] {
-            assert!(
-                validate_endpoint_options(&Cli::try_parse_from(args).unwrap())
-                    .unwrap_err()
-                    .to_string()
-                    .contains("--listen")
-            );
-        }
-        for args in [
-            vec!["client", "watch"],
-            vec![
-                "client",
-                "--codex-bin",
-                "codex",
-                "-c",
-                "model=chosen",
-                "watch",
-            ],
-            vec![
-                "client",
-                "-c",
-                "model=chosen",
-                "serve",
-                "--listen",
-                "ws://127.0.0.1:4223",
-            ],
-        ] {
-            validate_endpoint_options(&Cli::try_parse_from(args).unwrap()).unwrap();
-        }
-    }
-
-    #[test]
-    fn approval_smoke_requires_matching_wire_requests() {
-        use super::*;
-        use serde_json::json;
-
-        for (expectation, method, thread_id, turn_id, status, succeeds) in [
-            (
-                ApprovalExpectation::Command,
-                Some("commandExecution"),
-                "thread",
-                "turn",
-                "completed",
-                true,
-            ),
-            (
-                ApprovalExpectation::Command,
-                None,
-                "thread",
-                "turn",
-                "completed",
-                false,
-            ),
-            (
-                ApprovalExpectation::Command,
-                Some("commandExecution"),
-                "other",
-                "turn",
-                "completed",
-                false,
-            ),
-            (
-                ApprovalExpectation::Command,
-                Some("commandExecution"),
-                "thread",
-                "other",
-                "completed",
-                false,
-            ),
-            (
-                ApprovalExpectation::Command,
-                Some("fileChange"),
-                "thread",
-                "turn",
-                "completed",
-                false,
-            ),
-            (
-                ApprovalExpectation::FileChange,
-                Some("fileChange"),
-                "thread",
-                "turn",
-                "completed",
-                true,
-            ),
-            (
-                ApprovalExpectation::FileChange,
-                None,
-                "thread",
-                "turn",
-                "completed",
-                false,
-            ),
-            (
-                ApprovalExpectation::NoCommand,
-                None,
-                "thread",
-                "turn",
-                "completed",
-                true,
-            ),
-            (
-                ApprovalExpectation::NoCommand,
-                Some("commandExecution"),
-                "thread",
-                "turn",
-                "completed",
-                false,
-            ),
-            (
-                ApprovalExpectation::Command,
-                Some("commandExecution"),
-                "thread",
-                "turn",
-                "failed",
-                false,
-            ),
-        ] {
-            for tool_status in [Some("completed"), Some("failed"), None] {
-                let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-                let address = listener.local_addr().unwrap();
-                let peer = thread::spawn(move || {
-                    let (stream, _) = listener.accept().unwrap();
-                    stream
-                        .set_read_timeout(Some(Duration::from_secs(5)))
-                        .unwrap();
-                    stream
-                        .set_write_timeout(Some(Duration::from_secs(5)))
-                        .unwrap();
-                    let mut socket = tungstenite::accept(stream).unwrap();
-                    let request: Value =
-                        serde_json::from_str(socket.read().unwrap().to_text().unwrap()).unwrap();
-                    assert_eq!(request["method"], "turn/start");
-                    if let Some(method) = method {
-                        socket.send(tungstenite::Message::Text(json!({
-                        "id": "approval", "method": format!("item/{method}/requestApproval"),
-                        "params": {"threadId":thread_id, "turnId":turn_id, "itemId":"item", "startedAtMs":0}
-                    }).to_string().into())).unwrap();
-                        let response: Value =
-                            serde_json::from_str(socket.read().unwrap().to_text().unwrap())
-                                .unwrap();
-                        assert_eq!(response["id"], "approval");
-                        assert_eq!(response["result"]["decision"], "accept");
-                    }
-                    socket.send(tungstenite::Message::Text(json!({
-                    "id":request["id"], "result":{"turn":{"id":"turn", "items":[], "status":"inProgress", "error":null}}
-                }).to_string().into())).unwrap();
-                    if let Some(tool_status) = tool_status {
-                        let item = if expectation == ApprovalExpectation::FileChange {
-                            json!({"type":"fileChange", "id":"item", "changes":[], "status":tool_status})
-                        } else {
-                            json!({"type":"commandExecution", "id":"item", "command":"fixture", "cwd":std::env::temp_dir(), "commandActions":[], "status":tool_status, "exitCode":if tool_status == "completed" { 0 } else { 1 }})
-                        };
-                        socket.send(tungstenite::Message::Text(json!({
-                        "method":"item/completed", "params":{"threadId":"thread", "turnId":"turn", "item":item, "completedAtMs":0}
-                    }).to_string().into())).unwrap();
-                    }
-                    socket.send(tungstenite::Message::Text(json!({
-                    "method":"turn/completed", "params":{"threadId":"thread", "turn":{
-                        "id":"turn", "items":[], "status":status,
-                        "error":if status == "failed" { json!({"message":"backend failed"}) } else { Value::Null }
-                    }}
-                }).to_string().into())).unwrap();
-                });
-                let mut client =
-                    CodexClient::connect_websocket(&format!("ws://{address}")).unwrap();
-                client.approval_expectation = Some(expectation);
-                // A previous turn's observation must not satisfy this request.
-                client
-                    .approval_requests
-                    .push(("thread".into(), "turn".into(), expectation));
-                let result = client.with_operation_deadline(
-                    Instant::now() + Duration::from_secs(5),
-                    |client| {
-                        let response = client.turn_start(TurnStartParams {
-                            thread_id: "thread".into(),
-                            input: vec![],
-                            ..Default::default()
-                        })?;
-                        client.stream_turn("thread", &response.turn.id)
-                    },
-                );
-                peer.join().unwrap();
-                assert_eq!(
-                    result.is_ok(),
-                    succeeds && tool_status == Some("completed"),
-                    "{expectation:?}, {method:?}, {thread_id}, {turn_id}, {status}, {tool_status:?}: {result:?}"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn websocket_rpc_deadline_closes_stalled_peer() {
-        use super::*;
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let address = listener.local_addr().unwrap();
-        let peer = thread::spawn(move || {
-            let (stream, _) = listener.accept().unwrap();
-            stream
-                .set_read_timeout(Some(Duration::from_secs(2)))
-                .unwrap();
-            let mut socket = tungstenite::accept(stream).unwrap();
-            let request: serde_json::Value =
-                serde_json::from_str(socket.read().unwrap().to_text().unwrap()).unwrap();
-            assert_eq!(request["method"], "initialize");
-            let error = socket.read().unwrap_err();
-            assert!(
-                !matches!(error, tungstenite::Error::Io(ref err) if matches!(err.kind(), std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock)),
-                "the client must close the stalled connection: {error}"
-            );
-        });
-        let mut client = CodexClient::connect_websocket(&format!("ws://{address}")).unwrap();
-        let started = Instant::now();
-        let error = client
-            .with_operation_deadline(started + Duration::from_millis(150), |client| {
-                client.initialize()
-            })
-            .unwrap_err();
-        assert!(format!("{error:#}").contains("deadline"), "{error:#}");
-        assert!(started.elapsed() < Duration::from_secs(2));
-        // Keep the client alive: closure must come from the expired operation,
-        // not from client teardown masking a leaked socket/worker.
-        peer.join().unwrap();
-        drop(client);
-    }
-
-    #[test]
-    fn turn_results_and_helper_observations_follow_wire_identity() {
-        use super::*;
-        use serde_json::json;
-        let temp = tempfile::tempdir().unwrap();
-        let mut client = smoke_deadline_client(&temp.path().join("requests.jsonl"), "");
-        let completion = |thread_id: &str, status: &str| -> JSONRPCNotification {
-            serde_json::from_value(json!({"method":"turn/completed", "params":{
-                "threadId":thread_id, "turn":{"id":"turn", "items":[], "status":status,
-                    "error": if status == "failed" { json!({"message":"fixture failure"}) } else { json!(null) }}
-            }})).unwrap()
-        };
-        for (status, expected) in [
-            ("failed", TurnStatus::Failed),
-            ("interrupted", TurnStatus::Interrupted),
-            ("completed", TurnStatus::Completed),
-        ] {
-            client
-                .pending_notifications
-                .push_back(completion("other-thread", "failed"));
-            client
-                .pending_notifications
-                .push_back(completion("thread", status));
-            let result = client
-                .with_operation_deadline(Instant::now() + Duration::from_secs(1), |client| {
-                    client.stream_turn("thread", "turn")
-                });
-            assert_eq!(result.is_ok(), status == "completed");
-            assert_eq!(client.last_turn_status, Some(expected));
-            assert_eq!(
-                client.last_turn_error_message.as_deref(),
-                (status == "failed").then_some("fixture failure")
-            );
-        }
-        client.note_helper_output(&"x".repeat(100_000));
-        assert!(
-            client.command_output_stream.is_empty(),
-            "ordinary turns retain no helper output"
-        );
-        client.helper_command = Some("run helper".into());
-        client.note_helper_output(&format!("{}[elicitation-hold] ", "é".repeat(100_000)));
-        assert!(!client.helper_done_seen);
-        assert!(client.command_output_stream.len() < "[elicitation-hold] done".len());
-        client.note_helper_output("done");
-        assert!(client.helper_done_seen, "split markers must be recognized");
-
-        let item = |id: &str, duration: i64| json!({"type":"commandExecution", "id":id, "command":"run helper", "cwd":temp.path(), "status":"completed", "commandActions":[], "aggregatedOutput":"[elicitation-hold] done", "durationMs":duration});
-        for (method, thread_id, id, duration) in [
-            ("item/started", "thread", "helper", 0),
-            ("item/completed", "other-thread", "helper", 99999),
-            ("item/completed", "thread", "unrelated", 99999),
-            ("item/completed", "thread", "helper", 12500),
-        ] {
-            client.pending_notifications.push_back(serde_json::from_value(json!({"method":method, "params":{
-                "threadId":thread_id, "turnId":"turn", "item":item(id, duration), "startedAtMs":0, "completedAtMs":0
-            }})).unwrap());
-        }
-        client
-            .pending_notifications
-            .push_back(completion("thread", "completed"));
-        client
-            .with_operation_deadline(Instant::now() + Duration::from_secs(1), |client| {
-                client.stream_turn("thread", "turn")
-            })
-            .unwrap();
-        assert_eq!(client.helper_item_id.as_deref(), Some("helper"));
-        assert_eq!(client.helper_duration, Some(Duration::from_millis(12500)));
-        assert_eq!(
-            client.command_execution_statuses,
-            vec![CommandExecutionStatus::Completed]
-        );
-        assert_eq!(
-            client.command_execution_outputs,
-            vec!["[elicitation-hold] done"]
-        );
-        assert!(client.helper_done_seen);
-    }
-
-    #[test]
-    fn helper_matching_and_wire_diagnostics_preserve_exact_payloads() {
-        use super::*;
-        let expected = "$env:X='a'; powershell -File 'C:\\helper.ps1'";
-        assert!(is_helper_command(expected, expected));
-        for shell in [r"C:\Program Files\PowerShell\7\pwsh.exe", "powershell"] {
-            let rendered = codex_app_server_protocol::command_display_string(&[
-                shell.into(),
-                "-NoProfile".into(),
-                "-Command".into(),
-                expected.into(),
-            ]);
-            assert!(is_helper_command(&rendered, expected), "{rendered}");
-            assert!(!is_helper_command(&rendered, "different command"));
-        }
-        let message = JSONRPCMessage::Response(JSONRPCResponse {
-            id: RequestId::Integer(42),
-            result: serde_json::json!({"answers":{"q":{"answers":["private answer"]}}, "interrupted":false}),
-        });
-        assert_eq!(wire_diagnostic(&message, false).unwrap(), None);
-        let diagnostic = wire_diagnostic(&message, true).unwrap().unwrap();
-        assert!(!diagnostic.contains("private answer"));
-        assert!(diagnostic.contains("redacted"));
-        let temp = tempfile::tempdir().unwrap();
-        let log = temp.path().join("requests.jsonl");
-        let mut client = smoke_deadline_client(
-            &log,
-            "$response = @{id=$request.id; result=@{data=@(); nextCursor=$null}}; [Console]::WriteLine(($response | ConvertTo-Json -Depth 10 -Compress))",
-        );
-        client.wire_dump = true;
-        client.write_jsonrpc_message(message).unwrap();
-        client.model_list(ModelListParams::default()).unwrap();
-        let requests = std::fs::read_to_string(log).unwrap();
-        let actual: serde_json::Value =
-            serde_json::from_str(requests.lines().next().unwrap()).unwrap();
-        assert_eq!(
-            actual["result"]["answers"]["q"]["answers"],
-            serde_json::json!(["private answer"])
-        );
-    }
-
-    #[test]
-    fn background_app_server_reports_bound_port_and_accepts_initialization() {
-        use super::*;
-
-        let codex_bin = codex_utils_cargo_bin::cargo_bin("codex").expect("built codex binary");
-        let codex_home = tempfile::tempdir().expect("isolated codex home");
-        let mut command =
-            BackgroundAppServer::command(&codex_bin, &["analytics.enabled=false".to_owned()])
-                .expect("build app-server command");
-        command.env("CODEX_HOME", codex_home.path());
-        let server = BackgroundAppServer::spawn(command).expect("start real websocket app-server");
-        let url = Url::parse(&server.url).expect("reported websocket URL");
-        assert_eq!(url.scheme(), "ws");
-        assert_eq!(url.host_str(), Some("127.0.0.1"));
-        assert!(url.port().is_some_and(|port| port != 0));
-        let mut client = CodexClient::connect(&Endpoint::ConnectWs(server.url.clone()), &[])
-            .expect("connect to the address actually bound by the child");
-        let response = client.initialize().expect("initialize the spawned server");
-        assert_eq!(
-            response
-                .codex_home
-                .as_path()
-                .canonicalize()
-                .expect("server home"),
-            codex_home
-                .path()
-                .canonicalize()
-                .expect("expected child home"),
-            "the reported port must reach this spawned server"
-        );
-    }
-
-    #[test]
-    fn background_app_server_rejects_child_exit_before_listening() {
-        use super::*;
-
-        let codex_bin = codex_utils_cargo_bin::cargo_bin("codex").expect("built codex binary");
-        let codex_home = tempfile::tempdir().expect("isolated codex home");
-        let mut command = BackgroundAppServer::command(&codex_bin, &["missing-equals".to_owned()])
-            .expect("build app-server command");
-        command.env("CODEX_HOME", codex_home.path());
-        let started = Instant::now();
-        let error = BackgroundAppServer::spawn(command)
-            .err()
-            .expect("invalid child arguments must not return a usable server URL");
-        assert!(
-            error
-                .to_string()
-                .contains("did not report its websocket listening address"),
-            "unexpected startup error: {error:#}"
-        );
-        assert!(
-            started.elapsed() < APP_SERVER_STARTUP_TIMEOUT,
-            "child exit must fail immediately instead of waiting for the startup deadline"
-        );
-    }
-
-    #[test]
-    fn client_shutdown_reaps_cooperative_and_unresponsive_processes() {
-        use super::*;
-        use std::os::windows::process::CommandExt;
-
-        for (script, must_wait_for_grace) in [
-            (
-                "[Console]::WriteLine('ready'); $null = [Console]::In.ReadToEnd()",
-                false,
-            ),
-            (
-                "[Console]::WriteLine('ready'); Start-Sleep -Seconds 60",
-                true,
-            ),
-        ] {
-            let mut child = Command::new("powershell.exe")
-                .args(["-NoProfile", "-NonInteractive", "-Command", script])
-                .creation_flags(0x08000000)
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .spawn()
-                .expect("start real stdio server substitute");
-            let pid = child.id();
-            let stdin = child.stdin.take();
-            let mut stdout = BufReader::new(child.stdout.take().expect("stdout"));
-            let mut ready = String::new();
-            stdout.read_line(&mut ready).expect("server startup");
-            assert_eq!(ready.trim(), "ready");
-            let mut client = CodexClient::from_transport(ClientTransport::Stdio {
-                child: std::sync::Arc::new(std::sync::Mutex::new(child)),
-                stdin,
-                stdout: stdout.into(),
-            });
-            assert_eq!(client.shutdown_grace, APP_SERVER_GRACEFUL_SHUTDOWN_TIMEOUT);
-            let grace = if must_wait_for_grace {
-                Duration::from_millis(300)
-            } else {
-                APP_SERVER_GRACEFUL_SHUTDOWN_TIMEOUT
-            };
-            client.shutdown_grace = grace;
-            let started = Instant::now();
-            drop(client);
-            let elapsed = started.elapsed();
-            if must_wait_for_grace {
-                assert!(elapsed >= grace);
-            } else {
-                assert!(
-                    elapsed < APP_SERVER_GRACEFUL_SHUTDOWN_TIMEOUT,
-                    "a cooperative server must exit before forced termination: {elapsed:?}"
-                );
-            }
-            assert!(elapsed < APP_SERVER_GRACEFUL_SHUTDOWN_TIMEOUT + Duration::from_secs(10));
-            let probe = Command::new("powershell.exe")
-                .args([
-                    "-NoProfile",
-                    "-NonInteractive",
-                    "-Command",
-                    &format!(
-                        "if (Get-Process -Id {pid} -ErrorAction SilentlyContinue) {{ exit 1 }} else {{ exit 0 }}"
-                    ),
-                ])
-                .creation_flags(0x08000000)
-                .status()
-                .expect("probe server exit");
-            assert!(probe.success(), "shutdown must reap the server process");
-        }
-    }
-
-    #[test]
-    fn websocket_connection_deadline_does_not_wait_for_blocked_dns_worker() {
-        use super::*;
-
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind DNS target");
-        listener
-            .set_nonblocking(true)
-            .expect("observe absent connection");
-        let port = listener.local_addr().expect("DNS target port").port();
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .max_blocking_threads(1)
-            .build()
-            .expect("single resolver worker runtime");
-        let (started_tx, started_rx) = mpsc::channel();
-        let (release_tx, release_rx) = mpsc::channel();
-        let blocker = runtime.spawn_blocking(move || {
-            started_tx
-                .send(())
-                .expect("announce occupied resolver worker");
-            release_rx.recv().expect("release resolver worker");
-        });
-        started_rx.recv().expect("resolver worker is occupied");
-        let (result_tx, result_rx) = mpsc::channel();
-        let caller = thread::spawn(move || {
-            let result = BlockingWebSocket::connect_with_runtime(
-                &format!("ws://localhost:{port}"),
-                Duration::from_millis(100),
-                || Ok(runtime),
-            );
-            result_tx
-                .send(result.map(|_| ()))
-                .expect("return connection result");
-        });
-        // Capture the result before releasing the blocking worker. An ordinary
-        // Runtime drop would keep the caller waiting here after its timeout.
-        let result = result_rx.recv_timeout(Duration::from_secs(2));
-        release_tx.send(()).expect("release test-owned blocker");
-        caller.join().expect("join connection caller");
-        tokio::runtime::Builder::new_current_thread()
-            .build()
-            .expect("blocker join runtime")
-            .block_on(blocker)
-            .expect("join test-owned blocking job");
-        let connection = listener.accept();
-        let error = result
-            .expect("caller deadline does not wait for DNS teardown")
-            .expect_err("queued hostname resolution cannot establish a connection");
-        assert!(
-            format!("{error:#}").contains("websocket connection deadline expired"),
-            "{error:#}"
-        );
-        assert!(
-            matches!(connection, Err(error) if error.kind() == std::io::ErrorKind::WouldBlock),
-            "expiry must not start a later TCP connection"
-        );
-    }
-
-    #[test]
-    fn websocket_connection_deadline_closes_stalled_handshake() {
-        use super::*;
-        use std::io::Read;
-
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind stalled peer");
-        let address = listener.local_addr().expect("stalled peer address");
-        let peer = thread::spawn(move || {
-            let (stream, _) = listener.accept().expect("accept normal client connection");
-            stream
-                .set_read_timeout(Some(Duration::from_secs(2)))
-                .expect("bound regression peer");
-            let mut reader = BufReader::new(stream);
-            let mut request_line = String::new();
-            reader
-                .read_line(&mut request_line)
-                .expect("read upgrade request");
-            assert!(request_line.starts_with("GET / HTTP/1.1"), "{request_line}");
-            loop {
-                let mut header = String::new();
-                assert_ne!(
-                    reader.read_line(&mut header).expect("read upgrade headers"),
-                    0
-                );
-                if header == "\r\n" {
-                    break;
-                }
-            }
-            // Never answer the handshake. The connection deadline must close
-            // the owned socket; the original blocking connect waits until this
-            // independent two-second peer timeout and fails both assertions.
-            let mut byte = [0];
-            reader.read(&mut byte)
-        });
-        let started = Instant::now();
-        let error = match BlockingWebSocket::connect_with_runtime(
-            &format!("ws://{address}"),
-            Duration::from_millis(150),
-            || {
-                tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-            },
-        ) {
-            Ok(_) => panic!("a stalled handshake cannot establish a client"),
-            Err(error) => error,
-        };
-        let elapsed = started.elapsed();
-        let peer_result = peer.join().expect("join stalled peer");
-        assert!(
-            format!("{error:#}").contains("websocket connection deadline expired"),
-            "{error:#}"
-        );
-        assert!(elapsed >= Duration::from_millis(150), "{elapsed:?}");
-        assert!(elapsed < Duration::from_secs(2), "{elapsed:?}");
-        assert_eq!(
-            peer_result.expect("deadline closes the connection before peer timeout"),
-            0
-        );
-    }
-
-    #[test]
-    fn initialize_advertises_supported_notification_opt_outs_and_finishes_handshake() {
-        use super::*;
-
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback peer");
-        let address = listener.local_addr().expect("bound peer address");
-        let codex_home = tempfile::tempdir().expect("peer codex home");
-        let response_home = codex_home.path().to_path_buf();
-        let peer = thread::spawn(move || {
-            let (redirect_stream, _) = listener.accept().expect("accept initial connection");
-            redirect_stream
-                .set_read_timeout(Some(Duration::from_secs(5)))
-                .expect("bound redirect request");
-            let mut redirect_reader = BufReader::new(redirect_stream);
-            loop {
-                let mut header = String::new();
-                assert_ne!(
-                    redirect_reader
-                        .read_line(&mut header)
-                        .expect("read redirect request"),
-                    0
-                );
-                if header == "\r\n" {
-                    break;
-                }
-            }
-            write!(redirect_reader.get_mut(), "HTTP/1.1 302 Found\r\nLocation: ws://{address}/redirected\r\nContent-Length: 0\r\n\r\n")
-                .expect("redirect to the actual websocket peer");
-            drop(redirect_reader);
-            let (stream, _) = listener.accept().expect("accept client connection");
-            stream
-                .set_read_timeout(Some(Duration::from_secs(5)))
-                .expect("bound peer reads");
-            stream
-                .set_write_timeout(Some(Duration::from_secs(5)))
-                .expect("bound peer writes");
-            let mut socket = tungstenite::accept(stream).expect("accept websocket handshake");
-            let request: Value = serde_json::from_str(
-                socket
-                    .read()
-                    .expect("receive initialize request")
-                    .to_text()
-                    .expect("initialize is a text frame"),
-            )
-            .expect("initialize is JSON");
-            socket
-                .send(tungstenite::Message::Text(
-                    serde_json::json!({
-                        "id": request["id"],
-                        "result": {
-                            "userAgent": "loopback-initialize-peer",
-                            "codexHome": response_home,
-                            "platformFamily": "windows",
-                            "platformOs": "windows"
-                        }
-                    })
-                    .to_string()
-                    .into(),
-                ))
-                .expect("send initialize response");
-            let initialized: Value = serde_json::from_str(
-                socket
-                    .read()
-                    .expect("receive initialized notification")
-                    .to_text()
-                    .expect("initialized is a text frame"),
-            )
-            .expect("initialized is JSON");
-            (request, initialized)
-        });
-
-        let mut client = CodexClient::connect(&Endpoint::ConnectWs(format!("ws://{address}")), &[])
-            .expect("connect production client to loopback peer");
-        let response = client.initialize().expect("complete initialize handshake");
-        let (request, initialized) = peer.join().expect("loopback peer completes");
-
-        assert_eq!(response.user_agent, "loopback-initialize-peer");
-        assert_eq!(response.codex_home.as_path(), codex_home.path());
-        assert_eq!(request["method"], "initialize");
-        assert_eq!(request["params"]["capabilities"]["experimentalApi"], true);
-        assert_eq!(
-            request["params"]["capabilities"]["optOutNotificationMethods"],
-            serde_json::json!([
-                "command/exec/outputDelta",
-                "item/agentMessage/delta",
-                "item/plan/delta",
-                "item/reasoning/summaryTextDelta",
-                "item/reasoning/textDelta"
-            ]),
-            "the actual initialize request must advertise supported methods and omit retired ones"
-        );
-        assert_eq!(initialized, serde_json::json!({ "method": "initialized" }));
-    }
-    /// Real stdio peer; the production deadline owns/terminates it just like its app-server child.
-    /// The peer logs each request itself, so the log is complete only for requests it answered;
-    /// a test whose deadline terminates the peer mid-request uses `stalled_smoke_deadline_client`.
-    /// `ready` follows PowerShell's lazy first-use work (JSON module autoload, first conversions,
-    /// log creation), so a deadline armed after it budgets only the caller and warm replies.
-    pub(super) fn smoke_deadline_client(log: &std::path::Path, body: &str) -> super::CodexClient {
-        use super::*;
-        use std::os::windows::process::CommandExt;
-        let log_path = log.to_string_lossy().replace('\'', "''");
-        let script = format!(
-            "$log = '{log_path}'; [System.IO.File]::AppendAllText($log, ''); $null = '{{}}' | ConvertFrom-Json; $null = @{{warm=1}} | ConvertTo-Json -Compress; [Console]::WriteLine('ready'); while ($null -ne ($line = [Console]::In.ReadLine())) {{ [System.IO.File]::AppendAllText($log, $line + [Environment]::NewLine); $request = $line | ConvertFrom-Json; {body} }}"
-        );
-        let mut child = Command::new("powershell.exe")
-            .args(["-NoProfile", "-NonInteractive", "-Command", &script])
-            .creation_flags(0x08000000)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .spawn()
-            .expect("start real stdio deadline peer");
-        let stdin = child.stdin.take();
-        let mut stdout = BufReader::new(child.stdout.take().expect("peer stdout"));
-        let mut ready = String::new();
-        stdout.read_line(&mut ready).expect("peer ready");
-        assert_eq!(ready.trim(), "ready");
-        CodexClient::from_transport(ClientTransport::Stdio {
-            child: std::sync::Arc::new(std::sync::Mutex::new(child)),
-            stdin,
-            stdout: stdout.into(),
-        })
-    }
-
-    /// Silent stdio peer for deadline tests: the production deadline owns and terminates its
-    /// child exactly as it would a stalled app-server. Requests go to a separate recorder that
-    /// the deadline does not own, because a record kept by the terminated child races that
-    /// termination: under load the child can read a request yet die before persisting it.
-    pub(super) fn stalled_smoke_deadline_client() -> (super::CodexClient, RequestRecorder) {
-        use super::*;
-        use std::os::windows::process::CommandExt;
-        let powershell = |script: &str, stdin: Stdio| {
-            Command::new("powershell.exe")
-                .args(["-NoProfile", "-NonInteractive", "-Command", script])
-                .creation_flags(0x08000000)
-                .stdin(stdin)
-                .stdout(Stdio::piped())
-                .spawn()
-        };
-        let mut recorder = powershell(
-            "try { while ($null -ne ($line = [Console]::In.ReadLine())) { [Console]::WriteLine($line) } } catch { exit 1 }; exit 0",
-            Stdio::piped(),
-        )
-        .expect("start request recorder");
-        let recorded = BufReader::new(recorder.stdout.take().expect("recorder stdout"));
-        // Drain concurrently so recording never applies backpressure to the client's writes.
-        let lines =
-            thread::spawn(move || -> std::io::Result<Vec<String>> { recorded.lines().collect() });
-        let mut child = powershell(
-            "[Console]::WriteLine('ready'); Start-Sleep -Seconds 5",
-            Stdio::null(),
-        )
-        .expect("start real stalled stdio peer");
-        let mut stdout = BufReader::new(child.stdout.take().expect("peer stdout"));
-        let mut ready = String::new();
-        stdout.read_line(&mut ready).expect("peer ready");
-        assert_eq!(ready.trim(), "ready");
-        let client = CodexClient::from_transport(ClientTransport::Stdio {
-            child: std::sync::Arc::new(std::sync::Mutex::new(child)),
-            stdin: recorder.stdin.take(),
-            stdout: stdout.into(),
-        });
-        (client, RequestRecorder { recorder, lines })
-    }
-
-    /// Requests a stalled smoke client wrote, observed by a process its deadline does not stop.
-    pub(super) struct RequestRecorder {
-        recorder: std::process::Child,
-        lines: std::thread::JoinHandle<std::io::Result<Vec<String>>>,
-    }
-
-    impl RequestRecorder {
-        /// Closes the client's request stream, then returns every request it wrote, in order.
-        pub(super) fn finish(mut self, client: super::CodexClient) -> Vec<serde_json::Value> {
-            drop(client);
-            let lines = self
-                .lines
-                .join()
-                .expect("request recorder reader")
-                .expect("recorded request lines");
-            let status = self.recorder.wait().expect("request recorder exit");
-            assert!(status.success(), "request recorder failed: {status}");
-            lines
-                .iter()
-                .map(|line| serde_json::from_str(line).expect("RPC JSON"))
-                .collect()
-        }
-    }
-
-    #[test]
-    fn smoke_deadline_success_disarms_watchdog_and_keeps_rpc_usable() {
-        use super::*;
-        let temp = tempfile::tempdir().expect("peer log root");
-        let log = temp.path().join("requests.jsonl");
-        let mut client = smoke_deadline_client(
-            &log,
-            "$response = @{jsonrpc='2.0'; id=$request.id; result=@{data=@(); nextCursor=$null}}; [Console]::WriteLine(($response | ConvertTo-Json -Depth 10 -Compress))",
-        );
-        client
-            .with_operation_deadline(Instant::now() + Duration::from_secs(1), |client| {
-                let response = client.model_list(ModelListParams::default())?;
-                assert!(response.data.is_empty());
-                assert_eq!(response.next_cursor, None);
-                Ok(())
-            })
-            .expect("successful RPC finishes inside the total budget");
-        assert!(client.operation_deadline.is_none());
-        let response = client
-            .model_list(ModelListParams::default())
-            .expect("deadline watchdog was disarmed without killing healthy peer");
-        assert!(response.data.is_empty());
-        assert_eq!(
-            std::fs::read_to_string(log)
-                .expect("actual requests")
-                .lines()
-                .count(),
-            2
-        );
-    }
-}

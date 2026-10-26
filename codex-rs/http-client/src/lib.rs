@@ -25,13 +25,6 @@ pub use crate::client::RequestBuilder;
 pub use crate::client_builder::HttpClientBuilder;
 pub use crate::custom_ca::BuildCustomCaTransportError;
 pub use crate::custom_ca::build_blocking_reqwest_client_with_custom_ca;
-/// Test-only subprocess hook for custom CA coverage.
-///
-/// This stays public only so the `custom_ca_probe` binary target can reuse the shared helper. It
-/// is hidden from normal docs because ordinary callers should use
-/// [`build_reqwest_client_with_custom_ca`] instead.
-#[doc(hidden)]
-pub use crate::custom_ca::build_reqwest_client_for_subprocess_tests;
 pub use crate::custom_ca::build_reqwest_client_with_custom_ca;
 pub use crate::custom_ca::build_rustls_client_config_with_custom_ca;
 pub use crate::custom_ca::maybe_build_rustls_client_config_with_custom_ca;
@@ -48,8 +41,6 @@ pub use crate::outbound_proxy::HttpClientFactory;
 pub use crate::outbound_proxy::OutboundProxyPolicy;
 pub use crate::outbound_proxy::OutboundProxyRoute;
 pub use crate::outbound_proxy::RouteFailureClass;
-#[doc(hidden)]
-pub use crate::outbound_proxy::cache_system_proxy_route_for_test;
 pub use crate::request::EncodedJsonBody;
 pub use crate::request::PreparedRequestBody;
 pub use crate::request::Request;
@@ -74,18 +65,3 @@ pub use crate::transport::record_first_response_body_byte;
 pub use crate::transport::with_transport_timing;
 pub use codex_network_types::RetryAfter;
 
-#[cfg(test)]
-mod network_type_compatibility_tests {
-    use super::RetryAfter;
-    use std::time::Duration;
-
-    #[tokio::test(start_paused = true)]
-    async fn forwarding_legacy_retry_advice_preserves_its_absolute_deadline() {
-        let original = RetryAfter::from_delay(Duration::from_secs(10)).unwrap();
-        tokio::time::advance(Duration::from_secs(4)).await;
-        let forwarded: codex_network_types::RetryAfter = original;
-        let legacy: RetryAfter = forwarded;
-        assert_eq!(legacy.deadline(), original.deadline());
-        assert_eq!(legacy.remaining_delay(), Duration::from_secs(6));
-    }
-}

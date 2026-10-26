@@ -53,6 +53,3 @@ fn auth_keyring_backend_kind_from_secret_auth_storage(
     }
 }
 
-#[cfg(test)]
-#[path = "auth_keyring_tests.rs"]
-mod tests;

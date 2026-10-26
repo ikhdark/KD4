@@ -19,9 +19,8 @@ SCCACHE_DEFAULT_SERVER_PORT = 4226
 SCCACHE_SERVER_PROBE_TIMEOUT_SECONDS = 0.05
 WINDOWS_LLVM_LLD_LINK_DEFAULT = Path("C:/Program Files/LLVM/bin/lld-link.exe")
 _SCOOP_LLVM_LLD_LINK = Path("apps/llvm/current/bin/lld-link.exe")
-# codex-core and the package holding its integration tests: named targets own
-# their test runs, and they share the core-tests lanes.
-CORE_TEST_PACKAGES = ("codex-core", "codex-core-integration-tests")
+# Keep core compilation in its existing warm lane family.
+CORE_BUILD_PACKAGES = ("codex-core",)
 
 
 def local_rust_env(
@@ -30,7 +29,7 @@ def local_rust_env(
     repo_root: Path | None = None,
     which: Callable[[str], str | None] = shutil.which,
 ) -> dict[str, str]:
-    """Shared, probe-free defaults for Just, lane and direct test entrypoints."""
+    """Shared, probe-free defaults for Just, lane and direct Cargo entrypoints."""
     if env.get("CI", "").lower() not in ("", "0", "false", "no"):
         return {}
     updates: dict[str, str] = {}

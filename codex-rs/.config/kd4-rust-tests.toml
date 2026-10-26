@@ -1,3 +1,0 @@
-# Fork-local checkout marker used by command analysis.
-# No runner gates, ownership queries, or required-consumer contracts.
-version = 1

@@ -334,20 +334,7 @@ impl ClientSegmentMetadata {
     }
 }
 
-#[cfg(test)]
-pub(super) fn split_server_envelope_for_transport(
-    envelope: ServerEnvelope,
-) -> io::Result<Vec<ServerEnvelope>> {
-    Ok(encode_server_envelope_for_transport(envelope)?
-        .into_iter().map(|(envelope, _)| envelope).collect())
-}
 
-#[cfg(test)]
-pub(super) fn encode_server_envelope_for_transport(
-    envelope: ServerEnvelope,
-) -> io::Result<Vec<(ServerEnvelope, String)>> {
-    encode_server_envelope_with(envelope, |envelope, payload| (envelope, payload))
-}
 
 pub(super) struct EncodedServerPayload {
     pub(super) client_id: ClientId,

@@ -251,6 +251,3 @@ impl CoreToolRuntime for ListFilesHandler {
     }
 }
 
-#[cfg(test)]
-#[path = "list_files_tests.rs"]
-mod tests;

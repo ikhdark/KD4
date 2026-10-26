@@ -1188,7 +1188,7 @@ try {
         if (-not [string]::IsNullOrWhiteSpace($env:CARGO_HOME)) {
             Write-Output "CARGO_HOME=$env:CARGO_HOME"
         }
-        Write-Output "Generic package example: just test-lane-package codex-exec"
+        Write-Output "Generic package example: just cargo-lane auto cargo check -p codex-exec"
         Write-Output "Check example: just check-lane codex-core"
         exit 0
     }

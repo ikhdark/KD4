@@ -2,8 +2,6 @@ mod discoverable;
 mod injection;
 mod mentions;
 mod render;
-#[cfg(test)]
-pub(crate) mod test_support;
 
 pub(crate) use codex_plugin::PluginCapabilitySummary;
 

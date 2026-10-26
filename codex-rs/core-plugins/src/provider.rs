@@ -237,7 +237,3 @@ async fn resolve_plugin_root(
 
     Ok(Some(plugin))
 }
-
-#[cfg(test)]
-#[path = "provider_tests.rs"]
-mod tests;

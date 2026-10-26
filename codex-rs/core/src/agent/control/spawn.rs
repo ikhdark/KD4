@@ -224,8 +224,6 @@ struct PendingSpawnCleanupJob {
     child_thread_id: ThreadId,
     capacity: PendingSpawnCapacity,
     kind: PendingSpawnCleanupKind,
-    #[cfg(test)]
-    completion: Option<tokio::sync::oneshot::Sender<()>>,
 }
 
 impl PendingSpawnCleanupJob {
@@ -245,10 +243,6 @@ impl PendingSpawnCleanupJob {
         if !matches!(error, CodexErr::TurnAborted) {
             warn!(child_thread_id = %self.child_thread_id, %error,
                 "cancelled agent spawn cleanup was incomplete");
-        }
-        #[cfg(test)]
-        if let Some(completion) = self.completion {
-            let _ = completion.send(());
         }
     }
 }
@@ -423,8 +417,6 @@ impl Drop for PendingSpawnCleanup {
             child_thread_id: self.child_thread_id,
             capacity: self.take_capacity(),
             kind: self.kind,
-            #[cfg(test)]
-            completion: None,
         }) {
             if let Ok(runtime) = tokio::runtime::Handle::try_current() {
                 // A native cleanup worker may fail to start while this runtime is
@@ -517,6 +509,7 @@ fn keep_forked_rollout_item(item: &RolloutItem, preserve_reference_context_item:
         // A fork borrows conversation, not the parent's task-completion authority.
         RolloutItem::ResponseItem(item)
             if crate::plan_store::plan_snapshot_from_item(item).is_some() => false,
+        RolloutItem::EventMsg(codex_protocol::protocol::EventMsg::PlanUpdate(_)) => false,
         RolloutItem::ResponseItem(ResponseItem::Message { role, phase, .. }) => match role.as_str()
         {
             "system" | "developer" | "user" => true,
@@ -717,24 +710,6 @@ impl AgentControl {
             .await
     }
 
-    /// Spawn a new agent thread and submit the initial prompt.
-    #[cfg(test)]
-    pub(crate) async fn spawn_agent(
-        &self,
-        config: Config,
-        initial_input: Vec<UserInput>,
-        session_source: Option<SessionSource>,
-    ) -> CodexResult<ThreadId> {
-        let spawned_agent = Box::pin(self.spawn_agent_internal(
-            config,
-            SpawnInitialInput::UserInput(initial_input),
-            session_source,
-            SpawnAgentOptions::default(),
-            None,
-        ))
-        .await?;
-        Ok(spawned_agent.thread_id)
-    }
 
     /// Spawn an agent thread with some metadata.
     pub(crate) async fn spawn_agent_with_metadata(
@@ -1056,8 +1031,6 @@ impl AgentControl {
             return Err(CodexErr::ThreadNotFound(thread_id));
         }
 
-        #[cfg(test)]
-        self.pause_before_v2_cold_load_for_test().await;
 
         let (initial_history, stored_source, stored_parent_thread_id) = match loaded_history {
             Some(history) => history,
@@ -1133,44 +1106,8 @@ impl AgentControl {
         }
     }
 
-    #[cfg(test)]
-    async fn pause_before_initial_submission_for_test(&self) {
-        let barrier = self
-            .test_hooks
-            .before_initial_submission
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone();
-        if let Some(barrier) = barrier {
-            barrier.pause().await;
-        }
-    }
 
-    #[cfg(test)]
-    async fn pause_after_thread_created_for_test(&self) {
-        let barrier = self
-            .test_hooks
-            .after_thread_created
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone();
-        if let Some(barrier) = barrier {
-            barrier.pause().await;
-        }
-    }
 
-    #[cfg(test)]
-    async fn pause_before_v2_cold_load_for_test(&self) {
-        let barrier = self
-            .test_hooks
-            .before_v2_cold_load
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone();
-        if let Some(barrier) = barrier {
-            barrier.pause().await;
-        }
-    }
 
     async fn spawn_agent_internal(
         &self,
@@ -1476,8 +1413,6 @@ impl AgentControl {
             }
             SpawnInitialInput::TaskCapsule(_) => Some("TaskCapsuleV1".to_string()),
         };
-        #[cfg(test)]
-        self.pause_before_initial_submission_for_test().await;
         // Construction before this point cannot execute the worker. From the
         // possible-start boundary onward its deadline also covers a stalled
         // publication/metadata handoff. Timeout drops the existing rollback
@@ -1550,8 +1485,6 @@ impl AgentControl {
             state
                 .notify_thread_created(new_thread.thread_id, &new_thread.thread)
                 .await;
-            #[cfg(test)]
-            self.pause_after_thread_created_for_test().await;
 
             if let Some(SessionSource::SubAgent(
                 subagent_source @ SubAgentSource::ThreadSpawn {
@@ -1640,18 +1573,6 @@ impl AgentControl {
         child_thread_id: ThreadId,
         submission_error: CodexErr,
     ) -> CodexErr {
-        #[cfg(test)]
-        {
-            let barrier = self
-                .test_hooks
-                .before_spawn_rollback
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .clone();
-            if let Some(barrier) = barrier {
-                barrier.pause().await;
-            }
-        }
         let mut cleanup_failures = Vec::new();
         match self.upgrade() {
             Ok(state) => {
@@ -2247,8 +2168,6 @@ impl AgentControl {
         state
             .notify_thread_created(resumed_thread.thread_id, &resumed_thread.thread)
             .await;
-        #[cfg(test)]
-        self.pause_after_thread_created_for_test().await;
         if multi_agent_version != MultiAgentVersion::V2 {
             let child_reference = agent_metadata
                 .agent_path
@@ -2266,250 +2185,3 @@ impl AgentControl {
     }
 }
 
-#[cfg(test)]
-mod pending_spawn_cleanup_worker_tests {
-    use super::send_with_restarting_worker;
-
-    #[tokio::test]
-    async fn pending_capacity_releases_only_after_confirmed_drain() {
-        let mut config = crate::config::test_config().await;
-        let home = tempfile::tempdir().expect("temporary home");
-        config.codex_home = home.path().to_path_buf().try_into().unwrap();
-        config.cwd = home.path().to_path_buf().try_into().unwrap();
-        config.agent_max_threads = Some(1);
-        let manager = crate::ThreadManager::with_models_provider_and_home_for_tests(
-            codex_login::CodexAuth::from_api_key("dummy"),
-            config.model_provider.clone(),
-            config.codex_home.to_path_buf(),
-            std::sync::Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
-            std::sync::Arc::new(crate::test_support::EmptyUserInstructionsProvider),
-        );
-        let child = manager
-            .start_thread(config.clone())
-            .await
-            .expect("start capacity owner");
-        let control = manager.agent_control();
-        let state = control.upgrade().expect("live thread manager");
-        let reservation = control.state.reserve_spawn_slot(Some(1)).unwrap();
-        let residency_slot = control
-            .reserve_v2_residency_slot(&state, &config, None)
-            .await
-            .expect("reserve the child's resident capacity");
-        let release = crate::test_support::block_thread_terminal_tasks(child.thread.as_ref());
-        child.thread.request_shutdown().await.unwrap();
-        tokio::time::timeout(
-            std::time::Duration::from_secs(20),
-            child.thread.wait_until_terminated(),
-        )
-        .await
-        .expect("the bounded session loop must exit while terminal work remains owned");
-
-        let mut retirement = Box::pin(
-            super::PendingSpawnCapacity {
-                reservation: Some(reservation),
-                residency_slot: Some(residency_slot),
-            }
-            .release_after_drain(std::sync::Arc::clone(&child.thread)),
-        );
-        assert!(
-            futures::poll!(retirement.as_mut()).is_pending(),
-            "loop termination must not release capacity while an accepted owner is blocked"
-        );
-        assert!(matches!(
-            control.state.reserve_spawn_slot(Some(1)),
-            Err(codex_protocol::error::CodexErr::AgentLimitReached { max_threads: 1 })
-        ));
-        assert!(matches!(
-            control.reserve_v2_residency_slot(&state, &config, None).await,
-            Err(codex_protocol::error::CodexErr::AgentLimitReached { max_threads: 1 })
-        ));
-
-        release.send(()).expect("release the accepted terminal owner");
-        tokio::time::timeout(std::time::Duration::from_secs(5), retirement)
-            .await
-            .expect("confirmed owner drain must release pending capacity");
-        let reservation = control
-            .state
-            .reserve_spawn_slot(Some(1))
-            .expect("drain releases the spawn reservation");
-        let residency_slot = control
-            .reserve_v2_residency_slot(&state, &config, None)
-            .await
-            .expect("drain releases the resident slot");
-
-        // Inject a retirement failure only after the real persistence owner has
-        // finished, so no background result writer can race this fault.
-        *child
-            .thread
-            .codex
-            .session
-            .persistence_retirement_result
-            .lock()
-            .unwrap() = Some(Err("injected retirement failure".to_string()));
-        super::PendingSpawnCapacity {
-            reservation: Some(reservation),
-            residency_slot: Some(residency_slot),
-        }
-        .release_after_drain(std::sync::Arc::clone(&child.thread))
-        .await;
-        assert!(matches!(
-            control.state.reserve_spawn_slot(Some(1)),
-            Err(codex_protocol::error::CodexErr::AgentLimitReached { max_threads: 1 })
-        ));
-        assert!(matches!(
-            control.reserve_v2_residency_slot(&state, &config, None).await,
-            Err(codex_protocol::error::CodexErr::AgentLimitReached { max_threads: 1 })
-        ));
-    }
-
-    #[tokio::test]
-    async fn cleanup_worker_finishes_late_shutdown_without_another_job() {
-        let mut config = crate::config::test_config().await;
-        let home = tempfile::tempdir().expect("temporary home");
-        config.codex_home = home.path().to_path_buf().try_into().unwrap();
-        config.cwd = home.path().to_path_buf().try_into().unwrap();
-        let manager = crate::ThreadManager::with_models_provider_and_home_for_tests(
-            codex_login::CodexAuth::from_api_key("dummy"),
-            config.model_provider.clone(),
-            config.codex_home.to_path_buf(),
-            std::sync::Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
-            std::sync::Arc::new(crate::test_support::EmptyUserInstructionsProvider),
-        );
-        let independent = manager
-            .start_thread(config.clone())
-            .await
-            .expect("independent cleanup target");
-        let child = manager
-            .start_thread(config)
-            .await
-            .expect("start cleanup target");
-        let release = crate::test_support::block_thread_terminal_tasks(child.thread.as_ref());
-        let control = manager.agent_control();
-        let reservation = control
-            .state
-            .reserve_spawn_slot(Some(1))
-            .expect("reserve the child's uncommitted capacity");
-        let sender = super::start_pending_spawn_cleanup_worker().expect("start isolated worker");
-        let (completion_tx, completion_rx) = tokio::sync::oneshot::channel();
-        assert!(
-            sender
-                .send(super::PendingSpawnCleanupJob {
-                    control: manager.agent_control(),
-                    child_thread: std::sync::Arc::clone(&child.thread),
-                    child_thread_id: child.thread_id,
-                    capacity: super::PendingSpawnCapacity {
-                        reservation: Some(reservation),
-                        residency_slot: None,
-                    },
-                    kind: super::PendingSpawnCleanupKind::Spawn,
-                    completion: Some(completion_tx),
-                })
-                .is_ok()
-        );
-        tokio::time::timeout(std::time::Duration::from_secs(2), async {
-            while !child.thread.codex.session.terminal_tasks.is_closed() {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("first cleanup has reached blocked shutdown");
-        let (independent_tx, independent_rx) = tokio::sync::oneshot::channel();
-        assert!(
-            sender
-                .send(super::PendingSpawnCleanupJob {
-                    control: manager.agent_control(),
-                    child_thread: std::sync::Arc::clone(&independent.thread),
-                    child_thread_id: independent.thread_id,
-                    capacity: super::PendingSpawnCapacity {
-                        reservation: None,
-                        residency_slot: None
-                    },
-                    kind: super::PendingSpawnCleanupKind::Spawn,
-                    completion: Some(independent_tx),
-                })
-                .is_ok()
-        );
-        tokio::time::timeout(std::time::Duration::from_secs(2), independent_rx)
-            .await
-            .expect("blocked cleanup must not delay independent terminal cleanup")
-            .unwrap();
-        assert!(matches!(
-            manager.get_thread(independent.thread_id).await,
-            Err(codex_protocol::error::CodexErr::ThreadNotFound(_))
-        ));
-        tokio::time::timeout(std::time::Duration::from_secs(20), completion_rx)
-            .await
-            .expect("foreground rollback returns at its deadline")
-            .expect("worker job completed");
-        assert!(
-            manager.get_thread(child.thread_id).await.is_ok(),
-            "late termination still owns runtime"
-        );
-        assert!(
-            matches!(
-                control.state.reserve_spawn_slot(Some(1)),
-                Err(codex_protocol::error::CodexErr::AgentLimitReached { max_threads: 1 })
-            ),
-            "foreground rollback completion must not release a live child's capacity"
-        );
-        release
-            .send(())
-            .expect("release terminal work after worker becomes idle");
-        tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            loop {
-                match manager.get_thread(child.thread_id).await {
-                    Err(codex_protocol::error::CodexErr::ThreadNotFound(id)) => {
-                        assert_eq!(id, child.thread_id);
-                        break;
-                    }
-                    Ok(_) => tokio::task::yield_now().await,
-                    Err(error) => panic!("unexpected lookup: {error}"),
-                }
-            }
-        })
-        .await
-        .expect("idle worker must drive delayed cleanup without a second job");
-        tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            loop {
-                match control.state.reserve_spawn_slot(Some(1)) {
-                    Ok(reservation) => break reservation,
-                    Err(codex_protocol::error::CodexErr::AgentLimitReached { max_threads: 1 }) => {
-                        tokio::task::yield_now().await;
-                    }
-                    Err(error) => panic!("unexpected capacity error: {error}"),
-                }
-            }
-        })
-        .await
-        .expect("actual termination releases the retained capacity");
-        drop(sender);
-    }
-
-    #[test]
-    fn cleanup_worker_failure_does_not_disable_later_scheduling() {
-        let state = std::sync::Mutex::new(None);
-        assert_eq!(
-            send_with_restarting_worker(&state, || None, 1),
-            Err(1),
-            "a failed worker start should return the unscheduled job"
-        );
-
-        let (first_sender, mut first_receiver) = tokio::sync::mpsc::unbounded_channel();
-        let mut first_sender = Some(first_sender);
-        send_with_restarting_worker(&state, || first_sender.take(), 2)
-            .expect("a later worker start should be retried");
-        assert_eq!(first_receiver.blocking_recv().expect("first worker job"), 2);
-        drop(first_receiver);
-
-        let (replacement_sender, mut replacement_receiver) = tokio::sync::mpsc::unbounded_channel();
-        let mut replacement_sender = Some(replacement_sender);
-        send_with_restarting_worker(&state, || replacement_sender.take(), 3)
-            .expect("a disconnected cached worker should be replaced");
-        assert_eq!(
-            replacement_receiver
-                .blocking_recv()
-                .expect("replacement job"),
-            3
-        );
-    }
-}

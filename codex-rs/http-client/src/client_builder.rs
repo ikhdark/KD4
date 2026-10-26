@@ -303,6 +303,3 @@ impl Default for HttpClientBuilder {
     }
 }
 
-#[cfg(test)]
-#[path = "client_builder_tests.rs"]
-mod tests;

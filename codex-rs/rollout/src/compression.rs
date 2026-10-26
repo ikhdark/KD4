@@ -108,11 +108,6 @@ fn is_retryable_open_error(error: &io::Error) -> bool {
     error.kind() == io::ErrorKind::NotFound || (cfg!(windows) && error.raw_os_error() == Some(32))
 }
 
-/// Returns the compressed `.jsonl.zst` path for a rollout path.
-#[cfg(test)]
-pub(crate) fn compressed_rollout_path(path: &Path) -> PathBuf {
-    path::compressed_rollout_path(path)
-}
 
 /// Shared per-rollout lock held while an append handle remains open.
 ///
@@ -501,17 +496,6 @@ pub(crate) fn lock_rollout_for_write_blocking(path: &Path) -> io::Result<Rollout
     Ok(RolloutWriteLock { _file: lock_file })
 }
 
-#[cfg(test)]
-pub(crate) fn try_lock_rollout_for_write_blocking(
-    path: &Path,
-) -> io::Result<Option<RolloutWriteLock>> {
-    let lock_file = open_rollout_write_lock_file(plain_rollout_path(path).as_path())?;
-    match lock_file.try_lock() {
-        Ok(()) => Ok(Some(RolloutWriteLock { _file: lock_file })),
-        Err(std::fs::TryLockError::WouldBlock) => Ok(None),
-        Err(err) => Err(err.into()),
-    }
-}
 
 fn try_lock_rollout_for_compression(path: &Path) -> io::Result<Option<File>> {
     let lock_file = open_rollout_lock_file(plain_rollout_path(path).as_path())?;
@@ -1047,14 +1031,6 @@ mod worker {
         ))
     }
 
-    /// Workers start with their process, and a long-lived app-server can start
-    /// inside another process's cooldown. Retry every cooldown period so cold
-    /// rollouts are still compressed while such a process keeps running.
-    #[cfg(test)]
-    pub(super) async fn run_periodically(codex_home: PathBuf, interval: Duration) {
-        let (_stop, stopped) = tokio::sync::watch::channel(false);
-        run_periodically_until(codex_home, interval, stopped).await;
-    }
 
     async fn run_periodically_until(
         codex_home: PathBuf,
@@ -1444,23 +1420,6 @@ mod worker {
         ))
     }
 
-    #[cfg(test)]
-    pub(super) fn compress_rollout_if_cold_blocking_paused(
-        path: &Path,
-        reached_final_check: tokio::sync::oneshot::Sender<()>,
-        resume: std::sync::mpsc::Receiver<()>,
-    ) -> io::Result<()> {
-        compress_rollout_if_cold_blocking_with_hook(path, move || {
-            reached_final_check
-                .send(())
-                .map_err(|()| io::Error::other("compression pause receiver was dropped"))?;
-            resume.recv().map_err(|err| {
-                io::Error::other(format!("compression pause sender was dropped: {err}"))
-            })?;
-            Ok(())
-        })
-        .map(|_| ())
-    }
 
     struct FileState {
         len: u64,
@@ -1879,6 +1838,3 @@ fn temp_path_for(path: &Path, operation: &str) -> PathBuf {
     path.with_file_name(file_name)
 }
 
-#[cfg(test)]
-#[path = "compression_tests.rs"]
-mod tests;

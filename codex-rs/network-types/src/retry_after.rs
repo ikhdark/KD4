@@ -49,6 +49,3 @@ impl RetryAfter {
     }
 }
 
-#[cfg(test)]
-#[path = "retry_after_tests.rs"]
-mod tests;

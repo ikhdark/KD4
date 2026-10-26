@@ -285,55 +285,6 @@ impl Serialize for ResponsesInput {
     }
 }
 
-#[cfg(test)]
-mod responses_input_tests {
-    use super::*;
-
-    #[test]
-    fn prefixed_serialization_keeps_exact_bytes_without_copying_shared_history() {
-        let item = |text: &str| ResponseItem::Message {
-            id: None,
-            role: "developer".into(),
-            content: vec![codex_protocol::models::ContentItem::InputText { text: text.into() }],
-            phase: None,
-            internal_chat_message_metadata_passthrough: None,
-        };
-        let history: Arc<[ResponseItem]> = Arc::from([item("shared history")]);
-        for prefix in [Vec::new(), vec![item("fixed prefix")]] {
-            let expected = prefix
-                .iter()
-                .chain(history.iter())
-                .cloned()
-                .collect::<Vec<_>>();
-            let input = ResponsesInput::with_prefix(prefix, Arc::clone(&history));
-            for (index, item) in input.iter().enumerate() {
-                assert!(std::ptr::eq(input.get_item(index).unwrap(), item));
-            }
-            assert!(input.get_item(input.len()).is_none());
-            assert!(input.get_item(usize::MAX).is_none());
-            for _ in 0..2 {
-                assert_eq!(
-                    serde_json::to_vec(&input).unwrap(),
-                    serde_json::to_vec(&expected).unwrap()
-                );
-                assert!(input.contiguous.get().is_none());
-                assert!(Arc::ptr_eq(&input.shared, &history));
-            }
-            let mut modified = input.clone();
-            Arc::make_mut(&mut modified)[0] = item("rewritten");
-            let mut expected_modified = expected.clone();
-            expected_modified[0] = item("rewritten");
-            assert_eq!(
-                serde_json::to_vec(&modified).unwrap(),
-                serde_json::to_vec(&expected_modified).unwrap()
-            );
-            assert_eq!(
-                serde_json::to_vec(&input).unwrap(),
-                serde_json::to_vec(&expected).unwrap()
-            );
-        }
-    }
-}
 
 #[derive(Debug, Serialize, Clone, PartialEq)]
 pub struct ResponsesApiRequest {

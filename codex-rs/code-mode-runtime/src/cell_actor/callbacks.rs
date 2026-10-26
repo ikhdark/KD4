@@ -317,7 +317,3 @@ async fn drain_tasks_bounded(
     tasks.abort_all();
     drain_tasks(tasks, description, task_failure_handler).await;
 }
-
-#[cfg(test)]
-#[path = "callbacks_tests.rs"]
-mod tests;

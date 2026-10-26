@@ -2,9 +2,6 @@ use super::*;
 
 const RATE_LIMIT_RESET_REQUEST_TIMEOUT: Duration = Duration::from_secs(/*secs*/ 10);
 const RATE_LIMIT_RESET_DETAILS_REQUEST_TIMEOUT: Duration = Duration::from_secs(/*secs*/ 5);
-#[cfg(debug_assertions)]
-const RATE_LIMIT_RESET_REQUEST_TIMEOUT_ENV_VAR: &str =
-    "CODEX_TEST_RATE_LIMIT_RESET_REQUEST_TIMEOUT_MS";
 
 impl AccountRequestProcessor {
     pub(super) async fn detailed_rate_limit_reset_credits(
@@ -55,12 +52,6 @@ impl AccountRequestProcessor {
 
         let client = self.rate_limit_reset_backend_client().await?;
         let request_timeout = RATE_LIMIT_RESET_REQUEST_TIMEOUT;
-        #[cfg(debug_assertions)]
-        let request_timeout = std::env::var(RATE_LIMIT_RESET_REQUEST_TIMEOUT_ENV_VAR)
-            .ok()
-            .and_then(|value| value.parse::<u64>().ok())
-            .map(Duration::from_millis)
-            .unwrap_or(request_timeout);
         let response = tokio::time::timeout(request_timeout, async {
             match params.credit_id.as_deref() {
                 Some(credit_id) => {

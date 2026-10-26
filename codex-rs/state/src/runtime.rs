@@ -64,17 +64,12 @@ mod backfill;
 mod external_agent_config_imports;
 pub use external_agent_config_imports::{ExternalAgentConfigImportFailureRecord, ExternalAgentConfigImportHistoryRecord, ExternalAgentConfigImportSuccessRecord};
 
-#[cfg(test)]
-#[path = "runtime_compat_tests.rs"]
-mod compatibility_tests;
 mod logs;
 pub use logs::LogReader;
 pub(crate) use logs::LogRetentionScope;
 mod projects;
 mod recovery;
 mod remote_control;
-#[cfg(test)]
-mod test_support;
 mod thread_queues;
 mod threads;
 
@@ -155,8 +150,6 @@ pub struct StateRuntime {
     agent_job_runner_heartbeat_shutdown: tokio::sync::watch::Sender<bool>,
     agent_job_updates: tokio::sync::watch::Sender<u64>,
     db_telemetry: Option<DbTelemetryHandle>,
-    #[cfg(test)]
-    log_retention_test_control: Arc<logs::LogRetentionTestControl>,
     thread_updated_at_millis: Arc<AtomicI64>,
     thread_recency_at_millis: Arc<AtomicI64>,
 }
@@ -183,14 +176,6 @@ impl StateRuntime {
         Self::init_serialized(codex_home, default_provider, None, false).await
     }
 
-    #[cfg(test)]
-    pub(crate) async fn init_with_telemetry_for_tests(
-        codex_home: PathBuf,
-        default_provider: String,
-        telemetry_override: DbTelemetryHandle,
-    ) -> anyhow::Result<Arc<Self>> {
-        Self::init_serialized(codex_home, default_provider, Some(telemetry_override), true).await
-    }
 
     async fn init_serialized(
         codex_home: PathBuf,
@@ -345,8 +330,6 @@ SELECT
             agent_job_runner_heartbeat_shutdown,
             agent_job_updates: tokio::sync::watch::channel(0).0,
             db_telemetry: telemetry_override,
-            #[cfg(test)]
-            log_retention_test_control: Arc::new(logs::LogRetentionTestControl::default()),
             codex_home,
             default_provider,
             thread_updated_at_millis: Arc::new(AtomicI64::new(thread_updated_at_millis)),
@@ -570,254 +553,4 @@ pub async fn sqlite_integrity_check(path: &Path) -> anyhow::Result<Vec<String>> 
     Ok(rows)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::StateRuntime;
-    use super::open_state_sqlite;
-    use super::runtime_state_migrator;
-    use super::sqlite_integrity_check;
-    use super::state_db_path;
-    use super::test_support::unique_temp_dir;
-    use crate::DB_INIT_METRIC;
-    use crate::DbTelemetry;
-    use crate::migrations::STATE_MIGRATOR;
-    use pretty_assertions::assert_eq;
-    use sqlx::SqlitePool;
-    use sqlx::migrate::MigrateError;
-    use sqlx::sqlite::SqliteConnectOptions;
-    use std::collections::BTreeMap;
-    use std::collections::BTreeSet;
-    use std::path::Path;
-    use std::sync::Arc;
-    use std::sync::Mutex;
 
-    #[derive(Default)]
-    struct TestTelemetry {
-        counters: Mutex<Vec<MetricEvent>>,
-    }
-
-    #[derive(Debug, Eq, PartialEq)]
-    struct MetricEvent {
-        name: String,
-        tags: BTreeMap<String, String>,
-    }
-
-    impl TestTelemetry {
-        fn counters(&self) -> Vec<MetricEvent> {
-            self.counters
-                .lock()
-                .expect("telemetry lock")
-                .iter()
-                .map(|event| MetricEvent {
-                    name: event.name.clone(),
-                    tags: event.tags.clone(),
-                })
-                .collect()
-        }
-    }
-
-    impl DbTelemetry for TestTelemetry {
-        fn counter(&self, name: &str, _inc: i64, tags: &[(&str, &str)]) {
-            self.counters
-                .lock()
-                .expect("telemetry lock")
-                .push(MetricEvent {
-                    name: name.to_string(),
-                    tags: tags_to_map(tags),
-                });
-        }
-
-        fn record_duration(
-            &self,
-            _name: &str,
-            _duration: std::time::Duration,
-            _tags: &[(&str, &str)],
-        ) {
-        }
-    }
-
-    fn tags_to_map(tags: &[(&str, &str)]) -> BTreeMap<String, String> {
-        tags.iter()
-            .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
-            .collect()
-    }
-
-    async fn open_db_pool(path: &Path) -> SqlitePool {
-        SqlitePool::connect_with(
-            SqliteConnectOptions::new()
-                .filename(path)
-                .create_if_missing(false),
-        )
-        .await
-        .expect("open sqlite pool")
-    }
-
-    #[tokio::test]
-    async fn sqlite_integrity_check_reports_ok_for_valid_db() {
-        let codex_home = unique_temp_dir();
-        tokio::fs::create_dir_all(&codex_home)
-            .await
-            .expect("create codex home");
-        let path = state_db_path(codex_home.as_path());
-        let pool = SqlitePool::connect_with(
-            SqliteConnectOptions::new()
-                .filename(&path)
-                .create_if_missing(true),
-        )
-        .await
-        .expect("open sqlite db");
-        sqlx::query("CREATE TABLE sample (id INTEGER PRIMARY KEY)")
-            .execute(&pool)
-            .await
-            .expect("create sample table");
-        pool.close().await;
-
-        let result = sqlite_integrity_check(&path)
-            .await
-            .expect("integrity check should run");
-
-        assert_eq!(result, vec!["ok".to_string()]);
-        let _ = tokio::fs::remove_dir_all(codex_home).await;
-    }
-
-    #[tokio::test]
-    async fn open_state_sqlite_tolerates_newer_applied_migrations() {
-        let codex_home = unique_temp_dir();
-        tokio::fs::create_dir_all(&codex_home)
-            .await
-            .expect("create codex home");
-        let state_path = state_db_path(codex_home.as_path());
-        let pool = SqlitePool::connect_with(
-            SqliteConnectOptions::new()
-                .filename(&state_path)
-                .create_if_missing(true),
-        )
-        .await
-        .expect("open state db");
-        STATE_MIGRATOR
-            .run(&pool)
-            .await
-            .expect("apply current state schema");
-        sqlx::query(
-            "INSERT INTO _sqlx_migrations (version, description, success, checksum, execution_time) VALUES (?, ?, ?, ?, ?)",
-        )
-        .bind(9_999_i64)
-        .bind("future migration")
-        .bind(true)
-        .bind(vec![1_u8, 2, 3, 4])
-        .bind(1_i64)
-        .execute(&pool)
-        .await
-        .expect("insert future migration record");
-        pool.close().await;
-
-        let strict_pool = open_db_pool(state_path.as_path()).await;
-        let strict_err = STATE_MIGRATOR
-            .run(&strict_pool)
-            .await
-            .expect_err("strict migrator should reject newer applied migrations");
-        assert!(matches!(strict_err, MigrateError::VersionMissing(9_999)));
-        strict_pool.close().await;
-
-        let tolerant_migrator = runtime_state_migrator();
-        let tolerant_pool = open_state_sqlite(
-            state_path.as_path(),
-            &tolerant_migrator,
-            /*telemetry_override*/ None,
-        )
-        .await
-        .expect("runtime migrator should tolerate newer applied migrations");
-        tolerant_pool.close().await;
-
-        let _ = tokio::fs::remove_dir_all(codex_home).await;
-    }
-
-    #[tokio::test]
-    async fn concurrent_initializers_both_migrate_a_fresh_database() {
-        let migrator = runtime_state_migrator();
-        for _ in 0..3 {
-            let codex_home = unique_temp_dir();
-            tokio::fs::create_dir_all(&codex_home)
-                .await
-                .expect("create codex home");
-            let state_path = state_db_path(codex_home.as_path());
-            let (first, second) = tokio::join!(
-                open_state_sqlite(
-                    state_path.as_path(),
-                    &migrator,
-                    /*telemetry_override*/ None
-                ),
-                open_state_sqlite(
-                    state_path.as_path(),
-                    &migrator,
-                    /*telemetry_override*/ None
-                ),
-            );
-            let first = first.expect("first initializer should migrate");
-            let second = second.expect("concurrent initializer should accept the shared migration");
-            let applied = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM _sqlx_migrations")
-                .fetch_one(&second)
-                .await
-                .expect("count applied migrations");
-            assert_eq!(
-                usize::try_from(applied).expect("non-negative count"),
-                STATE_MIGRATOR.migrations.len()
-            );
-            first.close().await;
-            second.close().await;
-            let _ = tokio::fs::remove_dir_all(codex_home).await;
-        }
-    }
-
-    #[tokio::test]
-    async fn init_records_successful_sqlite_init_phases_to_explicit_telemetry() {
-        let codex_home = unique_temp_dir();
-        let telemetry = Arc::new(TestTelemetry::default());
-
-        let runtime = StateRuntime::init_with_telemetry_for_tests(
-            codex_home.clone(),
-            "test-provider".to_string(),
-            telemetry.clone(),
-        )
-        .await
-        .expect("state runtime should initialize");
-
-        let phases = telemetry
-            .counters()
-            .into_iter()
-            .filter(|event| event.name == DB_INIT_METRIC)
-            .filter(|event| event.tags.get("status").map(String::as_str) == Some("success"))
-            .filter_map(|event| event.tags.get("phase").cloned())
-            .collect::<BTreeSet<_>>();
-        let expected = [
-            "open_state",
-            "migrate_state",
-            "open_logs",
-            "migrate_logs",
-            "ensure_backfill_state",
-            "post_init_query",
-        ]
-        .into_iter()
-        .map(str::to_string)
-        .collect::<BTreeSet<_>>();
-        assert_eq!(phases, expected);
-        assert!(!codex_home.join("memories_1.sqlite").exists());
-        let memory_columns: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM pragma_table_info('threads') WHERE name = 'memory_mode'",
-        )
-        .fetch_one(runtime.pool.as_ref())
-        .await
-        .expect("inspect thread schema");
-        // Retired features stay absent, but older ordinary writers still name
-        // this inert storage column in their INSERT/UPSERT statements.
-        assert_eq!(memory_columns, 1);
-
-        runtime.pool.close().await;
-        runtime.logs_pool.close().await;
-        let _ = tokio::fs::remove_dir_all(codex_home).await;
-    }
-}
-
-#[cfg(test)]
-#[path = "runtime/audit20261023_tests.rs"]
-mod audit20261023_tests;

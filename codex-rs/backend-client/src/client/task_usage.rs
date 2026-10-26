@@ -233,6 +233,3 @@ impl PartialEq for TaskCredits {
     }
 }
 
-#[cfg(test)]
-#[path = "task_usage_tests.rs"]
-mod tests;

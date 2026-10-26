@@ -48,11 +48,6 @@ ts-rs = { workspace = true, features = [
 uuid = { workspace = true, features = ["serde", "v7", "v4"] }
 wildmatch = { workspace = true }
 
-[dev-dependencies]
-anyhow = { workspace = true }
-codex-execpolicy = { workspace = true }
-pretty_assertions = { workspace = true }
-tempfile = { workspace = true }
 
 [package.metadata.cargo-shear]
 # Required because:

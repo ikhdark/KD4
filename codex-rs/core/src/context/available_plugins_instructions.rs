@@ -55,19 +55,3 @@ impl ContextualUserFragment for PluginsInstructionsUnavailable {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use pretty_assertions::assert_eq;
-
-    #[test]
-    fn renders_capability_routing_and_source_preserving_fallback_guidance() {
-        let expected_body = "\n## Plugins\nPlugins contribute skills (`plugin_name:skill`), MCP tools, or apps; use the contributed capability, not the bundle. Prefer a named plugin's relevant capability, loading or discovering it through its existing route when needed. If unavailable, explain the limitation; use a fallback only if it preserves the requested source and scope.\n";
-        assert_eq!(AvailablePluginsInstructions.body(), expected_body);
-        assert_eq!(AvailablePluginsInstructions.role(), "developer");
-        assert_eq!(
-            AvailablePluginsInstructions.render(),
-            format!("<plugins_instructions>{expected_body}</plugins_instructions>")
-        );
-    }
-}

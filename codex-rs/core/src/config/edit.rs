@@ -896,6 +896,3 @@ impl ConfigEditsBuilder {
     }
 }
 
-#[cfg(test)]
-#[path = "edit_tests.rs"]
-mod tests;

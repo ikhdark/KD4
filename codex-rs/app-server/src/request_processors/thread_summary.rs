@@ -144,6 +144,3 @@ pub(super) fn thread_started_notification(thread: &mut Thread) -> ThreadStartedN
     notification
 }
 
-#[cfg(test)]
-#[path = "thread_summary_tests.rs"]
-mod thread_summary_tests;

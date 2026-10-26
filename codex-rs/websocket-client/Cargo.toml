@@ -13,11 +13,6 @@ tokio-rustls = { workspace = true }
 tokio-tungstenite = { workspace = true }
 url = { workspace = true }
 
-[dev-dependencies]
-codex-utils-rustls-provider = { workspace = true }
-pretty_assertions = { workspace = true }
-rcgen = { workspace = true }
-tokio = { workspace = true, features = ["macros", "test-util", "process", "io-util"] }
 
 [lints]
 workspace = true

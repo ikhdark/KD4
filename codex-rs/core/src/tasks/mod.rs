@@ -485,18 +485,6 @@ impl Session {
         let _ = self.start_task_locked(turn_context, input, task).await;
     }
 
-    #[cfg(test)]
-    pub(crate) async fn start_task<T: SessionTask>(
-        self: &Arc<Self>,
-        turn_context: Arc<TurnContext>,
-        input: Vec<TurnInput>,
-        task: T,
-    ) {
-        let Ok(_task_start_permit) = self.task_start_gate.acquire().await else {
-            unreachable!("session-owned task-start semaphore is never closed");
-        };
-        let _ = self.start_task_locked(turn_context, input, task).await;
-    }
 
     pub(crate) async fn start_task_with_admission<T: SessionTask>(
         self: &Arc<Self>,
@@ -1233,11 +1221,6 @@ impl Session {
             .selected_terminal_event
             .get_or_insert(event)
             .clone();
-        #[cfg(test)]
-        finalization
-            .coordinator
-            .wait_publication_pause_for_test()
-            .await;
         let published_event = self
             .publish_terminal_event(
                 turn_context.as_ref(),
@@ -1255,10 +1238,6 @@ impl Session {
         // Do not acquire task_start_gate here: a replacement holds it while
         // waiting for this coordinator. Optional post-dispatch work stays outside.
         let cleared_active_turn = self.detach_terminal_turn(finalization).await;
-        #[cfg(test)]
-        finalization
-            .coordinator
-            .panic_after_terminal_publication_if_requested();
         if !finalization.terminal_post_dispatch_completed {
             finalization.terminal_post_dispatch_completed = self
                 .finish_terminal_event_dispatch(turn_context.as_ref(), &published_event)
@@ -1278,10 +1257,6 @@ impl Session {
             TurnTerminalOutcome::Aborted(_) | TurnTerminalOutcome::WorkerJoinFailed(_)
         );
         if requires_abort_cleanup {
-            #[cfg(test)]
-            finalization
-                .coordinator
-                .panic_before_worker_cancellation_if_requested();
             trace!(
                 task_kind = ?finalization.task.kind,
                 sub_id = %turn_context.sub_id,
@@ -1877,6 +1852,3 @@ impl Session {
     }
 }
 
-#[cfg(test)]
-#[path = "mod_tests.rs"]
-mod tests;

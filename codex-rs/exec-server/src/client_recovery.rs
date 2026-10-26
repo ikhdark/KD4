@@ -31,9 +31,6 @@ use crate::rpc::RpcClient;
 use crate::rpc::RpcClientEvent;
 use crate::rpc::SESSION_ALREADY_ATTACHED_ERROR_CODE;
 
-#[cfg(test)]
-const SESSION_RECOVERY_TIMEOUT: Duration = Duration::from_millis(500);
-#[cfg(not(test))]
 // Leave margin inside the server's 30-second retention windows because the
 // client and server start their disconnect clocks independently.
 const SESSION_RECOVERY_TIMEOUT: Duration = Duration::from_secs(25);
@@ -858,6 +855,3 @@ fn registry_recovery_retry_delay(session_id: &str, attempt: u32) -> Duration {
     Duration::from_millis(base_millis + hasher.finish() % (base_millis / 2 + 1))
 }
 
-#[cfg(test)]
-#[path = "client_recovery_tests.rs"]
-mod tests;

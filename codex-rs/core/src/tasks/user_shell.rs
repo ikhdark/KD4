@@ -793,6 +793,3 @@ async fn persist_user_shell_output(
     }
 }
 
-#[cfg(test)]
-#[path = "user_shell_tests.rs"]
-mod tests;

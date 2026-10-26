@@ -410,17 +410,6 @@ impl PluginStore {
         self.begin_install_with_manifest(source_path, plugin_id, InstallManifest::OnDisk)
     }
 
-    #[cfg(test)]
-    pub(crate) fn install_with_fallback_manifest(
-        &self,
-        source_path: AbsolutePathBuf,
-        plugin_id: PluginId,
-        manifest_contents: &str,
-    ) -> Result<PluginInstallResult, PluginStoreError> {
-        self.begin_install_with_fallback_manifest(source_path, plugin_id, manifest_contents)
-            .map(PendingPluginInstall::commit)
-    }
-
     pub(crate) fn begin_install_with_fallback_manifest(
         &self,
         source_path: AbsolutePathBuf,
@@ -939,7 +928,3 @@ fn copy_dir_recursive(source: &Path, target: &Path) -> Result<(), PluginStoreErr
 
     Ok(())
 }
-
-#[cfg(test)]
-#[path = "store_tests.rs"]
-mod tests;

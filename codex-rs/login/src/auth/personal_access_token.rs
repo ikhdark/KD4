@@ -117,6 +117,3 @@ fn whoami_endpoint(authapi_base_url: &str) -> String {
     format!("{}{WHOAMI_PATH}", authapi_base_url.trim_end_matches('/'))
 }
 
-#[cfg(test)]
-#[path = "personal_access_token_tests.rs"]
-mod tests;

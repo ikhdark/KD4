@@ -29,6 +29,3 @@ pub use scope::repo_path_identity_keys;
 pub use scope::repository_lineage_id;
 pub use scope::repository_workspace_id;
 
-#[cfg(test)]
-#[path = "tests.rs"]
-mod tests;

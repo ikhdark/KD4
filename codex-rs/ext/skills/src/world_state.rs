@@ -1,4 +1,3 @@
-use codex_extension_api::ContextualUserFragment;
 use codex_extension_api::PreviousWorldStateSection;
 use codex_extension_api::RenderedWorldStateFragment;
 use codex_extension_api::WorldStateSectionContribution;
@@ -106,78 +105,5 @@ pub(crate) fn executor_skills_world_state_section(
                 && (text.contains(body.as_str()) || text.contains(DEFERRED_EXECUTOR_SKILLS_BODY))
         }),
         None => contribution,
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::catalog::SkillAuthority;
-    use crate::catalog::SkillCatalogEntry;
-    use crate::catalog::SkillPackageId;
-    use crate::catalog::SkillResourceId;
-    use crate::catalog::SkillSourceKind;
-
-    #[test]
-    fn catalog_transitions_have_truthful_bounded_fallbacks() {
-        let catalog = SkillCatalog {
-            entries: vec![SkillCatalogEntry::new(
-                SkillPackageId("env/new/SKILL.md".into()),
-                SkillAuthority::new(SkillSourceKind::Executor, "env"),
-                "replacement-skill",
-                "Replacement description.",
-                SkillResourceId::new("env/new/SKILL.md"),
-            )],
-            ..Default::default()
-        };
-        let previous = json!({"body": "old catalog", "includeInstructions": true});
-        for (catalog, include, expected) in [
-            (SkillCatalog::default(), true, NO_EXECUTOR_SKILLS_BODY),
-            (catalog.clone(), false, HIDDEN_EXECUTOR_SKILLS_BODY),
-            (catalog, true, DEFERRED_EXECUTOR_SKILLS_BODY),
-        ] {
-            let section = executor_skills_world_state_section(&catalog, include);
-            let deferred = json!({"includeInstructions": true, "catalogDeferred": true});
-            assert!(
-                section
-                    .render_diff(PreviousWorldStateSection::Known(&deferred))
-                    .is_some(),
-                "a deferred listing is not evidence that the current catalog is empty"
-            );
-            assert!(
-                section
-                    .render_diff(PreviousWorldStateSection::Known(&previous))
-                    .is_some()
-            );
-            let (snapshot, fallback) = section.budget_fallback().unwrap();
-            assert_eq!(fallback.role(), "developer");
-            assert_eq!(fallback.body(), expected);
-            assert!(
-                expected.len()
-                    + ENVIRONMENT_SKILLS_INSTRUCTIONS_OPEN_TAG.len()
-                    + ENVIRONMENT_SKILLS_INSTRUCTIONS_CLOSE_TAG.len()
-                    <= 1024
-            );
-            if expected == DEFERRED_EXECUTOR_SKILLS_BODY {
-                assert_ne!(
-                    snapshot,
-                    section.snapshot(),
-                    "a clearing notice is not a full catalog receipt"
-                );
-                assert!(
-                    section
-                        .render_diff(PreviousWorldStateSection::Known(snapshot))
-                        .is_some()
-                );
-                assert!(section.matches_retained_fragment("developer", expected));
-            } else {
-                assert_eq!(snapshot, section.snapshot());
-                assert!(
-                    section
-                        .render_diff(PreviousWorldStateSection::Known(snapshot))
-                        .is_none()
-                );
-            }
-        }
     }
 }

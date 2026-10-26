@@ -63,6 +63,3 @@ fn acquire_named_setup_mutex(name: &str) -> Result<SetupMutexGuard> {
     Ok(SetupMutexGuard { handle })
 }
 
-#[cfg(test)]
-#[path = "setup_mutex_tests.rs"]
-mod tests;

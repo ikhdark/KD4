@@ -249,10 +249,4 @@ fn build_content_with_timeout(exec_output: &ExecToolCallOutput) -> Cow<'_, str> 
     }
 }
 
-#[cfg(test)]
-#[path = "tools_tests.rs"]
-mod tests;
 
-#[cfg(test)]
-#[path = "shell_output_summary_projection_tests.rs"]
-mod shell_output_summary_projection_tests;

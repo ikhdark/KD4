@@ -1,6 +1,3 @@
-#[cfg(test)]
-#[path = "workspace_coordination_tests.rs"]
-mod workspace_coordination_tests;
 #[path = "wake_subscriptions.rs"]
 mod wake_subscriptions;
 #[path = "source_inspection.rs"]
@@ -153,62 +150,15 @@ fn record_coordination_timing(
 
 static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
 
-#[cfg(test)]
-tokio::task_local! {
-    static TEST_COMPARISON_NOW: chrono::DateTime<Utc>;
-    static TEST_SNAPSHOT_CAPTURE_PAUSE: Arc<TestSnapshotCapturePause>;
-    static TEST_LEGACY_UPGRADE_BARRIER: Arc<tokio::sync::Barrier>;
-    pub(crate) static TEST_LEGACY_IDENTITY_RESOLUTIONS: std::cell::Cell<usize>;
-    pub(crate) static TEST_STARTUP_CAPSULE_VALIDATIONS: std::cell::Cell<usize>;
-}
 
-#[cfg(test)]
-pub(crate) struct TestSnapshotCapturePause {
-    pub(crate) started: tokio::sync::Semaphore,
-    pub(crate) release: tokio::sync::Semaphore,
-}
 
-#[cfg(test)]
-impl TestSnapshotCapturePause {
-    pub(crate) fn new() -> Self {
-        Self {
-            started: tokio::sync::Semaphore::new(0),
-            release: tokio::sync::Semaphore::new(0),
-        }
-    }
-}
 
-#[cfg(test)]
-pub(crate) async fn with_test_legacy_upgrade_barrier<T>(
-    barrier: Arc<tokio::sync::Barrier>,
-    future: impl Future<Output = T>,
-) -> T {
-    TEST_LEGACY_UPGRADE_BARRIER.scope(barrier, future).await
-}
 
 fn comparison_now() -> chrono::DateTime<Utc> {
-    #[cfg(test)]
-    if let Ok(now) = TEST_COMPARISON_NOW.try_with(ToOwned::to_owned) {
-        return now;
-    }
     Utc::now()
 }
 
-#[cfg(test)]
-pub(crate) async fn with_test_comparison_now<T>(
-    now: chrono::DateTime<Utc>,
-    future: impl std::future::Future<Output = T>,
-) -> T {
-    TEST_COMPARISON_NOW.scope(now, future).await
-}
 
-#[cfg(test)]
-pub(crate) async fn with_test_snapshot_capture_pause<T>(
-    pause: Arc<TestSnapshotCapturePause>,
-    future: impl std::future::Future<Output = T>,
-) -> T {
-    TEST_SNAPSHOT_CAPTURE_PAUSE.scope(pause, future).await
-}
 
 #[derive(Clone)]
 pub struct LocalAgentTaskStore {
@@ -288,8 +238,6 @@ struct DurableWakePoller {
     active: watch::Sender<bool>,
     shutdown: watch::Sender<bool>,
     task: Mutex<Option<tokio::task::JoinHandle<()>>>,
-    #[cfg(test)]
-    poll_progress: watch::Sender<(usize, u64)>,
 }
 
 impl DurableWakePoller {
@@ -300,10 +248,6 @@ impl DurableWakePoller {
     ) -> Arc<Self> {
         let (active, mut active_rx) = watch::channel(false);
         let (shutdown, mut shutdown_rx) = watch::channel(false);
-        #[cfg(test)]
-        let (poll_progress, _) = watch::channel((0, 0));
-        #[cfg(test)]
-        let task_poll_progress = poll_progress.clone();
         let subscriptions = Arc::new(wake_subscriptions::WakeSubscriptions::default());
         let task_subscriptions = Arc::clone(&subscriptions);
         let mut local_wake = wake_revision.subscribe();
@@ -345,8 +289,6 @@ impl DurableWakePoller {
                         true
                     }
                     _ = tokio::time::sleep(EXTERNAL_WAKE_RECHECK_INTERVAL) => {
-                        #[cfg(test)]
-                        task_poll_progress.send_modify(|(_, polls)| *polls += 1);
                         false
                     }
                 };
@@ -374,8 +316,6 @@ impl DurableWakePoller {
             active,
             shutdown,
             task: Mutex::new(Some(task)),
-            #[cfg(test)]
-            poll_progress,
         })
     }
 
@@ -384,8 +324,6 @@ impl DurableWakePoller {
         if self.waiter_count.fetch_add(1, Ordering::AcqRel) == 0 {
             self.active.send_replace(true);
         }
-        #[cfg(test)]
-        self.poll_progress.send_modify(|(waiters, _)| *waiters += 1);
         DurableWakeWaiter {
             poller: Arc::clone(self),
             root: root.into(),
@@ -411,10 +349,6 @@ struct DurableWakeWaiter {
 impl Drop for DurableWakeWaiter {
     fn drop(&mut self) {
         self.poller.subscriptions.unregister(&self.root);
-        #[cfg(test)]
-        self.poller
-            .poll_progress
-            .send_modify(|(waiters, _)| *waiters -= 1);
         if self.poller.waiter_count.fetch_sub(1, Ordering::AcqRel) == 1 {
             self.poller.active.send_if_modified(|active| {
                 if self.poller.waiter_count.load(Ordering::Acquire) == 0 {
@@ -550,24 +484,8 @@ impl LocalAgentTaskStore {
             .unwrap_or(0))
     }
 
-    #[cfg(test)]
-    pub(crate) fn wake_revision(&self) -> u64 {
-        *self.wake_revision.borrow()
-    }
 
-    #[cfg(test)]
-    pub(crate) fn durable_wake_poll_count(&self) -> u64 {
-        self.durable_wake_poller.poll_progress.borrow().1
-    }
 
-    #[cfg(test)]
-    pub(crate) async fn wait_for_durable_wake_poll(&self, waiters: usize, after: u64) {
-        let mut progress = self.durable_wake_poller.poll_progress.subscribe();
-        progress
-            .wait_for(|&(registered, polls)| registered == waiters && polls > after)
-            .await
-            .expect("test owns the durable poller");
-    }
 
     async fn create_assignment_impl(
         &self,
@@ -797,8 +715,6 @@ impl LocalAgentTaskStore {
         let staging_payload = canonical_payload.clone();
         let durable_payload = canonical_payload.clone();
         let pool = self.pool.clone();
-        #[cfg(test)]
-        let publication_pause = TEST_SNAPSHOT_CAPTURE_PAUSE.try_with(Arc::clone).ok();
         // Reuse Assignment's existing immutable capsule slot as an independent
         // authoritative copy. The worker owns publication AND DB commit through
         // observer cancellation; the sidecar alone is not an attachment receipt.
@@ -851,18 +767,6 @@ impl LocalAgentTaskStore {
                 }
             };
             std::fs::rename(&writing_path, &staging_path)?;
-            #[cfg(test)]
-            if let Some(pause) = publication_pause {
-                pause.started.add_permits(1);
-                tokio::runtime::Handle::current().block_on(async {
-                    pause
-                        .release
-                        .acquire()
-                        .await
-                        .expect("publication pause open")
-                        .forget();
-                });
-            }
             std::fs::rename(&staging_path, &capsule_path)?;
             tokio::runtime::Handle::current().block_on(async move {
                 sqlx::query("UPDATE assignments SET body_json = json_set(body_json, '$.task_capsule', ?) WHERE assignment_id = ?")
@@ -2824,8 +2728,6 @@ LIMIT 1
                     continue;
                 }
             }
-            #[cfg(test)]
-            let _ = TEST_STARTUP_CAPSULE_VALIDATIONS.try_with(|count| count.set(count.get() + 1));
             let Some(_capsule_lease) = try_capsule_lease(capsule_dir.join(format!("{stem}.lock"))).await? else {
                 // A live publisher owns recovery; unrelated roots need not wait.
                 continue;
@@ -2834,11 +2736,6 @@ LIMIT 1
             // make the affected assignment fail closed, not the entire store.
             let mut invalid_payload = false;
             let result: StoreResult<()> = async {
-                #[cfg(test)]
-                if let Ok(pause) = workspace_coordination_tests::CAPSULE_READ_PAUSE.try_with(Arc::clone) {
-                    pause.started.add_permits(1);
-                    pause.release.acquire().await.expect("capsule read pause open").forget();
-                }
                 let payload = match tokio::fs::read_to_string(&path).await {
                     Ok(payload) => payload,
                     Err(error) => {
@@ -4265,10 +4162,6 @@ async fn upgrade_legacy_repository_bindings(pool: &SqlitePool) -> StoreResult<()
     )
     .fetch_all(pool)
     .await?;
-    #[cfg(test)]
-    if let Ok(barrier) = TEST_LEGACY_UPGRADE_BARRIER.try_with(Arc::clone) {
-        barrier.wait().await;
-    }
     // Non-Git roots legitimately retain repository_id == workspace_id. Resolve
     // each distinct root once per open, not once per historical assignment.
     let mut identities = std::collections::HashMap::new();
@@ -4278,8 +4171,6 @@ async fn upgrade_legacy_repository_bindings(pool: &SqlitePool) -> StoreResult<()
         let workspace_id = row.get::<String, _>("workspace_id");
         let canonical_root = row.get::<String, _>("canonical_root");
         if !identities.contains_key(&canonical_root) {
-            #[cfg(test)]
-            let _ = TEST_LEGACY_IDENTITY_RESOLUTIONS.try_with(|count| count.set(count.get() + 1));
             let identity = match repository_identity_async(Path::new(&canonical_root)).await {
                 Ok(repository) => Some(repository),
                 Err(StoreError::InvalidScope(_)) => None,

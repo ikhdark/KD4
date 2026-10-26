@@ -22,9 +22,3 @@ tracing = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { workspace = true, features = ["Win32_System_Console"] }
-
-[dev-dependencies]
-codex-protocol = { workspace = true }
-futures = { workspace = true, features = ["async-await"] }
-pretty_assertions = { workspace = true }
-tokio = { workspace = true, features = ["test-util"] }

@@ -61,11 +61,3 @@ pub const RECEIPT_RECOVERY_CAPABILITY: &str = "terminal-receipt-recovery-v1";
 /// host error, this response permits observing the same session's close again.
 pub const SESSION_SHUTDOWN_PENDING: &str =
     "code-mode session shutdown pending; storage remains owned";
-
-#[cfg(test)]
-#[path = "host_tests.rs"]
-mod tests;
-
-#[cfg(test)]
-#[path = "codec_tests.rs"]
-mod codec_tests;

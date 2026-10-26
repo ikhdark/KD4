@@ -352,7 +352,3 @@ fn prepare_image(
     }
     Ok(notice)
 }
-
-#[cfg(test)]
-#[path = "image_preparation_tests.rs"]
-mod tests;

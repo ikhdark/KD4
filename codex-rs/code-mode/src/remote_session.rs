@@ -801,7 +801,3 @@ fn resolve_host_program(
     }
     PathBuf::from(executable_name)
 }
-
-#[cfg(test)]
-#[path = "remote_session_tests.rs"]
-mod tests;

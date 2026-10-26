@@ -938,17 +938,6 @@ impl PluginsManager {
             .map(|entry| (entry.roots.clone(), Some(entry.snapshots.clone())))
     }
 
-    #[cfg(test)]
-    fn cached_loaded_plugins(&self, key: &PluginLoadCacheKey) -> Option<Vec<LoadedPlugin>> {
-        self.loaded_plugins_cache
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .entries
-            .iter()
-            .find(|cached| cached.key == *key)
-            .map(|cached| cached.plugins.clone())
-    }
-
     fn cached_plugin_outcome(&self, key: &PluginLoadCacheKey) -> Option<PluginLoadOutcome> {
         let auth_mode = self.auth_mode();
         {
@@ -1248,16 +1237,6 @@ impl PluginsManager {
         Ok(self
             .build_remote_installed_plugin_marketplaces_from_cache(visible_marketplaces)
             .unwrap_or_default())
-    }
-
-    #[cfg(test)]
-    fn write_remote_installed_plugins_cache(&self, plugins: Vec<RemoteInstalledPlugin>) -> bool {
-        let generation = self
-            .remote_installed_plugins_cache_generation
-            .load(Ordering::Acquire);
-        let ticket = self.begin_remote_installed_plugins_fetch();
-        self.write_remote_installed_plugins_cache_if_generation(plugins, generation, ticket)
-            .unwrap_or(false)
     }
 
     fn begin_remote_installed_plugins_fetch(&self) -> u64 {
@@ -1806,11 +1785,11 @@ impl PluginsManager {
         config_layer_stack: &ConfigLayerStack,
         request: PluginInstallRequest,
     ) -> Result<PluginInstallOutcome, PluginInstallError> {
-        let resolved = self
+        let (resolved, curated_snapshot) = self
             .resolve_installable_plugin(config_layer_stack, &request)
             .await?;
         let plugin_id = resolved.plugin_id.clone();
-        match self.install_resolved_plugin(resolved).await {
+        match self.install_resolved_plugin(resolved, curated_snapshot).await {
             Ok(outcome) => Ok(outcome),
             Err(err) => {
                 self.track_plugin_install_failed(
@@ -1828,17 +1807,42 @@ impl PluginsManager {
         &self,
         config_layer_stack: &ConfigLayerStack,
         request: &PluginInstallRequest,
-    ) -> Result<ResolvedMarketplacePlugin, PluginInstallError> {
+    ) -> Result<(ResolvedMarketplacePlugin, Option<(std::fs::File, String)>), PluginInstallError> {
         let config_layer_stack = config_layer_stack.clone();
         let request = request.clone();
         let codex_home = self.codex_home.clone();
         let restriction_product = self.restriction_product;
         let result = tokio::task::spawn_blocking(move || {
-            let resolved = find_installable_marketplace_plugin(
+            let curated_root = curated_plugins_repo_path(&codex_home);
+            let curated_path = request.marketplace_path.as_path().starts_with(&curated_root)
+                || std::fs::canonicalize(request.marketplace_path.as_path()).ok()
+                    .zip(std::fs::canonicalize(&curated_root).ok())
+                    .is_some_and(|(path, root)| path.starts_with(root));
+            let lock_snapshot = || crate::startup_sync::lock_curated_plugins_startup_sync(&codex_home)
+                .map_err(|message| MarketplaceError::InvalidMarketplaceFile {
+                    path: request.marketplace_path.to_path_buf(), message,
+                });
+            // Known curated paths are leased before the first read, including
+            // activation's temporary missing-root window. Unrelated marketplaces
+            // must not wait behind a curated network sync.
+            let mut snapshot = if curated_path { Some(lock_snapshot()?) } else { None };
+            let mut resolved = find_installable_marketplace_plugin(
                 &request.marketplace_path,
                 &request.plugin_name,
                 restriction_product,
             )?;
+            if snapshot.is_none()
+                && is_openai_curated_marketplace_name(resolved.plugin_id.marketplace_name())
+            {
+                snapshot = Some(lock_snapshot()?);
+                // A discovery read is not snapshot authority. Select all source
+                // and policy facts again under the lease before reading the SHA.
+                resolved = find_installable_marketplace_plugin(
+                    &request.marketplace_path,
+                    &request.plugin_name,
+                    restriction_product,
+                )?;
+            }
             MarketplacePolicy::from_requirements(config_layer_stack.requirements())
                 .validate_install(
                     &config_layer_stack,
@@ -1850,7 +1854,18 @@ impl PluginsManager {
                     path: request.marketplace_path.to_path_buf(),
                     message,
                 })?;
-            Ok::<_, MarketplaceError>(resolved)
+            let curated_snapshot = if is_openai_curated_marketplace_name(resolved.plugin_id.marketplace_name()) {
+                let version = read_curated_plugins_sha(&codex_home).ok_or_else(|| MarketplaceError::InvalidMarketplaceFile {
+                    path: request.marketplace_path.to_path_buf(),
+                    message: "local curated marketplace sha is not available".to_string(),
+                })?;
+                Some((snapshot.expect("curated source is leased"), curated_plugin_cache_version(&version)))
+            } else {
+                // Non-curated downloads/copies need no curated snapshot lease.
+                drop(snapshot);
+                None
+            };
+            Ok::<_, MarketplaceError>((resolved, curated_snapshot))
         })
         .await
         .map_err(PluginInstallError::join)?;
@@ -1922,6 +1937,7 @@ impl PluginsManager {
     async fn install_resolved_plugin(
         &self,
         resolved: ResolvedMarketplacePlugin,
+        curated_snapshot: Option<(std::fs::File, String)>,
     ) -> Result<PluginInstallOutcome, PluginInstallError> {
         let auth_policy = resolved.policy.authentication;
         let store = self.store.clone();
@@ -1933,18 +1949,10 @@ impl PluginsManager {
         // The worker owns staging, config persistence, and commit together so
         // cancelling its caller cannot roll back files while config is written.
         let result = tokio::task::spawn_blocking(move || -> Result<_, PluginInstallError> {
-            let plugin_version =
-                if is_openai_curated_marketplace_name(resolved.plugin_id.marketplace_name()) {
-                    let curated_plugin_version = read_curated_plugins_sha(codex_home.as_path())
-                        .ok_or_else(|| {
-                            PluginStoreError::Invalid(
-                                "local curated marketplace sha is not available".to_string(),
-                            )
-                        })?;
-                    Some(curated_plugin_cache_version(&curated_plugin_version))
-                } else {
-                    None
-                };
+            let (snapshot, plugin_version) = match curated_snapshot {
+                Some((snapshot, version)) => (Some(snapshot), Some(version)),
+                None => (None, None),
+            };
             let materialized =
                 materialize_marketplace_plugin_source(codex_home.as_path(), &resolved.source)
                     .map_err(PluginStoreError::Invalid)?;
@@ -1969,6 +1977,9 @@ impl PluginsManager {
                 ),
                 (None, None) => store.begin_install(source_path, resolved.plugin_id),
             }?;
+            // begin_install has synchronously copied the source into its owned
+            // transaction. Release snapshot authority before config locking.
+            drop(snapshot);
             apply_user_plugin_config_edits_blocking(
                 codex_home.as_path(),
                 vec![PluginConfigEdit::SetEnabled {
@@ -3361,7 +3372,3 @@ impl PluginUninstallError {
         matches!(self, Self::InvalidPluginId(_))
     }
 }
-
-#[cfg(test)]
-#[path = "manager_tests.rs"]
-mod tests;

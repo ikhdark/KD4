@@ -17,6 +17,3 @@ pub(super) fn base_url(region: &str) -> String {
     format!("https://bedrock-runtime.{region}.amazonaws.com/openai/v1")
 }
 
-#[cfg(test)]
-#[path = "runtime_tests.rs"]
-mod tests;

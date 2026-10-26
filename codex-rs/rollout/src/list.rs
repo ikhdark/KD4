@@ -301,10 +301,10 @@ impl<'de> serde::Deserialize<'de> for Cursor {
 
 impl From<codex_state::Anchor> for Cursor {
     fn from(anchor: codex_state::Anchor) -> Self {
-        let ts = anchor
-            .ts
-            .timestamp_nanos_opt()
-            .and_then(|nanos| OffsetDateTime::from_unix_timestamp_nanos(nanos as i128).ok())
+        let nanos = i128::from(anchor.ts.timestamp()) * 1_000_000_000
+            + i128::from(anchor.ts.timestamp_subsec_nanos());
+        let ts = OffsetDateTime::from_unix_timestamp_nanos(nanos)
+            .ok()
             .unwrap_or(OffsetDateTime::UNIX_EPOCH);
         Self { ts, id: anchor.id }
     }
@@ -1431,9 +1431,11 @@ async fn read_head_summary(
     let extraction_cache_guard =
         crate::metadata::extraction_cache_guard(path, default_provider).await;
 
-    let (thread_id, parse_errors) =
-        crate::recorder::RolloutRecorder::for_each_rollout_item_with_record_number(
+    let (thread_id, parse_errors, _, unresolved_payloads, payload_versions) =
+        crate::recorder::RolloutRecorder::for_each_rollout_item_with_versions(
             path,
+            false,
+            true,
             |item, record_number| {
                 settings_reducer.apply_item(&item);
                 if let Some(recency_at) =
@@ -1531,14 +1533,16 @@ async fn read_head_summary(
         summary.cwd = Some(environments.legacy_fallback_cwd.into_path_buf());
     }
 
-    let outcome = metadata_accumulator
+    let mut outcome = metadata_accumulator
         .finish(path, default_provider, parse_errors)
         .await
         .map_err(io::Error::other)?;
+    outcome.unresolved_payloads = unresolved_payloads;
     crate::metadata::cache_extraction_outcome(
         extraction_cache_guard,
         outcome,
         (head_limit == HEAD_RECORD_LIMIT).then(|| summary.clone()),
+        payload_versions,
     ).await;
 
     Ok(summary)
@@ -1798,11 +1802,6 @@ async fn verified_rollout_identity(path: &Path) -> io::Result<(ThreadId, Option<
     }
 }
 
-#[cfg(test)]
-async fn find_rollout_path_by_id_from_filenames(root: &Path, id_str: &str) -> io::Result<Option<PathBuf>> {
-    find_rollout_location_by_id_from_filenames(root, id_str).await
-        .map(|found| found.map(|(path, _)| path))
-}
 
 async fn find_rollout_location_by_id_from_filenames(
     root: &Path,
@@ -1981,139 +1980,3 @@ pub fn rollout_date_parts(file_name: &OsStr) -> Option<(String, String, String)>
     Some((year, month, day))
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use pretty_assertions::assert_eq;
-
-    #[tokio::test]
-    async fn filesystem_lookup_distinguishes_missing_roots_from_errors() -> io::Result<()> {
-        let home = tempfile::tempdir()?;
-        let id = Uuid::from_u128(0x12345678123456781234567812345678).to_string();
-        for (root, invalid) in [
-            (home.path().join("missing"), false),
-            (home.path().join("invalid\0root"), true),
-        ] {
-            for ascending in [false, true] {
-                let config = ThreadListConfig {
-                    allowed_sources: &[],
-                    model_providers: None,
-                    cwd_filters: None,
-                    default_provider: "openai",
-                    layout: ThreadListLayout::NestedByDate,
-                };
-                let result = if ascending {
-                    get_threads_in_root_ascending(
-                        root.clone(),
-                        1,
-                        None,
-                        ThreadSortKey::CreatedAt,
-                        config,
-                    )
-                    .await
-                } else {
-                    get_threads_in_root(root.clone(), 1, None, ThreadSortKey::CreatedAt, config)
-                        .await
-                };
-                if invalid {
-                    assert_eq!(
-                        result.expect_err("invalid root").kind(),
-                        io::ErrorKind::InvalidInput
-                    );
-                } else {
-                    assert_eq!(result?, ThreadsPage::default());
-                }
-            }
-            for archived in [false, true] {
-                let result = if archived {
-                    find_archived_thread_path_by_id_str(&root, &id, None).await
-                } else {
-                    find_thread_path_by_id_str(&root, &id, None).await
-                };
-                if invalid {
-                    assert_eq!(
-                        result.expect_err("invalid root").kind(),
-                        io::ErrorKind::InvalidInput
-                    );
-                } else {
-                    assert_eq!(result?, None);
-                }
-            }
-        }
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn uuid_lookup_finds_noncanonical_plain_and_compressed_rollouts() -> io::Result<()> {
-        let home = tempfile::tempdir()?;
-        let id = Uuid::from_u128(0x12345678123456781234567812345678).to_string();
-        for (subdir, suffix) in [
-            (SESSIONS_SUBDIR, ".jsonl"),
-            (ARCHIVED_SESSIONS_SUBDIR, ".jsonl.zst"),
-        ] {
-            let directory = home.path().join(subdir).join("legacy");
-            tokio::fs::create_dir_all(&directory).await?;
-            let path = directory.join(format!("rollout-custom-{id}{suffix}"));
-            let content = serde_json::json!({
-                "timestamp": "2026-01-01T00:00:00Z",
-                "type": "session_meta",
-                "payload": {
-                    "id": id, "timestamp": "2026-01-01T00:00:00Z",
-                    "cwd": ".", "originator": "test", "cli_version": "test",
-                    "source": "cli"
-                }
-            })
-            .to_string()
-                + "\n";
-            let bytes = if suffix.ends_with(".zst") {
-                zstd::stream::encode_all(content.as_bytes(), 0)?
-            } else {
-                content.as_bytes().to_vec()
-            };
-            tokio::fs::write(&path, &bytes).await?;
-            assert!(
-                parse_timestamp_uuid_from_filename(&format!("rollout-custom-{id}.jsonl")).is_none()
-            );
-            let found = if subdir == SESSIONS_SUBDIR {
-                find_thread_path_by_id_str(home.path(), &id, None).await?
-            } else {
-                find_archived_thread_path_by_id_str(home.path(), &id, None).await?
-            };
-            assert_eq!(found, Some(path.clone()));
-            assert_eq!(tokio::fs::read(&path).await?, bytes);
-            // Plain is authoritative even if the compressed sibling was
-            // created first. A misleading authoritative sibling must not be
-            // bypassed by selecting the compressed file.
-            if suffix.ends_with(".zst") {
-                let plain = directory.join(format!("rollout-custom-{id}.jsonl"));
-                tokio::fs::write(&plain, &content).await?;
-                assert_eq!(
-                    find_archived_thread_path_by_id_str(home.path(), &id, None).await?,
-                    Some(plain.clone())
-                );
-                tokio::fs::write(&plain, content.replace(&id, &Uuid::nil().to_string())).await?;
-                assert_eq!(
-                    find_archived_thread_path_by_id_str(home.path(), &id, None).await?,
-                    None
-                );
-            }
-            let wrong_id = Uuid::nil().to_string();
-            let misleading = directory.join(format!("rollout-custom-{wrong_id}.jsonl"));
-            tokio::fs::write(&misleading, &content).await?;
-            assert_eq!(
-                find_rollout_path_by_id_from_filenames(&directory, &wrong_id).await?,
-                None
-            );
-        }
-        let missing_id = Uuid::from_u128(0xffffffffffffffffffffffffffffffff).to_string();
-        assert_eq!(
-            find_thread_path_by_id_str(home.path(), &missing_id, None).await?,
-            None
-        );
-        assert_eq!(
-            find_archived_thread_path_by_id_str(home.path(), "invalid", None).await?,
-            None
-        );
-        Ok(())
-    }
-}

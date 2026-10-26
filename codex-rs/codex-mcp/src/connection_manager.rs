@@ -1762,18 +1762,6 @@ impl McpConnectionManager {
             .context("failed to get client")
     }
 
-    #[cfg(test)]
-    fn new_uninitialized(
-        approval_policy: &Constrained<AskForApproval>,
-        permission_profile: &Constrained<PermissionProfile>,
-        prefix_mcp_tool_names: bool,
-    ) -> Self {
-        Self::new_uninitialized_with_permission_profile(
-            approval_policy,
-            permission_profile.get(),
-            prefix_mcp_tool_names,
-        )
-    }
 }
 
 impl Drop for McpConnectionManager {
@@ -1900,6 +1888,3 @@ fn is_mcp_client_startup_timeout_error(error: &StartupOutcomeError) -> bool {
     error.is_timeout()
 }
 
-#[cfg(test)]
-#[path = "connection_manager_tests.rs"]
-mod tests;

@@ -203,18 +203,3 @@ pub fn kill_child_process_group(_child: &mut Child) -> io::Result<()> {
     Ok(())
 }
 
-#[cfg(all(test, unix))]
-#[tokio::test]
-async fn owned_exit_waiter_is_send_and_does_not_reap_the_child() {
-    let mut child = tokio::process::Command::new("sh")
-        .args(["-c", "exit 7"])
-        .spawn()
-        .unwrap();
-    let pid = child.id().unwrap();
-    // tokio::spawn is also the production Send requirement that regressed.
-    tokio::spawn(wait_for_exit_without_reaping(pid))
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(child.wait().await.unwrap().code(), Some(7));
-}

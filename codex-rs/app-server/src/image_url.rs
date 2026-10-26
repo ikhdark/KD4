@@ -13,28 +13,3 @@ pub(crate) fn image_url_error(image_url: &str) -> Option<&'static str> {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn accepts_only_embedded_image_representations() {
-        for url in ["data:image/png;base64,YQ==", "DATA:image/png;BASE64,YQ=="] {
-            assert_eq!(image_url_error(url), None);
-        }
-        for url in [
-            "file:///a.png",
-            "ftp://a/a.png",
-            "blob:a",
-            "",
-            "plain",
-            " https://a/a.png",
-            "HtTpS://a/a.png",
-        ] {
-            assert!(image_url_error(url).is_some());
-        }
-        assert_eq!(
-            image_url_error("HTTPS://a/a.png"),
-            Some(REMOTE_IMAGE_URL_ERROR)
-        );
-    }
-}

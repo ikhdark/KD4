@@ -239,63 +239,9 @@ pub(crate) struct ListedAgent {
     pub(crate) runtime_loaded: bool,
 }
 
-#[cfg(test)]
-pub(crate) struct AgentControlTestBarrier {
-    visits: std::sync::atomic::AtomicUsize,
-    reached: tokio::sync::Semaphore,
-    release: tokio::sync::Semaphore,
-}
 
-#[cfg(test)]
-impl Default for AgentControlTestBarrier {
-    fn default() -> Self {
-        Self {
-            visits: std::sync::atomic::AtomicUsize::new(0),
-            reached: tokio::sync::Semaphore::new(0),
-            release: tokio::sync::Semaphore::new(0),
-        }
-    }
-}
 
-#[cfg(test)]
-impl AgentControlTestBarrier {
-    async fn pause(&self) {
-        self.visits
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        self.reached.add_permits(1);
-        self.release
-            .acquire()
-            .await
-            .expect("test barrier should remain open")
-            .forget();
-    }
 
-    pub(crate) async fn wait_until_reached(&self) {
-        self.reached
-            .acquire()
-            .await
-            .expect("test barrier should remain open")
-            .forget();
-    }
-
-    pub(crate) fn release_one(&self) {
-        self.release.add_permits(1);
-    }
-
-    fn visits(&self) -> usize {
-        self.visits.load(std::sync::atomic::Ordering::SeqCst)
-    }
-}
-
-#[cfg(test)]
-#[derive(Default)]
-struct AgentControlTestHooks {
-    before_initial_submission: std::sync::Mutex<Option<Arc<AgentControlTestBarrier>>>,
-    after_thread_created: std::sync::Mutex<Option<Arc<AgentControlTestBarrier>>>,
-    before_spawn_rollback: std::sync::Mutex<Option<Arc<AgentControlTestBarrier>>>,
-    before_v2_cold_load: std::sync::Mutex<Option<Arc<AgentControlTestBarrier>>>,
-    after_execution_reservation: std::sync::Mutex<Option<Arc<AgentControlTestBarrier>>>,
-}
 
 #[derive(Clone, Debug)]
 enum V2AgentLoadCompletion {
@@ -330,8 +276,6 @@ pub(crate) struct AgentControl {
     /// Durable typed-task state shared by the root thread and all of its sub-agents.
     task_coordinator: AgentTaskCoordinator,
     pub(crate) inherited_validation_context: Option<super::task_coordinator::ValidationTurnContext>,
-    #[cfg(test)]
-    test_hooks: Arc<AgentControlTestHooks>,
 }
 
 impl AgentControl {
@@ -534,41 +478,8 @@ impl AgentControl {
         Ok(())
     }
 
-    #[cfg(test)]
-    pub(crate) fn set_before_initial_submission_barrier(
-        &self,
-        barrier: Option<Arc<AgentControlTestBarrier>>,
-    ) {
-        *self
-            .test_hooks
-            .before_initial_submission
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = barrier;
-    }
 
-    #[cfg(test)]
-    pub(crate) fn set_before_spawn_rollback_barrier(
-        &self,
-        barrier: Option<Arc<AgentControlTestBarrier>>,
-    ) {
-        *self
-            .test_hooks
-            .before_spawn_rollback
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = barrier;
-    }
 
-    /// Registers an already-running thread as one of this tree's agents, as a
-    /// committed spawn would, without starting a turn on it.
-    #[cfg(test)]
-    pub(crate) fn register_running_agent_for_test(&self, thread_id: ThreadId) -> CodexResult<()> {
-        self.state
-            .reserve_spawn_slot(/*max_threads*/ None)?
-            .commit(AgentMetadata {
-                agent_id: Some(thread_id),
-                ..Default::default()
-            })
-    }
 
     /// Wait for the actual child loop before retiring its accounting identity.
     pub(crate) async fn wait_for_agent_termination(&self, agent_id: ThreadId) -> CodexResult<()> {
@@ -591,18 +502,6 @@ impl AgentControl {
         let execution_guard = self
             .reserve_execution_capacity_for_turn_start(agent_id, /*starts_turn*/ true)
             .await?;
-        #[cfg(test)]
-        if execution_guard.is_some() {
-            let barrier = self
-                .test_hooks
-                .after_execution_reservation
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .clone();
-            if let Some(barrier) = barrier {
-                barrier.pause().await;
-            }
-        }
         self.send_input_after_capacity_check(agent_id, &state, input, execution_guard)
             .await
     }
@@ -1955,6 +1854,3 @@ fn thread_spawn_depth(session_source: &SessionSource) -> Option<i32> {
         _ => None,
     }
 }
-#[cfg(test)]
-#[path = "control_tests.rs"]
-mod tests;

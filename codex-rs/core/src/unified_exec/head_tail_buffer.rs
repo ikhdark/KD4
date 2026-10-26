@@ -68,14 +68,12 @@ impl HeadTailBuffer {
         }
     }
 
-    // Used for tests.
     #[allow(dead_code)]
     /// Total bytes currently retained by the buffer (head + tail).
     pub(crate) fn retained_bytes(&self) -> usize {
         self.head.len().saturating_add(self.tail.len())
     }
 
-    // Used for tests.
     #[allow(dead_code)]
     /// Total bytes that were dropped from the middle due to the size cap.
     pub(crate) fn omitted_bytes(&self) -> usize {
@@ -272,36 +270,8 @@ impl HeadTailBuffer {
         meaningful
     }
 
-    /// Snapshot the retained output as a list of chunks.
-    ///
-    /// The returned chunks are ordered as: head chunks first, then tail chunks.
-    /// Omitted bytes are not represented in the snapshot.
-    #[cfg(test)]
-    pub(crate) fn snapshot_chunks(&self) -> Vec<Vec<u8>> {
-        let mut out = Vec::with_capacity(2);
-        if !self.head.is_empty() {
-            out.push(self.head.clone());
-        }
-        if !self.tail.is_empty() {
-            out.push(self.tail.iter().copied().collect());
-        }
-        out
-    }
 
-    /// Return the retained output as a single byte vector.
-    ///
-    /// The output is formed by concatenating head chunks, then tail chunks.
-    /// Omitted bytes are not represented in the returned value.
-    #[cfg(test)]
-    pub(crate) fn to_bytes(&self) -> Vec<u8> {
-        self.to_bytes_with_markers(&[], &[])
-    }
 
-    /// Return retained output with an explicit marker at the head/tail seam.
-    #[cfg(test)]
-    pub(crate) fn to_bytes_with_omission_marker(&self, omission_marker: &[u8]) -> Vec<u8> {
-        self.to_bytes_with_markers(omission_marker, &[])
-    }
 
     /// Snapshot output, formatting a retention notice only when bytes were lost.
     /// Reserve space for an optional trailing loss notice in the same allocation.
@@ -334,35 +304,7 @@ impl HeadTailBuffer {
         out
     }
 
-    /// Drain all retained chunks from the buffer and reset its byte state.
-    ///
-    /// The drained chunks are returned in head-then-tail order. Omitted bytes
-    /// are discarded along with the retained content. Cumulative and pending
-    /// omission/lag accounting are preserved until the caller explicitly
-    /// consumes their pending counts.
-    #[cfg(test)]
-    pub(crate) fn drain_chunks(&mut self) -> Vec<Vec<u8>> {
-        self.drain_chunks_with_omission_marker(None)
-    }
 
-    /// Drain retained chunks with an optional marker at the head/tail seam.
-    #[cfg(test)]
-    pub(crate) fn drain_chunks_with_omission_marker(
-        &mut self,
-        omission_marker: Option<Vec<u8>>,
-    ) -> Vec<Vec<u8>> {
-        let mut out = Vec::with_capacity(3);
-        if !self.head.is_empty() {
-            out.push(std::mem::take(&mut self.head));
-        }
-        if let Some(marker) = omission_marker {
-            out.push(marker);
-        }
-        if !self.tail.is_empty() {
-            out.push(Vec::from(std::mem::take(&mut self.tail)));
-        }
-        out
-    }
 
     fn push_to_tail(&mut self, chunk: &[u8]) {
         if chunk.is_empty() {
@@ -403,6 +345,3 @@ impl HeadTailBuffer {
     }
 }
 
-#[cfg(test)]
-#[path = "head_tail_buffer_tests.rs"]
-mod tests;

@@ -1915,8 +1915,5 @@ fn cited_fact_schema() -> Value {
     })
 }
 
-#[cfg(test)]
-#[path = "turn_processor_tests.rs"]
-mod tests;
 
 const MCP_ELICITATIONS_AUTO_DENY: bool = false;

@@ -328,6 +328,3 @@ impl From<clatter::error::TransportError> for NoiseChannelError {
     }
 }
 
-#[cfg(test)]
-#[path = "noise_channel_tests.rs"]
-mod tests;

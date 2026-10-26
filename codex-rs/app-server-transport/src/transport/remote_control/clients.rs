@@ -14,8 +14,6 @@ use codex_app_server_protocol::RemoteControlClientsRevokeResponse;
 use codex_http_client::HttpClient;
 use codex_http_client::RouteAwareClientPool;
 use codex_login::AuthManager;
-#[cfg(test)]
-use codex_login::default_client::create_client_without_request_logging;
 use serde::Deserialize;
 use std::io;
 use std::io::ErrorKind;
@@ -69,16 +67,6 @@ struct ClientManagementResponse {
     body: Vec<u8>,
 }
 
-#[cfg(test)]
-pub(super) async fn list_remote_control_clients(
-    remote_control_url: &str,
-    auth_manager: &Arc<AuthManager>,
-    params: RemoteControlClientsListParams,
-) -> io::Result<RemoteControlClientsListResponse> {
-    validate_client_list_params(&params)?;
-    let client = create_client_without_request_logging()?;
-    list_remote_control_clients_with_client(&client, remote_control_url, auth_manager, params).await
-}
 
 pub(super) async fn list_remote_control_clients_with_client(
     client: &HttpClient,
@@ -158,17 +146,6 @@ fn validate_client_list_params(params: &RemoteControlClientsListParams) -> io::R
     Ok(())
 }
 
-#[cfg(test)]
-pub(super) async fn revoke_remote_control_client(
-    remote_control_url: &str,
-    auth_manager: &Arc<AuthManager>,
-    params: RemoteControlClientsRevokeParams,
-) -> io::Result<RemoteControlClientsRevokeResponse> {
-    validate_client_revoke_params(&params)?;
-    let client = create_client_without_request_logging()?;
-    revoke_remote_control_client_with_client(&client, remote_control_url, auth_manager, params)
-        .await
-}
 
 pub(super) async fn revoke_remote_control_client_with_client(
     client: &HttpClient,

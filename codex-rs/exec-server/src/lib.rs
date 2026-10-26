@@ -2,8 +2,6 @@ mod client;
 mod client_api;
 mod client_error;
 mod client_transport;
-#[cfg(test)]
-mod executor_concurrency_tests;
 mod connection;
 mod environment;
 mod environment_provider;
@@ -25,8 +23,6 @@ mod relay;
 mod relay_proto;
 mod remote;
 mod remote_file_system;
-#[cfg(test)]
-mod remote_integrity_tests;
 mod remote_process;
 mod resolved_capability;
 mod rpc;

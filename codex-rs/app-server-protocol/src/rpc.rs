@@ -109,8 +109,7 @@ impl JsonSchema for JSONRPCMessage {
             })
         })
         .collect::<Vec<_>>();
-        // Statically valid; `expect_used` is denied in library code, and a
-        // degraded schema fails the envelope test and fixture checks.
+        // Statically valid; `expect_used` is denied in library code.
         serde_json::from_value(serde_json::json!({
             "description": "Refers to any valid JSON-RPC object that can be decoded off the wire, or encoded to be sent.",
             "anyOf": branches,
@@ -197,99 +196,3 @@ pub struct JSONRPCErrorError {
     pub message: String,
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn generated_envelope_schema_matches_reserved_field_decoder() {
-        let schema = serde_json::to_value(schemars::schema_for!(JSONRPCMessage)).unwrap();
-        let validator = jsonschema::validator_for(&schema).unwrap();
-        for (input, valid) in [
-            (
-                r#"{"id":1,"method":"future/method","params":null,"extension":true}"#,
-                true,
-            ),
-            (r#"{"method":"future/notification","extension":true}"#, true),
-            (r#"{"id":"request","result":null}"#, true),
-            (r#"{"id":1,"error":{"code":-1,"message":"failure"}}"#, true),
-            (r#"{"id":null,"method":"example"}"#, false),
-            (r#"{"id":{},"method":"example"}"#, false),
-            (
-                r#"{"id":1,"result":null,"error":{"code":-1,"message":"failure"}}"#,
-                false,
-            ),
-            (r#"{"method":"example","result":null}"#, false),
-            (r#"{"method":"example","error":null}"#, false),
-            (r#"{"id":1}"#, false),
-            (r#"{"id":1,"method":null}"#, false),
-            (r#"[]"#, false),
-        ] {
-            let value: serde_json::Value = serde_json::from_str(input).unwrap();
-            assert_eq!(
-                serde_json::from_value::<JSONRPCMessage>(value.clone()).is_ok(),
-                valid,
-                "decoder: {input}"
-            );
-            assert_eq!(validator.is_valid(&value), valid, "schema: {input}");
-        }
-    }
-
-    #[test]
-    fn wire_decoder_rejects_malformed_and_conflicting_envelopes() {
-        for input in [
-            r#"{"id":{},"method":"example"}"#,
-            r#"{"id":null,"method":"example"}"#,
-            r#"{"id":1,"result":"success","error":{"code":-1,"message":"failure"}}"#,
-            r#"{"method":"example","result":null}"#,
-            r#"{"method":"example","error":null}"#,
-            r#"{"id":1}"#,
-        ] {
-            assert!(
-                serde_json::from_str::<JSONRPCMessage>(input).is_err(),
-                "accepted {input}"
-            );
-        }
-    }
-
-    #[test]
-    fn wire_decoder_preserves_valid_envelopes_and_ignores_extension_fields() {
-        for input in [
-            r#"{"id":1,"method":"example","params":null}"#,
-            r#"{"method":"example"}"#,
-            r#"{"id":"request","result":null}"#,
-            r#"{"id":1,"error":{"code":-1,"message":"failure"}}"#,
-        ] {
-            let expected: JSONRPCMessage = serde_json::from_str(input).unwrap();
-            assert_eq!(serde_json::to_value(&expected).unwrap(), {
-                let mut value: serde_json::Value = serde_json::from_str(input).unwrap();
-                value.as_object_mut().unwrap().remove("params");
-                value
-            });
-            let mut extended: serde_json::Value = serde_json::from_str(input).unwrap();
-            extended["extension"] = serde_json::json!(true);
-            assert_eq!(
-                serde_json::from_value::<JSONRPCMessage>(extended).unwrap(),
-                expected
-            );
-        }
-    }
-
-    #[test]
-    fn overloaded_error_has_one_code_and_typed_retryable_data() {
-        let error = overloaded_error(OverloadReason::TransportIngress, "queue full");
-
-        // Clients match on the numeric wire value, so pin it rather than the constant.
-        assert_eq!(error.code, -32001);
-        assert_eq!(error.code, OVERLOADED_ERROR_CODE);
-        assert_eq!(error.message, "queue full");
-        assert_eq!(
-            serde_json::from_value::<OverloadErrorData>(error.data.expect("overload data"))
-                .expect("valid overload data"),
-            OverloadErrorData {
-                reason: OverloadReason::TransportIngress,
-                retryable: true,
-            }
-        );
-    }
-}

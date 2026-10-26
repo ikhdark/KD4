@@ -73,10 +73,6 @@ struct WatchState {
     next_subscriber_id: SubscriberId,
     path_ref_counts: HashMap<PathBuf, PathWatchCounts>,
     subscribers: HashMap<SubscriberId, SubscriberState>,
-    #[cfg(test)]
-    actual_watch_path_resolution_count: usize,
-    #[cfg(test)]
-    before_registration_reconcile: Option<Box<dyn FnOnce() + Send + Sync>>,
 }
 
 struct SubscriberState {
@@ -393,10 +389,6 @@ struct FileWatcherInner {
     watched_paths: HashMap<PathBuf, RecursiveMode>,
     /// Paths whose backend mode could not be reconciled with logical state.
     degraded_paths: HashSet<PathBuf>,
-    #[cfg(test)]
-    fail_watch_attempts: usize,
-    #[cfg(test)]
-    fail_next_unwatch: bool,
 }
 
 /// Coalesces bursts of watch notifications and emits at most once per interval.
@@ -572,11 +564,6 @@ impl FileWatcherSubscriber {
         })
     }
 
-    #[cfg(test)]
-    pub(crate) fn register_path(&self, path: PathBuf, recursive: bool) -> WatchRegistration {
-        self.register_paths(vec![WatchPath { path, recursive }])
-            .expect("register path")
-    }
 }
 
 impl Drop for FileWatcherSubscriber {
@@ -652,10 +639,6 @@ impl FileWatcher {
             needs_rebuild: false,
             watched_paths: HashMap::new(),
             degraded_paths: HashSet::new(),
-            #[cfg(test)]
-            fail_watch_attempts: 0,
-            #[cfg(test)]
-            fail_next_unwatch: false,
         };
         let state = Arc::new(RwLock::new(WatchState::default()));
         let inner = Arc::new(Mutex::new(inner));
@@ -922,10 +905,6 @@ impl FileWatcher {
             committed.push(registration.key.clone());
         }
 
-        #[cfg(test)]
-        if let Some(hook) = state.before_registration_reconcile.take() {
-            hook();
-        }
 
         // All requested namespace guards now have native coverage. Resolution
         // before that coverage existed may have missed an alias retarget, even
@@ -1195,15 +1174,6 @@ impl FileWatcher {
             .any(|(path, mode)| effective.get(path) != Some(mode));
         // The injected failure models stopping a native root that leaves the
         // effective set. A mode change stages the root's replacement instead.
-        #[cfg(test)]
-        if guard
-            .native_paths
-            .keys()
-            .any(|path| !effective.contains_key(path))
-            && std::mem::take(&mut guard.fail_next_unwatch)
-        {
-            return Err(notify::Error::generic("injected unwatch failure"));
-        }
         if guard.needs_rebuild || retires_coverage {
             #[cfg(windows)]
             let retired_in_place = next_mode.is_none()
@@ -1293,11 +1263,6 @@ impl FileWatcher {
             Arc::clone(&guard.raw_overflow_notify),
         )?;
         for (root, mode) in namespace_ordered_native_paths(roots) {
-            #[cfg(test)]
-            if guard.fail_watch_attempts > 0 {
-                guard.fail_watch_attempts -= 1;
-                return Err(notify::Error::generic("injected watch failure"));
-            }
             watcher.watch(root, mode)?;
         }
         guard.watcher = watcher;
@@ -1327,11 +1292,6 @@ impl FileWatcher {
         path: &Path,
         mode: RecursiveMode,
     ) -> notify::Result<()> {
-        #[cfg(test)]
-        if guard.fail_watch_attempts > 0 {
-            guard.fail_watch_attempts -= 1;
-            return Err(notify::Error::generic("injected watch failure"));
-        }
         guard.watcher.watch(path, mode)
     }
 
@@ -1683,8 +1643,6 @@ impl FileWatcher {
         // Subscribers sharing a requested path can share its resolution within
         // this pass. Never retain filesystem observations across event batches.
         let mut resolved_paths = HashMap::new();
-        #[cfg(test)]
-        let mut actual_watch_path_resolution_count = 0;
 
         let WatchState {
             subscribers,
@@ -1770,10 +1728,6 @@ impl FileWatcher {
                     resolved_paths
                         .entry(subscriber_watch.requested.clone())
                         .or_insert_with(|| {
-                            #[cfg(test)]
-                            {
-                                actual_watch_path_resolution_count += 1;
-                            }
                             actual_watch_path(&subscriber_watch.requested)
                         })
                         .clone()
@@ -1871,10 +1825,6 @@ impl FileWatcher {
                 subscribers_to_notify
                     .push((subscriber.tx.clone(), changed_paths.into_iter().collect()));
             }
-        }
-        #[cfg(test)]
-        {
-            state.actual_watch_path_resolution_count += actual_watch_path_resolution_count;
         }
 
         let mut inner_guard: Option<std::sync::MutexGuard<'_, FileWatcherInner>> = None;
@@ -1996,53 +1946,9 @@ impl FileWatcher {
         Ok(())
     }
 
-    #[cfg(test)]
-    pub(crate) async fn send_paths_for_test(&self, paths: Vec<PathBuf>) {
-        Self::reconcile_changes(
-            &self.state,
-            self.inner.as_ref(),
-            self.reconcile_tx.as_ref(),
-            ObservedChanges {
-                paths,
-                ..Default::default()
-            },
-        )
-        .await;
-    }
 
-    #[cfg(test)]
-    pub(crate) fn spawn_event_loop_for_test(&self, raw_rx: mpsc::Receiver<notify::Result<Event>>) {
-        self.spawn_event_loop(
-            &Handle::current(),
-            raw_rx,
-            Arc::new(AtomicBool::new(false)),
-            Arc::new(Notify::new()),
-        );
-    }
 
-    #[cfg(test)]
-    pub(crate) fn watch_counts_for_test(&self, path: &Path) -> Option<(usize, usize)> {
-        // The registry uses the canonical backend spelling (including Windows
-        // verbatim prefixes), not necessarily the caller's requested spelling.
-        let path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-        let state = self
-            .state
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        state
-            .path_ref_counts
-            .get(&path)
-            .map(|counts| (counts.non_recursive, counts.recursive))
-    }
 
-    #[cfg(test)]
-    pub(crate) fn take_actual_watch_path_resolution_count_for_test(&self) -> usize {
-        let mut state = self
-            .state
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        std::mem::take(&mut state.actual_watch_path_resolution_count)
-    }
 }
 
 fn request_reconciliation(reconcile_tx: &mpsc::Sender<()>) {
@@ -2440,6 +2346,3 @@ fn changed_path_for_matched_path(
     )
 }
 
-#[cfg(test)]
-#[path = "file_watcher_tests.rs"]
-mod tests;

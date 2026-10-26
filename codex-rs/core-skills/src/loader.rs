@@ -1401,24 +1401,3 @@ fn extract_frontmatter(contents: &str) -> Option<String> {
 
     Some(frontmatter_lines.join("\n"))
 }
-#[cfg(test)]
-pub(crate) async fn skill_roots_from_layer_stack(
-    fs: Arc<dyn ExecutorFileSystem>,
-    config_layer_stack: &ConfigLayerStack,
-    cwd: &AbsolutePathBuf,
-    home_dir: Option<&AbsolutePathBuf>,
-) -> Vec<SkillRoot> {
-    skill_roots_with_home_dir(
-        Some(fs),
-        config_layer_stack,
-        cwd,
-        home_dir,
-        Vec::new(),
-        Vec::new(),
-    )
-    .await
-}
-
-#[cfg(test)]
-#[path = "loader_tests.rs"]
-mod tests;

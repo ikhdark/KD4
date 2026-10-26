@@ -81,6 +81,3 @@ impl WorldStateSection for PluginsInstructionsState {
     }
 }
 
-#[cfg(test)]
-#[path = "plugins_instructions_tests.rs"]
-mod tests;

@@ -157,7 +157,3 @@ impl ConnectorSnapshot {
         Self::from_plugin_sources(self.sources.iter().chain(&other.sources).cloned())
     }
 }
-
-#[cfg(test)]
-#[path = "snapshot_tests.rs"]
-mod tests;

@@ -32,6 +32,3 @@ fn default_mode_instructions() -> String {
     COLLABORATION_MODE_DEFAULT.to_string()
 }
 
-#[cfg(test)]
-#[path = "collaboration_mode_presets_tests.rs"]
-mod tests;

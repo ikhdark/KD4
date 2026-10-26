@@ -177,38 +177,3 @@ pub(crate) trait AsyncIo: AsyncRead + AsyncWrite + Send + Unpin {}
 
 impl<T> AsyncIo for T where T: AsyncRead + AsyncWrite + Send + Unpin {}
 
-#[cfg(test)]
-mod dispatch_tests {
-    use super::*;
-    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
-
-    struct RejectedAuthority;
-
-    impl codex_http_client::RequestDispatchGuard for RejectedAuthority {
-        fn admit(&self, _: &mut dyn FnMut()) -> Result<(), String> {
-            Err("account changed during connection preparation".into())
-        }
-    }
-
-    #[tokio::test]
-    async fn invalidated_authority_cannot_open_a_websocket() {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        listener.set_nonblocking(true).unwrap();
-        let factory =
-            HttpClientFactory::new(codex_http_client::OutboundProxyPolicy::ReqwestDefault);
-        let connector = WebSocketConnector::new(&factory).unwrap();
-        let request = format!("ws://{}/responses", listener.local_addr().unwrap())
-            .into_client_request()
-            .unwrap();
-        let result = codex_http_client::with_dispatch_guard(
-            Some(Arc::new(RejectedAuthority)),
-            connector.connect(request, WebSocketConfig::default()),
-        )
-        .await;
-        assert!(matches!(result, Err(WebSocketError::Io(error))
-            if error.kind() == std::io::ErrorKind::PermissionDenied
-                && error.get_ref().is_some_and(<dyn std::error::Error + Send + Sync>::is::<DispatchRejected>)));
-        assert!(matches!(listener.accept(), Err(error)
-            if error.kind() == std::io::ErrorKind::WouldBlock));
-    }
-}

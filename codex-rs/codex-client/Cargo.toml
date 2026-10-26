@@ -17,5 +17,3 @@ workspace = true
 doctest = false
 test = false
 
-[dev-dependencies]
-tokio = { workspace = true, features = ["macros", "rt", "test-util"] }

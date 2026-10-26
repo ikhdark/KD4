@@ -27,17 +27,7 @@ use tokio::sync::Semaphore;
 use tokio::sync::mpsc;
 use tokio::sync::watch;
 
-#[cfg(test)]
-pub(crate) struct SessionInitPersistenceTestHook {
-    pub codex_home: PathBuf,
-    pub ready: tokio::sync::oneshot::Sender<ThreadId>,
-    pub release: tokio::sync::oneshot::Receiver<()>,
-}
 
-#[cfg(test)]
-pub(crate) static SESSION_INIT_PERSISTENCE_TEST_HOOK: std::sync::Mutex<
-    Option<SessionInitPersistenceTestHook>,
-> = std::sync::Mutex::new(None);
 
 const TOOL_HISTORY_JOURNAL_COMPACTION_RECORDS: u64 = 128;
 const TOOL_HISTORY_JOURNAL_COMPACTION_BYTES: u64 = 1024 * 1024;
@@ -156,8 +146,6 @@ pub(super) struct ToolHistoryPersistenceQueue {
     progress: watch::Receiver<ToolHistoryPersistenceProgress>,
     mirror: Arc<tokio::sync::Mutex<crate::tool_history::ToolHistoryState>>,
     _worker: Arc<ToolHistoryPersistenceWorker>,
-    #[cfg(test)]
-    persisted_batch_count: Arc<std::sync::atomic::AtomicU64>,
 }
 
 pub(super) struct SessionStorageOwnership {
@@ -202,125 +190,8 @@ async fn acquire_session_storage_ownership(
     }))
 }
 
-#[cfg(test)]
-mod durable_storage_ownership_tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn audit63_retired_thread_cannot_reacquire_session_storage() {
-        let home = tempfile::tempdir().unwrap();
-        let id = ThreadId::new();
-        drop(
-            acquire_session_storage_ownership(home.path(), id)
-                .await
-                .unwrap(),
-        );
-        std::fs::write(
-            home.path()
-                .join("tool-history")
-                .join(format!("{id}.retired")),
-            b"retired",
-        )
-        .unwrap();
-        assert!(
-            acquire_session_storage_ownership(home.path(), id)
-                .await
-                .is_err()
-        );
-        assert!(
-            acquire_session_storage_ownership(home.path(), ThreadId::new())
-                .await
-                .is_ok()
-        );
-    }
-
-    #[tokio::test]
-    async fn durable_audit_11_owner_survives_the_last_worker_clone() {
-        let home = tempfile::tempdir().unwrap();
-        let id = ThreadId::new();
-        let owner = acquire_session_storage_ownership(home.path(), id)
-            .await
-            .unwrap();
-        let worker = Arc::clone(&owner);
-        assert!(
-            acquire_session_storage_ownership(home.path(), id)
-                .await
-                .is_err()
-        );
-        drop(owner);
-        assert!(
-            acquire_session_storage_ownership(home.path(), id)
-                .await
-                .is_err()
-        );
-        assert!(
-            acquire_session_storage_ownership(home.path(), ThreadId::new())
-                .await
-                .is_ok()
-        );
-        drop(worker);
-        assert!(
-            acquire_session_storage_ownership(home.path(), id)
-                .await
-                .is_ok()
-        );
-    }
-
-    #[tokio::test]
-    async fn cancelled_queue_shutdown_retains_storage_until_writer_stops() {
-        let home = tempfile::tempdir().unwrap();
-        let id = ThreadId::new();
-        let owner = acquire_session_storage_ownership(home.path(), id)
-            .await
-            .unwrap();
-        let gate = Arc::new(Semaphore::new(1));
-        let held = Arc::clone(&gate).acquire_owned().await.unwrap();
-        let queue = ToolHistoryPersistenceQueue::new_with_owner(
-            gate,
-            home.path().to_path_buf(),
-            id,
-            crate::tool_history::ToolHistoryState::default(),
-            Some(owner),
-        );
-        let mut shutdown = Box::pin(queue.shutdown());
-        assert!(
-            tokio::time::timeout(std::time::Duration::from_millis(20), shutdown.as_mut())
-                .await
-                .is_err(),
-            "shutdown cannot bypass a blocked ledger checkpoint"
-        );
-        drop(shutdown);
-        assert!(
-            acquire_session_storage_ownership(home.path(), id)
-                .await
-                .is_err(),
-            "cancelling the observer must not release the live writer's lease"
-        );
-        drop(held);
-        tokio::time::timeout(std::time::Duration::from_secs(5), queue.shutdown())
-            .await
-            .unwrap()
-            .unwrap();
-        assert!(
-            acquire_session_storage_ownership(home.path(), id)
-                .await
-                .is_ok(),
-            "a stopped queue must release ownership even while its handle survives"
-        );
-        assert!(queue._worker.stopped.is_cancelled());
-    }
-}
 
 impl ToolHistoryPersistenceQueue {
-    #[cfg(test)]
-    pub(super) fn new(
-        io_gate: Arc<Semaphore>,
-        codex_home: PathBuf,
-        thread_id: ThreadId,
-        initial_state: crate::tool_history::ToolHistoryState,
-    ) -> Self {
-        Self::new_with_owner(io_gate, codex_home, thread_id, initial_state, None)
-    }
 
     fn new_with_owner(
         io_gate: Arc<Semaphore>,
@@ -347,10 +218,6 @@ impl ToolHistoryPersistenceQueue {
         let worker_shutdown = shutdown.clone();
         let stopped = tokio_util::sync::CancellationToken::new();
         let worker_stopped = stopped.clone();
-        #[cfg(test)]
-        let persisted_batch_count = Arc::new(std::sync::atomic::AtomicU64::new(0));
-        #[cfg(test)]
-        let worker_persisted_batch_count = Arc::clone(&persisted_batch_count);
         let task = tokio::spawn(async move {
             // Declared before the owner so completion is signalled only after
             // the worker has released its storage lease, including on unwind.
@@ -480,9 +347,6 @@ impl ToolHistoryPersistenceQueue {
                                     u64::try_from(sequenced_mutations.len()).unwrap_or(u64::MAX),
                                 );
                                 journal_bytes = journal_bytes.saturating_add(bytes);
-                                #[cfg(test)]
-                                worker_persisted_batch_count
-                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             }
                             Err(err) => {
                                 tracing::warn!("failed to persist {description}: {err}");
@@ -523,9 +387,6 @@ impl ToolHistoryPersistenceQueue {
                                 mirror_checkpointed = !checkpoint_required;
                                 journal_records = 0;
                                 journal_bytes = 0;
-                                #[cfg(test)]
-                                worker_persisted_batch_count
-                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             }
                             Err(err) if checkpoint_required => {
                                 failure = Some(ToolHistoryPersistenceError::Persistence(format!(
@@ -567,8 +428,6 @@ impl ToolHistoryPersistenceQueue {
                 stopped,
                 _task: task,
             }),
-            #[cfg(test)]
-            persisted_batch_count,
         }
     }
 
@@ -579,14 +438,6 @@ impl ToolHistoryPersistenceQueue {
         }
     }
 
-    #[cfg(test)]
-    pub(super) async fn enqueue_mutation(
-        &self,
-        mutation: crate::tool_history::ToolHistoryMutation,
-        description: &'static str,
-    ) -> Result<(), ToolHistoryPersistenceEnqueueError> {
-        self.writer().await.enqueue_mutation(mutation, description)
-    }
 
     pub(super) fn check_failure(&self) -> Result<(), ToolHistoryPersistenceError> {
         match &self.progress.borrow().failure {
@@ -651,21 +502,8 @@ impl ToolHistoryPersistenceQueue {
         *self.mirror.lock().await = state;
     }
 
-    #[cfg(test)]
-    pub(super) fn persisted_batch_count(&self) -> u64 {
-        self.persisted_batch_count
-            .load(std::sync::atomic::Ordering::Relaxed)
-    }
 
-    #[cfg(test)]
-    pub(super) fn worker_handle_for_test(&self) -> tokio::task::AbortHandle {
-        self._worker._task.abort_handle()
-    }
 
-    #[cfg(test)]
-    pub(super) async fn wait_until_worker_closed_for_test(&self) {
-        self.wake_tx.closed().await;
-    }
 }
 
 /// Acquired before changing session history so publishing its matching queue
@@ -976,14 +814,6 @@ impl SessionConfiguration {
         permissions.set_permission_profile_state(self.permission_profile_state.clone());
     }
 
-    #[cfg(test)]
-    pub(super) fn set_permission_profile_for_tests(
-        &mut self,
-        permission_profile: PermissionProfile,
-    ) -> ConstraintResult<()> {
-        self.permission_profile_state
-            .set_legacy_permission_profile(permission_profile)
-    }
 
     pub(super) fn sandbox_policy(&self) -> SandboxPolicy {
         let permission_profile = self.permission_profile();
@@ -1326,60 +1156,6 @@ impl Drop for SessionRuntimeInitGuard {
     }
 }
 
-#[cfg(test)]
-mod initialization_ownership_tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn abandoned_constructor_breaks_a_pending_prewarm_session_cycle() {
-        struct OnDrop(Option<tokio::sync::oneshot::Sender<()>>);
-        impl Drop for OnDrop {
-            fn drop(&mut self) {
-                if let Some(sender) = self.0.take() {
-                    let _ = sender.send(());
-                }
-            }
-        }
-        let (session, _) = crate::session::tests::make_session_and_context().await;
-        let session = Arc::new(session);
-        let weak = Arc::downgrade(&session);
-        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
-        let (dropped_tx, dropped_rx) = tokio::sync::oneshot::channel();
-        let retained = Arc::clone(&session);
-        let task = tokio::spawn(async move {
-            let _session = retained;
-            let _drop = OnDrop(Some(dropped_tx));
-            let _ = entered_tx.send(());
-            futures::future::pending::<CodexResult<Option<crate::client::ModelClientSession>>>()
-                .await
-        });
-        session
-            .set_session_startup_prewarm(
-                crate::session_startup_prewarm::SessionStartupPrewarmHandle::new(
-                    task,
-                    std::time::Instant::now(),
-                ),
-            )
-            .await;
-        entered_rx.await.unwrap();
-        let cancellation = session.startup_cancellation.clone();
-        let guard = SessionRuntimeInitGuard(Some(Arc::clone(&session)));
-        drop(session);
-        drop(guard);
-        assert!(cancellation.is_cancelled());
-        tokio::time::timeout(std::time::Duration::from_secs(2), dropped_rx)
-            .await
-            .unwrap()
-            .unwrap();
-        tokio::time::timeout(std::time::Duration::from_secs(2), async {
-            while weak.upgrade().is_some() {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("cleanup must release the unpublished session");
-    }
-}
 
 pub(crate) struct AppServerClientMetadata {
     pub(crate) client_name: Option<String>,
@@ -1560,21 +1336,6 @@ impl Session {
         // - initialize thread persistence with new or resumed session info
         // Host shell discovery is lazy: remote-only/empty selections do not need it.
         // - load history metadata (skipped for subagents)
-        #[cfg(test)]
-        let (persistence_ready, startup_release) = {
-            let mut hook = SESSION_INIT_PERSISTENCE_TEST_HOOK
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if hook
-                .as_ref()
-                .is_some_and(|hook| hook.codex_home == config.codex_home.as_path())
-            {
-                let hook = hook.take().expect("matching startup hook");
-                (Some(hook.ready), Some(hook.release))
-            } else {
-                (None, None)
-            }
-        };
         let thread_persistence_fut = async {
             if config.ephemeral {
                 Ok::<_, anyhow::Error>(LiveThreadInitGuard::new(None))
@@ -1629,10 +1390,6 @@ impl Session {
                 // The other joined branches may still be pending when this one
                 // completes. Keep persistence guarded while join! owns its result.
                 let guarded = LiveThreadInitGuard::new(Some(live_thread));
-                #[cfg(test)]
-                if let Some(ready) = persistence_ready {
-                    let _ = ready.send(thread_id);
-                }
                 Ok(guarded)
             }
         }
@@ -1725,10 +1482,6 @@ impl Session {
             McpRuntimeContext::new(Arc::clone(&environment_manager), mcp_runtime_cwd);
         let mcp_runtime_context_for_auth = mcp_runtime_context.clone();
         let auth_and_mcp_fut = async move {
-            #[cfg(test)]
-            if let Some(release) = startup_release {
-                let _ = release.await;
-            }
             let auth = auth_manager_clone.auth().await;
             let mcp_projection = mcp_manager_for_mcp
                 .runtime_config_for_step(

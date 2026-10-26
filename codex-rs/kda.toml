@@ -5,9 +5,9 @@
 # Diagnose: cargo kda op --root . --json '{"op":"gate","execute_workspace":true}'
 # Review: cargo kda op --root . --json '{"op":"review","base":"HEAD"}'
 # Follow returned next_calls and artifact IDs for retained evidence, witnesses,
-# consumers, unknown boundaries, and focused test plans before making repairs.
+# consumers, unknown boundaries, and authorized evidence plans before making repairs.
 # Apply only reviewed, revision-matching edits. Verify the observable behavior
-# with focused tests, then rerun only checks invalidated by the changes.
+# with permitted owning-path evidence, then rerun only authorized checks invalidated by the changes.
 # A partial report or an unresolved obligation is not a clean gate or repair
 # authority. Preserve existing user edits; never activate Desktop as a side effect.
 version = 1

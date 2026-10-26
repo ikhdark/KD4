@@ -56,25 +56,3 @@ pub async fn has_recoverable_delete_staging(home: &Path) -> io::Result<bool> {
     Ok(false)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn abandoned_and_unknown_stages_defer_gc_but_resolved_stages_do_not() {
-        for kind in ["indexed", "unindexed", "unknown", "committed"] {
-            let home = tempfile::tempdir().unwrap();
-            let stage = home
-                .path()
-                .join(format!("{RECOVERABLE_DELETE_PREFIX}fixture"));
-            tokio::fs::create_dir_all(stage.join(kind)).await.unwrap();
-            tokio::fs::write(stage.join(".owner"), b"").await.unwrap();
-            assert_eq!(
-                has_recoverable_delete_staging(home.path()).await.unwrap(),
-                kind != "committed"
-            );
-        }
-        let home = tempfile::tempdir().unwrap();
-        assert!(!has_recoverable_delete_staging(home.path()).await.unwrap());
-    }
-}

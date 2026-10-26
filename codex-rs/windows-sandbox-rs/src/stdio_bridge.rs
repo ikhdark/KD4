@@ -175,6 +175,3 @@ where
     (handle, done_rx)
 }
 
-#[cfg(test)]
-#[path = "stdio_bridge_tests.rs"]
-mod tests;

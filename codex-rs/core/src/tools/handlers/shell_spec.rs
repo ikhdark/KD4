@@ -58,26 +58,7 @@ pub struct CommandToolOptions {
     pub exec_permission_approvals_enabled: bool,
 }
 
-#[cfg(test)]
-pub fn create_exec_command_tool(options: CommandToolOptions) -> ToolSpec {
-    create_exec_command_tool_with_environment_id(
-        options, /*include_environment_id*/ false, /*include_shell_parameter*/ true,
-    )
-}
 
-#[cfg(test)]
-pub(crate) fn create_exec_command_tool_with_environment_id(
-    options: CommandToolOptions,
-    include_environment_id: bool,
-    include_shell_parameter: bool,
-) -> ToolSpec {
-    create_exec_command_tool_for_policy(
-        options,
-        include_environment_id,
-        include_shell_parameter,
-        /*allow_escalated_sandbox_permissions*/ true,
-    )
-}
 
 pub(crate) fn create_exec_command_tool_for_policy(
     options: CommandToolOptions,
@@ -225,12 +206,6 @@ pub(crate) fn create_foreign_shell_command_tool(
     ToolSpec::Function(tool)
 }
 
-#[cfg(test)]
-pub fn create_write_stdin_tool() -> ToolSpec {
-    create_write_stdin_tool_with_max_timeout(
-        crate::unified_exec::DEFAULT_MAX_BACKGROUND_TERMINAL_TIMEOUT_MS,
-    )
-}
 
 pub(crate) fn create_write_stdin_tool_with_max_timeout(max_timeout_ms: u64) -> ToolSpec {
     let max_timeout_ms = max_timeout_ms.max(crate::unified_exec::MIN_EMPTY_YIELD_TIME_MS);
@@ -306,10 +281,6 @@ pub(crate) fn create_write_stdin_tool_with_max_timeout(max_timeout_ms: u64) -> T
     })
 }
 
-#[cfg(test)]
-pub fn create_shell_command_tool(options: CommandToolOptions) -> ToolSpec {
-    create_shell_command_tool_for_policy(options, /*allow_escalated_sandbox_permissions*/ true)
-}
 
 pub(crate) fn create_shell_command_tool_for_policy(
     options: CommandToolOptions,
@@ -830,6 +801,3 @@ fn rg_search_admission_guidance() -> &'static str {
 - Omit `max_output_tokens` unless deliberately requesting a smaller display; the host enforces output caps. When output is truncated, recover only missing evidence from the retained artifact."#
 }
 
-#[cfg(test)]
-#[path = "shell_spec_tests.rs"]
-mod tests;

@@ -1,24 +1,28 @@
 # Repository scripts
 
-Keep executable paths small. Validation/test wrappers must save wall-clock time;
-policy gates, receipts, evidence ledgers, static oracles and audit inventories do
-not belong here.
+Keep executable paths small. Build wrappers must save wall-clock time; policy
+gates, receipts, evidence ledgers, static oracles and audit inventories do not
+belong here.
 
 - `build/`: warm Cargo lane reuse, shared sccache/linker setup, bounded process
   execution and the opt-in LTO wall-clock benchmark. Lane commands execute once;
-  they do not publish validation receipts or enforce test-selection policy.
+  they do not publish validation receipts or enforce command-selection policy.
 - `maintenance/`: parallel formatting with explicit language/package selection.
 - `install/`: install and publish the CLI, Code Mode host and sandbox helpers.
 - `codex_package/`: construct and stage distributable packages.
 - `common/`: shared file locking, atomic writes and process-tree cleanup.
 
-Run Cargo directly from `codex-rs`, or use `just test-fast`,
-`just test-lane-package <package>` and `just cargo-lane <lane> ...` to reuse
-bounded warm build directories. Build any helper binaries required by the selected
-tests explicitly. Named target/gate runners and automatic consumer expansion
-have been removed.
+Run Cargo directly from `codex-rs`, or use
+`just cargo-lane <lane> cargo <command> ...` to reuse bounded warm build
+directories. Repository test suites, test-only support files, and named test and
+coverage recipes have been removed. Generic Cargo tooling still accepts
+caller-selected commands without supplying a repository test suite.
+
+The opt-in LTO runtime benchmark generates a disposable coding workload and its
+behavior oracle outside the repository source tree. That benchmark input is not
+a retained repository test suite; see `build/lto-runtime-benchmark.md`.
 
 Formatting remains opt-in: `just fmt` selects Just and Rust;
 `just fmt-full` runs the independent formatters in parallel.
-The Python project retains only formatting and archive dependencies.
+The `scripts/` Python project retains only formatting and archive dependencies.
 Saved-session analysis belongs in KDR, not compatibility shims in this tree.

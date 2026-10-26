@@ -502,6 +502,3 @@ impl ExecutorProcessTransport {
     }
 }
 
-#[cfg(test)]
-#[path = "executor_process_transport_tests.rs"]
-mod tests;

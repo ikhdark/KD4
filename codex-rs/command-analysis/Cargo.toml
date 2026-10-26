@@ -10,10 +10,6 @@ doctest = false
 [lints]
 workspace = true
 
-[features]
-# Exposes test-only helpers and instrumentation counters to codex-core's tests.
-test-support = []
-
 [dependencies]
 anyhow = { workspace = true }
 base64 = { workspace = true }
@@ -36,8 +32,3 @@ tokio-util = { workspace = true }
 toml = { workspace = true }
 walkdir = { workspace = true }
 
-[dev-dependencies]
-futures = { workspace = true }
-pretty_assertions = { workspace = true }
-tempfile = { workspace = true }
-tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }

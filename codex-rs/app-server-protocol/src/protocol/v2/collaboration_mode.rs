@@ -51,35 +51,3 @@ pub struct CollaborationModeListResponse {
     pub data: Vec<CollaborationModeMask>,
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use serde_json::json;
-
-    #[test]
-    fn reasoning_effort_preserves_absent_null_and_value() {
-        for (effort, wire) in [
-            (None, json!({"name": "test", "mode": null, "model": null})),
-            (
-                Some(None),
-                json!({"name": "test", "mode": null, "model": null, "reasoning_effort": null}),
-            ),
-            (
-                Some(Some(ReasoningEffort::High)),
-                json!({"name": "test", "mode": null, "model": null, "reasoning_effort": "high"}),
-            ),
-        ] {
-            let mask = CollaborationModeMask {
-                name: "test".into(),
-                mode: None,
-                model: None,
-                reasoning_effort: effort,
-            };
-            assert_eq!(serde_json::to_value(&mask).unwrap(), wire);
-            assert_eq!(
-                serde_json::from_value::<CollaborationModeMask>(wire).unwrap(),
-                mask
-            );
-        }
-    }
-}

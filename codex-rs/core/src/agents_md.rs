@@ -297,40 +297,6 @@ enum RetainedUtf8Boundary {
     ValidSplit(usize),
 }
 
-/// Loads project AGENTS.md content and combines it with host-provided user
-/// instructions.
-#[cfg(test)]
-pub(crate) async fn load_project_instructions(
-    config: &Config,
-    user_instructions: Option<UserInstructions>,
-    environments: &TurnEnvironmentSnapshot,
-) -> ProjectInstructionsLoad {
-    let project_root_markers = effective_project_root_markers(config);
-    load_project_instructions_with_markers(
-        config,
-        user_instructions,
-        environments,
-        &project_root_markers,
-    )
-    .await
-}
-
-#[cfg(test)]
-pub(crate) async fn load_project_instructions_with_markers(
-    config: &Config,
-    user_instructions: Option<UserInstructions>,
-    environments: &TurnEnvironmentSnapshot,
-    project_root_markers: &[String],
-) -> ProjectInstructionsLoad {
-    let discovery = discover_project_instructions_with_markers(
-        Arc::new(config.clone()),
-        environments,
-        project_root_markers,
-    )
-    .await;
-    load_project_instructions_from_discovery(config, user_instructions, discovery, None).await
-}
-
 pub(crate) async fn discover_project_instructions_with_markers(
     config: Arc<Config>,
     environments: &TurnEnvironmentSnapshot,
@@ -385,23 +351,6 @@ pub(crate) async fn discover_project_instructions_with_markers(
         environment_labels_required,
         complete,
     }
-}
-
-#[cfg(test)]
-pub(crate) async fn load_project_instructions_from_discovery(
-    config: &Config,
-    user_instructions: Option<UserInstructions>,
-    discovery: ProjectInstructionsDiscovery,
-    omission_recovery: Option<&ProjectDocOmissionRecovery>,
-) -> ProjectInstructionsLoad {
-    load_project_instructions_with_fallback(
-        config,
-        user_instructions,
-        discovery,
-        omission_recovery,
-        None,
-    )
-    .await
 }
 
 pub(crate) async fn load_project_instructions_with_fallback(
@@ -617,71 +566,6 @@ fn retain_failed_environment(
         }
     }
     retained
-}
-
-/// Attempt to locate and load AGENTS.md documentation.
-///
-/// On success returns `Ok(Some(loaded))` where `loaded` contains every
-/// discovered doc. If no documentation file is found the function returns
-/// `Ok(None)`. Unexpected I/O failures bubble up as `Err` so callers can
-/// decide how to handle them.
-#[cfg(test)]
-async fn read_agents_md(
-    config: &Config,
-    fs: &dyn ExecutorFileSystem,
-    environment_id: &str,
-    cwd: &PathUri,
-) -> io::Result<Option<LoadedAgentsMd>> {
-    let max_total = config.project_doc_max_bytes;
-
-    if max_total == 0 {
-        return Ok(None);
-    }
-
-    let paths = agents_md_paths(config, cwd, fs, /*reuse_project_discovery*/ false).await?;
-    Ok(
-        read_discovered_agents_md(fs, environment_id, cwd, paths, max_total)
-            .await?
-            .loaded,
-    )
-}
-
-#[cfg(test)]
-async fn read_discovered_agents_md(
-    fs: &dyn ExecutorFileSystem,
-    environment_id: &str,
-    cwd: &PathUri,
-    paths: Vec<ProjectDocCandidate>,
-    max_total: usize,
-) -> io::Result<EnvironmentProjectInstructions> {
-    let (project_docs, failed_sources) =
-        read_discovered_project_docs(fs, paths, max_total, None).await;
-    if !failed_sources.is_empty() {
-        return Err(io::Error::other("instruction source read failed"));
-    }
-    let rendered_max = project_doc_rendered_max_bytes(max_total);
-    let aggregate_reserve = rendered_max.min(PROJECT_DOC_AGGREGATE_NOTICE_RESERVE_BYTES);
-    let mut rendered = render_project_docs(
-        environment_id,
-        cwd,
-        project_docs,
-        rendered_max.saturating_sub(aggregate_reserve),
-    );
-    if !rendered.omitted_documents.is_empty() {
-        let notice = aggregate_project_doc_omission_notice(&rendered.omitted_documents);
-        debug_assert!(
-            ContextUserInstructions::escaped_text_len(&notice).saturating_add(2)
-                <= aggregate_reserve
-        );
-        let mut loaded = rendered.loaded.take().unwrap_or_default();
-        loaded.entries.push(InstructionEntry {
-            contents: notice,
-            provenance: InstructionProvenance::Internal,
-        });
-        rendered.loaded = Some(loaded);
-        rendered.rendered_bytes = rendered.rendered_bytes.saturating_add(aggregate_reserve);
-    }
-    Ok(rendered)
 }
 
 async fn read_discovered_project_docs(
@@ -1131,26 +1015,6 @@ fn project_doc_truncation_notice(
     )
 }
 
-/// Discovers AGENTS.md files from the project root to the current working
-/// directory, inclusive. Symlinks are allowed.
-#[cfg(test)]
-async fn agents_md_paths(
-    config: &Config,
-    cwd: &PathUri,
-    fs: &dyn ExecutorFileSystem,
-    reuse_project_discovery: bool,
-) -> io::Result<Vec<ProjectDocCandidate>> {
-    let project_root_markers = effective_project_root_markers(config);
-    agents_md_paths_with_markers(
-        config,
-        cwd,
-        fs,
-        reuse_project_discovery,
-        &project_root_markers,
-    )
-    .await
-}
-
 async fn agents_md_paths_with_markers(
     config: &Config,
     cwd: &PathUri,
@@ -1166,26 +1030,6 @@ async fn agents_md_paths_with_markers(
         reuse_project_discovery,
         project_root_markers,
         metrics.as_ref(),
-    )
-    .await
-}
-
-#[cfg(test)]
-async fn agents_md_paths_with_metrics(
-    config: &Config,
-    cwd: &PathUri,
-    fs: &dyn ExecutorFileSystem,
-    reuse_project_discovery: bool,
-    metrics: Option<&MetricsClient>,
-) -> io::Result<Vec<ProjectDocCandidate>> {
-    let project_root_markers = effective_project_root_markers(config);
-    agents_md_paths_with_metrics_and_markers(
-        config,
-        cwd,
-        fs,
-        reuse_project_discovery,
-        &project_root_markers,
-        metrics,
     )
     .await
 }
@@ -1548,25 +1392,6 @@ impl LoadedAgentsMd {
         }
     }
 
-    /// Creates source-less user instructions for tests.
-    ///
-    /// This cannot be gated with `#[cfg(test)]` because integration tests
-    /// compile `codex-core` as a normal dependency without that configuration.
-    pub fn from_text_for_testing(contents: impl Into<String>) -> Self {
-        let contents = contents.into();
-        if contents.trim().is_empty() {
-            return Self::default();
-        }
-        Self {
-            environment_labels_required: false,
-            user_instructions: None,
-            entries: vec![InstructionEntry {
-                contents,
-                provenance: InstructionProvenance::Internal,
-            }],
-        }
-    }
-
     fn is_empty(&self) -> bool {
         self.user_instructions.is_none()
             && self
@@ -1596,12 +1421,6 @@ impl LoadedAgentsMd {
             }
         }
         loaded
-    }
-
-    /// Stable digest of the exact model-visible instruction text.
-    #[cfg(test)]
-    pub(crate) fn semantic_digest(&self) -> [u8; 32] {
-        Sha256::digest(self.text().as_bytes()).into()
     }
 
     /// Versioned identity for repository instructions used by model-input
@@ -1689,11 +1508,6 @@ impl LoadedAgentsMd {
         }
     }
 
-    #[cfg(test)]
-    fn legacy_text(&self) -> String {
-        self.render_legacy_text().text
-    }
-
     fn render_legacy_text(&self) -> RenderedStableContext {
         let mut output = StableContextRenderer::new(self.entries.len());
         let mut has_previous = false;
@@ -1727,11 +1541,6 @@ impl LoadedAgentsMd {
             previous_was_project = is_project;
         }
         output.finish()
-    }
-
-    #[cfg(test)]
-    fn environment_labeled_text(&self) -> String {
-        self.render_environment_labeled_text().text
     }
 
     fn render_environment_labeled_text(&self) -> RenderedStableContext {
@@ -1778,11 +1587,6 @@ impl LoadedAgentsMd {
             has_previous = true;
         }
         output.finish()
-    }
-
-    #[cfg(test)]
-    pub(crate) fn contextual_user_fragment(&self) -> ContextUserInstructions {
-        self.contextual_user_fragment_with_text(self.text())
     }
 
     pub(crate) fn contextual_user_fragment_with_text(
@@ -1872,7 +1676,3 @@ impl InstructionProvenance {
         }
     }
 }
-
-#[cfg(test)]
-#[path = "agents_md_tests.rs"]
-mod tests;

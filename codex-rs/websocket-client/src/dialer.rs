@@ -321,6 +321,3 @@ fn take_next_address(addresses: &mut VecDeque<SocketAddr>) -> io::Result<SocketA
         .ok_or_else(|| io::Error::other("connection address queue unexpectedly empty"))
 }
 
-#[cfg(test)]
-#[path = "dialer_tests.rs"]
-mod tests;

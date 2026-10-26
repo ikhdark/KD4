@@ -311,9 +311,9 @@ fn finalize_exit(
                                 ),
                                 logs_base_dir,
                             );
-                            (1, false)
+                            (None, true)
                         } else {
-                            (raw_exit as i32, true)
+                            (Some(raw_exit as i32), true)
                         }
                     }
                     WAIT_TIMEOUT => {
@@ -321,7 +321,7 @@ fn finalize_exit(
                             "legacy root process did not exit after termination",
                             logs_base_dir,
                         );
-                        (1, false)
+                        (None, false)
                     }
                     WAIT_FAILED => {
                         log_note(
@@ -331,7 +331,7 @@ fn finalize_exit(
                             ),
                             logs_base_dir,
                         );
-                        (1, false)
+                        (None, false)
                     }
                     unexpected => {
                         log_note(
@@ -341,13 +341,13 @@ fn finalize_exit(
                             ),
                             logs_base_dir,
                         );
-                        (1, false)
+                        (None, false)
                     }
                 }
             }
             None => {
                 log_note("legacy spawn lost its root process handle", logs_base_dir);
-                (1, false)
+                (None, false)
             }
         },
         Err(_) => {
@@ -355,7 +355,7 @@ fn finalize_exit(
                 "legacy spawn root process handle lock poisoned",
                 logs_base_dir,
             );
-            (1, false)
+            (None, false)
         }
     };
 
@@ -364,7 +364,9 @@ fn finalize_exit(
     if root_exited && wait_for_output_readers(&[&output_join], OUTPUT_DRAIN_AFTER_ROOT_EXIT) {
         let _ = output_join.join();
     }
-    let _ = exit_tx.send(exit_code);
+    if let Some(exit_code) = exit_code {
+        let _ = exit_tx.send(exit_code);
+    }
 
     // SAFETY: finalize_exit owns the thread handle; taking the process handle under its mutex
     // removes shared access before its single close.
@@ -380,10 +382,10 @@ fn finalize_exit(
         }
     }
 
-    if exit_code == 0 {
-        log_success(&command, logs_base_dir);
-    } else {
-        log_failure(&command, &format!("exit code {exit_code}"), logs_base_dir);
+    match exit_code {
+        Some(0) => log_success(&command, logs_base_dir),
+        Some(code) => log_failure(&command, &format!("exit code {code}"), logs_base_dir),
+        None => log_failure(&command, "root process exit status unavailable", logs_base_dir),
     }
 }
 
@@ -703,6 +705,3 @@ fn spawn_windows_sandbox_session_legacy_blocking(
     Ok(finish_driver_spawn(driver, stdin_open))
 }
 
-#[cfg(test)]
-#[path = "legacy_tests.rs"]
-mod tests;

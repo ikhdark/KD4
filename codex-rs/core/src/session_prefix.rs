@@ -9,7 +9,6 @@ use codex_utils_output_truncation::truncate_text;
 use sha2::Digest;
 use sha2::Sha256;
 
-use crate::context::ContextualUserFragment;
 use crate::context::InterAgentCompletionMessage;
 use crate::context::SubagentNotification;
 
@@ -56,27 +55,6 @@ fn format_bounded_subagent_error_notification(agent_reference: &str, error: &str
     }
 }
 
-/// Runtime error completions are idempotent within a producer attempt. Reuse
-/// mailbox admission's bounded, resume-seeded ID deduplication before history
-/// insertion. Ordinary messages and successful answers remain distinct.
-#[cfg(test)]
-pub(crate) fn inter_agent_completion_communication(
-    task_name: AgentPath,
-    sender: AgentPath,
-    sender_thread_id: ThreadId,
-    status: &AgentStatus,
-    receipt: Option<&str>,
-) -> Option<InterAgentCommunication> {
-    inter_agent_completion_communication_with_diagnostics(
-        task_name,
-        sender,
-        sender_thread_id,
-        status,
-        receipt,
-        None,
-    )
-}
-
 pub(crate) fn inter_agent_completion_communication_with_diagnostics(
     task_name: AgentPath,
     sender: AgentPath,
@@ -114,16 +92,6 @@ pub(crate) fn inter_agent_completion_communication_with_diagnostics(
         )));
     }
     Some(communication)
-}
-
-#[cfg(test)]
-pub(crate) fn format_inter_agent_completion_message(
-    task_name: AgentPath,
-    sender: AgentPath,
-    status: &AgentStatus,
-    receipt: Option<&str>,
-) -> Option<String> {
-    format_inter_agent_completion_message_with_diagnostics(task_name, sender, status, receipt, None)
 }
 
 fn format_inter_agent_completion_message_with_diagnostics(
@@ -290,10 +258,6 @@ fn format_bounded_inter_agent_completion_message(
         payload_budget = next_budget.min(payload_budget.saturating_sub(1));
     }
 }
-
-#[cfg(test)]
-#[path = "session_prefix_tests.rs"]
-mod tests;
 
 pub(crate) fn format_subagent_context_line(
     agent_reference: &str,

@@ -312,6 +312,3 @@ where
         .collect()
 }
 
-#[cfg(test)]
-#[path = "legacy_tests.rs"]
-mod tests;

@@ -11,7 +11,6 @@ path = "src/main.rs"
 [lib]
 name = "codex_stdio_to_uds"
 path = "src/lib.rs"
-test = true
 doctest = false
 
 [lints]
@@ -27,8 +26,3 @@ tokio = { workspace = true, features = [
     "rt-multi-thread",
     "time",
 ] }
-
-[dev-dependencies]
-codex-utils-cargo-bin = { workspace = true }
-pretty_assertions = { workspace = true }
-tempfile = { workspace = true }

@@ -283,10 +283,6 @@ pub(super) struct RolloutReconstruction {
     pub(super) window_id: Option<Uuid>,
 }
 
-#[cfg(test)]
-pub(super) fn append_unified_exec_resume_invalidation(history: &mut Vec<ResponseItem>) {
-    append_unified_exec_resume_invalidation_with_rollout(history, &[]);
-}
 
 pub(super) fn append_unified_exec_resume_invalidation_with_rollout(
     history: &mut Vec<ResponseItem>,

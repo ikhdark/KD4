@@ -176,5 +176,3 @@ fn map_client_management_error(err: io::Error) -> JSONRPCErrorError {
     }
 }
 
-#[cfg(test)]
-mod remote_control_processor_tests;

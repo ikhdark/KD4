@@ -189,6 +189,3 @@ fn resolve_provider_auth_program(command: &str, cwd: &Path) -> io::Result<PathBu
     Ok(PathBuf::from(command))
 }
 
-#[cfg(test)]
-#[path = "external_bearer_tests.rs"]
-mod tests;

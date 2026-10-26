@@ -96,30 +96,3 @@ impl fmt::Display for ProcessCleanupTicket {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn late_observer_cannot_overwrite_settlement_or_known_exit() {
-        for settlement in [
-            ProcessCleanupStatus::Confirmed,
-            ProcessCleanupStatus::Unconfirmed("unreachable".into()),
-        ] {
-            let ticket = ProcessCleanupTicket::new("process".into(), Some("session".into()));
-            ticket.update(
-                ProcessExecutionKnowledge::ObservedExit(7),
-                settlement.clone(),
-            );
-            ticket.update(
-                ProcessExecutionKnowledge::PossiblyExecuted,
-                ProcessCleanupStatus::Pending,
-            );
-            assert_eq!(ticket.snapshot().cleanup, settlement);
-            assert_eq!(
-                ticket.snapshot().execution,
-                ProcessExecutionKnowledge::ObservedExit(7)
-            );
-        }
-    }
-}

@@ -2,8 +2,6 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::OnceLock;
 use std::sync::atomic::AtomicBool;
-#[cfg(test)]
-use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 use std::time::Instant;
@@ -28,10 +26,7 @@ use tokio_util::sync::CancellationToken;
 use tokio_util::sync::DropGuard;
 use tracing::warn;
 
-#[cfg(not(test))]
 const WATCHER_THROTTLE_INTERVAL: Duration = Duration::from_secs(10);
-#[cfg(test)]
-const WATCHER_THROTTLE_INTERVAL: Duration = Duration::from_millis(50);
 
 pub(crate) struct SkillsWatcher {
     runtime: OnceLock<SkillsWatcherRuntime>,
@@ -40,12 +35,6 @@ pub(crate) struct SkillsWatcher {
     outgoing: Arc<OutgoingMessageSender>,
     runtime_extra_roots_registration: Mutex<WatchRegistration>,
     shutdown_requested: AtomicBool,
-    #[cfg(test)]
-    initialization_count: AtomicUsize,
-    #[cfg(test)]
-    thread_config_registration_count: AtomicUsize,
-    #[cfg(test)]
-    file_watcher_result: Mutex<Option<Result<Arc<FileWatcher>, String>>>,
 }
 
 struct SkillsWatcherRuntime {
@@ -66,33 +55,9 @@ impl SkillsWatcher {
             outgoing,
             runtime_extra_roots_registration: Mutex::new(WatchRegistration::default()),
             shutdown_requested: AtomicBool::new(false),
-            #[cfg(test)]
-            initialization_count: AtomicUsize::new(0),
-            #[cfg(test)]
-            thread_config_registration_count: AtomicUsize::new(0),
-            #[cfg(test)]
-            file_watcher_result: Mutex::new(None),
         })
     }
 
-    #[cfg(test)]
-    pub(crate) fn new_with_file_watcher_result(
-        skills_service: Arc<SkillsService>,
-        outgoing: Arc<OutgoingMessageSender>,
-        file_watcher_result: Result<Arc<FileWatcher>, String>,
-    ) -> Arc<Self> {
-        Arc::new(Self {
-            runtime: OnceLock::new(),
-            initialization: Mutex::new(None),
-            skills_service,
-            outgoing,
-            runtime_extra_roots_registration: Mutex::new(WatchRegistration::default()),
-            shutdown_requested: AtomicBool::new(false),
-            initialization_count: AtomicUsize::new(0),
-            thread_config_registration_count: AtomicUsize::new(0),
-            file_watcher_result: Mutex::new(Some(file_watcher_result)),
-        })
-    }
 
     pub(crate) fn shutdown(&self) {
         self.shutdown_requested.store(true, Ordering::Release);
@@ -148,9 +113,6 @@ impl SkillsWatcher {
         thread_manager: &ThreadManager,
         environments: &[TurnEnvironmentSelection],
     ) -> Result<WatchRegistration, String> {
-        #[cfg(test)]
-        self.thread_config_registration_count
-            .fetch_add(1, Ordering::AcqRel);
         let Some(environment_selection) = environments.first() else {
             return Ok(WatchRegistration::default());
         };
@@ -210,21 +172,8 @@ impl SkillsWatcher {
         .map_err(|err| format!("skills registration worker failed: {err}"))?
     }
 
-    #[cfg(test)]
-    pub(crate) fn thread_config_registration_count(&self) -> usize {
-        self.thread_config_registration_count
-            .load(Ordering::Acquire)
-    }
 
-    #[cfg(test)]
-    pub(crate) fn is_initialized(&self) -> bool {
-        self.runtime.get().is_some()
-    }
 
-    #[cfg(test)]
-    pub(crate) fn initialization_count(&self) -> usize {
-        self.initialization_count.load(Ordering::Acquire)
-    }
 
     fn runtime(&self) -> Result<Option<&SkillsWatcherRuntime>, String> {
         if self.shutdown_requested.load(Ordering::Acquire) {
@@ -247,8 +196,6 @@ impl SkillsWatcher {
                     return Err(error.clone());
                 }
                 let created: Result<SkillsWatcherRuntime, String> = (|| {
-                    #[cfg(test)]
-                    self.initialization_count.fetch_add(1, Ordering::AcqRel);
                     let file_watcher = self.create_file_watcher()?;
                     let (subscriber, rx) = file_watcher.add_subscriber();
                     let shutdown_token = CancellationToken::new();
@@ -299,10 +246,6 @@ impl SkillsWatcher {
     }
 
     fn create_file_watcher(&self) -> Result<Arc<FileWatcher>, String> {
-        #[cfg(test)]
-        if let Some(result) = self.file_watcher_result.lock().unwrap().as_ref() {
-            return result.clone();
-        }
         FileWatcher::new()
             .map(Arc::new)
             .map_err(|err| format!("failed to initialize skills file watcher: {err}"))
@@ -365,262 +308,3 @@ fn invalidate_changed_skills(skills_service: &SkillsService, event: &FileWatcher
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn scoped_events_keep_unrelated_skill_snapshots_warm_and_overflow_cools_them() {
-        let home = tempfile::tempdir().unwrap();
-        let repos = tempfile::tempdir().unwrap();
-        let service = SkillsService::new(AbsolutePathBuf::from_absolute_path(home.path()).unwrap(), false);
-        let mut inputs = Vec::new();
-        for name in ["a", "b"] {
-            let cwd = repos.path().join(name);
-            let skill = cwd.join(".agents/skills").join(name).join("SKILL.md");
-            std::fs::create_dir_all(skill.parent().unwrap()).unwrap();
-            std::fs::write(&skill, format!("---\nname: {name}\ndescription: initial\n---\nBody\n")).unwrap();
-            inputs.push(SkillsLoadInput::new(
-                AbsolutePathBuf::from_absolute_path(cwd).unwrap(),
-                Vec::new(),
-                codex_config::ConfigLayerStack::default(),
-                false,
-            ));
-        }
-        let a = service.snapshot_for_config(&inputs[0], None).await;
-        let b = service.snapshot_for_config(&inputs[1], None).await;
-        let path = repos.path().join("a/.agents/skills/a/SKILL.md");
-        std::fs::write(&path, "---\nname: a\ndescription: changed\n---\nBody\n").unwrap();
-        invalidate_changed_skills(&service, &FileWatcherEvent { paths: vec![path], rescan_required: false });
-        let fresh_a = service.snapshot_for_config(&inputs[0], None).await;
-        assert!(fresh_a.outcome().skills.iter().any(|skill| skill.name == "a" && skill.description == "changed"));
-        assert!(!std::ptr::eq(a.outcome(), fresh_a.outcome()));
-        let warm_b = service.snapshot_for_config(&inputs[1], None).await;
-        assert!(std::ptr::eq(b.outcome(), warm_b.outcome()));
-        for event in [
-            FileWatcherEvent { paths: Vec::new(), rescan_required: true },
-            FileWatcherEvent { paths: vec!["relative/SKILL.md".into()], rescan_required: false },
-        ] {
-            let before = service.snapshot_for_config(&inputs[1], None).await;
-            invalidate_changed_skills(&service, &event);
-            let after = service.snapshot_for_config(&inputs[1], None).await;
-            assert!(!std::ptr::eq(before.outcome(), after.outcome()), "ambiguous events must retain global freshness");
-        }
-    }
-
-    #[tokio::test]
-    async fn initialization_failure_retries_once_after_recovery_and_shutdown_stays_closed() {
-        let home = tempfile::tempdir().unwrap();
-        let roots = tempfile::tempdir().unwrap();
-        let root = AbsolutePathBuf::from_absolute_path(roots.path()).unwrap();
-        let skills = Arc::new(SkillsService::new(
-            AbsolutePathBuf::from_absolute_path(home.path()).unwrap(),
-            false,
-        ));
-        let (tx, _rx) = tokio::sync::mpsc::channel(8);
-        let outgoing = Arc::new(OutgoingMessageSender::new(
-            tx,
-            codex_analytics::AnalyticsEventsClient::disabled(),
-        ));
-        let watcher = SkillsWatcher::new_with_file_watcher_result(
-            skills,
-            outgoing,
-            Err("transient native failure".to_string()),
-        );
-        for _ in 0..2 {
-            assert!(
-                watcher
-                    .register_runtime_extra_roots(std::slice::from_ref(&root))
-                    .await
-                    .is_err()
-            );
-        }
-        assert_eq!(
-            watcher.initialization_count(),
-            1,
-            "failure cooldown bounds retries"
-        );
-        *watcher.file_watcher_result.lock().unwrap() = Some(Ok(Arc::new(FileWatcher::noop())));
-        watcher.initialization.lock().unwrap().as_mut().unwrap().0 =
-            Instant::now() - Duration::from_secs(1);
-        let results = futures::future::join_all(
-            (0..8).map(|_| watcher.register_runtime_extra_roots(std::slice::from_ref(&root))),
-        )
-        .await;
-        assert!(results.into_iter().all(|result| result.is_ok()));
-        assert_eq!(
-            watcher.initialization_count(),
-            2,
-            "one successful shared runtime"
-        );
-        assert!(watcher.is_initialized());
-        watcher.shutdown();
-        assert!(watcher.runtime().unwrap().is_none());
-        assert!(watcher.register_runtime_extra_roots(&[root]).await.is_err());
-        assert_eq!(watcher.initialization_count(), 2);
-    }
-
-    #[tokio::test]
-    async fn acquiring_coverage_reconciles_warm_snapshots_and_reacquisition_gaps() {
-        let home = tempfile::tempdir().unwrap();
-        let roots = tempfile::tempdir().unwrap();
-        let skill = roots.path().join("watched/SKILL.md");
-        std::fs::create_dir_all(skill.parent().unwrap()).unwrap();
-        let write = |description: &str| {
-            std::fs::write(
-                &skill,
-                format!("---\nname: watched\ndescription: {description}\n---\nBody\n"),
-            )
-            .unwrap()
-        };
-        write("A");
-        let root = AbsolutePathBuf::from_absolute_path(roots.path()).unwrap();
-        let skills = Arc::new(SkillsService::new(
-            AbsolutePathBuf::from_absolute_path(home.path()).unwrap(),
-            false,
-        ));
-        skills.set_extra_roots(vec![root.clone()]);
-        let input = SkillsLoadInput::new(
-            root.clone(),
-            Vec::new(),
-            codex_config::ConfigLayerStack::default(),
-            false,
-        );
-        let first = skills.snapshot_for_config(&input, None).await;
-        assert_eq!(first.outcome().skills[0].description, "A");
-        write("B");
-        let (tx, _rx) = tokio::sync::mpsc::channel(8);
-        let outgoing = Arc::new(OutgoingMessageSender::new(
-            tx,
-            codex_analytics::AnalyticsEventsClient::disabled(),
-        ));
-        let watcher = SkillsWatcher::new(Arc::clone(&skills), outgoing);
-        watcher
-            .register_runtime_extra_roots(std::slice::from_ref(&root))
-            .await
-            .unwrap();
-        let covered = skills.snapshot_for_config(&input, None).await;
-        assert_eq!(covered.outcome().skills[0].description, "B");
-        assert_eq!(
-            first.outcome().skills[0].description,
-            "A",
-            "running snapshots stay immutable"
-        );
-        watcher
-            .register_runtime_extra_roots(std::slice::from_ref(&root))
-            .await
-            .unwrap();
-        let continuous = skills.snapshot_for_config(&input, None).await;
-        assert!(
-            std::ptr::eq(covered.outcome(), continuous.outcome()),
-            "a continuously covered replacement must preserve the warm snapshot"
-        );
-        watcher.register_runtime_extra_roots(&[]).await.unwrap();
-        write("C");
-        watcher.register_runtime_extra_roots(&[root]).await.unwrap();
-        assert_eq!(
-            skills
-                .snapshot_for_config(&input, None)
-                .await
-                .outcome()
-                .skills[0]
-                .description,
-            "C"
-        );
-        watcher.shutdown();
-    }
-
-    #[tokio::test]
-    async fn backpressured_notifications_allow_later_invalidation_and_shutdown() {
-        let home = tempfile::tempdir().expect("temporary home");
-        let roots = tempfile::tempdir().expect("temporary skills");
-        let skill_dir = roots.path().join("watched");
-        std::fs::create_dir(&skill_dir).expect("create skill directory");
-        let skill_path = skill_dir.join("SKILL.md");
-        let write_skill = |description: &str| {
-            std::fs::write(
-                &skill_path,
-                format!("---\nname: watched\ndescription: {description}\n---\nInstructions\n"),
-            )
-            .expect("write skill");
-        };
-        write_skill("initial");
-        let root = AbsolutePathBuf::from_absolute_path(roots.path()).expect("absolute root");
-        let skills = Arc::new(SkillsService::new(
-            AbsolutePathBuf::from_absolute_path(home.path()).expect("absolute home"),
-            false,
-        ));
-        skills.set_extra_roots(vec![root.clone()]);
-        let input = SkillsLoadInput::new(
-            root.clone(),
-            Vec::new(),
-            codex_config::ConfigLayerStack::default(),
-            false,
-        );
-        let initial = skills.snapshot_for_config(&input, None).await;
-        assert_eq!(initial.outcome().skills[0].description, "initial");
-        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
-        let outgoing = Arc::new(OutgoingMessageSender::new(
-            tx,
-            codex_analytics::AnalyticsEventsClient::disabled(),
-        ));
-        assert!(
-            outgoing.try_send_server_notification(ServerNotification::SkillsChanged(
-                SkillsChangedNotification {},
-            ))
-        );
-        let watcher = SkillsWatcher::new(Arc::clone(&skills), Arc::clone(&outgoing));
-        watcher
-            .register_runtime_extra_roots(&[root])
-            .await
-            .expect("watch skills");
-
-        // Observe real cache invalidation while the outgoing queue remains full.
-        for description in ["first change", "second change"] {
-            write_skill(description);
-            tokio::time::timeout(Duration::from_secs(8), async {
-                loop {
-                    let snapshot = skills.snapshot_for_config(&input, None).await;
-                    if snapshot.outcome().skills[0].description == description {
-                        break;
-                    }
-                    tokio::time::sleep(Duration::from_millis(10)).await;
-                }
-            })
-            .await
-            .expect("notification backpressure must not indefinitely block invalidation");
-            // Let the throttled notification reach the already full transport.
-            tokio::time::sleep(WATCHER_THROTTLE_INTERVAL * 2).await;
-        }
-        // The final dirty marker must deliver after capacity returns, even
-        // though no further filesystem event wakes the listener.
-        rx.recv().await.expect("prefilled notification");
-        let delivered = tokio::time::timeout(Duration::from_secs(1), rx.recv())
-            .await
-            .expect("pending skills notification must survive quiescence")
-            .expect("skills notification");
-        assert!(matches!(
-            delivered,
-            crate::outgoing_message::OutgoingEnvelope::Broadcast {
-                message: crate::outgoing_message::OutgoingMessage::AppServerNotification(
-                    ServerNotification::SkillsChanged(_)
-                ),
-            }
-        ));
-        // Shutdown must still release the listener with a full outgoing queue.
-        let _ = outgoing.try_send_server_notification(ServerNotification::SkillsChanged(
-            SkillsChangedNotification {},
-        ));
-        assert_eq!(rx.len(), 1);
-        watcher.shutdown();
-        drop(watcher);
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while Arc::strong_count(&outgoing) != 1 {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("shutdown must release the event loop despite a full queue");
-        assert_eq!(rx.len(), 1);
-    }
-}

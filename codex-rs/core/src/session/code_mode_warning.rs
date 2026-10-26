@@ -21,6 +21,3 @@ pub(super) fn unsupported_code_mode_warning(
     ))
 }
 
-#[cfg(test)]
-#[path = "code_mode_warning_tests.rs"]
-mod tests;

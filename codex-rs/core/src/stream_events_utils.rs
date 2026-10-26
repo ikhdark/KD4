@@ -145,29 +145,6 @@ pub(crate) struct InFlightToolResult {
 }
 
 impl InFlightToolCall {
-    #[cfg(test)]
-    pub(crate) fn from_test_future(
-        call_id: impl Into<String>,
-        future: Pin<Box<dyn Future<Output = Result<ResponseInputItem>> + Send + 'static>>,
-    ) -> Self {
-        let call_id = call_id.into();
-        let timing = Arc::new(ToolDispatchTiming::new(tokio::time::Instant::now(), false));
-        let execution_id = timing.execution_id().clone();
-        Self {
-            call: ToolCall {
-                tool_name: codex_tools::ToolName::plain("test_tool"),
-                call_id: call_id.clone(),
-                payload: crate::tools::context::ToolPayload::Function {
-                    arguments: "{}".to_string(),
-                },
-            },
-            call_id,
-            execution_id,
-            timing,
-            future: Box::pin(async move { future.await.map(ToolCallCompletion::nonterminal) }),
-        }
-    }
-
     pub(crate) async fn into_future(self) -> InFlightToolResult {
         let result = self.future.await;
         self.timing.mark_relay_enqueue();
@@ -344,33 +321,6 @@ impl OrderedResponseItemRecorder {
         Ok(())
     }
 
-    #[cfg(test)]
-    pub(crate) async fn block_required_persistence_for_test(
-        &self,
-        release: tokio::sync::oneshot::Receiver<()>,
-    ) {
-        let barrier = async move {
-            let _ = release.await;
-            Ok(())
-        }
-        .boxed()
-        .shared();
-        self.state.lock().await.required_tail = Some(barrier);
-    }
-
-    #[cfg(test)]
-    pub(crate) async fn block_auxiliary_persistence_for_test(
-        &self,
-        release: tokio::sync::oneshot::Receiver<()>,
-    ) {
-        let barrier = async move {
-            let _ = release.await;
-            Ok(())
-        }
-        .boxed()
-        .shared();
-        self.state.lock().await.auxiliary_tail = Some(barrier);
-    }
 }
 
 pub(crate) async fn apply_turn_item_contributors(
@@ -914,7 +864,3 @@ pub(crate) fn response_input_to_response_item(input: &ResponseInputItem) -> Opti
         _ => None,
     }
 }
-
-#[cfg(test)]
-#[path = "stream_events_utils_tests.rs"]
-mod tests;

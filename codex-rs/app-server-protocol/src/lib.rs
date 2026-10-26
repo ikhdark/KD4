@@ -39,9 +39,4 @@ pub use protocol::v1::UserSavedConfig;
 pub use protocol::v2::*;
 pub use rpc::*;
 pub use schema_fixtures::SchemaFixtureOptions;
-#[doc(hidden)]
-pub use schema_fixtures::generate_json_schema_fixture_subtree_for_tests;
-#[doc(hidden)]
-pub use schema_fixtures::generate_typescript_schema_fixture_subtree_for_tests;
-pub use schema_fixtures::read_schema_fixture_subtree;
 pub use schema_fixtures::write_schema_fixtures_with_options;

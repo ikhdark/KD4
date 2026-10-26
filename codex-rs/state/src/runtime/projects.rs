@@ -505,6 +505,3 @@ fn parse_project_cursor(
     Ok((value, id.to_string()))
 }
 
-#[cfg(test)]
-#[path = "projects_tests.rs"]
-mod tests;

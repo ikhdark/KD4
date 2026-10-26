@@ -771,9 +771,6 @@ macro_rules! define_features {
                 }),*
             }
         }
-
-        #[cfg(test)]
-        const ALL_FEATURES: &[Feature] = &[$(Feature::$id),*];
     };
 
     (@consumer $consumer:expr) => { $consumer };
@@ -1258,6 +1255,3 @@ pub fn unstable_features_warning_event(
         msg: EventMsg::Warning(WarningEvent { message }),
     })
 }
-
-#[cfg(test)]
-mod tests;

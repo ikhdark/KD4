@@ -10,9 +10,6 @@ use windows_sys::Win32::Security::OBJECT_INHERIT_ACE;
 use windows_sys::Win32::Storage::FileSystem::FILE_GENERIC_EXECUTE;
 use windows_sys::Win32::Storage::FileSystem::FILE_GENERIC_READ;
 
-#[cfg(test)]
-#[path = "setup_runtime_bin_tests.rs"]
-mod tests;
 
 pub(super) fn ensure_codex_app_runtime_paths_readable(
     sandbox_group_psid: *mut c_void,

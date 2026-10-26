@@ -1100,6 +1100,3 @@ fn append_failure_message(mut output: String, message: &str) -> String {
     output
 }
 
-#[cfg(test)]
-#[path = "async_watcher_tests.rs"]
-mod tests;

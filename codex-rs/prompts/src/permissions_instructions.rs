@@ -113,22 +113,6 @@ impl PermissionsInstructions {
         self.text.clone()
     }
 
-    #[cfg(test)]
-    fn from_permissions_with_network(
-        sandbox_mode: SandboxMode,
-        network_access: NetworkAccess,
-        config: PermissionsPromptConfig<'_>,
-        writable_roots: Option<Vec<WritableRoot>>,
-    ) -> Self {
-        Self::from_permissions_with_network_and_denied_reads(
-            sandbox_mode,
-            network_access,
-            config,
-            writable_roots,
-            /*denied_reads*/ None,
-        )
-    }
-
     fn from_permissions_with_network_and_denied_reads(
         sandbox_mode: SandboxMode,
         network_access: NetworkAccess,
@@ -472,7 +456,3 @@ fn granular_instructions(
 
     sections.join("\n\n")
 }
-
-#[cfg(test)]
-#[path = "permissions_instructions_tests.rs"]
-mod permissions_instructions_tests;

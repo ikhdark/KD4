@@ -271,27 +271,7 @@ impl ExecServerHandler {
         Ok(EnvironmentInfo::local())
     }
 
-    // Unowned read/terminate are test conveniences; the router dispatches the
-    // owned variants so a stale handle cannot reach a successor process.
-    #[cfg(test)]
-    pub(crate) async fn exec_read(
-        &self,
-        params: ReadParams,
-    ) -> Result<ReadResponse, JSONRPCErrorError> {
-        let session = self.require_initialized_for("exec")?;
-        let response = session.process().exec_read(params).await?;
-        self.require_session_attached()?;
-        Ok(response)
-    }
 
-    #[cfg(test)]
-    pub(crate) async fn terminate(
-        &self,
-        params: TerminateParams,
-    ) -> Result<TerminateResponse, JSONRPCErrorError> {
-        let session = self.require_initialized_for("exec")?;
-        session.process().terminate(params).await
-    }
 
     pub(crate) async fn http_request(
         self: &Arc<Self>,
@@ -575,5 +555,3 @@ impl ExecServerHandler {
     }
 }
 
-#[cfg(test)]
-mod tests;

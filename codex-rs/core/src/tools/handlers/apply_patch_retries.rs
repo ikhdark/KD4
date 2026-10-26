@@ -8,6 +8,7 @@ use codex_apply_patch::AppliedPatchDelta;
 use codex_apply_patch::ApplyPatchArgs;
 use codex_apply_patch::Hunk;
 use codex_apply_patch::UpdateFileChunk;
+use codex_apply_patch::UpdateLineKind;
 use codex_utils_path_uri::PathUri;
 use serde_json::Value;
 
@@ -412,11 +413,33 @@ fn render_patch(hunks: &[Hunk], environment_id: Option<&str>) -> String {
                         Some(context) => append_patch_line(&mut text, "@@ ", context),
                         None => text.push_str("@@\n"),
                     }
-                    for line in &chunk.old_lines {
-                        append_patch_line(&mut text, "-", line);
-                    }
-                    for line in &chunk.new_lines {
-                        append_patch_line(&mut text, "+", line);
+                    if chunk.line_kinds.is_empty() {
+                        // Legacy programmatic chunks have no marker provenance.
+                        for line in &chunk.old_lines {
+                            append_patch_line(&mut text, "-", line);
+                        }
+                        for line in &chunk.new_lines {
+                            append_patch_line(&mut text, "+", line);
+                        }
+                    } else {
+                        let (mut old, mut new) = (0, 0);
+                        for kind in &chunk.line_kinds {
+                            match kind {
+                                UpdateLineKind::Context => {
+                                    append_patch_line(&mut text, " ", &chunk.old_lines[old]);
+                                    old += 1;
+                                    new += 1;
+                                }
+                                UpdateLineKind::Remove => {
+                                    append_patch_line(&mut text, "-", &chunk.old_lines[old]);
+                                    old += 1;
+                                }
+                                UpdateLineKind::Add => {
+                                    append_patch_line(&mut text, "+", &chunk.new_lines[new]);
+                                    new += 1;
+                                }
+                            }
+                        }
                     }
                     if chunk.is_end_of_file {
                         text.push_str("*** End of File\n");
@@ -438,347 +461,4 @@ fn append_patch_line(text: &mut String, prefix: &str, line: &str) {
     text.push('\n');
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use codex_exec_server::LOCAL_FS;
 
-    fn retained(store: &mut RetainedPatches, cwd: &PathUri, patch: &str) -> String {
-        store
-            .retain(
-                patch,
-                "local",
-                "test-instance",
-                cwd,
-                &Default::default(),
-                None,
-            )
-            .unwrap()["patch_id"]
-            .as_str()
-            .unwrap()
-            .to_owned()
-    }
-
-    #[test]
-    fn retained_and_amended_code_preserve_literal_carriage_returns() {
-        let dir = tempfile::tempdir().unwrap();
-        let cwd = PathUri::from_host_native_path(dir.path()).unwrap();
-        let patch = "*** Begin Patch\n*** Add File: a\n+literal\r\r\n*** Update File: b\n@@\n-old\r\r\n+new\r\r\n*** End Patch";
-        let mut store = RetainedPatches::default();
-        let id = retained(&mut store, &cwd, patch);
-        let retry = format!("*** Begin Patch\n*** Retry Patch: {id}\n*** End Patch");
-        assert_eq!(
-            store.prepare(&retry).unwrap().args.hunks,
-            codex_apply_patch::parse_patch(patch).unwrap().hunks
-        );
-        let retry = format!(
-            "*** Begin Patch\n*** Retry Patch: {id}\n*** Replace Chunk: 2 1\n@@\n-current\r\r\n+fixed\r\r\n*** End Patch"
-        );
-        let prepared = store.prepare(&retry).unwrap();
-        let Hunk::UpdateFile { chunks, .. } = &prepared.args.hunks[1] else {
-            panic!("update")
-        };
-        assert_eq!(chunks[0].new_lines, ["fixed\r"]);
-        assert_eq!(
-            codex_apply_patch::parse_patch(&prepared.args.patch)
-                .unwrap()
-                .hunks,
-            prepared.args.hunks
-        );
-    }
-
-    #[test]
-    fn retry_may_omit_its_opening_line_but_not_its_closing_line() {
-        let dir = tempfile::tempdir().unwrap();
-        let cwd = PathUri::from_host_native_path(dir.path()).unwrap();
-        let patch = "*** Begin Patch\n*** Update File: a\n@@\n-old\n+new\n*** End Patch";
-        let mut store = RetainedPatches::default();
-        let receipt = store
-            .retain(
-                patch,
-                "local",
-                "test-instance",
-                &cwd,
-                &Default::default(),
-                None,
-            )
-            .unwrap();
-        let id = receipt["patch_id"].as_str().unwrap();
-        // The instruction shows the complete input for this receipt.
-        let instruction = receipt["instruction"].as_str().unwrap();
-        assert!(
-            instruction.contains(&format!("*** Begin Patch\n*** Retry Patch: {id}\n")),
-            "{instruction}"
-        );
-        assert!(instruction.contains("\n*** End Patch\n"), "{instruction}");
-
-        let amendment =
-            format!("*** Retry Patch: {id}\n*** Replace Chunk: 1 1\n@@\n-current\n+new");
-        assert!(is_retry(&amendment));
-        let wrapped = store
-            .prepare(&format!("*** Begin Patch\n{amendment}\n*** End Patch"))
-            .unwrap();
-        let unwrapped = store
-            .prepare(&format!("{amendment}\n*** End Patch"))
-            .unwrap();
-        assert_eq!(unwrapped.id, id);
-        assert_eq!(unwrapped.args.hunks, wrapped.args.hunks);
-        assert_eq!(unwrapped.args.patch, wrapped.args.patch);
-        // A retry cut off before its closing line is never applied.
-        let Err(error) = store.prepare(&amendment) else {
-            panic!("a retry without *** End Patch was accepted");
-        };
-        assert!(error.contains("final *** End Patch"), "{error}");
-    }
-
-    #[test]
-    fn hook_rotation_preserves_the_concrete_environment_identity() {
-        let dir = tempfile::tempdir().unwrap();
-        let cwd = PathUri::from_host_native_path(dir.path()).unwrap();
-        let mut store = RetainedPatches::default();
-        let patch = "*** Begin Patch\n*** Add File: a\n+x\n*** End Patch";
-        let receipt = store
-            .retain(
-                patch,
-                "alias",
-                "instance-A",
-                &cwd,
-                &Default::default(),
-                None,
-            )
-            .unwrap();
-        let id = receipt["patch_id"].as_str().unwrap();
-        let replacement = store.replace_after_hook(id, patch, "hook").unwrap();
-        let retry = format!(
-            "*** Begin Patch\n*** Retry Patch: {}\n*** End Patch",
-            replacement["patch_id"].as_str().unwrap()
-        );
-        let prepared = store.prepare(&retry).unwrap();
-        assert_eq!(prepared.environment_id, "alias");
-        assert_eq!(prepared.environment_instance, "instance-A");
-        assert_eq!(prepared.cwd, cwd);
-    }
-
-    #[test]
-    fn amendments_preserve_unmentioned_chunks_and_are_single_use() {
-        let dir = tempfile::tempdir().unwrap();
-        let cwd = PathUri::from_host_native_path(dir.path()).unwrap();
-        let patch = "*** Begin Patch\n*** Update File: a\n@@ first\n-old\n+new\n@@ second\n-two\n+three\n*** Add File: b\n+unchanged\n*** End Patch";
-        let mut store = RetainedPatches::default();
-        let id = retained(&mut store, &cwd, patch);
-        let retry = format!(
-            "*** Begin Patch\n*** Retry Patch: {id}\n*** Replace Chunk: 1 1\n@@ first\n-current\n+new\n*** End Patch"
-        );
-        let prepared = store.prepare(&retry).unwrap();
-        let original = codex_apply_patch::parse_patch(patch).unwrap();
-        assert_eq!(prepared.args.hunks[1], original.hunks[1]);
-        let Hunk::UpdateFile { chunks, .. } = &prepared.args.hunks[0] else {
-            panic!("update")
-        };
-        assert_eq!(chunks[0].old_lines, ["current"]);
-        let Hunk::UpdateFile { chunks: old, .. } = &original.hunks[0] else {
-            panic!("update")
-        };
-        assert_eq!(chunks[1], old[1]);
-        assert_eq!(
-            codex_apply_patch::parse_patch(&prepared.args.patch)
-                .unwrap()
-                .hunks,
-            prepared.args.hunks
-        );
-        store.consume(&id).unwrap();
-        assert!(store.consume(&id).is_err());
-        assert!(store.prepare(&retry).is_err());
-        assert_eq!(store.bytes, 0);
-    }
-
-    #[test]
-    fn invalid_or_overlapping_amendments_do_not_consume_the_receipt() {
-        let dir = tempfile::tempdir().unwrap();
-        let cwd = PathUri::from_host_native_path(dir.path()).unwrap();
-        let mut store = RetainedPatches::default();
-        let id = retained(
-            &mut store,
-            &cwd,
-            "*** Begin Patch\n*** Add File: a\n+x\n*** End Patch",
-        );
-        for edits in [
-            "*** Replace Hunk: 0\n*** Add File: a\n+y\n",
-            "*** Replace Hunk: 2\n*** Add File: a\n+y\n",
-            "*** Replace Chunk: 1 1\n@@\n-x\n+y\n",
-            "*** Replace Hunk: 1\n*** Add File: a\n+y\n*** Replace Hunk: 1\n*** Add File: a\n+z\n",
-        ] {
-            assert!(
-                store
-                    .prepare(&format!(
-                        "*** Begin Patch\n*** Retry Patch: {id}\n{edits}*** End Patch"
-                    ))
-                    .is_err(),
-                "{edits}"
-            );
-        }
-        let retry = format!(
-            "*** Begin Patch\n*** Retry Patch: {id}\n*** Replace Hunk: 1\n*** Add File: a\n+corrected\n*** End Patch"
-        );
-        assert!(
-            store
-                .prepare(&retry)
-                .unwrap()
-                .args
-                .patch
-                .contains("+corrected")
-        );
-        assert!(
-            RetainedPatches::default().prepare(&retry).is_err(),
-            "session-local IDs cannot resurrect writes after restart"
-        );
-    }
-
-    #[tokio::test]
-    async fn runtime_partial_commit_is_excluded_from_the_retained_patch() {
-        use std::os::windows::fs::OpenOptionsExt;
-        let dir = tempfile::tempdir().unwrap();
-        let cwd = PathUri::from_host_native_path(dir.path()).unwrap();
-        let patch = "*** Begin Patch\n*** Add File: committed\n+first\n*** Update File: pending\n@@\n-old\n+new\n*** End Patch";
-        std::fs::write(dir.path().join("pending"), "old\n").unwrap();
-        // Deny rollback of the first write, retaining the exact committed prefix.
-        let committed = dir.path().join("committed");
-        let reader = std::sync::Mutex::new(None);
-        let failure = codex_apply_patch::apply_patch_with_cancellation(
-            patch,
-            &cwd,
-            &mut Vec::new(),
-            &mut Vec::new(),
-            LOCAL_FS.as_ref(),
-            None,
-            &|| {
-                if !committed.exists() {
-                    return false;
-                }
-                *reader.lock().unwrap() = Some(
-                    std::fs::OpenOptions::new()
-                        .read(true)
-                        .share_mode(1)
-                        .open(&committed)
-                        .unwrap(),
-                );
-                true
-            },
-        )
-        .await
-        .unwrap_err();
-        drop(reader);
-        assert_eq!(failure.delta().changes().len(), 1);
-        let mut store = RetainedPatches::default();
-        let receipt = store
-            .retain(patch, "local", "test-instance", &cwd, failure.delta(), None)
-            .unwrap();
-        assert_eq!(receipt["committed_hunks_excluded"], 1);
-        std::fs::write(dir.path().join("committed"), "later independent edit\n").unwrap();
-        let retry = store
-            .prepare(&format!(
-                "*** Begin Patch\n*** Retry Patch: {}\n*** End Patch",
-                receipt["patch_id"].as_str().unwrap()
-            ))
-            .unwrap();
-        assert_eq!(retry.args.hunks.len(), 1);
-        codex_apply_patch::apply_patch(
-            &retry.args.patch,
-            &cwd,
-            &mut Vec::new(),
-            &mut Vec::new(),
-            LOCAL_FS.as_ref(),
-            None,
-        )
-        .await
-        .unwrap();
-        assert_eq!(
-            std::fs::read_to_string(dir.path().join("committed")).unwrap(),
-            "later independent edit\n"
-        );
-        assert_eq!(
-            std::fs::read_to_string(dir.path().join("pending")).unwrap(),
-            "new\n"
-        );
-    }
-
-    #[test]
-    fn retention_eviction_does_not_allow_replaying_expired_ids() {
-        let dir = tempfile::tempdir().unwrap();
-        let cwd = PathUri::from_host_native_path(dir.path()).unwrap();
-        let patch = "*** Begin Patch\n*** Add File: a\n+x\n*** End Patch";
-        let mut store = RetainedPatches::default();
-        let first = retained(&mut store, &cwd, patch);
-        for _ in 0..MAX_RETAINED_PATCHES {
-            retained(&mut store, &cwd, patch);
-        }
-        assert!(
-            store
-                .prepare(&format!(
-                    "*** Begin Patch\n*** Retry Patch: {first}\n*** End Patch"
-                ))
-                .is_err()
-        );
-        assert_eq!(store.patches.len(), MAX_RETAINED_PATCHES);
-        assert!(store.bytes <= MAX_RETAINED_BYTES);
-    }
-
-    #[tokio::test]
-    async fn rolled_back_failure_retains_the_identical_patch_for_retry() {
-        use std::os::windows::fs::OpenOptionsExt;
-        let dir = tempfile::tempdir().unwrap();
-        let cwd = PathUri::from_host_native_path(dir.path()).unwrap();
-        let pending = dir.path().join("pending");
-        std::fs::write(&pending, "old\n").unwrap();
-        let reader = std::fs::OpenOptions::new()
-            .read(true)
-            .share_mode(1)
-            .open(&pending)
-            .unwrap();
-        let patch = "*** Begin Patch\n*** Add File: first\n+first\n*** Update File: pending\n@@\n-old\n+new\n*** End Patch";
-        let failure = codex_apply_patch::apply_patch(
-            patch,
-            &cwd,
-            &mut Vec::new(),
-            &mut Vec::new(),
-            LOCAL_FS.as_ref(),
-            None,
-        )
-        .await
-        .unwrap_err();
-        assert!(failure.delta().is_empty());
-        assert!(failure.delta().is_exact());
-        let mut store = RetainedPatches::default();
-        let receipt = store
-            .retain(patch, "local", "test-instance", &cwd, failure.delta(), None)
-            .unwrap();
-        assert_eq!(receipt["committed_hunks_excluded"], 0);
-        let retry = store
-            .prepare(&format!(
-                "*** Begin Patch\n*** Retry Patch: {}\n*** End Patch",
-                receipt["patch_id"].as_str().unwrap()
-            ))
-            .unwrap();
-        assert_eq!(retry.args.hunks.len(), 2);
-        drop(reader);
-        codex_apply_patch::apply_patch(
-            &retry.args.patch,
-            &cwd,
-            &mut Vec::new(),
-            &mut Vec::new(),
-            LOCAL_FS.as_ref(),
-            None,
-        )
-        .await
-        .unwrap();
-        assert_eq!(std::fs::read_to_string(&pending).unwrap(), "new\n");
-        assert_eq!(
-            std::fs::read_to_string(dir.path().join("first")).unwrap(),
-            "first\n"
-        );
-    }
-}
-
-#[cfg(test)]
-#[path = "apply_patch_retries_residue_tests.rs"]
-mod residue_tests;

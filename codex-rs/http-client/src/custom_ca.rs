@@ -18,22 +18,6 @@
 //! every parseable certificate block from the configured PEM bundle, or fail early with a precise
 //! error before the caller starts network traffic.
 //!
-//! In this module's test setup, a hermetic test is one whose result depends only on the CA file
-//! and environment variables that the test chose for itself. That matters here because the normal
-//! reqwest client-construction path is not hermetic enough for environment-sensitive tests:
-//!
-//! - child processes inherit CA-related environment variables by default, which lets developer
-//!   shell state or CI configuration affect a test unless the test scrubs those variables first
-//!
-//! The tests in this crate therefore stay split across two layers:
-//!
-//! - unit tests in this module cover env-selection logic without constructing a real client
-//! - subprocess integration tests under `tests/` cover real client construction through
-//!   [`build_reqwest_client_for_subprocess_tests`], which disables reqwest proxy autodetection so
-//!   the tests can observe custom-CA success and failure directly, including one TLS handshake
-//!   through a local HTTPS server
-//! - those subprocess tests also scrub inherited CA environment variables before launch so their
-//!   result depends only on the test fixtures and env vars set by the test itself
 
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -320,30 +304,7 @@ pub fn build_rustls_client_config_with_custom_ca()
     cached_rustls_client_config(bundle.as_ref())
 }
 
-/// Builds a reqwest client for spawned subprocess tests that exercise CA behavior.
-///
-/// This is the test-only client-construction path used by the subprocess coverage in `tests/`.
-/// The module-level docs explain the hermeticity problem in full; this helper only addresses the
-/// reqwest proxy-discovery panic side of that problem by disabling proxy autodetection. The tests
-/// still scrub inherited CA environment variables themselves. Normal production callers should use
-/// [`build_reqwest_client_with_custom_ca`] so test-only proxy behavior does not leak into
-/// ordinary client construction.
-pub fn build_reqwest_client_for_subprocess_tests(
-    builder: reqwest::ClientBuilder,
-) -> Result<reqwest::Client, BuildCustomCaTransportError> {
-    build_reqwest_client_with_env(&ProcessEnv, builder.no_proxy())
-}
 
-#[cfg(test)]
-fn maybe_build_rustls_client_config_with_env(
-    env_source: &dyn EnvSource,
-) -> Result<Option<Arc<ClientConfig>>, BuildCustomCaTransportError> {
-    let Some(bundle) = env_source.configured_ca_bundle() else {
-        return Ok(None);
-    };
-
-    build_rustls_client_config(Some(&bundle)).map(Some)
-}
 
 fn cached_rustls_client_config(
     bundle: Option<&ConfiguredCaBundle>,
@@ -421,13 +382,6 @@ fn cached_reqwest_certificates(
     Ok(certificates)
 }
 
-#[cfg(test)]
-fn build_rustls_client_config(
-    bundle: Option<&ConfiguredCaBundle>,
-) -> Result<Arc<ClientConfig>, BuildCustomCaTransportError> {
-    let pem_data = bundle.map(ConfiguredCaBundle::read_pem_data).transpose()?;
-    build_rustls_client_config_from_pem_data(bundle, pem_data.as_deref(), &native_root_store())
-}
 
 fn build_rustls_client_config_from_pem_data(
     bundle: Option<&ConfiguredCaBundle>,
@@ -483,8 +437,8 @@ fn build_rustls_client_config_from_pem_data(
 
 /// Builds a reqwest client using an injected environment source and reqwest builder.
 ///
-/// This exists so tests can exercise precedence behavior deterministically without mutating the
-/// real process environment. It selects the CA bundle, delegates file parsing to
+/// The injected source controls precedence without changing the real process environment.
+/// This selects the CA bundle, delegates file parsing to
 /// the shared content-keyed certificate cache, preserves the caller's chosen `reqwest` builder
 /// configuration, forces rustls when a custom CA is configured, and finally registers each parsed
 /// certificate with that builder.
@@ -650,8 +604,7 @@ fn build_blocking_reqwest_client_with_env_and_policy(
     })
 }
 
-/// Abstracts environment access so tests can cover precedence rules without mutating process-wide
-/// variables.
+/// Abstracts environment access without mutating process-wide variables.
 trait EnvSource {
     /// Returns the environment variable value for `key`, if this source considers it set.
     ///
@@ -694,11 +647,7 @@ trait EnvSource {
     }
 }
 
-/// Reads CA configuration from the real process environment.
-///
-/// This is the production `EnvSource` implementation used by
-/// [`build_reqwest_client_with_custom_ca`]. Tests substitute in-memory env maps so they can
-/// exercise precedence and empty-value behavior without mutating process-global variables.
+/// Rejects an empty SSL_CERT_FILE when no Codex-specific CA bundle is configured.
 fn validate_rustls_ca_environment(
     env_source: &dyn EnvSource,
 ) -> Result<(), BuildCustomCaTransportError> {
@@ -713,6 +662,7 @@ fn validate_rustls_ca_environment(
     Ok(())
 }
 
+/// Reads CA configuration from the real process environment.
 struct ProcessEnv;
 
 impl EnvSource for ProcessEnv {
@@ -902,430 +852,3 @@ impl NormalizedPem {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use std::collections::HashMap;
-    use std::fs;
-    use std::fs::FileTimes;
-    use std::fs::OpenOptions;
-    use std::path::PathBuf;
-    use std::sync::Arc;
-
-    use pretty_assertions::assert_eq;
-    use tempfile::TempDir;
-
-    use super::BuildCustomCaTransportError;
-    use super::CODEX_CA_CERT_ENV;
-    use super::ConfiguredCaBundle;
-    use super::CustomCaPolicy;
-    use super::EnvSource;
-    use super::RUSTLS_CLIENT_CONFIGS;
-    use super::SSL_CERT_FILE_ENV;
-    use super::build_blocking_reqwest_client_with_env;
-    use super::build_blocking_reqwest_client_with_env_and_policy;
-    use super::build_reqwest_client_with_env_and_policy;
-    use super::build_rustls_client_config;
-    use super::cached_reqwest_certificates;
-    use super::cached_rustls_client_config;
-    use super::maybe_build_rustls_client_config_with_env;
-    use super::native_root_store;
-
-    const TEST_CERT: &str = include_str!("../tests/fixtures/test-ca.pem");
-
-    struct MapEnv {
-        values: HashMap<String, String>,
-    }
-
-    impl EnvSource for MapEnv {
-        fn var(&self, key: &str) -> Option<String> {
-            self.values.get(key).cloned()
-        }
-    }
-
-    fn map_env(pairs: &[(&str, &str)]) -> MapEnv {
-        MapEnv {
-            values: pairs
-                .iter()
-                .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
-                .collect(),
-        }
-    }
-
-    fn write_cert_file(temp_dir: &TempDir, name: &str, contents: &str) -> PathBuf {
-        let path = temp_dir.path().join(name);
-        fs::write(&path, contents).unwrap_or_else(|error| {
-            panic!("write cert fixture failed for {}: {error}", path.display())
-        });
-        path
-    }
-
-    #[test]
-    fn rustls_rejects_empty_ssl_cert_file_before_loading_roots() {
-        let error = super::validate_rustls_ca_environment(&map_env(&[(SSL_CERT_FILE_ENV, "")]))
-            .unwrap_err();
-        assert!(error.to_string().contains("unset SSL_CERT_FILE"));
-        super::validate_rustls_ca_environment(&map_env(&[])).unwrap();
-        super::validate_rustls_ca_environment(&map_env(&[
-            (CODEX_CA_CERT_ENV, "/configured/codex.pem"), (SSL_CERT_FILE_ENV, ""),
-        ])).unwrap();
-    }
-
-    #[test]
-    fn ca_path_selection_preserves_precedence_and_source() {
-        for (values, expected) in [
-            (
-                vec![
-                    (CODEX_CA_CERT_ENV, "/tmp/codex.pem"),
-                    (SSL_CERT_FILE_ENV, "/tmp/fallback.pem"),
-                ],
-                Some((CODEX_CA_CERT_ENV, PathBuf::from("/tmp/codex.pem"))),
-            ),
-            (
-                vec![(SSL_CERT_FILE_ENV, "/tmp/fallback.pem")],
-                Some((SSL_CERT_FILE_ENV, PathBuf::from("/tmp/fallback.pem"))),
-            ),
-            (
-                vec![
-                    (CODEX_CA_CERT_ENV, ""),
-                    (SSL_CERT_FILE_ENV, "/tmp/fallback.pem"),
-                ],
-                Some((SSL_CERT_FILE_ENV, PathBuf::from("/tmp/fallback.pem"))),
-            ),
-            (vec![], None),
-            (vec![(CODEX_CA_CERT_ENV, ""), (SSL_CERT_FILE_ENV, "")], None),
-        ] {
-            assert_eq!(
-                map_env(&values)
-                    .configured_ca_bundle()
-                    .map(|bundle| (bundle.source_env, bundle.path)),
-                expected,
-                "environment: {values:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn rustls_config_uses_custom_ca_bundle_when_configured() {
-        let temp_dir = TempDir::new().expect("tempdir");
-        let rcgen::CertifiedKey { cert, signing_key } =
-            rcgen::generate_simple_self_signed(vec!["localhost".to_string()])
-                .expect("generate server certificate");
-        let cert_path = write_cert_file(&temp_dir, "ca.pem", &cert.pem());
-        let env = map_env(&[(CODEX_CA_CERT_ENV, cert_path.to_string_lossy().as_ref())]);
-        let config = maybe_build_rustls_client_config_with_env(&env)
-            .expect("rustls config")
-            .expect("custom CA config should be present");
-        let server_config = Arc::new(
-            rustls::ServerConfig::builder()
-                .with_no_client_auth()
-                .with_single_cert(
-                    vec![cert.der().clone()],
-                    rustls_pki_types::PrivateKeyDer::Pkcs8(signing_key.serialize_der().into()),
-                )
-                .expect("server config"),
-        );
-
-        handshake(config, Arc::clone(&server_config))
-            .expect("loaded custom CA must authenticate the server");
-        let default_config = build_rustls_client_config(None).expect("default config");
-        assert!(matches!(
-            handshake(default_config, server_config),
-            Err(rustls::Error::InvalidCertificate(
-                rustls::CertificateError::UnknownIssuer
-            ))
-        ));
-    }
-
-    fn handshake(
-        config: Arc<rustls::ClientConfig>,
-        server_config: Arc<rustls::ServerConfig>,
-    ) -> Result<(), rustls::Error> {
-        let mut client =
-            rustls::ClientConnection::new(config, "localhost".try_into().expect("server name"))?;
-        let mut server = rustls::ServerConnection::new(Arc::clone(&server_config))?;
-        for _ in 0..10 {
-            let mut records = Vec::new();
-            client
-                .write_tls(&mut records)
-                .expect("write client records");
-            server
-                .read_tls(&mut records.as_slice())
-                .expect("read client records");
-            server.process_new_packets()?;
-            records.clear();
-            server
-                .write_tls(&mut records)
-                .expect("write server records");
-            client
-                .read_tls(&mut records.as_slice())
-                .expect("read server records");
-            client.process_new_packets()?;
-            if !client.is_handshaking() && !server.is_handshaking() {
-                return Ok(());
-            }
-        }
-        panic!("TLS handshake failed to finish within ten record exchanges");
-    }
-
-    #[test]
-    fn rustls_native_root_store_is_reused() {
-        let first = native_root_store();
-        let second = native_root_store();
-
-        if std::env::var_os("SSL_CERT_FILE").is_none() && std::env::var_os("SSL_CERT_DIR").is_none()
-        {
-            assert!(std::ptr::eq(first.as_ref(), second.as_ref()));
-        } else {
-            assert_eq!(first.roots, second.roots);
-        }
-    }
-
-    #[test]
-    fn rustls_client_config_is_reused_for_same_ca_state() {
-        let first = cached_rustls_client_config(None).expect("build first rustls config");
-        let second = cached_rustls_client_config(None).expect("reuse rustls config");
-
-        assert!(Arc::ptr_eq(&first, &second));
-    }
-
-    #[test]
-    fn rustls_client_config_cache_detects_same_metadata_ca_rotation() {
-        const ROTATION_TEST_SOURCE: &str = "CODEX_CA_CERTIFICATE_ROTATION_TEST";
-        let temp_dir = TempDir::new().expect("tempdir");
-        let first_pem = format!("# rotation A\n{TEST_CERT}");
-        let second_pem = format!("# rotation B\n{TEST_CERT}");
-        assert_eq!(first_pem.len(), second_pem.len());
-        let cert_path = write_cert_file(&temp_dir, "rotating-ca.pem", &first_pem);
-        let original_metadata = fs::metadata(&cert_path).expect("first CA metadata");
-        let original_modified = original_metadata.modified().expect("first CA mtime");
-        let bundle = ConfiguredCaBundle {
-            source_env: ROTATION_TEST_SOURCE,
-            path: cert_path.clone(),
-        };
-
-        let first = cached_rustls_client_config(Some(&bundle)).expect("first rustls config");
-        let first_key = RUSTLS_CLIENT_CONFIGS
-            .lock()
-            .unwrap()
-            .iter()
-            .find(|(_, config)| Arc::ptr_eq(config, &first))
-            .map(|(key, _)| key.clone())
-            .expect("first config is cached");
-        fs::write(&cert_path, second_pem).expect("rotate CA contents");
-        OpenOptions::new()
-            .write(true)
-            .open(&cert_path)
-            .expect("open rotated CA")
-            .set_times(FileTimes::new().set_modified(original_modified))
-            .expect("restore CA mtime");
-        let rotated_metadata = fs::metadata(&cert_path).expect("rotated CA metadata");
-        assert_eq!(rotated_metadata.len(), original_metadata.len());
-        assert_eq!(
-            rotated_metadata.modified().expect("rotated CA mtime"),
-            original_modified
-        );
-
-        let second = cached_rustls_client_config(Some(&bundle)).expect("rotated rustls config");
-        let reused = cached_rustls_client_config(Some(&bundle)).expect("reused rustls config");
-
-        assert!(!Arc::ptr_eq(&first, &second));
-        assert!(Arc::ptr_eq(&second, &reused));
-        let configs = RUSTLS_CLIENT_CONFIGS
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        assert!(!configs.contains_key(&first_key));
-        assert_eq!(
-            configs
-                .keys()
-                .filter(|key| key.source_env == Some(ROTATION_TEST_SOURCE))
-                .count(),
-            1
-        );
-    }
-
-    #[test]
-    fn reqwest_certificate_cache_reuses_content_and_detects_same_metadata_rotation() {
-        const ROTATION_TEST_SOURCE: &str = "CODEX_REQWEST_CA_CERTIFICATE_ROTATION_TEST";
-        let temp_dir = TempDir::new().expect("tempdir");
-        let first_pem = format!("# rotation A\n{TEST_CERT}");
-        let second_pem = format!("# rotation B\n{TEST_CERT}");
-        assert_eq!(first_pem.len(), second_pem.len());
-        let cert_path = write_cert_file(&temp_dir, "rotating-reqwest-ca.pem", &first_pem);
-        let original_metadata = fs::metadata(&cert_path).expect("first CA metadata");
-        let original_modified = original_metadata.modified().expect("first CA mtime");
-        let bundle = ConfiguredCaBundle {
-            source_env: ROTATION_TEST_SOURCE,
-            path: cert_path.clone(),
-        };
-
-        let first = cached_reqwest_certificates(&bundle).expect("first parsed certificates");
-        let reused = cached_reqwest_certificates(&bundle).expect("reused parsed certificates");
-        assert!(Arc::ptr_eq(&first, &reused));
-
-        fs::write(&cert_path, second_pem).expect("rotate CA contents");
-        OpenOptions::new()
-            .write(true)
-            .open(&cert_path)
-            .expect("open rotated CA")
-            .set_times(FileTimes::new().set_modified(original_modified))
-            .expect("restore CA mtime");
-        let rotated_metadata = fs::metadata(&cert_path).expect("rotated CA metadata");
-        assert_eq!(rotated_metadata.len(), original_metadata.len());
-        assert_eq!(
-            rotated_metadata.modified().expect("rotated CA mtime"),
-            original_modified
-        );
-
-        let rotated = cached_reqwest_certificates(&bundle).expect("rotated parsed certificates");
-        assert!(!Arc::ptr_eq(&first, &rotated));
-        assert!(Arc::ptr_eq(
-            &rotated,
-            &cached_reqwest_certificates(&bundle).expect("reused rotated certificates")
-        ));
-    }
-
-    #[test]
-    fn rustls_config_reports_invalid_ca_file() {
-        let temp_dir = TempDir::new().expect("tempdir");
-        let cert_path = write_cert_file(&temp_dir, "empty.pem", "");
-        let env = map_env(&[(CODEX_CA_CERT_ENV, cert_path.to_string_lossy().as_ref())]);
-
-        let error = maybe_build_rustls_client_config_with_env(&env).expect_err("invalid CA");
-
-        assert!(matches!(
-            error,
-            BuildCustomCaTransportError::InvalidCaFile { .. }
-        ));
-    }
-
-    #[test]
-    fn blocking_client_reports_invalid_ca_file() {
-        let temp_dir = TempDir::new().expect("tempdir");
-        let cert_path = write_cert_file(&temp_dir, "empty.pem", "");
-        let env = map_env(&[(CODEX_CA_CERT_ENV, cert_path.to_string_lossy().as_ref())]);
-
-        let error = build_blocking_reqwest_client_with_env(
-            &env,
-            reqwest::blocking::Client::builder().no_proxy(),
-        )
-        .expect_err("invalid CA");
-
-        assert!(matches!(
-            error,
-            BuildCustomCaTransportError::InvalidCaFile { .. }
-        ));
-    }
-
-    #[test]
-    fn explicit_async_roots_ignore_process_custom_ca_file() {
-        let env = map_env(&[(CODEX_CA_CERT_ENV, "missing-process-ca.pem")]);
-        let certificate = reqwest::Certificate::from_pem(TEST_CERT.as_bytes())
-            .expect("valid explicit CA certificate");
-
-        let client = build_reqwest_client_with_env_and_policy(
-            &env,
-            reqwest::Client::builder()
-                .no_proxy()
-                .tls_certs_only(vec![certificate]),
-            CustomCaPolicy::ExplicitRootSet,
-        );
-
-        assert!(client.is_ok());
-    }
-
-    #[test]
-    fn explicit_blocking_roots_ignore_process_custom_ca_file() {
-        let env = map_env(&[(CODEX_CA_CERT_ENV, "missing-process-ca.pem")]);
-        let certificate = reqwest::Certificate::from_pem(TEST_CERT.as_bytes())
-            .expect("valid explicit CA certificate");
-
-        let client = build_blocking_reqwest_client_with_env_and_policy(
-            &env,
-            reqwest::blocking::Client::builder()
-                .no_proxy()
-                .tls_certs_only(vec![certificate]),
-            CustomCaPolicy::ExplicitRootSet,
-        );
-
-        assert!(client.is_ok());
-    }
-    #[test]
-    fn trusted_pem_normalization_is_scoped_to_each_block() {
-        let bundle = ConfiguredCaBundle {
-            source_env: "TEST",
-            path: "mixed.pem".into(),
-        };
-        let certs = bundle.parse_certificates(b"# TRUSTED CERTIFICATE comment\n-----BEGIN CERTIFICATE-----\nMAAFAA==\n-----END CERTIFICATE-----\n-----BEGIN TRUSTED CERTIFICATE-----\nMAAwAA==\n-----END TRUSTED CERTIFICATE-----\n").expect("parse mixed PEM with empty AUX");
-        assert_eq!(
-            certs.iter().map(AsRef::as_ref).collect::<Vec<_>>(),
-            vec![&[0x30, 0, 5, 0][..], &[0x30, 0][..]]
-        );
-        // Unknown/nonempty AUX must not become an unrestricted root, even alongside a plain block.
-        assert!(bundle.parse_certificates(b"-----BEGIN CERTIFICATE-----\nMAA=\n-----END CERTIFICATE-----\n-----BEGIN TRUSTED CERTIFICATE-----\nMAAFAA==\n-----END TRUSTED CERTIFICATE-----\n").is_err());
-    }
-
-    #[test]
-    fn environment_root_rotation_revokes_old_trust() {
-        const CHILD: &str = "CODEX_HTTP_ROOT_ROTATION_CHILD";
-        let Ok(path) = std::env::var(CHILD) else {
-            let dir = TempDir::new().expect("tempdir");
-            for codex_override in [false, true] {
-                let path = dir.path().join("rotating.pem");
-                let mut command = std::process::Command::new(std::env::current_exe().unwrap());
-                command
-                    .args([
-                        "--exact",
-                        "custom_ca::tests::environment_root_rotation_revokes_old_trust",
-                        "--nocapture",
-                    ])
-                    .env(CHILD, &path)
-                    .env("SSL_CERT_FILE", &path)
-                    .env_remove("SSL_CERT_DIR")
-                    .env_remove("CODEX_CA_CERTIFICATE");
-                if codex_override {
-                    command.env("CODEX_CA_CERTIFICATE", dir.path().join("fixed.pem"));
-                }
-                let output = command.output().expect("run isolated rotation test");
-                assert!(
-                    output.status.success(),
-                    "rotation failed: {} {}",
-                    String::from_utf8_lossy(&output.stdout),
-                    String::from_utf8_lossy(&output.stderr)
-                );
-                assert!(String::from_utf8_lossy(&output.stdout).contains("ROTATION_ASSERTED"));
-            }
-            return;
-        };
-        fn certificate() -> (String, Arc<rustls::ServerConfig>) {
-            let rcgen::CertifiedKey { cert, signing_key } =
-                rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
-            let server = rustls::ServerConfig::builder()
-                .with_no_client_auth()
-                .with_single_cert(
-                    vec![cert.der().clone()],
-                    rustls_pki_types::PrivateKeyDer::Pkcs8(signing_key.serialize_der().into()),
-                )
-                .unwrap();
-            (cert.pem(), Arc::new(server))
-        }
-        super::ensure_rustls_crypto_provider();
-        let (pem_a, server_a) = certificate();
-        let (pem_b, server_b) = certificate();
-        fs::write(&path, pem_a).unwrap();
-        if let Some(fixed) = std::env::var_os("CODEX_CA_CERTIFICATE") {
-            fs::write(fixed, TEST_CERT).unwrap();
-        }
-        let first = super::build_rustls_client_config_with_custom_ca().expect("first config");
-        handshake(first, Arc::clone(&server_a)).expect("A trusted initially");
-        fs::write(&path, pem_b).unwrap();
-        let rotated = super::build_rustls_client_config_with_custom_ca().expect("rotated config");
-        handshake(Arc::clone(&rotated), server_b).expect("B trusted after rotation");
-        assert!(matches!(
-            handshake(rotated, server_a),
-            Err(rustls::Error::InvalidCertificate(
-                rustls::CertificateError::UnknownIssuer | rustls::CertificateError::BadSignature
-            ))
-        ));
-        println!("ROTATION_ASSERTED");
-    }
-}

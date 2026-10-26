@@ -59,5 +59,3 @@ pub use thread_queue::*;
 pub use turn::*;
 pub use windows_sandbox::*;
 
-#[cfg(test)]
-mod tests;

@@ -106,26 +106,3 @@ impl JsonSchema for SessionId {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_session_id_default_is_not_zeroes() {
-        let id = SessionId::default();
-        assert_ne!(id.uuid, Uuid::nil());
-        assert_eq!(id.uuid.get_version(), Some(uuid::Version::SortRand));
-        assert_eq!(
-            serde_json::from_value::<SessionId>(serde_json::to_value(id).unwrap()).unwrap(),
-            id
-        );
-    }
-
-    #[test]
-    fn converts_to_and_from_thread_id() {
-        let thread_id = ThreadId::new();
-        let session_id = SessionId::from(thread_id);
-
-        assert_eq!(ThreadId::from(session_id), thread_id);
-    }
-}

@@ -165,12 +165,6 @@ impl CommandPreflightRetry {
     }
 }
 
-#[cfg(test)]
-pub fn preflight_command(command: &[String], shell_type: Option<ShellType>) -> Result<(), String> {
-    preflight_command_issue(command, shell_type)
-        .map(|_| ())
-        .map_err(|issue| issue.render_for_model())
-}
 
 fn preflight_command_issue(
     command: &[String],
@@ -227,15 +221,6 @@ fn preflight_command_issues(
     Ok(argv_commands)
 }
 
-#[cfg(any(test, feature = "test-support"))]
-pub fn preflight_invocation_with_equivalent_repair(
-    invocation: &CommandInvocation,
-    command: &[String],
-    shell_type: Option<ShellType>,
-) -> Result<CommandPreflightOutcome, String> {
-    preflight_invocation_with_equivalent_repair_detailed(invocation, command, shell_type)
-        .map_err(|issue| issue.render_for_model())
-}
 
 pub async fn preflight_invocation_with_equivalent_repair_async(
     invocation: &CommandInvocation,
@@ -1345,6 +1330,3 @@ fn truncate(value: &str) -> String {
     }
 }
 
-#[cfg(test)]
-#[path = "command_preflight_tests.rs"]
-mod command_preflight_tests;

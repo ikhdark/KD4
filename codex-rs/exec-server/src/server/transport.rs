@@ -125,26 +125,6 @@ async fn run_stdio_connection(
     .await
 }
 
-#[cfg(test)]
-async fn run_stdio_connection_with_io<R, W>(
-    reader: R,
-    writer: W,
-    runtime_paths: ExecServerRuntimePaths,
-    telemetry: ExecServerTelemetry,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
-where
-    R: AsyncRead + Unpin + Send + 'static,
-    W: AsyncWrite + Unpin + Send + 'static,
-{
-    run_stdio_connection_with_io_and_shutdown(
-        reader,
-        writer,
-        runtime_paths,
-        telemetry,
-        crate::ExecServerShutdown::new(),
-    )
-    .await
-}
 
 async fn run_stdio_connection_with_io_and_shutdown<R, W>(
     reader: R,
@@ -272,6 +252,3 @@ async fn websocket_upgrade_handler(
         .into_response()
 }
 
-#[cfg(test)]
-#[path = "transport_tests.rs"]
-mod transport_tests;

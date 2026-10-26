@@ -35,7 +35,7 @@ impl From<LoaderOverrides> for ConfigLoadOptions {
     }
 }
 
-/// LoaderOverrides overrides managed configuration inputs (primarily for tests).
+/// LoaderOverrides overrides managed configuration inputs.
 #[derive(Debug, Default, Clone)]
 pub struct LoaderOverrides {
     pub user_config_path: Option<AbsolutePathBuf>,
@@ -49,48 +49,6 @@ pub struct LoaderOverrides {
 }
 
 impl LoaderOverrides {
-    /// Returns overrides that ignore host-managed configuration.
-    ///
-    /// This is intended for tests that should load only repo-controlled config fixtures.
-    pub fn without_managed_config_for_tests() -> Self {
-        let base = std::env::temp_dir().join("codex-config-tests");
-        Self {
-            user_config_path: None,
-            user_config_profile: None,
-            managed_config_path: Some(base.join("managed_config.toml")),
-            system_config_path: Some(base.join("config.toml")),
-            system_requirements_path: Some(base.join("requirements.toml")),
-            ignore_managed_requirements: false,
-            ignore_user_config: false,
-            ignore_user_and_project_exec_policy_rules: false,
-        }
-    }
-
-    /// Returns overrides with host MDM disabled and managed config loaded from
-    /// `managed_config_path`. System requirements are loaded from a sibling
-    /// `requirements.toml` fixture.
-    ///
-    /// This is intended for tests that supply an explicit managed config fixture.
-    pub fn with_managed_config_path_for_tests(managed_config_path: PathBuf) -> Self {
-        let system_requirements_path = managed_config_path.with_file_name("requirements.toml");
-        Self {
-            user_config_path: None,
-            user_config_profile: None,
-            managed_config_path: Some(managed_config_path),
-            system_requirements_path: Some(system_requirements_path),
-            ..Self::without_managed_config_for_tests()
-        }
-    }
-
-    /// Returns overrides with host-managed inputs disabled and system requirements loaded from
-    /// `system_requirements_path`.
-    pub fn with_system_requirements_path_for_tests(system_requirements_path: PathBuf) -> Self {
-        Self {
-            system_requirements_path: Some(system_requirements_path),
-            ..Self::without_managed_config_for_tests()
-        }
-    }
-
     pub fn user_config_path(&self, codex_home: &Path) -> std::io::Result<AbsolutePathBuf> {
         match self.user_config_path.as_ref() {
             Some(path) => Ok(path.clone()),
@@ -762,7 +720,3 @@ fn verify_layer_ordering(layers: &[ConfigLayerEntry]) -> std::io::Result<Option<
 
     Ok(user_layer_index)
 }
-
-#[cfg(test)]
-#[path = "state_tests.rs"]
-mod tests;

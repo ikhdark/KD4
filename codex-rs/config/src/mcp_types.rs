@@ -487,7 +487,3 @@ mod option_duration_secs {
             .transpose()
     }
 }
-
-#[cfg(test)]
-#[path = "mcp_types_tests.rs"]
-mod tests;

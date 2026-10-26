@@ -231,6 +231,3 @@ fn is_http_token(value: &str) -> bool {
         })
 }
 
-#[cfg(test)]
-#[path = "www_authenticate_tests.rs"]
-mod tests;

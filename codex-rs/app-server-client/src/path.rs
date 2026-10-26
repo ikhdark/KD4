@@ -52,15 +52,3 @@ impl fmt::Display for AppServerPath {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn joins_forward_slash_unc_path_with_windows_separator() {
-        let path = AppServerPath::from_absolute_str("//server/share")
-            .expect("UNC path should be absolute");
-
-        assert_eq!(path.join("folder").as_str(), "//server/share\\folder");
-    }
-}

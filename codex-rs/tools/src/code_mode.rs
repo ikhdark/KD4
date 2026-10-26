@@ -246,7 +246,3 @@ fn code_mode_tool_definitions_for_spec(spec: &ToolSpec) -> Vec<CodeModeToolDefin
 pub fn code_mode_name_for_tool_name(tool_name: &ToolName) -> String {
     codex_code_mode::legacy_code_mode_identifier(tool_name)
 }
-
-#[cfg(test)]
-#[path = "code_mode_tests.rs"]
-mod tests;

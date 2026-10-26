@@ -437,6 +437,3 @@ async fn spawn_stdio_command(
     Ok((child, managed_root))
 }
 
-#[cfg(test)]
-#[path = "client_transport_tests.rs"]
-mod tests;

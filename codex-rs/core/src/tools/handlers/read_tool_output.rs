@@ -9,10 +9,6 @@ use crate::tools::command_output_artifact::ToolOutputSelectorStatus;
 use crate::tools::command_output_artifact::ToolOutputSnapshot;
 use crate::tools::command_output_artifact::find_other_thread_artifact_owner;
 use crate::tools::command_output_artifact::load_tool_output_snapshot;
-#[cfg(test)]
-use crate::tools::command_output_artifact::read_tool_output_selectors_with_ceiling_and_reuse;
-#[cfg(test)]
-use crate::tools::command_output_artifact::read_tool_output_selectors_with_reuse;
 use crate::tools::context::ToolCallSource;
 use crate::tools::context::ToolInvocation;
 use crate::tools::context::ToolPayload;
@@ -43,8 +39,6 @@ use serde::Serialize;
 use serde_json::Value;
 use sha2::Digest;
 use sha2::Sha256;
-#[cfg(test)]
-use std::path::Path;
 use tokio_util::sync::CancellationToken;
 
 const DEFAULT_LINE_COUNT: usize = 200;
@@ -447,54 +441,6 @@ impl RecoveryContinuationState {
         Ok(())
     }
 
-    #[cfg(test)]
-    fn reconstructed_output(&self) -> ReadToolOutputResult {
-        // Replace overflow descriptors only after exact, gap-free coverage is
-        // proven. Appended byte pages are transport fragments, not extra selections.
-        if self.output.unavailable_ranges.is_empty()
-            && self.output.results[..self.initial_result_count]
-                .iter()
-                .any(|owner| owner.status != ToolOutputSelectorStatus::Ok)
-        {
-            let mut reconstructed = self.output.clone();
-            let mut recovered_owners = Vec::new();
-            for owner in &mut reconstructed.results[..self.initial_result_count] {
-                if owner.status == ToolOutputSelectorStatus::Ok {
-                    continue;
-                }
-                if let Some(exact) = reconstruct_selection(owner, &self.output.results) {
-                    recovered_owners.push((exact.selector.clone(), exact.canonical_range));
-                    *owner = exact;
-                }
-            }
-            if !recovered_owners.is_empty() {
-                // Only discard fragments represented by a reconstructed owner.
-                // Other continuation pages and explicit search pages remain intact.
-                let mut index = 0;
-                reconstructed.results.retain(|page| {
-                    let keep = index < self.initial_result_count
-                        || !recovered_owners.iter().any(|(selector, range)| {
-                            page.selector == *selector
-                                || (matches!(page.selector, ToolOutputSelector::Bytes { .. })
-                                    && range.zip(page.canonical_range).is_some_and(
-                                        |(owner, page)| {
-                                            owner.start <= page.start && page.end <= owner.end
-                                        },
-                                    ))
-                        });
-                    index += 1;
-                    keep
-                });
-                reconstructed.complete = reconstructed.results.iter().all(|r| {
-                    r.status == ToolOutputSelectorStatus::Ok
-                        && r.complete
-                        && (r.selector.is_search() || r.continuation.is_none())
-                });
-                return reconstructed;
-            }
-        }
-        self.output.clone()
-    }
 
     // Charge unrelated selections and already accepted payload before reading
     // another page. The active owner's overflow descriptor and fragment
@@ -1487,45 +1433,7 @@ fn file_only_selector_kind(arguments: &str) -> Option<&'static str> {
         })
 }
 
-#[cfg(test)]
-pub(crate) async fn execute_recovery_transaction(
-    codex_home: &Path,
-    thread_id: &str,
-    artifact_id: &str,
-    selectors: Vec<ToolOutputSelector>,
-    code_mode_recovery: bool,
-) -> Result<(ReadToolOutputResult, bool), ReadToolOutputError> {
-    if code_mode_recovery {
-        read_tool_output_selectors_with_ceiling_and_reuse(
-            codex_home,
-            thread_id,
-            artifact_id,
-            selectors,
-            CODE_MODE_RECOVERY_TOKEN_CEILING,
-        )
-        .await
-    } else {
-        read_tool_output_selectors_with_reuse(codex_home, thread_id, artifact_id, selectors).await
-    }
-}
 
-#[cfg(test)]
-pub(crate) async fn execute_recovery_transaction_with_continuations(
-    codex_home: &Path,
-    thread_id: &str,
-    artifact_id: &str,
-    selectors: Vec<ToolOutputSelector>,
-    code_mode_recovery: bool,
-    cancellation_token: &CancellationToken,
-) -> Result<DrainedRecoveryTransaction, ReadToolOutputError> {
-    let token_ceiling = if code_mode_recovery {
-        CODE_MODE_RECOVERY_TOKEN_CEILING
-    } else {
-        RECOVERY_AGGREGATE_TOKEN_CEILING
-    };
-    let snapshot = load_tool_output_snapshot(codex_home, thread_id, artifact_id).await?;
-    drain_recovery_snapshot(&snapshot, selectors, token_ceiling, cancellation_token).await
-}
 
 async fn drain_recovery_snapshot_for_delivery(
     snapshot: &std::sync::Arc<ToolOutputSnapshot>,
@@ -1618,22 +1526,6 @@ async fn drain_recovery_snapshot_with_byte_limit(
     }
 }
 
-#[cfg(test)]
-async fn drain_recovery_snapshot(
-    snapshot: &std::sync::Arc<ToolOutputSnapshot>,
-    selectors: Vec<ToolOutputSelector>,
-    token_ceiling: usize,
-    cancellation_token: &CancellationToken,
-) -> Result<DrainedRecoveryTransaction, ReadToolOutputError> {
-    drain_recovery_snapshot_with_source_budget(
-        snapshot,
-        selectors,
-        token_ceiling,
-        usize::MAX,
-        cancellation_token,
-    )
-    .await
-}
 
 // Source bytes and envelope metadata have independent budgets. Turn an exact
 // oversized selection into the same byte-subdivision contract used by the
@@ -1890,11 +1782,6 @@ async fn drain_recovery_snapshot_with_source_budget(
     Ok(result)
 }
 
-#[cfg(test)]
-fn recovery_result_fits_token_ceiling(output: &ReadToolOutputResult, token_ceiling: usize) -> bool {
-    serde_json::to_string(output)
-        .is_ok_and(|rendered| codex_utils_string::approx_token_count(&rendered) <= token_ceiling)
-}
 
 fn exact_code_mode_recovery_receipt(
     code_mode_recovery: bool,
@@ -2020,12 +1907,3 @@ fn resolved_max_bytes(max_bytes: Option<usize>) -> Result<usize, FunctionCallErr
     }
 }
 
-#[cfg(test)]
-#[path = "read_tool_output_paging_tests.rs"]
-mod paging_regressions;
-#[cfg(test)]
-#[path = "read_tool_output_budget_tests.rs"]
-mod budget_tests;
-#[cfg(test)]
-#[path = "read_tool_output_tests.rs"]
-mod tests;

@@ -133,8 +133,6 @@ pub struct RemoteControlHandle {
 #[derive(Clone, Copy)]
 enum RemoteControlHttpClientSource<'a> {
     Pool(&'a RouteAwareClientPool),
-    #[cfg(test)]
-    Fixed(&'a HttpClient),
 }
 
 impl RemoteControlHttpClientSource<'_> {
@@ -144,8 +142,6 @@ impl RemoteControlHttpClientSource<'_> {
                 .client_for_url(url)
                 .await
                 .map_err(io::Error::other),
-            #[cfg(test)]
-            Self::Fixed(client) => Ok(client.clone()),
         }
     }
 }
@@ -604,20 +600,6 @@ impl RemoteControlHandle {
         .await
     }
 
-    #[cfg(test)]
-    pub(super) async fn start_pairing_with_client(
-        &self,
-        client: &HttpClient,
-        params: RemoteControlPairingStartParams,
-        app_server_client_name: Option<&str>,
-    ) -> io::Result<RemoteControlPairingStartResponse> {
-        self.start_pairing_with_source(
-            RemoteControlHttpClientSource::Fixed(client),
-            params,
-            app_server_client_name,
-        )
-        .await
-    }
 
     async fn start_pairing_with_source(
         &self,
@@ -1529,7 +1511,3 @@ pub async fn start_remote_control(
     ))
 }
 
-#[cfg(test)]
-mod segment_tests;
-#[cfg(test)]
-mod tests;

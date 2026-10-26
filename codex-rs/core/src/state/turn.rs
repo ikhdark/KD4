@@ -112,21 +112,8 @@ pub(crate) struct TurnTerminalCoordinator {
     tool_call_acceptance: Arc<ToolCallAcceptanceGate>,
     wake_generation: AtomicU64,
     completion_waiters: AtomicU32,
-    #[cfg(test)]
-    cleanup_waiters: AtomicU32,
     interrupt_resolution_waiters: AtomicU32,
     sampling_admission_waiters: AtomicU32,
-    #[cfg(test)]
-    panic_before_worker_cancellation: AtomicBool,
-    #[cfg(test)]
-    panic_after_terminal_publication: AtomicBool,
-    #[cfg(test)]
-    publication_pause: std::sync::Mutex<
-        Option<(
-            tokio::sync::oneshot::Sender<()>,
-            tokio::sync::oneshot::Receiver<()>,
-        )>,
-    >,
 }
 
 /// The interrupt durability fence is one state machine, not three independent
@@ -182,14 +169,6 @@ pub(crate) enum TerminalWakeResult {
     Stale,
 }
 
-#[cfg(test)]
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub(crate) struct TerminalWaiterSnapshot {
-    pub(crate) completion: u32,
-    pub(crate) cleanup: u32,
-    pub(crate) interrupt_resolution: u32,
-    pub(crate) sampling_admission: u32,
-}
 
 struct TerminalWaiterGuard<'a>(&'a AtomicU32);
 
@@ -227,10 +206,6 @@ impl InterruptFenceState {
 }
 
 impl TurnTerminalCoordinator {
-    #[cfg(test)]
-    pub(crate) fn new(turn_id: String) -> Arc<Self> {
-        Self::new_with_tool_call_acceptance(turn_id, Arc::new(ToolCallAcceptanceGate::default()))
-    }
 
     pub(crate) fn new_with_tool_call_acceptance(
         turn_id: String,
@@ -251,16 +226,8 @@ impl TurnTerminalCoordinator {
             tool_call_acceptance,
             wake_generation: AtomicU64::new(1),
             completion_waiters: AtomicU32::new(0),
-            #[cfg(test)]
-            cleanup_waiters: AtomicU32::new(0),
             interrupt_resolution_waiters: AtomicU32::new(0),
             sampling_admission_waiters: AtomicU32::new(0),
-            #[cfg(test)]
-            panic_before_worker_cancellation: AtomicBool::new(false),
-            #[cfg(test)]
-            panic_after_terminal_publication: AtomicBool::new(false),
-            #[cfg(test)]
-            publication_pause: std::sync::Mutex::new(None),
         })
     }
 
@@ -281,15 +248,6 @@ impl TurnTerminalCoordinator {
         ))
     }
 
-    #[cfg(test)]
-    pub(crate) fn waiter_snapshot(&self) -> TerminalWaiterSnapshot {
-        TerminalWaiterSnapshot {
-            completion: self.completion_waiters.load(Ordering::Acquire),
-            cleanup: self.cleanup_waiters.load(Ordering::Acquire),
-            interrupt_resolution: self.interrupt_resolution_waiters.load(Ordering::Acquire),
-            sampling_admission: self.sampling_admission_waiters.load(Ordering::Acquire),
-        }
-    }
 
     fn wake_generation_matches(&self, expected: &SamplingGenerationId) -> bool {
         &self.wake_generation_id() == expected
@@ -342,12 +300,6 @@ impl TurnTerminalCoordinator {
         self.completion_notify.notify_waiters();
     }
 
-    /// Establish a pre-terminal fence. This deliberately does not claim or
-    /// terminalize the turn; it only closes provider sampling admission.
-    #[cfg(test)]
-    pub(crate) async fn mark_interrupt_pending(&self) -> bool {
-        self.mark_interrupt_pending_if(|| true).await
-    }
 
     /// Deliver an interruption while admission is locked, fencing only an
     /// accepted delivery before its consumer can claim terminal completion.
@@ -479,78 +431,13 @@ impl TurnTerminalCoordinator {
         }
     }
 
-    #[cfg(test)]
-    pub(crate) async fn wait_cleanup_completed(&self) {
-        let _waiter = TerminalWaiterGuard::new(&self.cleanup_waiters);
-        loop {
-            let notified = self.cleanup_completion_notify.notified();
-            if self.cleanup_completed.load(Ordering::Acquire) {
-                return;
-            }
-            notified.await;
-        }
-    }
 
-    #[cfg(test)]
-    pub(crate) fn request_panic_after_terminal_publication(&self) {
-        self.panic_after_terminal_publication
-            .store(true, Ordering::Release);
-    }
 
-    #[cfg(test)]
-    pub(crate) fn pause_publication_for_test(
-        &self,
-    ) -> (
-        tokio::sync::oneshot::Receiver<()>,
-        tokio::sync::oneshot::Sender<()>,
-    ) {
-        let (entered, wait_entered) = tokio::sync::oneshot::channel();
-        let (release, wait_release) = tokio::sync::oneshot::channel();
-        *self.publication_pause.lock().unwrap() = Some((entered, wait_release));
-        (wait_entered, release)
-    }
 
-    #[cfg(test)]
-    pub(crate) async fn wait_publication_pause_for_test(&self) {
-        let pause = self.publication_pause.lock().unwrap().take();
-        if let Some((entered, release)) = pause {
-            let _ = entered.send(());
-            let _ = release.await;
-        }
-    }
 
-    #[cfg(test)]
-    pub(crate) fn panic_after_terminal_publication_was_consumed_for_test(&self) -> bool {
-        !self
-            .panic_after_terminal_publication
-            .load(Ordering::Acquire)
-    }
 
-    #[cfg(test)]
-    pub(crate) fn panic_after_terminal_publication_if_requested(&self) {
-        if self
-            .panic_after_terminal_publication
-            .swap(false, Ordering::AcqRel)
-        {
-            panic!("injected panic after terminal publication before parent dispatch");
-        }
-    }
 
-    #[cfg(test)]
-    pub(crate) fn request_panic_before_worker_cancellation(&self) {
-        self.panic_before_worker_cancellation
-            .store(true, Ordering::Release);
-    }
 
-    #[cfg(test)]
-    pub(crate) fn panic_before_worker_cancellation_if_requested(&self) {
-        if self
-            .panic_before_worker_cancellation
-            .swap(false, Ordering::AcqRel)
-        {
-            panic!("injected panic before worker cancellation");
-        }
-    }
 }
 
 pub(crate) struct TurnTerminalPermit {
@@ -652,10 +539,6 @@ impl TurnState {
         }
     }
 
-    #[cfg(test)]
-    pub(crate) fn has_pending_approval(&self, key: &str) -> bool {
-        self.pending_approvals.contains_key(key)
-    }
 
     pub(crate) fn clear_pending_waiters(&mut self) {
         self.pending_approvals.clear();
@@ -674,10 +557,6 @@ impl TurnState {
             .insert(key, pending_request_permissions)
     }
 
-    #[cfg(test)]
-    pub(crate) fn has_pending_request_permissions(&self, key: &str) -> bool {
-        self.pending_request_permissions.contains_key(key)
-    }
 
     pub(crate) fn remove_pending_request_permissions(
         &mut self,
@@ -750,10 +629,6 @@ impl TurnState {
         }
     }
 
-    #[cfg(test)]
-    pub(crate) fn has_pending_user_input(&self, key: &str) -> bool {
-        self.pending_user_input.contains_key(key)
-    }
 
     pub(crate) fn insert_pending_elicitation(
         &mut self,
@@ -789,15 +664,6 @@ impl TurnState {
         }
     }
 
-    #[cfg(test)]
-    pub(crate) fn has_pending_elicitation(
-        &self,
-        server_name: &str,
-        request_id: &RequestId,
-    ) -> bool {
-        self.pending_elicitations
-            .contains_key(&(server_name.to_string(), request_id.clone()))
-    }
 
     pub(crate) fn try_insert_pending_dynamic_tool(
         &mut self,
@@ -842,10 +708,6 @@ impl TurnState {
         }
     }
 
-    #[cfg(test)]
-    pub(crate) fn has_pending_dynamic_tool(&self, key: &str) -> bool {
-        self.pending_dynamic_tools.contains_key(key)
-    }
 
     pub(crate) fn accept_mailbox_delivery_for_current_turn(&mut self) {
         self.set_mailbox_delivery_phase(MailboxDeliveryPhase::CurrentTurn);

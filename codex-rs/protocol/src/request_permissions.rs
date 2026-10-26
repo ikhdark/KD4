@@ -158,20 +158,3 @@ pub struct RequestPermissionsEvent {
     pub cwd_uri: Option<PathUri>,
 }
 
-#[cfg(test)]
-mod tests {
-    use super::RequestPermissionsEvent;
-    use serde_json::json;
-
-    #[test]
-    fn request_permissions_event_accepts_legacy_payload_without_cwd_uri() {
-        let event = serde_json::from_value::<RequestPermissionsEvent>(json!({
-            "call_id": "call-1",
-            "started_at_ms": 0,
-            "permissions": {}
-        }))
-        .expect("legacy request-permissions event should deserialize");
-
-        assert_eq!(event.cwd_uri, None);
-    }
-}

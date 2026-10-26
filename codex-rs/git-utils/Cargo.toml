@@ -20,8 +20,5 @@ tempfile = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["macros", "process", "rt", "time"] }
 
-[dev-dependencies]
-pretty_assertions = { workspace = true }
-
 [lib]
 doctest = false

@@ -284,7 +284,3 @@ fn hook_output_path(output_dir: &AbsolutePathBuf, thread_id: ThreadId) -> Absolu
         .join(thread_id.to_string())
         .join(format!("{}.txt", Uuid::new_v4()))
 }
-
-#[cfg(test)]
-#[path = "output_spill_tests.rs"]
-mod tests;

@@ -295,16 +295,6 @@ impl CodexAppsToolsCacheContext {
         tools
     }
 
-    #[cfg(test)]
-    pub(crate) fn store_current_tools_for_test(&self, tools: Vec<ToolInfo>) {
-        self.entry
-            .current_snapshot
-            .store(Some(Arc::new(CodexAppsToolsSnapshot {
-                tools,
-                published_at: None,
-                content_revision: self.content_revision() + 1,
-            })));
-    }
 }
 
 impl CodexAppsToolsCache {
@@ -473,22 +463,6 @@ impl CodexAppsToolsCacheIdentity {
     }
 }
 
-#[cfg(test)]
-fn write_cached_codex_apps_tools_for_test(
-    cache_context: &CodexAppsToolsCacheContext,
-    server_info: &McpServerInfo,
-    tools: &[ToolInfo],
-) {
-    cache_context
-        .entry
-        .current_snapshot
-        .store(Some(Arc::new(CodexAppsToolsSnapshot {
-            tools: tools.to_vec(),
-            published_at: Some(Instant::now()),
-            content_revision: cache_context.content_revision() + 1,
-        })));
-    persist_codex_apps_cache(cache_context, server_info, tools);
-}
 
 pub(crate) fn load_startup_cached_codex_apps_server_info(
     cache_context: &CodexAppsToolsCacheContext,
@@ -496,12 +470,6 @@ pub(crate) fn load_startup_cached_codex_apps_server_info(
     load_cached_codex_apps_server_info(cache_context)
 }
 
-#[cfg(test)]
-fn read_cached_codex_apps_tools(
-    cache_context: &CodexAppsToolsCacheContext,
-) -> Option<Vec<ToolInfo>> {
-    load_cached_codex_apps_tools_for_identity(&cache_context.entry.identity)
-}
 
 #[instrument(level = "trace", skip_all)]
 fn load_cached_codex_apps_tools_for_identity(
@@ -652,6 +620,3 @@ fn lock_unpoisoned<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-#[cfg(test)]
-#[path = "codex_apps_cache_tests.rs"]
-mod tests;

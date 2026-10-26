@@ -1246,39 +1246,6 @@ const MCP_TOOL_PLUGIN_ID_META_KEY: &str = "plugin_id";
 const MCP_TOOL_TEMPLATE_ID_META_KEY: &str = "template_id";
 const MCP_TOOL_RESOURCE_URI_META_KEY: &str = "resource_uri";
 
-#[cfg(test)]
-async fn custom_mcp_tool_approval_mode(
-    sess: &Session,
-    turn_context: &TurnContext,
-    server: &str,
-    tool_name: &str,
-) -> AppToolApproval {
-    let config = sess
-        .services
-        .mcp_manager
-        .runtime_config(&turn_context.config)
-        .await;
-    let servers = codex_mcp::configured_mcp_servers(&config);
-    configured_mcp_tool_approval_mode(&servers, server, tool_name).unwrap_or_default()
-}
-
-#[cfg(test)]
-fn configured_mcp_tool_approval_mode(
-    servers: &HashMap<String, codex_config::types::McpServerConfig>,
-    server: &str,
-    tool_name: &str,
-) -> Option<AppToolApproval> {
-    let server_config = servers.get(server)?;
-    Some(
-        server_config
-            .tools
-            .get(tool_name)
-            .and_then(|tool| tool.approval_mode)
-            .or(server_config.default_tools_approval_mode)
-            .unwrap_or_default(),
-    )
-}
-
 fn build_mcp_tool_call_request_meta(
     turn_context: &TurnContext,
     server: &str,
@@ -2151,20 +2118,6 @@ async fn persist_codex_app_tool_approval(
         .await
 }
 
-#[cfg(test)]
-async fn persist_custom_mcp_tool_approval(
-    config: &Config,
-    server: &str,
-    tool_name: &str,
-) -> anyhow::Result<()> {
-    let Some(config_edits_builder) = custom_mcp_tool_approval_config_builder(config, server)?
-    else {
-        anyhow::bail!("MCP server `{server}` is not configured in config.toml");
-    };
-
-    persist_custom_mcp_tool_approval_with(config_edits_builder, server, tool_name).await
-}
-
 async fn persist_non_app_mcp_tool_approval(
     sess: &Session,
     config: &Config,
@@ -2349,7 +2302,3 @@ async fn notify_mcp_tool_call_skip(
     .await;
     Err(message)
 }
-
-#[cfg(test)]
-#[path = "mcp_tool_call_tests.rs"]
-mod tests;

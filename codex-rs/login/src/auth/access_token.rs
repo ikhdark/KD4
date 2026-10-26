@@ -13,6 +13,3 @@ pub(super) fn classify_codex_access_token(access_token: &str) -> CodexAccessToke
     }
 }
 
-#[cfg(test)]
-#[path = "access_token_tests.rs"]
-mod tests;

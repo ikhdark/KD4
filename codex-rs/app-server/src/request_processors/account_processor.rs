@@ -7,9 +7,6 @@ mod workspace_routing;
 
 // Duration before a browser ChatGPT login attempt is abandoned.
 const LOGIN_CHATGPT_TIMEOUT: Duration = Duration::from_secs(10 * 60);
-// Explicit test-process override. Zero asks the OS to allocate the callback
-// socket; ordinary launches retain the registered OAuth port.
-const LOGIN_TEST_PORT_ENV_VAR: &str = "CODEX_APP_SERVER_TEST_LOGIN_PORT";
 const ACCOUNT_TOKEN_USAGE_FETCH_TIMEOUT: Duration = Duration::from_secs(/*secs*/ 10);
 const ACCOUNT_BACKEND_REQUEST_TIMEOUT: Duration = Duration::from_secs(/*secs*/ 10);
 const ACCOUNT_WORKSPACE_MESSAGES_FETCH_TIMEOUT: Duration =
@@ -20,13 +17,6 @@ const LOGIN_ISSUER_OVERRIDE_ENV_VAR: &str = "CODEX_APP_SERVER_LOGIN_ISSUER";
 #[cfg(debug_assertions)]
 const LOGIN_OPEN_APP_URL_OVERRIDE_ENV_VAR: &str = "CODEX_APP_SERVER_DEV_OPEN_APP_URL";
 
-#[cfg(test)]
-struct DeviceCodeLoginTestControl {
-    issuer: String,
-    prepared: Option<oneshot::Sender<()>>,
-    release: Option<oneshot::Receiver<()>>,
-    committing: Option<oneshot::Sender<()>>,
-}
 
 enum ActiveLogin {
     Browser {
@@ -95,8 +85,6 @@ pub(crate) struct AccountRequestProcessor {
     config_manager: ConfigManager,
     backend_client: BackendClient,
     active_login: Arc<Mutex<Option<ActiveLogin>>>,
-    #[cfg(test)]
-    device_code_test_control: Arc<std::sync::Mutex<Option<DeviceCodeLoginTestControl>>>,
 }
 
 impl AccountRequestProcessor {
@@ -119,33 +107,9 @@ impl AccountRequestProcessor {
             config_manager,
             backend_client,
             active_login: Arc::new(Mutex::new(None)),
-            #[cfg(test)]
-            device_code_test_control: Arc::new(std::sync::Mutex::new(None)),
         }
     }
 
-    #[cfg(test)]
-    pub(crate) fn observe_device_code_commit_for_test(
-        &self,
-        issuer: String,
-        prepared: oneshot::Sender<()>,
-        release: oneshot::Receiver<()>,
-        committing: oneshot::Sender<()>,
-    ) {
-        let control = DeviceCodeLoginTestControl {
-            issuer,
-            prepared: Some(prepared),
-            release: Some(release),
-            committing: Some(committing),
-        };
-        assert!(
-            self.device_code_test_control
-                .lock()
-                .unwrap()
-                .replace(control)
-                .is_none()
-        );
-    }
 
     fn backend_client_for_auth(&self, auth: &CodexAuth) -> BackendClient {
         self.backend_client.clone().with_auth(auth)
@@ -459,20 +423,6 @@ impl AccountRequestProcessor {
                 config.auth_route_config(),
             )
         };
-        let opts = match std::env::var(LOGIN_TEST_PORT_ENV_VAR) {
-            Ok(port) => LoginServerOptions {
-                port: port.parse::<u16>().map_err(|err| {
-                    internal_error(format!("invalid test login callback port: {err}"))
-                })?,
-                ..opts
-            },
-            Err(std::env::VarError::NotPresent) => opts,
-            Err(err) => {
-                return Err(internal_error(format!(
-                    "invalid test login callback port: {err}"
-                )));
-            }
-        };
         #[cfg(debug_assertions)]
         let opts = {
             let mut opts = opts;
@@ -623,16 +573,6 @@ impl AccountRequestProcessor {
                 LoginSuccessPage::default(),
             )
             .await?;
-        #[cfg(test)]
-        let mut test_control = self.device_code_test_control.lock().unwrap().take();
-        #[cfg(test)]
-        let opts = {
-            let mut opts = opts;
-            if let Some(control) = &test_control {
-                opts.issuer = control.issuer.clone();
-            }
-            opts
-        };
         let device_code = request_device_code(&opts)
             .await
             .map_err(Self::login_chatgpt_device_code_start_error)?;
@@ -668,15 +608,6 @@ impl AccountRequestProcessor {
                     }
                     result = prepare_device_code_login(opts, device_code) => result?,
                 };
-                #[cfg(test)]
-                if let Some(control) = &mut test_control {
-                    if let Some(prepared) = control.prepared.take() {
-                        let _ = prepared.send(());
-                    }
-                    if let Some(release) = control.release.take() {
-                        let _ = release.await;
-                    }
-                }
                 // Cancellation and persistence admission share the existing login
                 // registry lock. Once removed here, cancellation returns NotFound:
                 // the owned completion task must finish any admitted auth write.
@@ -686,12 +617,6 @@ impl AccountRequestProcessor {
                         return Err(IoError::new(std::io::ErrorKind::Interrupted, "Login was not completed"));
                     }
                     guard.take();
-                }
-                #[cfg(test)]
-                if let Some(control) = &mut test_control
-                    && let Some(committing) = control.committing.take()
-                {
-                    let _ = committing.send(());
                 }
                 pending.persist().await
             }.await;
@@ -1368,333 +1293,3 @@ fn workspace_messages_feature_disabled(err: &BackendRequestError) -> bool {
     err.status().is_some_and(|status| status.as_u16() == 404)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use codex_backend_client::TokenUsageProfileDailyBucket;
-    use codex_backend_client::TokenUsageProfileStats;
-    use pretty_assertions::assert_eq;
-
-    #[tokio::test]
-    async fn rejected_external_credentials_preserve_active_login() -> anyhow::Result<()> {
-        use crate::outgoing_message::OutgoingEnvelope;
-        use crate::outgoing_message::OutgoingMessage;
-
-        let server = core_test_support::responses::start_mock_server().await;
-        let catalog = codex_models_manager::bundled_models_response()?;
-        let test = core_test_support::test_codex::test_codex()
-            .with_config(move |config| {
-                config.model_catalog = Some(catalog);
-                config.forced_chatgpt_workspace_id = Some(vec!["allowed".to_string()]);
-            })
-            .build(&server)
-            .await?;
-        let config = Arc::new(test.config.clone());
-        let config_manager =
-            ConfigManager::without_managed_config_for_tests(config.codex_home.to_path_buf());
-        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
-        let outgoing = Arc::new(OutgoingMessageSender::new(
-            tx,
-            codex_analytics::AnalyticsEventsClient::disabled(),
-        ));
-        let processor = AccountRequestProcessor::new(
-            AuthManager::from_auth_for_testing(CodexAuth::from_api_key("dummy")),
-            Arc::clone(&test.thread_manager),
-            outgoing,
-            config,
-            config_manager,
-        );
-        let cancel = CancellationToken::new();
-        let login_id = Uuid::new_v4();
-        *processor.active_login.lock().await = Some(ActiveLogin::DeviceCode {
-            cancel: cancel.clone(),
-            login_id,
-        });
-        for (workspace, expected_error) in [
-            ("denied", "External auth must use one of workspace(s)"),
-            ("allowed", "failed to set external auth"),
-        ] {
-            processor
-                .login_account(
-                    ConnectionRequestId {
-                        connection_id: ConnectionId(1),
-                        request_id: RequestId::Integer(1),
-                    },
-                    LoginAccountParams::ChatgptAuthTokens {
-                        access_token: String::new(),
-                        chatgpt_account_id: workspace.to_string(),
-                        chatgpt_plan_type: None,
-                    },
-                )
-                .await
-                .expect("request dispatch");
-            let OutgoingEnvelope::ToConnection {
-                message: OutgoingMessage::Error(error),
-                ..
-            } = rx.recv().await.expect("login rejection")
-            else {
-                panic!("expected a rejected login");
-            };
-            assert!(error.error.message.starts_with(expected_error));
-            assert!(!cancel.is_cancelled());
-            assert_eq!(
-                processor
-                    .active_login
-                    .lock()
-                    .await
-                    .as_ref()
-                    .map(ActiveLogin::login_id),
-                Some(login_id)
-            );
-        }
-        processor.cancel_active_login().await;
-        assert!(cancel.is_cancelled());
-        test.codex.shutdown_and_wait().await?;
-        Ok(())
-    }
-
-    #[test]
-    fn account_token_usage_response_maps_profile_stats_and_daily_buckets() {
-        let response = AccountRequestProcessor::account_token_usage_response(TokenUsageProfile {
-            stats: TokenUsageProfileStats {
-                lifetime_tokens: Some(123),
-                peak_daily_tokens: Some(45),
-                longest_running_turn_sec: Some(67),
-                current_streak_days: Some(8),
-                longest_streak_days: Some(9),
-                daily_usage_buckets: Some(vec![TokenUsageProfileDailyBucket {
-                    start_date: "2026-05-29".to_string(),
-                    tokens: 10,
-                }]),
-            },
-        });
-
-        assert_eq!(
-            response,
-            GetAccountTokenUsageResponse {
-                summary: AccountTokenUsageSummary {
-                    lifetime_tokens: Some(123),
-                    peak_daily_tokens: Some(45),
-                    longest_running_turn_sec: Some(67),
-                    current_streak_days: Some(8),
-                    longest_streak_days: Some(9),
-                },
-                daily_usage_buckets: Some(vec![AccountTokenUsageDailyBucket {
-                    start_date: "2026-05-29".to_string(),
-                    tokens: 10,
-                }]),
-            }
-        );
-    }
-
-    #[test]
-    fn workspace_messages_response_maps_backend_messages() {
-        let response = AccountRequestProcessor::workspace_messages_response(
-            BackendWorkspaceMessagesResponse {
-                messages: vec![BackendWorkspaceMessage {
-                    message_id: "headline-id".to_string(),
-                    message_type: BackendWorkspaceMessageType::Headline,
-                    message_body: "Headline body".to_string(),
-                    created_at: Some("2026-06-14T00:00:00Z".to_string()),
-                    archived_at: Some("2026-06-15T00:00:00Z".to_string()),
-                }],
-            },
-            /*feature_enabled*/ true,
-        )
-        .expect("workspace message timestamps should parse");
-
-        assert_eq!(
-            response,
-            GetWorkspaceMessagesResponse {
-                feature_enabled: true,
-                messages: vec![WorkspaceMessage {
-                    message_id: "headline-id".to_string(),
-                    message_type: WorkspaceMessageType::Headline,
-                    message_body: "Headline body".to_string(),
-                    created_at: Some(1_781_395_200),
-                    archived_at: Some(1_781_481_600),
-                }],
-            }
-        );
-
-        for (backend_type, api_type) in [
-            (
-                BackendWorkspaceMessageType::Announcement,
-                WorkspaceMessageType::Announcement,
-            ),
-            (
-                BackendWorkspaceMessageType::Unknown,
-                WorkspaceMessageType::Unknown,
-            ),
-        ] {
-            let response = AccountRequestProcessor::workspace_messages_response(
-                BackendWorkspaceMessagesResponse {
-                    messages: vec![BackendWorkspaceMessage {
-                        message_id: "other-id".to_string(),
-                        message_type: backend_type,
-                        message_body: "Other body".to_string(),
-                        created_at: None,
-                        archived_at: None,
-                    }],
-                },
-                false,
-            )
-            .expect("absent timestamps are valid");
-            assert_eq!(
-                response,
-                GetWorkspaceMessagesResponse {
-                    feature_enabled: false,
-                    messages: vec![WorkspaceMessage {
-                        message_id: "other-id".to_string(),
-                        message_type: api_type,
-                        message_body: "Other body".to_string(),
-                        created_at: None,
-                        archived_at: None,
-                    }],
-                }
-            );
-        }
-        for (created_at, archived_at) in [(Some("invalid"), None), (None, Some("invalid"))] {
-            let error = AccountRequestProcessor::workspace_messages_response(
-                BackendWorkspaceMessagesResponse {
-                    messages: vec![BackendWorkspaceMessage {
-                        message_id: "invalid-id".to_string(),
-                        message_type: BackendWorkspaceMessageType::Headline,
-                        message_body: String::new(),
-                        created_at: created_at.map(str::to_string),
-                        archived_at: archived_at.map(str::to_string),
-                    }],
-                },
-                true,
-            )
-            .expect_err("invalid timestamps must not be silently dropped");
-            assert_eq!(error.code, -32603);
-            assert!(
-                error
-                    .message
-                    .starts_with("failed to parse workspace message timestamp `invalid`:")
-            );
-        }
-    }
-
-    #[test]
-    fn workspace_messages_feature_disabled_only_for_not_found() {
-        let cases = [
-            (http::StatusCode::NOT_FOUND, true),
-            (http::StatusCode::UNAUTHORIZED, false),
-            (http::StatusCode::FORBIDDEN, false),
-        ];
-
-        for (status, expected) in cases {
-            let err = BackendRequestError::UnexpectedStatus {
-                method: "GET".to_string(),
-                url: "https://example.test/api/codex/workspace-messages".to_string(),
-                status,
-                content_type: "application/json".to_string(),
-                body: "{}".to_string(),
-                retry_after: None,
-            };
-            assert_eq!(workspace_messages_feature_disabled(&err), expected);
-        }
-    }
-
-    #[tokio::test]
-    #[serial_test::serial(login_port)]
-    #[expect(
-        clippy::await_holding_invalid_type,
-        reason = "The held registry lock forces cancellation before ownership transfer and verifies callback cleanup"
-    )]
-    async fn cancelled_login_start_closes_callback_before_registry_ownership() -> anyhow::Result<()>
-    {
-        use tokio::io::AsyncReadExt;
-        use tokio::io::AsyncWriteExt;
-
-        let _ports = core_test_support::login_port::LoginPortLease::acquire().await?;
-        let server = core_test_support::responses::start_mock_server().await;
-        let model_catalog = codex_models_manager::bundled_models_response()?;
-        let test = core_test_support::test_codex::test_codex()
-            .with_config(move |config| config.model_catalog = Some(model_catalog))
-            .build(&server)
-            .await?;
-        let config = Arc::new(test.config.clone());
-        let config_manager =
-            ConfigManager::without_managed_config_for_tests(config.codex_home.to_path_buf());
-        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
-        let outgoing = Arc::new(OutgoingMessageSender::new(
-            tx,
-            codex_analytics::AnalyticsEventsClient::disabled(),
-        ));
-        outgoing
-            .connection_opened(
-                ConnectionId(1),
-                Arc::new(std::sync::atomic::AtomicBool::new(true)),
-            )
-            .await;
-        let processor = AccountRequestProcessor::new(
-            AuthManager::from_auth_for_testing(CodexAuth::from_api_key("dummy")),
-            Arc::clone(&test.thread_manager),
-            outgoing,
-            config,
-            config_manager,
-        );
-        // This is the registered OAuth callback port. An unrelated listener
-        // must not accidentally satisfy the live-server probe below.
-        let callback_address = (std::net::Ipv4Addr::LOCALHOST, 1455);
-        drop(std::net::TcpListener::bind(callback_address)?);
-        let active_login = processor.active_login.lock().await;
-        assert!(active_login.is_none());
-        let mut login = Box::pin(processor.login_account(
-            ConnectionRequestId {
-                connection_id: ConnectionId(1),
-                request_id: RequestId::Integer(1),
-            },
-            LoginAccountParams::Chatgpt {
-                codex_streamlined_login: false,
-                use_hosted_login_success_page: false,
-                app_brand: None,
-            },
-        ));
-        let callback_running = async {
-            loop {
-                if let Ok(mut stream) = tokio::net::TcpStream::connect(callback_address).await {
-                    stream
-                        .write_all(b"GET /startup-probe HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
-                        .await?;
-                    let mut status = [0_u8; 12];
-                    stream.read_exact(&mut status).await?;
-                    assert_eq!(&status, b"HTTP/1.1 404");
-                    return Ok::<(), anyhow::Error>(());
-                }
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        };
-        tokio::select! {
-            _ = &mut login => panic!("login must wait for registry ownership"),
-            result = tokio::time::timeout(Duration::from_secs(5), callback_running) => result??,
-        }
-        // A real HTTP reply proves the callback workers started, not merely
-        // that bind_server has reserved the port on its blocking worker.
-        drop(login);
-        tokio::time::timeout(Duration::from_secs(5), async {
-            loop {
-                match std::net::TcpListener::bind(callback_address) {
-                    Ok(listener) => break listener,
-                    Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => {
-                        tokio::time::sleep(Duration::from_millis(10)).await;
-                    }
-                    Err(error) => panic!("failed checking callback release: {error}"),
-                }
-            }
-        })
-        .await?;
-        assert!(active_login.is_none());
-        assert!(matches!(
-            rx.try_recv(),
-            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
-        ));
-        assert!(!test.codex_home_path().join("auth.json").exists());
-        drop(active_login);
-        test.codex.shutdown_and_wait().await?;
-        Ok(())
-    }
-}

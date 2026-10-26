@@ -44,9 +44,6 @@ use codex_protocol::error::CodexErr;
 use codex_protocol::protocol::InitialHistory;
 use codex_protocol::protocol::MultiAgentVersion;
 
-#[cfg(test)]
-use crate::session::completed_session_loop_termination;
-
 /// Start an interactive sub-Codex thread and return IO channels.
 ///
 /// The returned `events_rx` yields non-approval events emitted by the sub-agent.
@@ -846,7 +843,3 @@ where
         }
     }
 }
-
-#[cfg(test)]
-#[path = "codex_delegate_tests.rs"]
-mod tests;

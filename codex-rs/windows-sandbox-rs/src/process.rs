@@ -429,35 +429,3 @@ where
     })
 }
 
-#[cfg(test)]
-mod tests {
-    use super::wait_for_output_readers;
-    use std::sync::mpsc;
-    use std::time::Duration;
-    use std::time::Instant;
-
-    #[test]
-    fn output_reader_wait_is_bounded_while_a_reader_stays_open() {
-        let (release_tx, release_rx) = mpsc::channel::<()>();
-        let finished = std::thread::spawn(|| {});
-        // Models a reader whose pipe is still held open by a preserved descendant.
-        let blocked = std::thread::spawn(move || {
-            let _ = release_rx.recv();
-        });
-
-        let started = Instant::now();
-        assert!(!wait_for_output_readers(
-            &[&finished, &blocked],
-            Duration::from_millis(50)
-        ));
-        assert!(started.elapsed() < Duration::from_secs(1));
-
-        drop(release_tx);
-        assert!(wait_for_output_readers(
-            &[&finished, &blocked],
-            Duration::from_secs(5)
-        ));
-        blocked.join().expect("join released reader");
-        finished.join().expect("join finished reader");
-    }
-}

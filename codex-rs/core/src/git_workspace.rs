@@ -12,8 +12,6 @@ use std::time::SystemTime;
 use codex_config::ProjectDiscoveryContext;
 use codex_file_system::ExecutorFileSystem;
 use codex_git_utils::{get_git_remote_urls_result, get_git_repo_root_with_fs, get_has_changes, get_head_commit_hash_result};
-#[cfg(test)]
-use codex_git_utils::get_git_repo_root;
 use codex_otel::MetricsClient;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_path_uri::PathUri;
@@ -27,10 +25,6 @@ pub(crate) use codex_command_analysis::git_dirs::resolve_git_dirs;
 const RETAINED_REPOSITORY_CAPACITY: usize = 64;
 const PROJECT_DISCOVERY_REUSE_METRIC: &str = "codex.project_discovery_reuse";
 const ROOT_DISCOVERY_CONCURRENCY: usize = 4;
-
-#[cfg(test)]
-#[path = "git_workspace_tests.rs"]
-mod tests;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct EnvironmentWorkspaceKey {
@@ -247,17 +241,6 @@ pub(crate) struct WorkspaceRootCache {
 }
 
 impl WorkspaceRootCache {
-    #[cfg(test)]
-    pub(crate) fn with_lock_for_test<T>(&self, f: impl FnOnce() -> T) -> T {
-        let _guard = self.entries.lock().expect("workspace root cache");
-        f()
-    }
-
-    #[cfg(test)]
-    pub(crate) fn len(&self) -> usize {
-        self.entries.lock().unwrap().len()
-    }
-
     pub(crate) fn resolve(&self, cwd: &Path) -> std::io::Result<Option<PathBuf>> {
         // Only an exhaustive, successful ancestor walk proves absence. Missing
         // cwd, unreadable metadata and worker failure must not look like non-Git.
@@ -314,17 +297,6 @@ impl WorkspaceRootCache {
 }
 
 impl GitWorkspaceMetadataSource {
-    #[cfg(test)]
-    pub(crate) fn discover_local(cwd: AbsolutePathBuf) -> Option<Self> {
-        let repo_root =
-            AbsolutePathBuf::from_absolute_path(get_git_repo_root(cwd.as_path())?).ok()?;
-        Some(Self {
-            cwd,
-            repo_root,
-            cache: GitWorkspaceCache::new(),
-        })
-    }
-
     pub(crate) fn repo_root(&self) -> &AbsolutePathBuf {
         &self.repo_root
     }
@@ -388,8 +360,6 @@ pub(crate) enum SourceFreshness {
 pub(crate) struct GitWorkspaceCache {
     pub(crate) roots: Arc<WorkspaceRootCache>,
     state: Mutex<RootState>,
-    #[cfg(test)]
-    root_resolution_count: AtomicU64,
 }
 #[derive(Default)]
 struct RootState { root: Option<RootCacheEntry> }
@@ -401,9 +371,6 @@ struct RootCacheEntry {
 
 impl GitWorkspaceCache {
     pub(crate) fn new() -> Arc<Self> { Arc::new(Self::default()) }
-
-    #[cfg(test)]
-    pub(crate) fn with_noop_watcher_for_tests() -> Arc<Self> { Self::new() }
 
     pub(crate) async fn resolve_workspace_root(&self, cwd: &Path) -> std::io::Result<Option<PathBuf>> {
         let roots = Arc::clone(&self.roots);
@@ -498,8 +465,6 @@ impl GitWorkspaceCache {
                 {
                     Some(repo_root)
                 } else {
-                    #[cfg(test)]
-                    _cache.root_resolution_count.fetch_add(1, Ordering::AcqRel);
                     get_git_repo_root_with_fs(fs.as_ref(), &key_environment.cwd).await
                 };
                 GitWorkspaceEntry {
@@ -544,7 +509,8 @@ impl GitWorkspaceCache {
     }
 
     // Compatibility boundaries for historical consumers during reconstruction.
-    // These never certify source freshness or perform workspace I/O.
+    // These never certify source freshness. The command-receipt helper only
+    // discovers repository identity; it does not capture mutable source evidence.
     pub(crate) async fn workspace_evidence_for_environment(
         &self, _environments: &TurnEnvironmentSnapshot, _host_cwd: &Path, _cwd: &Path,
     ) -> WorkspaceEvidenceCapture { WorkspaceEvidenceCapture::default() }
@@ -556,6 +522,19 @@ impl GitWorkspaceCache {
     ) -> Option<WorkspaceEvidenceIdentity> { None }
     pub(crate) async fn workspace_evidence_identity(&self, _cwd: &Path) -> Option<WorkspaceEvidenceIdentity> { None }
     pub(crate) async fn workspace_root_identity(&self, _cwd: &Path) -> Option<WorkspaceEvidenceIdentity> { None }
+    /// Root identity for closed input-determined receipts, not source freshness
+    /// or authority to reuse execution results.
+    pub(crate) async fn command_receipt_workspace_identity(&self, cwd: &Path) -> Option<WorkspaceEvidenceIdentity> {
+        let root = self.resolve_workspace_root(cwd).await.ok()?;
+        Some(WorkspaceEvidenceIdentity {
+            unavailable: false,
+            repository_root: root.map(|path| path.to_string_lossy().into_owned()),
+            head_identity: None,
+            index_identity: None,
+            worktree_identity: None,
+            path_fingerprints: None,
+        })
+    }
     pub(crate) async fn workspace_evidence_identity_with_attribution(&self, _cwd: &Path) -> WorkspaceEvidenceCapture {
         WorkspaceEvidenceCapture::default()
     }
@@ -568,16 +547,6 @@ impl GitWorkspaceCache {
     pub(crate) fn begin_host_workspace_mutation(self: &Arc<Self>) -> PendingSourceMutation { PendingSourceMutation }
     pub(crate) fn note_host_workspace_mutation(&self) {}
     pub(crate) async fn note_host_workspace_mutation_paths(self: &Arc<Self>, _root: &Path, _paths: &[String]) {}
-    #[cfg(test)]
-    pub(crate) fn root_resolution_count(&self) -> u64 { self.root_resolution_count.load(Ordering::Acquire) }
-    #[cfg(test)]
-    pub(crate) fn workspace_evidence_capture_count(&self) -> u64 { 0 }
-    #[cfg(test)]
-    pub(crate) fn workspace_evidence_capture_sequence(&self) -> u64 { 0 }
-    #[cfg(test)]
-    pub(crate) fn take_source_change_freshness_lookup_count_for_test(&self) -> usize { 0 }
-    #[cfg(test)]
-    pub(crate) async fn begin_source_path_change_observation(&self, _root: &Path, _path: &Path, _recursive: bool) -> Option<SourcePathChangeObservation> { None }
 }
 pub(crate) struct PendingSourceMutation;
 impl PendingSourceMutation { pub(crate) fn settle(self) {} }

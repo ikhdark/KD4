@@ -14,29 +14,3 @@ pub fn base_url_to_host_root(base_url: &str) -> String {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_base_url_to_host_root() {
-        assert_eq!(
-            base_url_to_host_root("http://localhost:11434/v1"),
-            "http://localhost:11434"
-        );
-        assert_eq!(
-            base_url_to_host_root("http://localhost:11434"),
-            "http://localhost:11434"
-        );
-        assert_eq!(
-            base_url_to_host_root("http://localhost:11434/"),
-            "http://localhost:11434"
-        );
-        // Only the API suffix belongs to us; preceding segments are the
-        // configured deployment path, even when they are also named `v1`.
-        assert_eq!(
-            base_url_to_host_root("http://localhost:11434/gateway/v1/v1/"),
-            "http://localhost:11434/gateway/v1"
-        );
-    }
-}

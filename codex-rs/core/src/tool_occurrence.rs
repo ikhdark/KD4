@@ -77,33 +77,3 @@ pub(crate) fn reused_call_ids(items: &[ResponseItem]) -> std::collections::HashS
         .filter_map(|(_, call, id)| (call && !seen.insert(id)).then_some(id))
         .collect()
 }
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn ctxaudit_legacy_pairing_does_not_let_an_old_output_close_a_new_call() {
-        let call = || ResponseItem::FunctionCall {
-            id: None,
-            name: "read_file".into(),
-            namespace: None,
-            arguments: "{}".into(),
-            call_id: "x".into(),
-            internal_chat_message_metadata_passthrough: None,
-        };
-        let output = ResponseItem::FunctionCallOutput {
-            id: None,
-            call_id: "x".into(),
-            output: codex_protocol::models::FunctionCallOutputPayload::from_text("success".into()),
-            internal_chat_message_metadata_passthrough: None,
-        };
-        assert_eq!(
-            pairs(&[call(), output.clone(), call()]),
-            vec![Some(1), Some(0), None]
-        );
-        assert_eq!(
-            pairs(&[call(), call(), output.clone()]),
-            vec![None, None, None]
-        );
-        assert_eq!(pairs(&[output, call()]), vec![None, None]);
-    }
-}

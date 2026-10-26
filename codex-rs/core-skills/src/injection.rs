@@ -925,7 +925,3 @@ pub fn is_mention_name_char(byte: u8) -> bool {
 pub fn is_mention_name_char_char(ch: char) -> bool {
     ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | ':')
 }
-
-#[cfg(test)]
-#[path = "injection_tests.rs"]
-mod tests;

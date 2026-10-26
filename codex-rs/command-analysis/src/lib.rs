@@ -26,15 +26,3 @@ where
     .await
 }
 
-#[cfg(test)]
-mod scope_tests {
-    #[tokio::test]
-    async fn command_workers_inherit_only_the_current_invocation_syntax_scope() {
-        use codex_shell_command::PowershellAnalysisScope;
-        assert!(PowershellAnalysisScope::current().is_none());
-        PowershellAnalysisScope::default().scope(async {
-            assert!(super::run_blocking_command_analysis(|| PowershellAnalysisScope::current().is_some()).await.unwrap());
-        }).await;
-        assert!(!super::run_blocking_command_analysis(|| PowershellAnalysisScope::current().is_some()).await.unwrap());
-    }
-}

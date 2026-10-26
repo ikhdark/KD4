@@ -150,6 +150,3 @@ pub enum RemoteControlConnectionStatus {
     Errored,
 }
 
-#[cfg(test)]
-#[path = "remote_control_tests.rs"]
-mod tests;

@@ -67,10 +67,3 @@ pub(crate) fn sign_request(
     })
 }
 
-#[cfg(test)]
-pub(crate) fn header_value(headers: &http::HeaderMap, name: &str) -> Option<String> {
-    headers
-        .get(name)
-        .and_then(|value| value.to_str().ok())
-        .map(str::to_string)
-}

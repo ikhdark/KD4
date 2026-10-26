@@ -140,6 +140,3 @@ pub fn create_report_agent_job_result_tool() -> ToolSpec {
     })
 }
 
-#[cfg(test)]
-#[path = "agent_jobs_spec_tests.rs"]
-mod tests;

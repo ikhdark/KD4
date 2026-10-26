@@ -281,7 +281,7 @@ def target_disk_report_lines(
         names = ", ".join(path.name for path in strays)
         lines.append(
             "stray cargo target dirs: "
-            f"{names}; prefer `just cargo-lane <lane> ...` or `just test-lane <lane> ...`"
+            f"{names}; prefer `just cargo-lane <lane> ...`"
         )
     return lines
 

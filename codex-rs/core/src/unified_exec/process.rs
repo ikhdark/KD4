@@ -285,12 +285,6 @@ impl UnifiedExecProcess {
         }
     }
 
-    #[cfg(test)]
-    pub(super) fn hold_termination_for_test(&self) -> tokio::sync::SemaphorePermit<'_> {
-        self.termination_lock
-            .try_acquire()
-            .expect("uncontended termination fixture")
-    }
 
     pub(super) fn set_termination_owner(&self, owner: ProcessTerminationOwner) {
         let _ = self.termination_owner.set(owner);
@@ -527,37 +521,7 @@ impl UnifiedExecProcess {
         Arc::clone(&self.interaction_requested)
     }
 
-    #[cfg(test)]
-    pub(super) async fn publish_output_for_test(&self, chunk: Vec<u8>) {
-        self.publish_stream_output_for_test(ExecOutputStream::Stdout, chunk)
-            .await;
-    }
 
-    #[cfg(test)]
-    pub(super) async fn publish_stream_output_for_test(
-        &self,
-        stream: ExecOutputStream,
-        chunk: Vec<u8>,
-    ) {
-        let stream_buffer = match &stream {
-            ExecOutputStream::Stdout => &self.stdout_buffer,
-            ExecOutputStream::Stderr => &self.stderr_buffer,
-        };
-        append_output_chunk(
-            &self.output_buffer,
-            &self.completion_output_buffer,
-            stream_buffer,
-            &chunk,
-        )
-        .await;
-        self.output_tx
-            .send(ProcessOutputChunk {
-                stream,
-                bytes: chunk,
-            })
-            .expect("reserved streaming output receiver should remain subscribed");
-        self.output_notify.notify_waiters();
-    }
 
     pub(super) async fn raw_output_artifact(&self) -> Option<RawOutputArtifact> {
         match &self.raw_output_artifact {
@@ -584,12 +548,6 @@ impl UnifiedExecProcess {
         (!artifact.is_pending()).then(|| artifact.clone())
     }
 
-    #[cfg(test)]
-    pub(super) fn raw_output_artifact_owner_for_test(
-        &self,
-    ) -> Option<Arc<Mutex<RawOutputArtifact>>> {
-        self.raw_output_artifact.clone()
-    }
 
     pub(super) async fn snapshot_completion_output(&self) -> ProcessOutputSnapshot {
         let (aggregated_output, aggregated_output_is_exact) =
@@ -727,7 +685,7 @@ impl UnifiedExecProcess {
                 if let Some(owner) = self.termination_owner.get() {
                     owner.tasks.spawn_on(termination, &owner.runtime);
                 } else if let Ok(runtime) = tokio::runtime::Handle::try_current() {
-                    // Standalone test processes have no session cleanup owner.
+                    // Standalone processes have no session cleanup owner.
                     runtime.spawn(termination);
                 } else {
                     tracing::warn!("remote process termination has no runtime owner");
@@ -986,7 +944,8 @@ impl UnifiedExecProcess {
             }
             Err(TryRecvError::Closed) => {
                 managed.signal_exit_failure(MISSING_LOCAL_EXIT_STATUS_MESSAGE.to_string());
-                managed.finish_termination();
+                // Observation loss is not root exit. Keep native termination
+                // custody with pending startup cleanup instead of releasing it.
                 return Err(UnifiedExecError::process_failed(
                     MISSING_LOCAL_EXIT_STATUS_MESSAGE.to_string(),
                 ));
@@ -1390,10 +1349,6 @@ impl UnifiedExecProcess {
         self.cancellation_token.cancel();
     }
 
-    #[cfg(test)]
-    pub(super) fn signal_exit_for_test(&self, exit_code: Option<i32>) {
-        self.signal_exit(exit_code);
-    }
 }
 
 impl Drop for UnifiedExecProcess {

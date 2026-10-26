@@ -313,10 +313,6 @@ fn shared_description<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     description: &str,
 ) -> Result<v8::Local<'s, v8::String>, String> {
-    #[cfg(test)]
-    if let Some(state) = scope.get_slot_mut::<RuntimeState>() {
-        state.description_materializations += 1;
-    }
     // Internalization shares description storage between callable metadata and
     // the optional discovery array within this cell's isolate.
     v8::String::new_from_utf8(

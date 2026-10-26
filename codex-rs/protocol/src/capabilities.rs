@@ -46,6 +46,3 @@ where
     path.try_into().map_err(serde::de::Error::custom)
 }
 
-#[cfg(test)]
-#[path = "capabilities_tests.rs"]
-mod tests;

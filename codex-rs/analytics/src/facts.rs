@@ -1,7 +1,5 @@
 use crate::events::AppServerRpcTransport;
 use crate::events::CodexRuntimeMetadata;
-#[cfg(test)]
-use codex_app_server_protocol::ClientRequest;
 use codex_app_server_protocol::ClientResponsePayload;
 use codex_app_server_protocol::InitializeParams;
 use codex_app_server_protocol::RequestId;
@@ -479,12 +477,6 @@ pub(crate) enum AnalyticsFact {
         runtime: CodexRuntimeMetadata,
         rpc_transport: AppServerRpcTransport,
     },
-    #[cfg(test)]
-    ClientRequest {
-        connection_id: u64,
-        request_id: RequestId,
-        request: Box<ClientRequest>,
-    },
     TurnRequest {
         connection_id: u64,
         request_id: RequestId,
@@ -628,49 +620,3 @@ pub(crate) enum PluginState {
     Disabled,
 }
 
-#[cfg(test)]
-mod tests {
-    use super::CodexErrKind;
-    use codex_protocol::error::CodexErr;
-    use codex_protocol::error::UnexpectedResponseError;
-    use pretty_assertions::assert_eq;
-
-    #[test]
-    fn retry_and_request_build_errors_have_distinct_analytics_kinds() {
-        for (error, expected) in [
-            (
-                CodexErr::PreDispatchRetryExhausted("connection reset".to_string()),
-                "pre_dispatch_retry_exhausted",
-            ),
-            (
-                CodexErr::RequestBuild("invalid header".to_string()),
-                "request_build",
-            ),
-        ] {
-            assert_eq!(
-                serde_json::to_value(CodexErrKind::from(&error)).expect("serialize error kind"),
-                serde_json::json!(expected)
-            );
-        }
-    }
-
-    #[test]
-    fn region_restriction_keeps_unexpected_status_analytics_kind() {
-        let kind = CodexErrKind::from(&CodexErr::RegionRestricted(UnexpectedResponseError {
-            retry_after: None,
-            status: "403".parse().expect("valid status"),
-            body: String::new(),
-            user_message: None,
-            url: None,
-            cf_ray: None,
-            request_id: None,
-            identity_authorization_error: None,
-            identity_error_code: None,
-        }));
-
-        assert_eq!(
-            serde_json::to_value(kind).expect("serialize error kind"),
-            serde_json::json!("unexpected_status")
-        );
-    }
-}

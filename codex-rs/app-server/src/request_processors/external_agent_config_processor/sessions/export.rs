@@ -67,7 +67,6 @@ fn rollout_items_from_messages(messages: Vec<ConversationMessage>) -> Vec<Rollou
     let mut items = Vec::new();
     let mut current_turn = None;
     let mut response_item_bytes = 0i64;
-    let mut last_model_visible_tokens = 0i64;
     let mut user_turn_count = 0usize;
     let completed_at = messages.last().and_then(|message| message.timestamp);
 
@@ -105,7 +104,6 @@ fn rollout_items_from_messages(messages: Vec<ConversationMessage>) -> Vec<Rollou
                 }
                 response_item_bytes =
                     response_item_bytes.saturating_add(message_byte_count(&message));
-                last_model_visible_tokens = approx_tokens_from_byte_count_i64(response_item_bytes);
                 items.push(RolloutItem::EventMsg(EventMsg::AgentMessage(
                     AgentMessageEvent {
                         message: message.text.clone(),
@@ -119,7 +117,7 @@ fn rollout_items_from_messages(messages: Vec<ConversationMessage>) -> Vec<Rollou
 
     if let Some(turn_id) = current_turn {
         items.push(external_session_imported_marker_item());
-        items.push(token_count_item(last_model_visible_tokens));
+        items.push(token_count_item(approx_tokens_from_byte_count_i64(response_item_bytes)));
         items.push(turn_complete_item(turn_id, completed_at));
     }
 

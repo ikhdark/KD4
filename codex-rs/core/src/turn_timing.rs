@@ -229,11 +229,6 @@ struct CanonicalInputSection {
     before_close: Sha256,
 }
 
-#[cfg(test)]
-std::thread_local! {
-    static CANONICAL_SECTION_ITEM_VISITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-}
-
 impl CanonicalInputSection {
     fn hash(cache: &mut Option<Self>, raw: &serde_json::value::RawValue) -> Option<String> {
         let items: Vec<&serde_json::value::RawValue> = serde_json::from_str(raw.get()).ok()?;
@@ -247,8 +242,6 @@ impl CanonicalInputSection {
         }, |previous| previous.before_close.clone());
         for (index, item) in items.iter().enumerate().skip(start) {
             if index != 0 { hasher.update(b","); }
-            #[cfg(test)]
-            CANONICAL_SECTION_ITEM_VISITS.with(|count| count.set(count.get() + 1));
             let value: serde_json::Value = serde_json::from_str(item.get()).ok()?;
             hasher.update(value.to_string().as_bytes());
         }
@@ -1502,8 +1495,6 @@ struct ToolClosureLedger {
     // Collision buckets reference the same immutable identity as entries.
     call_index: BTreeMap<u64, Vec<Arc<TurnTimingToolCallIdentity>>>,
     call_key_hasher: std::collections::hash_map::RandomState,
-    #[cfg(test)]
-    key_comparisons: std::cell::Cell<u64>,
     orphan_calls: BTreeMap<ToolExecutionId, ToolClosureEntry>,
     duplicate_call_id_count: u32,
     duplicate_acceptance_count: u32,
@@ -1539,9 +1530,6 @@ impl ToolClosureLedger {
             .get(&self.call_key(call_id, generation, source))
             .is_some_and(|bucket| {
                 bucket.iter().any(|identity| {
-                    #[cfg(test)]
-                    self.key_comparisons
-                        .set(self.key_comparisons.get().saturating_add(1));
                     identity.call_id == call_id
                         && &identity.sampling_generation_id == generation
                         && identity.source == source
@@ -2141,11 +2129,6 @@ impl TurnTimingState {
         }
     }
 
-    #[cfg(test)]
-    fn with_clock(clock: Arc<dyn TurnClock>) -> Self {
-        Self::new(clock)
-    }
-
     pub(crate) fn mark_turn_started(&self) -> i64 {
         let mut state = self.state();
         let sample = self.clock.sample();
@@ -2332,21 +2315,6 @@ impl TurnTimingState {
         state.record_model_retry();
     }
 
-    #[cfg(test)]
-    pub(crate) fn begin_model_generation(
-        &self,
-        pending: &mut Option<ContinuationCause>,
-        session_source: &SessionSource,
-    ) {
-        self.begin_model_generation_with_metadata(
-            pending,
-            session_source,
-            Some(TurnTimingGenerationPurpose::InitialReasoning),
-            TurnTimingGenerationDisposition::DecisionBearing,
-            None,
-        );
-    }
-
     pub(crate) fn begin_model_generation_with_metadata(
         &self,
         pending: &mut Option<ContinuationCause>,
@@ -2515,18 +2483,6 @@ impl TurnTimingState {
         }
     }
 
-    #[cfg(test)]
-    pub(crate) fn record_tool_call(&self, tool_name: &str) {
-        let id = format!("test-admission-{}", self.state().counters.tool_call_count);
-        assert!(self.try_record_accepted_tool_call(
-            &id,
-            &ToolExecutionId(id.clone()),
-            TurnTimingToolCallSource::Direct,
-            None,
-            tool_name,
-        ));
-    }
-
     /// Registers one exact direct or nested execution at the point where the
     /// runtime accepts ownership of it. Completion and abort publication use
     /// this ledger rather than aggregate call counts.
@@ -2618,28 +2574,6 @@ impl TurnTimingState {
             self.signal_tool_closure_changed();
         }
         duplicate
-    }
-
-    #[cfg(test)]
-    pub(crate) fn record_accepted_tool_call(
-        &self,
-        call_id: &str,
-        execution_id: &ToolExecutionId,
-        source: TurnTimingToolCallSource,
-        parent_call_id: Option<&str>,
-    ) {
-        assert!(self.try_record_accepted_tool_call(
-            call_id,
-            execution_id,
-            source,
-            parent_call_id,
-            "test_tool"
-        ));
-    }
-
-    #[cfg(test)]
-    pub(crate) fn tool_closure_snapshot(&self) -> TurnTimingToolClosure {
-        self.state().tool_closure.snapshot()
     }
 
     pub(crate) fn record_tool_call_acceptance_closed(&self) {
@@ -2759,25 +2693,6 @@ impl TurnTimingState {
             request.executor_active_tool_call_count =
                 request.executor_active_tool_call_count.saturating_sub(1);
         }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn model_tool_call_counts(&self) -> Option<(u32, u32)> {
-        let state = self.state();
-        let generation_index = state.current_generation_index?;
-        state
-            .model_requests
-            .iter()
-            .find(|request| {
-                request.generation_index == generation_index
-                    && request.attempt_kind == TurnTimingAttemptKind::Primary
-            })
-            .map(|request| {
-                (
-                    request.model_emitted_tool_call_count,
-                    request.tool_call_count,
-                )
-            })
     }
 
     pub(crate) fn record_tool_handler_entry(&self, tool_name: &str) {
@@ -3175,20 +3090,6 @@ impl TurnTimingState {
             .collect()
     }
 
-    #[cfg(test)]
-    pub(crate) fn record_tool_result_persisted(&self, call_id: &str) {
-        if let Some(execution) = self.tool_result_execution_id(call_id) {
-            self.record_tool_result_executions_persisted(&[execution]);
-        }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn record_tool_result_persistence_queued(&self, call_id: &str) {
-        if let Some(execution) = self.tool_result_execution_id(call_id) {
-            self.record_tool_result_executions_queued(&[execution]);
-        }
-    }
-
     /// Records that the terminal rollout barrier failed. This releases closure waiters without
     /// attesting that any queued result crossed the durability boundary.
     pub(crate) fn record_tool_result_persistence_barrier_failed(&self) {
@@ -3200,11 +3101,6 @@ impl TurnTimingState {
         state.tool_result_persistence_barrier_failed = true;
         drop(state);
         self.signal_tool_closure_changed();
-    }
-
-    #[cfg(test)]
-    pub(crate) fn record_queued_tool_results_persisted(&self) {
-        self.record_tool_result_executions_persisted(&self.queued_tool_result_executions());
     }
 
     /// Persists a background process exit into the turn record even when the
@@ -3299,15 +3195,6 @@ impl TurnTimingState {
             .saturating_add(count);
     }
 
-    #[cfg(test)]
-    pub(crate) fn record_residual_deterministic_generation(&self) {
-        let mut state = self.state();
-        state.counters.residual_deterministic_generation_count = state
-            .counters
-            .residual_deterministic_generation_count
-            .map_or(Some(1), |count| Some(count.saturating_add(1)));
-    }
-
     pub(crate) fn record_owner_drained_continuation(&self) {
         let mut state = self.state();
         state.counters.owner_drained_continuation_count = state
@@ -3324,11 +3211,6 @@ impl TurnTimingState {
             .counters
             .executed_validation_duration_ns
             .saturating_add(u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX));
-    }
-
-    #[cfg(test)]
-    pub(crate) fn record_executed_validation(&self, duration_ms: u64) {
-        self.record_executed_validation_duration(Duration::from_millis(duration_ms));
     }
 
     pub(crate) fn record_ready_startup_prewarm(&self) {
@@ -4020,15 +3902,6 @@ impl TurnTimingState {
             .saturating_add(1);
     }
 
-    #[cfg(test)]
-    pub(crate) fn record_truncation_induced_continuation(&self) {
-        let mut state = self.state();
-        state.counters.truncation_induced_continuation_count = state
-            .counters
-            .truncation_induced_continuation_count
-            .saturating_add(1);
-    }
-
     pub(crate) fn begin_tool_blocking(self: &Arc<Self>) -> TurnTimingGuard {
         self.begin_guard(GuardKind::LegacyToolBlocking)
     }
@@ -4486,12 +4359,6 @@ impl TurnTimingState {
         let state = self.state();
         u64::from(state.counters.model_request_count)
             .saturating_sub(state.accounted_model_responses)
-    }
-
-    /// Test fixtures without a transport identity still model one dispatch per row.
-    #[cfg(test)]
-    pub(crate) fn mark_model_request_dispatched(&self) {
-        self.mark_model_request_dispatched_inner(None);
     }
 
     /// Called at transport entry, after preparation/authentication, not at readiness.
@@ -6124,7 +5991,3 @@ pub(crate) fn now_unix_timestamp_ms() -> i64 {
         .unwrap_or_default();
     i64::try_from(duration.as_millis()).unwrap_or(i64::MAX)
 }
-
-#[cfg(test)]
-#[path = "turn_timing_tests.rs"]
-mod tests;

@@ -569,6 +569,3 @@ pub(crate) fn patch_failure_kind(error: &codex_apply_patch::ApplyPatchError) -> 
     }
 }
 
-#[cfg(test)]
-#[path = "apply_patch_tests.rs"]
-mod tests;

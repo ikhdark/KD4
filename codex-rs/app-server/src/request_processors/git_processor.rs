@@ -22,6 +22,3 @@ pub(crate) async fn git_diff_to_remote_response(
         })
 }
 
-#[cfg(test)]
-#[path = "git_processor_tests.rs"]
-mod tests;

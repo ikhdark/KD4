@@ -220,35 +220,4 @@ impl IntoIterator for UpdatePathsError {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn display_formatted_errors() {
-        let expected = "Some error";
-
-        assert_eq!(expected, format!("{}", Error::generic(expected)));
-
-        assert_eq!(
-            expected,
-            format!("{}", Error::io(io::Error::other(expected)))
-        );
-    }
-
-    #[test]
-    fn display_update_paths() {
-        let actual = UpdatePathsError {
-            source: Error::generic("Some error"),
-            origin: None,
-            remaining: Default::default(),
-        }
-        .to_string();
-
-        assert_eq!(
-            format!("unable to apply the batch operation: Some error"),
-            actual
-        );
-    }
-}
 

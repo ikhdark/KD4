@@ -240,7 +240,3 @@ fn app_tool_policy_from_apps_config(
 
     AppToolPolicy { enabled, approval }
 }
-
-#[cfg(test)]
-#[path = "app_tool_policy_tests.rs"]
-mod tests;

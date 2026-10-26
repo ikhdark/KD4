@@ -81,6 +81,3 @@ impl WorldStateSection for AppsInstructionsState {
     }
 }
 
-#[cfg(test)]
-#[path = "apps_instructions_tests.rs"]
-mod tests;

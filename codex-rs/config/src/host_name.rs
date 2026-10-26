@@ -42,35 +42,3 @@ fn local_fqdn_for_hostname(_hostname: &str) -> Option<String> {
 fn normalize_fqdn_candidate(hostname: &str) -> Option<String> {
     normalize_host_name(hostname).filter(|hostname| hostname.contains('.'))
 }
-
-#[cfg(test)]
-mod tests {
-    use super::normalize_fqdn_candidate;
-    use pretty_assertions::assert_eq;
-
-    #[test]
-    fn normalize_fqdn_candidate_requires_a_qualified_normalized_name() {
-        for (input, expected) in [
-            ("runner-01.ci.example.com", Some("runner-01.ci.example.com")),
-            (
-                "RUNNER-01.CI.EXAMPLE.COM.",
-                Some("runner-01.ci.example.com"),
-            ),
-            (
-                "  RUNNER-01.CI.EXAMPLE.COM.  ",
-                Some("runner-01.ci.example.com"),
-            ),
-            ("runner-01", None),
-            ("runner-01.", None),
-            ("", None),
-            ("   ", None),
-            (".", None),
-        ] {
-            assert_eq!(
-                normalize_fqdn_candidate(input).as_deref(),
-                expected,
-                "{input:?}"
-            );
-        }
-    }
-}

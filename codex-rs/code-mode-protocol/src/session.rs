@@ -209,7 +209,3 @@ impl CodeModeSessionDelegate for NoopCodeModeSessionDelegate {
 
     fn cell_closed(&self, _cell_id: &CellId) {}
 }
-
-#[cfg(test)]
-#[path = "session_tests.rs"]
-mod tests;

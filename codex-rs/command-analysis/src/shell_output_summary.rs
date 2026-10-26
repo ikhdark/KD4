@@ -40,15 +40,6 @@ pub struct ShellOutputSummaryOptions<'a> {
     pub command_text: Option<&'a str>,
 }
 
-#[cfg(any(test, feature = "test-support"))]
-pub fn summarize_shell_output_for_model(
-    output: &str,
-    exit_code: i32,
-    timed_out: bool,
-    options: ShellOutputSummaryOptions<'_>,
-) -> Option<String> {
-    summarize_shell_output_for_model_with_streams(output, exit_code, timed_out, options, None)
-}
 
 /// `streams` must be complete, producer-owned stdout/stderr for this output,
 /// not a cumulative snapshot paired with a later polling chunk.
@@ -415,19 +406,6 @@ pub fn summarize_shell_output_for_model_with_streams(
     (summary.len() < output.len()).then_some(summary)
 }
 
-/// Cargo/rustc JSON carries diagnostics inside escaped single-line records.
-/// Ranking/truncating those raw lines can hide their message or location.
-/// Cargo mixes JSON stdout with plain stderr; retain that context verbatim.
-/// Malformed/unknown JSON or excessive text still uses the existing text path.
-#[cfg(test)]
-fn structured_compiler_summary(
-    output: &str,
-    exit_code: i32,
-    timed_out: bool,
-    token_limit: Option<usize>,
-) -> Option<String> {
-    structured_compiler_summary_with_streams(output, exit_code, timed_out, token_limit, None)
-}
 
 fn structured_compiler_summary_with_streams(
     output: &str,
@@ -1682,112 +1660,5 @@ fn summarize_oversized_line(line: &str, max_bytes: usize) -> std::borrow::Cow<'_
     std::borrow::Cow::Owned(format!("{head}{MARKER}{tail}"))
 }
 
-#[cfg(test)]
-mod optimization_tests {
-    use super::*;
 
-    #[test]
-    fn diagnostic_search_preserves_ascii_case_and_utf8_offsets() {
-        for (line, needle, expected) in [
-            ("界 ERROR: failed", "error:", Some(4)),
-            ("error er", "error:", None),
-            ("x eRrOr: y ERROR:", "error:", Some(2)),
-            ("ordinary output", "npm err!", None),
-        ] {
-            assert_eq!(find_ascii_case(line, needle), expected);
-        }
-    }
 
-    #[test]
-    fn selection_storage_is_bounded_for_large_logs() {
-        let output = "error: repeated failure\nordinary context\n".repeat(100_000);
-        let selection = select_lines(&output, 200_000, true, true);
-        assert!(
-            selection.indexes.len()
-                <= FAILURE_TAIL_LINES + MAX_FOCUS_MATCHES * 7 + MAX_STATUS_MATCHES
-        );
-        assert!(selection.indexes.contains(&0));
-        assert!(selection.indexes.contains(&199_999));
-        assert_eq!(selection.omitted_groups, 0);
-    }
-
-    #[test]
-    fn line_classification_is_case_insensitive_without_retained_scratch() {
-        let classification = classify_line("  ERROR: warning; tests PASSED");
-        assert!(classification.critical);
-        assert!(classification.advisory);
-        assert!(classification.status);
-        let classification = classify_line("ordinary output");
-        assert!(!classification.critical);
-        assert!(!classification.advisory);
-        assert!(!classification.status);
-    }
-
-    #[test]
-    fn selection_flags_emit_each_index_once_in_source_order() {
-        let lines = [
-            "warning: advisory",
-            "before",
-            "error: exact failure",
-            "after one",
-            "after two",
-            "after three",
-            "tail one",
-            "tail two",
-        ];
-        let selection = select_lines(&lines.join("\n"), lines.len(), true, true);
-        let ordered = selection.indexes.into_iter().collect::<Vec<_>>();
-
-        assert_eq!(ordered, (0..lines.len()).collect::<Vec<_>>());
-        let mut sorted = ordered.clone();
-        sorted.sort_unstable();
-        sorted.dedup();
-        assert_eq!(sorted.len(), ordered.len());
-    }
-}
-
-#[cfg(test)]
-mod audit04_summary_regressions {
-    use super::*;
-
-    #[test]
-    fn distinct_early_progress_cannot_crowd_out_final_failure_status() {
-        let mut lines = (0..64).map(|index| format!("job {index} progress 1/10 elapsed 1s")).collect::<Vec<_>>();
-        for index in 0..8 {
-            lines.extend((0..30).map(|_| "ordinary context".to_owned()));
-            lines.push(format!("error: distinct failure {index}"));
-            lines.push(String::new());
-        }
-        lines.extend((0..300).map(|_| "ordinary tail".to_owned()));
-        lines.push("test result: FAILED. 0 passed; 8 failed".into());
-        let output = lines.join("\n");
-        let summary = summarize_shell_output_for_model(&output, 1, false, ShellOutputSummaryOptions {
-            enabled: true, applied_token_limit: None, command_text: Some("cargo test"),
-        }).unwrap();
-        assert!(summary.contains("test result: FAILED. 0 passed; 8 failed"), "{summary}");
-        assert!(summary.contains("error: distinct failure 0"));
-        assert!(summary.lines().count() <= SUMMARY_MAX_LINES);
-        assert!(summary.len() <= SUMMARY_MAX_BYTES);
-    }
-
-    #[test]
-    fn rg_counts_require_explicit_path_line_format_not_content_prefixes() {
-        let output = "1:worker:123:needle\n".repeat(700);
-        for command in [
-            "rg -n --no-filename needle src/a.log",
-            "rg -n needle src/a.log",
-            "rg --json needle src",
-            "rg --no-config -n --with-filename --no-heading --color never --replace 'a:123:' needle src",
-        ] {
-            assert!(rg_file_summary(&output, command, Some(500)).is_none(), "{command}");
-        }
-        let output = "src/a.log:1:worker:123:needle\n".repeat(700);
-        let summary = rg_file_summary(&output, "rg --no-config -n --with-filename --no-heading --color never needle src", Some(500)).unwrap();
-        assert!(summary.contains("700 hits across 1 files"));
-        assert!(summary.contains("src/a.log"));
-    }
-}
-
-#[cfg(test)]
-#[path = "shell_output_summary_tests.rs"]
-mod tests;

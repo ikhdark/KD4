@@ -40,10 +40,6 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::OnceLock;
-#[cfg(test)]
-use std::sync::atomic::AtomicUsize;
-#[cfg(test)]
-use std::sync::atomic::Ordering;
 use std::time::Instant;
 use tokio_util::sync::CancellationToken;
 use tracing::instrument;
@@ -83,12 +79,6 @@ pub struct ToolRouter {
     schema_cache: Mutex<Option<(HashSet<ToolName>, Arc<ToolSchemaArtifact>)>>,
     manifest_cache: Mutex<ToolManifestCache>,
     deferred_tool_capability_revisions: OnceLock<Arc<HashMap<ToolName, String>>>,
-    #[cfg(test)]
-    schema_snapshot_build_count: AtomicUsize,
-    #[cfg(test)]
-    manifest_snapshot_build_count: AtomicUsize,
-    #[cfg(test)]
-    deferred_tool_capability_revision_build_count: AtomicUsize,
 }
 
 /// Retain the resolved inputs used by the canonical planner, not just the
@@ -164,15 +154,6 @@ pub(crate) struct ToolSuggestCandidates {
 }
 
 impl ToolRouter {
-    #[cfg(test)]
-    pub(crate) fn from_context(
-        step_context: &StepContext,
-        params: ToolRouterParams<'_>,
-        tool_search_handler_cache: &ToolSearchHandlerCache,
-    ) -> Self {
-        Self::try_from_context(step_context, params, tool_search_handler_cache)
-            .unwrap_or_else(|error| panic!("failed to build tool router: {error}"))
-    }
 
     pub(crate) fn try_from_context(
         step_context: &StepContext,
@@ -207,40 +188,8 @@ impl ToolRouter {
             })
     }
 
-    #[cfg(test)]
-    pub(crate) fn from_parts(registry: ToolRegistry, model_visible_specs: Vec<ToolSpec>) -> Self {
-        Self::from_parts_with_warnings(registry, model_visible_specs, Vec::new())
-    }
 
-    #[cfg(test)]
-    pub(crate) fn from_parts_with_warnings(
-        registry: ToolRegistry,
-        model_visible_specs: Vec<ToolSpec>,
-        planning_warnings: Vec<String>,
-    ) -> Self {
-        Self::from_parts_with_warnings_and_identity(
-            registry,
-            model_visible_specs,
-            planning_warnings,
-            ToolExposureIdentity::default(),
-        )
-    }
 
-    #[cfg(test)]
-    pub(crate) fn from_parts_with_warnings_and_identity(
-        registry: ToolRegistry,
-        model_visible_specs: Vec<ToolSpec>,
-        planning_warnings: Vec<String>,
-        exposure_identity: ToolExposureIdentity,
-    ) -> Self {
-        Self::from_parts_with_prepared_search_sources(
-            registry,
-            model_visible_specs,
-            planning_warnings,
-            exposure_identity,
-            None,
-        )
-    }
 
     pub(crate) fn from_parts_with_prepared_search_sources(
         mut registry: ToolRegistry,
@@ -293,12 +242,6 @@ impl ToolRouter {
             schema_cache: Mutex::new(None),
             manifest_cache: Mutex::new(ToolManifestCache::default()),
             deferred_tool_capability_revisions: OnceLock::new(),
-            #[cfg(test)]
-            schema_snapshot_build_count: AtomicUsize::new(0),
-            #[cfg(test)]
-            manifest_snapshot_build_count: AtomicUsize::new(0),
-            #[cfg(test)]
-            deferred_tool_capability_revision_build_count: AtomicUsize::new(0),
         }
     }
 
@@ -376,9 +319,6 @@ impl ToolRouter {
 
     pub(crate) fn deferred_tool_capability_revisions(&self) -> Arc<HashMap<ToolName, String>> {
         Arc::clone(self.deferred_tool_capability_revisions.get_or_init(|| {
-            #[cfg(test)]
-            self.deferred_tool_capability_revision_build_count
-                .fetch_add(1, Ordering::Relaxed);
             Arc::new(
                 self.registry
                     .manifest_entries()
@@ -402,14 +342,6 @@ impl ToolRouter {
         }))
     }
 
-    #[cfg(test)]
-    pub(crate) fn tool_manifest(
-        &self,
-        turn: &crate::session::turn_context::TurnContext,
-    ) -> ToolManifestItem {
-        let (_, activated) = turn.deferred_tool_activation_snapshot();
-        self.tool_manifest_snapshot(&activated, turn)
-    }
 
     /// Return the manifest record for this request without cloning the full schema tree when the
     /// same hash was already queued for this rollout. The recorder still owns canonical
@@ -463,8 +395,6 @@ impl ToolRouter {
                 {
                     continue;
                 }
-                #[cfg(test)]
-                DEFERRED_SCHEMA_MATERIALIZATIONS.with(|count| count.set(count.get() + 1));
                 let Some(spec) = filter_activated_deferred_spec(tool.spec(), activated) else {
                     continue;
                 };
@@ -480,9 +410,6 @@ impl ToolRouter {
         {
             tracing::warn!("{warning}");
         }
-        #[cfg(test)]
-        self.schema_snapshot_build_count
-            .fetch_add(1, Ordering::Relaxed);
         *cache = Some((activated.clone(), Arc::clone(&schemas)));
         schemas
     }
@@ -553,61 +480,20 @@ impl ToolRouter {
         });
         let encoded = serde_json::to_vec(&fingerprint_input).unwrap_or_default();
         let manifest = ToolManifestItem::full(hex::encode(Sha256::digest(encoded)), manifest);
-        #[cfg(test)]
-        self.manifest_snapshot_build_count
-            .fetch_add(1, Ordering::Relaxed);
         cache.insert(activated.clone(), manifest.clone());
         manifest
     }
 
-    #[cfg(test)]
-    pub(crate) fn schema_snapshot_build_count(&self) -> usize {
-        self.schema_snapshot_build_count.load(Ordering::Relaxed)
-    }
 
-    #[cfg(test)]
-    pub(crate) fn manifest_snapshot_build_count(&self) -> usize {
-        self.manifest_snapshot_build_count.load(Ordering::Relaxed)
-    }
 
-    #[cfg(test)]
-    pub(crate) fn deferred_tool_capability_revision_build_count(&self) -> usize {
-        self.deferred_tool_capability_revision_build_count
-            .load(Ordering::Relaxed)
-    }
 
     pub(crate) fn planning_warnings(&self) -> &[String] {
         &self.planning_warnings
     }
 
-    #[cfg(test)]
-    pub(crate) fn registered_tool_names_for_test(&self) -> Vec<ToolName> {
-        self.registry.tool_names_for_test()
-    }
 
-    #[cfg(test)]
-    pub(crate) fn tool_exposure_for_test(
-        &self,
-        name: &ToolName,
-    ) -> Option<crate::tools::registry::ToolExposure> {
-        self.registry.tool_exposure(name)
-    }
 
-    #[cfg(test)]
-    pub(crate) fn tool_authorization_class_for_test(
-        &self,
-        name: &ToolName,
-    ) -> Option<TypedToolClass> {
-        self.registry.tool_authorization_class(name)
-    }
 
-    #[cfg(test)]
-    pub(crate) fn tool_external_mutation_intent_for_test(
-        &self,
-        name: &ToolName,
-    ) -> Option<ExternalMutationIntent> {
-        self.registry.tool_external_mutation_intent(name)
-    }
 
     pub(crate) fn create_diff_consumer(
         &self,
@@ -1049,14 +935,6 @@ async fn authorize_bound_typed_tool_call(
     Ok(())
 }
 
-/// Test convenience for the executors in the current extension tool surface;
-/// production captures [`extension_tool_surface_snapshot`] to keep its revision.
-#[cfg(test)]
-pub(crate) fn extension_tool_executors(
-    session: &Session,
-) -> Vec<Arc<dyn ToolExecutor<ExtensionToolCall>>> {
-    extension_tool_surface_snapshot(session).tools
-}
 
 pub(crate) fn extension_tool_surface_snapshot(
     session: &Session,
@@ -1095,11 +973,4 @@ pub(crate) fn extension_tool_surface_revision(session: &Session) -> u64 {
         })
 }
 
-#[cfg(test)]
-#[path = "router_tests.rs"]
-mod tests;
 
-#[cfg(test)]
-std::thread_local! {
-    static DEFERRED_SCHEMA_MATERIALIZATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-}

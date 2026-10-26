@@ -43,11 +43,6 @@ pub(crate) mod list {
     pub use codex_rollout::find_thread_path_by_id_str;
 }
 
-#[cfg(test)]
-pub(crate) mod recorder {
-    pub use codex_rollout::RolloutRecorder;
-}
-
 pub(crate) use crate::session_rollout_init_error::map_session_init_error;
 
 pub(crate) mod truncation {

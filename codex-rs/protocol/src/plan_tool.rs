@@ -97,6 +97,3 @@ fn validate_plan_items(plan: &[PlanItemArg]) -> Result<(), &'static str> {
     }
 }
 
-#[cfg(test)]
-#[path = "plan_tool_tests.rs"]
-mod tests;

@@ -297,6 +297,3 @@ pub async fn run_device_code_login(opts: ServerOptions) -> std::io::Result<()> {
     complete_device_code_login(opts, device_code).await
 }
 
-#[cfg(test)]
-#[path = "device_code_auth_tests.rs"]
-mod tests;

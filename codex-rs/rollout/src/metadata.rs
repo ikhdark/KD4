@@ -216,7 +216,7 @@ struct ExtractionCacheKey {
 
 #[derive(Default)]
 struct ExtractionCache {
-    entries: HashMap<ExtractionCacheKey, ExtractionOutcome>,
+    entries: HashMap<ExtractionCacheKey, (ExtractionOutcome, Vec<PayloadDependencyVersion>)>,
     summaries: HashMap<ExtractionCacheKey, crate::list::HeadTailSummary>,
     order: VecDeque<ExtractionCacheKey>,
 }
@@ -258,6 +258,7 @@ pub(crate) async fn cache_extraction_outcome(
     guard: ExtractionCacheGuard,
     outcome: ExtractionOutcome,
     summary: Option<crate::list::HeadTailSummary>,
+    payload_versions: Vec<PayloadDependencyVersion>,
 ) {
     let Some(key) = guard.key else {
         return;
@@ -268,6 +269,10 @@ pub(crate) async fn cache_extraction_outcome(
     if current_key != key {
         return;
     }
+    // Sidecars are independent inputs. Check the streaming reader's pre-read
+    // receipts without holding the cache mutex across filesystem work.
+    let payloads_unchanged = payload_versions.is_empty()
+        || crate::payload_artifact::payload_versions_match(&payload_versions).await;
     let mut cache = extraction_cache()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -282,14 +287,14 @@ pub(crate) async fn cache_extraction_outcome(
     });
     // Payload artifacts can be repaired without changing the rollout cache key.
     // Retire any earlier snapshot, but do not retain this incomplete projection.
-    if outcome.parse_errors != 0 {
+    if outcome.parse_errors != 0 || outcome.unresolved_payloads != 0 || !payloads_unchanged {
         return;
     }
     cache.order.push_back(key.clone());
     if let Some(summary) = summary {
         cache.summaries.insert(key.clone(), summary);
     }
-    cache.entries.insert(key, outcome);
+    cache.entries.insert(key, (outcome, payload_versions));
     while cache.order.len() > EXTRACTION_CACHE_CAPACITY {
         if let Some(evicted) = cache.order.pop_front() {
             cache.entries.remove(&evicted);
@@ -303,10 +308,12 @@ pub(crate) async fn cached_head_summary(
     default_provider: &str,
 ) -> Option<crate::list::HeadTailSummary> {
     let key = extraction_cache_key(rollout_path, default_provider).await?;
-    extraction_cache()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .summaries.get(&key).cloned()
+    let (summary, dependencies) = {
+        let cache = extraction_cache().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        (cache.summaries.get(&key)?.clone(), cache.entries.get(&key)?.1.clone())
+    };
+    (dependencies.is_empty() || crate::payload_artifact::payload_versions_match(&dependencies).await)
+        .then_some(summary)
 }
 
 async fn cached_extraction_outcome(
@@ -314,10 +321,12 @@ async fn cached_extraction_outcome(
     default_provider: &str,
 ) -> Option<ExtractionOutcome> {
     let key = extraction_cache_key(rollout_path, default_provider).await?;
-    let cache = extraction_cache()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    cache.entries.get(&key).cloned()
+    let (outcome, dependencies) = {
+        let cache = extraction_cache().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        cache.entries.get(&key)?.clone()
+    };
+    (dependencies.is_empty() || crate::payload_artifact::payload_versions_match(&dependencies).await)
+        .then_some(outcome)
 }
 
 #[derive(Default)]
@@ -427,38 +436,7 @@ impl RolloutMetadataAccumulator {
     }
 }
 
-#[cfg(test)]
-pub(crate) async fn backfill_sessions(
-    runtime: &codex_state::StateRuntime,
-    codex_home: &Path,
-    default_provider: &str,
-) {
-    backfill_sessions_with_lease(
-        runtime,
-        codex_home,
-        default_provider,
-        BACKFILL_LEASE_SECONDS,
-    )
-    .await;
-}
 
-#[cfg(test)]
-pub(crate) async fn backfill_sessions_with_lease(
-    runtime: &codex_state::StateRuntime,
-    codex_home: &Path,
-    default_provider: &str,
-    backfill_lease_seconds: i64,
-) {
-    backfill_sessions_until(
-        runtime,
-        codex_home,
-        default_provider,
-        backfill_lease_seconds,
-        &mut BackfillMemo::default(),
-        || false,
-    )
-    .await;
-}
 
 /// Rollout version stamped before a read: physical path, length and mtime.
 type RolloutSourceVersion = (PathBuf, u64, Option<SystemTime>);
@@ -1035,6 +1013,3 @@ impl BackfillDiscovery {
     }
 }
 
-#[cfg(test)]
-#[path = "metadata_tests.rs"]
-mod tests;

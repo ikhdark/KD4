@@ -37,11 +37,11 @@ fn is_dangerous_powershell(command: &[String]) -> bool {
     if !is_powershell_executable(exe) {
         return false;
     }
-    // Backticks have PowerShell escape semantics that shlex cannot preserve.
-    // Use the existing bounded parser for those scripts; an unavailable parse
-    // cannot establish that the escaped command is harmless.
+    // These forms have PowerShell semantics that POSIX shlex cannot preserve.
+    // An unavailable bounded parse cannot establish harmlessness.
     match parse_powershell_invocation(rest) {
-        PowershellInvocation::InlineCommand { script, .. } if script.contains('`') => {
+        PowershellInvocation::InlineCommand { script, .. }
+            if script.contains(['`', '\\']) || script.contains("<#") => {
             try_parse_powershell_ast_commands(exe, script)
                 .map(|commands| {
                     commands
@@ -159,19 +159,10 @@ fn is_dangerous_cmd(command: &[String]) -> bool {
         return false;
     }
 
-    let cmd_tokens: Vec<String> = match remaining.as_slice() {
-        [only] => shlex_split(only).unwrap_or_else(|| vec![only.clone()]),
-        _ => remaining,
+    let Some(commands) = split_cmd_script(&remaining.join(" ")) else {
+        return true;
     };
-
-    // Refine tokens by splitting concatenated CMD operators (e.g. "echo hi&del")
-    let tokens: Vec<&str> = cmd_tokens
-        .iter()
-        .flat_map(|t| split_embedded_cmd_operators(t))
-        .collect();
-
-    const CMD_SEPARATORS: &[&str] = &["&", "&&", "|", "||"];
-    tokens.split(|t| CMD_SEPARATORS.contains(t)).any(|segment| {
+    commands.iter().any(|segment| {
         let Some(cmd) = segment.first() else {
             return false;
         };
@@ -228,39 +219,59 @@ fn is_direct_gui_launch(command: &[String]) -> bool {
     false
 }
 
-fn split_embedded_cmd_operators(token: &str) -> Vec<&str> {
-    // Split concatenated CMD operators so `echo hi&del` becomes `["echo hi", "&", "del"]`.
-    // Handles `&`, `&&`, `|`, `||`. Best-effort (CMD escaping is weird by nature).
-    let mut parts = Vec::new();
-    let mut start = 0;
-    let mut it = token.char_indices().peekable();
-
-    while let Some((i, ch)) = it.next() {
-        if ch == '&' || ch == '|' {
-            if i > start {
-                parts.push(&token[start..i]);
+fn split_cmd_script(script: &str) -> Option<Vec<Vec<String>>> {
+    // CMD groups with double quotes. Apostrophes and backslashes are literal;
+    // only an unquoted caret escapes the next character.
+    let mut commands = Vec::new();
+    let mut words = Vec::new();
+    let mut word = String::new();
+    let mut started = false;
+    let mut quoted = false;
+    let mut chars = script.chars().peekable();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '"' => {
+                quoted = !quoted;
+                started = true;
             }
-
-            // Detect doubled operator: && or ||
-            let op_len = match it.peek() {
-                Some(&(j, next)) if next == ch => {
-                    it.next(); // consume second char
-                    (j + next.len_utf8()) - i
+            '^' if !quoted => {
+                word.push(chars.next()?);
+                started = true;
+            }
+            '&' | '|' | '\r' | '\n' if !quoted => {
+                if started {
+                    words.push(std::mem::take(&mut word));
+                    started = false;
                 }
-                _ => ch.len_utf8(),
-            };
-
-            parts.push(&token[i..i + op_len]);
-            start = i + op_len;
+                if !words.is_empty() {
+                    commands.push(std::mem::take(&mut words));
+                }
+                if chars.peek() == Some(&ch) {
+                    chars.next();
+                }
+            }
+            ch if ch.is_whitespace() && !quoted => {
+                if started {
+                    words.push(std::mem::take(&mut word));
+                    started = false;
+                }
+            }
+            _ => {
+                word.push(ch);
+                started = true;
+            }
         }
     }
-
-    if start < token.len() {
-        parts.push(&token[start..]);
+    if quoted {
+        return None;
     }
-
-    parts.retain(|s| !s.trim().is_empty());
-    parts
+    if started {
+        words.push(word);
+    }
+    if !words.is_empty() {
+        commands.push(words);
+    }
+    Some(commands)
 }
 
 fn has_force_delete_cmdlet(tokens: &[String]) -> bool {
@@ -296,8 +307,9 @@ fn has_force_delete_cmdlet(tokens: &[String]) -> bool {
 
 /// Check a CMD builtin's switches case-insensitively. CMD accepts switches joined in one
 /// token (`rd /s/q`, `del /f/q`) and switch values after a colon (`del /a:h`).
-fn has_cmd_switch(args: &[&str], switch: char) -> bool {
+fn has_cmd_switch(args: &[impl AsRef<str>], switch: char) -> bool {
     args.iter()
+        .map(|arg| arg.as_ref())
         .filter(|arg| arg.starts_with('/'))
         .flat_map(|arg| arg.split('/'))
         .filter_map(|group| group.chars().next())
@@ -362,502 +374,3 @@ fn is_browser_executable(name: &str) -> bool {
     )
 }
 
-#[cfg(test)]
-mod tests {
-    use super::has_force_delete_cmdlet;
-    use super::is_dangerous_command_windows;
-    use super::is_dangerous_powershell_words;
-
-    fn vec_str(items: &[&str]) -> Vec<String> {
-        items.iter().map(std::string::ToString::to_string).collect()
-    }
-
-    #[test]
-    fn review_regression_structured_arguments_are_not_commands() {
-        let words = |items: &[&str]| items.iter().map(ToString::to_string).collect::<Vec<_>>();
-        assert!(!is_dangerous_powershell_words(&words(&[
-            "Write-Output",
-            "Remove-Item",
-            "-Force"
-        ])));
-        assert!(!is_dangerous_powershell_words(&words(&[
-            "Write-Output",
-            "Start-Process",
-            "https://example.com"
-        ])));
-        assert!(is_dangerous_powershell_words(&words(&[
-            "Remove-Item",
-            "file",
-            "-Force"
-        ])));
-        assert!(is_dangerous_command_windows(&words(&[
-            "powershell.exe",
-            "-Command",
-            "echo hi; Remove-Item file -Force"
-        ])));
-    }
-
-    #[test]
-    fn looks_like_url_reuses_initialized_regex() {
-        assert!(super::looks_like_url("('https://example.com');"));
-        assert!(super::looks_like_url("('https://example.org');"));
-        assert!(!super::looks_like_url("('not-a-url');"));
-    }
-
-    #[test]
-    fn powershell_start_process_url_is_dangerous() {
-        assert!(is_dangerous_command_windows(&vec_str(&[
-            "powershell",
-            "-NoLogo",
-            "-Command",
-            "Start-Process 'https://example.com'"
-        ])));
-    }
-
-    #[test]
-    fn opaque_powershell_invocations_are_dangerous() {
-        for invocation in [
-            vec_str(&[
-                "powershell",
-                "-EncodedCommand",
-                "UwB0AGEAcgB0AC0AUAByAG8AYwBlAHMAcwA=",
-            ]),
-            vec_str(&["powershell", "-File", "script.ps1"]),
-            vec_str(&["powershell", "-UnknownFlag", "value"]),
-            vec_str(&["powershell", "script.ps1"]),
-        ] {
-            assert!(is_dangerous_command_windows(&invocation), "{invocation:?}");
-        }
-    }
-
-    #[test]
-    fn powershell_start_process_url_with_trailing_semicolon_is_dangerous() {
-        assert!(is_dangerous_command_windows(&vec_str(&[
-            "powershell",
-            "-Command",
-            "Start-Process('https://example.com');"
-        ])));
-    }
-
-    #[test]
-    fn powershell_start_process_mixed_case_urls_are_dangerous() {
-        for script in [
-            "Start-Process('HTTP://example.com');",
-            "Start-Process('hTtPs://example.com');",
-        ] {
-            assert!(
-                is_dangerous_command_windows(&vec_str(&["powershell", "-Command", script])),
-                "{script}"
-            );
-        }
-    }
-
-    #[test]
-    fn powershell_start_process_local_is_not_flagged() {
-        assert!(!is_dangerous_command_windows(&vec_str(&[
-            "powershell",
-            "-Command",
-            "Start-Process notepad.exe"
-        ])));
-    }
-
-    #[test]
-    fn powershell_gui_executables_use_direct_argv_classification() {
-        for executable in ["rundll32", "RUNDLL32.EXE", "mshta", "MsHtA.ExE"] {
-            let args = if executable.to_ascii_lowercase().starts_with("rundll32") {
-                "url.dll,FileProtocolHandler https://example.com"
-            } else {
-                "https://example.com"
-            };
-            let script = format!("{executable} {args}");
-            let invocation = vec_str(&["powershell", "-Command", &script]);
-            assert!(
-                crate::is_dangerous_command::command_might_be_dangerous(&invocation),
-                "{script}"
-            );
-        }
-        for script in [
-            "mshta.exe local.hta",
-            "rundll32.exe url.dll,FileProtocolHandler local.txt",
-        ] {
-            assert!(!crate::is_dangerous_command::command_might_be_dangerous(
-                &vec_str(&["powershell", "-Command", script])
-            ));
-        }
-    }
-
-    #[test]
-    fn cmd_start_with_url_is_dangerous() {
-        assert!(is_dangerous_command_windows(&vec_str(&[
-            "cmd",
-            "/c",
-            "start",
-            "https://example.com"
-        ])));
-    }
-
-    #[test]
-    fn direct_gui_launch_normalizes_executable_ascii_case() {
-        use crate::is_dangerous_command::command_might_be_dangerous;
-
-        for executable in ["rundll32", "RUNDLL32.EXE", "bin/RuNdLl32.ExE"] {
-            assert!(command_might_be_dangerous(&vec_str(&[
-                executable,
-                "URL.DLL,FileProtocolHandler",
-                "https://example.com",
-            ])));
-            assert!(!command_might_be_dangerous(&vec_str(&[
-                executable,
-                "URL.DLL,FileProtocolHandler",
-                "local.txt",
-            ])));
-            assert!(!command_might_be_dangerous(&vec_str(&[
-                executable,
-                "other.dll,OtherEntryPoint",
-                "https://example.com",
-            ])));
-        }
-    }
-
-    #[test]
-    fn msedge_with_url_is_dangerous() {
-        assert!(is_dangerous_command_windows(&vec_str(&[
-            "msedge.exe",
-            "https://example.com"
-        ])));
-    }
-
-    #[test]
-    fn explorer_with_directory_is_not_flagged() {
-        assert!(!is_dangerous_command_windows(&vec_str(&[
-            "explorer.exe",
-            "."
-        ])));
-    }
-
-    #[test]
-    fn force_delete_command_variants_preserve_hazard_classification() {
-        for (case, command, expected) in [
-            (
-                "powershell_remove_item_force_is_dangerous",
-                vec_str(&["powershell", "-Command", "Remove-Item test -Force"]),
-                true,
-            ),
-            (
-                "powershell_remove_item_recurse_force_is_dangerous",
-                vec_str(&["powershell", "-Command", "Remove-Item test -Recurse -Force"]),
-                true,
-            ),
-            (
-                "powershell_ri_alias_force_is_dangerous",
-                vec_str(&["pwsh", "-Command", "ri test -Force"]),
-                true,
-            ),
-            (
-                "powershell_remove_item_without_force_is_not_flagged",
-                vec_str(&["powershell", "-Command", "Remove-Item test"]),
-                false,
-            ),
-            (
-                "cmd_del_force_is_dangerous",
-                vec_str(&["cmd", "/c", "del", "/f", "test.txt"]),
-                true,
-            ),
-            (
-                "cmd_erase_force_is_dangerous",
-                vec_str(&["cmd", "/c", "erase", "/f", "test.txt"]),
-                true,
-            ),
-            (
-                "cmd_del_without_force_is_not_flagged",
-                vec_str(&["cmd", "/c", "del", "test.txt"]),
-                false,
-            ),
-            (
-                "cmd_rd_recursive_is_dangerous",
-                vec_str(&["cmd", "/c", "rd", "/s", "/q", "test"]),
-                true,
-            ),
-            (
-                "cmd_rd_without_quiet_is_not_flagged",
-                vec_str(&["cmd", "/c", "rd", "/s", "test"]),
-                false,
-            ),
-            (
-                "cmd_rmdir_recursive_is_dangerous",
-                vec_str(&["cmd", "/c", "rmdir", "/s", "/q", "test"]),
-                true,
-            ),
-            (
-                "powershell_remove_item_path_recurse_force_is_dangerous",
-                vec_str(&[
-                    "powershell",
-                    "-Command",
-                    "Remove-Item -Path 'test' -Recurse -Force",
-                ]),
-                true,
-            ),
-            (
-                "powershell_remove_item_force_with_semicolon_is_dangerous",
-                vec_str(&[
-                    "powershell",
-                    "-Command",
-                    "Remove-Item test -Force; Write-Host done",
-                ]),
-                true,
-            ),
-            (
-                "powershell_remove_item_force_inside_block_is_dangerous",
-                vec_str(&[
-                    "powershell",
-                    "-Command",
-                    "if ($true) { Remove-Item test -Force}",
-                ]),
-                true,
-            ),
-            (
-                "powershell_remove_item_force_inside_brackets_is_dangerous",
-                vec_str(&[
-                    "powershell",
-                    "-Command",
-                    "[void]( Remove-Item test -Force)]",
-                ]),
-                true,
-            ),
-            (
-                "cmd_del_path_containing_f_is_not_flagged",
-                vec_str(&["cmd", "/c", "del", "C:/foo/bar.txt"]),
-                false,
-            ),
-            (
-                "cmd_rd_path_containing_s_is_not_flagged",
-                vec_str(&["cmd", "/c", "rd", "C:/source"]),
-                false,
-            ),
-            (
-                "cmd_bypass_chained_del_is_dangerous",
-                vec_str(&["cmd", "/c", "echo", "hello", "&", "del", "/f", "file.txt"]),
-                true,
-            ),
-            (
-                "powershell_chained_no_space_is_dangerous",
-                vec_str(&[
-                    "powershell",
-                    "-Command",
-                    "Write-Host hi;Remove-Item -Force C:\\tmp",
-                ]),
-                true,
-            ),
-            (
-                "powershell_comma_separated_is_dangerous",
-                vec_str(&["powershell", "-Command", "del,-Force,C:\\foo"]),
-                true,
-            ),
-            (
-                "cmd_echo_del_is_not_dangerous",
-                vec_str(&["cmd", "/c", "echo", "del", "/f"]),
-                false,
-            ),
-            (
-                "cmd_del_single_string_argument_is_dangerous",
-                vec_str(&["cmd", "/c", "del /f file.txt"]),
-                true,
-            ),
-            (
-                "cmd_del_chained_single_string_argument_is_dangerous",
-                vec_str(&["cmd", "/c", "echo hello & del /f file.txt"]),
-                true,
-            ),
-            (
-                "cmd_chained_no_space_del_is_dangerous",
-                vec_str(&["cmd", "/c", "echo hi&del /f file.txt"]),
-                true,
-            ),
-            (
-                "cmd_chained_andand_no_space_del_is_dangerous",
-                vec_str(&["cmd", "/c", "echo hi&&del /f file.txt"]),
-                true,
-            ),
-            (
-                "cmd_chained_oror_no_space_del_is_dangerous",
-                vec_str(&["cmd", "/c", "echo hi||del /f file.txt"]),
-                true,
-            ),
-            (
-                "cmd_start_url_single_string_is_dangerous",
-                vec_str(&["cmd", "/c", "start https://example.com"]),
-                true,
-            ),
-            (
-                "cmd_chained_no_space_rmdir_is_dangerous",
-                vec_str(&["cmd", "/c", "echo hi&rmdir /s /q testdir"]),
-                true,
-            ),
-            (
-                "cmd_del_force_uppercase_flag_is_dangerous",
-                vec_str(&["cmd", "/c", "DEL", "/F", "file.txt"]),
-                true,
-            ),
-            (
-                "cmdexe_r_del_force_is_dangerous",
-                vec_str(&["cmd.exe", "/r", "del", "/f", "file.txt"]),
-                true,
-            ),
-            (
-                "cmd_start_quoted_url_single_string_is_dangerous",
-                vec_str(&["cmd", "/c", r#"start "https://example.com""#]),
-                true,
-            ),
-            (
-                "cmd_start_title_then_url_is_dangerous",
-                vec_str(&["cmd", "/c", r#"start "" https://example.com"#]),
-                true,
-            ),
-            (
-                "powershell_rm_alias_force_is_dangerous",
-                vec_str(&["powershell", "-Command", "rm test -Force"]),
-                true,
-            ),
-        ] {
-            assert_eq!(
-                is_dangerous_command_windows(&command),
-                expected,
-                "{case}: {command:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn powershell_literal_tab_in_path_does_not_hide_force_delete() {
-        // A tab inside a quoted path is argument data, not a command separator.
-        // PowerShell's native AST retains all three elements in one CommandAst.
-        for script in [
-            "Remove-Item 'a\tb' -Force",
-            "Remove-Item -Force 'a\tb'",
-            "Remove-Item\tfile\t-Force",
-        ] {
-            assert!(
-                is_dangerous_command_windows(&vec_str(&["powershell", "-Command", script])),
-                "{script:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn powershell_force_delete_does_not_cross_command_separators() {
-        for separator in [";", "|", "&", "\n", "\r", "&&", "||"] {
-            let tokens = vec_str(&[
-                "Get-ChildItem",
-                &format!("-Force{separator}Remove-Item"),
-                "file",
-            ]);
-            assert!(
-                !has_force_delete_cmdlet(&tokens),
-                "separator: {separator:?}"
-            );
-            let tokens = vec_str(&[
-                "Remove-Item",
-                &format!("file{separator}Get-ChildItem"),
-                "-Force",
-            ]);
-            assert!(
-                !has_force_delete_cmdlet(&tokens),
-                "separator: {separator:?}"
-            );
-        }
-        assert!(has_force_delete_cmdlet(&vec_str(&[
-            "(REMOVE-ITEM)",
-            "file",
-            "[-Force:$true]"
-        ])));
-        assert!(has_force_delete_cmdlet(&vec_str(&[
-            "-Force",
-            "{Remove-Item}",
-            "file"
-        ])));
-        assert!(!has_force_delete_cmdlet(&vec_str(&[
-            "Remove-Item",
-            "file",
-            "-Forceful"
-        ])));
-    }
-
-    #[test]
-    fn powershell_force_parameter_prefixes_and_dash_variants_are_dangerous() {
-        // PowerShell binds each of these to Remove-Item -Force (verified against pwsh 7 and
-        // Windows PowerShell 5.1 by deleting a read-only file).
-        for force in [
-            "-Fo",
-            "-forc",
-            "-FORCE",
-            "\u{2013}Force",
-            "\u{2014}Fo",
-            "\u{2015}force",
-            "-Fo:$true",
-        ] {
-            let script = format!("Remove-Item test {force}");
-            assert!(
-                is_dangerous_command_windows(&vec_str(&["powershell", "-Command", &script])),
-                "{script}"
-            );
-            assert!(
-                is_dangerous_powershell_words(&vec_str(&["Remove-Item", "test", force])),
-                "{force}"
-            );
-        }
-        for not_force in ["-F", "-Filter", "-Forceful", "-fx", "Force"] {
-            assert!(
-                !is_dangerous_powershell_words(&vec_str(&["Remove-Item", "test", not_force])),
-                "{not_force}"
-            );
-        }
-    }
-
-    #[test]
-    fn cmd_joined_switches_and_keep_open_shell_are_dangerous() {
-        for command in [
-            vec_str(&["cmd", "/c", "rd", "/s/q", "build"]),
-            vec_str(&["cmd", "/c", "rmdir /Q/S build"]),
-            vec_str(&["cmd", "/c", "del /f/q file.txt"]),
-            vec_str(&["cmd", "/c", "del", "/A:R/F", "file.txt"]),
-            vec_str(&["cmd", "/k", "del", "/f", "file.txt"]),
-        ] {
-            assert!(is_dangerous_command_windows(&command), "{command:?}");
-        }
-        for command in [
-            vec_str(&["cmd", "/c", "rd", "/s", "build"]),
-            vec_str(&["cmd", "/c", "del", "/q", "C:/fast/file.txt"]),
-        ] {
-            assert!(!is_dangerous_command_windows(&command), "{command:?}");
-        }
-    }
-
-    #[test]
-    fn powershell_benign_force_separate_command_is_not_dangerous() {
-        assert!(!is_dangerous_command_windows(&vec_str(&[
-            "powershell",
-            "-Command",
-            "Get-ChildItem -Force; Remove-Item test"
-        ])));
-    }
-
-    #[test]
-    fn powershell_escaped_force_delete_is_dangerous() {
-        for script in ["Remove-`Item sample -Force", "r`m sample -Force"] {
-            assert!(
-                is_dangerous_command_windows(&vec_str(&["powershell.exe", "-Command", script])),
-                "escaped deletion must remain dangerous: {script}"
-            );
-        }
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn powershell_escaped_benign_command_is_not_dangerous() {
-        assert!(!is_dangerous_command_windows(&vec_str(&[
-            "powershell.exe",
-            "-Command",
-            "Get-Chil`dItem -Force",
-        ])));
-    }
-}

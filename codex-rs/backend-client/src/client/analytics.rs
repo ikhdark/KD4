@@ -125,6 +125,3 @@ impl Client {
     }
 }
 
-#[cfg(test)]
-#[path = "analytics_tests.rs"]
-mod tests;

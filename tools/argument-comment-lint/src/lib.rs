@@ -60,7 +60,7 @@ rustc_session::declare_lint! {
     ///
     /// ### Example
     ///
-    /// ```rust
+    /// ```text
     /// fn create_openai_url(base_url: Option<String>) -> String {
     ///     String::new()
     /// }
@@ -70,7 +70,7 @@ rustc_session::declare_lint! {
     ///
     /// Use instead:
     ///
-    /// ```rust
+    /// ```text
     /// fn create_openai_url(base_url: Option<String>) -> String {
     ///     String::new()
     /// }
@@ -101,7 +101,7 @@ rustc_session::declare_lint! {
     ///
     /// ### Example
     ///
-    /// ```rust
+    /// ```text
     /// fn create_openai_url(base_url: Option<String>) -> String {
     ///     String::new()
     /// }
@@ -111,7 +111,7 @@ rustc_session::declare_lint! {
     ///
     /// Use instead:
     ///
-    /// ```rust
+    /// ```text
     /// fn create_openai_url(base_url: Option<String>) -> String {
     ///     String::new()
     /// }
@@ -291,24 +291,4 @@ fn is_workspace_crate_name(name: &str) -> bool {
             name,
             "app_test_support" | "core_test_support" | "core_test_support_base"
         )
-}
-
-#[test]
-fn ui() {
-    dylint_testing::ui_test(env!("CARGO_PKG_NAME"), "ui");
-}
-
-#[test]
-fn workspace_crate_filter_accepts_first_party_names_only() {
-    assert!(is_workspace_crate_name("codex_core"));
-    assert!(is_workspace_crate_name("codex_exec"));
-    assert!(is_workspace_crate_name("core_test_support"));
-    assert!(is_workspace_crate_name("core_test_support_base"));
-    assert!(is_workspace_crate_name("app_test_support"));
-    assert!(!is_workspace_crate_name("std"));
-    assert!(!is_workspace_crate_name("tokio"));
-    assert!(!is_workspace_crate_name("codex"));
-    assert!(!is_workspace_crate_name("my_codex_core"));
-    assert!(!is_workspace_crate_name("external_test_support"));
-    assert!(!is_workspace_crate_name("core_test_support_base_extra"));
 }

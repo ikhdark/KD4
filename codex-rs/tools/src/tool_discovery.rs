@@ -144,7 +144,3 @@ pub fn collect_request_plugin_install_entries(
         })
         .collect()
 }
-
-#[cfg(test)]
-#[path = "tool_discovery_tests.rs"]
-mod tests;

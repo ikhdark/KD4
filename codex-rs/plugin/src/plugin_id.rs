@@ -70,7 +70,3 @@ pub fn validate_plugin_segment(segment: &str, kind: &str) -> Result<(), String> 
     }
     Ok(())
 }
-
-#[cfg(test)]
-#[path = "plugin_id_tests.rs"]
-mod tests;

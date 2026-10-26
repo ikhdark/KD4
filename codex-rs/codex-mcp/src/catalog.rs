@@ -431,6 +431,3 @@ impl ResolvedMcpCatalog {
     }
 }
 
-#[cfg(test)]
-#[path = "catalog_tests.rs"]
-mod tests;

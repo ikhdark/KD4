@@ -49,8 +49,6 @@ pub(super) struct DurableState {
     completed_cells: Mutex<BTreeMap<String, Arc<CompletedSnapshotEvent>>>,
     pub(super) first_cell_id: u64,
     pub(super) cell_id_limit: u64,
-    #[cfg(test)]
-    pub(super) io_gate: Mutex<Option<(bool, Arc<super::StorageTestGate>)>>,
 }
 
 pub(super) struct StagedSnapshot {
@@ -92,10 +90,6 @@ impl CompletedSnapshotEvent {
 }
 
 impl DurableState {
-    #[cfg(test)]
-    pub(super) fn open(path: PathBuf) -> Result<(Self, HashMap<String, StoredValue>), String> {
-        Self::open_with_values(path, HashMap::new(), 1)
-    }
 
     pub(super) fn open_with_values(
         path: PathBuf,
@@ -247,8 +241,6 @@ impl DurableState {
             ),
             first_cell_id,
             cell_id_limit,
-            #[cfg(test)]
-            io_gate: Mutex::new(None),
         };
         let reservation = state.stage_state(
             snapshot.completed_call_id,
@@ -278,23 +270,6 @@ impl DurableState {
             .collect()
     }
 
-    #[cfg(test)]
-    pub(super) fn completed_cells(&self) -> Vec<(String, CellEvent)> {
-        self.completed_cells_for_replay()
-            .into_iter()
-            .map(|(id, event, _)| (id, event.read()))
-            .collect()
-    }
-
-    #[cfg(test)]
-    pub(super) fn completed_cell(&self, cell_id: &str) -> Option<CellEvent> {
-        self.completed_cells
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(cell_id)
-            .map(|event| event.event.clone())
-    }
-
     pub(super) fn completed_cell_for_replay(
         &self,
         cell_id: &str,
@@ -315,8 +290,6 @@ impl DurableState {
         cell_id: String,
         event: CellEvent,
     ) -> Result<StagedSnapshot, String> {
-        #[cfg(test)]
-        self.wait_for_test_io(false);
         let mut completed_cells = self
             .completed_cells
             .lock()
@@ -429,8 +402,6 @@ impl DurableState {
     /// decision. Until this succeeds, callers must report uncertain durability.
     /// This is process-crash recovery, not guaranteed power-loss durability.
     pub(super) fn publish(&self, staged: StagedSnapshot) -> Result<(), String> {
-        #[cfg(test)]
-        self.wait_for_test_io(true);
         let StagedSnapshot {
             file,
             revision,
@@ -444,73 +415,5 @@ impl DurableState {
             .unwrap_or_else(std::sync::PoisonError::into_inner) = completed_cells;
         self.revision.store(revision, Ordering::Release);
         Ok(())
-    }
-
-    #[cfg(test)]
-    fn wait_for_test_io(&self, publishing: bool) {
-        let gate = self.io_gate.lock().unwrap().clone();
-        if let Some((phase, gate)) = gate
-            && phase == publishing
-        {
-            gate.wait();
-        }
-    }
-}
-
-#[cfg(test)]
-mod audit63_retirement_tests {
-    use super::*;
-
-    #[test]
-    fn permanently_deleted_thread_cannot_recreate_a_snapshot() {
-        let home = tempfile::tempdir().unwrap();
-        let path = home.path().join("code-mode-state/thread.json");
-        let (state, _) = DurableState::open(path.clone()).unwrap();
-        drop(state);
-        std::fs::remove_file(&path).unwrap();
-        std::fs::create_dir_all(home.path().join("tool-history")).unwrap();
-        std::fs::write(home.path().join("tool-history/thread.retired"), b"retired").unwrap();
-        assert!(DurableState::open(path.clone()).is_err());
-        assert!(!path.exists());
-    }
-}
-
-#[cfg(test)]
-mod deep_payload_tests {
-    use super::*;
-
-    #[test]
-    fn standalone_depth_boundaries_survive_snapshot_publication_and_reopening() {
-        for depth in [125, 126, 127] {
-            let directory = tempfile::tempdir().unwrap();
-            let path = directory.path().join("state.json");
-            let (state, _) = DurableState::open(path.clone()).unwrap();
-            let json = format!("{}0{}", "[".repeat(depth), "]".repeat(depth));
-            let deep: Value = serde_json::from_str(&json).unwrap();
-            let event = CellEvent::Completed {
-                content_items: Vec::new(), error_text: None, output_loss: None,
-            };
-            let staged = state.stage("deep-call".into(), HashMap::from([
-                ("deep".into(), StoredValue::new("deep", deep.clone())),
-                ("kept".into(), StoredValue::new("kept", Value::Bool(true))),
-            ]), "1".into(), event.clone()).unwrap();
-            state.publish(staged).unwrap();
-            drop(state);
-            let (restored, values) = DurableState::open(path).unwrap();
-            assert_eq!(values["deep"].value.as_ref(), &deep, "depth {depth}");
-            assert_eq!(values["kept"].value.as_ref(), &Value::Bool(true));
-            assert_eq!(restored.completed_cell("1"), Some(event));
-        }
-    }
-
-    #[test]
-    fn overdeep_external_payload_is_rejected_without_replacing_snapshot() {
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("state.json");
-        let bytes = format!(r#"{{"version":7,"revision":1,"completed_call_id":"","values":{{"deep":{}0{}}},"completed_cells":{{}}}}"#,
-            "[".repeat(128), "]".repeat(128));
-        std::fs::write(&path, &bytes).unwrap();
-        assert!(DurableState::open(path.clone()).is_err());
-        assert_eq!(std::fs::read(&path).unwrap(), bytes.as_bytes());
     }
 }

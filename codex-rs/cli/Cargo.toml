@@ -87,14 +87,3 @@ windows-sys = { workspace = true, features = [
 
 [target.'cfg(target_os = "macos")'.dependencies]
 libc = { workspace = true }
-
-[dev-dependencies]
-app_test_support = { workspace = true }
-assert_cmd = { workspace = true }
-assert_matches = { workspace = true }
-codex-utils-cargo-bin = { workspace = true }
-insta = { workspace = true }
-predicates = { workspace = true }
-pretty_assertions = { workspace = true }
-sqlx = { workspace = true }
-wiremock = { workspace = true }

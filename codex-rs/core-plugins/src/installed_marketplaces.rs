@@ -15,6 +15,14 @@ pub fn marketplace_install_root(codex_home: &Path) -> PathBuf {
     codex_home.join(INSTALLED_MARKETPLACES_DIR)
 }
 
+/// Stable same-marketplace operation lease. Acquire before config locking and
+/// retain through filesystem publication, config update, and any rollback.
+/// Reuse the existing nonblocking entry-lock owner; unrelated names do not wait.
+pub(crate) fn try_lock_marketplace_operation(codex_home: &Path, name: &str) -> std::io::Result<std::fs::File> {
+    validate_plugin_segment(name, "marketplace name").map_err(std::io::Error::other)?;
+    crate::store::try_lock_plugin_cache_entry(&marketplace_install_root(codex_home).join(name))
+}
+
 pub fn installed_marketplace_roots_from_layer_stack(
     config_layer_stack: &ConfigLayerStack,
     codex_home: &Path,

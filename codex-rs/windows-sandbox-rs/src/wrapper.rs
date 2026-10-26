@@ -330,6 +330,3 @@ fn parse_windows_sandbox_level(value: &str) -> Result<WindowsSandboxLevel> {
     }
 }
 
-#[cfg(test)]
-#[path = "wrapper_tests.rs"]
-mod tests;

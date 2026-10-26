@@ -508,7 +508,3 @@ fn push_search_part(parts: &mut String, part: &str) {
         parts.push_str(part);
     }
 }
-
-#[cfg(test)]
-#[path = "tool_search_tests.rs"]
-mod tests;

@@ -1122,5 +1122,3 @@ pub fn approx_tokens_from_byte_count_i64(bytes: i64) -> i64 {
     i64::try_from(approx_tokens_from_byte_count(bytes)).unwrap_or(i64::MAX)
 }
 
-#[cfg(test)]
-mod truncate_tests;

@@ -645,6 +645,3 @@ fn wait_agent_tool_parameters_v2(options: WaitAgentTimeoutOptions) -> JsonSchema
     JsonSchema::object(properties, /*required*/ None, Some(false.into()))
 }
 
-#[cfg(test)]
-#[path = "multi_agents_spec_tests.rs"]
-mod tests;

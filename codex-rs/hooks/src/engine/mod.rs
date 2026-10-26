@@ -129,16 +129,6 @@ impl<'a> ScopedRunGate<'a> {
         }
     }
 
-    /// A gate with no `once_per` limits, for tests that exercise event modules directly.
-    #[cfg(test)]
-    pub(crate) fn unscoped() -> ScopedRunGate<'static> {
-        static ONCE_PER: std::sync::LazyLock<HashMap<String, OncePerLimit>> =
-            std::sync::LazyLock::new(HashMap::new);
-        static SCOPED_RUNS: std::sync::LazyLock<Mutex<HashSet<String>>> =
-            std::sync::LazyLock::new(Mutex::default);
-        ScopedRunGate::new(&ONCE_PER, &SCOPED_RUNS, "", "")
-    }
-
     fn scope_key(&self, handler: &ConfiguredHandler) -> Option<String> {
         if self.once_per.is_empty() {
             return None;
@@ -466,7 +456,3 @@ impl ClaudeHooksEngine {
             .await
     }
 }
-
-#[cfg(test)]
-#[path = "mod_tests.rs"]
-mod tests;

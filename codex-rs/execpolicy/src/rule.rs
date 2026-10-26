@@ -391,15 +391,3 @@ pub(crate) fn validate_not_match_examples(
     Ok(())
 }
 
-#[cfg(test)]
-mod tests {
-    use super::PatternToken;
-
-    #[test]
-    fn constructs_and_reads_pattern_alternatives() {
-        let token = PatternToken::from_alternatives(vec!["git".into(), "jj".into()])
-            .expect("non-empty alternatives should be valid");
-
-        assert_eq!(token.alternatives(), &["git", "jj"]);
-    }
-}

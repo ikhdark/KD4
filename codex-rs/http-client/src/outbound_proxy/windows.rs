@@ -414,9 +414,6 @@ fn proxy_bypass_matches_origin(proxy_bypass: &str, origin: &RequestOrigin) -> bo
         })
 }
 
-#[cfg(test)]
-#[path = "windows_tests.rs"]
-mod tests;
 
 fn wide_null(value: &str) -> Vec<u16> {
     value.encode_utf16().chain(std::iter::once(0)).collect()

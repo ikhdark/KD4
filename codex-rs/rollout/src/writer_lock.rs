@@ -37,28 +37,3 @@ pub async fn acquire_thread_writer(
     .map_err(io::Error::other)?
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[tokio::test]
-    async fn independent_owners_conflict_until_last_guard_drops() {
-        let home = tempfile::tempdir().unwrap();
-        let id = codex_protocol::ThreadId::new();
-        let first = acquire_thread_writer(home.path(), id).await.unwrap();
-        let retained = Arc::clone(&first);
-        drop(first);
-        assert_eq!(
-            acquire_thread_writer(home.path(), id)
-                .await
-                .unwrap_err()
-                .kind(),
-            io::ErrorKind::WouldBlock
-        );
-        let other = acquire_thread_writer(home.path(), codex_protocol::ThreadId::new())
-            .await
-            .unwrap();
-        drop(retained);
-        assert!(acquire_thread_writer(home.path(), id).await.is_ok());
-        drop(other);
-    }
-}

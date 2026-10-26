@@ -60,13 +60,6 @@ pub(super) fn bounded_string(
 }
 
 fn copy_string(scope: &mut v8::PinScope<'_, '_>, value: v8::Local<'_, v8::String>) -> String {
-    #[cfg(test)]
-    {
-        let bytes = value.utf8_length(scope);
-        if let Some(state) = scope.get_slot_mut::<super::RuntimeState>() {
-            state.rust_conversion_bytes += bytes;
-        }
-    }
     value.to_rust_string_lossy(scope)
 }
 

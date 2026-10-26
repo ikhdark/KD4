@@ -4,22 +4,12 @@ use clap::Parser;
 use codex_app_server::AppServerRuntimeOptions;
 use codex_app_server::AppServerTransport;
 use codex_app_server::AppServerWebsocketAuthArgs;
-#[cfg(debug_assertions)]
-use codex_app_server::PluginStartupTasks;
 use codex_app_server::run_main;
 use codex_arg0::Arg0DispatchPaths;
 use codex_arg0::arg0_dispatch_or_else;
 use codex_config::LoaderOverrides;
 use codex_protocol::protocol::SessionSource;
 use codex_utils_cli::CliConfigOverrides;
-use std::path::PathBuf;
-
-// Debug-only test hook: lets integration tests point the server at a temporary
-// managed config file without writing to /etc.
-#[cfg(debug_assertions)]
-const MANAGED_CONFIG_PATH_ENV_VAR: &str = "CODEX_APP_SERVER_MANAGED_CONFIG_PATH";
-#[cfg(debug_assertions)]
-const DISABLE_MANAGED_CONFIG_ENV_VAR: &str = "CODEX_APP_SERVER_DISABLE_MANAGED_CONFIG";
 
 #[derive(Debug, Parser)]
 #[command(version = codex_utils_build_info::CODEX_VERSION)]
@@ -52,12 +42,6 @@ struct AppServerArgs {
     #[arg(long = "strict-config", default_value_t = false)]
     strict_config: bool,
 
-    /// Hidden debug-only test hook used by integration tests that spawn the
-    /// production app-server binary.
-    #[cfg(debug_assertions)]
-    #[arg(long = "disable-plugin-startup-tasks-for-tests", hide = true)]
-    disable_plugin_startup_tasks_for_tests: bool,
-
     /// Enable remote control for this app-server process without changing persistence.
     #[arg(long = "remote-control", hide = true)]
     remote_control: bool,
@@ -72,24 +56,12 @@ fn main() -> anyhow::Result<()> {
             session_source,
             auth,
             strict_config,
-            #[cfg(debug_assertions)]
-            disable_plugin_startup_tasks_for_tests,
             remote_control,
         } = AppServerArgs::parse();
-        let loader_overrides = if disable_managed_config_from_debug_env() {
-            LoaderOverrides::without_managed_config_for_tests()
-        } else {
-            managed_config_path_from_debug_env()
-                .map(LoaderOverrides::with_managed_config_path_for_tests)
-                .unwrap_or_default()
-        };
+        let loader_overrides = LoaderOverrides::default();
         let transport = listen;
         let auth = auth.try_into_settings()?;
         let mut runtime_options = AppServerRuntimeOptions::default();
-        #[cfg(debug_assertions)]
-        if disable_plugin_startup_tasks_for_tests {
-            runtime_options.plugin_startup_tasks = PluginStartupTasks::Skip;
-        }
         runtime_options.remote_control_startup_mode =
             match (remote_control, remote_control_disabled) {
                 (true, _) => codex_app_server::RemoteControlStartupMode::EnabledEphemeral,
@@ -113,32 +85,4 @@ fn main() -> anyhow::Result<()> {
     })
 }
 
-fn disable_managed_config_from_debug_env() -> bool {
-    #[cfg(debug_assertions)]
-    {
-        if let Ok(value) = std::env::var(DISABLE_MANAGED_CONFIG_ENV_VAR) {
-            return matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES");
-        }
-    }
 
-    false
-}
-
-fn managed_config_path_from_debug_env() -> Option<PathBuf> {
-    #[cfg(debug_assertions)]
-    {
-        if let Ok(value) = std::env::var(MANAGED_CONFIG_PATH_ENV_VAR) {
-            return if value.is_empty() {
-                None
-            } else {
-                Some(PathBuf::from(value))
-            };
-        }
-    }
-
-    None
-}
-
-#[cfg(test)]
-#[path = "main_tests.rs"]
-mod tests;

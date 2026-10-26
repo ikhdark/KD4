@@ -468,6 +468,3 @@ fn is_sandboxed() -> bool {
     std::env::var("CODEX_SANDBOX").as_deref() == Ok("seatbelt")
 }
 
-#[cfg(test)]
-#[path = "default_client_tests.rs"]
-mod tests;

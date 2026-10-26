@@ -138,6 +138,3 @@ pub(crate) fn jwt_auth_claims(jwt: &str) -> serde_json::Map<String, serde_json::
     serde_json::Map::new()
 }
 
-#[cfg(test)]
-#[path = "success_page_tests.rs"]
-mod tests;

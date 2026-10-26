@@ -39,8 +39,3 @@ tokio-util = { workspace = true, features = ["rt"] }
 tracing = { workspace = true }
 url = { workspace = true }
 
-[dev-dependencies]
-codex-plugin = { workspace = true }
-pretty_assertions = { workspace = true }
-rmcp = { workspace = true, default-features = false, features = ["base64", "macros", "schemars", "server"] }
-tokio = { workspace = true, features = ["test-util"] }

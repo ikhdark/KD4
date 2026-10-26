@@ -384,17 +384,6 @@ impl HostState {
         });
     }
 
-    #[cfg(test)]
-    async fn handle_request(
-        &self,
-        request_id: RequestId,
-        request: HostRequest,
-        cancellation: CancellationToken,
-    ) {
-        self.handle_request_with_catalog(request_id, request, cancellation, None)
-            .await;
-    }
-
     async fn handle_request_with_catalog(
         &self,
         request_id: RequestId,
@@ -755,7 +744,3 @@ impl SeenSessionIds {
         true
     }
 }
-
-#[cfg(test)]
-#[path = "host_tests.rs"]
-mod tests;

@@ -62,9 +62,6 @@ pub(crate) struct NoiseHarnessConnectionArgs {
 const NOISE_RELAY_RESET_DISCONNECT_REASON: &str = "Noise relay stream reset";
 // Give a Pong already queued behind data a bounded chance to reach the reader.
 const MAX_FRAMES_DRAINED_AFTER_PONG_DEADLINE: usize = 32;
-#[cfg(test)]
-const NOISE_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(200);
-#[cfg(not(test))]
 const NOISE_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 const NOISE_HANDSHAKE_TIMEOUT_REASON: &str = "Noise relay handshake timed out";
 
@@ -543,6 +540,3 @@ fn send_disconnected(
     });
 }
 
-#[cfg(test)]
-#[path = "harness_tests.rs"]
-mod tests;

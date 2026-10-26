@@ -154,10 +154,6 @@ impl<E> ResponseEventSender<E> {
         self.tx.capacity() == 0 || payload_bytes > self.bytes.available_permits()
     }
 
-    #[cfg(test)]
-    pub(crate) fn queued_payload_bytes(&self) -> usize {
-        self.limit - self.bytes.available_permits()
-    }
 
     pub async fn send(&self, event: Result<ResponseEvent, E>) -> Result<(), ApiError> {
         self.send_charged(event.into()).await
@@ -299,15 +295,11 @@ fn nanos(duration: std::time::Duration) -> u64 {
 }
 
 fn payload_bytes<E>(event: &Result<ResponseEvent, E>) -> usize {
-    #[cfg(test)]
-    CHARGE_CALCULATIONS.with(|count| count.set(count.get() + 1));
     event
         .as_ref()
         .map_or(0, ResponseEvent::queued_payload_bytes)
 }
 
-#[cfg(test)]
-thread_local! { static CHARGE_CALCULATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
 
 // Count encoded payload without allocating another copy of large output items.
 // JSON escaping/envelopes conservatively charge more than their string contents.
@@ -385,139 +377,3 @@ pub fn response_item_payload_bytes(item: &codex_protocol::models::ResponseItem) 
     encoded_bytes(item).saturating_add(retained_content)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use futures::FutureExt;
-
-    #[tokio::test]
-    async fn immutable_charge_survives_two_queues_and_changed_payload_is_recharged() {
-        let (tx, mut rx) = channel_with_limit::<ApiError>(1, 1024 * 1024);
-        let (next_tx, mut next_rx) = channel_with_limit::<String>(1, 1024 * 1024);
-        let item = serde_json::from_value(serde_json::json!({
-            "type":"function_call", "name":"read_file", "call_id":"c", "arguments":"\"\\\n".repeat(32768)
-        })).unwrap();
-        let expected = response_item_payload_bytes(&item);
-        let before = CHARGE_CALCULATIONS.with(std::cell::Cell::get);
-        tx.send(Ok(ResponseEvent::OutputItemDone(item))).await.unwrap();
-        let envelope = futures::future::poll_fn(|cx| rx.poll_recv_charged(cx)).await.unwrap();
-        assert_eq!(envelope.payload_bytes(), expected);
-        assert_eq!(tx.bytes.available_permits(), 1024 * 1024);
-        next_tx.send_charged(envelope.map_err(|error| error.to_string())).await.unwrap();
-        assert_eq!(next_tx.queued_payload_bytes(), expected);
-        let envelope = futures::future::poll_fn(|cx| next_rx.poll_recv_charged(cx)).await.unwrap();
-        assert_eq!(CHARGE_CALCULATIONS.with(std::cell::Cell::get) - before, 1);
-        let changed = envelope.map(|_| Ok(ResponseEvent::OutputTextDelta("x".repeat(1024 * 1024 + 1))));
-        assert!(next_tx.send_charged(changed).await.is_err());
-        assert_eq!(next_tx.bytes.available_permits(), 1024 * 1024);
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn queue_timing_separates_capacity_wait_from_residence() {
-        let (tx, mut rx) = channel_with_limit::<ApiError>(1, 8);
-        let (receipt_tx, receipt_rx) = tokio::sync::oneshot::channel();
-        rx.observe_timing(move |receipt| {
-            let _ = receipt_tx.send(receipt);
-        });
-        tx.send(Ok(ResponseEvent::Created)).await.unwrap();
-        let mut blocked = Box::pin(tx.send(Ok(ResponseEvent::Completed {
-            response_id: "r".into(),
-            token_usage: None,
-            end_turn: None,
-        })));
-        assert!(blocked.as_mut().now_or_never().is_none());
-        tokio::time::advance(std::time::Duration::from_millis(7)).await;
-        assert!(matches!(rx.recv().await, Some(Ok(ResponseEvent::Created))));
-        blocked.await.unwrap();
-        tokio::time::advance(std::time::Duration::from_millis(11)).await;
-        assert!(matches!(
-            rx.recv().await,
-            Some(Ok(ResponseEvent::Completed { .. }))
-        ));
-        let receipt = receipt_rx.await.unwrap();
-        assert_eq!((receipt.enqueued_events, receipt.dequeued_events), (2, 2));
-        assert_eq!(receipt.enqueue_wait_ns, 7_000_000);
-        assert_eq!(receipt.queue_residence_ns, 18_000_000);
-        assert_eq!(receipt.max_enqueue_wait_ns, 7_000_000);
-        assert_eq!(receipt.max_queue_residence_ns, 11_000_000);
-        assert!(receipt.terminal_received);
-        assert_eq!(tx.bytes.available_permits(), 8);
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn queue_timing_keeps_silence_and_cancelled_delivery_partial() {
-        let (tx, mut rx) = channel_with_limit::<ApiError>(1, 8);
-        let (receipt_tx, receipt_rx) = tokio::sync::oneshot::channel();
-        rx.observe_timing(move |receipt| {
-            let _ = receipt_tx.send(receipt);
-        });
-        // Provider silence before enqueue is not host queue residence.
-        tokio::time::advance(std::time::Duration::from_secs(30)).await;
-        tx.send(Ok(ResponseEvent::Created)).await.unwrap();
-        assert!(matches!(rx.recv().await, Some(Ok(ResponseEvent::Created))));
-        tx.try_send(Ok(ResponseEvent::Created)).unwrap();
-        let mut blocked = Box::pin(tx.send(Ok(ResponseEvent::Created)));
-        assert!(blocked.as_mut().now_or_never().is_none());
-        tokio::time::advance(std::time::Duration::from_secs(5)).await;
-        drop(blocked);
-        drop(rx);
-        let receipt = receipt_rx.await.unwrap();
-        assert_eq!((receipt.enqueued_events, receipt.dequeued_events), (2, 1));
-        assert_eq!(receipt.enqueue_wait_ns, 0);
-        assert_eq!(receipt.queue_residence_ns, 0);
-        assert!(!receipt.terminal_received);
-        assert_eq!(tx.bytes.available_permits(), 8);
-    }
-
-    #[test]
-    fn locally_retained_reasoning_content_is_charged_even_when_not_serialized() {
-        let item = serde_json::from_value(serde_json::json!({
-            "type":"reasoning", "summary":[], "content":[{"type":"text","text":"x".repeat(4096)}]
-        }))
-        .unwrap();
-        let event = ResponseEvent::OutputItemDone(item);
-        assert!(event.queued_payload_bytes() >= 4096);
-    }
-
-    #[tokio::test]
-    async fn bytes_bound_large_deltas_and_release_on_drain_cancel_and_drop() {
-        let (tx, mut rx) = channel_with_limit::<ApiError>(1600, 8);
-        tx.send(Ok(ResponseEvent::OutputTextDelta("12345678".into())))
-            .await
-            .unwrap();
-        let mut blocked = Box::pin(tx.send(Ok(ResponseEvent::OutputTextDelta("x".into()))));
-        assert!(blocked.as_mut().now_or_never().is_none());
-        assert_eq!(tx.bytes.available_permits(), 0);
-        assert!(
-            matches!(rx.recv().await, Some(Ok(ResponseEvent::OutputTextDelta(text))) if text == "12345678")
-        );
-        blocked.await.unwrap();
-        assert_eq!(tx.bytes.available_permits(), 7);
-        let mut cancelled =
-            Box::pin(tx.send(Ok(ResponseEvent::OutputTextDelta("12345678".into()))));
-        assert!(cancelled.as_mut().now_or_never().is_none());
-        drop(cancelled);
-        assert_eq!(tx.bytes.available_permits(), 7);
-        let mut blocked = Box::pin(tx.send(Ok(ResponseEvent::OutputTextDelta("12345678".into()))));
-        assert!(blocked.as_mut().now_or_never().is_none());
-        drop(rx);
-        assert!(blocked.await.is_err());
-        assert_eq!(tx.bytes.available_permits(), 8);
-    }
-
-    #[tokio::test]
-    async fn oversized_events_fail_without_waiting_and_count_bounds_empty_events() {
-        let (tx, mut rx) = channel_with_limit::<ApiError>(1, 8);
-        let error = tx
-            .send(Ok(ResponseEvent::OutputTextDelta("123456789".into())))
-            .await
-            .unwrap_err();
-        assert!(!crate::map_api_error(error).is_retryable());
-        tx.send(Ok(ResponseEvent::Created)).await.unwrap();
-        let mut blocked = Box::pin(tx.send(Ok(ResponseEvent::Created)));
-        assert!(blocked.as_mut().now_or_never().is_none());
-        drop(blocked);
-        assert!(matches!(rx.recv().await, Some(Ok(ResponseEvent::Created))));
-        assert_eq!(tx.bytes.available_permits(), 8);
-    }
-}

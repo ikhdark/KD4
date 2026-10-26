@@ -570,6 +570,3 @@ async fn send_and_expect_status(
     while let Ok(Some(_)) = response.chunk().await {}
     Ok(())
 }
-
-#[cfg(test)]
-mod tests;

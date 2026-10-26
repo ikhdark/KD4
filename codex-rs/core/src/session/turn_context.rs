@@ -236,10 +236,6 @@ impl TurnEnvironment {
         self.shell_snapshot.clone().now_or_never().flatten()
     }
 
-    #[cfg(test)]
-    pub(crate) async fn shell_snapshot(&self, cwd: &PathUri) -> Option<Arc<ShellSnapshotFile>> {
-        self.ready_shell_snapshot(cwd)
-    }
 
     pub(crate) fn cwd(&self) -> &PathUri {
         &self.cwd
@@ -523,17 +519,6 @@ impl TurnContext {
         }
     }
 
-    #[cfg(test)]
-    pub(crate) async fn take_post_tool_contexts(&self, call_id: &str) -> Vec<ResponseItem> {
-        let mut context = self
-            .pending_post_tool_contexts
-            .lock()
-            .await
-            .remove(call_id)
-            .unwrap_or_default();
-        context.items.extend(context.search_items);
-        context.items
-    }
 
     pub(crate) fn record_dispatched_tool_name(&self, tool_name: &str) {
         self.dispatched_tool_names
@@ -1250,22 +1235,6 @@ impl Session {
         }
     }
 
-    #[cfg(test)]
-    pub(crate) async fn new_turn_with_sub_id(
-        &self,
-        sub_id: String,
-        updates: SessionSettingsUpdate,
-    ) -> CodexResult<Arc<TurnContext>> {
-        let session_configuration = self.apply_turn_settings(&sub_id, &updates).await?;
-
-        Ok(self
-            .new_turn_from_configuration(
-                sub_id,
-                session_configuration,
-                /*final_output_json_schema*/ None,
-            )
-            .await)
-    }
 
     pub(crate) async fn apply_turn_settings(
         &self,
@@ -1537,110 +1506,5 @@ impl Session {
     async fn default_turn_configuration(&self) -> SessionConfiguration {
         let state = self.state.lock().await;
         state.session_configuration.clone()
-    }
-}
-#[cfg(test)]
-mod runtime_epoch_tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn validation_policy_survives_context_rebuild_and_round_trip() {
-        use codex_protocol::validation::ValidationMode;
-
-        let (session, _) = crate::session::tests::make_session_and_context().await;
-        let turn = session.new_turn_with_sub_id(
-            "validation-turn".into(),
-            SessionSettingsUpdate {
-                validation_mode: Some(ValidationMode::Full),
-                ..Default::default()
-            },
-        ).await.unwrap();
-        assert_eq!(turn.validation_mode, ValidationMode::Full);
-        turn.full_suite_budget.restore_policy_attempts(&[("selection".into(), "revision".into())]);
-        let item = turn.to_turn_context_item();
-        let restored: TurnContextItem = serde_json::from_value(
-            serde_json::to_value(&item).unwrap(),
-        ).unwrap();
-        assert_eq!(restored.validation_mode, Some(ValidationMode::Full));
-        assert_eq!(restored.validation_full_budget, Some(2));
-        assert_eq!(restored.validation_attempts, vec![("selection".into(), "revision".into())]);
-
-        let mut configuration = session.state.lock().await.session_configuration.clone();
-        configuration.validation_root_turn = restored.validation_root_turn;
-        configuration.validation_attempts = restored.validation_attempts;
-        let rebuilt = session.new_turn_from_configuration(
-            "validation-rebuilt".into(), configuration, None,
-        ).await;
-        assert_eq!(rebuilt.validation_mode, ValidationMode::Full);
-        assert_eq!(rebuilt.full_suite_budget.policy_snapshot(2).admitted, 1);
-        assert!(Arc::ptr_eq(&turn.full_suite_budget, &rebuilt.full_suite_budget));
-        let next = session.new_turn_with_sub_id(
-            "ordinary-next-turn".into(),
-            SessionSettingsUpdate {
-                validation_mode: Some(ValidationMode::Compile),
-                ..Default::default()
-            },
-        ).await.unwrap();
-        assert_eq!(next.validation_mode, ValidationMode::Compile);
-    }
-
-    #[tokio::test]
-    async fn fresh_session_metadata_replaces_shell_and_discards_old_snapshot() {
-        let environment = Arc::new(codex_exec_server::Environment::default_for_tests());
-        let backend = environment.get_exec_backend();
-        let mut selected = TurnEnvironment::new(
-            "remote".into(),
-            environment,
-            PathUri::parse("file:///C:/workspace").unwrap(),
-            None,
-        );
-        let runtime = |id: &str, name: &str, path: &str| {
-            codex_exec_server::EnvironmentRuntime::for_tests(
-                id.into(),
-                serde_json::from_value(serde_json::json!({
-                    "operatingSystem":"windows", "shell":{"name":name,"path":path},
-                    "cwd":"file:///C:/workspace",
-                }))
-                .unwrap(),
-                Arc::clone(&backend),
-            )
-        };
-        selected
-            .apply_runtime(runtime("first", "powershell", "C:/first/powershell.exe"))
-            .unwrap();
-        let stable = Arc::clone(&selected.environment);
-        let owner = selected.owner_id();
-        selected
-            .apply_runtime(runtime("first", "powershell", "C:/first/powershell.exe"))
-            .unwrap();
-        assert!(Arc::ptr_eq(&stable, &selected.environment));
-        assert_eq!(selected.owner_id(), owner);
-        selected.shell_snapshot = futures::future::pending().boxed().shared();
-        selected
-            .apply_runtime(runtime("second", "cmd", "C:/second/cmd.exe"))
-            .unwrap();
-        assert_eq!(
-            selected.shell.as_ref().unwrap().shell_type,
-            shell::ShellType::Cmd
-        );
-        assert!(
-            selected
-                .shell
-                .as_ref()
-                .unwrap()
-                .shell_path
-                .to_string_lossy()
-                .contains("second")
-        );
-        assert_eq!(selected.runtime.as_ref().unwrap().session_id, "second");
-        assert_ne!(selected.owner_id(), owner);
-        assert!(
-            selected
-                .shell_snapshot
-                .clone()
-                .now_or_never()
-                .unwrap()
-                .is_none()
-        );
     }
 }

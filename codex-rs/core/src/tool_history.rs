@@ -385,13 +385,6 @@ impl ToolHistoryCandidate {
         }).clone()
     }
 
-    #[cfg(test)]
-    fn receipt(&self) -> Option<(&str, &str, u64)> {
-        self.render_receipt(
-            /*require_consumed*/ true, /*require_savings*/ true,
-        )
-    }
-
     fn render_receipt(
         &self,
         require_consumed: bool,
@@ -1000,23 +993,6 @@ impl WorkspaceEvidenceObservation {
                 // changes. Never let it override the captured dependency watcher.
                 self.source_paths_are_current(workspace_identity, git_workspace)
             }
-    }
-
-    #[cfg(test)]
-    // Synthetic test observations explicitly promise that their supplied inputs
-    // are exhaustive. Runtime callers must use classification provenance below.
-    pub(crate) fn from_response_item(
-        revision: Option<WorkspaceEvidenceIdentity>,
-        item: &ResponseItem,
-        source_dependencies: BTreeSet<SourceDependencyV1>,
-    ) -> Option<Self> {
-        Self::from_response_item_with_freshness(
-            revision,
-            item,
-            source_dependencies,
-            /*source_dependencies_current*/ true,
-        )
-        .map(|observation| observation.with_source_scope_complete(true))
     }
 
     pub(crate) fn from_response_item_with_freshness(
@@ -1782,16 +1758,6 @@ impl ToolHistoryState {
                 .is_some_and(|(actual, expected)| actual == expected)
     }
 
-    #[cfg(test)]
-    pub(crate) fn read_status(
-        &self,
-        paths: &[PathBuf],
-        environment_id: Option<&str>,
-        items: &[ResponseItem],
-    ) -> serde_json::Value {
-        self.read_status_page(paths, environment_id, items, &ReadStatusQuery::default())
-    }
-
     /// Derive obtained byte coverage from existing output records. This does
     /// not read source, refresh evidence, or assert model/semantic inspection.
     pub(crate) fn read_status_page(
@@ -2077,73 +2043,6 @@ impl ToolHistoryState {
             .find(later_consumption)
     }
 
-    #[cfg(test)]
-    pub(crate) fn phase_checkpoint_receipts(
-        &self,
-        call_ids: &[String],
-    ) -> Result<serde_json::Value, String> {
-        let unknown = call_ids
-            .iter()
-            .filter(|id| !self.candidates.contains_key(*id))
-            .collect::<Vec<_>>();
-        if !unknown.is_empty() {
-            let eligible = self
-                .candidates
-                .values()
-                .filter(|candidate| {
-                    candidate.successful
-                        && candidate.consumed_by_generation.is_some()
-                        && candidate.checkpoint_pin().is_some()
-                })
-                .map(|candidate| candidate.call_id.clone())
-                .collect::<BTreeSet<_>>();
-            return Err(serde_json::json!({
-                "error": "unknown checkpoint tool results; no evidence was changed",
-                "unknown_call_ids": unknown,
-                "eligible_call_ids": eligible.iter().take(16).collect::<Vec<_>>(),
-                "eligible_count": eligible.len(),
-                "eligible_list_complete": eligible.len() <= 16,
-            })
-            .to_string());
-        }
-        let mut receipts = BTreeMap::new();
-        let resolutions = FailureResolutionIndex::default();
-        for id in call_ids {
-            let candidate = self
-                .candidates
-                .get(id)
-                .ok_or_else(|| format!("unknown tool result {id}"))?;
-            let resolution = self.failure_resolution(candidate, &resolutions);
-            if (!candidate.successful && resolution.is_none())
-                || candidate.consumed_by_generation.is_none()
-            {
-                return Err(format!(
-                    "{id} is unresolved or has not yet been consumed; retain it until resolved"
-                ));
-            }
-            let mut receipt = candidate
-                .artifact_pin_value()
-                .ok_or_else(|| format!("{id} has no complete recovery artifact"))?;
-            if let Some(fields) = receipt.as_object_mut() {
-                fields.remove("digest");
-                if let Some(resolution) = resolution {
-                    fields.insert(
-                        "resolved_by".into(),
-                        serde_json::json!({
-                            "call_id": resolution.call_id,
-                            "evidence": resolution.artifact_pin_value(),
-                        }),
-                    );
-                }
-            }
-            if candidate.checkpoint_pin().is_none() {
-                continue;
-            }
-            receipts.insert(id.clone(), receipt);
-        }
-        serde_json::to_value(receipts).map_err(|e| e.to_string())
-    }
-
     pub(crate) fn has_phase_checkpoint(items: &[ResponseItem]) -> bool {
         items
             .iter()
@@ -2328,19 +2227,6 @@ impl ToolHistoryState {
         }
     }
 
-    #[cfg(test)]
-    pub(crate) fn invalidate_source_dependencies(
-        &mut self,
-        affected_paths: Option<&BTreeSet<PathBuf>>,
-        current_workspace_identity: Option<&WorkspaceEvidenceIdentity>,
-    ) -> bool {
-        self.invalidate_source_dependencies_excluding_call_ids(
-            affected_paths,
-            current_workspace_identity,
-            &BTreeSet::new(),
-        )
-    }
-
     pub(crate) fn invalidate_source_dependencies_excluding_call_ids(
         &mut self,
         affected_paths: Option<&BTreeSet<PathBuf>>,
@@ -2424,16 +2310,6 @@ impl ToolHistoryState {
             .or_insert(observation);
     }
 
-    #[cfg(test)]
-    pub(crate) fn workspace_evidence_revision_for_test(
-        &self,
-        call_id: &str,
-    ) -> Option<Option<WorkspaceEvidenceIdentity>> {
-        self.workspace_evidence
-            .get(call_id)
-            .map(|observation| observation.revision.clone())
-    }
-
     pub(crate) fn register_non_workspace_code_mode_call(&mut self, call_id: String) {
         self.workspace_evidence.remove(&call_id);
         self.non_workspace_code_mode_calls.insert(call_id);
@@ -2458,15 +2334,6 @@ impl ToolHistoryState {
             }
         }
         changed
-    }
-
-    #[cfg(test)]
-    pub(crate) fn mark_consumed(
-        &mut self,
-        input: &[ResponseItem],
-        generation: ModelGenerationId,
-    ) -> bool {
-        !self.mark_consumed_with_delta(input, generation).is_empty()
     }
 
     pub(crate) fn mark_consumed_with_delta(
@@ -2536,32 +2403,6 @@ impl ToolHistoryState {
             }
         }
         changed
-    }
-
-    #[cfg(test)]
-    fn output_was_consumed(&self, call_id: &str) -> bool {
-        if matches!(
-            self.exposed_representations.get(call_id),
-            Some(ExposedRepresentation::Compact { .. } | ExposedRepresentation::Omitted)
-        ) {
-            // Old ledgers may have marked first-exposure receipts consumed.
-            // The exposure record and exact recovered coverage qualify that.
-            return self.candidates.get(call_id).is_some_and(|candidate| {
-                self.recovered_artifact_selectors(&candidate.artifact_id)
-                    .into_iter()
-                    .flatten()
-                    .any(|range| {
-                        range["kind"] == "bytes"
-                            && range["start"].as_u64() == Some(0)
-                            && range["end"].as_u64() == Some(candidate.artifact_bytes)
-                    })
-            });
-        }
-        self.untracked_consumption.contains_key(call_id)
-            || self
-                .candidates
-                .get(call_id)
-                .is_some_and(|candidate| candidate.consumed_by_generation.is_some())
     }
 
     pub(crate) fn project_workspace_freshness_with_cache(
@@ -3717,14 +3558,6 @@ impl ToolHistoryLoadOutcome {
     }
 }
 
-#[cfg(test)]
-pub(crate) async fn load_tool_history_state(
-    codex_home: &std::path::Path,
-    thread_id: &str,
-) -> ToolHistoryLoadOutcome {
-    load_tool_history_state_with_reconciliation(codex_home, thread_id, true).await
-}
-
 /// Initialization owns validation after history reconstruction, immediately
 /// before its durable replacement. Do not hash the same set during loading.
 pub(crate) async fn load_tool_history_state_for_initialization(
@@ -4226,10 +4059,6 @@ pub(crate) struct ToolHistoryJournalWriter {
     journal_stamp: Option<JournalStamp>,
     ledger_stamp: Option<JournalStamp>,
     sequences: Option<BTreeMap<String, u64>>,
-    #[cfg(test)]
-    checkpoint_replays: u64,
-    #[cfg(test)]
-    journal_opens: u64,
 }
 
 pub(crate) async fn persist_tool_history_state(
@@ -4261,10 +4090,6 @@ async fn persist_tool_history_checkpoint(
         .map_err(|error| format!("failed to sync checkpoint artifacts: {error}"))?;
     let path = ledger_path(codex_home, thread_id);
     let journal_path = journal_path(codex_home, thread_id);
-    #[cfg(test)]
-    pause_tool_history_persistence_for_test_if_requested(thread_id).await;
-    #[cfg(test)]
-    fail_tool_history_persistence_for_test_if_requested(thread_id).await?;
     let lock_path = path.clone();
     let transaction_owner = tokio::task::spawn_blocking(move || {
         // The transaction lock lives in the ledger directory; report its
@@ -4312,10 +4137,6 @@ async fn persist_tool_history_checkpoint(
     let journal_sequences = if let Some(sequences) = cached_boundary {
         sequences
     } else {
-        #[cfg(test)]
-        {
-            writer.lock().unwrap().checkpoint_replays += 1;
-        }
         let mut journal_sequences = match tokio::fs::read(&path).await {
             Ok(bytes) => {
                 decode_tool_history_version::<CheckpointSequences>(&bytes, LEDGER_VERSION)
@@ -4416,23 +4237,6 @@ async fn tool_history_storage_is_definitely_absent(
     true
 }
 
-#[cfg(test)]
-pub(crate) async fn persist_tool_history_mutations(
-    codex_home: &std::path::Path,
-    thread_id: &str,
-    writer_id: &str,
-    mutations: &[(u64, ToolHistoryMutation)],
-) -> Result<u64, String> {
-    persist_tool_history_mutations_with_writer(
-        codex_home,
-        thread_id,
-        writer_id,
-        mutations,
-        Arc::default(),
-    )
-    .await
-}
-
 pub(crate) async fn persist_tool_history_mutations_with_writer(
     codex_home: &std::path::Path,
     thread_id: &str,
@@ -4467,10 +4271,6 @@ pub(crate) async fn persist_tool_history_mutations_with_writer(
         .map(|(sequence, _)| *sequence)
         .unwrap_or_default();
     let ledger = ledger_path(codex_home, thread_id);
-    #[cfg(test)]
-    pause_tool_history_persistence_for_test_if_requested(thread_id).await;
-    #[cfg(test)]
-    fail_tool_history_persistence_for_test_if_requested(thread_id).await?;
     tokio::task::spawn_blocking(move || {
         let _transaction = codex_file_system::acquire_atomic_write_lock(&ledger)
             .map_err(|error| error.to_string())?;
@@ -4513,10 +4313,6 @@ pub(crate) async fn persist_tool_history_mutations_with_writer(
         std::fs::create_dir_all(directory)
             .map_err(|error| format!("failed to create tool-history journal directory: {error}"))?;
         let retained = writer.file.is_some();
-        #[cfg(test)]
-        if !retained {
-            writer.journal_opens += 1;
-        }
         let mut file = match writer.file.take() {
             Some(file) => file,
             None => std::fs::OpenOptions::new()
@@ -4589,190 +4385,6 @@ pub(crate) async fn persist_tool_history_mutations_with_writer(
     .map_err(|error| format!("tool-history journal writer failed: {error}"))?
 }
 
-#[cfg(test)]
-#[derive(Clone)]
-struct ToolHistoryPersistencePauseState {
-    thread_id: String,
-    reached: Arc<tokio::sync::Notify>,
-    release: Arc<tokio::sync::Notify>,
-}
-
-#[cfg(test)]
-pub(crate) struct ToolHistoryPersistencePause {
-    state: ToolHistoryPersistencePauseState,
-}
-
-#[cfg(test)]
-impl ToolHistoryPersistencePause {
-    pub(crate) async fn wait_until_reached(&self) {
-        self.state.reached.notified().await;
-    }
-
-    pub(crate) fn release(&self) {
-        self.state.release.notify_one();
-    }
-}
-
-#[cfg(test)]
-impl Drop for ToolHistoryPersistencePause {
-    fn drop(&mut self) {
-        let slot = tool_history_persistence_pause_slot();
-        let mut pending = slot
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if pending
-            .as_ref()
-            .is_some_and(|pending| Arc::ptr_eq(&pending.reached, &self.state.reached))
-        {
-            *pending = None;
-        }
-        self.state.release.notify_one();
-    }
-}
-
-#[cfg(test)]
-fn tool_history_persistence_pause_slot()
--> &'static std::sync::Mutex<Option<ToolHistoryPersistencePauseState>> {
-    static SLOT: std::sync::OnceLock<std::sync::Mutex<Option<ToolHistoryPersistencePauseState>>> =
-        std::sync::OnceLock::new();
-    SLOT.get_or_init(|| std::sync::Mutex::new(None))
-}
-
-#[cfg(test)]
-pub(crate) fn pause_next_tool_history_persistence_for_test(
-    thread_id: &str,
-) -> ToolHistoryPersistencePause {
-    let state = ToolHistoryPersistencePauseState {
-        thread_id: thread_id.to_string(),
-        reached: Arc::new(tokio::sync::Notify::new()),
-        release: Arc::new(tokio::sync::Notify::new()),
-    };
-    let mut pending = tool_history_persistence_pause_slot()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    assert!(
-        pending.is_none(),
-        "only one tool-history persistence pause may be installed at a time"
-    );
-    *pending = Some(state.clone());
-    ToolHistoryPersistencePause { state }
-}
-
-#[cfg(test)]
-async fn pause_tool_history_persistence_for_test_if_requested(thread_id: &str) {
-    let pause = {
-        let mut pending = tool_history_persistence_pause_slot()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if pending
-            .as_ref()
-            .is_some_and(|pending| pending.thread_id == thread_id)
-        {
-            pending.take()
-        } else {
-            None
-        }
-    };
-    if let Some(pause) = pause {
-        pause.reached.notify_one();
-        pause.release.notified().await;
-    }
-}
-
-#[cfg(test)]
-#[derive(Clone)]
-struct ToolHistoryPersistenceFailureState {
-    thread_id: String,
-    reached: Arc<tokio::sync::Notify>,
-    release: Arc<tokio::sync::Notify>,
-}
-
-#[cfg(test)]
-pub(crate) struct ToolHistoryPersistenceFailure {
-    state: ToolHistoryPersistenceFailureState,
-}
-
-#[cfg(test)]
-impl ToolHistoryPersistenceFailure {
-    pub(crate) async fn wait_until_reached(&self) {
-        self.state.reached.notified().await;
-    }
-
-    pub(crate) fn release(&self) {
-        self.state.release.notify_one();
-    }
-}
-
-#[cfg(test)]
-impl Drop for ToolHistoryPersistenceFailure {
-    fn drop(&mut self) {
-        let slot = tool_history_persistence_failure_slot();
-        let mut pending = slot
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if pending
-            .as_ref()
-            .is_some_and(|pending| Arc::ptr_eq(&pending.reached, &self.state.reached))
-        {
-            *pending = None;
-        }
-        self.state.release.notify_one();
-    }
-}
-
-#[cfg(test)]
-fn tool_history_persistence_failure_slot()
--> &'static std::sync::Mutex<Option<ToolHistoryPersistenceFailureState>> {
-    static SLOT: std::sync::OnceLock<std::sync::Mutex<Option<ToolHistoryPersistenceFailureState>>> =
-        std::sync::OnceLock::new();
-    SLOT.get_or_init(|| std::sync::Mutex::new(None))
-}
-
-#[cfg(test)]
-pub(crate) fn fail_next_tool_history_persistence_for_test(
-    thread_id: &str,
-) -> ToolHistoryPersistenceFailure {
-    let state = ToolHistoryPersistenceFailureState {
-        thread_id: thread_id.to_string(),
-        reached: Arc::new(tokio::sync::Notify::new()),
-        release: Arc::new(tokio::sync::Notify::new()),
-    };
-    let mut pending = tool_history_persistence_failure_slot()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    assert!(
-        pending.is_none(),
-        "only one tool-history persistence failure may be installed at a time"
-    );
-    *pending = Some(state.clone());
-    ToolHistoryPersistenceFailure { state }
-}
-
-#[cfg(test)]
-async fn fail_tool_history_persistence_for_test_if_requested(
-    thread_id: &str,
-) -> Result<(), String> {
-    let failure = {
-        let mut pending = tool_history_persistence_failure_slot()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if pending
-            .as_ref()
-            .is_some_and(|pending| pending.thread_id == thread_id)
-        {
-            pending.take()
-        } else {
-            None
-        }
-    };
-    if let Some(failure) = failure {
-        failure.reached.notify_one();
-        failure.release.notified().await;
-        return Err("injected tool-history persistence failure".to_string());
-    }
-    Ok(())
-}
-
 fn ledger_path(codex_home: &std::path::Path, thread_id: &str) -> std::path::PathBuf {
     codex_home
         .join("tool-history")
@@ -4785,13 +4397,7 @@ fn journal_path(codex_home: &std::path::Path, thread_id: &str) -> std::path::Pat
         .join(format!("{thread_id}.journal.jsonl"))
 }
 
-#[cfg(test)]
-static TOOL_HISTORY_DIRECTORY_SYNC_ATTEMPTS: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
-
 fn sync_tool_history_ledger_directory(directory: &std::path::Path) -> Result<(), String> {
-    #[cfg(test)]
-    TOOL_HISTORY_DIRECTORY_SYNC_ATTEMPTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     sync_tool_history_ledger_directory_impl(directory)
 }
 
@@ -4832,18 +4438,6 @@ fn visit_artifact_reference_objects(
         }
         _ => {}
     }
-}
-
-#[cfg(test)]
-fn json_value_contains_artifact_reference(
-    value: &serde_json::Value,
-    candidate: &ToolHistoryCandidate,
-) -> bool {
-    let mut found = false;
-    visit_artifact_reference_objects(value, &mut |value, object| {
-        found |= json_object_matches_artifact_reference(value, object, candidate);
-    });
-    found
 }
 
 fn json_object_matches_artifact_reference(
@@ -5189,17 +4783,6 @@ pub(crate) fn classify_workspace_tool_call(
     }
 }
 
-#[cfg(test)]
-pub(crate) fn tool_call_observes_workspace(tool_identity: &str, payload: &ToolPayload) -> bool {
-    if !tool_observes_workspace(tool_identity) {
-        return false;
-    }
-    let ToolPayload::Function { arguments } = payload else {
-        return true;
-    };
-    tool_call_observes_workspace_parts(tool_identity, arguments)
-}
-
 fn tool_call_observes_workspace_parts(tool_identity: &str, arguments: &str) -> bool {
     if !tool_observes_workspace(tool_identity) {
         return false;
@@ -5306,20 +4889,6 @@ fn workspace_call_observes_from_arguments(
         crate::turn_diff_tracker::command_mutation(&command, None),
         crate::turn_diff_tracker::CommandMutation::KnownMutation { .. }
     ) && !crate::turn_diff_tracker::command_reads_repository_history(&command)
-}
-
-#[cfg(test)]
-pub(crate) fn source_dependencies_for_tool_call(
-    tool_identity: &str,
-    payload: &ToolPayload,
-    default_cwd: &Path,
-) -> BTreeSet<SourceDependencyV1> {
-    source_dependencies_for_tool_call_with_parsed_arguments(
-        tool_identity,
-        payload,
-        None,
-        default_cwd,
-    )
 }
 
 pub(crate) fn source_dependencies_for_tool_call_with_parsed_arguments(
@@ -5656,23 +5225,6 @@ struct CargoWorkspaceGraph {
     manifests: BTreeMap<PathBuf, CargoManifestRecord>,
 }
 
-#[cfg(test)]
-fn cargo_package_index(workspace_root: &Path) -> CargoWorkspaceGraph {
-    let root_manifest = std::fs::read_to_string(workspace_root.join("Cargo.toml")).ok();
-    cargo_package_index_with_root_manifest(workspace_root, root_manifest)
-}
-
-#[cfg(test)]
-fn cargo_package_index_with_root_manifest(
-    workspace_root: &Path,
-    root_manifest: Option<String>,
-) -> CargoWorkspaceGraph {
-    cargo_workspace_graph_with_root_manifest(
-        workspace_root,
-        root_manifest.map(CargoManifestRecord::new),
-    )
-}
-
 fn cargo_workspace_graph_with_root_manifest(
     workspace_root: &Path,
     root_manifest: Option<CargoManifestRecord>,
@@ -5680,19 +5232,6 @@ fn cargo_workspace_graph_with_root_manifest(
     cargo_workspace_graph_with_manifest_reader(workspace_root, root_manifest, |path| {
         std::fs::read_to_string(path).ok()
     })
-}
-
-#[cfg(test)]
-fn cargo_package_index_with_manifest_reader(
-    workspace_root: &Path,
-    root_manifest: Option<String>,
-    read_manifest: impl FnMut(&Path) -> Option<String>,
-) -> CargoWorkspaceGraph {
-    cargo_workspace_graph_with_manifest_reader(
-        workspace_root,
-        root_manifest.map(CargoManifestRecord::new),
-        read_manifest,
-    )
 }
 
 fn cargo_workspace_graph_with_manifest_reader(
@@ -6011,21 +5550,6 @@ fn inline_dependency_string<'a>(specification: &'a str, key: &str) -> Option<&'a
         .find_map(|(field_key, value)| {
             (field_key.trim() == key).then(|| value.trim().trim_matches(['\'', '"']))
         })
-}
-
-#[cfg(test)]
-pub(crate) fn workspace_evidence_cwd_for_tool_call(
-    tool_identity: &str,
-    payload: &ToolPayload,
-    default_cwd: &Path,
-) -> PathBuf {
-    if !tool_observes_workspace(tool_identity) {
-        return default_cwd.to_path_buf();
-    }
-    let Some(arguments) = workspace_call_arguments(payload) else {
-        return default_cwd.to_path_buf();
-    };
-    workspace_cwd_from_arguments(&arguments, default_cwd)
 }
 
 fn workspace_cwd_from_arguments(arguments: &serde_json::Value, default_cwd: &Path) -> PathBuf {
@@ -6973,65 +6497,3 @@ pub(crate) fn sha256(bytes: &[u8]) -> String {
     hex::encode(Sha256::digest(bytes))
 }
 
-#[cfg(test)]
-#[path = "tool_history_tests.rs"]
-pub(crate) mod tests;
-
-#[cfg(test)]
-#[path = "tool_history_recovery_tests.rs"]
-mod recovery_tests;
-
-#[cfg(test)]
-#[test]
-fn audit148_check_lane_attributes_package_inputs_without_test_receipts() {
-    let fixture = tempfile::tempdir().unwrap();
-    let root = fixture.path();
-    std::fs::create_dir_all(root.join("codex-rs/core/src")).unwrap();
-    std::fs::write(
-        root.join("codex-rs/Cargo.toml"),
-        "[workspace]\nmembers = [\"core\"]\nresolver = \"2\"\n",
-    )
-    .unwrap();
-    std::fs::write(
-        root.join("codex-rs/core/Cargo.toml"),
-        "[package]\nname = \"codex-core\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
-    )
-    .unwrap();
-    std::fs::write(root.join("codex-rs/core/src/lib.rs"), "").unwrap();
-    let mut runners: Vec<codex_shell_command::validation::RepositoryRunner> =
-        serde_json::from_value(
-            serde_json::from_str::<serde_json::Value>(include_str!(
-                "../../../.codex/test-runners.json"
-            ))
-            .unwrap()["runners"]
-                .clone(),
-        )
-        .unwrap();
-    for runner in &mut runners {
-        runner.path_context = Some((root.to_path_buf(), root.to_path_buf()));
-    }
-    let command = ["just", "check-lane", "codex-core", "--tests"].map(str::to_string);
-    let paths = runner_source_dependencies(&command, root, &runners).unwrap();
-    assert!(!paths.is_empty());
-    assert!(
-        paths
-            .iter()
-            .any(|path| path.recursive && path.path.ends_with("/codex-rs/core"))
-    );
-    assert!(paths.iter().any(|path| path.path.ends_with("/justfile")));
-    let declaration = runners
-        .iter()
-        .find(|runner| runner.matches("just", &command[1..]))
-        .unwrap();
-    assert!(declaration.receipt_runner.is_none());
-    assert_eq!(
-        declaration.admission_runner.as_deref(),
-        Some("rust_build_status")
-    );
-    let other = ["just", "check-lane", "missing_audit148_package", "--tests"].map(str::to_string);
-    assert!(
-        runner_source_dependencies(&other, root, &runners)
-            .unwrap()
-            .is_empty()
-    );
-}

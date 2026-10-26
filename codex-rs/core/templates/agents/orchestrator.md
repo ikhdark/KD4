@@ -17,5 +17,5 @@ Keep rules in their active owning surfaces:
 - `prompts/templates/review/rubric.md`: review criteria.
 
 Paths above are relative to `codex-rs`. Update an owning runtime source and its
-focused rendering or behavior tests when changing a rule; do not add a second
+affected consumers when changing a rule; do not add a second
 policy copy here. Text in this reference is not delivered to the model.

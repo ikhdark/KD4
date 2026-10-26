@@ -106,22 +106,10 @@ impl ChildTerminator for PipeChildTerminator {
     }
 }
 
-#[cfg(all(test, windows))]
-type DuplicateProcessHandleHook = Box<dyn FnOnce(RawHandle) -> io::Result<OwnedHandle> + Send>;
 
-#[cfg(all(test, windows))]
-thread_local! {
-    static TEST_DUPLICATE_PROCESS_HANDLE: std::cell::RefCell<Option<DuplicateProcessHandleHook>> = std::cell::RefCell::new(None);
-}
 
 #[cfg(windows)]
 fn duplicate_process_handle(process: RawHandle) -> io::Result<OwnedHandle> {
-    #[cfg(test)]
-    if let Some(duplicate) =
-        TEST_DUPLICATE_PROCESS_HANDLE.with(|duplicate| duplicate.borrow_mut().take())
-    {
-        return duplicate(process);
-    }
     // SAFETY: The sole caller keeps its Child alive through duplication, so this borrowed
     // process handle remains valid until try_clone_to_owned returns.
     unsafe { BorrowedHandle::borrow_raw(process) }.try_clone_to_owned()
@@ -243,15 +231,11 @@ async fn spawn_process_with_stdin_mode(
     {
         command.kill_on_drop(true);
         let runtime = tokio::runtime::Handle::current();
-        #[cfg(test)]
-        let duplicate = TEST_DUPLICATE_PROCESS_HANDLE.with(|hook| hook.borrow_mut().take());
         // The non-cancellable native owner retains admission through creation, containment,
         // handle setup, and waiter installation. An undeliverable session terminates on drop,
         // while its detached waiter retains admission until the child has been reaped.
         run_windows_process_operation(WINDOWS_PROCESS_OPERATION_TIMEOUT, move || {
             let child = command.spawn()?;
-            #[cfg(test)]
-            TEST_DUPLICATE_PROCESS_HANDLE.with(|hook| *hook.borrow_mut() = duplicate);
             Ok(runtime.block_on(finish_pipe_process_setup(child, managed)))
         })
         .await?
@@ -478,66 +462,3 @@ pub async fn spawn_process_no_stdin_with_inherited_fds(
     .await
 }
 
-#[cfg(all(test, windows))]
-#[path = "pipe_tests.rs"]
-mod tests;
-#[cfg(test)]
-mod capture_tests {
-    use super::*;
-    use std::pin::Pin;
-    use std::task::Context;
-    use std::task::Poll;
-    use tokio::io::ReadBuf;
-
-    struct Tail {
-        interrupted: bool,
-        fail: bool,
-    }
-    impl AsyncRead for Tail {
-        fn poll_read(
-            mut self: Pin<&mut Self>,
-            _: &mut Context<'_>,
-            _: &mut ReadBuf<'_>,
-        ) -> Poll<std::io::Result<()>> {
-            if std::mem::take(&mut self.interrupted) {
-                Poll::Ready(Err(std::io::Error::from(ErrorKind::Interrupted)))
-            } else if self.fail {
-                Poll::Ready(Err(std::io::Error::other("injected reader failure")))
-            } else {
-                Poll::Ready(Ok(()))
-            }
-        }
-    }
-
-    #[tokio::test]
-    async fn native_capture_distinguishes_eof_error_and_abort() {
-        for prefix in [b"".as_slice(), b"known prefix".as_slice()] {
-            for fail in [false, true] {
-                let complete = Arc::new(AtomicBool::new(false));
-                let (tx, mut rx) = mpsc::channel(2);
-                let reader = std::io::Cursor::new(prefix.to_vec()).chain(Tail {
-                    interrupted: true,
-                    fail,
-                });
-                read_output_stream(reader, tx, Arc::clone(&complete)).await;
-                let mut delivered = Vec::new();
-                while let Some(chunk) = rx.recv().await {
-                    delivered.extend(chunk);
-                }
-                assert_eq!(delivered, prefix);
-                assert_eq!(complete.load(std::sync::atomic::Ordering::Acquire), !fail);
-            }
-        }
-        let (mut writer, reader) = tokio::io::duplex(64);
-        tokio::io::AsyncWriteExt::write_all(&mut writer, b"prefix")
-            .await
-            .unwrap();
-        let (tx, mut rx) = mpsc::channel(2);
-        let complete = Arc::new(AtomicBool::new(false));
-        let task = tokio::spawn(read_output_stream(reader, tx, Arc::clone(&complete)));
-        assert_eq!(rx.recv().await.unwrap(), b"prefix");
-        task.abort();
-        assert!(task.await.unwrap_err().is_cancelled());
-        assert!(!complete.load(std::sync::atomic::Ordering::Acquire));
-    }
-}

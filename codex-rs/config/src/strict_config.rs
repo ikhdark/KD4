@@ -262,7 +262,3 @@ fn push_ignored_path_segments(path: &serde_ignored::Path<'_>, segments: &mut Vec
         }
     }
 }
-
-#[cfg(test)]
-#[path = "strict_config_tests.rs"]
-mod tests;

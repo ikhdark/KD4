@@ -23,9 +23,6 @@ use codex_protocol::models::PermissionProfile;
 use codex_protocol::openai_models::ReasoningEffort as ReasoningEffortConfig;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::ThreadSource;
-#[cfg(test)]
-use codex_utils_absolute_path::AbsolutePathBuf;
-
 const MODEL_KEY: &str = "model";
 const REASONING_EFFORT_KEY: &str = "reasoning_effort";
 const USER_INPUT_REQUESTED_DURING_TURN_KEY: &str = "user_input_requested_during_turn";
@@ -57,37 +54,6 @@ pub(crate) struct TurnMetadataState {
 }
 
 impl TurnMetadataState {
-    #[cfg(test)]
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn new(
-        session_id: String,
-        thread_id: String,
-        forked_from_thread_id: Option<ThreadId>,
-        parent_thread_id: Option<ThreadId>,
-        session_source: &SessionSource,
-        thread_source: Option<ThreadSource>,
-        turn_id: String,
-        cwd: AbsolutePathBuf,
-        permission_profile: &PermissionProfile,
-        windows_sandbox_level: WindowsSandboxLevel,
-        enforce_managed_network: bool,
-    ) -> Self {
-        let git_metadata_source = GitWorkspaceMetadataSource::discover_local(cwd);
-        Self::new_with_git_metadata_source(
-            session_id,
-            thread_id,
-            forked_from_thread_id,
-            parent_thread_id,
-            session_source,
-            thread_source,
-            turn_id,
-            permission_profile,
-            windows_sandbox_level,
-            enforce_managed_network,
-            git_metadata_source,
-        )
-    }
-
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new_with_git_metadata_source(
         session_id: String,
@@ -310,7 +276,3 @@ impl TurnMetadataState {
         }
     }
 }
-
-#[cfg(test)]
-#[path = "turn_metadata_tests.rs"]
-mod tests;

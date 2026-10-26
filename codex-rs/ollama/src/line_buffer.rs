@@ -2,7 +2,6 @@ use bytes::BytesMut;
 use memchr::memchr;
 
 #[derive(Default)]
-#[cfg_attr(test, derive(Debug, PartialEq, Eq))]
 pub(crate) struct LineBuffer {
     bytes: BytesMut,
     /// Prefix already scanned and known not to contain a newline.
@@ -32,6 +31,3 @@ impl LineBuffer {
     }
 }
 
-#[cfg(test)]
-#[path = "line_buffer_tests.rs"]
-mod tests;

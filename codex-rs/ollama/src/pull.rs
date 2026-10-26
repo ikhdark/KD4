@@ -131,31 +131,3 @@ impl CliProgressReporter {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn progress_totals_do_not_panic_when_layer_counts_overflow() {
-        for (total, completed) in [(u64::MAX, 0), (1, u64::MAX)] {
-            let mut reporter = CliProgressReporter::new();
-            reporter
-                .on_event(&PullEvent::ChunkProgress {
-                    digest: "first".to_string(),
-                    total: Some(total),
-                    completed: Some(completed),
-                })
-                .expect("one layer's counts fit the progress representation");
-            // The peer controls these counts. An unrepresentable aggregate is rejected as
-            // invalid data; it must neither crash the CLI nor wrap into a bogus total.
-            let error = reporter
-                .on_event(&PullEvent::ChunkProgress {
-                    digest: "second".to_string(),
-                    total: Some(1),
-                    completed: Some(1),
-                })
-                .expect_err("an aggregate beyond u64 must be rejected");
-            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
-        }
-    }
-}

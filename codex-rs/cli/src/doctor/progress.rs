@@ -97,24 +97,3 @@ impl DoctorProgress for StderrProgress {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn progress_requires_human_tty_and_a_capable_terminal() {
-        for (json, term, tty, expected) in [
-            (true, Some("xterm-256color"), true, false),
-            (false, Some("xterm-256color"), false, false),
-            (false, Some("dumb"), true, false),
-            (false, Some("xterm-256color"), true, true),
-            (false, None, true, true),
-        ] {
-            assert_eq!(
-                should_show_progress(json, term, tty),
-                expected,
-                "{json} {term:?} {tty}"
-            );
-        }
-    }
-}

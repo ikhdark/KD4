@@ -3,8 +3,6 @@ edition.workspace = true
 license.workspace = true
 name = "codex-core"
 version.workspace = true
-# Integration tests are the `codex-core-integration-tests` package (core/tests).
-autotests = false
 
 [lib]
 name = "codex_core"
@@ -17,10 +15,6 @@ test = false
 
 [lints]
 workspace = true
-
-[package.metadata.cargo-shear]
-# Used by the core_test_support files that src/test_harness.rs includes by path.
-ignored = ["codex-home", "codex-utils-cargo-bin"]
 
 [dependencies]
 codex-client = { workspace = true }
@@ -143,34 +137,3 @@ windows-sys = { workspace = true, features = [
     "Win32_Storage_FileSystem",
     "Win32_System_Threading",
 ] }
-
-[dev-dependencies]
-codex-command-analysis = { workspace = true, features = ["test-support"] }
-codex-code-mode-runtime = { workspace = true }
-codex-utils-pty = { workspace = true, features = ["test-support"] }
-tokio = { workspace = true, features = ["test-util"] }
-codex-extension-items = { workspace = true }
-assert_matches = { workspace = true }
-codex-home = { workspace = true }
-codex-otel = { workspace = true, features = ["test-support"] }
-codex-utils-cargo-bin = { workspace = true }
-core_test_support_base = { workspace = true }
-ctor = { workspace = true }
-insta = { workspace = true }
-maplit = { workspace = true }
-opentelemetry = { workspace = true }
-pretty_assertions = { workspace = true }
-test-case = { workspace = true }
-opentelemetry_sdk = { workspace = true, features = [
-    "experimental_metrics_custom_reader",
-    "metrics",
-] }
-serial_test = { workspace = true }
-tempfile = { workspace = true }
-test-log = { workspace = true }
-tracing-opentelemetry = { workspace = true }
-tracing-subscriber = { workspace = true }
-tracing-test = { workspace = true, features = ["no-env-filter"] }
-wiremock = { workspace = true }
-zstd = { workspace = true }
-

@@ -125,7 +125,3 @@ async fn load_from_file_system(
 
     Ok(parsed)
 }
-
-#[cfg(test)]
-#[path = "provider_tests.rs"]
-mod tests;

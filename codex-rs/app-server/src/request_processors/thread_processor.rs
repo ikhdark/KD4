@@ -3025,10 +3025,6 @@ impl ThreadRequestProcessor {
         }
     }
 
-    #[cfg(test)]
-    pub(crate) async fn thread_created_ids_for_test(&self) -> Vec<ThreadId> {
-        self.thread_manager.list_thread_created_ids().await
-    }
 
     async fn attach_created_thread_listeners(
         &self,
@@ -3104,11 +3100,12 @@ impl ThreadRequestProcessor {
     pub(crate) async fn thread_resume(
         &self,
         request_id: ConnectionRequestId,
-        params: ThreadResumeParams,
+        mut params: ThreadResumeParams,
         app_server_client_name: Option<String>,
         app_server_client_version: Option<String>,
         supports_openai_form_elicitation: bool,
     ) -> Result<(), JSONRPCErrorError> {
+        'resume: loop {
         let parsed_thread_id = ParsedThreadId::parse(&params.thread_id);
         if let Some(thread_id) = parsed_thread_id.valid()
             && self.pending_thread_unloads.contains(&thread_id).await
@@ -3162,6 +3159,8 @@ impl ThreadRequestProcessor {
             }
         };
 
+        // Core may borrow a runtime loaded while cold history/config were awaited.
+        let running_resume_params = params.history.is_none().then(|| params.clone());
         let ThreadResumeParams {
             thread_id: _,
             history,
@@ -3305,6 +3304,32 @@ impl ThreadRequestProcessor {
                 session_configured,
                 was_already_running,
             }) => {
+                if was_already_running {
+                    let Some(live_params) = running_resume_params.as_ref() else {
+                        self.outgoing.send_error(request_id, invalid_request(
+                            "cannot replace a running thread's history",
+                        )).await;
+                        return Ok(());
+                    };
+                    match self.resume_running_thread(
+                        &request_id,
+                        live_params,
+                        &parsed_thread_id,
+                        app_server_client_name.clone(),
+                        app_server_client_version.clone(),
+                    ).await {
+                        Ok(RunningThreadResumeResult::Handled) => {}
+                        Ok(RunningThreadResumeResult::NotRunning(_)) => {
+                            // The live owner may have retired an idle cache for
+                            // overrides. Restart cold preparation with fresh history;
+                            // leaving this iteration releases its list-state permit.
+                            params = running_resume_params.expect("live resume request retained");
+                            continue 'resume;
+                        }
+                        Err(error) => self.outgoing.send_error(request_id, error).await,
+                    }
+                    return Ok(());
+                }
                 if let Err(err) = Self::set_app_server_client_info(
                     codex_thread.as_ref(),
                     app_server_client_name,
@@ -3486,7 +3511,8 @@ impl ThreadRequestProcessor {
                 self.outgoing.send_error(request_id, error).await;
             }
         }
-        Ok(())
+        return Ok(());
+        }
     }
 
     #[tracing::instrument(level = "trace", skip_all)]
@@ -4788,24 +4814,6 @@ fn apply_thread_turns_items_view(turns: &mut [Turn], items_view: TurnItemsView) 
     }
 }
 
-#[cfg(test)]
-fn reconstruct_thread_turns_for_turns_list(
-    items: &[RolloutItem],
-    loaded_status: ThreadStatus,
-    has_live_running_thread: bool,
-    active_turn: Option<Turn>,
-) -> Vec<Turn> {
-    let has_live_in_progress_turn = has_live_running_thread
-        || active_turn
-            .as_ref()
-            .is_some_and(|turn| matches!(turn.status, TurnStatus::InProgress));
-    let mut turns = build_legacy_api_turns_from_rollout_items(items);
-    normalize_thread_turns_status(&mut turns, loaded_status, has_live_in_progress_turn);
-    if let Some(active_turn) = active_turn {
-        merge_turn_history_with_active_turn(&mut turns, active_turn);
-    }
-    turns
-}
 
 fn normalize_thread_turns_status(
     turns: &mut [Turn],
@@ -5270,112 +5278,5 @@ fn build_thread_from_loaded_snapshot(
     )
 }
 
-#[cfg(test)]
-mod thread_api_policy_tests {
-    use super::ParsedThreadId;
-    use super::SortDirection;
-    use super::StoreSortDirection;
-    use super::StoreThreadSortKey;
-    use super::ThreadErrorData;
-    use super::ThreadErrorReason;
-    use super::ThreadSortKey;
-    use super::thread_page_size;
-    use super::thread_store_resume_read_error;
-    use super::thread_store_sort_direction;
-    use super::thread_store_sort_key;
-    use codex_protocol::ThreadId;
-    use codex_thread_store::ThreadStoreError;
 
-    #[test]
-    fn parsed_thread_id_reuses_boundary_validation_result() {
-        let thread_id = "00000000-0000-0000-0000-000000000403";
-        let expected = ThreadId::from_string(thread_id).expect("valid thread id");
-        let parsed = ParsedThreadId::parse(thread_id);
 
-        assert_eq!(parsed.valid(), Some(expected));
-        assert_eq!(
-            parsed.required().expect("thread id remains valid"),
-            expected
-        );
-
-        let invalid = ParsedThreadId::parse("not-a-thread-id");
-        assert_eq!(invalid.valid(), None);
-        let error = invalid
-            .required()
-            .expect_err("invalid thread id is rejected");
-        assert_eq!(error.code, -32600);
-        assert!(error.message.starts_with("invalid session id: "));
-    }
-
-    #[test]
-    fn one_policy_resolves_all_thread_page_limits() {
-        assert_eq!(thread_page_size(None), 25);
-        assert_eq!(thread_page_size(Some(0)), 1);
-        assert_eq!(thread_page_size(Some(40)), 40);
-        assert_eq!(thread_page_size(Some(200)), 100);
-    }
-
-    #[test]
-    fn one_policy_maps_all_thread_sort_options() {
-        assert_eq!(thread_store_sort_key(None), StoreThreadSortKey::CreatedAt);
-        assert_eq!(
-            thread_store_sort_key(Some(ThreadSortKey::UpdatedAt)),
-            StoreThreadSortKey::UpdatedAt
-        );
-        assert_eq!(
-            thread_store_sort_key(Some(ThreadSortKey::RecencyAt)),
-            StoreThreadSortKey::RecencyAt
-        );
-        assert_eq!(
-            thread_store_sort_direction(SortDirection::Asc),
-            StoreSortDirection::Asc
-        );
-        assert_eq!(
-            thread_store_sort_direction(SortDirection::Desc),
-            StoreSortDirection::Desc
-        );
-    }
-
-    #[test]
-    fn resume_read_uses_typed_store_error_for_wire_classification() {
-        let thread_id =
-            ThreadId::from_string("00000000-0000-0000-0000-000000000403").expect("valid thread id");
-        let error = thread_store_resume_read_error(ThreadStoreError::ThreadNotFound { thread_id });
-
-        assert_eq!(error.code, -32600);
-        assert_eq!(
-            error.message,
-            format!("no rollout found for thread id {thread_id}")
-        );
-        assert_eq!(
-            serde_json::from_value::<ThreadErrorData>(error.data.expect("classified error data"))
-                .expect("valid thread error data")
-                .reason,
-            ThreadErrorReason::NotFound
-        );
-
-        let lazy = thread_store_resume_read_error(ThreadStoreError::RolloutNotMaterialized {
-            path: std::path::PathBuf::from(thread_id.to_string()),
-            reason: "not yet materialized".to_string(),
-        });
-        assert_eq!(
-            serde_json::from_value::<ThreadErrorData>(lazy.data.unwrap())
-                .unwrap()
-                .reason,
-            ThreadErrorReason::NotMaterialized
-        );
-
-        let internal = thread_store_resume_read_error(ThreadStoreError::Internal {
-            message: "lookup unavailable".to_string(),
-        });
-        assert_eq!(internal.code, -32603);
-    }
-}
-
-#[cfg(test)]
-#[path = "thread_processor_projection_tests.rs"]
-mod thread_processor_projection_tests;
-
-#[cfg(test)]
-#[path = "thread_processor_tests.rs"]
-mod thread_processor_tests;

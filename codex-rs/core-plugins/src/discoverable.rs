@@ -225,7 +225,3 @@ fn is_tool_suggest_fallback_plugin(plugin_id: &str) -> bool {
     );
     TOOL_SUGGEST_DISCOVERABLE_PLUGIN_ALLOWLIST.contains(&default_curated_plugin_id.as_str())
 }
-
-#[cfg(test)]
-#[path = "discoverable_tests.rs"]
-mod tests;

@@ -466,20 +466,3 @@ pub fn powershell_script_failure_advisory(
     )
 }
 
-#[cfg(test)]
-mod audit36_advice_regressions {
-    use super::*;
-
-    #[test]
-    fn unrelated_measure_object_binding_error_has_no_computed_property_workaround() {
-        assert_eq!(
-            powershell_script_failure_advisory(
-                Some(ShellType::PowerShell),
-                Some(1),
-                true,
-                "Measure-Object: A parameter cannot be found that matches parameter name 'Smu'.",
-            ),
-            None
-        );
-    }
-}

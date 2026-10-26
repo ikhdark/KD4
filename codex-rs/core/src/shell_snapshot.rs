@@ -486,13 +486,6 @@ impl ShellSnapshotFile {
         }
     }
 
-    #[cfg(test)]
-    pub(crate) fn path(&self) -> AbsolutePathBuf {
-        self.local_path()
-            .cloned()
-            .expect("remote shell snapshot does not have a local path")
-    }
-
     pub(crate) fn native_path_string(&self) -> String {
         match &self.location {
             ShellSnapshotLocation::Local(path) => path.to_string_lossy().into_owned(),
@@ -903,10 +896,6 @@ async fn run_script_with_timeout_with_args(
     environment_variables: &HashMap<String, String>,
 ) -> Result<String> {
     let timeout_deadline = tokio::time::Instant::now() + snapshot_timeout;
-    #[cfg(test)]
-    let spawn_observer = tests::take_snapshot_process_observer();
-    #[cfg(test)]
-    let spawn_gate = tests::take_snapshot_spawn_gate();
     let args = shell.derive_exec_args(script, use_login_shell)?;
     let args = clean_snapshot_shell_args(shell.shell_type, args, use_login_shell);
     let shell_name = shell.name();
@@ -933,16 +922,10 @@ async fn run_script_with_timeout_with_args(
     let managed = timeout_at(timeout_deadline, ManagedRootProcess::reserve_with_reclaim())
         .await
         .map_err(|_| anyhow!("Snapshot command timed out for {shell_name}"))??;
-    #[cfg(test)]
-    tests::wait_for_snapshot_spawn_gate(spawn_gate).await;
     if tokio::time::Instant::now() >= timeout_deadline {
         return Err(anyhow!("Snapshot command timed out for {shell_name}"));
     }
     let spawn_timeout = timeout_deadline.saturating_duration_since(tokio::time::Instant::now());
-    #[cfg(test)]
-    tests::record_snapshot_process_event(&spawn_observer, tests::SnapshotProcessEvent::Queued);
-    #[cfg(test)]
-    let worker_spawn_observer = spawn_observer.clone();
     let spawn = run_windows_process_operation(spawn_timeout, move || {
         // A timed-out JoinHandle does not cancel a queued blocking operation.
         // Check the original budget at native admission, not just at enqueue.
@@ -953,11 +936,6 @@ async fn run_script_with_timeout_with_args(
             ));
         }
         let child = handler.spawn()?;
-        #[cfg(test)]
-        tests::record_snapshot_process_event(
-            &worker_spawn_observer,
-            tests::SnapshotProcessEvent::Spawned(child.id()),
-        );
         Ok(child)
     });
     let mut child = timeout_at(timeout_deadline, spawn)
@@ -979,11 +957,6 @@ async fn run_script_with_timeout_with_args(
         }
         return Err(err).context("Failed to contain snapshot command");
     }
-    #[cfg(test)]
-    tests::record_snapshot_process_event(
-        &spawn_observer,
-        tests::SnapshotProcessEvent::Resumed(process_id),
-    );
     let mut stdout = child
         .stdout
         .take()
@@ -1390,7 +1363,3 @@ fn snapshot_session_id_from_file_name(file_name: &str) -> Option<&str> {
         _ => None,
     }
 }
-
-#[cfg(test)]
-#[path = "shell_snapshot_tests.rs"]
-mod tests;

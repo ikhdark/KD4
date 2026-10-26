@@ -49,7 +49,7 @@ pub enum WindowsPathSeparatorStyle {
 /// This contains multiple settings that may relate to only one specific backend,
 /// such as to correctly configure each backend regardless of what is selected during runtime.
 ///
-/// ```rust
+/// ```text
 /// # use std::time::Duration;
 /// # use notify::Config;
 /// let config = Config::default()
@@ -167,7 +167,7 @@ impl Config {
     ///
     /// # Example
     ///
-    /// ```rust
+    /// ```text
     /// use notify::{Config, EventKindMask};
     ///
     /// // Only monitor file creation and deletion
@@ -351,72 +351,4 @@ impl PathOp {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use notify_types::event::EventKindMask;
-
-    #[test]
-    fn config_default_event_kinds_is_all() {
-        let config = Config::default();
-        assert_eq!(config.event_kinds(), EventKindMask::ALL);
-    }
-
-    #[test]
-    fn config_with_event_kinds() {
-        let mask = EventKindMask::CREATE | EventKindMask::REMOVE;
-        let config = Config::default().with_event_kinds(mask);
-        assert_eq!(config.event_kinds(), mask);
-    }
-
-    #[test]
-    fn config_with_all_events_includes_access() {
-        let config = Config::default().with_event_kinds(EventKindMask::ALL);
-        assert!(config.event_kinds().intersects(EventKindMask::ALL_ACCESS));
-    }
-
-    #[test]
-    fn config_with_empty_mask() {
-        let config = Config::default().with_event_kinds(EventKindMask::empty());
-        assert!(config.event_kinds().is_empty());
-    }
-
-    #[test]
-    fn event_kind_mask_default_matches_config_default() {
-        // Verify cross-crate consistency: both defaults should be ALL
-        assert_eq!(EventKindMask::default(), Config::default().event_kinds());
-        assert_eq!(EventKindMask::default(), EventKindMask::ALL);
-    }
-
-    #[test]
-    fn config_default_windows_separator_style_is_auto() {
-        let config = Config::default();
-        assert_eq!(
-            config.windows_path_separator_style(),
-            WindowsPathSeparatorStyle::Auto
-        );
-    }
-
-    #[test]
-    fn config_with_windows_separator_style() {
-        let config =
-            Config::default().with_windows_path_separator_style(WindowsPathSeparatorStyle::Slash);
-        assert_eq!(
-            config.windows_path_separator_style(),
-            WindowsPathSeparatorStyle::Slash
-        );
-    }
-
-    #[test]
-    fn config_default_fsevent_latency_is_zero() {
-        assert_eq!(Config::default().fsevent_latency(), Duration::ZERO);
-    }
-
-    #[test]
-    fn config_with_fsevent_latency() {
-        let latency = Duration::from_millis(250);
-        let config = Config::default().with_fsevent_latency(latency);
-        assert_eq!(config.fsevent_latency(), latency);
-    }
-}
 

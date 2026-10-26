@@ -135,10 +135,6 @@ pub(crate) struct ToolDispatchTiming {
 }
 
 impl ToolDispatchTiming {
-    #[cfg(test)]
-    pub(crate) fn new(item_accepted_at: Instant, eager: bool) -> Self {
-        Self::new_inner(None, item_accepted_at, eager)
-    }
 
     pub(crate) fn new_with_turn_clock(
         turn_timing: Arc<TurnTimingState>,
@@ -742,6 +738,3 @@ record_phase!(record_pre_tool_hook, record_pre_tool_hook);
 record_phase!(record_post_tool_hook, record_post_tool_hook);
 record_phase!(record_output_projection, record_output_projection);
 record_phase!(record_history_persistence, record_history_persistence);
-#[cfg(test)]
-#[path = "tool_dispatch_trace_tests.rs"]
-mod tests;

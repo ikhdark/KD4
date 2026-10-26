@@ -86,13 +86,7 @@ async fn run() -> anyhow::Result<(Vec<u8>, i32)> {
 Swap in `spawn_pipe_process` for a non-TTY subprocess with separate stdout and stderr; the rest
 of the API stays the same.
 
-## Tests
+## Repository test coverage
 
-Tests live beside the modules they cover (`src/tests.rs`, `src/pipe_tests.rs`,
-`src/windows_tests.rs`, and each module's unit tests) plus `tests/conpty_search_path.rs`. Some
-Windows process tests need Python or PowerShell; set `CODEX_REQUIRE_WINDOWS_SANDBOX_PROCESS_TESTS`
-to turn a missing prerequisite into a failure. Run with:
-
-```text
-just test-fast -p codex-utils-pty
-```
+This fork does not include test suites or test-only support files. The usage example
+above is documentation, not an executable test.

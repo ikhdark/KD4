@@ -2,16 +2,12 @@ use crate::config::OtelExporter;
 use crate::metrics::Result;
 use crate::metrics::validation::validate_tag_key;
 use crate::metrics::validation::validate_tag_value;
-#[cfg(any(test, feature = "test-support"))]
-use opentelemetry_sdk::metrics::InMemoryMetricExporter;
 use std::collections::BTreeMap;
 use std::time::Duration;
 
 #[derive(Clone, Debug)]
 pub enum MetricsExporter {
     Otlp(OtelExporter),
-    #[cfg(any(test, feature = "test-support"))]
-    InMemory(InMemoryMetricExporter),
 }
 
 #[derive(Clone, Debug)]
@@ -43,24 +39,6 @@ impl MetricsConfig {
         }
     }
 
-    /// Create an in-memory config (used in tests).
-    #[cfg(any(test, feature = "test-support"))]
-    pub fn in_memory(
-        environment: impl Into<String>,
-        service_name: impl Into<String>,
-        service_version: impl Into<String>,
-        exporter: InMemoryMetricExporter,
-    ) -> Self {
-        Self {
-            environment: environment.into(),
-            service_name: service_name.into(),
-            service_version: service_version.into(),
-            exporter: MetricsExporter::InMemory(exporter),
-            export_interval: None,
-            runtime_reader: false,
-            default_tags: BTreeMap::new(),
-        }
-    }
 
     /// Override the interval between periodic metric exports.
     pub fn with_export_interval(mut self, interval: Duration) -> Self {

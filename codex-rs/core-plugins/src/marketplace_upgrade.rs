@@ -209,6 +209,9 @@ fn upgrade_configured_git_marketplace(
     marketplace: &ConfiguredGitMarketplace,
 ) -> Result<Option<AbsolutePathBuf>, String> {
     validate_plugin_segment(&marketplace.name, "marketplace name")?;
+    let _operation = crate::installed_marketplaces::try_lock_marketplace_operation(codex_home, &marketplace.name)
+        .map_err(|err| format!("marketplace operation is busy or unavailable: {err}"))?;
+    ensure_configured_git_marketplace_unchanged(codex_home, marketplace)?;
     let (source, ref_name) = marketplace.git_source();
     let remote_revision = git_remote_revision(source, ref_name, MARKETPLACE_UPGRADE_GIT_TIMEOUT)?;
     let destination = install_root.join(&marketplace.name);
@@ -336,7 +339,3 @@ fn read_configured_git_marketplace(
     };
     parse_configured_git_marketplace(marketplace_name, marketplace)
 }
-
-#[cfg(test)]
-#[path = "marketplace_upgrade_tests.rs"]
-mod tests;

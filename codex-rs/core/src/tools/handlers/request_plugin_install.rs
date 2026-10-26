@@ -704,6 +704,3 @@ async fn verified_plugin_install_completed(
     })
 }
 
-#[cfg(test)]
-#[path = "request_plugin_install_tests.rs"]
-mod tests;

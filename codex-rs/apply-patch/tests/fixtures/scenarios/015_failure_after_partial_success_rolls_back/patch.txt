@@ -1,6 +1,0 @@
-*** Begin Patch
-*** Add File: created.txt
-+hello
-*** Add File: blocked
-+never written
-*** End Patch

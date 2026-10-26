@@ -94,7 +94,3 @@ pub fn connector_tool_is_synthetic(connector_meta: Option<&serde_json::Value>) -
         .and_then(serde_json::Value::as_bool)
         == Some(true)
 }
-
-#[cfg(test)]
-#[path = "runtime_projection_tests.rs"]
-mod tests;

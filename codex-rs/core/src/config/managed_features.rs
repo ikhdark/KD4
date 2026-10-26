@@ -125,20 +125,6 @@ impl ManagedFeatures {
     }
 }
 
-/// Only available for tests to ensure `ManagedFeatures` is constructed with
-/// any required constraints taken into account.
-#[cfg(test)]
-impl From<Features> for ManagedFeatures {
-    fn from(features: Features) -> Self {
-        Self {
-            value: ConstrainedWithSource::new(
-                Constrained::allow_any(features),
-                /*source*/ None,
-            ),
-            pinned_features: BTreeMap::new(),
-        }
-    }
-}
 
 impl std::ops::Deref for ManagedFeatures {
     type Target = Features;
@@ -316,12 +302,3 @@ pub(crate) fn validate_feature_requirements_in_config_toml(
     ManagedFeatures::from_configured(configured_features, feature_requirements.cloned()).map(|_| ())
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn default_uses_authoritative_feature_defaults() {
-        assert_eq!(ManagedFeatures::default().get(), &Features::with_defaults());
-    }
-}

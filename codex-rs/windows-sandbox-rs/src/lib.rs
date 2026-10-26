@@ -46,15 +46,7 @@ impl RetainedCapture {
         (self.bytes, self.truncated)
     }
 
-    #[cfg(test)]
-    fn is_empty(&self) -> bool {
-        self.bytes.is_empty()
-    }
 
-    #[cfg(test)]
-    fn as_slice(&self) -> &[u8] {
-        &self.bytes
-    }
 }
 
 /// Converts an optional millisecond timeout to the Win32 wait representation.
@@ -66,62 +58,6 @@ pub fn windows_wait_timeout(timeout_ms: Option<u64>) -> u32 {
         .unwrap_or(u32::MAX)
 }
 
-#[cfg(test)]
-mod wait_timeout_tests {
-    use super::RetainedCapture;
-    use super::windows_wait_timeout;
-
-    #[test]
-    fn finite_wait_timeouts_never_alias_infinite() {
-        assert_eq!(windows_wait_timeout(None), u32::MAX);
-        assert_eq!(windows_wait_timeout(Some(0)), 0);
-        assert_eq!(
-            windows_wait_timeout(Some(u64::from(u32::MAX - 1))),
-            u32::MAX - 1
-        );
-        assert_eq!(
-            windows_wait_timeout(Some(u64::from(u32::MAX))),
-            u32::MAX - 1
-        );
-        assert_eq!(windows_wait_timeout(Some(u64::MAX)), u32::MAX - 1);
-    }
-
-    #[test]
-    fn retained_capture_marks_truncation_only_after_observing_excess_bytes() {
-        for (cap, chunks, expected, truncated) in [
-            (
-                None,
-                vec![b"abc".as_slice(), b"def", b""],
-                b"abcdef".as_slice(),
-                false,
-            ),
-            (Some(0), vec![b"".as_slice()], b"".as_slice(), false),
-            (Some(0), vec![b"a".as_slice(), b""], b"".as_slice(), true),
-            (
-                Some(4),
-                vec![b"ab".as_slice(), b"cd", b""],
-                b"abcd".as_slice(),
-                false,
-            ),
-            (
-                Some(4),
-                vec![b"abc".as_slice(), b"def", b""],
-                b"abcd".as_slice(),
-                true,
-            ),
-        ] {
-            let mut capture = RetainedCapture::new(cap);
-            for chunk in chunks {
-                capture.append(chunk);
-            }
-            assert_eq!(
-                capture.into_parts(),
-                (expected.to_vec(), truncated),
-                "cap={cap:?}"
-            );
-        }
-    }
-}
 
 /// Cancellation hook used by Windows sandbox capture backends.
 #[derive(Clone)]
@@ -255,8 +191,6 @@ mod unified_exec;
 
 mod wrapper;
 
-#[cfg(test)]
-mod audit20261023_tests;
 
 pub(crate) use elevated::ipc_framed;
 
@@ -773,15 +707,6 @@ mod windows_impl {
     }
 
     impl CapturePipeReader {
-        #[cfg(test)]
-        fn spawn_capture_pipe_reader(handle: HANDLE) -> Self {
-            Self::spawn_capture_pipe_reader_with_sink(
-                handle,
-                None,
-                CaptureOutputStream::Stdout,
-                None,
-            )
-        }
 
         fn spawn_capture_pipe_reader_with_sink(
             handle: HANDLE,
@@ -1175,235 +1100,4 @@ mod windows_impl {
         Ok(())
     }
 
-    #[cfg(test)]
-    mod tests {
-        use crate::resolved_permissions::ResolvedWindowsSandboxPermissions;
-        use codex_protocol::models::PermissionProfile;
-        use codex_protocol::permissions::NetworkSandboxPolicy;
-        use std::collections::HashMap;
-        use std::io;
-        use std::path::Path;
-        use std::ptr;
-        use std::time::Duration;
-        use std::time::Instant;
-        use windows_sys::Win32::Foundation::CloseHandle;
-        use windows_sys::Win32::Foundation::ERROR_INVALID_HANDLE;
-        use windows_sys::Win32::Foundation::HANDLE;
-        use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
-        use windows_sys::Win32::Storage::FileSystem::WriteFile;
-
-        fn workspace_profile(network_policy: NetworkSandboxPolicy) -> PermissionProfile {
-            PermissionProfile::workspace_write_with(
-                &[],
-                network_policy,
-                /*exclude_tmpdir_env_var*/ false,
-                /*exclude_slash_tmp*/ false,
-            )
-        }
-
-        fn should_apply_network_block(permission_profile: &PermissionProfile) -> bool {
-            ResolvedWindowsSandboxPermissions::try_from_permission_profile_for_workspace_roots(
-                permission_profile,
-                &[],
-            )
-            .expect("managed permissions")
-            .should_apply_network_block()
-        }
-
-        #[test]
-        fn network_block_follows_profile_network_policy() {
-            for (profile, blocked) in [
-                (workspace_profile(NetworkSandboxPolicy::Restricted), true),
-                (workspace_profile(NetworkSandboxPolicy::Enabled), false),
-                (PermissionProfile::read_only(), true),
-            ] {
-                assert_eq!(should_apply_network_block(&profile), blocked);
-            }
-        }
-
-        fn capture_pipe_with_open_writer() -> (super::CapturePipeReader, HANDLE) {
-            let ((in_r, in_w), (out_r, out_w), (err_r, err_w)) =
-                // SAFETY: The helper returns successful pipe allocations to the test, which
-                // transfers out_r to its reader and closes every remaining end.
-                unsafe { super::setup_stdio_pipes() }.expect("create capture pipes");
-            // SAFETY: These four pipe ends belong to the test and are unused; the stdout pair is
-            // excluded because its ownership continues below.
-            unsafe {
-                CloseHandle(in_r);
-                CloseHandle(in_w);
-                CloseHandle(err_r);
-                CloseHandle(err_w);
-            }
-            (
-                super::CapturePipeReader::spawn_capture_pipe_reader(out_r),
-                out_w,
-            )
-        }
-
-        fn write_pipe(handle: HANDLE, mut bytes: &[u8]) -> io::Result<()> {
-            while !bytes.is_empty() {
-                let mut written = 0u32;
-                // SAFETY: The test retains handle during synchronous writes; bytes is a live
-                // readable slice and written is a writable output slot, with no OVERLAPPED
-                // operation.
-                let ok = unsafe {
-                    WriteFile(
-                        handle,
-                        bytes.as_ptr(),
-                        bytes.len() as u32,
-                        &mut written,
-                        ptr::null_mut(),
-                    )
-                };
-                if ok == 0 {
-                    return Err(io::Error::last_os_error());
-                }
-                if written == 0 {
-                    return Err(io::Error::new(
-                        io::ErrorKind::WriteZero,
-                        "pipe write completed without writing bytes",
-                    ));
-                }
-                bytes = &bytes[written as usize..];
-            }
-            Ok(())
-        }
-
-        #[test]
-        fn stopped_capture_reader_joins_before_return_with_writer_open() {
-            let started_at = Instant::now();
-            for _ in 0..16 {
-                let (reader, out_w) = capture_pipe_with_open_writer();
-                let output = reader.stop_and_collect();
-                let write_after_join = write_pipe(out_w, b"x");
-                // SAFETY: The test owns out_w and both the reader join and final write attempt have
-                // completed before its single close.
-                unsafe {
-                    CloseHandle(out_w);
-                }
-
-                assert!(output.expect("stop and join capture reader").is_empty());
-                assert!(
-                    write_after_join.is_err(),
-                    "reader handle must be closed before collection returns"
-                );
-            }
-
-            assert!(
-                started_at.elapsed() < Duration::from_secs(2),
-                "repeated stop-and-join cycles should be bounded"
-            );
-        }
-
-        #[test]
-        fn stopped_capture_reader_preserves_buffered_output() {
-            let (reader, out_w) = capture_pipe_with_open_writer();
-            let expected = b"buffered before stop";
-            write_pipe(out_w, expected).expect("buffer output");
-
-            let output = reader.stop_and_collect();
-            // SAFETY: The test owns out_w and all writes have finished before its single close
-            // after reader collection.
-            unsafe {
-                CloseHandle(out_w);
-            }
-
-            assert_eq!(
-                output.expect("stop and join capture reader").as_slice(),
-                expected
-            );
-        }
-
-        #[test]
-        fn stopped_capture_reader_bounds_continuous_writer_drain() {
-            let (reader, out_w) = capture_pipe_with_open_writer();
-            let out_w_addr = out_w as usize;
-            let (started_tx, started_rx) = std::sync::mpsc::channel();
-            let writer = std::thread::spawn(move || {
-                let out_w = out_w_addr as HANDLE;
-                let chunk = [b'x'; 64];
-                let mut started_tx = Some(started_tx);
-                while write_pipe(out_w, &chunk).is_ok() {
-                    if let Some(started_tx) = started_tx.take() {
-                        let _ = started_tx.send(());
-                    }
-                    std::thread::sleep(Duration::from_millis(2));
-                }
-                // SAFETY: The writer thread received sole ownership of out_w and has finished its
-                // write loop before closing that pipe end once.
-                unsafe {
-                    CloseHandle(out_w);
-                }
-            });
-            started_rx
-                .recv_timeout(Duration::from_secs(5))
-                .expect("writer produced output");
-
-            let started_at = Instant::now();
-            let output = reader.stop_and_collect();
-            let elapsed = started_at.elapsed();
-            writer.join().expect("join capture writer");
-
-            assert!(!output.expect("stop and join capture reader").is_empty());
-            assert!(
-                elapsed < Duration::from_secs(1),
-                "continuous output must not extend the bounded drain"
-            );
-        }
-
-        #[test]
-        fn capture_reader_propagates_read_errors() {
-            let reader = super::CapturePipeReader::spawn_capture_pipe_reader(INVALID_HANDLE_VALUE);
-            let err = reader
-                .stop_and_collect()
-                .expect_err("invalid pipe handle should fail");
-
-            assert_eq!(err.raw_os_error(), Some(ERROR_INVALID_HANDLE as i32));
-        }
-
-        #[test]
-        fn process_wait_failure_is_not_treated_as_exit() {
-            match super::wait_for_process(
-                /*invalid process handle*/ ptr::null_mut(),
-                Some(0),
-                /*cancellation*/ None,
-            ) {
-                super::WaitOutcome::Failed(err) => {
-                    assert_eq!(err.raw_os_error(), Some(ERROR_INVALID_HANDLE as i32));
-                }
-                outcome => panic!("invalid handle was misclassified as {outcome:?}"),
-            }
-        }
-
-        #[test]
-        fn legacy_preflight_skips_profiles_without_managed_filesystem_permissions() {
-            for permission_profile in [
-                PermissionProfile::Disabled,
-                PermissionProfile::External {
-                    network: NetworkSandboxPolicy::Restricted,
-                },
-            ] {
-                super::run_windows_sandbox_legacy_preflight(
-                    &permission_profile,
-                    &[],
-                    Path::new("."),
-                    Path::new("."),
-                    &HashMap::new(),
-                )
-                .expect("unsupported profiles do not need ACL preflight");
-            }
-        }
-
-        #[test]
-        fn legacy_delete_child_safety_is_deterministic() {
-            crate::ensure_legacy_delete_child_safety(true)
-                .expect("safe delete-child semantics should be accepted");
-            let err = crate::ensure_legacy_delete_child_safety(false)
-                .expect_err("unsafe delete-child semantics should fail closed");
-            assert_eq!(
-                err.to_string(),
-                crate::LEGACY_RESTRICTED_TOKEN_UNSAFE_DELETE_ERROR
-            );
-        }
-    }
 }

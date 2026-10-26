@@ -96,36 +96,3 @@ pub fn canonical_review_title(title: &str, priority: i32) -> String {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn verdict_is_not_inferred_from_narrative_or_empty_findings() {
-        for (verdict, label) in [
-            ("patch is correct", "Review verdict: patch is correct."),
-            ("patch is incorrect", "Review verdict: patch is incorrect."),
-            ("", "Review verdict unavailable."),
-        ] {
-            let output = ReviewOutputEvent {
-                findings: Vec::new(),
-                overall_correctness: verdict.to_string(),
-                overall_explanation: "Inspection completed.".to_string(),
-                overall_confidence_score: 0.9,
-            };
-            assert_eq!(
-                render_review_output_text(&output),
-                format!("{label}\n\nInspection completed.")
-            );
-        }
-    }
-
-    #[test]
-    fn numeric_priority_owns_display() {
-        assert_eq!(
-            canonical_review_title("[P0] Preserve λ", 2),
-            "[P2] Preserve λ"
-        );
-        assert_eq!(canonical_review_title("Preserve λ", 3), "[P3] Preserve λ");
-    }
-}

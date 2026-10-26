@@ -224,6 +224,3 @@ fn same_origin(previous: &reqwest::Url, next: &reqwest::Url) -> bool {
         && previous.port_or_known_default() == next.port_or_known_default()
 }
 
-#[cfg(test)]
-#[path = "route_aware_redirect_tests.rs"]
-mod tests;

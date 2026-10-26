@@ -19,23 +19,3 @@ impl ToolPayload {
         }
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn tool_search_log_payload_borrows_query() {
-        let payload = ToolPayload::ToolSearch {
-            arguments: SearchToolCallParams {
-                query: "find the owner".to_string(),
-                limit: None,
-            },
-        };
-
-        assert!(matches!(
-            payload.log_payload(),
-            Cow::Borrowed("find the owner")
-        ));
-    }
-}

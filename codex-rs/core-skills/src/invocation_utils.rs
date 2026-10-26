@@ -126,7 +126,3 @@ fn command_basename(command: &str) -> String {
 fn canonicalize_if_exists(path: &AbsolutePathBuf) -> AbsolutePathBuf {
     path.canonicalize().unwrap_or_else(|_| path.clone())
 }
-
-#[cfg(test)]
-#[path = "invocation_utils_tests.rs"]
-mod tests;

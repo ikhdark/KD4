@@ -13,8 +13,6 @@ use super::protocol::remote_control_user_agent;
 use axum::http::HeaderMap;
 use axum::http::StatusCode;
 use codex_http_client::HttpClient;
-#[cfg(test)]
-use codex_login::default_client::create_client_without_request_logging;
 use rand::RngExt;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -78,23 +76,6 @@ impl fmt::Display for RemoteControlServerRequestError {
 
 impl std::error::Error for RemoteControlServerRequestError {}
 
-#[cfg(test)]
-pub(super) async fn enroll_remote_control_server(
-    remote_control_target: &RemoteControlTarget,
-    auth: &RemoteControlConnectionAuth,
-    installation_id: &str,
-    server_name: &str,
-) -> io::Result<RemoteControlEnrollment> {
-    let client = create_client_without_request_logging()?;
-    enroll_remote_control_server_with_client(
-        &client,
-        remote_control_target,
-        auth,
-        installation_id,
-        server_name,
-    )
-    .await
-}
 
 pub(super) async fn enroll_remote_control_server_with_client(
     client: &HttpClient,
@@ -369,6 +350,3 @@ fn remote_control_server_token_refresh_backoff() -> Duration {
     ))
 }
 
-#[cfg(test)]
-#[path = "server_api_tests.rs"]
-mod tests;

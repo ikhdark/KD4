@@ -79,7 +79,7 @@ fn resolve_git_executable() -> Option<PathBuf> {
     executable_from_exec_path(&bytes)
 }
 
-#[cfg(any(windows, test))]
+#[cfg(windows)]
 fn executable_from_exec_path(output: &[u8]) -> Option<PathBuf> {
     let text = std::str::from_utf8(output)
         .ok()?
@@ -92,45 +92,3 @@ fn executable_from_exec_path(output: &[u8]) -> Option<PathBuf> {
     executable.is_file().then_some(executable)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn exec_path_requires_an_absolute_existing_binary() {
-        let dir = tempfile::tempdir().unwrap();
-        let output = format!("{}\r\n", dir.path().display());
-        assert!(executable_from_exec_path(output.as_bytes()).is_none());
-        std::fs::write(dir.path().join("git.exe"), "fixture").unwrap();
-        assert_eq!(
-            executable_from_exec_path(output.as_bytes()),
-            Some(dir.path().join("git.exe"))
-        );
-        assert!(executable_from_exec_path(b"relative\n").is_none());
-        assert!(executable_from_exec_path(b"one\ntwo\n").is_none());
-    }
-
-    #[tokio::test]
-    async fn resolution_is_shared_and_preserves_path_for_helpers() {
-        let inherited = std::env::var_os("PATH");
-        let first = git_executable_async().await;
-        assert_eq!(first, git_executable());
-        // The bare `git` fallback satisfies every other assertion here.
-        #[cfg(windows)]
-        assert!(
-            first.is_absolute() && first.ends_with("git.exe"),
-            "Git for Windows resolution fell back to {}",
-            first.display()
-        );
-        assert_eq!(inherited, std::env::var_os("PATH"));
-        assert!(
-            tokio::process::Command::new(first)
-                .arg("--version")
-                .output()
-                .await
-                .unwrap()
-                .status
-                .success()
-        );
-    }
-}

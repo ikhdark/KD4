@@ -13,8 +13,6 @@ use crate::stable_context::StableContextTarget;
 use crate::stable_context::project_stable_context;
 use crate::tool_history::ModelGenerationId;
 use crate::tool_history::SamplingProjectionAnchor;
-#[cfg(test)]
-use crate::tool_history::ToolHistoryCandidate;
 use crate::tool_history::ToolHistoryProjection;
 use crate::tool_history::ToolHistoryState;
 use crate::tool_history::ToolHistorySubstitution;
@@ -169,10 +167,6 @@ impl PreparedPromptItems {
         Arc::ptr_eq(&self.0, &other.0)
     }
 
-    #[cfg(test)]
-    fn is_materialized(&self) -> bool {
-        self.0.flattened.get().is_some()
-    }
 }
 
 pub(crate) type SharedPromptProjections = [Arc<[ResponseItem]>; 4];
@@ -204,15 +198,7 @@ impl PreparedPromptInput {
         self.fallback_items.shared()
     }
 
-    #[cfg(test)]
-    pub(crate) fn shared_unreplaced_items(&self) -> Arc<[ResponseItem]> {
-        self.unreplaced_items.shared()
-    }
 
-    #[cfg(test)]
-    pub(crate) fn shared_unreplaced_fallback_items(&self) -> Arc<[ResponseItem]> {
-        self.unreplaced_fallback_items.shared()
-    }
 
     pub(crate) fn tool_history_substitutions(&self) -> Arc<[ToolHistorySubstitution]> {
         Arc::clone(&self.tool_history_substitutions)
@@ -255,8 +241,6 @@ impl PreparedPromptInput {
 struct PreparedHistoryFingerprint {
     hasher: Sha256,
     digest: [u8; 32],
-    #[cfg(test)]
-    last_update_item_count: usize,
 }
 
 impl PreparedHistoryFingerprint {
@@ -279,8 +263,6 @@ impl PreparedHistoryFingerprint {
         Ok(Self {
             hasher,
             digest,
-            #[cfg(test)]
-            last_update_item_count: items.len(),
         })
     }
 
@@ -291,8 +273,6 @@ impl PreparedHistoryFingerprint {
         Ok(Self {
             hasher,
             digest,
-            #[cfg(test)]
-            last_update_item_count: items.len(),
         })
     }
 }
@@ -526,26 +506,6 @@ impl ContextManager {
             .map(|snapshot| snapshot.as_ref().clone())
     }
 
-    #[cfg(test)]
-    fn baselines_share_storage_with(&self, other: &Self) -> bool {
-        let realized_context_is_shared = match (
-            &self.realized_context_baseline,
-            &other.realized_context_baseline,
-        ) {
-            (RealizedContextBaseline::Known(left), RealizedContextBaseline::Known(right)) => {
-                Arc::ptr_eq(left, right)
-            }
-            (RealizedContextBaseline::Unknown, RealizedContextBaseline::Unknown) => true,
-            _ => false,
-        };
-        let world_state_is_shared = match (&self.world_state_baseline, &other.world_state_baseline)
-        {
-            (Some(left), Some(right)) => Arc::ptr_eq(left, right),
-            (None, None) => true,
-            _ => false,
-        };
-        realized_context_is_shared && world_state_is_shared
-    }
 
     pub(crate) fn mark_realized_context_unknown(&mut self) {
         self.realized_context_baseline = RealizedContextBaseline::Unknown;
@@ -662,18 +622,6 @@ impl ContextManager {
         self.prepare_for_prompt_target(input_modalities, StableContextTarget::FailOpen)
     }
 
-    /// Sampling-only preparation entrypoint. Callers must select the target
-    /// explicitly so generic and compaction preparation cannot accidentally
-    /// enable logical projection.
-    #[cfg(test)]
-    pub(crate) fn prepare_for_sampling_prompt(
-        self,
-        input_modalities: &[InputModality],
-        target: StableContextTarget,
-    ) -> PreparedPromptInput {
-        debug_assert_eq!(target, StableContextTarget::Sampling);
-        self.prepare_for_prompt_target(input_modalities, target)
-    }
 
     fn prepare_for_prompt_target(
         mut self,
@@ -1026,14 +974,6 @@ impl ContextManager {
         self.sampling_projection_anchor = Arc::new(StdMutex::new(None));
     }
 
-    #[cfg(test)]
-    pub(crate) fn sampling_projection_anchor_len(&self) -> Option<usize> {
-        self.sampling_projection_anchor
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .as_ref()
-            .map(|entry| entry.anchor.prepared_items.len())
-    }
 
     pub(crate) fn set_tool_history_state(&mut self, state: ToolHistoryState) {
         self.tool_history = Arc::new(state);
@@ -1060,10 +1000,6 @@ impl ContextManager {
 
 
 
-    #[cfg(test)]
-    pub(crate) fn register_non_workspace_code_mode_call(&mut self, call_id: String) {
-        Arc::make_mut(&mut self.tool_history).register_non_workspace_code_mode_call(call_id);
-    }
 
     pub(crate) fn apply_tool_history_mutation(
         &mut self,
@@ -1099,10 +1035,6 @@ impl ContextManager {
         self.items
     }
 
-    #[cfg(test)]
-    pub(crate) fn history_version(&self) -> u64 {
-        self.history_version
-    }
 
     // Estimate token usage using byte-based heuristics from the truncation helpers.
     // This is a coarse estimate, not a tokenizer-accurate count or a guaranteed lower bound.
@@ -1280,13 +1212,6 @@ impl ContextManager {
         )
     }
 
-    #[cfg(test)]
-    pub(crate) fn estimate_token_count_with_base_instructions(
-        &self,
-        base_instructions: &BaseInstructions,
-    ) -> Option<i64> {
-        Self::estimate_items_token_count_with_base_instructions(self.raw_items(), base_instructions)
-    }
 
     pub(crate) fn estimate_token_count_after_pending_user_boundary(
         &self,
@@ -1362,23 +1287,7 @@ impl ContextManager {
         total
     }
 
-    #[cfg(test)]
-    fn cached_item_token_estimate_count(&self) -> usize {
-        self.item_token_estimates
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .values()
-            .map(HashMap::len)
-            .sum()
-    }
 
-    #[cfg(test)]
-    fn cached_item_token_estimate_namespace_count(&self) -> usize {
-        self.item_token_estimates
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .len()
-    }
 
     pub(crate) fn estimate_items_token_count_with_base_instructions(
         items: &[ResponseItem],
@@ -1863,8 +1772,8 @@ fn project_update_plan_history(items: &mut Vec<ResponseItem>) {
 
 fn prepared_append_can_be_completed(items: &[ResponseItem], supports_images: bool) -> bool {
     let mut calls = BTreeSet::new();
-    let mut outputs = BTreeSet::new();
-    for item in items {
+    let paired = crate::tool_occurrence::pairs(items);
+    for (index, item) in items.iter().enumerate() {
         match item {
             ResponseItem::Reasoning { .. } => {}
             ResponseItem::Message { role, content, .. }
@@ -1892,10 +1801,10 @@ fn prepared_append_can_be_completed(items: &[ResponseItem], supports_images: boo
                 }
             }
             ResponseItem::FunctionCallOutput {
-                call_id, output, ..
+                output, ..
             }
             | ResponseItem::CustomToolCallOutput {
-                call_id, output, ..
+                output, ..
             } => {
                 if !supports_images
                     && matches!(
@@ -1909,15 +1818,14 @@ fn prepared_append_can_be_completed(items: &[ResponseItem], supports_images: boo
                 {
                     return false;
                 }
-                let custom = matches!(item, ResponseItem::CustomToolCallOutput { .. });
-                if !outputs.insert((custom, call_id.as_str())) {
+                if paired[index].is_none() {
                     return false;
                 }
             }
             _ => return false,
         }
     }
-    outputs.is_subset(&calls)
+    true
 }
 
 fn prepared_append_is_complete_and_safe(items: &[ResponseItem], supports_images: bool) -> bool {
@@ -2255,14 +2163,6 @@ fn apply_tool_history_projection(
     prepared
 }
 
-#[cfg(test)]
-fn prepared_history_fingerprint(
-    items: &[ResponseItem],
-    manifest: &StableContextManifest,
-    policy: PreparedHistoryPolicy,
-) -> serde_json::Result<[u8; 32]> {
-    PreparedHistoryFingerprint::new(items, manifest, policy).map(|fingerprint| fingerprint.digest)
-}
 
 fn hash_prepared_history_items(
     hasher: &mut Sha256,
@@ -2733,6 +2633,3 @@ fn user_message_positions(items: &[ResponseItem]) -> Vec<usize> {
     positions
 }
 
-#[cfg(test)]
-#[path = "history_tests.rs"]
-mod tests;

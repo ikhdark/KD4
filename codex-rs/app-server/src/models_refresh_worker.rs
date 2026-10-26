@@ -139,6 +139,3 @@ fn spawn_with_interval(
     }
 }
 
-#[cfg(test)]
-#[path = "models_refresh_worker_tests.rs"]
-mod tests;

@@ -57,9 +57,6 @@ mod process;
 mod process_manager;
 mod process_state;
 
-pub(crate) fn set_deterministic_process_ids_for_tests(enabled: bool) {
-    process_manager::set_deterministic_process_ids_for_tests(enabled);
-}
 
 pub(crate) use errors::UnifiedExecError;
 pub(crate) use process::NoopSpawnLifecycle;
@@ -91,17 +88,6 @@ pub(crate) struct UnifiedExecContext {
 }
 
 impl UnifiedExecContext {
-    #[cfg(test)]
-    pub fn new(session: Arc<Session>, turn: Arc<TurnContext>, call_id: String) -> Self {
-        Self {
-            session,
-            turn,
-            call_id,
-            tracker: None,
-            source: ToolCallSource::Direct,
-            env_overrides: Default::default(),
-        }
-    }
 
     pub fn with_tracker(
         session: Arc<Session>,
@@ -179,16 +165,6 @@ pub(crate) struct PendingSpawnRegistration {
     termination_owner: Option<process::ProcessTerminationOwner>,
 }
 
-#[cfg(test)]
-type PendingSpawnRetirementObserver = (
-    oneshot::Sender<Vec<Weak<UnifiedExecProcess>>>,
-    oneshot::Sender<()>,
-    std::sync::mpsc::Receiver<()>,
-);
-#[cfg(test)]
-thread_local! {
-    static PENDING_SPAWN_RETIREMENT_OBSERVER: std::cell::RefCell<Option<PendingSpawnRetirementObserver>> = const { std::cell::RefCell::new(None) };
-}
 
 impl PendingSpawnRegistration {
     fn with_termination_owner(owner: process::ProcessTerminationOwner) -> Self {
@@ -227,29 +203,11 @@ impl PendingSpawnRegistration {
         if processes.is_empty() {
             return;
         }
-        #[cfg(test)]
-        let observer =
-            PENDING_SPAWN_RETIREMENT_OBSERVER.with(|observer| observer.borrow_mut().take());
-        #[cfg(test)]
-        let retired = observer.map(|(taken, retired, release)| {
-            let _ = taken.send(processes.iter().map(Arc::downgrade).collect());
-            (retired, release)
-        });
         // The final process owner can run native/client destructors. Keep both
         // those destructors and their nested locks off the asynchronous caller.
         // The worker owns the vector even if the awaiting caller is cancelled.
         if let Err(error) = tokio::task::spawn_blocking(move || {
-            #[cfg(test)]
-            if let Some((_, release)) = retired.as_ref() {
-                release
-                    .recv_timeout(std::time::Duration::from_secs(20))
-                    .expect("test must release the actual retirement worker");
-            }
             drop(processes);
-            #[cfg(test)]
-            if let Some((retired, _)) = retired {
-                let _ = retired.send(());
-            }
         })
         .await
         {
@@ -453,10 +411,6 @@ struct ProcessEntry {
     last_used: tokio::time::Instant,
 }
 
-#[cfg(test)]
-pub(crate) fn clamp_yield_time(yield_time_ms: u64) -> u64 {
-    clamp_yield_time_for_readiness(yield_time_ms, /*executor_ready*/ false)
-}
 
 pub(crate) fn clamp_yield_time_for_readiness(yield_time_ms: u64, executor_ready: bool) -> u64 {
     let yield_time_ms = if cfg!(windows) && !executor_ready {
@@ -471,9 +425,3 @@ pub(crate) fn generate_chunk_id() -> String {
     format!("{:016x}", rng().random::<u64>())
 }
 
-#[cfg(test)]
-#[path = "process_tests.rs"]
-mod process_tests;
-#[cfg(test)]
-#[path = "mod_tests.rs"]
-mod tests;

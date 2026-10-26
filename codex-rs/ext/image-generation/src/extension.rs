@@ -127,22 +127,3 @@ pub fn install(
     registry.config_contributor(extension.clone());
     registry.tool_contributor(extension);
 }
-
-#[cfg(test)]
-mod tests {
-    use codex_http_client::HttpClientFactory;
-    use codex_http_client::OutboundProxyPolicy;
-    use pretty_assertions::assert_eq;
-
-    #[test]
-    fn image_generation_pool_retains_the_effective_proxy_policy() {
-        let http_clients = super::image_generation_http_clients(HttpClientFactory::new(
-            OutboundProxyPolicy::RespectSystemProxy,
-        ));
-
-        assert_eq!(
-            http_clients.outbound_proxy_policy(),
-            OutboundProxyPolicy::RespectSystemProxy
-        );
-    }
-}

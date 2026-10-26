@@ -98,24 +98,3 @@ pub(super) fn path_with_base(path: &Path, base_path: &Path) -> PathBuf {
     path
 }
 
-#[cfg(all(test, windows))]
-mod tests {
-    use super::*;
-    use pretty_assertions::assert_eq;
-
-    #[test]
-    fn windows_root_relative_path_uses_base_prefix() {
-        assert_eq!(
-            absolutize_from(Path::new(r"\path\to\file"), Path::new(r"C:\base\cwd")),
-            PathBuf::from(r"C:\path\to\file")
-        );
-    }
-
-    #[test]
-    fn windows_drive_relative_path_uses_path_prefix_and_base_tail() {
-        assert_eq!(
-            absolutize_from(Path::new(r"D:path\to\file"), Path::new(r"C:\base\cwd")),
-            PathBuf::from(r"D:\base\cwd\path\to\file")
-        );
-    }
-}

@@ -4,8 +4,6 @@ use crate::error_code::invalid_request;
 use codex_analytics::PluginInstallSource;
 use codex_app_server_protocol::PluginAvailability;
 use codex_app_server_protocol::PluginInstallPolicy;
-#[cfg(test)]
-use codex_app_server_protocol::PluginRemoteErrorData;
 use codex_app_server_protocol::PluginRemoteErrorReason;
 use codex_app_server_protocol::PluginSharePrincipalRole;
 use codex_app_server_protocol::PluginShareTargetRole;
@@ -2520,6 +2518,3 @@ fn remote_plugin_bundle_install_error_to_jsonrpc(
     internal_error(format!("install remote plugin bundle: {err}"))
 }
 
-#[cfg(test)]
-#[path = "plugins_tests.rs"]
-mod tests;

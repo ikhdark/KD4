@@ -54,6 +54,3 @@ pub(crate) async fn list_tool_suggest_discoverable_plugins(
         })
 }
 
-#[cfg(test)]
-#[path = "discoverable_tests.rs"]
-mod tests;

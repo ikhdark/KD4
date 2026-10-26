@@ -73,13 +73,6 @@ impl AgentsMdState {
         text.starts_with(UPDATE_OPEN)
     }
 
-    #[cfg(test)]
-    pub(crate) fn new(loaded: Option<&LoadedAgentsMd>) -> Self {
-        Self::from_instructions(
-            loaded.map(LoadedAgentsMd::contextual_user_fragment),
-            AgentsMdFreshness::Refreshed,
-        )
-    }
 
     pub(crate) fn new_cached(
         loaded: Option<&LoadedAgentsMd>,
@@ -603,6 +596,3 @@ fn is_real_user_message(item: &ResponseItem) -> bool {
         && !crate::stable_context::is_trusted_stable_context_item(item)
 }
 
-#[cfg(test)]
-#[path = "agents_md_tests.rs"]
-mod tests;

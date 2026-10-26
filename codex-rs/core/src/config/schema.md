@@ -7,8 +7,11 @@ When you change any fields included in `ConfigToml` (or nested config types),
 regenerate the schema:
 
 ```text
-just config-schema-regenerate <owner>
+just cargo-lane auto cargo run -p codex-core --bin codex-write-config-schema
 ```
+
+Run this from the repository root when schema generation is authorized. The retained
+generator writes `codex-rs/core/config.schema.json` directly; no test fixture is involved.
 
 ## Custom provider hosted search
 

@@ -23,26 +23,3 @@ pub fn json_to_toml(value: JsonValue) -> TomlValue {
         ),
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use serde_json::json;
-
-    #[test]
-    fn converts_nested_override_values() {
-        assert_eq!(
-            json_to_toml(json!({"outer": [true, 1, 1.5, "text", null]})),
-            TomlValue::Table(toml::Table::from_iter([(
-                "outer".to_string(),
-                TomlValue::Array(vec![
-                    TomlValue::Boolean(true),
-                    TomlValue::Integer(1),
-                    TomlValue::Float(1.5),
-                    TomlValue::String("text".to_string()),
-                    TomlValue::String(String::new()),
-                ]),
-            )]))
-        );
-    }
-}

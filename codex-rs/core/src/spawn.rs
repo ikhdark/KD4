@@ -49,13 +49,6 @@ pub(crate) struct SpawnChildRequest<'a> {
     pub creation_flags: u32,
 }
 
-#[cfg(test)]
-pub(crate) async fn spawn_child_async(request: SpawnChildRequest<'_>) -> std::io::Result<Child> {
-    spawn_child_with_observation_async(request)
-        .await
-        .map(|(child, _)| child)
-}
-
 pub(crate) async fn spawn_child_with_observation_async(
     request: SpawnChildRequest<'_>,
 ) -> std::io::Result<(Child, codex_utils_pty::process_observation::ObservedProcess)> {
@@ -151,7 +144,3 @@ fn trace_spawn_child(
         "spawn_child_async"
     );
 }
-
-#[cfg(test)]
-#[path = "spawn_tests.rs"]
-mod tests;

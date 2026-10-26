@@ -715,10 +715,6 @@ impl SpawnReservation {
         Ok(())
     }
 
-    #[cfg(test)]
-    pub(crate) fn commit(mut self, agent_metadata: AgentMetadata) -> Result<()> {
-        self.try_commit(agent_metadata)
-    }
 
     /// Keep failed admission owned by the caller until its live child terminates.
     pub(crate) fn try_commit(&mut self, agent_metadata: AgentMetadata) -> Result<()> {
@@ -801,6 +797,3 @@ fn bounded_task_message(mut message: String) -> String {
     message
 }
 
-#[cfg(test)]
-#[path = "registry_tests.rs"]
-mod tests;

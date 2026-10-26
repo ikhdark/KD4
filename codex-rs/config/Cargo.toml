@@ -52,11 +52,6 @@ windows-sys = { workspace = true, features = [
 ] }
 
 [dev-dependencies]
-pretty_assertions = { workspace = true }
-tempfile = { workspace = true }
-tokio = { workspace = true, features = ["full"] }
-tokio-stream = { workspace = true, features = ["net"] }
-tonic = { workspace = true, features = ["router", "transport"] }
 tonic-prost-build = { workspace = true, default-features = false, features = ["transport"] }
 
 [lib]

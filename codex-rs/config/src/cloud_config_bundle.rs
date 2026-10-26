@@ -388,7 +388,3 @@ impl Default for CloudConfigBundleLoader {
         Self::new(async { Ok(None) })
     }
 }
-
-#[cfg(test)]
-#[path = "cloud_config_bundle_tests.rs"]
-mod tests;

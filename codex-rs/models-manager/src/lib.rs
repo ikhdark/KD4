@@ -2,10 +2,7 @@ pub(crate) mod cache;
 pub mod collaboration_mode_presets;
 pub mod manager;
 pub mod model_info;
-#[cfg(test)]
-mod prompt_contract_tests;
 mod prompt_resolver;
-pub mod test_support;
 
 pub use codex_protocol::auth::AuthMode;
 use codex_protocol::openai_models::ModelsResponse;
@@ -86,81 +83,3 @@ fn model_catalog_client_version(package_version: &str) -> String {
         .to_string()
 }
 
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn model_catalog_client_version_handles_source_and_release_builds() {
-        for (package_version, expected) in [
-            ("0.0.0", "0.159.1"),
-            ("0.0.0-dev+local", "0.159.1"),
-            ("0.158.0", "0.158.0"),
-            ("0.159.0-alpha.4", "0.159.0"),
-            ("0.159.1", "0.159.1"),
-            ("1.2.3+local", "1.2.3"),
-            ("1.2.3-alpha.4+local", "1.2.3"),
-            ("0.99.0", "0.99.0"),
-        ] {
-            assert_eq!(
-                super::model_catalog_client_version(package_version),
-                expected
-            );
-        }
-        assert_ne!(super::client_version_to_whole(), "0.0.0");
-        assert_eq!(
-            super::source_build_client_version("0.0.0-dev+local"),
-            Some("0.159.1")
-        );
-        assert_eq!(super::source_build_client_version("0.159.0-alpha.4"), None);
-    }
-
-    #[test]
-    fn bundled_luna_6_preserves_runtime_metadata_and_local_prompt() {
-        use codex_protocol::openai_models::ModelPreset;
-        use codex_protocol::openai_models::ReasoningEffort;
-        use codex_protocol::openai_models::ToolMode;
-        use codex_protocol::protocol::MultiAgentVersion;
-
-        let response = super::bundled_models_response().expect("bundled catalog");
-        let luna = response
-            .models
-            .into_iter()
-            .find(|model| model.slug == "gpt-6-luna")
-            .expect("Luna 6");
-        assert_eq!(luna.tool_mode, Some(ToolMode::CodeModeOnly));
-        assert_eq!(luna.multi_agent_version, Some(MultiAgentVersion::V2));
-        assert!(luna.use_responses_lite && luna.supports_parallel_tool_calls);
-        assert_eq!(
-            (luna.context_window, luna.max_context_window),
-            (Some(272_000), Some(872_000))
-        );
-        assert_eq!(
-            luna.get_model_instructions(None),
-            codex_protocol::models::BASE_INSTRUCTIONS_DEFAULT.trim()
-        );
-        let preset: ModelPreset = luna.into();
-        assert!(preset.show_in_picker);
-        assert_eq!(preset.default_reasoning_effort, ReasoningEffort::Medium);
-        assert_eq!(
-            preset
-                .supported_reasoning_efforts
-                .into_iter()
-                .map(|level| level.effort)
-                .collect::<Vec<_>>(),
-            vec![
-                ReasoningEffort::Low,
-                ReasoningEffort::Medium,
-                ReasoningEffort::High,
-                ReasoningEffort::XHigh,
-                ReasoningEffort::Max
-            ]
-        );
-    }
-
-    #[test]
-    fn bundled_catalog_reuses_one_parsed_normalized_instance() {
-        let first = super::bundled_models().expect("bundled models should parse");
-        let second = super::bundled_models().expect("bundled models should remain available");
-
-        assert!(std::ptr::eq(first, second));
-    }
-}

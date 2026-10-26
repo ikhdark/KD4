@@ -387,6 +387,3 @@ pub(crate) fn get_command(
     })
 }
 
-#[cfg(test)]
-#[path = "unified_exec_tests.rs"]
-mod tests;

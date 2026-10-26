@@ -83,6 +83,9 @@ codegen-unit override.
 
 ## What actually runs
 
+This is a performance benchmark, not a repository test suite. Its behavior
+oracle is generated only inside each disposable workload workspace.
+
 Each sample launches a fresh `codex exec` process and matching real Code Mode
 host. The bundled model catalog is snapshotted once and supplied to every run
 so native tool capabilities do not depend on provider discovery or a user cache.

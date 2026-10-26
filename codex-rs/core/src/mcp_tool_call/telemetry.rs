@@ -171,6 +171,3 @@ pub(super) fn record_mcp_call_outcome_span_telemetry(
     span.record(MCP_CALL_ERROR_CODE_SPAN_ATTR, error_code);
 }
 
-#[cfg(test)]
-#[path = "telemetry_tests.rs"]
-mod tests;

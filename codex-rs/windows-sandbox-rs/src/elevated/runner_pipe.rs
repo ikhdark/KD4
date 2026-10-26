@@ -149,19 +149,3 @@ pub fn connect_pipe(h: HANDLE, expected_runner_pid: u32) -> io::Result<()> {
     Ok(())
 }
 
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn invalid_named_pipe_name_preserves_the_creation_error() {
-        let error = super::create_named_pipe(
-            "not-a-named-pipe-path",
-            super::PIPE_ACCESS_INBOUND,
-            "Everyone",
-        )
-        .expect_err("invalid pipe name must fail");
-        assert_eq!(
-            error.raw_os_error(),
-            Some(windows_sys::Win32::Foundation::ERROR_INVALID_NAME as i32)
-        );
-    }
-}

@@ -66,13 +66,6 @@ rustup toolchain install nightly-2025-09-18 `
   --component rust-src
 ```
 
-Run the lint crate tests:
-
-```powershell
-Set-Location tools/argument-comment-lint
-cargo test
-```
-
 `just argument-comment-lint` runs `run.py`, which builds this crate from source
 with `cargo dylint --path tools/argument-comment-lint` before checking
 `codex-rs`, so the enforced rules are always the checked-in ones.
@@ -87,9 +80,10 @@ python tools/argument-comment-lint/run.py -p codex-core
 
 If no package selection is provided, `just argument-comment-lint` checks the
 whole Cargo workspace. The wrapper defaults the underlying Cargo invocation to
-`--all-targets` unless you explicitly narrow the target set, so targeted runs
-cover test-only call sites by default. It also passes `--ignore-rust-version`:
-the pinned lint nightly (Rust 1.92) is older than the `rust-version` some
+`--all-targets` unless you explicitly narrow the target set, covering every
+retained target rather than only libraries. This checkout no longer contains
+Rust test implementations or test-only call sites. It also passes
+`--ignore-rust-version`: the pinned lint nightly (Rust 1.92) is older than the `rust-version` some
 `codex-rs` dependencies declare, and the lint only needs the code to type-check.
 
 Repo runs also promote `argument_comment_mismatch` and

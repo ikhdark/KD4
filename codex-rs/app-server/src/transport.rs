@@ -64,8 +64,6 @@ impl ConnectionState {
 pub(crate) struct OutboundNotificationOptOuts {
     methods: RwLock<HashSet<String>>,
     has_any: AtomicBool,
-    #[cfg(test)]
-    lock_reads: std::sync::atomic::AtomicUsize,
 }
 
 impl OutboundNotificationOptOuts {
@@ -74,8 +72,6 @@ impl OutboundNotificationOptOuts {
         Self {
             methods: RwLock::new(methods),
             has_any: AtomicBool::new(has_any),
-            #[cfg(test)]
-            lock_reads: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
@@ -94,8 +90,6 @@ impl OutboundNotificationOptOuts {
     }
 
     fn contains(&self, method: &str) -> Option<bool> {
-        #[cfg(test)]
-        self.lock_reads.fetch_add(1, Ordering::Relaxed);
         self.methods
             .read()
             .ok()
@@ -419,6 +413,3 @@ fn target_connection_ids(
     }
 }
 
-#[cfg(test)]
-#[path = "transport_tests.rs"]
-mod tests;

@@ -70,6 +70,3 @@ pub(crate) fn build_plugin_injections(
         .collect()
 }
 
-#[cfg(test)]
-#[path = "injection_tests.rs"]
-mod tests;

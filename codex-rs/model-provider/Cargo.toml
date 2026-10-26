@@ -32,9 +32,3 @@ tokio = { workspace = true, features = ["sync", "time"] }
 tracing = { workspace = true, features = ["log"] }
 url = { workspace = true }
 
-[dev-dependencies]
-tempfile = { workspace = true }
-pretty_assertions = { workspace = true }
-serde_json = { workspace = true }
-tokio = { workspace = true, features = ["macros", "rt"] }
-wiremock = { workspace = true }

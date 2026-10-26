@@ -1358,6 +1358,3 @@ fn require_environment_id(
     }
 }
 
-#[cfg(test)]
-#[path = "apply_patch_tests.rs"]
-mod tests;

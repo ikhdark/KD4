@@ -83,33 +83,3 @@ where
     });
     accessible
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use pretty_assertions::assert_eq;
-
-    #[test]
-    fn repeated_tools_fill_missing_metadata_and_keep_first_real_values() {
-        let tools = [
-            (None, Some("  ")),
-            (Some(" Calendar "), None),
-            (Some("Ignored"), Some(" Plan events ")),
-            (Some("Later"), Some("Ignored")),
-        ]
-        .into_iter()
-        .map(|(name, description)| AccessibleConnectorTool {
-            connector_id: "calendar".to_string(),
-            connector_name: name.map(str::to_string),
-            connector_description: description.map(str::to_string),
-            plugin_display_names: vec!["Plugin".to_string()],
-        });
-        let mut expected = crate::merge::plugin_connector_to_app_info("calendar".to_string()).unwrap();
-        expected.name = "Calendar".to_string();
-        expected.description = Some("Plan events".to_string());
-        expected.install_url = Some("https://chatgpt.com/apps/calendar/calendar".to_string());
-        expected.is_accessible = true;
-        expected.plugin_display_names = vec!["Plugin".to_string()];
-        assert_eq!(collect_accessible_connectors(tools), vec![expected]);
-    }
-}

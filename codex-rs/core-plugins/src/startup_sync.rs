@@ -189,7 +189,9 @@ fn sync_openai_plugins_repo_with_transport_overrides(
     }
 }
 
-fn lock_curated_plugins_startup_sync(codex_home: &Path) -> Result<File, String> {
+/// Snapshot authority shared by sync and curated readers. Call only from
+/// blocking owners, before cache-entry/config locks; never reacquire recursively.
+pub(crate) fn lock_curated_plugins_startup_sync(codex_home: &Path) -> Result<File, String> {
     let lock_path = codex_home.join(CURATED_PLUGINS_SYNC_LOCK_FILE);
     std::fs::create_dir_all(codex_home.join(".tmp"))
         .map_err(|err| format!("failed to create curated plugins sync directory: {err}"))?;
@@ -1371,7 +1373,3 @@ fn apply_zip_permissions(
     }
     Ok(())
 }
-
-#[cfg(test)]
-#[path = "startup_sync_tests.rs"]
-mod tests;

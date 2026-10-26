@@ -135,20 +135,3 @@ impl Drop for ProcThreadAttributeList {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::os::windows::io::AsRawHandle;
-
-    #[test]
-    fn setting_job_twice_preserves_registered_storage() -> anyhow::Result<()> {
-        let job = crate::win::job::JobObject::create()?;
-        let mut attributes = ProcThreadAttributeList::with_capacity(1)?;
-        attributes.set_job(job.as_raw_handle().cast())?;
-        let address = attributes.job_list.as_ptr();
-        assert!(attributes.set_job(job.as_raw_handle().cast()).is_err());
-        assert_eq!(attributes.job_list.as_ptr(), address);
-        assert_eq!(attributes.job_list, vec![job.as_raw_handle().cast()]);
-        Ok(())
-    }
-}

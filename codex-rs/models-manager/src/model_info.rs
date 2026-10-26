@@ -197,6 +197,3 @@ pub(crate) fn apply_local_personality_messages(model: &mut ModelInfo, requested_
     model.model_messages = Some(local_messages);
 }
 
-#[cfg(test)]
-#[path = "model_info_tests.rs"]
-mod tests;

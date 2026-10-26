@@ -7,7 +7,6 @@ license.workspace = true
 [lib]
 name = "codex_apply_patch"
 path = "src/lib.rs"
-doctest = false
 
 [[bin]]
 name = "apply_patch"
@@ -30,15 +29,6 @@ thiserror = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt"] }
 tree-sitter = { workspace = true }
 tree-sitter-bash = { workspace = true }
-
-[dev-dependencies]
-assert_cmd = { workspace = true }
-assert_matches = { workspace = true }
-codex-utils-cargo-bin = { workspace = true }
-pretty_assertions = { workspace = true }
-tempfile = { workspace = true }
-tokio = { workspace = true, features = ["process", "time"] }
-windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = { workspace = true }

@@ -204,14 +204,6 @@ fn windows_sandbox_stdin_open(tty: bool, pipe_stdin: bool) -> bool {
     tty || pipe_stdin
 }
 
-#[cfg(test)]
-pub(crate) fn prepare_exec_request(
-    params: &ExecParams,
-    env: HashMap<String, String>,
-    runtime_paths: Option<&ExecServerRuntimePaths>,
-) -> Result<PreparedExecRequest, JSONRPCErrorError> {
-    prepare_exec_request_cancellable(params, env, runtime_paths, &tokio_util::sync::CancellationToken::new())
-}
 
 pub(crate) fn prepare_exec_request_cancellable(
     params: &ExecParams,
@@ -350,6 +342,3 @@ fn native_path(path: &PathUri, label: &str) -> Result<AbsolutePathBuf, JSONRPCEr
     })
 }
 
-#[cfg(test)]
-#[path = "process_sandbox_tests.rs"]
-mod tests;

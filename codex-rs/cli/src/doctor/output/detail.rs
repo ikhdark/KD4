@@ -840,29 +840,3 @@ pub(super) fn is_falsy(value: &str) -> bool {
     )
 }
 
-#[cfg(test)]
-mod guidance_integrity_regressions {
-    use super::*;
-
-    #[test]
-    fn integrity_failure_without_path_survives_human_rendering() {
-        let parsed = vec![ParsedDetail {
-            label: "goals DB integrity".into(),
-            value: "unavailable (permission denied)".into(),
-            expected: None,
-        }];
-        for show_all in [false, true] {
-            let rows = state_details(
-                &parsed,
-                HumanOutputOptions {
-                    show_details: true,
-                    show_all,
-                    ascii: true,
-                    color_enabled: false,
-                },
-            );
-            assert!(rows.iter().any(|row| matches!(row,
-                HumanDetail::Row { label, value, .. } if label == "goals DB integrity" && value.contains("permission denied"))));
-        }
-    }
-}

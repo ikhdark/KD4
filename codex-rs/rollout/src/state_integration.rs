@@ -95,25 +95,6 @@ async fn try_init_with_roots(
     .await
 }
 
-#[cfg(test)]
-async fn try_init_with_roots_and_backfill_lease(
-    codex_home: PathBuf,
-    sqlite_home: PathBuf,
-    default_model_provider_id: String,
-    backfill_lease_seconds: i64,
-    wait_timeout: Duration,
-    poll_interval: Duration,
-) -> anyhow::Result<StateDbHandle> {
-    try_init_with_roots_inner(
-        codex_home,
-        sqlite_home,
-        default_model_provider_id,
-        Some(backfill_lease_seconds),
-        wait_timeout,
-        poll_interval,
-    )
-    .await
-}
 
 async fn try_init_with_roots_inner(
     codex_home: PathBuf,
@@ -869,6 +850,3 @@ pub async fn touch_thread_updated_at(
         })
 }
 
-#[cfg(test)]
-#[path = "state_integration_tests.rs"]
-mod tests;

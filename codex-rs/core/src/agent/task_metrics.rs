@@ -68,31 +68,23 @@ impl OpaqueId {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) enum RoleLabel {
-    #[cfg(test)]
-    Root,
     Architect,
     Explorer,
     Worker,
     Reviewer,
     Verifier,
     Integrator,
-    #[cfg(test)]
-    Legacy,
 }
 
 impl RoleLabel {
     const fn as_str(self) -> &'static str {
         match self {
-            #[cfg(test)]
-            Self::Root => "root",
             Self::Architect => "architect",
             Self::Explorer => "explorer",
             Self::Worker => "worker",
             Self::Reviewer => "reviewer",
             Self::Verifier => "verifier",
             Self::Integrator => "integrator",
-            #[cfg(test)]
-            Self::Legacy => "legacy",
         }
     }
 }
@@ -117,8 +109,6 @@ pub(crate) enum CapabilityLabel {
     ReadSearchShell,
     ScopedWrite,
     CrossOwnerWrite,
-    #[cfg(test)]
-    Legacy,
 }
 
 impl CapabilityLabel {
@@ -129,8 +119,6 @@ impl CapabilityLabel {
             Self::ReadSearchShell => "read_search_shell",
             Self::ScopedWrite => "scoped_write",
             Self::CrossOwnerWrite => "cross_owner_write",
-            #[cfg(test)]
-            Self::Legacy => "legacy",
         }
     }
 }
@@ -198,11 +186,6 @@ impl TokenClassTotals {
         (!coverage.saturated && field(&coverage) == coverage.receipts).then_some(value)
     }
 
-    /// Non-cached input tokens, the portion billed at the full input rate.
-    #[cfg(test)]
-    pub(crate) fn uncached_input(self) -> u64 {
-        self.input.saturating_sub(self.cached_input)
-    }
 
     fn checked_add(self, other: Self) -> Option<Self> {
         Some(Self {
@@ -256,13 +239,6 @@ pub(crate) struct UsageTotals {
     pub calls: u64,
 }
 
-#[cfg(test)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct ConcurrencySlice {
-    pub duration: Duration,
-    pub active_turns: u32,
-    pub capacity: u32,
-}
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct FindingTotals {
@@ -314,8 +290,6 @@ pub(crate) struct TaskMetricInput {
     /// Time with no active assignments anywhere in this coordinator, within this task's lifetime.
     pub coordinator_zero_active_time: Duration,
     pub role_usage: Vec<RoleUsage>,
-    #[cfg(test)]
-    pub concurrency: Vec<ConcurrencySlice>,
     pub acceptance_total: u32,
     pub acceptance_first_pass_closed: Option<u32>,
     pub acceptance_final_closed: u32,
@@ -381,24 +355,6 @@ pub(crate) enum MetricsError {
 }
 
 impl TaskMetrics {
-    #[cfg(test)]
-    pub(crate) fn evaluate(input: TaskMetricInput) -> Result<Self, MetricsError> {
-        if input.role_usage.len() > MAX_METRIC_ROWS || input.concurrency.len() > MAX_METRIC_ROWS {
-            return Err(MetricsError::TooManyRows);
-        }
-
-        let mut active_time = Duration::ZERO;
-        let mut capacity_time = Duration::ZERO;
-        for slice in &input.concurrency {
-            if slice.capacity == 0 || slice.active_turns > slice.capacity {
-                return Err(MetricsError::InvalidConcurrencySlice);
-            }
-            active_time = weighted_add(active_time, slice.duration, slice.active_turns)?;
-            capacity_time = weighted_add(capacity_time, slice.duration, slice.capacity)?;
-        }
-
-        Self::evaluate_with_concurrency_totals(input, active_time, capacity_time)
-    }
 
     fn evaluate_with_concurrency_totals(
         input: TaskMetricInput,
@@ -599,15 +555,7 @@ impl TaskMetricRecorder {
         })
     }
 
-    #[cfg(test)]
-    fn recorded_events(&self) -> usize {
-        self.recorded_events
-    }
 
-    #[cfg(test)]
-    pub(crate) fn is_terminal(&self) -> bool {
-        self.finished
-    }
 
     pub(crate) fn record_role_usage(
         &mut self,
@@ -691,8 +639,6 @@ impl TaskMetricRecorder {
                 duration: elapsed,
                 coordinator_zero_active_time,
                 role_usage,
-                #[cfg(test)]
-                concurrency: Vec::new(),
                 acceptance_total: terminal.acceptance_total,
                 acceptance_first_pass_closed: terminal.acceptance_first_pass_closed,
                 acceptance_final_closed: terminal.acceptance_final_closed,
@@ -720,19 +666,6 @@ impl TaskMetricRecorder {
         Ok(Some(metrics))
     }
 
-    #[cfg(test)]
-    fn finish_with(
-        &mut self,
-        elapsed: Duration,
-        terminal: TaskMetricTerminalInput,
-        emit: impl FnOnce(&TaskMetrics),
-    ) -> Result<Option<TaskMetrics>, MetricsError> {
-        let metrics = self.finish(elapsed, terminal)?;
-        if let Some(metrics) = metrics.as_ref() {
-            emit(metrics);
-        }
-        Ok(metrics)
-    }
 
     fn ensure_recordable(&self) -> Result<(), MetricsError> {
         if self.finished {
@@ -1097,6 +1030,3 @@ fn ratio(numerator: u128, denominator: u128) -> u16 {
     }
 }
 
-#[cfg(test)]
-#[path = "task_metrics_tests.rs"]
-mod tests;

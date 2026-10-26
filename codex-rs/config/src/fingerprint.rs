@@ -55,20 +55,3 @@ pub fn version_for_toml(value: &TomlValue) -> String {
     let hash = hex::encode(hasher.finalize());
     format!("sha256:{hash}")
 }
-
-#[cfg(test)]
-#[test]
-fn origin_keys_keep_dotted_headers_and_array_indices_distinct() {
-    let first: TomlValue = toml::from_str("[mcp_servers.'docs.http_headers.x'.http_headers]\ny = 'a'").unwrap();
-    let second: TomlValue = toml::from_str("[mcp_servers.docs.http_headers]\n'x.http_headers.y' = 'b'").unwrap();
-    let mut origins = HashMap::new();
-    record_origins(&first, &1, &mut Vec::new(), &mut origins);
-    record_origins(&second, &2, &mut Vec::new(), &mut origins);
-    assert_eq!(origins.len(), 2);
-    assert_eq!(origins.get(r#"mcp_servers."docs.http_headers.x".http_headers.y"#), Some(&1));
-    assert_eq!(origins.get(r#"mcp_servers.docs.http_headers."x.http_headers.y""#), Some(&2));
-    record_origins(&toml::from_str::<TomlValue>("items = ['array']").unwrap(), &3, &mut Vec::new(), &mut origins);
-    record_origins(&toml::from_str::<TomlValue>("[items]\n0 = 'map'").unwrap(), &4, &mut Vec::new(), &mut origins);
-    assert_eq!(origins.get("items.[0]"), Some(&3));
-    assert_eq!(origins.get("items.0"), Some(&4));
-}

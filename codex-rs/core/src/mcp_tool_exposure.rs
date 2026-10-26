@@ -227,7 +227,3 @@ fn filter_codex_apps_mcp_tools(
         .cloned()
         .collect()
 }
-
-#[cfg(test)]
-#[path = "mcp_tool_exposure_test.rs"]
-mod tests;

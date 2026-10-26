@@ -126,6 +126,3 @@ impl Client {
     }
 }
 
-#[cfg(test)]
-#[path = "thread_usage_tests.rs"]
-mod tests;

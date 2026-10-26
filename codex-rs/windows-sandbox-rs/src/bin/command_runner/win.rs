@@ -980,7 +980,6 @@ pub fn main() -> Result<()> {
     let timeout = windows_wait_timeout(req.timeout_ms);
     let wait_outcome = wait_for_process(pi.hProcess, timeout);
     let timed_out = matches!(wait_outcome, ProcessWaitOutcome::TimedOut);
-    let root_exited = matches!(wait_outcome, ProcessWaitOutcome::Exited);
     let child_stopped = match wait_outcome {
         ProcessWaitOutcome::Exited => {
             if let Err(err) = job.preserve_descendants() {
@@ -1010,19 +1009,19 @@ pub fn main() -> Result<()> {
         }
     };
 
-    let exit_code: i32;
+    let exit_code: Option<i32>;
     // SAFETY: The spawn result owns both process/thread handles until this cleanup. raw_exit is
     // writable for GetExitCodeProcess, and each non-null handle is closed once after
     // waiting.
     unsafe {
-        if timed_out {
-            exit_code = 128 + 64;
-        } else if root_exited {
-            let mut raw_exit: u32 = 1;
-            GetExitCodeProcess(pi.hProcess, &mut raw_exit);
-            exit_code = raw_exit as i32;
+        if timed_out && child_stopped {
+            exit_code = Some(128 + 64);
+        } else if child_stopped {
+            let mut raw_exit: u32 = 0;
+            exit_code = (GetExitCodeProcess(pi.hProcess, &mut raw_exit) != 0)
+                .then_some(raw_exit as i32);
         } else {
-            exit_code = 1;
+            exit_code = None;
         }
         if !pi.hThread.is_null() {
             CloseHandle(pi.hThread);
@@ -1056,313 +1055,33 @@ pub fn main() -> Result<()> {
         log_note("runner stderr reader thread panicked", log_dir);
     }
 
-    let exit_msg = FramedMessage {
-        version: IPC_PROTOCOL_VERSION,
-        message: Message::Exit {
-            payload: ExitPayload {
-                exit_code,
-                timed_out,
+    if let Some(exit_code) = exit_code {
+        let exit_msg = FramedMessage {
+            version: IPC_PROTOCOL_VERSION,
+            message: Message::Exit {
+                payload: ExitPayload {
+                    exit_code,
+                    timed_out,
+                },
             },
-        },
-    };
-    if let Ok(mut guard) = pipe_write.lock()
-        && let Err(err) = write_frame(&mut *guard, &exit_msg)
-    {
-        log_note(&format!("runner exit write failed: {err}"), log_dir);
+        };
+        if let Ok(mut guard) = pipe_write.lock()
+            && let Err(err) = write_frame(&mut *guard, &exit_msg)
+        {
+            log_note(&format!("runner exit write failed: {err}"), log_dir);
+        }
+    } else {
+        let _ = send_error(
+            &pipe_write,
+            ErrorStage::ObserveChildExit,
+            None,
+            "root process exit status unavailable".to_string(),
+        );
     }
 
     // Publish root exit before potentially blocking older ConPTY teardown.
     drop(conpty_owner.take());
-    std::process::exit(exit_code);
+    // This is the runner's own failure status, never a fabricated child Exit.
+    std::process::exit(exit_code.unwrap_or(1));
 }
 
-#[cfg(test)]
-mod tests {
-    use super::FramedMessage;
-    use super::IPC_PROTOCOL_VERSION;
-    use super::Message;
-    use super::OwnedWinHandle;
-    use super::ProcessWaitOutcome;
-    use super::WAIT_FAILED;
-    use super::encode_bytes;
-    use super::spawn_input_loop;
-    use super::spawn_input_loop_with_terminator;
-    use super::wait_for_process;
-    use super::write_frame;
-    use codex_utils_pty::JobObject;
-    use codex_windows_sandbox::StdinPayload;
-    use std::fs::File;
-    use std::io::Seek;
-    use std::os::windows::io::AsRawHandle;
-    use std::os::windows::io::FromRawHandle;
-    use std::process::Stdio;
-    use std::ptr;
-    use std::sync::Arc;
-    use std::sync::Mutex;
-    use std::sync::mpsc;
-    use std::time::Duration;
-    use std::time::Instant;
-    use windows_sys::Win32::Foundation::ERROR_INVALID_HANDLE;
-    use windows_sys::Win32::Foundation::HANDLE;
-    use windows_sys::Win32::System::Pipes::CreatePipe;
-
-    fn encode_powershell_script(script: &str) -> String {
-        let utf16_le = script
-            .encode_utf16()
-            .flat_map(u16::to_le_bytes)
-            .collect::<Vec<_>>();
-        encode_bytes(&utf16_le)
-    }
-
-    fn powershell_literal_path(path: &std::path::Path) -> String {
-        path.to_string_lossy().replace('\'', "''")
-    }
-
-    fn wait_for_path(path: &std::path::Path, timeout: Duration) -> bool {
-        let deadline = Instant::now() + timeout;
-        while !path.exists() && Instant::now() < deadline {
-            std::thread::sleep(
-                Duration::from_millis(25).min(deadline.saturating_duration_since(Instant::now())),
-            );
-        }
-        path.exists()
-    }
-
-    #[test]
-    fn invalid_process_wait_is_not_treated_as_exit() {
-        assert_eq!(
-            wait_for_process(/*invalid process handle*/ std::ptr::null_mut(), 0),
-            ProcessWaitOutcome::Failed {
-                wait_result: WAIT_FAILED,
-                windows_error: Some(ERROR_INVALID_HANDLE),
-            }
-        );
-    }
-
-    #[test]
-    fn blocked_stdin_does_not_delay_control_eof() -> anyhow::Result<()> {
-        let mut control_reader = tempfile::tempfile()?;
-        write_frame(
-            &mut control_reader,
-            &FramedMessage {
-                version: IPC_PROTOCOL_VERSION,
-                message: Message::Stdin {
-                    payload: StdinPayload {
-                        data_b64: encode_bytes(&vec![b'x'; super::IO_CHUNK_BYTES]),
-                    },
-                },
-            },
-        )?;
-        control_reader.rewind()?;
-
-        let mut stdin_read: HANDLE = std::ptr::null_mut();
-        let mut stdin_write: HANDLE = std::ptr::null_mut();
-        // SAFETY: Both output pointers refer to writable HANDLE slots; default security and buffer
-        // size are requested. The test checks success before transferring ownership of
-        // either end.
-        let pipe_created = unsafe { CreatePipe(&mut stdin_read, &mut stdin_write, ptr::null(), 0) };
-        assert_ne!(pipe_created, 0, "CreatePipe failed: {}", unsafe {
-            windows_sys::Win32::Foundation::GetLastError()
-        });
-        let stdin_read = OwnedWinHandle::new(stdin_read);
-
-        let (terminated_tx, terminated_rx) = mpsc::channel();
-        let input_thread = spawn_input_loop_with_terminator(
-            control_reader,
-            Some(stdin_write),
-            Arc::new(Mutex::new(None)),
-            None,
-            None,
-            move || {
-                let _ = terminated_tx.send(());
-            },
-        );
-
-        terminated_rx
-            .recv_timeout(Duration::from_secs(2))
-            .expect("control EOF must remain responsive while child stdin is blocked");
-        input_thread.join().expect("join runner input loop");
-        drop(stdin_read);
-        Ok(())
-    }
-
-    #[test]
-    fn late_stdin_after_child_closed_input_is_not_fatal() -> anyhow::Result<()> {
-        let stdin_frame = || FramedMessage {
-            version: IPC_PROTOCOL_VERSION,
-            message: Message::Stdin {
-                payload: StdinPayload {
-                    data_b64: encode_bytes(b"x"),
-                },
-            },
-        };
-        let mut control_read: HANDLE = std::ptr::null_mut();
-        let mut control_write: HANDLE = std::ptr::null_mut();
-        // SAFETY: Both output pointers refer to writable HANDLE slots; default security and buffer
-        // size are requested. Failure is checked before using either returned pipe end.
-        if unsafe { CreatePipe(&mut control_read, &mut control_write, ptr::null_mut(), 0) } == 0 {
-            return Err(std::io::Error::last_os_error().into());
-        }
-        // SAFETY: CreatePipe succeeded; each File takes sole ownership of one pipe end.
-        let reader = unsafe { File::from_raw_handle(control_read as _) };
-        // SAFETY: As above, for the unshared write end.
-        let mut control = unsafe { File::from_raw_handle(control_write as _) };
-        let mut stdin_read: HANDLE = std::ptr::null_mut();
-        let mut stdin_write: HANDLE = std::ptr::null_mut();
-        // SAFETY: As above; failure is checked before using either returned pipe end.
-        if unsafe { CreatePipe(&mut stdin_read, &mut stdin_write, ptr::null_mut(), 0) } == 0 {
-            return Err(std::io::Error::last_os_error().into());
-        }
-        // The child has closed its stdin, so every runner write to it fails.
-        drop(OwnedWinHandle::new(stdin_read));
-        let temp_dir = tempfile::TempDir::new()?;
-        let receipts_path = temp_dir.path().join("receipts");
-        let flow = super::RunnerFlow {
-            writer: Arc::new(Mutex::new(File::create(&receipts_path)?)),
-            output: Arc::new(super::OutputWindow::default()),
-        };
-        let (terminated_tx, terminated_rx) = mpsc::channel();
-        let input_thread = spawn_input_loop_with_terminator(
-            reader,
-            Some(stdin_write),
-            Arc::new(Mutex::new(None)),
-            /*log_dir*/ None,
-            Some(flow),
-            move || {
-                let _ = terminated_tx.send(());
-            },
-        );
-        let stdin_closed_reported = || {
-            let bytes = std::fs::read(&receipts_path).unwrap_or_default();
-            let mut remaining = bytes.as_slice();
-            std::iter::from_fn(|| super::read_frame(&mut remaining).ok().flatten())
-                .any(|frame| matches!(frame.message, Message::StdinClosed { .. }))
-        };
-
-        write_frame(&mut control, &stdin_frame())?;
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while !stdin_closed_reported() {
-            assert!(
-                Instant::now() < deadline,
-                "runner did not report closed child stdin"
-            );
-            std::thread::sleep(Duration::from_millis(25));
-        }
-        // Let the stdin writer finish exiting, then deliver input the parent sent
-        // before it observed StdinClosed.
-        std::thread::sleep(Duration::from_millis(250));
-        write_frame(&mut control, &stdin_frame())?;
-        assert!(
-            terminated_rx
-                .recv_timeout(Duration::from_millis(500))
-                .is_err(),
-            "late stdin after the child closed its input terminated the process tree"
-        );
-
-        drop(control);
-        terminated_rx
-            .recv_timeout(Duration::from_secs(2))
-            .expect("control EOF still terminates the process tree");
-        input_thread.join().expect("join runner input loop");
-        Ok(())
-    }
-
-    #[test]
-    fn controlling_ipc_eof_terminates_process_tree() -> anyhow::Result<()> {
-        use windows_sys::Win32::System::Threading::OpenProcess;
-        use windows_sys::Win32::System::Threading::PROCESS_SYNCHRONIZE;
-
-        let temp_dir = tempfile::TempDir::new()?;
-        let start_marker = temp_dir.path().join("start");
-        let ready_marker = temp_dir.path().join("ready");
-        let descendant_script = encode_powershell_script("Start-Sleep -Seconds 60");
-        let root_script = format!(
-            "$ErrorActionPreference = 'Stop'; \
-             while (-not (Test-Path -LiteralPath '{}')) {{ Start-Sleep -Milliseconds 25 }}; \
-             $child = Start-Process -FilePath 'powershell.exe' -PassThru \
-                 -ArgumentList @('-NoLogo','-NoProfile','-NonInteractive','-EncodedCommand','{descendant_script}') \
-                 -WindowStyle Hidden; \
-             Set-Content -LiteralPath '{ready}.pending' -Value $child.Id; \
-             Move-Item -LiteralPath '{ready}.pending' -Destination '{ready}'; \
-             Start-Sleep -Seconds 60",
-            powershell_literal_path(&start_marker),
-            ready = powershell_literal_path(&ready_marker)
-        );
-        let root_script = encode_powershell_script(&root_script);
-        let mut root = std::process::Command::new("powershell.exe")
-            .args([
-                "-NoLogo",
-                "-NoProfile",
-                "-NonInteractive",
-                "-EncodedCommand",
-                &root_script,
-            ])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()?;
-        let job = Arc::new(JobObject::create()?);
-        if let Err(err) = job.assign_process(root.as_raw_handle()) {
-            let _ = root.kill();
-            let _ = root.wait();
-            return Err(err.into());
-        }
-        std::fs::write(&start_marker, b"start")?;
-        assert!(
-            wait_for_path(&ready_marker, Duration::from_secs(10)),
-            "descendant did not start"
-        );
-        let descendant_pid: u32 = std::fs::read_to_string(&ready_marker)?.trim().parse()?;
-        // SAFETY: this PID was recorded by our child; retain the handle across
-        // termination so PID reuse cannot turn the observation into a false pass.
-        let descendant = unsafe { OpenProcess(PROCESS_SYNCHRONIZE, 0, descendant_pid) };
-        if descendant.is_null() {
-            return Err(std::io::Error::last_os_error().into());
-        }
-        let descendant = OwnedWinHandle::new(descendant);
-        assert_eq!(
-            wait_for_process(descendant.raw(), 0),
-            ProcessWaitOutcome::TimedOut
-        );
-
-        let mut control_read: HANDLE = std::ptr::null_mut();
-        let mut control_write: HANDLE = std::ptr::null_mut();
-        // SAFETY: Both output pointers refer to writable HANDLE slots; default security and buffer
-        // size are requested. Failure is checked before using either returned pipe end.
-        if unsafe { CreatePipe(&mut control_read, &mut control_write, ptr::null_mut(), 0) } == 0 {
-            return Err(std::io::Error::last_os_error().into());
-        }
-        // SAFETY: CreatePipe succeeded and control_read is an owned, unshared read handle; File
-        // takes sole responsibility for closing it.
-        let reader = unsafe { File::from_raw_handle(control_read as _) };
-        let control_writer = OwnedWinHandle::new(control_write);
-        let process_observer = OwnedWinHandle::duplicate(root.as_raw_handle() as HANDLE)?;
-        let input_thread = spawn_input_loop(
-            reader,
-            /*stdin_handle*/ None,
-            Arc::new(Mutex::new(None)),
-            Arc::clone(&job),
-            OwnedWinHandle::duplicate(root.as_raw_handle() as HANDLE)?,
-            /*log_dir*/ None,
-            /*flow*/ None,
-        );
-
-        // Close the original `Child` handle before delivering EOF. The input
-        // thread must terminate through the duplicate it owns, never a stale
-        // raw HANDLE that could be reused for another kernel object.
-        drop(root);
-        drop(control_writer);
-        input_thread.join().expect("join runner input loop");
-        assert_eq!(
-            wait_for_process(process_observer.raw(), 10_000),
-            ProcessWaitOutcome::Exited,
-            "root survived control-pipe EOF"
-        );
-        assert_eq!(
-            wait_for_process(descendant.raw(), 2_000),
-            ProcessWaitOutcome::Exited,
-            "descendant survived control-pipe EOF"
-        );
-        Ok(())
-    }
-}

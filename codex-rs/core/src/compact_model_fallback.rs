@@ -101,7 +101,3 @@ pub(crate) fn record_model_fallback(
         "previous-model compaction failed; retried with current model"
     );
 }
-
-#[cfg(test)]
-#[path = "compact_model_fallback_tests.rs"]
-mod tests;

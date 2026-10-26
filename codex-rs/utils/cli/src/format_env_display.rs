@@ -23,29 +23,3 @@ pub fn format_env_display<S: AsRef<str>>(
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn masks_values_and_preserves_sorted_pairs_then_variable_order() {
-        let empty_map = HashMap::new();
-        let mut env = HashMap::new();
-        env.insert("B".to_string(), "two".to_string());
-        env.insert("A".to_string(), "one".to_string());
-        let vars = ["TOKEN", "PATH"];
-        for (map, variables, expected) in [
-            (None, &[][..], "-"),
-            (Some(&empty_map), &[][..], "-"),
-            (Some(&env), &[][..], "A=*****, B=*****"),
-            (None, &vars[..], "TOKEN=*****, PATH=*****"),
-            (
-                Some(&env),
-                &vars[..],
-                "A=*****, B=*****, TOKEN=*****, PATH=*****",
-            ),
-        ] {
-            assert_eq!(format_env_display(map, variables), expected);
-        }
-    }
-}

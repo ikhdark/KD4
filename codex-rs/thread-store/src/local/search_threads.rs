@@ -24,9 +24,6 @@ use crate::ThreadSortKey;
 use crate::ThreadStoreError;
 use crate::ThreadStoreResult;
 
-#[cfg(test)]
-#[path = "search_threads_tests.rs"]
-mod tests;
 
 struct ThreadSearchItem {
     item: codex_rollout::ThreadItem,

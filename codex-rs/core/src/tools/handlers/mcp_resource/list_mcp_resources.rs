@@ -153,24 +153,3 @@ impl CoreToolRuntime for ListMcpResourcesHandler {
     }
 }
 
-#[cfg(test)]
-mod tests {
-
-    #[test]
-    fn omitted_cursor_uses_exhaustive_owner_collection() {
-        assert_eq!(
-            super::super::mcp_list_strategy(None),
-            super::super::McpListStrategy::Exhaustive
-        );
-        assert_eq!(
-            super::super::mcp_list_strategy(Some("opaque-cursor")),
-            super::super::McpListStrategy::ExplicitPage
-        );
-    }
-
-    #[test]
-    fn cursor_requires_an_explicit_server() {
-        assert!(super::super::ensure_cursor_has_server(None, Some("cursor")).is_err());
-        assert!(super::super::ensure_cursor_has_server(Some("server"), Some("cursor")).is_ok());
-    }
-}

@@ -29,8 +29,3 @@ tokio-util = { workspace = true, features = ["rt"] }
 tracing = { workspace = true }
 uuid = { workspace = true, features = ["v4"] }
 v8 = { workspace = true }
-
-[dev-dependencies]
-futures = { workspace = true, features = ["async-await"] }
-pretty_assertions = { workspace = true }
-tokio = { workspace = true, features = ["test-util"] }

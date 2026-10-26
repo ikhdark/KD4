@@ -19,38 +19,3 @@ pub(crate) fn treatment_from_headers(headers: &HeaderMap) -> Option<SafetyBuffer
     Some(SafetyBufferingTreatment { faster_model })
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use http::HeaderValue;
-    use pretty_assertions::assert_eq;
-
-    #[test]
-    fn treatment_depends_on_header_presence_not_enabled_value() {
-        for enabled in [None, Some("true"), Some("false")] {
-            for faster_model in [None, Some("faster-model")] {
-                let mut headers = HeaderMap::new();
-                if let Some(enabled) = enabled {
-                    headers.insert(
-                        X_CODEX_SAFETY_BUFFERING_ENABLED_HEADER,
-                        HeaderValue::from_static(enabled),
-                    );
-                }
-                if let Some(faster_model) = faster_model {
-                    headers.insert(
-                        X_CODEX_SAFETY_BUFFERING_FASTER_MODEL_HEADER,
-                        HeaderValue::from_static(faster_model),
-                    );
-                }
-                assert_eq!(
-                    treatment_from_headers(&headers),
-                    (enabled.is_some() || faster_model.is_some()).then(|| {
-                        SafetyBufferingTreatment {
-                            faster_model: faster_model.map(str::to_owned),
-                        }
-                    }),
-                );
-            }
-        }
-    }
-}

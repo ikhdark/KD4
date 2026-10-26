@@ -223,7 +223,3 @@ impl Drop for ConnectionDriver {
 fn notify_cell_closed(delegate: &Arc<dyn CodeModeSessionDelegate>, cell_id: &CellId) {
     let _ = std::panic::catch_unwind(AssertUnwindSafe(|| delegate.cell_closed(cell_id)));
 }
-
-#[cfg(test)]
-#[path = "driver_tests.rs"]
-mod tests;

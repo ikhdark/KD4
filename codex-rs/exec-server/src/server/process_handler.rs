@@ -133,10 +133,6 @@ impl ProcessHandler {
         self.process.shutdown().await;
     }
 
-    #[cfg(test)]
-    pub(crate) async fn wait_for_read_wait(&self) {
-        self.process.wait_for_read_wait().await;
-    }
 
     pub(crate) fn set_notification_sender(&self, notifications: Option<RpcNotificationSender>) {
         self.process.set_notification_sender(notifications);
@@ -146,19 +142,5 @@ impl ProcessHandler {
         self.process.exec(params).await
     }
 
-    #[cfg(test)]
-    pub(crate) async fn exec_read(
-        &self,
-        params: ReadParams,
-    ) -> Result<ReadResponse, JSONRPCErrorError> {
-        self.process.exec_read(params).await
-    }
 
-    #[cfg(test)]
-    pub(crate) async fn terminate(
-        &self,
-        params: TerminateParams,
-    ) -> Result<TerminateResponse, JSONRPCErrorError> {
-        self.process.terminate_process(params).await
-    }
 }

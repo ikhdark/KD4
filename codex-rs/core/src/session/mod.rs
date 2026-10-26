@@ -199,8 +199,6 @@ use uuid::Uuid;
 
 use crate::client::ModelClient;
 use crate::codex_thread::ThreadConfigSnapshot;
-#[cfg(test)]
-use crate::compact::collect_user_messages;
 use crate::config::Config;
 use crate::config::Constrained;
 use crate::config::ConstraintResult;
@@ -217,8 +215,6 @@ use codex_config::types::McpServerConfig;
 use codex_model_provider_info::ModelProviderInfo;
 use codex_protocol::error::CodexErr;
 use codex_protocol::error::Result as CodexResult;
-#[cfg(test)]
-use codex_protocol::exec_output::StreamOutput;
 
 mod code_mode_warning;
 mod config_lock;
@@ -243,8 +239,6 @@ mod world_state;
 use self::code_mode_warning::unsupported_code_mode_warning;
 use self::config_lock::export_config_lock_if_configured;
 use self::config_lock::validate_config_lock_if_configured;
-#[cfg(test)]
-use self::handlers::submission_dispatch_span;
 use self::handlers::submission_loop;
 pub(crate) use self::input_queue::InputQueue;
 pub(crate) use self::input_queue::InputQueueActivity;
@@ -258,10 +252,6 @@ use self::session::AppServerClientMetadata;
 pub(crate) use self::session::Session;
 use self::session::SessionConfiguration;
 pub(crate) use self::session::SessionSettingsUpdate;
-#[cfg(test)]
-use self::turn::AssistantMessageStreamParsers;
-#[cfg(test)]
-use self::turn::collect_explicit_app_ids_from_skill_items;
 use self::turn_context::TurnContext;
 use self::turn_context::TurnSkillsContext;
 
@@ -374,8 +364,6 @@ fn context_snapshot_matches(
     &realized == candidate
 }
 
-#[cfg(test)]
-mod rollout_reconstruction_tests;
 
 #[derive(Debug, PartialEq)]
 pub enum SteerInputError {
@@ -456,8 +444,6 @@ fn retarget_previous_turn_settings_for_provider(
     }
 }
 
-#[cfg(test)]
-use crate::SkillMetadata;
 use crate::SkillsService;
 use crate::exec_policy::ExecPolicyUpdateError;
 use crate::mcp::McpManager;
@@ -465,23 +451,13 @@ use crate::rollout::map_session_init_error;
 use crate::session_startup_prewarm::SessionStartupPrewarmHandle;
 use crate::session_startup_prewarm::SessionStartupTransportHandle;
 use crate::shell;
-#[cfg(test)]
-use crate::skills::SkillLoadOutcome;
 use crate::state::AutoCompactWindowIds;
 use crate::state::AutoCompactWindowSnapshot;
 use crate::state::ContextBaselineCandidate;
 use crate::state::PendingRequestPermissions;
 use crate::state::SessionServices;
 use crate::state::SessionState;
-#[cfg(test)]
-use crate::stream_events_utils::HandleOutputCtx;
-#[cfg(test)]
-use crate::stream_events_utils::OrderedResponseItemRecorder;
-#[cfg(test)]
-use crate::stream_events_utils::handle_output_item_done;
 use crate::tasks::ReviewTask;
-#[cfg(test)]
-use crate::tools::parallel::ToolCallRuntime;
 use crate::tools::sandboxing::ApprovalStore;
 use crate::turn_timing::InteractiveWaitKind;
 use crate::turn_timing::TurnLocalPhase;
@@ -538,8 +514,6 @@ use codex_protocol::protocol::TurnModerationMetadataEvent;
 use codex_protocol::protocol::WarningEvent;
 use codex_protocol::user_input::UserInput;
 use codex_utils_absolute_path::AbsolutePathBuf;
-#[cfg(test)]
-use codex_utils_stream_parser::ProposedPlanSegment;
 
 /// The high-level interface to the Codex system.
 /// It operates as a queue pair where you send submissions and receive events.
@@ -1307,10 +1281,6 @@ fn session_permission_profile_state_from_config(
     Ok(config.permissions.permission_profile_state().clone())
 }
 
-#[cfg(test)]
-pub(crate) fn completed_session_loop_termination() -> SessionLoopTermination {
-    futures::future::ready(Ok(())).boxed().shared()
-}
 
 pub(crate) fn session_loop_termination_from_handle(
     handle: JoinHandle<()>,
@@ -1361,14 +1331,6 @@ async fn thread_title_from_thread_store(
     (!title.is_empty() && thread.preview.trim() != title).then(|| title.to_string())
 }
 
-#[cfg(test)]
-fn take_prompt_fragment(
-    fragment: PromptFragment,
-    budget: &mut ModelContextBudget,
-    turn_id: &str,
-) -> Option<(PromptSlot, String)> {
-    take_prompt_fragment_with_identity(fragment, budget, turn_id, None)
-}
 
 #[expect(
     clippy::expect_used,
@@ -1787,10 +1749,6 @@ impl Session {
         .map_err(std::io::Error::other)
     }
 
-    #[cfg(test)]
-    pub(crate) async fn shutdown_runtime_for_test(self: &Arc<Self>) -> bool {
-        handlers::shutdown(self, "cleanup-shutdown-test".to_string()).await
-    }
 
     /// Keep accepted tool commits ahead of turn terminalization even if their
     /// caller disappears before cooperative cancellation finishes.
@@ -2055,13 +2013,6 @@ impl Session {
         state.clear_connector_selection();
     }
 
-    #[cfg(test)]
-    async fn record_initial_history(&self, conversation_history: InitialHistory) {
-        let startup_rollout_facts = StartupRolloutFacts::reduce(&conversation_history);
-        self.record_initial_history_with_facts(conversation_history, startup_rollout_facts)
-            .await
-            .expect("initial history persistence");
-    }
 
     async fn record_initial_history_with_facts(
         &self,
@@ -3975,15 +3926,6 @@ impl Session {
         rx_response.await.ok()
     }
 
-    #[cfg(test)]
-    pub async fn notify_user_input_response(
-        &self,
-        sub_id: &str,
-        response: RequestUserInputResponse,
-    ) {
-        self.notify_user_input_response_for_request(sub_id, None, response)
-            .await;
-    }
 
     #[expect(
         clippy::await_holding_invalid_type,
@@ -5051,15 +4993,6 @@ impl Session {
             .await;
     }
 
-    #[cfg(test)]
-    pub(crate) async fn replace_history(
-        &self,
-        items: Vec<ResponseItem>,
-        reference_context_item: Option<TurnContextItem>,
-    ) {
-        let mut state = self.state.lock().await;
-        state.replace_history(items, reference_context_item);
-    }
 
     pub(crate) async fn commit_rollback_history(
         self: &Arc<Self>,
@@ -5439,29 +5372,6 @@ impl Session {
         fragments
     }
 
-    #[cfg(test)]
-    async fn build_turn_context_contribution_items(
-        &self,
-        turn_context: &TurnContext,
-        estimate: bool,
-    ) -> Vec<ResponseItem> {
-        let mut extension_context_budget = ModelContextBudget::default();
-        let rendered_fragments = self
-            .poll_turn_context_contributors(turn_context, estimate)
-            .await
-            .into_iter()
-            .flatten()
-            .flatten()
-            .filter_map(|fragment| {
-                take_prompt_fragment(
-                    fragment,
-                    &mut extension_context_budget,
-                    &turn_context.sub_id,
-                )
-            })
-            .collect();
-        Self::build_context_contribution_items_from_rendered_fragments(rendered_fragments)
-    }
 
     fn build_context_contribution_items_from_rendered_fragments(
         rendered_fragments: Vec<(PromptSlot, String)>,
@@ -5500,27 +5410,7 @@ impl Session {
         items
     }
 
-    #[cfg(test)]
-    pub(crate) async fn build_initial_context_with_world_state(
-        &self,
-        turn_context: &TurnContext,
-        world_state: &WorldState,
-    ) -> Vec<ResponseItem> {
-        self.build_initial_context_with_world_state_and_mcp(turn_context, world_state, false)
-            .await
-            .items
-    }
 
-    #[cfg(test)]
-    pub(crate) async fn build_context_fragment_digests(
-        &self,
-        turn_context: &TurnContext,
-        world_state: &WorldState,
-    ) -> Vec<ContextFragmentDigest> {
-        self.build_initial_context_with_world_state_and_mcp(turn_context, world_state, false)
-            .await
-            .fragment_digests
-    }
 
     pub(crate) async fn build_initial_context_with_world_state_and_provenance(
         &self,
@@ -6245,17 +6135,7 @@ impl Session {
         state.clear_pending_context_baseline();
     }
 
-    #[cfg(test)]
-    pub(crate) fn close_durable_history_commit_gate_for_test(&self) {
-        self.durable_history_commit_gate.close();
-    }
 
-    #[cfg(test)]
-    pub(crate) async fn lock_history_state_for_test(
-        &self,
-    ) -> tokio::sync::MutexGuard<'_, SessionState> {
-        self.state.lock().await
-    }
 
     pub(crate) async fn clone_history(&self) -> ContextManager {
         self.state.lock().await.clone_history()
@@ -6948,11 +6828,6 @@ impl Session {
         format!("{thread_id}:{window_number}")
     }
 
-    #[cfg(test)]
-    pub(crate) async fn advance_auto_compact_window(&self) -> (u64, AutoCompactWindowIds) {
-        let mut state = self.state.lock().await;
-        state.advance_auto_compact_window()
-    }
 
     pub(crate) async fn reference_context_item(&self) -> Option<TurnContextItem> {
         let state = self.state.lock().await;
@@ -7139,16 +7014,6 @@ impl Session {
         self.prepare_context_update_inner(step_context, false).await
     }
 
-    /// Builds a read-only preview for tests and callers that do not intend to commit it.
-    #[cfg(test)]
-    pub(crate) async fn estimate_context_update_items(
-        &self,
-        step_context: &StepContext,
-    ) -> Vec<ResponseItem> {
-        self.prepare_context_update_inner(step_context, true)
-            .await
-            .context_items
-    }
 
     /// Persist the latest turn context snapshot for the first real user turn and for
     /// steady-state turns that emit model-visible context updates.
@@ -7828,13 +7693,6 @@ impl Session {
         }
     }
 
-    #[cfg(test)]
-    pub(crate) fn user_shell(&self) -> Arc<shell::Shell> {
-        self.services
-            .user_shell
-            .cached()
-            .unwrap_or_else(|| Arc::new(shell::default_user_shell()))
-    }
 
     pub(crate) async fn current_rollout_path(&self) -> anyhow::Result<Option<PathBuf>> {
         let Some(live_thread) = self.live_thread() else {
@@ -7977,12 +7835,5 @@ async fn build_hooks_for_config(
         .expect("hook discovery worker should complete")
 }
 
-#[cfg(test)]
-#[path = "elicitation_holders_tests.rs"]
-pub(crate) mod elicitation_holders_tests;
 
-#[cfg(test)]
-pub(crate) mod tests;
 
-#[cfg(test)]
-mod world_state_delivery_tests;

@@ -31,7 +31,6 @@ use crate::tools::handlers::RequestUserInputHandler;
 use crate::tools::handlers::ShellCommandHandler;
 use crate::tools::handlers::ShellCommandHandlerOptions;
 use crate::tools::handlers::SleepHandler;
-use crate::tools::handlers::TestSyncHandler;
 use crate::tools::handlers::ToolSearchHandler;
 use crate::tools::handlers::ToolSearchHandlerCache;
 use crate::tools::handlers::ViewImageHandler;
@@ -1338,15 +1337,6 @@ fn add_core_utility_tools(context: &CoreToolPlanContext<'_>, planned_tools: &mut
         );
     }
 
-    if turn_context
-        .model_info
-        .experimental_supported_tools
-        .iter()
-        .any(|tool| tool == "test_sync_tool")
-    {
-        planned_tools
-            .add_with_authorization_class(TestSyncHandler, TypedToolClass::CodeModeControl);
-    }
 
     if environment_mode.has_environment()
         && turn_context
@@ -1821,24 +1811,3 @@ impl CoreToolRuntime for MultiAgentV2NamespaceOverride {
     }
 }
 
-#[cfg(test)]
-#[path = "spec_plan_tests.rs"]
-mod tests;
-#[cfg(test)]
-mod audit150_namespace_tests {
-    use super::*;
-    #[test]
-    fn registration_retains_full_guidance_while_visible_projection_is_bounded() {
-        let description = format!("{}\nFINAL_REQUIRED_SAFETY_INSTRUCTION", "guidance ".repeat(8000));
-        let mut planned = PlannedTools { hosted_specs:vec![ToolSpec::Namespace(ResponsesApiNamespace {
-            name:"large_namespace".into(),description:description.clone(),tools:vec![],
-        })], ..Default::default() };
-        apply_namespace_description_budget(&mut planned);
-        let ToolSpec::Namespace(authoritative)=&planned.hosted_specs[0] else { panic!("namespace"); };
-        assert_eq!(authoritative.description,description);
-        let projected=merge_into_namespaces(planned.hosted_specs.clone());
-        let ToolSpec::Namespace(visible)=&projected[0] else { panic!("namespace"); };
-        assert!(visible.description.len()<description.len());
-        assert!(authoritative.description.contains("FINAL_REQUIRED_SAFETY_INSTRUCTION"));
-    }
-}

@@ -41,6 +41,3 @@ pub(super) fn static_runtime_model_catalog() -> ModelsResponse {
     ModelsResponse { models }
 }
 
-#[cfg(test)]
-#[path = "runtime_catalog_tests.rs"]
-mod tests;

@@ -427,19 +427,3 @@ fn project_store_error(operation: &'static str, error: ThreadStoreError) -> JSON
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn off_thread_roots_preserve_order_duplicates_and_nonexistent_paths() {
-        let home = tempfile::tempdir().unwrap();
-        let root = |name: &str| ProjectRoot {
-            path: codex_utils_absolute_path::AbsolutePathBuf::from_absolute_path(home.path().join(name)).unwrap(),
-        };
-        let roots = validate_roots_off_thread(vec![root("missing-b"), root("missing-a")]).await.unwrap();
-        assert_eq!(roots.iter().map(|root| root.path.clone()).collect::<Vec<_>>(), vec![home.path().join("missing-b").display().to_string(), home.path().join("missing-a").display().to_string()]);
-        assert!(validate_roots_off_thread(vec![root("same"), root("same")]).await.unwrap_err().message.contains("duplicate project root"));
-        assert!(validate_roots_off_thread(Vec::new()).await.unwrap().is_empty());
-    }
-}

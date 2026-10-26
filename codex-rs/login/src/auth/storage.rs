@@ -664,16 +664,7 @@ impl AuthStorageBackend for AutoAuthStorage {
 static EPHEMERAL_AUTH_STORE: Lazy<Mutex<HashMap<String, AuthDotJson>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
 
-#[cfg(test)]
-thread_local! {
-    static BEFORE_EPHEMERAL_STORE_LOCK: std::cell::RefCell<Option<std::sync::mpsc::Sender<()>>> =
-        const { std::cell::RefCell::new(None) };
-}
 
-#[cfg(test)]
-pub(super) fn notify_before_next_ephemeral_store_lock(sender: std::sync::mpsc::Sender<()>) {
-    BEFORE_EPHEMERAL_STORE_LOCK.with(|slot| slot.replace(Some(sender)));
-}
 
 #[derive(Clone, Debug)]
 struct EphemeralAuthStorage {
@@ -690,12 +681,6 @@ impl EphemeralAuthStorage {
         F: FnOnce(&mut HashMap<String, AuthDotJson>, String) -> std::io::Result<T>,
     {
         let key = compute_store_key(&self.codex_home)?;
-        #[cfg(test)]
-        BEFORE_EPHEMERAL_STORE_LOCK.with(|slot| {
-            if let Some(sender) = slot.borrow_mut().take() {
-                let _ = sender.send(());
-            }
-        });
         let mut store = EPHEMERAL_AUTH_STORE
             .lock()
             .map_err(|_| std::io::Error::other("failed to lock ephemeral auth storage"))?;
@@ -780,6 +765,3 @@ fn create_keyring_auth_storage(
     }
 }
 
-#[cfg(test)]
-#[path = "storage_tests.rs"]
-mod tests;

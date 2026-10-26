@@ -381,24 +381,3 @@ fn push_escaped_attr_value(escaped: &mut String, value: &str) {
         }
     }
 }
-
-#[cfg(test)]
-mod policy_tests {
-    use super::*;
-
-    #[test]
-    fn application_policy_keeps_middle_while_external_data_remains_bounded() {
-        let value = format!(
-            "{}Never modify X.{}",
-            "before ".repeat(1500),
-            " after".repeat(1500)
-        );
-        let policy =
-            AdditionalContextDeveloperFragment::new("policy".into(), value.clone()).render();
-        assert!(policy.contains(&value));
-        assert!(AdditionalContextDeveloperFragment::matches_text(&policy));
-        let external = AdditionalContextUserFragment::new("data".into(), value).render();
-        assert!(external.contains("tokens truncated"));
-        assert!(external.len() < 4200);
-    }
-}

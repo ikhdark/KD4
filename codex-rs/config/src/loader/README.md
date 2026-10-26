@@ -9,19 +9,20 @@ CLI/session overrides, cloud-managed config, and managed config) and to produce:
 
 ## Public surface
 
-Exported from `codex_config::loader`:
+The entry point is `codex_config::loader::load_config_layers_state`. Supporting types and
+helpers are re-exported from `codex_config`:
 
 - `load_config_layers_state(fs, codex_home, cwd_opt, cli_overrides, options, thread_config_loader)
-  -> ConfigLayerStack`
+  -> io::Result<ConfigLayerStack>` (async)
 - `ConfigLayerStack`
   - `effective_config() -> toml::Value`
   - `origins() -> HashMap<String, ConfigLayerMetadata>`
-  - `layers_high_to_low() -> Vec<ConfigLayer>`
-  - `with_user_config(user_config) -> ConfigLayerStack`
+  - `layers_high_to_low() -> Vec<&ConfigLayerEntry>`
+  - `with_user_config(config_toml, user_config) -> ConfigLayerStack`
 - `ConfigLayerEntry` (one layer’s `{name, config, version, disabled_reason}`; `name` carries source
   metadata)
 - `ConfigLoadOptions` (user-facing load behavior such as strict config validation)
-- `LoaderOverrides` (test/override hooks for managed config sources)
+- `LoaderOverrides` (overrides for managed and user config sources)
 - `merge_toml_values(base, overlay)` (public helper used elsewhere)
 
 ## Layering model
@@ -98,9 +99,10 @@ let layers_for_ui = layers.layers_high_to_low();
 
 Implementation is split by concern:
 
-- `state.rs`: public types (`ConfigLayerEntry`, `ConfigLayerStack`) + merge/origins convenience
+- `mod.rs`: async layer acquisition, project discovery, and requirements composition.
+- `../state.rs`: public types (`ConfigLayerEntry`, `ConfigLayerStack`) + merge/origins convenience
   methods.
 - `layer_io.rs`: reading `config.toml` and managed config inputs.
-- `overrides.rs`: CLI dotted-path overrides → TOML “session flags” layer.
-- `merge.rs`: recursive TOML merge.
-- `fingerprint.rs`: stable per-layer hashing and per-key origins traversal.
+- `../overrides.rs`: CLI dotted-path overrides → TOML “session flags” layer.
+- `../merge.rs`: recursive TOML merge.
+- `../fingerprint.rs`: stable per-layer hashing and per-key origins traversal.

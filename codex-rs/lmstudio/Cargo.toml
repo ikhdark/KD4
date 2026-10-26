@@ -20,10 +20,6 @@ tokio = { workspace = true, features = ["rt", "process"] }
 tracing = { workspace = true, features = ["log"] }
 which = { workspace = true }
 
-[dev-dependencies]
-tempfile = { workspace = true }
-wiremock = { workspace = true }
-tokio = { workspace = true, features = ["full"] }
 
 [lints]
 workspace = true

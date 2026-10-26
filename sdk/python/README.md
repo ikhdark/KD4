@@ -121,14 +121,9 @@ thread joins. Restart is refused while old pipe workers remain alive, including
 when a descendant retains inherited pipe handles. Low-level approval handling
 denies command/file requests by default, matching the curated `deny_all` policy.
 
-Local transport regression tests require only the existing Python test environment:
-
-```bash
-python -m pytest tests/test_transport_limits.py tests/test_client_rpc_methods.py tests/test_async_client_behavior.py tests/test_retry.py
-```
-
-The real app-server integration tests install packages and depend on the pinned
-runtime and a live model; they are not part of these local checks.
+This checkout does not include an automated Python test suite. The
+[runnable examples](examples/README.md) exercise SDK workflows using your
+configured Codex runtime and may make live model requests.
 
 ## Built-In Help
 

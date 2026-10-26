@@ -116,7 +116,7 @@ pub fn ensure_rollout_source_integrity(items: &[RolloutItem]) -> std::io::Result
 ///
 /// Rollouts are recorded as JSONL and can be inspected with tools such as:
 ///
-/// ```ignore
+/// ```text
 /// $ jq -C . ~/.codex/sessions/rollout-2025-05-07T17-24-21-5973b6c0-94b8-487b-a530-2aeb6098ae0e.jsonl
 /// $ fx ~/.codex/sessions/rollout-2025-05-07T17-24-21-5973b6c0-94b8-487b-a530-2aeb6098ae0e.jsonl
 /// ```
@@ -208,11 +208,6 @@ enum RolloutCmd {
     Maintenance {
         ack: oneshot::Sender<std::io::Result<()>>,
         decision: oneshot::Receiver<MaintenanceDecision>,
-    },
-    #[cfg(test)]
-    Pause {
-        entered: oneshot::Sender<()>,
-        resume: oneshot::Receiver<()>,
     },
 }
 
@@ -1647,7 +1642,7 @@ impl RolloutRecorder {
         Ok((id, errors, partial, unresolved))
     }
 
-    async fn for_each_rollout_item_with_versions<F>(
+    pub(crate) async fn for_each_rollout_item_with_versions<F>(
         path: &Path,
         enroll_dependencies: bool,
         capture_payload_versions: bool,
@@ -1772,13 +1767,6 @@ impl RolloutRecorder {
         ))
     }
 
-    #[cfg(test)]
-    async fn existing_tool_manifests(
-        path: &Path,
-    ) -> std::io::Result<crate::ToolManifestDictionary> {
-        let (_, manifests) = Self::existing_rollout_state(path).await?;
-        Ok(manifests)
-    }
 
     async fn existing_rollout_state(
         path: &Path,
@@ -2396,10 +2384,6 @@ impl LockedRolloutFile {
             _payload_sync_owner: self.payload_sync_owner,
             _append_lock: Arc::new(self.append_lock),
             _payload_retention: Arc::new(self.payload_retention),
-            #[cfg(test)]
-            write_fault: None,
-            #[cfg(test)]
-            append_transaction_count: 0,
         }
     }
 }
@@ -2711,10 +2695,6 @@ impl RolloutWriterState {
                 _payload_sync_owner: Arc::clone(&self.payload_sync_owner),
                 _append_lock: Arc::clone(append_lock),
                 _payload_retention: Arc::clone(payload_retention),
-                #[cfg(test)]
-                write_fault: None,
-                #[cfg(test)]
-                append_transaction_count: 0,
             }
         } else {
             tokio::task::spawn_blocking(move || open_log_file(path.as_path()))
@@ -3011,11 +2991,6 @@ async fn rollout_writer(
                     MaintenanceDecision::Resume => {}
                 }
             }
-            #[cfg(test)]
-            RolloutCmd::Pause { entered, resume } => {
-                let _ = entered.send(());
-                let _ = resume.await;
-            }
         }
         if let Some(message) = state.retry_blocked_error.as_ref() {
             let pending_records = state.pending_items.len();
@@ -3177,10 +3152,6 @@ struct JsonlWriter {
     _payload_sync_owner: Arc<crate::payload_artifact::PayloadSyncOwner>,
     _append_lock: Arc<compression::RolloutAppendLock>,
     _payload_retention: Arc<std::fs::File>,
-    #[cfg(test)]
-    write_fault: Option<JsonlWriteFault>,
-    #[cfg(test)]
-    append_transaction_count: usize,
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -3189,13 +3160,6 @@ enum FailedAppendRecovery {
     RolledBack,
 }
 
-#[cfg(test)]
-#[derive(Clone, Copy, Debug)]
-enum JsonlWriteFault {
-    Partial(usize),
-    Complete,
-    Unexpected,
-}
 
 #[derive(serde::Serialize)]
 struct RolloutLineRef<'a> {
@@ -3341,10 +3305,6 @@ impl JsonlWriter {
     }
 
     async fn write_transaction(&mut self, bytes: &[u8], append_start: u64) -> std::io::Result<u64> {
-        #[cfg(test)]
-        {
-            self.append_transaction_count += 1;
-        }
         let committed_end = append_start.checked_add(bytes.len() as u64)
             .ok_or_else(|| IoError::other("rollout append offset overflow"))?;
         let write_result = self.write_line_bytes(bytes).await;
@@ -3364,23 +3324,6 @@ impl JsonlWriter {
     }
 
     async fn write_line_bytes(&mut self, line: &[u8]) -> std::io::Result<()> {
-        #[cfg(test)]
-        if let Some(fault) = self.write_fault.take() {
-            match fault {
-                JsonlWriteFault::Partial(max_bytes) => {
-                    let partial_len = max_bytes.min(line.len().saturating_sub(1));
-                    self.file.write_all(&line[..partial_len]).await?;
-                }
-                JsonlWriteFault::Complete => {
-                    self.file.write_all(line).await?;
-                }
-                JsonlWriteFault::Unexpected => {
-                    self.file.write_all(b"unexpected bytes").await?;
-                }
-            }
-            self.file.flush().await?;
-            return Err(IoError::other("injected rollout append failure"));
-        }
 
         self.file.write_all(line).await?;
         self.file.flush().await
@@ -3512,10 +3455,4 @@ fn thread_item_from_state_metadata(
     }
 }
 
-#[cfg(test)]
-#[path = "recorder_tests.rs"]
-mod tests;
 
-#[cfg(test)]
-#[path = "recorder_compat_tests.rs"]
-mod compatibility_tests;

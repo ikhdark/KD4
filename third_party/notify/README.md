@@ -15,10 +15,7 @@ _Cross-platform filesystem notification library for Rust._
 - [Mini Debouncer Documentation][debouncer-mini-docs]
 - [Full Debouncer Documentation][debouncer-full-docs]
 - [File ID][file-id-docs]
-- [Examples][examples]
-- [Changelog][changelog]
-- [Upgrading notify from v8](./docs/UPGRADING_V8_TO_V9.md)
-- [Upgrading notify from v4](./docs/UPGRADING_V4_TO_V5.md)
+- Examples, changelog, and upgrade guides for notify v8 and v4 live in the [upstream repository](https://github.com/notify-rs/notify); they are not included in this vendored subset.
 - Minimum supported Rust version: **1.88**
 
 As used by: [alacritty], [cargo watch], [cobalt], [deno], [docket], [mdBook],
@@ -54,10 +51,13 @@ We follow these MSRV rules:
 ## License
 
 notify is licensed under the [CC Zero 1.0][cc0].    
-notify-types is licensed under the [MIT] or [Apache-2.0][apache] license.  
-notify-debouncer-mini is licensed under the [MIT] or [Apache-2.0][apache] license.  
-notify-debouncer-full is licensed under the [MIT] or [Apache-2.0][apache] license.  
-file-id is licensed under the [MIT] or [Apache-2.0][apache] license.
+notify-types is licensed under the MIT or Apache-2.0 license.  
+notify-debouncer-mini is licensed under the MIT or Apache-2.0 license.  
+notify-debouncer-full is licensed under the MIT or Apache-2.0 license.  
+file-id is licensed under the MIT or Apache-2.0 license.
+
+Those components and their license texts are maintained in the
+[upstream repository](https://github.com/notify-rs/notify), not this vendored notify subtree.
 
 ## Origins
 
@@ -76,10 +76,7 @@ Originally created by [Félix Saparelli] and awesome [contributors].
 [alert-after]: https://github.com/frewsxcv/alert-after
 [build]: https://github.com/notify-rs/notify/actions
 [cargo watch]: https://github.com/passcod/cargo-watch
-[cc0]: ./notify/LICENSE-CC0
-[MIT]: ./file-id/LICENSE-MIT
-[apache]: ./file-id/LICENSE-APACHE
-[changelog]: ./CHANGELOG.md
+[cc0]: ./LICENSE-CC0
 [cobalt]: https://github.com/cobalt-org/cobalt.rs
 [coc]: http://contributor-covenant.org/version/1/4/
 [contributors]: https://github.com/notify-rs/notify/graphs/contributors
@@ -101,5 +98,4 @@ Originally created by [Félix Saparelli] and awesome [contributors].
 [xi-editor]: https://xi-editor.io/
 [watchfiles]: https://watchfiles.helpmanual.io/
 [zed]: https://github.com/zed-industries/zed
-[examples]: examples/
 

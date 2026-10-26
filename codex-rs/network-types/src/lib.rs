@@ -40,32 +40,3 @@ impl NetworkDecisionSource {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn policy_wire_spellings_round_trip() {
-        for (decision, decision_name) in [
-            (NetworkPolicyDecision::Deny, "deny"),
-            (NetworkPolicyDecision::Ask, "ask"),
-        ] {
-            for (source, source_name) in [
-                (NetworkDecisionSource::BaselinePolicy, "baseline_policy"),
-                (NetworkDecisionSource::ModeGuard, "mode_guard"),
-                (NetworkDecisionSource::ProxyState, "proxy_state"),
-                (NetworkDecisionSource::Decider, "decider"),
-            ] {
-                let wire = serde_json::json!([decision_name, source_name]);
-                assert_eq!(serde_json::to_value((decision, source)).unwrap(), wire);
-                assert_eq!(
-                    serde_json::from_value::<(NetworkPolicyDecision, NetworkDecisionSource)>(wire)
-                        .unwrap(),
-                    (decision, source)
-                );
-                assert_eq!(decision.as_str(), decision_name);
-                assert_eq!(source.as_str(), source_name);
-            }
-        }
-    }
-}

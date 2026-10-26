@@ -296,7 +296,6 @@ pub(crate) mod spawn_tool_spec {
         build_from_configs(built_in_roles, user_defined_agent_roles)
     }
 
-    // This function is not inlined for testing purpose.
     fn build_from_configs(
         built_in_roles: &BTreeMap<String, AgentRoleConfig>,
         user_defined_roles: &BTreeMap<String, AgentRoleConfig>,
@@ -406,6 +405,3 @@ mod built_in {
     }
 }
 
-#[cfg(test)]
-#[path = "role_tests.rs"]
-mod tests;

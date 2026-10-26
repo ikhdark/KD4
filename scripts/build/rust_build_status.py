@@ -667,8 +667,8 @@ def _cargo_profile_locks_are_busy(target_dir: Path, *, profile: str | None) -> b
     # Cargo locks each profile directory, optionally below a target triple.
     # Inspect only those two levels; never follow junctions into other trees.
     # Admission can ignore unrelated Cargo profiles; lane reservation/pruning
-    # must keep the default whole-target probe. Runner leases remain exclusive
-    # for the whole invocation, including helper staging and test execution.
+    # must keep the default whole-target probe. Legacy runner leases remain
+    # exclusive for their whole invocation, including all child processes.
     try:
         for child in target_dir.iterdir():
             if not child.is_dir():
@@ -970,14 +970,14 @@ def _cargo_profile_options(command: Sequence[str]) -> list[str]:
 def _auto_lane_base(command: Sequence[str]) -> str:
     signature = " ".join(command).strip()
     release = _cargo_profile_options(command) == ["--profile", "release"]
-    from scripts.build.rust_tool_env import CORE_TEST_PACKAGES, cargo_package_specs
+    from scripts.build.rust_tool_env import CORE_BUILD_PACKAGES, cargo_package_specs
 
     # Affinity also covers Cargo watch's embedded --exec/-x command strings.
     packages = cargo_package_specs(signature.split())
     if packages:
         base = (
             "core-tests"
-            if any(package in packages for package in CORE_TEST_PACKAGES)
+            if any(package in packages for package in CORE_BUILD_PACKAGES)
             else packages[0]
         )
     elif command:
@@ -1804,36 +1804,6 @@ def _guard_cargo_checkout_cwd(command: Sequence[str], repo_root: Path) -> None:
 
 
 
-def _direct_reserved_lane_command(
-    command: Sequence[str],
-    child_env: dict[str, str],
-    *,
-    repo_root: Path,
-    target_dir: Path,
-) -> list[str] | None:
-    if len(command) < 2 or Path(command[0]).stem.lower() != "just":
-        return None
-
-    recipe = command[1]
-    arguments = list(command[2:])
-    profile: str | None = None
-    cargo_arguments: list[str] | None = None
-    if recipe == "_test-lane-local-reserved":
-        profile = "local"
-        cargo_arguments = ["--no-fail-fast", *arguments]
-    elif recipe == "_test-lane-fast-reserved":
-        profile = "fast"
-        cargo_arguments = arguments
-    elif recipe == "_test-lane-package-reserved" and arguments:
-        package, *forwarded = arguments
-        profile = "fast"
-        cargo_arguments = ["-p", package, *forwarded]
-    else:
-        return None
-
-    child_env["RUST_MIN_STACK"] = RUST_MIN_STACK_BYTES
-    child_env["NEXTEST_PROFILE"] = profile
-    return ["cargo", "nextest", "run", *cargo_arguments]
 
 
 def maintain_cargo_lanes(repo_root: Path, lane_root: Path) -> None:
@@ -2121,51 +2091,6 @@ def cargo_build_context(
     }
 
 
-def _provision_code_mode_test_host(command: Sequence[str], target_dir: Path, child_env: dict[str, str]) -> int:
-    """Build the retained core fixture's helper in this already-owned lane."""
-    if not command or Path(command[0]).stem.lower() != "cargo":
-        return 0
-    index = _cargo_subcommand_index(command)
-    if index is None or list(command[index:index + 2]) != ["nextest", "run"]:
-        return 0
-    tokens = list(command[index + 2:])
-    packages = []
-    excluded = []
-    target = child_env.get("CARGO_BUILD_TARGET", "")
-    for position, token in enumerate(tokens):
-        value = tokens[position + 1] if position + 1 < len(tokens) else ""
-        if token in {"-p", "--package"}: packages.append(value)
-        elif token.startswith("--package="): packages.append(token.split("=", 1)[1])
-        elif token.startswith("-p") and token != "-p": packages.append(token[2:])
-        elif token == "--exclude": excluded.append(value)
-        elif token.startswith("--exclude="): excluded.append(token.split("=", 1)[1])
-        elif token == "--target": target = value
-        elif token.startswith("--target="): target = token.split("=", 1)[1]
-    owner = "codex-core-integration-tests"
-    if owner in excluded or (packages and owner not in packages and "--workspace" not in tokens):
-        return 0
-    explicit = child_env.get("CARGO_BIN_EXE_codex-code-mode-host") or child_env.get("CARGO_BIN_EXE_codex_code_mode_host")
-    if explicit:
-        if not Path(explicit).is_absolute() or not Path(explicit).is_file():
-            raise ValueError("explicit Code Mode test host must be an existing absolute executable path")
-        return 0
-    profile_options = _cargo_profile_options(command)
-    profile = profile_options[1] if profile_options else "dev"
-    host_command = [*command[:index], "build", "-p", "codex-code-mode-host", "--bin", "codex-code-mode-host",
-                    "--target-dir", str(target_dir), *profile_options]
-    if target: host_command.extend(["--target", target])
-    host_command.extend(flag for flag in tokens if flag in {"--locked", "--offline", "--frozen"})
-    code = run_owned(host_command, env=child_env, prepare_sccache=True, check=False,
-                     stdout=sys.stdout, stderr=sys.stderr).returncode
-    if code:
-        return code
-    directory = target_dir / target if target else target_dir
-    directory /= "debug" if profile in {"dev", "test"} else profile
-    host = directory / ("codex-code-mode-host.exe" if os.name == "nt" else "codex-code-mode-host")
-    if not host.is_file():
-        raise ValueError(f"Code Mode test host build succeeded but its executable is missing: {host}")
-    child_env["CARGO_BIN_EXE_codex-code-mode-host"] = str(host.resolve())
-    return 0
 
 
 def run_in_cargo_lane(
@@ -2204,15 +2129,9 @@ def run_in_cargo_lane(
             child_env.pop("CARGO_TARGET_DIR", None)
             child_env.pop("CODEX_CARGO_LANE_TARGET_DIR", None)
             child_env.pop("CODEX_CARGO_LANE_OWNER_PID", None)
-            direct = _direct_reserved_lane_command(
-                command, child_env, repo_root=repo_root, target_dir=target_dir
-            )
-            if direct is None:
-                child_env["CODEX_CARGO_LANE_OWNER_PID"] = str(os.getpid())
-                child_env["CODEX_CARGO_LANE_TARGET_DIR"] = str(target_dir)
-            child_command = _cargo_command_with_target_dir(
-                direct if direct is not None else command, target_dir
-            )
+            child_env["CODEX_CARGO_LANE_OWNER_PID"] = str(os.getpid())
+            child_env["CODEX_CARGO_LANE_TARGET_DIR"] = str(target_dir)
+            child_command = _cargo_command_with_target_dir(command, target_dir)
             if not Path(child_command[0]).parent.name:
                 program = shutil.which(child_command[0], path=child_env.get("PATH"))
                 if program is not None:
@@ -2222,10 +2141,6 @@ def run_in_cargo_lane(
             except OSError as error:
                 print(f"warning: could not request Cargo maintenance: {error}", file=sys.stderr)
             try:
-                helper_code = _provision_code_mode_test_host(child_command, target_dir, child_env)
-                if helper_code:
-                    record["exitCode"] = helper_code
-                    return helper_code
                 code = run_owned(
                     child_command, env=child_env,
                     creationflags=getattr(subprocess, "BELOW_NORMAL_PRIORITY_CLASS", 0),

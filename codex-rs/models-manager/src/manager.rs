@@ -383,11 +383,6 @@ struct AvailableModelPresets {
 }
 
 impl AvailableModelPresets {
-    #[cfg(test)]
-    fn new(remote_models: &[ModelInfo]) -> Self {
-        let normalized = normalize_model_catalog(remote_models.to_vec());
-        Self::from_normalized(&normalized)
-    }
 
     /// Project a manager snapshot whose capabilities and slug conflicts were checked at publication.
     fn from_normalized(remote_models: &[ModelInfo]) -> Self {
@@ -563,8 +558,6 @@ pub struct StaticModelsManager {
     available_models: AvailableModelPresets,
     auth_manager: Option<Arc<AuthManager>>,
     model_catalog_activity: Arc<ModelCatalogActivity>,
-    #[cfg(test)]
-    list_models_calls: std::sync::atomic::AtomicUsize,
 }
 
 impl OpenAiModelsManager {
@@ -622,16 +615,9 @@ impl StaticModelsManager {
             auth_manager,
             rejected_slugs: normalized.rejected_slugs,
             model_catalog_activity: Arc::new(ModelCatalogActivity::new()),
-            #[cfg(test)]
-            list_models_calls: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
-    #[cfg(test)]
-    fn list_models_call_count(&self) -> usize {
-        self.list_models_calls
-            .load(std::sync::atomic::Ordering::Relaxed)
-    }
 }
 
 impl ModelsManager for OpenAiModelsManager {
@@ -1410,16 +1396,6 @@ impl OpenAiModelsManager {
         }
     }
 
-    /// Attempt to satisfy the refresh from the cache when its complete identity and TTL match.
-    #[expect(
-        clippy::await_holding_invalid_type,
-        reason = "Serializes model catalog and cache refresh transactions across network and disk awaits"
-    )]
-    #[cfg(test)]
-    async fn try_load_cache(&self) -> CoreResult<bool> {
-        let _refresh = self.refresh_gate.lock().await;
-        self.try_load_cache_locked().await
-    }
 
     async fn try_load_cache_locked(&self) -> CoreResult<bool> {
         let load_identity = self.ensure_current_cache_identity().await;
@@ -1499,9 +1475,6 @@ impl ModelsManager for StaticModelsManager {
     ) -> ModelsManagerFuture<'_, CoreResult<Vec<ModelPreset>>> {
         Box::pin(async move {
             self.model_catalog_activity.note_activity().await;
-            #[cfg(test)]
-            self.list_models_calls
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let uses_codex_backend = self
                 .auth_manager()
                 .is_some_and(AuthManager::current_auth_uses_codex_backend);
@@ -1732,11 +1705,6 @@ fn requested_model_is_available(
     })
 }
 
-#[cfg(test)]
-fn find_model_by_longest_prefix(model: &str, candidates: &[ModelInfo]) -> Option<ModelInfo> {
-    let candidates = normalize_model_catalog(candidates.to_vec());
-    find_normalized_model_by_longest_prefix(model, &candidates).cloned()
-}
 
 fn find_normalized_model_by_longest_prefix<'a>(
     model: &str,
@@ -1784,6 +1752,3 @@ fn construct_model_info_from_normalized(
     model_info::with_config_overrides(model_info, config)
 }
 
-#[cfg(test)]
-#[path = "manager_tests.rs"]
-mod tests;

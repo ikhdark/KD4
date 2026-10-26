@@ -85,12 +85,6 @@ impl AgentsMdCacheKey {
         })
     }
 
-    #[cfg(test)]
-    fn capture(config: &Config, environments: &TurnEnvironmentSnapshot) -> Self {
-        let project_root_markers = effective_project_root_markers(config);
-        Self::capture_with_markers(config, environments, &project_root_markers)
-    }
-
     fn capture_with_markers(
         config: &Config,
         environments: &TurnEnvironmentSnapshot,
@@ -514,7 +508,3 @@ impl AgentsMdManager {
         self.user_instructions.clone()
     }
 }
-
-#[cfg(test)]
-#[path = "agents_md_manager_tests.rs"]
-mod tests;

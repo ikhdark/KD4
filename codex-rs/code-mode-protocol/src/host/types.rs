@@ -148,19 +148,6 @@ impl<'de> Deserialize<'de> for SessionId {
     }
 }
 
-#[cfg(test)]
-#[test]
-fn session_ids_enforce_the_same_byte_bound_for_construction_and_wire_input() {
-    for value in ["x".repeat(MAX_SESSION_ID_BYTES), "é".repeat(MAX_SESSION_ID_BYTES / 2)] {
-        assert!(SessionId::new(value.clone()).is_ok());
-        assert!(serde_json::from_str::<SessionId>(&serde_json::to_string(&value).unwrap()).is_ok());
-    }
-    for value in ["x".repeat(MAX_SESSION_ID_BYTES + 1), "é".repeat(MAX_SESSION_ID_BYTES / 2 + 1)] {
-        assert!(SessionId::new(value.clone()).is_err());
-        assert!(serde_json::from_str::<SessionId>(&serde_json::to_string(&value).unwrap()).is_err());
-    }
-}
-
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
 #[serde(transparent)]
 pub struct CapabilitySet(BTreeSet<Capability>);

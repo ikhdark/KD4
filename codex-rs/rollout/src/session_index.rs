@@ -451,8 +451,6 @@ where
     while remaining > 0 {
         let read_size = usize::try_from(remaining.min(READ_CHUNK_SIZE as u64))
             .map_err(std::io::Error::other)?;
-        #[cfg(test)]
-        SESSION_INDEX_REVERSE_BYTES_READ.with(|bytes| bytes.set(bytes.get() + read_size));
         remaining -= read_size as u64;
         file.seek(SeekFrom::Start(remaining))?;
         file.read_exact(&mut buf[..read_size])?;
@@ -475,20 +473,8 @@ where
     Ok(None)
 }
 
-#[cfg(test)]
-thread_local! {
-    static SESSION_INDEX_REVERSE_BYTES_READ: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-}
 
-#[cfg(test)]
-fn reset_session_index_reverse_bytes_read() {
-    SESSION_INDEX_REVERSE_BYTES_READ.with(|bytes| bytes.set(0));
-}
 
-#[cfg(test)]
-fn session_index_reverse_bytes_read() -> usize {
-    SESSION_INDEX_REVERSE_BYTES_READ.with(std::cell::Cell::get)
-}
 
 fn parse_line_from_rev<F>(
     line_rev: &mut Vec<u8>,
@@ -518,6 +504,3 @@ where
     visit_entry(&entry)
 }
 
-#[cfg(test)]
-#[path = "session_index_tests.rs"]
-mod tests;

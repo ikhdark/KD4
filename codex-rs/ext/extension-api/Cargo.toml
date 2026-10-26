@@ -22,7 +22,3 @@ codex-tools = { workspace = true }
 codex-utils-absolute-path = { workspace = true }
 codex-utils-path-uri = { workspace = true }
 serde_json = { workspace = true }
-
-[dev-dependencies]
-pretty_assertions = { workspace = true }
-tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

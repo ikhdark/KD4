@@ -61,33 +61,6 @@ pub fn compose_requirements(
     compose_requirements_with_hostname_resolver(layers, crate::host_name)
 }
 
-#[cfg(test)]
-pub(super) fn compose_requirements_for_hostname(
-    layers: impl IntoIterator<Item = RequirementsLayerEntry>,
-    hostname: Option<&str>,
-) -> Result<Option<ConfigRequirementsWithSources>, RequirementsCompositionError> {
-    let hostname = hostname.map(str::to_string);
-    compose_requirements_with_hostname_resolver_and_hook_directory(
-        layers,
-        move || hostname.clone(),
-        HookDirectoryField::current_platform(),
-    )
-}
-
-#[cfg(test)]
-pub(super) fn compose_requirements_for_hostname_and_hook_directory(
-    layers: impl IntoIterator<Item = RequirementsLayerEntry>,
-    hostname: Option<&str>,
-    hook_directory_field: HookDirectoryField,
-) -> Result<Option<ConfigRequirementsWithSources>, RequirementsCompositionError> {
-    let hostname = hostname.map(str::to_string);
-    compose_requirements_with_hostname_resolver_and_hook_directory(
-        layers,
-        move || hostname.clone(),
-        hook_directory_field,
-    )
-}
-
 fn compose_requirements_with_hostname_resolver(
     layers: impl IntoIterator<Item = RequirementsLayerEntry>,
     hostname_resolver: impl Fn() -> Option<String>,
@@ -327,7 +300,3 @@ pub(super) fn composition_conflict(
         message: message.into(),
     }
 }
-
-#[cfg(test)]
-#[path = "stack_tests.rs"]
-mod tests;

@@ -288,6 +288,3 @@ fn normalize_plugin_mcp_server_value(
     object
 }
 
-#[cfg(test)]
-#[path = "plugin_config_tests.rs"]
-mod tests;

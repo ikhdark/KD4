@@ -3674,7 +3674,7 @@ function Exit-CodexLocalPublishMutex {
     }
 }
 
-# Focused tests import the consolidated function surface without publishing.
+# PGO orchestration imports the consolidated function surface without publishing.
 if ($ImportOnly) {
     return
 }

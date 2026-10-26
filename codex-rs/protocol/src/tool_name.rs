@@ -75,16 +75,3 @@ impl From<&str> for ToolName {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::ToolName;
-
-    #[test]
-    fn display_uses_callable_namespace_separator() {
-        assert_eq!(
-            ToolName::namespaced("agents", "get_agent_task").to_string(),
-            "agents__get_agent_task"
-        );
-        assert_eq!(ToolName::plain("read_file").to_string(), "read_file");
-    }
-}

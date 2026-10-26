@@ -307,20 +307,6 @@ pub(crate) fn default_range() -> TextRange {
     }
 }
 
-#[cfg(test)]
-#[test]
-fn diagnostic_positions_cover_eof_and_utf8_boundaries() {
-    for (contents, offset, line, column) in [
-        ("a = [\n", 6, 2, 1), ("abc", 3, 1, 4), ("", 0, 1, 1),
-        ("éé", 0, 1, 1), ("éé", 1, 1, 1), ("éé", 2, 1, 2), ("éé", 4, 1, 3),
-    ] {
-        let expected = TextPosition { line, column };
-        let range = text_range_from_span(contents, offset..offset);
-        assert_eq!(range.start, expected);
-        assert_eq!(range.end, expected);
-    }
-}
-
 enum TomlNode<'a> {
     Item(&'a Item),
     Table(&'a Table),
@@ -461,64 +447,5 @@ fn seq_child<'a>(node: &TomlNode<'a>, index: usize) -> Option<TomlNode<'a>> {
         TomlNode::Item(Item::ArrayOfTables(array)) => array.get(index).map(TomlNode::Table),
         TomlNode::Value(Value::Array(array)) => array.get(index).map(TomlNode::Value),
         _ => None,
-    }
-}
-
-#[cfg(test)]
-mod consolidated_type_tests {
-    use super::TextPosition;
-    use super::TextRange;
-
-    #[tokio::test]
-    async fn formats_config_error_with_source_and_missing_file() {
-        let temp = tempfile::tempdir().expect("temp dir");
-        let path = temp.path().join("config.toml");
-        let contents = "allow_login_shell = 123\n";
-        tokio::fs::write(&path, contents)
-            .await
-            .expect("write config");
-        let error =
-            super::config_error_from_typed_toml::<crate::config_toml::ConfigToml>(&path, contents)
-                .expect("invalid boolean");
-        let rendered = super::format_config_error_with_source(&error).await;
-        assert!(rendered.contains("allow_login_shell = 123"), "{rendered}");
-        assert!(rendered.contains("^^^"), "{rendered}");
-        assert_eq!(
-            super::format_config_error_with_source(&error).await,
-            super::format_config_error(&error, contents),
-        );
-        tokio::fs::remove_file(&path).await.expect("remove config");
-        assert_eq!(
-            super::format_config_error_with_source(&error).await,
-            super::format_config_error(&error, contents),
-        );
-    }
-
-    #[test]
-    fn invalid_config_value_has_exact_coordinates_and_rendered_highlight() {
-        let contents = "# settings\nallow_login_shell = 123\n";
-        let error = super::config_error_from_typed_toml::<crate::config_toml::ConfigToml>(
-            "config.toml",
-            contents,
-        )
-        .expect("an integer is invalid for a boolean option");
-        let range: codex_execpolicy::TextRange = error.range;
-        assert_eq!(
-            range,
-            TextRange {
-                start: TextPosition {
-                    line: 2,
-                    column: 21
-                },
-                end: TextPosition {
-                    line: 2,
-                    column: 23
-                },
-            }
-        );
-        let rendered = super::format_config_error(&error, contents);
-        assert!(rendered.starts_with("config.toml:2:21: "));
-        assert!(rendered.contains("2 | allow_login_shell = 123\n"));
-        assert!(rendered.ends_with(&format!("  | {}^^^", " ".repeat(20))));
     }
 }

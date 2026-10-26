@@ -9,8 +9,7 @@ param(
     [switch]$AllowRustyV8Download,
     [string]$InstallDir = $env:CODEX_LOCAL_PUBLISH_DIR,
     [string]$LocalCodexHome = $env:CODEX_LOCAL_CODEX_HOME,
-    [switch]$Force,
-    [switch]$ImportOnly
+    [switch]$Force
 )
 
 Set-StrictMode -Version Latest
@@ -197,7 +196,6 @@ function Get-PgoRawSnapshot {
     return [pscustomobject]@{ files = $files; fingerprint = $fingerprint }
 }
 
-if ($ImportOnly) { return }
 if ($TrainingScript -and $Stage -ne "Train") { throw "-TrainingScript is only valid for Train." }
 if ($Force -and $Stage -ne "Publish") { throw "-Force is only valid for Publish." }
 if ($Stage -eq "Train") {

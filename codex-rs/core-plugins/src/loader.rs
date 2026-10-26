@@ -347,10 +347,15 @@ pub fn remote_installed_plugins_to_config(
 
 pub fn refresh_curated_plugin_cache(
     codex_home: &Path,
-    plugin_version: &str,
+    _plugin_version: &str,
     configured_curated_plugin_ids: &[PluginId],
 ) -> Result<bool, String> {
-    let cache_plugin_version = curated_plugin_cache_version(plugin_version);
+    // A different sync may have published since the caller's sync returned.
+    // Re-read the version under the same authority as manifests and source copy.
+    let _snapshot = crate::startup_sync::lock_curated_plugins_startup_sync(codex_home)?;
+    let plugin_version = crate::startup_sync::read_curated_plugins_sha(codex_home)
+        .ok_or_else(|| "local curated marketplace sha is not available".to_string())?;
+    let cache_plugin_version = curated_plugin_cache_version(&plugin_version);
     let store = PluginStore::try_new(codex_home.to_path_buf()).map_err(|err| err.to_string())?;
     let curated_marketplace_paths = curated_marketplace_paths_for_cache_refresh(codex_home)?;
     let mut loaded_marketplace_names = HashSet::<String>::new();
@@ -469,46 +474,6 @@ pub fn curated_plugin_cache_version(plugin_version: &str) -> String {
     // Existing abbreviated directories remain readable and are replaced by the normal
     // versioned install transaction on the next refresh.
     plugin_version.to_string()
-}
-
-#[cfg(test)]
-pub(crate) fn refresh_non_curated_plugin_cache(
-    codex_home: &Path,
-    additional_roots: &[AbsolutePathBuf],
-    configured_plugin_keys: &[String],
-) -> Result<bool, String> {
-    collapse_non_curated_cache_refresh(refresh_non_curated_plugin_cache_detailed(
-        codex_home,
-        additional_roots,
-        configured_plugin_keys,
-    ))
-}
-
-#[cfg(test)]
-pub(crate) fn refresh_non_curated_plugin_cache_detailed(
-    codex_home: &Path,
-    additional_roots: &[AbsolutePathBuf],
-    configured_plugin_keys: &[String],
-) -> Result<NonCuratedCacheRefreshOutcome, String> {
-    refresh_non_curated_plugin_cache_with_mode(
-        codex_home,
-        additional_roots,
-        configured_plugin_keys,
-        NonCuratedCacheRefreshMode::IfVersionChanged,
-    )
-}
-
-#[cfg(test)]
-pub(crate) fn refresh_non_curated_plugin_cache_force_reinstall(
-    codex_home: &Path,
-    additional_roots: &[AbsolutePathBuf],
-    configured_plugin_keys: &[String],
-) -> Result<bool, String> {
-    collapse_non_curated_cache_refresh(refresh_non_curated_plugin_cache_force_reinstall_detailed(
-        codex_home,
-        additional_roots,
-        configured_plugin_keys,
-    ))
 }
 
 pub(crate) fn refresh_non_curated_plugin_cache_force_reinstall_detailed(
@@ -711,23 +676,6 @@ fn refresh_non_curated_plugin_cache_with_discovery(
         cache_refreshed,
         errors: refresh_errors,
     })
-}
-
-#[cfg(test)]
-fn collapse_non_curated_cache_refresh(
-    outcome: Result<NonCuratedCacheRefreshOutcome, String>,
-) -> Result<bool, String> {
-    let outcome = outcome?;
-    if outcome.errors.is_empty() {
-        Ok(outcome.cache_refreshed)
-    } else {
-        Err(outcome
-            .errors
-            .into_iter()
-            .map(|error| error.message)
-            .collect::<Vec<_>>()
-            .join("; "))
-    }
 }
 
 fn configured_plugins_from_user_config_value(
@@ -1727,7 +1675,3 @@ fn run_git(args: &[&str], cwd: Option<&Path>) -> Result<(), String> {
         String::from_utf8_lossy(&output.stderr).trim()
     ))
 }
-
-#[cfg(test)]
-#[path = "loader_tests.rs"]
-mod tests;

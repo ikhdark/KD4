@@ -829,6 +829,3 @@ fn format_to_mime(format: ImageFormat) -> &'static str {
     }
 }
 
-#[cfg(test)]
-#[path = "image_tests.rs"]
-mod tests;

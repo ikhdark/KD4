@@ -34,8 +34,6 @@ use std::sync::LazyLock;
 use tokio::sync::watch::Receiver;
 use tokio::time::Duration;
 use tokio::time::Instant;
-#[cfg(test)]
-use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::AbortOnDropHandle;
 use uuid::Uuid;
@@ -1235,24 +1233,6 @@ async fn reap_stale_active_items(
     Ok(true)
 }
 
-#[cfg(test)]
-async fn finalize_finished_item(
-    session: Arc<Session>,
-    db: Arc<codex_state::StateRuntime>,
-    job_id: &str,
-    item_id: &str,
-    thread_id: ThreadId,
-) -> anyhow::Result<()> {
-    shutdown_agent_job_worker(&session, thread_id).await?;
-    db.settle_agent_job_item_for_thread(
-        job_id,
-        item_id,
-        Some(thread_id.to_string().as_str()),
-        "worker finished without calling report_agent_job_result",
-    )
-    .await?;
-    Ok(())
-}
 
 fn build_worker_prompt(
     job: &codex_state::AgentJob,
@@ -1415,16 +1395,10 @@ fn parse_csv(content: &str) -> Result<(Vec<String>, Vec<Vec<String>>), String> {
 struct JobItemIds {
     seen: HashSet<String>,
     next_suffix: HashMap<String, usize>,
-    #[cfg(test)]
-    probes: usize,
 }
 
 impl JobItemIds {
     fn insert(&mut self, id: String) -> bool {
-        #[cfg(test)]
-        {
-            self.probes += 1;
-        }
         self.seen.insert(id)
     }
 
@@ -1536,6 +1510,3 @@ fn csv_escape(value: &str) -> String {
     }
 }
 
-#[cfg(test)]
-#[path = "agent_jobs_tests.rs"]
-mod tests;

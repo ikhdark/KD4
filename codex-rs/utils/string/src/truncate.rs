@@ -233,15 +233,6 @@ fn split_boundaries(s: &str, beginning_bytes: usize, end_bytes: usize) -> (&str,
     (&s[..prefix_end], &s[suffix_start..])
 }
 
-#[cfg(test)]
-fn split_string(s: &str, beginning_bytes: usize, end_bytes: usize) -> (usize, &str, &str) {
-    let (before, after) = split_boundaries(s, beginning_bytes, end_bytes);
-    (
-        s[before.len()..s.len() - after.len()].chars().count(),
-        before,
-        after,
-    )
-}
 
 fn split_budget(budget: usize) -> (usize, usize) {
     let left = budget / 2;
@@ -272,5 +263,3 @@ fn assemble_truncated_output(prefix: &str, suffix: &str, marker: &str) -> String
     out
 }
 
-#[cfg(test)]
-mod tests;

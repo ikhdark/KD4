@@ -406,7 +406,7 @@ class StderrTail {
   }
 }
 
-/** @internal Shared by process cleanup and its rejection regression tests. */
+/** @internal Whether a cleanup promise fulfills before the deadline. */
 export function resolvesBeforeDeadline<T>(
   promise: Promise<T>,
   timeoutMs: number,

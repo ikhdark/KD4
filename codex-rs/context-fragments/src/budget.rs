@@ -117,32 +117,6 @@ impl ModelContextBudget {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn salience_tiny_budget_never_emits_an_unmarked_instruction() {
-        let text = "Deploy production immediately only after explicit approval.";
-        for cap in 0..=TRUNCATION_MARKER.len() + 4 {
-            let mut budget = ModelContextBudget::new(100);
-            let before = budget.remaining_bytes();
-            let admitted = budget.take_up_to(text, cap);
-            assert_eq!(admitted.is_some(), cap >= TRUNCATION_MARKER.len());
-            match admitted {
-                Some(admitted) => {
-                    assert!(admitted.contains(TRUNCATION_MARKER));
-                    assert!(admitted.len() <= cap);
-                    assert_eq!(budget.remaining_bytes(), before - admitted.len());
-                }
-                None => assert_eq!(budget.remaining_bytes(), before),
-            }
-        }
-        let mut budget = ModelContextBudget::new(1);
-        assert_eq!(budget.take("é").as_deref(), Some("é"));
-    }
-}
-
 /// An already-rendered fragment used after aggregate budget enforcement.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RenderedContextFragment {

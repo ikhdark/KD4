@@ -280,17 +280,6 @@ impl AgentTaskCoordinator {
         true
     }
 
-    #[cfg(test)]
-    pub(crate) async fn create_assignment(
-        &self,
-        repo_root: &Path,
-        draft: AssignmentDraft,
-    ) -> StoreResult<(Assignment, Attempt)> {
-        let store = self.required_store()?;
-        let (assignment, attempt) = store.create_assignment(repo_root, draft).await?;
-        self.start_task_metrics(&assignment);
-        Ok((assignment, attempt))
-    }
 
     pub(crate) async fn create_admitted_assignment(
         &self,
@@ -1005,24 +994,6 @@ impl AgentTaskCoordinator {
         }
     }
 
-    #[cfg(test)]
-    pub(crate) async fn seal_missing_receipt(
-        &self,
-        agent_path: &AgentPath,
-        expected_thread_id: ThreadId,
-        status: &AgentStatus,
-    ) -> StoreResult<Option<AgentReceipt>> {
-        let Some(binding) = self.binding_for_agent_path(agent_path) else {
-            return Ok(None);
-        };
-        self.seal_missing_receipt_for_attempt(
-            agent_path,
-            expected_thread_id,
-            status,
-            binding.attempt_id,
-        )
-        .await
-    }
 
     pub(crate) async fn seal_missing_receipt_for_attempt(
         &self,
@@ -1343,6 +1314,3 @@ async fn binding_no_longer_needs_receipt(
         || task.current_attempt.state != AttemptState::Active)
 }
 
-#[cfg(test)]
-#[path = "task_coordinator_tests.rs"]
-mod tests;

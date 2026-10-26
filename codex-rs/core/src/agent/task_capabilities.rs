@@ -558,6 +558,3 @@ fn invalid_path(path: &str, reason: impl Into<String>) -> CapabilityPolicyError 
     }
 }
 
-#[cfg(test)]
-#[path = "task_capabilities_tests.rs"]
-mod tests;

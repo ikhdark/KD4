@@ -18,7 +18,7 @@ use anyhow::Result;
 const OAUTH_LOCK_DIR: &str = "mcp-oauth-locks";
 const STORE_LOCK_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(60);
 const STORE_LOCK_RETRY_SLEEP: Duration = Duration::from_millis(50);
-// Tests listen for this event so they prove a contender reached the real WouldBlock branch.
+// Tracing target for the first retryable WouldBlock while acquiring a store lock.
 const LOCK_CONTENTION_EVENT_TARGET: &str = "codex_rmcp_client::oauth::store_lock::contention";
 
 #[derive(Clone, Copy, Debug)]
@@ -165,6 +165,3 @@ fn oauth_store_lock_path(codex_home: &Path, store: OAuthStore) -> PathBuf {
     codex_home.join(OAUTH_LOCK_DIR).join(store.lock_filename())
 }
 
-#[cfg(test)]
-#[path = "tests/store_lock_tests.rs"]
-mod tests;

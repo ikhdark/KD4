@@ -524,21 +524,6 @@ impl ModelRequestMeasurements {
         }
     }
 
-    #[cfg(test)]
-    fn for_responses_request(
-        request: &ResponsesApiRequest,
-        provenance: &PromptProvenanceSidecar,
-        base_instructions: &str,
-    ) -> serde_json::Result<Self> {
-        Self::for_responses_request_cancellable(
-            request,
-            provenance,
-            base_instructions,
-            /*cancellation*/ None,
-            /*logical_request_bytes*/ None,
-        )
-    }
-
     fn for_responses_request_cancellable(
         request: &ResponsesApiRequest,
         provenance: &PromptProvenanceSidecar,
@@ -2797,10 +2782,6 @@ struct RequestSchemaCacheValue {
 #[derive(Debug)]
 struct RequestSchemaSerializationCache {
     entries: LruCache<RequestSchemaCacheKey, RequestSchemaCacheValue>,
-    #[cfg(test)]
-    hits: u64,
-    #[cfg(test)]
-    misses: u64,
 }
 
 impl Default for RequestSchemaSerializationCache {
@@ -2809,10 +2790,6 @@ impl Default for RequestSchemaSerializationCache {
             entries: LruCache::new(
                 NonZeroUsize::new(REQUEST_SCHEMA_CACHE_CAPACITY).unwrap_or(NonZeroUsize::MIN),
             ),
-            #[cfg(test)]
-            hits: 0,
-            #[cfg(test)]
-            misses: 0,
         }
     }
 }
@@ -2820,21 +2797,7 @@ impl Default for RequestSchemaSerializationCache {
 impl RequestSchemaSerializationCache {
     fn get(&mut self, key: RequestSchemaCacheKey) -> Option<RequestSchemaCacheValue> {
         let value = self.entries.get(&key)?.clone();
-        #[cfg(test)]
-        {
-            self.hits = self.hits.saturating_add(1);
-        }
         Some(value)
-    }
-
-    #[cfg(test)]
-    fn record_miss(&mut self) {
-        self.misses = self.misses.saturating_add(1);
-    }
-
-    #[cfg(test)]
-    fn diagnostics(&self) -> (u64, u64, usize) {
-        (self.hits, self.misses, self.entries.len())
     }
 
     fn insert(&mut self, key: RequestSchemaCacheKey, value: RequestSchemaCacheValue) {
@@ -2989,11 +2952,6 @@ impl CanonicalPrefixHash {
         }
     }
 
-    #[cfg(test)]
-    fn from_items(items: &[ResponseItem]) -> serde_json::Result<Self> {
-        Self::from_iter(items.iter())
-    }
-
     fn from_iter<'a>(
         items: impl IntoIterator<Item = &'a ResponseItem>,
     ) -> serde_json::Result<Self> {
@@ -3014,8 +2972,6 @@ impl CanonicalPrefixHash {
         // histories otherwise allocate and grow a fresh JSON buffer per item.
         let mut serialized = Vec::new();
         for item in items {
-            #[cfg(test)]
-            AUDIT143_PREFIX_ITEMS_HASHED.with(|count| count.set(count.get() + 1));
             let normalized = normalized_websocket_history_item(item);
             serialized.clear();
             serde_json::to_writer(&mut serialized, &normalized)?;
@@ -3033,9 +2989,6 @@ impl CanonicalPrefixHash {
 
 /// Hashes verified against the exact current request during preparation. This
 /// value travels with that request and is discarded whenever its input changes.
-#[cfg(test)]
-thread_local! { static AUDIT143_PREFIX_ITEMS_HASHED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
-
 struct VerifiedRequestHistory {
     prefix: CanonicalPrefixHash,
     properties: [u8; 32],
@@ -3873,8 +3826,6 @@ impl ModelClient {
                 trace!("request schema serialization cache hit");
                 return Ok(value);
             }
-            #[cfg(test)]
-            cache.record_miss();
         }
 
         let value = RequestSchemaCacheValue {
@@ -4480,15 +4431,6 @@ impl ModelClientSession {
         // These measurements never authorize previous_response_id reuse.
     }
 
-    #[cfg(test)]
-    fn remember_request_history(
-        &mut self,
-        request: &ResponsesApiRequest,
-        stable_context_fingerprint: [u8; 32],
-    ) {
-        self.remember_verified_request_history(request, stable_context_fingerprint, None);
-    }
-
     fn remember_verified_request_history(
         &mut self,
         request: &ResponsesApiRequest,
@@ -4567,21 +4509,6 @@ impl ModelClientSession {
             compression,
             turn_state: Some(Arc::clone(&self.turn_state)),
         }
-    }
-
-    /// Checks whether the current request is an incremental extension of the previous request.
-    /// We only reuse an incremental input delta when non-input request fields are unchanged and
-    /// `input` is a strict extension of the previous known input. Server-returned output items
-    /// are treated as part of the baseline so we do not resend them.
-    #[cfg(test)]
-    fn get_incremental_items(
-        &self,
-        request: &ResponsesApiRequest,
-        last_response: Option<&LastResponse>,
-        allow_empty_delta: bool,
-    ) -> Option<Vec<ResponseItem>> {
-        self.get_incremental_items_with_history(request, last_response, allow_empty_delta)
-            .map(|(items, _)| items)
     }
 
     fn get_incremental_items_with_history(
@@ -7734,10 +7661,3 @@ impl WebsocketTelemetry for ApiTelemetry {
     }
 }
 
-#[cfg(test)]
-#[path = "client_tests.rs"]
-mod tests;
-
-#[cfg(test)]
-#[path = "client_transport_accounting_tests.rs"]
-mod transport_accounting_tests;

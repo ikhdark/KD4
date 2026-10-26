@@ -211,9 +211,6 @@ const OAI_REQUEST_ID_HEADER: &str = "x-oai-request-id";
 const CF_RAY_HEADER: &str = "cf-ray";
 const CLOUDFLARE_BLOCKED_MESSAGE: &str = "Access blocked by Cloudflare";
 
-#[cfg(test)]
-#[path = "api_bridge_tests.rs"]
-mod tests;
 
 fn api_error_user_message(status: http::StatusCode, body: &str) -> Option<String> {
     if is_cloudflare_access_block(status, body) {

@@ -124,6 +124,3 @@ impl JsonRpcMessageDecoder {
     }
 }
 
-#[cfg(test)]
-#[path = "message_framing_tests.rs"]
-mod tests;

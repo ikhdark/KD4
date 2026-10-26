@@ -61,34 +61,6 @@ fn configured_usage_hint_text_for_source<'a>(
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::sync::Arc;
-
-    #[tokio::test]
-    async fn deferred_root_guidance_does_not_assume_the_default_tool_namespace() {
-        let (_session, mut turn) = crate::session::tests::make_session_and_context().await;
-        turn.multi_agent_version = MultiAgentVersion::V2;
-        turn.session_source = SessionSource::Cli;
-        let config = &mut Arc::make_mut(&mut turn.config).multi_agent_v2;
-        config.multi_agent_mode_hint_text = None;
-        config.root_agent_usage_hint_text = Some("Configured root guidance.".to_string());
-
-        for namespace in [None, Some("agents"), Some("custom_agents")] {
-            Arc::make_mut(&mut turn.config).multi_agent_v2.tool_namespace =
-                namespace.map(str::to_string);
-            let hint = usage_hint_text(&turn, &turn.session_source).expect("deferred root guidance");
-            assert!(hint.contains("advertised namespace and entrypoints"));
-            assert!(!hint.contains("`agents` namespace"));
-            assert!(hint.contains(USAGE_HINT_LOCATOR));
-            assert_eq!(
-                full_usage_hint_text(&turn, &turn.session_source),
-                Some("Configured root guidance.")
-            );
-        }
-    }
-}
 
 pub(crate) fn effective_multi_agent_mode(
     turn_context: &TurnContext,

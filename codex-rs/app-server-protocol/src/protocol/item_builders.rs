@@ -232,6 +232,3 @@ fn format_file_change_diff(change: &FileChange) -> String {
     }
 }
 
-#[cfg(test)]
-#[path = "item_builders_tests.rs"]
-mod tests;

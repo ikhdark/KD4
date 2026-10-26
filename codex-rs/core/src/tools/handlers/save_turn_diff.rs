@@ -235,6 +235,3 @@ fn validated_patch_name(name: &str) -> Result<&str, FunctionCallError> {
     }
 }
 
-#[cfg(test)]
-#[path = "save_turn_diff_tests.rs"]
-mod tests;

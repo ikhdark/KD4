@@ -21,7 +21,3 @@ pub fn render_review_exit_success(results: &str) -> String {
 pub fn render_review_exit_interrupted() -> String {
     REVIEW_EXIT_INTERRUPTED_TEMPLATE_TEXT.to_string()
 }
-
-#[cfg(test)]
-#[path = "review_exit_tests.rs"]
-mod review_exit_tests;

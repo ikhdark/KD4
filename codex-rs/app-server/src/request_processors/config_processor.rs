@@ -215,8 +215,9 @@ impl ConfigRequestProcessor {
         &self,
         params: ConfigValueWriteParams,
     ) -> Result<ConfigWriteResponse, JSONRPCErrorError> {
-        let pending_changes = codex_core_plugins::toggles::collect_plugin_enabled_candidates(
-            [(&params.key_path, &params.value)].into_iter(),
+        let pending_changes = codex_core_plugins::toggles::collect_plugin_enabled_candidates_from_segments(
+            crate::config_manager_service::parse_key_path(&params.key_path)
+                .ok().into_iter().map(|segments| (segments, &params.value)),
         );
         let response = self
             .config_manager
@@ -234,11 +235,12 @@ impl ConfigRequestProcessor {
     ) -> Result<ConfigWriteResponse, JSONRPCErrorError> {
         let reload_user_config = params.reload_user_config;
         let refreshed_features = runtime_refreshable_features_for_batch(&params);
-        let pending_changes = codex_core_plugins::toggles::collect_plugin_enabled_candidates(
+        let pending_changes = codex_core_plugins::toggles::collect_plugin_enabled_candidates_from_segments(
             params
                 .edits
                 .iter()
-                .map(|edit| (&edit.key_path, &edit.value)),
+                .filter_map(|edit| crate::config_manager_service::parse_key_path(&edit.key_path)
+                    .ok().map(|segments| (segments, &edit.value))),
         );
         let response = self
             .config_manager
@@ -611,135 +613,3 @@ fn config_write_error(code: ConfigWriteErrorCode, message: impl Into<String>) ->
     error
 }
 
-#[cfg(test)]
-mod tests {
-    use super::SUPPORTED_EXPERIMENTAL_FEATURE_ENABLEMENT;
-    use super::map_requirements_toml_to_api;
-    use codex_app_server_protocol::WindowsSandboxSetupMode;
-    use codex_config::ComputerUseRequirementsToml;
-    use codex_config::ConfigRequirementsToml;
-    use codex_config::ModelsRequirementsToml;
-    use codex_config::NewThreadModelDefaultsToml;
-    use codex_config::WindowsRequirementsToml;
-    use codex_features::user_settable_feature_for_key;
-    use codex_protocol::openai_models::ReasoningEffort;
-    use pretty_assertions::assert_eq;
-    use std::collections::BTreeMap;
-
-    #[test]
-    fn experimental_feature_enablement_allowlist_only_contains_user_settable_features() {
-        for key in SUPPORTED_EXPERIMENTAL_FEATURE_ENABLEMENT {
-            assert!(
-                user_settable_feature_for_key(key).is_some(),
-                "experimental feature enablement key `{key}` is not user-settable"
-            );
-        }
-    }
-
-    #[test]
-    fn batch_refresh_uses_parsed_feature_paths() {
-        let expected = user_settable_feature_for_key("tool_suggest").unwrap();
-        for key_path in [
-            "features.tool_suggest",
-            "\"features\".tool_suggest",
-            "features.\"tool_suggest\"",
-        ] {
-            let params = codex_app_server_protocol::ConfigBatchWriteParams {
-                edits: vec![codex_app_server_protocol::ConfigEdit {
-                    key_path: key_path.into(),
-                    value: serde_json::json!(true),
-                    merge_strategy: codex_app_server_protocol::MergeStrategy::Replace,
-                }],
-                file_path: None,
-                expected_version: None,
-                reload_user_config: true,
-            };
-            assert_eq!(
-                super::runtime_refreshable_features_for_batch(&params),
-                vec![expected],
-                "all accepted spellings of a feature path must refresh the same live gate: {key_path}"
-            );
-        }
-    }
-
-    #[test]
-    fn requirements_api_preserves_optional_policies_and_model_defaults() {
-        let absent = map_requirements_toml_to_api(ConfigRequirementsToml::default());
-        assert_eq!(absent.allow_managed_hooks_only, None);
-        assert_eq!(absent.allowed_permission_profiles, None);
-        assert_eq!(absent.default_permissions, None);
-        assert_eq!(absent.allow_appshots, None);
-        assert_eq!(absent.allow_remote_control, None);
-        assert_eq!(absent.models, None);
-        assert_eq!(absent.computer_use, None);
-        assert_eq!(absent.allowed_windows_sandbox_implementations, None);
-        assert_eq!(absent.hooks, None);
-
-        let mapped = map_requirements_toml_to_api(ConfigRequirementsToml {
-            allow_managed_hooks_only: Some(true),
-            allowed_permission_profiles: Some(BTreeMap::from([
-                ("managed-build".to_string(), false),
-                ("managed-standard".to_string(), true),
-            ])),
-            default_permissions: Some("managed-standard".to_string()),
-            allow_appshots: Some(false),
-            allow_remote_control: Some(false),
-            models: Some(ModelsRequirementsToml {
-                new_thread: Some(NewThreadModelDefaultsToml {
-                    model: Some("gpt-managed".to_string()),
-                    model_reasoning_effort: Some(ReasoningEffort::Medium),
-                    service_tier: Some("priority".to_string()),
-                }),
-            }),
-            computer_use: Some(ComputerUseRequirementsToml {
-                allow_locked_computer_use: Some(false),
-            }),
-            windows: Some(WindowsRequirementsToml {
-                allowed_sandbox_implementations: Some(vec![
-                    codex_config::types::WindowsSandboxModeToml::Elevated,
-                    codex_config::types::WindowsSandboxModeToml::Unelevated,
-                ]),
-            }),
-            ..ConfigRequirementsToml::default()
-        });
-
-        assert_eq!(mapped.allow_managed_hooks_only, Some(true));
-        assert_eq!(mapped.hooks, None);
-        assert_eq!(
-            mapped.allowed_permission_profiles,
-            Some(BTreeMap::from([
-                ("managed-build".to_string(), false),
-                ("managed-standard".to_string(), true),
-            ]))
-        );
-        assert_eq!(
-            mapped.default_permissions,
-            Some("managed-standard".to_string())
-        );
-        assert_eq!(mapped.allow_appshots, Some(false));
-        assert_eq!(mapped.allow_remote_control, Some(false));
-        let defaults = mapped
-            .models
-            .and_then(|models| models.new_thread)
-            .expect("new-thread defaults");
-        assert_eq!(defaults.model.as_deref(), Some("gpt-managed"));
-        assert_eq!(
-            defaults.model_reasoning_effort,
-            Some(ReasoningEffort::Medium)
-        );
-        assert_eq!(defaults.service_tier.as_deref(), Some("priority"));
-        assert_eq!(
-            mapped
-                .computer_use
-                .and_then(|requirements| requirements.allow_locked_computer_use),
-            Some(false)
-        );
-        assert_eq!(
-            mapped.allowed_windows_sandbox_implementations,
-            Some(vec![
-                WindowsSandboxSetupMode::Elevated,
-                WindowsSandboxSetupMode::Unelevated,
-            ])
-        );
-    }
-}

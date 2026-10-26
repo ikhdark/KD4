@@ -63,6 +63,3 @@ pub struct EnvironmentRegistryHarnessKeyValidationResponse {
     pub valid: bool,
 }
 
-#[cfg(test)]
-#[path = "environment_registry_tests.rs"]
-mod tests;

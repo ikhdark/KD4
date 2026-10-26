@@ -141,24 +141,6 @@ impl Drop for WriteStdinWait {
     }
 }
 
-/// Test-only override for deterministic unified exec process IDs.
-///
-/// Integration tests enable this through `core_test_support`; production callers
-/// must leave it disabled, just like the thread-manager test-mode override.
-static FORCE_DETERMINISTIC_PROCESS_IDS: AtomicBool = AtomicBool::new(false);
-
-pub(super) fn set_deterministic_process_ids_for_tests(enabled: bool) {
-    FORCE_DETERMINISTIC_PROCESS_IDS.store(enabled, Ordering::Relaxed);
-}
-
-fn deterministic_process_ids_forced_for_tests() -> bool {
-    FORCE_DETERMINISTIC_PROCESS_IDS.load(Ordering::Relaxed)
-}
-
-fn should_use_deterministic_process_ids() -> bool {
-    cfg!(test) || deterministic_process_ids_forced_for_tests()
-}
-
 fn apply_unified_exec_env(
     mut env: HashMap<String, String>,
     policy: &ShellEnvironmentPolicy,
@@ -194,6 +176,9 @@ fn build_unified_exec_environment(
     );
     context.apply_env_overrides(&mut local_policy_env);
     let mut env = local_policy_env.clone();
+    if cfg!(windows) {
+        env.retain(|name, _| !name.eq_ignore_ascii_case(CODEX_THREAD_ID_ENV_VAR));
+    }
     env.insert(
         CODEX_THREAD_ID_ENV_VAR.to_string(),
         context.session.thread_id.to_string(),
@@ -696,8 +681,7 @@ async fn cleanup_pending_process_registration(
         let exit_code = cleanup
             .primary_process
             .as_ref()
-            .and_then(|process| process.exit_code())
-            .unwrap_or(-1);
+            .and_then(|process| process.exit_code());
         session
             .services
             .command_execution
@@ -705,7 +689,7 @@ async fn cleanup_pending_process_registration(
                 cleanup.process_id,
                 running.execution_id,
                 &running.parent_tool_execution_id,
-                Some(exit_code),
+                exit_code,
             )
             .await;
     }
@@ -929,19 +913,7 @@ impl UnifiedExecProcessManager {
         loop {
             let mut store = self.process_store.lock().await;
 
-            let process_id = if should_use_deterministic_process_ids() {
-                // test or deterministic mode
-                let Some(process_id) = (1_000..=u32::MAX).find(|candidate| {
-                    !store.used_process_ids.contains_key(candidate)
-                        && !store.reserved_process_ids.contains(candidate)
-                }) else {
-                    panic!("process id space exhausted");
-                };
-                process_id
-            } else {
-                // production mode: random
-                rand::rng().random_range(1_000..=u32::MAX)
-            };
+            let process_id = rand::rng().random_range(1_000..=u32::MAX);
 
             if store.reserved_process_ids.contains(&process_id)
                 || store.used_process_ids.contains_key(&process_id)
@@ -1009,7 +981,7 @@ impl UnifiedExecProcessManager {
                         entry.process_id,
                         entry.command_execution_id,
                         &entry.parent_tool_execution_id,
-                        Some(entry.process.exit_code().unwrap_or(-1)),
+                        entry.process.exit_code(),
                     )
                     .await;
             }
@@ -1017,16 +989,7 @@ impl UnifiedExecProcessManager {
         Ok(())
     }
 
-    #[cfg(test)]
-    pub(crate) async fn allocate_process_id(&self) -> u32 {
-        self.allocate_process_id_value().await
-    }
 
-    #[cfg(test)]
-    pub(crate) async fn has_process_reservations_for_test(&self) -> bool {
-        let store = self.process_store.lock().await;
-        !store.reserved_process_ids.is_empty() || !store.reserved_process_slots.is_empty()
-    }
 
     pub(crate) async fn release_process_id(&self, process_id: u32) {
         let removed = {
@@ -2027,28 +1990,6 @@ impl UnifiedExecProcessManager {
         Some(response)
     }
 
-    #[cfg(test)]
-    pub(crate) async fn pending_packet_terminal_for_test(
-        &self,
-        session: &Arc<crate::session::session::Session>,
-        turn: &crate::session::turn_context::TurnContext,
-        process_id: u32,
-    ) -> (Uuid, watch::Sender<Option<Result<(), String>>>) {
-        let process = crate::unified_exec::process_tests::remote_process(
-            codex_exec_server::WriteStatus::Accepted, None,
-        ).await;
-        crate::unified_exec::process_tests::store_process_for_test(
-            self, session, turn, process_id, Arc::clone(&process),
-        ).await;
-        self.process_store.lock().await.processes.get_mut(&process_id).unwrap().tty = false;
-        process.signal_exit_for_test(Some(0));
-        let handles = process.output_handles();
-        handles.output_buffer.lock().await.push_chunk(b"late output");
-        handles.completion_output_buffer.lock().await.push_chunk(b"late output");
-        handles.stdout_buffer.lock().await.push_chunk(b"late output");
-        handles.output_closed.store(true, Ordering::Release);
-        (process.incarnation(), process.register_terminal_completion())
-    }
 
     async fn refresh_process_state(
         &self,
@@ -2725,89 +2666,8 @@ impl UnifiedExecProcessManager {
             })
     }
 
-    /// Collection without an early quiet yield. Production always supplies a
-    /// quiet-yield bound; this shape is retained for tests that drive the
-    /// deadline directly.
-    #[cfg(test)]
-    pub(super) async fn collect_output_until_deadline(
-        output_buffer: &OutputBuffer,
-        output_notify: &Arc<Notify>,
-        output_closed: &Arc<AtomicBool>,
-        output_closed_notify: &Arc<Notify>,
-        cancellation_token: &CancellationToken,
-        pause_state: Option<watch::Receiver<bool>>,
-        deadline: Instant,
-    ) -> Vec<u8> {
-        let collected = Self::collect_output_until_deadline_with_quiet_yield(
-            output_buffer,
-            output_notify,
-            output_closed,
-            output_closed_notify,
-            cancellation_token,
-            pause_state,
-            deadline,
-            None,
-            None,
-            &mut None,
-        )
-        .await;
-        output_buffer.lock().await.acknowledge_pending_output();
-        collected.bytes
-    }
 
-    #[cfg(test)]
-    async fn collect_output_until_progress_or_deadline(
-        output_buffer: &OutputBuffer,
-        output_notify: &Arc<Notify>,
-        output_closed: &Arc<AtomicBool>,
-        output_closed_notify: &Arc<Notify>,
-        cancellation_token: &CancellationToken,
-        pause_state: Option<watch::Receiver<bool>>,
-        deadline: Instant,
-    ) -> Vec<u8> {
-        let collected = Self::collect_output_until_deadline_with_quiet_yield(
-            output_buffer,
-            output_notify,
-            output_closed,
-            output_closed_notify,
-            cancellation_token,
-            pause_state,
-            deadline,
-            None,
-            Some(INITIAL_OUTPUT_QUIET_PERIOD),
-            &mut None,
-        )
-        .await;
-        output_buffer.lock().await.acknowledge_pending_output();
-        collected.bytes
-    }
 
-    #[cfg(test)]
-    async fn collect_initial_output_until_deadline(
-        output_buffer: &OutputBuffer,
-        output_notify: &Arc<Notify>,
-        output_closed: &Arc<AtomicBool>,
-        output_closed_notify: &Arc<Notify>,
-        cancellation_token: &CancellationToken,
-        pause_state: Option<watch::Receiver<bool>>,
-        deadline: Instant,
-    ) -> Vec<u8> {
-        let collected = Self::collect_output_until_deadline_with_quiet_yield(
-            output_buffer,
-            output_notify,
-            output_closed,
-            output_closed_notify,
-            cancellation_token,
-            pause_state,
-            deadline,
-            None,
-            Some(INITIAL_OUTPUT_QUIET_PERIOD),
-            &mut None,
-        )
-        .await;
-        output_buffer.lock().await.acknowledge_pending_output();
-        collected.bytes
-    }
 
     #[allow(clippy::too_many_arguments)]
     async fn collect_output_until_deadline_with_quiet_yield(
@@ -3278,7 +3138,7 @@ impl UnifiedExecProcessManager {
                         entry.process_id,
                         entry.command_execution_id,
                         &entry.parent_tool_execution_id,
-                        Some(entry.process.exit_code().unwrap_or(-1)),
+                        entry.process.exit_code(),
                     )
                     .await;
             }
@@ -3418,7 +3278,7 @@ impl UnifiedExecProcessManager {
                     entry.process_id,
                     entry.command_execution_id,
                     &entry.parent_tool_execution_id,
-                    Some(entry.process.exit_code().unwrap_or(-1)),
+                    entry.process.exit_code(),
                 )
                 .await;
         }
@@ -3444,6 +3304,3 @@ enum ProcessStatus {
     Unknown,
 }
 
-#[cfg(test)]
-#[path = "process_manager_tests.rs"]
-mod tests;

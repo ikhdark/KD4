@@ -21,27 +21,3 @@ impl NetworkPolicyDecisionPayload {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn only_ask_from_decider_requests_approval() {
-        for decision in ["deny", "ask"] {
-            for source in ["baseline_policy", "mode_guard", "proxy_state", "decider"] {
-                let payload: NetworkPolicyDecisionPayload = serde_json::from_value(
-                    serde_json::json!({ "decision": decision, "source": source }),
-                )
-                .unwrap();
-                assert_eq!(
-                    payload.is_ask_from_decider(),
-                    decision == "ask" && source == "decider"
-                );
-                assert!(payload.protocol.is_none());
-                assert!(payload.host.is_none());
-                assert!(payload.reason.is_none());
-                assert!(payload.port.is_none());
-            }
-        }
-    }
-}

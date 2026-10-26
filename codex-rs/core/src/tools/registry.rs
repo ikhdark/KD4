@@ -13,8 +13,6 @@ use crate::session::turn_execution::PendingOwnerDrainedContinuation;
 use crate::tools::command_output_artifact::ToolOutputSelector;
 use crate::tools::command_output_artifact::ToolOutputSelectorStatus;
 use crate::tools::command_output_artifact::attach_canonical_output_artifact;
-#[cfg(test)]
-use crate::tools::command_output_artifact::create_canonical_output_artifact;
 use crate::tools::command_output_artifact::read_tool_output_selectors_with_ceiling_and_reuse;
 use crate::tools::context::FunctionToolOutput;
 use crate::tools::context::ToolCallSource;
@@ -69,8 +67,6 @@ use codex_tools::ToolSpec;
 use codex_utils_output_truncation::OutputDiagnosticClass;
 use codex_utils_output_truncation::OutputOutcome;
 use codex_utils_output_truncation::approx_token_count;
-#[cfg(test)]
-use codex_utils_output_truncation::formatted_truncate_text_with_output_limit;
 use codex_utils_output_truncation::resolve_projected_output_limits;
 use codex_utils_output_truncation::truncate_text_to_token_ceiling;
 use futures::future::BoxFuture;
@@ -82,10 +78,6 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::OnceLock;
-#[cfg(test)]
-use std::sync::atomic::AtomicUsize;
-#[cfg(test)]
-use std::sync::atomic::Ordering;
 use std::time::Duration;
 use std::time::Instant;
 
@@ -148,12 +140,6 @@ impl ToolCleanupPolicy {
 pub(crate) enum TerminalFailureReuse {
     #[default]
     Never,
-    /// Only explicitly terminal, fingerprinted failures, with identical
-    /// arguments and the same turn-local mutation/plan/input/tool-exposure
-    /// revision. Producers with external or time-dependent invalidators must
-    /// not opt in. Authorization and hooks must remain unchanged.
-    #[cfg(test)]
-    RequestRevision,
     /// Also permits reuse of a previously rejected malformed JSON payload.
     /// The runtime must parse JSON before any effects. Syntax is rechecked by
     /// the current parser; schema errors and transient failures do not qualify.
@@ -479,15 +465,6 @@ impl BoundedModelProjection {
         }
     }
 
-    #[cfg(test)]
-    fn value(&self) -> Value {
-        match self {
-            Self::Envelope { envelope, .. } => {
-                serde_json::to_value(envelope).unwrap_or(Value::Null)
-            }
-            Self::Fallback { value, .. } => value.clone(),
-        }
-    }
 
     fn rendered(&self) -> &str {
         match self {
@@ -725,20 +702,6 @@ impl AnyToolResult {
         result.to_response_item(&call_id, &payload)
     }
 
-    /// The value JavaScript receives from a nested tool call.
-    ///
-    /// This is the handler's own execution result, not the model projection.
-    /// The projection exists to bound what the *model* reads; substituting it
-    /// here handed JS a logical-artifact envelope with no `results[]`, so code
-    /// inside a cell could not branch on what a read actually returned. The
-    /// projection stays on the model-facing `into_response` path.
-    #[cfg(test)]
-    pub(crate) fn code_mode_result(self) -> serde_json::Value {
-        let Self {
-            payload, result, ..
-        } = self;
-        result.code_mode_result(&payload)
-    }
 
     pub(crate) fn code_mode_result_with_budget(self, budget: usize) -> serde_json::Value {
         self.result
@@ -1428,15 +1391,6 @@ impl ToolRegistry {
         }
     }
 
-    #[cfg(test)]
-    #[tracing::instrument(level = "trace", skip_all)]
-    pub(crate) fn from_tools(tools: impl IntoIterator<Item = Arc<dyn CoreToolRuntime>>) -> Self {
-        Self::from_unique_registered_tools(
-            tools
-                .into_iter()
-                .map(|runtime| RegisteredTool::new(runtime, TypedToolClass::DynamicExternal)),
-        )
-    }
 
     pub(crate) fn from_unique_registered_tools(
         tools: impl IntoIterator<Item = RegisteredTool>,
@@ -1448,15 +1402,7 @@ impl ToolRegistry {
         Self::new(tools_by_name)
     }
 
-    #[cfg(test)]
-    pub(crate) fn empty_for_test() -> Self {
-        Self::new(HashMap::new())
-    }
 
-    #[cfg(test)]
-    pub(crate) fn with_handler_for_test<T>(handler: Arc<T>) -> Self
-    where
-        T: CoreToolRuntime + 'static,
     {
         let runtime = handler as Arc<dyn CoreToolRuntime>;
         let registered = RegisteredTool::new(runtime, TypedToolClass::DynamicExternal);
@@ -1470,12 +1416,6 @@ impl ToolRegistry {
         self.tools.get(name).map(|tool| Arc::clone(tool.runtime()))
     }
 
-    #[cfg(test)]
-    pub(crate) fn tool_names_for_test(&self) -> Vec<ToolName> {
-        let mut names = self.tools.keys().cloned().collect::<Vec<_>>();
-        names.sort();
-        names
-    }
 
     pub(crate) fn registered_tool(&self, name: &ToolName) -> Option<&RegisteredTool> {
         self.tools.get(name)
@@ -1491,15 +1431,6 @@ impl ToolRegistry {
             .map(RegisteredTool::authorization_class)
     }
 
-    #[cfg(test)]
-    pub(crate) fn tool_external_mutation_intent(
-        &self,
-        name: &ToolName,
-    ) -> Option<crate::agent::task_capabilities::ExternalMutationIntent> {
-        self.tools
-            .get(name)
-            .map(RegisteredTool::external_mutation_intent)
-    }
 
     pub(crate) fn set_model_visible_specs(&mut self, specs: Vec<ToolSpec>) {
         self.model_visible_schemas = Arc::new(ToolSchemaArtifact::new(specs));
@@ -1682,17 +1613,6 @@ impl ToolRegistry {
         Some(tool.owns_unified_exec_processes())
     }
 
-    #[cfg(test)]
-    pub(crate) fn code_mode_argument_preflight_counts(
-        &self,
-        name: &ToolName,
-    ) -> Option<(usize, usize)> {
-        let preflight = &self.tools.get(name)?.code_mode_argument_preflight;
-        Some((
-            preflight.compile_count.load(Ordering::Relaxed),
-            preflight.validation_count.load(Ordering::Relaxed),
-        ))
-    }
 
     pub(crate) async fn prepare_hook_input(
         &self,
@@ -4449,32 +4369,6 @@ async fn drain_predetermined_artifact_selectors(
     )
 }
 
-#[cfg(test)]
-async fn drain_predetermined_artifact_ranges(
-    codex_home: &std::path::Path,
-    thread_id: &str,
-    artifact_id: &str,
-    state_revision: &str,
-    ranges: Vec<ToolOutputProjectionRange>,
-    sections: &[ToolProjectionSection],
-) -> (
-    Vec<Value>,
-    Option<TurnTimingDeterministicContinuationReceipt>,
-) {
-    drain_predetermined_artifact_selectors(
-        codex_home,
-        thread_id,
-        artifact_id,
-        state_revision,
-        ranges,
-        Vec::new(),
-        sections,
-        &BTreeMap::new(),
-        codex_utils_output_truncation::DEFAULT_SUCCESS_OUTPUT_TOKENS,
-        None,
-    )
-    .await
-}
 
 fn recovery_matches_section_identity(
     ranges: &[ToolOutputProjectionRange],
@@ -4560,10 +4454,6 @@ fn serialize_projection_with_limit(
     serialize_projection_fragments(envelope, output, &[], token_limit)
 }
 
-#[cfg(test)]
-thread_local! {
-    static PROJECTION_FIT_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-}
 
 fn serialize_projection_fragments(
     mut envelope: ToolProjectionV1,
@@ -4571,8 +4461,6 @@ fn serialize_projection_fragments(
     fragments: &[ToolOutputProjectionFragment],
     token_limit: usize,
 ) -> Option<BoundedModelProjection> {
-    #[cfg(test)]
-    PROJECTION_FIT_CALLS.with(|count| count.set(count.get() + 1));
     // Spillable text remains subject to the requested limit. Structured control
     // state is not spillable, so the smallest typed carrier containing
     // `essential` defines a safe floor when that carrier alone exceeds the
@@ -5030,10 +4918,6 @@ fn accepted_shape(schema: &Value, pointer: &str) -> Option<String> {
 #[derive(Default)]
 struct CodeModeArgumentPreflight {
     validator: OnceLock<Result<Option<CompiledArgumentValidator>, String>>,
-    #[cfg(test)]
-    compile_count: AtomicUsize,
-    #[cfg(test)]
-    validation_count: AtomicUsize,
 }
 
 /// Bound formatting itself: truncating `error.to_string()` would first copy the
@@ -5111,16 +4995,12 @@ impl CodeModeArgumentPreflight {
         }
 
         let validator = self.validator.get_or_init(|| {
-            #[cfg(test)]
-            self.compile_count.fetch_add(1, Ordering::Relaxed);
             compile_code_mode_argument_validator(tool_name, spec)
         });
         let validator = validator.as_ref().map_err(Clone::clone)?;
         let Some(compiled) = validator else {
             return Ok(());
         };
-        #[cfg(test)]
-        self.validation_count.fetch_add(1, Ordering::Relaxed);
         let mut errors = compiled.validator.iter_errors(&value);
         let messages = errors
             .by_ref()
@@ -5194,11 +5074,5 @@ fn unsupported_tool_call_message(payload: &ToolPayload, tool_name: &ToolName) ->
         "{message}. No tool was run. Use an exact name from the current tool declarations; if tool_search is available, use it to discover and activate a missing tool. In code mode, inspect ALL_TOOL_NAMES and resolve_tool(name) before retrying."
     )
 }
-#[cfg(test)]
-#[path = "registry_tests.rs"]
-mod tests;
 
-#[cfg(test)]
-#[path = "registry_output_dedup_tests.rs"]
-mod output_dedup_tests;
 

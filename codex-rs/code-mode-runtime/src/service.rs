@@ -363,11 +363,3 @@ fn missing_cell_response(cell_id: CellId) -> RuntimeResponse {
 fn missing_wait(cell_id: CellId) -> CodeModeSessionResultFuture<'static, WaitOutcome> {
     Box::pin(async move { Ok(WaitOutcome::MissingCell(missing_cell_response(cell_id))) })
 }
-
-#[cfg(test)]
-#[path = "service_tests.rs"]
-mod tests;
-
-#[cfg(test)]
-#[path = "service_contract_tests.rs"]
-mod contract_tests;

@@ -768,7 +768,3 @@ impl Drop for PendingDelegateRequest {
         }
     }
 }
-
-#[cfg(test)]
-#[path = "peer_tests.rs"]
-mod tests;

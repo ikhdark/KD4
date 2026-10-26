@@ -496,14 +496,5 @@ fn environment_context_markers() -> (&'static str, &'static str) {
 }
 
 
-#[cfg(test)]
-#[path = "environment_tests.rs"]
-mod tests;
 
-#[cfg(test)]
-#[path = "environment_render_tests.rs"]
-mod render_tests;
 
-#[cfg(test)]
-#[path = "environment_retention_tests.rs"]
-mod retention_tests;

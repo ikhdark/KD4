@@ -8,11 +8,6 @@ license.workspace = true
 name = "codex-app-server"
 path = "src/main.rs"
 
-[[bin]]
-name = "codex-app-server-test-notify-capture"
-path = "src/bin/notify_capture.rs"
-test = false
-
 [lib]
 name = "codex_app_server"
 path = "src/lib.rs"
@@ -105,31 +100,3 @@ uuid = { workspace = true, features = ["serde", "v7"] }
 
 codex-windows-sandbox = { workspace = true }
 
-[dev-dependencies]
-app_test_support = { workspace = true }
-axum = { workspace = true, default-features = false, features = [
-    "http1",
-    "json",
-    "tokio",
-] }
-base64 = { workspace = true }
-codex-utils-cargo-bin = { workspace = true }
-core_test_support = { workspace = true }
-flate2 = { workspace = true }
-hmac = { workspace = true }
-http = { workspace = true }
-opentelemetry = { workspace = true }
-opentelemetry_sdk = { workspace = true }
-pretty_assertions = { workspace = true }
-rmcp = { workspace = true, default-features = false, features = [
-    "elicitation",
-    "server",
-    "transport-streamable-http-server",
-] }
-serial_test = { workspace = true }
-shlex = { workspace = true }
-sqlx = { workspace = true }
-tar = { workspace = true }
-tokio-tungstenite = { workspace = true }
-tracing-opentelemetry = { workspace = true }
-wiremock = { workspace = true }
