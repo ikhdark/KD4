@@ -9,6 +9,19 @@ use crate::session::session::Session;
 use crate::session::turn_context::TurnContext;
 
 impl Session {
+    pub(crate) async fn run_thread_start_lifecycle(
+        phase: impl std::future::Future<Output = ()>,
+    ) -> Result<(), codex_protocol::error::CodexErr> {
+        // One deadline for the ordered phase; dropping the caller or timing
+        // out drops the active callback, not a detached initialization task.
+        bounded_lifecycle(phase).await.map_err(|_| {
+            codex_protocol::error::CodexErr::Fatal(
+                "Extension thread startup failed or exceeded its 30 second phase deadline."
+                    .to_string(),
+            )
+        })
+    }
+
     pub(crate) async fn settle_extension_terminal_intents(
         &self,
         turn_store: &ExtensionData,

@@ -901,8 +901,10 @@ impl Codex {
             map_session_init_error(&e, &config.codex_home)
         })?;
         if let Some(message) = initial_service_tier_warning {
+            // The ordered writer retains this even before the lazy rollout
+            // exists; the normal persistence barrier will write it later.
             session
-                .send_event_raw_without_materializing_rollout(Event {
+                .send_event_raw(Event {
                     id: INITIAL_SUBMIT_ID.to_owned(),
                     msg: EventMsg::Warning(WarningEvent { message }),
                 })
@@ -1266,11 +1268,17 @@ fn unsupported_service_tier_warning(
     model_info: &ModelInfo,
 ) -> Option<String> {
     let service_tier = configured_service_tier.filter(|service_tier| {
-        fast_mode_enabled
-            && *service_tier != SERVICE_TIER_DEFAULT_REQUEST_VALUE
+        *service_tier != SERVICE_TIER_DEFAULT_REQUEST_VALUE
             && *service_tier != ServiceTier::Flex.request_value()
-            && !model_info.supports_service_tier(service_tier)
     })?;
+    if !fast_mode_enabled {
+        return Some(format!(
+            "Configured service tier `{service_tier}` will be omitted from requests because FastMode is disabled (`features.fast_mode = false`)."
+        ));
+    }
+    if model_info.supports_service_tier(service_tier) {
+        return None;
+    }
     Some(format!(
         "Configured service tier `{service_tier}` is not advertised as supported for model `{}` and will be omitted from requests.",
         model_info.slug
@@ -7566,7 +7574,14 @@ impl Session {
         message: impl Into<String>,
         codex_error: CodexErr,
     ) {
-        let additional_details = codex_error.to_string();
+        // This event announces an active retry, not a terminal failure. Keep
+        // model-switch advice for the final error after recovery is exhausted.
+        let additional_details = if matches!(&codex_error, CodexErr::ServerOverloaded { .. }) {
+            "Selected model is temporarily at capacity. Retrying automatically; your turn is still active."
+                .to_string()
+        } else {
+            codex_error.to_string()
+        };
         let codex_error_info = CodexErrorInfo::ResponseStreamDisconnected {
             http_status_code: codex_error.http_status_code_value(),
         };

@@ -12,7 +12,7 @@ from pydantic import BaseModel
 
 from ._goal import _GoalOperationState
 from ._run import _raise_for_failed_turn
-from .client import CodexClient, CodexConfig
+from .client import CodexClient, CodexConfig, _CONTROL_METHODS
 from .errors import CodexError, InvalidRequestError, TransportClosedError
 from .generated.v2_all import (
     AccountLoginCompletedNotification,
@@ -69,6 +69,7 @@ class AsyncCodexClient:
         """Create the wrapped sync client that owns the transport process."""
         self._sync = CodexClient(config=config)
         self._worker_slots = threading.BoundedSemaphore(self._sync.config.max_in_flight_requests)
+        self._control_slots = threading.BoundedSemaphore(self._sync.config.max_control_requests)
         self._close_slot = threading.BoundedSemaphore(1)
 
     @property
@@ -102,8 +103,11 @@ class AsyncCodexClient:
         *,
         shutdown: bool = False,
         expected_epoch: int | None = None,
+        control: bool = False,
     ) -> ReturnT:
-        slots = self._close_slot if shutdown else self._worker_slots
+        slots = self._close_slot if shutdown else (
+            self._control_slots if control else self._worker_slots
+        )
         if not slots.acquire(blocking=False):
             raise CodexError("async worker limit exceeded")
         operation: Future[ReturnT] = Future()
@@ -114,7 +118,9 @@ class AsyncCodexClient:
         def run_operation() -> None:
             owner = None
             try:
-                with nullcontext() if shutdown else self._sync._operation(cancelled) as owner:
+                with nullcontext() if shutdown else self._sync._operation(
+                    cancelled, rpc_control=control
+                ) as owner:
                     if expected_epoch is not None and self.process_epoch != expected_epoch:
                         raise TransportClosedError("turn handle belongs to a closed Codex process")
                     result = fn()
@@ -171,9 +177,9 @@ class AsyncCodexClient:
             result = await asyncio.wait_for(asyncio.shield(wrapped), timeout=timeout)
         except (asyncio.CancelledError, asyncio.TimeoutError):
             cancelled.set()
-            # SDK pipe/response waits observe this event and abort the captured
-            # transport generation. Arbitrary caller callbacks cannot be forcibly
-            # interrupted, but continue to occupy their bounded worker slot.
+            # Response waits detach independently; only an ambiguous in-progress
+            # pipe write fails the shared transport. Workers still retain their
+            # bounded slot until cancellation/late-start cleanup settles.
             operation.add_done_callback(_consume_background_future_result)
             wrapped.add_done_callback(lambda done: None if done.cancelled() else done.exception())
             raise
@@ -243,11 +249,9 @@ class AsyncCodexClient:
         response_model: type[ModelT],
     ) -> ModelT:
         """Send a typed JSON-RPC request through the wrapped sync client."""
-        return await self._call_sync(
-            self._sync.request,
-            method,
-            params,
-            response_model=response_model,
+        return await self._run_sync(
+            lambda: self._sync.request(method, params, response_model=response_model),
+            control=method in _CONTROL_METHODS,
         )
 
     async def account_login_start(
@@ -390,7 +394,9 @@ class AsyncCodexClient:
 
     async def turn_interrupt(self, thread_id: str, turn_id: str) -> TurnInterruptResponse:
         """Interrupt a turn using the wrapped sync client."""
-        return await self._call_sync(self._sync.turn_interrupt, thread_id, turn_id)
+        return await self._run_sync(
+            lambda: self._sync.turn_interrupt(thread_id, turn_id), control=True
+        )
 
     async def turn_steer(
         self,
@@ -399,11 +405,9 @@ class AsyncCodexClient:
         input_items: list[JsonObject] | JsonObject | str,
     ) -> TurnSteerResponse:
         """Send steering input to a turn using the wrapped sync client."""
-        return await self._call_sync(
-            self._sync.turn_steer,
-            thread_id,
-            expected_turn_id,
-            input_items,
+        return await self._run_sync(
+            lambda: self._sync.turn_steer(thread_id, expected_turn_id, input_items),
+            control=True,
         )
 
     async def model_list(self, include_hidden: bool = False) -> ModelListResponse:
@@ -421,14 +425,12 @@ class AsyncCodexClient:
         max_delay_s: float = 2.0,
     ) -> ModelT:
         """Send a typed request with the sync client's overload retry policy."""
-        return await self._call_sync(
-            self._sync.request_with_retry_on_overload,
-            method,
-            params,
-            response_model=response_model,
-            max_attempts=max_attempts,
-            initial_delay_s=initial_delay_s,
-            max_delay_s=max_delay_s,
+        return await self._run_sync(
+            lambda: self._sync.request_with_retry_on_overload(
+                method, params, response_model=response_model, max_attempts=max_attempts,
+                initial_delay_s=initial_delay_s, max_delay_s=max_delay_s,
+            ),
+            control=method in _CONTROL_METHODS,
         )
 
     async def next_notification(self) -> Notification:
@@ -485,10 +487,13 @@ class AsyncCodexClient:
         thread_id: str,
         text: str,
         params: V2TurnStartParams | JsonObject | None = None,
+        *,
+        cancel_on_close: bool = False,
     ) -> AsyncIterator[AgentMessageDeltaNotification]:
         """Yield text deltas; failed turns raise, interrupted turns end normally."""
         started = await self.turn_start(thread_id, text, params)
         turn_id = started.turn.id
+        completed = False
         try:
             while True:
                 notification = await self.next_turn_notification(turn_id)
@@ -504,7 +509,12 @@ class AsyncCodexClient:
                     and isinstance(notification.payload, TurnCompletedNotification)
                     and notification.payload.turn.id == turn_id
                 ):
+                    completed = True
                     _raise_for_failed_turn(notification.payload.turn)
                     break
         finally:
-            self.unregister_turn_notifications(turn_id)
+            try:
+                if cancel_on_close and not completed:
+                    await self.turn_interrupt(thread_id, turn_id)
+            finally:
+                self.unregister_turn_notifications(turn_id)

@@ -1082,7 +1082,6 @@ fn list_thread_retention_directory_blocking(
     directory: &Path,
     record_budget: Option<usize>,
 ) -> std::io::Result<Option<ThreadRetentionListing>> {
-    recover_abandoned_stages(directory);
     let mut entries = match std::fs::read_dir(directory) {
         Ok(entries) => entries,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -1098,11 +1097,13 @@ fn list_thread_retention_directory_blocking(
     let mut artifacts_by_stem =
         BTreeMap::<String, (u64, Option<(PathBuf, std::fs::Metadata)>)>::new();
     let mut markers = BTreeMap::<String, (PathBuf, std::fs::Metadata)>::new();
+    let mut has_staging_entries = false;
     while let Some(entry) = entries.next().transpose()? {
         let path = entry.path();
         let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
             continue;
         };
+        has_staging_entries |= name.starts_with('.');
         let extension = path.extension().and_then(|extension| extension.to_str());
         if extension == Some(LOGICAL_ARTIFACT_TRANSACTION_EXTENSION) {
             listing.transactions.push(path.with_extension("log"));
@@ -1150,6 +1151,14 @@ fn list_thread_retention_directory_blocking(
         if is_log {
             *log_path = Some((path, metadata));
         }
+    }
+    // Ordinary immutable families have no hidden staging files. Reuse this
+    // listing to avoid two more full directory walks and a residency-lock
+    // open for every inactive thread on a fresh process's first admission.
+    // Staging cleanup touches only private pending files, not the committed
+    // log/sidecar families collected above; its ownership locks stay intact.
+    if has_staging_entries {
+        recover_abandoned_stages(directory);
     }
     if collect {
         for (stem, (bytes, log)) in artifacts_by_stem {

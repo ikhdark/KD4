@@ -71,15 +71,25 @@ const PROJECTOR: &str = r#"((isProxy, boxedKind, projectTool) => {
   // descriptors without invoking user code, retaining every node and control
   // field. Storage's existing byte admission rejects an oversized snapshot
   // before changing a key; display overflow uses canonical cell-output custody.
-  function canonicalError(error, display = false) {
+  // Only uncaught-graph recovery supplies an omission counter. Ordinary
+  // canonical transport/storage remains strict and never silently drops data.
+  function canonicalError(error, display = false, omissions) {
     const active = new Set();
     const completed = new WeakMap();
+    const unsupported = message => {
+      if (!omissions) throw new TypeError(message);
+      ++omissions.count;
+      const marker = Object.create(null);
+      marker.code_mode_evidence_omitted = true;
+      marker.reason = message;
+      return marker;
+    };
     function clone(value, depth = 0) {
       if (typeof value === 'function' || typeof value === 'symbol')
-        throw new TypeError('Unsupported canonical error evidence value');
+        return unsupported('Unsupported canonical error evidence value');
       if (value === null || typeof value !== 'object') return value;
       if (depth >= 128 || isProxy(value) || active.has(value))
-        throw new TypeError('Canonical error evidence is cyclic, proxied, or too deep');
+        return unsupported('Canonical error evidence is cyclic, proxied, or too deep');
       if (!display && completed.has(value)) return completed.get(value);
       const isError = value instanceof NativeError;
       // Diagnostic causes can be circular or arbitrarily deep. Preserve the
@@ -91,7 +101,7 @@ const PROJECTOR: &str = r#"((isProxy, boxedKind, projectTool) => {
       // canonicalError here allowed mutually nested graphs to recurse forever.
       const proto = prototype(value);
       if (!isError && proto !== null && proto !== objectPrototype && proto !== arrayPrototype)
-        throw new TypeError('Canonical error evidence must contain plain data');
+        return unsupported('Canonical error evidence must contain plain data');
       active.add(value);
       try {
         const array = Array.isArray(value);
@@ -104,8 +114,9 @@ const PROJECTOR: &str = r#"((isProxy, boxedKind, projectTool) => {
           let field = descriptor(value, key);
           if (!field && isError && key === 'name') field = descriptor(proto, key);
           if (!field) continue;
-          if (!('value' in field)) throw new TypeError('Canonical error evidence cannot contain accessors');
-          Object.defineProperty(result, key, {value: clone(field.value, depth + 1),
+          const content = 'value' in field ? clone(field.value, depth + 1) :
+            unsupported('Canonical error evidence cannot contain accessors');
+          Object.defineProperty(result, key, {value: content,
             enumerable: true, writable: true, configurable: true});
         }
         if (!display) completed.set(value, result);
@@ -113,6 +124,59 @@ const PROJECTOR: &str = r#"((isProxy, boxedKind, projectTool) => {
       } finally { active.delete(value); }
     }
     return clone(error);
+  }
+  // Uncaught graphs need failure isolation, not the global body-stripping
+  // diagnostic preview. Encode each native node/value independently. Only an
+  // unsupported field receives an explicit marker; exact siblings stay exact.
+  function graphEvidence(value, maxBytes, encode) {
+    if (!value || typeof value !== 'object' || isProxy(value)) return null;
+    const omitted = reason => '{"code_mode_evidence_omitted":true,"reason":' + stringify(reason) + '}';
+    const attempt = (item, key) => {
+      try { return {json: encode(item, key)}; }
+      catch { return {failed: true}; }
+    };
+    const rows = [];
+    for (const id of keys(value)) {
+      const node = descriptor(value, id);
+      let encoded;
+      if (node && 'value' in node && node.value && typeof node.value === 'object' &&
+          !isProxy(node.value) && [null, objectPrototype].includes(prototype(node.value))) {
+        // Native graph records are descriptor-only wrappers. Encode each field
+        // once: a later failed reason must not re-run a successful value's
+        // serializer or discard its already-encoded receipt.
+        const fields = [], incomplete = [];
+        let omissionCount = 0;
+        for (const key of keys(node.value)) {
+          const field = descriptor(node.value, key);
+          let part = field && 'value' in field ? attempt(field.value, key) : {failed: true};
+          if (part.failed && field && 'value' in field) {
+            const omissions = {count: 0};
+            try { part = attempt(canonicalError(field.value, false, omissions), key); }
+            catch { part = {failed: true}; }
+            omissionCount += omissions.count;
+            if (omissions.count) incomplete.push(key);
+          }
+          if (typeof part.json !== 'string') {
+            part.json = omitted(part.failed ? 'unserializable_field' : 'canonical_byte_limit');
+            ++omissionCount;
+            incomplete.push(key);
+          }
+          fields.push(stringify(key) + ':' + part.json);
+        }
+        if (incomplete.length) {
+          fields.push('"_codex_evidence":{"complete":false,"incomplete_fields":[' +
+            incomplete.map(key => stringify(key)).join(',') + '],"omission_count":' + omissionCount + '}');
+        }
+        encoded = {json: '{' + fields.join(',') + '}'};
+      } else {
+        encoded = node && 'value' in node ? attempt(node.value, id) : {failed: true};
+        if (typeof encoded.json !== 'string')
+          encoded.json = '{"_codex_evidence":{"complete":false},"value":' + omitted('unsupported_node') + '}';
+      }
+      rows.push(stringify(id) + ':' + encoded.json);
+    }
+    const json = '{' + rows.join(',') + '}';
+    return utf8Size(json) <= maxBytes ? json : null;
   }
   let canonicalSerialization = false;
   // Display-only: retain native errors in scripts, but never print opaque {}.
@@ -595,6 +659,17 @@ const PROJECTOR: &str = r#"((isProxy, boxedKind, projectTool) => {
     }
     // The transport codec shares this cell-owned, captured serializer, not
     // script-overridable JSON methods. BigInt never silently becomes Number.
+    if (arguments.length === 3 && original === 'graph_evidence') {
+      return graphEvidence(value, projected, (item, key) => {
+        // Preserve toJSON's original property-key argument while isolating
+        // fields. This private wrapper cannot invoke a prototype serializer.
+        const wrapper = Object.create(null);
+        wrapper[key] = item;
+        const json = project(wrapper, 'canonical', projected);
+        if (typeof json !== 'string' || json === '{}') return undefined;
+        return stringSlice(json, stringify(key).length + 2, -1);
+      });
+    }
     if (arguments.length === 2 || (arguments.length === 3 && original === 'canonical')) {
       if (original === 'helper_evidence') {
         // Reserve exact controls globally, recursively, before optional body
@@ -961,12 +1036,29 @@ pub(super) fn bounded_json_codec<'s>(
     value: v8::Local<'_, v8::Value>,
     max_bytes: usize,
 ) -> Option<v8::Local<'s, v8::Value>> {
+    bounded_json_codec_mode(scope, value, max_bytes, "canonical")
+}
+
+pub(super) fn bounded_graph_json_codec<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    value: v8::Local<'_, v8::Value>,
+    max_bytes: usize,
+) -> Option<v8::Local<'s, v8::Value>> {
+    bounded_json_codec_mode(scope, value, max_bytes, "graph_evidence")
+}
+
+fn bounded_json_codec_mode<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    value: v8::Local<'_, v8::Value>,
+    max_bytes: usize,
+    mode: &str,
+) -> Option<v8::Local<'s, v8::Value>> {
     let function = scope
         .get_slot::<RuntimeState>()
         .and_then(|state| state.output_projector.as_ref())
         .map(|function| v8::Local::new(scope, function))?;
     let receiver = v8::undefined(scope).into();
-    let mode = v8::String::new(scope, "canonical")?;
+    let mode = v8::String::new(scope, mode)?;
     let limit = v8::Number::new(scope, max_bytes as f64);
     function.call(scope, receiver, &[value, mode.into(), limit.into()])
 }

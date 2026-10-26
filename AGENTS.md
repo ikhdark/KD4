@@ -4,6 +4,7 @@ See [the instruction architecture](codex-rs/core/instruction-architecture.md) fo
 
 This is Windows only project.
 This is a local project.
+Do not publish or republish without permission.
 
 Upstream is https://github.com/openai/codex
 

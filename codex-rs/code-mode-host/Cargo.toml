@@ -23,5 +23,6 @@ tracing-subscriber = { workspace = true, features = ["fmt"] }
 anyhow = { workspace = true }
 codex-code-mode-protocol = { workspace = true }
 codex-code-mode-runtime = { workspace = true }
+codex-process-hardening = { workspace = true }
 tokio = { workspace = true, features = ["io-std", "io-util", "macros", "rt", "sync", "time"] }
 tokio-util = { workspace = true, features = ["rt"] }

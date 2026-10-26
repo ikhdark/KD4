@@ -19,10 +19,16 @@ use tokio_util::sync::CancellationToken;
 use tracing::warn;
 
 const MAX_RESPONSE_STREAM_RETRY_DELAY: Duration = Duration::from_secs(5);
+// Capacity needs time to recover, not the subsecond cadence used for a broken
+// stream. Keep the provider's retry count and server-supplied deadlines intact.
+const INITIAL_CAPACITY_RETRY_DELAY: Duration = Duration::from_secs(5);
+const MAX_CAPACITY_RETRY_DELAY: Duration = Duration::from_secs(60);
 const INITIAL_CONNECTION_RETRY_DELAY: Duration = Duration::from_millis(500);
-const MAX_CONNECTION_RETRY_DELAY: Duration = Duration::from_secs(60);
-/// Bounds one request's wait for a login, account switch, or usage-limit reset.
-const ACCOUNT_CHANGE_WAIT: Duration = Duration::from_secs(15 * 60);
+const MAX_CONNECTION_RETRY_DELAY: Duration = Duration::from_secs(15);
+/// Bounds automatic recovery after the first failure, including account waits.
+/// This is not a timeout on an accepted, potentially long-running generation.
+const INTERACTIVE_RETRY_WAIT_BUDGET: Duration = Duration::from_secs(120);
+const INTERACTIVE_RETRY_BUDGET_ERROR_CODE: &str = "interactive_retry_budget_exhausted";
 /// Bounds the wait when the limit provably cannot reset inside the full bound,
 /// so only a human account switch could help. Long enough to catch a switch
 /// already under way, short enough not to stall a turn that cannot recover.
@@ -40,12 +46,14 @@ pub(crate) enum ResponsesStreamRequest {
 /// Retry bookkeeping for one Responses stream loop.
 ///
 /// `retries` tracks the bounded provider retry budget. Connection-loss waits are
-/// tracked separately because they must not consume that budget.
+/// tracked separately, but interactive recovery shares one elapsed-time budget.
 #[derive(Debug)]
 pub(crate) struct ResponsesStreamRetryState {
     retries: u64,
     connection_retries: u64,
     connection_retry_delay: Duration,
+    wait_deadline: Option<tokio::time::Instant>,
+    account_wait_started: bool,
     /// Whether this request already spent its one WebSocket reconnect on a
     /// close that invited another connection. Separate from `retries` so the
     /// reconnect does not shrink the provider budget, and per-request so a
@@ -60,9 +68,36 @@ impl Default for ResponsesStreamRetryState {
             retries: 0,
             connection_retries: 0,
             connection_retry_delay: INITIAL_CONNECTION_RETRY_DELAY,
+            wait_deadline: None,
+            account_wait_started: false,
             reconnected_after_close: false,
             repaired_explicit_rejection: false,
         }
+    }
+}
+
+impl ResponsesStreamRetryState {
+    fn interactive_wait_deadline(
+        &mut self,
+        session_source: &SessionSource,
+    ) -> Option<tokio::time::Instant> {
+        if !is_interactive_recovery(session_source) {
+            return None;
+        }
+        Some(*self.wait_deadline.get_or_insert_with(|| {
+            tokio::time::Instant::now() + INTERACTIVE_RETRY_WAIT_BUDGET
+        }))
+    }
+
+    /// Check before another attempt, without starting a timer for the initial request.
+    pub(crate) fn check_retry_budget(
+        &self,
+        cancellation_token: &CancellationToken,
+    ) -> Result<(), CodexErr> {
+        if cancellation_token.is_cancelled() {
+            return Err(CodexErr::TurnAborted);
+        }
+        check_retry_wait_budget(tokio::time::Instant::now(), self.wait_deadline, false)
     }
 }
 
@@ -89,6 +124,22 @@ pub(crate) async fn handle_retryable_response_stream_error(
         return Err(err);
     }
     let retry_after = err.retry_after();
+    let server_busy = is_server_busy(&err);
+    if server_busy {
+        // A capacity rejection can leave the socket open and its sticky routing
+        // token pointing at the rejecting backend. Retire both, including on
+        // the final attempt, without changing the retry budget or server delay.
+        client_session.replace_websocket_for_recovery();
+    }
+
+    let wait_deadline = retry_state.interactive_wait_deadline(&turn_context.session_source);
+    check_retry_wait_budget(
+        retry_after
+            .map(RetryAfter::deadline)
+            .unwrap_or_else(tokio::time::Instant::now),
+        wait_deadline,
+        retry_after.is_some(),
+    )?;
 
     if matches!(&err, CodexErr::WebsocketRejected { .. }) {
         if retry_state.repaired_explicit_rejection {
@@ -97,10 +148,17 @@ pub(crate) async fn handle_retryable_response_stream_error(
         retry_state.repaired_explicit_rejection = true;
         // Both typed rejections prove no sampling was accepted. Retire the
         // chain/socket so the next request carries full authoritative input.
-        client_session.replace_websocket_after_reconnectable_close();
+        client_session.replace_websocket_for_recovery();
         if let Some(advice) = retry_after {
-            let _retry_timing_guard = turn_context.turn_timing_state.begin_retry_backoff();
-            wait_for_retry_deadline(advice.deadline(), cancellation_token).await?;
+            wait_for_response_retry_deadline(
+                advice.deadline(),
+                wait_deadline,
+                true,
+                sess,
+                turn_context,
+                cancellation_token,
+            )
+            .await?;
         }
         return Ok(());
     }
@@ -117,7 +175,7 @@ pub(crate) async fn handle_retryable_response_stream_error(
             error = %err,
             "provider closed the stream and invited a reconnect; rebuilding the websocket"
         );
-        client_session.replace_websocket_after_reconnectable_close();
+        client_session.replace_websocket_for_recovery();
         sess.notify_stream_error(
             turn_context,
             "Reconnecting... the server closed the stream".to_string(),
@@ -171,8 +229,15 @@ pub(crate) async fn handle_retryable_response_stream_error(
             exhaust_retry_budget_for_http_fallback(&mut retry_state.retries, max_retries);
         }
         if let Some(advice) = retry_after {
-            let _retry_timing_guard = turn_context.turn_timing_state.begin_retry_backoff();
-            wait_for_retry_deadline(advice.deadline(), cancellation_token).await?;
+            wait_for_response_retry_deadline(
+                advice.deadline(),
+                wait_deadline,
+                true,
+                sess,
+                turn_context,
+                cancellation_token,
+            )
+            .await?;
         }
         return Ok(());
     }
@@ -188,9 +253,8 @@ pub(crate) async fn handle_retryable_response_stream_error(
             error = %err,
             "stream connection failed; waiting for the network to recover"
         );
-        // Deliberately does not touch `retry_state.retries`: a lost connection must not
-        // burn the bounded provider retry budget, so the turn survives sleep/wake and
-        // VPN churn instead of failing after `max_retries` quick attempts.
+        // A lost connection does not burn the provider attempt count, but the shared
+        // interactive deadline prevents an outage from keeping this request alive forever.
         sess.notify_stream_error(
             turn_context,
             format!(
@@ -200,9 +264,20 @@ pub(crate) async fn handle_retryable_response_stream_error(
             err,
         )
         .await;
-        let _retry_timing_guard = turn_context.turn_timing_state.begin_retry_backoff();
-        wait_for_retry_delay(retry_delay, cancellation_token).await?;
+        wait_for_response_retry_deadline(
+            tokio::time::Instant::now() + retry_delay,
+            wait_deadline,
+            false,
+            sess,
+            turn_context,
+            cancellation_token,
+        )
+        .await?;
         retry_state.connection_retry_delay = next_connection_retry_delay(retry_delay);
+        // This branch only handles proven pre-dispatch connection failures. An HTTP-only
+        // outage must not pin this same request to HTTP forever after WebSockets recover.
+        // Keep ordinary post-dispatch retries sticky and preserve the shared cooldown.
+        client_session.refresh_transport_after_cooldown();
         return Ok(());
     }
 
@@ -216,14 +291,26 @@ pub(crate) async fn handle_retryable_response_stream_error(
         log_retry(request, turn_context, &err, retry_count, max_retries, delay);
 
         // Surface retry information from the first attempt so a reconnect never looks frozen.
+        let status = if server_busy {
+            "Server is busy; retrying"
+        } else {
+            "Reconnecting"
+        };
         sess.notify_stream_error(
             turn_context,
-            format!("Reconnecting... {retry_count}/{max_retries} (next retry in {delay:.1?})"),
+            format!("{status}... {retry_count}/{max_retries} (next retry in {delay:.1?})"),
             err,
         )
         .await;
-        let _retry_timing_guard = turn_context.turn_timing_state.begin_retry_backoff();
-        wait_for_retry_deadline(retry_at, cancellation_token).await?;
+        wait_for_response_retry_deadline(
+            retry_at,
+            wait_deadline,
+            retry_after.is_some(),
+            sess,
+            turn_context,
+            cancellation_token,
+        )
+        .await?;
         return Ok(());
     }
 
@@ -323,13 +410,13 @@ pub(crate) enum AccountChangeWait<'a> {
 /// credentials to change (a login or account switch) or a usage limit to reset.
 ///
 /// Returns `Ok(true)` when the request should be sent again and `Ok(false)` when
-/// the wait does not apply or its bound has expired, so the caller keeps the
-/// original outcome. One deadline bounds every wait of the same request.
+/// the wait does not apply. Account recovery shares the request's elapsed retry
+/// budget with transport/capacity recovery; expiry stops automatic recovery.
 /// Interactive sessions and the agents they spawn wait; other sessions fail
 /// fast for their callers.
 pub(crate) async fn wait_for_account_change(
     reason: AccountChangeWait<'_>,
-    deadline: &mut Option<tokio::time::Instant>,
+    retry_state: &mut ResponsesStreamRetryState,
     sess: &Session,
     turn_context: &TurnContext,
     cancellation_token: &CancellationToken,
@@ -337,7 +424,7 @@ pub(crate) async fn wait_for_account_change(
     if cancellation_token.is_cancelled() {
         return Err(CodexErr::TurnAborted);
     }
-    if !waits_for_account_change(&turn_context.session_source) {
+    if !is_interactive_recovery(&turn_context.session_source) {
         return Ok(false);
     }
     let Some(auth_manager) = turn_context.provider.auth_manager() else {
@@ -361,14 +448,11 @@ pub(crate) async fn wait_for_account_change(
         return Ok(true);
     }
     let now = tokio::time::Instant::now();
-    let first_wait = deadline.is_none();
-    let deadline = *deadline.get_or_insert(now + ACCOUNT_CHANGE_WAIT);
-    let Some(_) = deadline
-        .checked_duration_since(now)
-        .filter(|remaining| !remaining.is_zero())
-    else {
+    let first_wait = !std::mem::replace(&mut retry_state.account_wait_started, true);
+    let Some(deadline) = retry_state.interactive_wait_deadline(&turn_context.session_source) else {
         return Ok(false);
     };
+    retry_state.check_retry_budget(cancellation_token)?;
     if matches!(reason, AccountChangeWait::UsageLimit(..))
         && current_account().is_some_and(|account| Some(account) != failed_account)
         && !turn_context.provider.missing_required_credentials()
@@ -445,6 +529,7 @@ pub(crate) async fn wait_for_account_change(
                 }
             }
             _ = tokio::time::sleep_until(reset_at.unwrap_or(deadline)) => {
+                retry_state.check_retry_budget(cancellation_token)?;
                 return Ok(reset_at.is_some());
             }
             _ = reload.tick() => {
@@ -458,6 +543,7 @@ pub(crate) async fn wait_for_account_change(
                         biased;
                         _ = cancellation_token.cancelled() => return Err(CodexErr::TurnAborted),
                         _ = tokio::time::sleep_until(reset_at.unwrap_or(deadline)) => {
+                            retry_state.check_retry_budget(cancellation_token)?;
                             return Ok(reset_at.is_some());
                         }
                         changed = auth_changes.changed() => {
@@ -477,7 +563,7 @@ pub(crate) async fn wait_for_account_change(
     }
 }
 
-fn waits_for_account_change(session_source: &SessionSource) -> bool {
+fn is_interactive_recovery(session_source: &SessionSource) -> bool {
     matches!(
         session_source,
         SessionSource::Cli
@@ -487,14 +573,110 @@ fn waits_for_account_change(session_source: &SessionSource) -> bool {
     )
 }
 
-async fn wait_for_retry_delay(
-    delay: Duration,
-    cancellation_token: &CancellationToken,
-) -> Result<(), CodexErr> {
-    wait_for_retry_deadline(tokio::time::Instant::now() + delay, cancellation_token).await
+fn retry_wait_budget_error(reason: &str) -> CodexErr {
+    CodexErr::ProviderFailure {
+        code: Some(INTERACTIVE_RETRY_BUDGET_ERROR_CODE.to_string()),
+        message: format!(
+            "{reason} Automatic recovery is limited to {} seconds per model request. The selected model has not changed. Retry this model later, or select a different model manually.",
+            INTERACTIVE_RETRY_WAIT_BUDGET.as_secs(),
+        ),
+    }
 }
 
-pub(crate) async fn wait_for_retry_deadline(
+/// Context retirement may recover an ordinary compaction failure, not a deliberate
+/// stop that handed retry/model choice back to the user.
+pub(crate) fn is_retry_wait_budget_exhausted(error: &CodexErr) -> bool {
+    match error {
+        CodexErr::TerminalResponse { source, .. } => is_retry_wait_budget_exhausted(source),
+        CodexErr::ProviderFailure { code, .. } => {
+            code.as_deref() == Some(INTERACTIVE_RETRY_BUDGET_ERROR_CODE)
+        }
+        _ => false,
+    }
+}
+
+fn check_retry_wait_budget(
+    retry_at: tokio::time::Instant,
+    wait_deadline: Option<tokio::time::Instant>,
+    provider_directed: bool,
+) -> Result<(), CodexErr> {
+    let Some(wait_deadline) = wait_deadline else {
+        return Ok(());
+    };
+    let now = tokio::time::Instant::now();
+    if now >= wait_deadline {
+        return Err(retry_wait_budget_error("Automatic retry waiting budget exhausted."));
+    }
+    if provider_directed && retry_at > wait_deadline {
+        let seconds = retry_at.saturating_duration_since(now).as_millis().div_ceil(1000);
+        return Err(retry_wait_budget_error(&format!(
+            "The provider requires waiting at least {seconds} seconds before retrying this model. Automatic retry stopped instead of retrying before that deadline."
+        )));
+    }
+    Ok(())
+}
+
+/// A compaction fallback is still a provider retry, not permission to ignore its delay.
+pub(crate) async fn wait_for_response_retry_after(
+    error: &CodexErr,
+    sess: &Session,
+    turn_context: &TurnContext,
+    cancellation_token: &CancellationToken,
+) -> Result<(), CodexErr> {
+    let Some(advice) = error.retry_after() else {
+        return Ok(());
+    };
+    let mut retry_state = ResponsesStreamRetryState::default();
+    let wait_deadline = retry_state.interactive_wait_deadline(&turn_context.session_source);
+    wait_for_response_retry_deadline(
+        advice.deadline(),
+        wait_deadline,
+        true,
+        sess,
+        turn_context,
+        cancellation_token,
+    )
+    .await
+}
+
+async fn wait_for_response_retry_deadline(
+    retry_at: tokio::time::Instant,
+    wait_deadline: Option<tokio::time::Instant>,
+    provider_directed: bool,
+    sess: &Session,
+    turn_context: &TurnContext,
+    cancellation_token: &CancellationToken,
+) -> Result<(), CodexErr> {
+    if cancellation_token.is_cancelled() {
+        return Err(CodexErr::TurnAborted);
+    }
+    check_retry_wait_budget(retry_at, wait_deadline, provider_directed)?;
+    let delay = retry_at.saturating_duration_since(tokio::time::Instant::now());
+    if provider_directed && delay > MAX_CONNECTION_RETRY_DELAY {
+        let seconds = delay.as_millis().div_ceil(1000);
+        tokio::select! {
+            biased;
+            _ = cancellation_token.cancelled() => return Err(CodexErr::TurnAborted),
+            _ = sess.send_event(
+                turn_context,
+                EventMsg::Warning(WarningEvent {
+                    message: format!(
+                        "Provider-directed retry wait: {seconds} seconds before retrying the current model. Cancel the turn to stop waiting; to use another model, cancel and select it manually. The harness will not switch models automatically."
+                    ),
+                }),
+            ) => {}
+        }
+    }
+    let _retry_timing_guard = turn_context.turn_timing_state.begin_retry_backoff();
+    let deadline = wait_deadline.map_or(retry_at, |limit| retry_at.min(limit));
+    wait_for_retry_deadline(deadline, cancellation_token).await?;
+    if cancellation_token.is_cancelled() {
+        return Err(CodexErr::TurnAborted);
+    }
+    check_retry_wait_budget(tokio::time::Instant::now(), wait_deadline, false)
+}
+
+async fn wait_for_retry_deadline(
     deadline: tokio::time::Instant,
     cancellation_token: &CancellationToken,
 ) -> Result<(), CodexErr> {
@@ -523,11 +705,30 @@ fn should_switch_fallback_transport(err: &CodexErr) -> bool {
     }
 }
 
+fn is_server_busy(err: &CodexErr) -> bool {
+    matches!(err, CodexErr::ServerOverloaded { .. })
+        || matches!(
+            err,
+            CodexErr::UnexpectedStatus(error)
+                if error.status == StatusCode::TOO_MANY_REQUESTS
+                    || error.status == StatusCode::SERVICE_UNAVAILABLE
+        )
+}
+
 fn response_stream_retry_delay(err: &CodexErr, retry_count: u64) -> Duration {
     // Server delays are a minimum wait, not a suggestion to retry sooner.
     // Only our own exponential backoff is capped; all waits remain cancellable.
     if let Some(advice) = err.retry_after() {
         return advice.remaining_delay();
+    }
+    if is_server_busy(err) {
+        // Reuse the shared jitter implementation so simultaneous agents do not
+        // retry in lockstep. No new retry loop or independent budget is added.
+        return codex_client::capped_backoff(
+            INITIAL_CAPACITY_RETRY_DELAY,
+            retry_count,
+            MAX_CAPACITY_RETRY_DELAY,
+        );
     }
     backoff_with_cap(retry_count, MAX_RESPONSE_STREAM_RETRY_DELAY)
 }

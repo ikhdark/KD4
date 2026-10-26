@@ -1433,8 +1433,29 @@ fn measure_responses_request_after_dispatch(
     }.in_current_span())
 }
 
+#[derive(Debug, Default, Clone, serde::Serialize)]
+struct ProviderPhaseReceipt {
+    first_us: u64,
+    last_us: u64,
+    count: u64,
+}
+
+/// Bounded control-event receipts before API-to-core delivery; never server phase durations.
+#[derive(Debug, Default, Clone, serde::Serialize)]
+struct ProviderObservations {
+    version: u32,
+    response_id: Option<String>,
+    created_at: Option<f64>,
+    completed_at: Option<f64>,
+    invalid: bool,
+    safety_buffering_events: u64,
+    first_safety_buffering_us: Option<u64>,
+    phases: std::collections::BTreeMap<&'static str, ProviderPhaseReceipt>,
+}
+
 #[derive(Debug, Default)]
 struct ModelAttemptOffsets {
+    provider_observations: Option<ProviderObservations>,
     stream_delivery_json: Option<String>,
     transport_attempt: u64,
     request_send_started_ns: Option<u64>,
@@ -1465,6 +1486,47 @@ struct ModelAttemptClock {
 }
 
 impl ModelAttemptClock {
+    fn record_provider_observation(&self, observation: codex_api::ProviderObservation) {
+        // Fixed phase vocabulary bounds memory. Only control/item boundaries call
+        // this, never deltas. Reuse the clock lock, without IO, awaits or new locks.
+        if !matches!(observation.phase, "created" | "queued" | "in_progress" | "completed"
+            | "failed" | "incomplete" | "reasoning_started" | "reasoning_finished" | "safety_buffering") {
+            return;
+        }
+        let now_us = self.elapsed_us();
+        let mut offsets = self.offsets.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let evidence = offsets.provider_observations.get_or_insert_with(|| ProviderObservations {
+            version: 1, ..Default::default()
+        });
+        evidence.invalid |= observation.invalid_source_fields || now_us == u64::MAX;
+        if let Some(id) = observation.response_id {
+            if let Some(previous) = &evidence.response_id {
+                evidence.invalid |= previous != &id;
+            } else {
+                evidence.response_id = Some(id);
+            }
+        }
+        for (target, value) in [(&mut evidence.created_at, observation.created_at),
+                               (&mut evidence.completed_at, observation.completed_at)] {
+            if let Some(value) = value {
+                evidence.invalid |= target.is_some_and(|previous| previous != value);
+                target.get_or_insert(value);
+            }
+        }
+        if observation.safety_buffering {
+            evidence.safety_buffering_events = evidence.safety_buffering_events.saturating_add(1);
+            evidence.first_safety_buffering_us.get_or_insert(now_us);
+            evidence.invalid |= evidence.safety_buffering_events == u64::MAX;
+        }
+        let phase = evidence.phases.entry(observation.phase).or_default();
+        if phase.count == 0 {
+            phase.first_us = now_us;
+        }
+        phase.last_us = now_us;
+        phase.count = phase.count.saturating_add(1);
+        evidence.invalid |= phase.count == u64::MAX;
+    }
+
     fn record_response_start(&self, response: &codex_otel::ResponseStartTelemetry<'_>) {
         let mut offsets = self
             .offsets
@@ -1631,6 +1693,8 @@ const MODEL_STREAM_GAP_BOUNDS_US: [u64; 13] = [
 #[derive(Default, serde::Serialize)]
 struct ModelStreamDelivery {
     version: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    provider_observations: Option<ProviderObservations>,
     physical_attempt_id: String,
     clock_id: &'static str,
     dispatch_ready_us: Option<u64>,
@@ -1750,6 +1814,7 @@ impl ModelStreamDeliveryObserver {
         self.summary.response_headers_received_ns = offsets.response_headers_received_ns;
         self.summary.first_response_body_byte_ns = offsets.first_response_body_byte_ns;
         self.summary.provider_processing_us = offsets.provider_processing_us;
+        self.summary.provider_observations = offsets.provider_observations.clone();
         self.summary.physical_attempt_id = if offsets.transport_attempt == 0 {
             identity.physical_attempt_id.clone()
         } else {
@@ -1980,7 +2045,7 @@ impl ModelAttemptGuard {
             total_tokens = self.terminal_usage.as_ref().and_then(TokenUsage::known_total),
             "model cache diagnostics"
         );
-        if !self.session_telemetry.model_attempt_logging_enabled() {
+        if !self.session_telemetry.model_attempt_telemetry_enabled() {
             return;
         }
         let offsets = self
@@ -2117,6 +2182,9 @@ impl ModelAttemptGuard {
                 stream_delivery_json: offsets.stream_delivery_json.clone(),
                 completed_us,
             });
+        if !self.session_telemetry.model_attempt_logging_enabled() {
+            return;
+        }
         for receipt in self.measurements.stable_context_manifest.filtering_receipts() {
             tracing::info!(event.name = "codex.stable_context.filtering_receipt",
                 sampling_request_id = %self.sampling_request_id, attempt_id = %self.attempt_id,
@@ -2163,6 +2231,7 @@ fn finish_queue_span(offsets: &mut ModelAttemptOffsets, now_us: u64) {
 /// backoff into connection setup and move dispatch-ready to the retry, so post-dispatch
 /// offsets (TTFT included) exclude client-side recovery. Phase totals are unchanged.
 fn redispatch_offsets(offsets: &mut ModelAttemptOffsets, now_us: u64) {
+    offsets.provider_observations = None;
     offsets.request_send_started_ns = None;
     offsets.response_headers_received_ns = None;
     offsets.first_response_body_byte_ns = None;
@@ -2712,41 +2781,45 @@ struct WebsocketTransportCache {
 }
 
 const WEBSOCKET_FALLBACK_COOLDOWN: Duration = Duration::from_secs(60);
+const WEBSOCKET_MAX_FALLBACK_COOLDOWN: Duration = Duration::from_secs(5 * 60);
 const WEBSOCKET_FAILURE_WINDOW: Duration = Duration::from_secs(30 * 60);
 
 #[derive(Debug, Default)]
 struct WebsocketFallbackState {
-    disabled: bool,
-    last_transient_failure: Option<tokio::time::Instant>,
+    last_failure: Option<tokio::time::Instant>,
+    cooldown: Duration,
 }
 
 impl WebsocketFallbackState {
     fn enabled(&self, now: tokio::time::Instant) -> bool {
-        !self.disabled
-            && self.last_transient_failure.is_none_or(|failed_at| {
-                now.saturating_duration_since(failed_at) >= WEBSOCKET_FALLBACK_COOLDOWN
-            })
+        self.last_failure
+            .is_none_or(|failed_at| now.saturating_duration_since(failed_at) >= self.cooldown)
     }
 
     fn record_failure(&mut self, recoverable: bool, now: tokio::time::Instant) {
-        if !recoverable
-            || self.last_transient_failure.is_some_and(|failed_at| {
-                now.saturating_duration_since(failed_at) <= WEBSOCKET_FAILURE_WINDOW
-            })
-        {
-            self.disabled = true;
+        // Upgrade rejection may belong to a proxy or network that later changes.
+        // Back off repeated failures, but never pin a capable provider to HTTP forever.
+        self.cooldown = if !recoverable {
+            WEBSOCKET_MAX_FALLBACK_COOLDOWN
+        } else if self.last_failure.is_some_and(|failed_at| {
+            now.saturating_duration_since(failed_at) <= WEBSOCKET_FAILURE_WINDOW
+        }) {
+            self.cooldown
+                .saturating_mul(2)
+                .min(WEBSOCKET_MAX_FALLBACK_COOLDOWN)
         } else {
-            self.last_transient_failure = Some(now);
-        }
+            WEBSOCKET_FALLBACK_COOLDOWN
+        };
+        self.last_failure = Some(now);
     }
 }
 
 impl WebsocketTransportCache {
     fn record_success(&mut self, epoch: u64) {
         // A completion from before a concurrent fallback must not erase that
-        // newer failure or re-enable a permanently disabled transport.
-        if self.epoch == epoch && !self.fallback.disabled {
-            self.fallback.last_transient_failure = None;
+        // newer failure or shorten its cooldown.
+        if self.epoch == epoch {
+            self.fallback = WebsocketFallbackState::default();
         }
     }
 
@@ -2842,9 +2915,12 @@ impl RequestRouteTelemetry {
 /// (auth, provider selection, thread id, transport fallback state, and the prompt-context
 /// diagnostic baseline that a turn's first request is compared against).
 ///
-/// WebSocket fallback is session-scoped. A transient failure uses HTTP for 60 seconds; a second
-/// failure within 30 minutes without an intervening successful request, or a non-transient
-/// failure, disables WebSockets for the session.
+/// WebSocket fallback is session-scoped. A transient failure uses HTTP for 60 seconds; repeated
+/// failures exponentially extend the cooldown up to five minutes. Rejected upgrades use the
+/// maximum cooldown. A new sampling request can retry WebSockets after the cooldown, even
+/// within the same turn. Pre-dispatch HTTP connection recovery may also retry WebSockets after
+/// cooldown; ambiguous or post-dispatch retries stay on HTTP. Only a completed WebSocket response
+/// clears the failure history.
 ///
 /// Turn-scoped settings (model selection, reasoning controls, telemetry context, and turn
 /// metadata) are passed explicitly to the relevant methods to keep turn lifetime visible at the
@@ -2887,8 +2963,8 @@ pub struct ModelClientSession {
     /// Transport selected for the current stream, including failed connection attempts.
     /// `None` means no stream has been selected yet.
     last_stream_transport: Option<ModelAttemptTransport>,
-    /// Once a prepared turn selects HTTP, cooldown expiry must not put another
-    /// WebSocket recovery cycle in front of that turn's continuations.
+    /// Keep HTTP recovery sticky across ambiguous or post-dispatch retries. A new logical request
+    /// or pre-dispatch connection recovery may retry WebSockets after the shared cooldown.
     http_for_turn: bool,
     effective_input: Option<Arc<[ResponseItem]>>,
     turn_timing: Option<Arc<TurnTimingState>>,
@@ -3190,6 +3266,7 @@ impl WebsocketStreamThroughput {
 #[derive(Debug, Default)]
 struct WebsocketSession {
     connection: Option<ApiWebSocketConnection>,
+    startup_observation: Option<crate::startup_timing::StartupConnectionObservation>,
     /// When `connection` was established; drives rotation before the server's age limit.
     connected_at: Option<Instant>,
     /// Shared with each response stream, which reports its rate on completion.
@@ -4328,6 +4405,9 @@ impl ModelClientSession {
         }
 
         let adopted_session = std::mem::take(&mut prewarmed_session.websocket_session);
+        if let Some(observation) = &adopted_session.startup_observation {
+            observation.claimed();
+        }
         let adopted_session = if compatible {
             adopted_session
         } else {
@@ -4346,6 +4426,9 @@ impl ModelClientSession {
 
     fn reset_websocket_session(&mut self) {
         self.websocket_session.connection = None;
+        if let Some(observation) = self.websocket_session.startup_observation.take() {
+            observation.release("connection_reset");
+        }
         self.websocket_session.connected_at = None;
         self.websocket_session.setup_fingerprint = None;
         self.invalidate_incremental_history("websocket reset");
@@ -4360,14 +4443,13 @@ impl ModelClientSession {
         self.reset_websocket_session();
     }
 
-    /// Replaces a websocket the provider closed mid-response with a code that
-    /// invites another connection, so the next attempt of the same request
-    /// reconnects instead of abandoning WebSockets for the session.
+    /// Retires a rejected or closed websocket so recovery reconnects without
+    /// abandoning WebSockets for the session.
     ///
     /// The sticky turn-state token is dropped for the same reason as a
-    /// throughput collapse: the backend that closed is the one the token would
-    /// route back to.
-    pub(crate) fn replace_websocket_after_reconnectable_close(&mut self) {
+    /// throughput collapse: the token would route back to the backend that
+    /// rejected the request or closed the stream.
+    pub(crate) fn replace_websocket_for_recovery(&mut self) {
         self.reset_websocket_session();
         self.turn_state = Arc::new(OnceLock::new());
     }
@@ -4849,6 +4931,7 @@ impl ModelClientSession {
             self.reset_websocket_session();
         }
         let mut session = self.client.new_speculative_session();
+        session.startup_timing = self.startup_timing.clone();
         let failure_setup = Arc::new(StdMutex::new(None));
         self.preconnect_failure_setup = Some(Arc::clone(&failure_setup));
         let model_info = model_info.clone();
@@ -4954,6 +5037,18 @@ impl ModelClientSession {
         }
     }
 
+    /// Reconsider a temporary fallback at a new logical request or after a proven pre-dispatch
+    /// HTTP connection failure. Callers must not use this for ambiguous or post-dispatch retries.
+    /// No probe or duplicate model request is sent.
+    pub(crate) fn refresh_transport_after_cooldown(&mut self) {
+        if self.http_for_turn && self.client.responses_websocket_enabled() {
+            self.http_for_turn = false;
+            // HTTP did not establish an incremental WebSocket chain. Reconnect
+            // with full input and without the failed backend's sticky routing.
+            self.replace_websocket_for_recovery();
+        }
+    }
+
     /// Opportunistically preconnects a websocket for this turn-scoped client session.
     ///
     /// This performs only connection setup; it never sends prompt payloads.
@@ -4977,6 +5072,8 @@ impl ModelClientSession {
         let mut pending_retry = PendingUnauthorizedRetry::default();
         loop {
             let client_setup = self.client.current_client_setup().await?;
+            let request_auth_for_recovery = Arc::clone(&client_setup.api_auth);
+            let request_auth_snapshot = client_setup.auth.clone();
             let auth_context = AuthRequestTelemetryContext::new(
                 client_setup.auth.as_ref().map(CodexAuth::auth_mode),
                 client_setup.api_auth.as_ref(),
@@ -5024,6 +5121,8 @@ impl ModelClientSession {
                         handle_unauthorized(
                             unauthorized_transport,
                             &mut auth_recovery,
+                            &request_auth_for_recovery,
+                            request_auth_snapshot.as_ref(),
                             session_telemetry,
                             &provider,
                         )
@@ -5112,6 +5211,11 @@ impl ModelClientSession {
                 }
             };
             self.websocket_session.connection = Some(new_conn);
+            if let Some(observation) = self.websocket_session.startup_observation.take() {
+                observation.release("connection_replaced");
+            }
+            self.websocket_session.startup_observation = self.startup_timing.as_ref()
+                .and_then(|timing| timing.observe_connection_ready(self.websocket_cache_publication.is_none()));
             self.websocket_session.connected_at = Some(Instant::now());
             self.websocket_session.setup_fingerprint = setup_fingerprint;
             self.websocket_session
@@ -5188,6 +5292,8 @@ impl ModelClientSession {
                         .as_ref()
                         .map(|timing| timing.begin_local_phase(TurnLocalPhase::TransportReadiness));
                     let client_setup = self.client.current_client_setup().await?;
+                    let request_auth_for_recovery = Arc::clone(&client_setup.api_auth);
+                    let request_auth_snapshot = client_setup.auth.clone();
                     let transport = self
                         .client
                         .build_api_transport(&client_setup.api_provider, RESPONSES_ENDPOINT)
@@ -5466,6 +5572,8 @@ impl ModelClientSession {
                                 handle_unauthorized(
                                     unauthorized_transport,
                                     &mut auth_recovery,
+                                    &request_auth_for_recovery,
+                                    request_auth_snapshot.as_ref(),
                                     session_telemetry,
                                     &self.client.state.provider,
                                 )
@@ -5649,6 +5757,8 @@ impl ModelClientSession {
             if let Some(clock) = attempt_clock.as_ref() {
                 clock.mark_connection_setup_started();
             }
+            let request_auth_for_recovery = Arc::clone(&client_setup.api_auth);
+            let request_auth_snapshot = client_setup.auth.clone();
             let connection_result = self
                 .websocket_connection(WebsocketConnectParams {
                     session_telemetry,
@@ -5689,6 +5799,8 @@ impl ModelClientSession {
                         handle_unauthorized(
                             unauthorized_transport,
                             &mut auth_recovery,
+                            &request_auth_for_recovery,
+                            request_auth_snapshot.as_ref(),
                             session_telemetry,
                             &self.client.state.provider,
                         )
@@ -5915,6 +6027,8 @@ impl ModelClientSession {
                         Arc::new(telemetry) as Arc<dyn WebsocketTelemetry>
                     });
             let startup_timing = self.startup_timing.clone();
+            let startup_connection_id = self.websocket_session.startup_observation.as_ref()
+                .map(|observation| observation.connection_id().to_owned());
             let stream_result = websocket_connection
                 .stream_request_with_observers(
                     &ws_request,
@@ -5982,7 +6096,10 @@ impl ModelClientSession {
                                 );
                             }
                             if let Some(timing) = &startup_timing {
-                                timing.freeze_at_first_transport_attempt();
+                                timing.freeze_at_first_transport_attempt(
+                                    startup_connection_id.as_deref(), "websocket",
+                                    transport_identity.as_ref().map(|identity| identity.physical_attempt_id.as_str()),
+                                );
                             }
                         }) as Arc<dyn Fn() + Send + Sync>
                     }),
@@ -6463,7 +6580,7 @@ impl ModelClientSession {
         self.effective_input.as_ref().map(Arc::clone)
     }
 
-    /// Permanently disables WebSockets for this Codex session and resets WebSocket state.
+    /// Pauses WebSockets for the maximum cooldown and resets WebSocket state.
     ///
     /// This is used when the server rejects the WebSocket upgrade.
     ///
@@ -6483,10 +6600,14 @@ impl ModelClientSession {
         err: &CodexErr,
     ) -> bool {
         let recoverable = match err {
-            CodexErr::ResponseStreamFailed(error) => error.status.is_none(),
-            CodexErr::ConnectionFailed(error) => error.status.is_none(),
-            // An exhausted retryable upgrade failure can recover on a later
-            // turn. The shared cooldown still makes a second failure permanent.
+            CodexErr::RequestTimeout => true,
+            CodexErr::ResponseStreamFailed(error) => {
+                error.status.is_none_or(|status| status.is_server_error())
+            }
+            CodexErr::ConnectionFailed(error) => {
+                error.status.is_none_or(|status| status.is_server_error())
+            }
+            // An exhausted retryable upgrade failure can recover after cooldown.
             CodexErr::UnexpectedStatus(error) => error.status.is_server_error(),
             _ => false,
         };
@@ -7113,6 +7234,8 @@ fn is_recoverable_authentication_failure(transport: &TransportError) -> bool {
 async fn handle_unauthorized(
     transport: TransportError,
     auth_recovery: &mut Option<UnauthorizedRecovery>,
+    request_auth: &SharedAuthProvider,
+    rejected_auth: Option<&CodexAuth>,
     session_telemetry: &SessionTelemetry,
     provider: &SharedModelProvider,
 ) -> Result<UnauthorizedRecoveryExecution> {
@@ -7122,7 +7245,14 @@ async fn handle_unauthorized(
     {
         let mode = recovery.mode_name();
         let phase = recovery.step_name();
-        return match recovery.next().await {
+        let result = match request_auth.auth_recovery_revision() {
+            Some(revision) => recovery.next_with_auth_revision(revision, rejected_auth).await,
+            None => match rejected_auth {
+                Some(auth) => recovery.next_with_auth(auth).await,
+                None => recovery.next().await,
+            },
+        };
+        return match result {
             Ok(step_result) => {
                 session_telemetry.record_auth_recovery(
                     mode,
@@ -7343,7 +7473,7 @@ impl RequestTelemetry for ApiTelemetry {
                 "model transport identity at HTTP entry"
             );
             if let Some(startup) = &context.startup {
-                startup.freeze_at_first_transport_attempt();
+                startup.freeze_at_first_transport_attempt(None, "http", Some(&physical_attempt_id));
             }
         }
     }
@@ -7495,6 +7625,12 @@ impl RequestTelemetry for ApiTelemetry {
 }
 
 impl SseTelemetry for ApiTelemetry {
+    fn on_provider_observation(&self, observation: codex_api::ProviderObservation) {
+        if let Some(request) = self.model_request.as_ref() {
+            request.clock.record_provider_observation(observation);
+        }
+    }
+
     fn on_sse_poll(
         &self,
         result: &std::result::Result<
@@ -7555,6 +7691,12 @@ impl SseTelemetry for ApiTelemetry {
 }
 
 impl WebsocketTelemetry for ApiTelemetry {
+    fn on_provider_observation(&self, observation: codex_api::ProviderObservation) {
+        if let Some((_, clock)) = &self.websocket_response {
+            clock.record_provider_observation(observation);
+        }
+    }
+
     fn on_response_event(&self) {
         if let Some((_, clock)) = &self.websocket_response
             && !self.first_response_event.swap(true, Ordering::Relaxed)

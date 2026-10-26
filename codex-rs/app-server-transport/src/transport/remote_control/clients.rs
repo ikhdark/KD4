@@ -243,7 +243,7 @@ async fn send_client_management_request(
     let response =
         send_client_management_request_once(client, request_state, &auth, &request, action).await?;
     if response.status.as_u16() != 401
-        || !recover_remote_control_auth(&mut auth_recovery, &mut auth_change_rx).await
+        || !recover_remote_control_auth(&mut auth_recovery, &mut auth_change_rx, &auth).await
     {
         return Ok(response);
     }

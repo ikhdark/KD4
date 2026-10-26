@@ -28,6 +28,12 @@ impl From<AuthError> for TransportError {
 /// Header-only providers can implement `add_auth_headers`; providers that sign
 /// complete requests can override `apply_auth`.
 pub trait AuthProvider: Send + Sync {
+    /// Opaque managed-auth revision used by this request's last header projection.
+    /// Recovery callers must use a request-local provider, never a shared recorder.
+    fn auth_recovery_revision(&self) -> Option<u64> {
+        None
+    }
+
     /// Final request-local admission, rechecked after transport preparation.
     fn dispatch_guard(&self) -> Option<Arc<dyn codex_client::RequestDispatchGuard>> {
         None

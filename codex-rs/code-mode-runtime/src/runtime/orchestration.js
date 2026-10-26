@@ -688,12 +688,13 @@
         throw new TypeError("on_progress must be a function");
       }
       const observations = [];
-      // Charge each packet once. The current packet appears both as terminal
-      // and in observations; include JSON framing and separators exactly.
+      // The evidence budget counts the unique observation representation.
+      // Preserve the public terminal alias in JSON/storage; serializing both
+      // fields can be larger than this explicitly scoped retained-byte budget.
       let observationBytes = 0;
       const packetSnapshots = [];
       let incremental = on_progress === undefined && typeof nativeIsProxy === "function";
-      const evidenceFramingBytes = bytes('{"terminal":,"observations":[]}');
+      const evidenceFramingBytes = bytes('{"observations":[]}');
       let current = initial;
       let session;
       let incarnation;
@@ -708,18 +709,14 @@
           if (incremental) {
             arrayPush(packetSnapshots, snapshot);
             const serialized = JSON.stringify(current, replacer);
-            // Undefined is null in an array, but omits the terminal property.
+            // Undefined is null in the observations array.
             const packetBytes = serialized === undefined ? 4 : bytes(serialized);
             observationBytes += packetBytes + (observations.length > 1 ? 1 : 0);
-            retainedBytes = observationBytes + (serialized === undefined
-              ? bytes('{"observations":[]}')
-              : evidenceFramingBytes + packetBytes);
+            retainedBytes = observationBytes + evidenceFramingBytes;
           }
         }
         if (!incremental)
-          retainedBytes = bytes(JSON.stringify(evidence, replacer));
-        if (retainedBytes >= max_bytes)
-          fail("command evidence byte limit reached; retain these observations and resume only the retained handle", evidence);
+          retainedBytes = bytes(JSON.stringify({ observations }, replacer));
         if (
           !current ||
           current.error != null ||
@@ -745,8 +742,11 @@
             if (
               current.exit_code === 0 ||
               (current.exit_code === 1 && current.search_no_match === true)
-            )
+            ) {
+              if (retainedBytes >= max_bytes)
+                fail("command succeeded but its completed evidence reached the byte limit; retain these observations, do not restart the command", evidence);
               return evidence;
+            }
             fail(
               `command did not succeed (exit_code=${current.exit_code ?? "unknown"}, ` +
                 `execution_state=${current.execution_state ?? "unknown"}, ` +
@@ -768,6 +768,8 @@
         ) {
           fail("missing or changed live command handle", evidence);
         }
+        if (retainedBytes >= max_bytes)
+          fail("command evidence byte limit reached; retain these observations and resume only the retained handle", evidence);
         session = current.session_id;
         incarnation = current.session_capabilities.incarnation;
         // Stop with the exact observations and live handle before consuming

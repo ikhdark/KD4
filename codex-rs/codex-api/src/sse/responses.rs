@@ -338,7 +338,11 @@ async fn process_sse_with_metadata(
         trace!(event = %event_name, payload_bytes = sse.data.len(), "SSE event");
 
         let interpretation_start = telemetry.as_ref().map(|_| Instant::now());
-        let events = match interpreter.process_payload(&sse.data) {
+        let events = match interpreter.process_payload(&sse.data, |observation| {
+            if let Some(t) = telemetry.as_ref() {
+                t.on_provider_observation(observation);
+            }
+        }) {
             Ok(events) => {
                 if let Some((t, start)) = telemetry.as_ref().zip(interpretation_start) {
                     t.on_sse_event(event_name, start.elapsed(), None);

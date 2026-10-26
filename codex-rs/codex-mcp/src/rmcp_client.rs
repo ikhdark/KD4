@@ -357,6 +357,7 @@ struct ManagedClientStartup {
     tool_catalog_revision: Arc<AtomicU64>,
     cancel_token: CancellationToken,
     startup_complete: Arc<AtomicBool>,
+    discover_tools: bool,
 }
 
 impl ManagedClientStartup {
@@ -385,6 +386,7 @@ impl ManagedClientStartup {
             tool_catalog_revision,
             cancel_token,
             startup_complete,
+            discover_tools,
         } = self.clone();
         let is_codex_apps_mcp_server = server_name == CODEX_APPS_MCP_SERVER_NAME;
         let tool_filter = server
@@ -448,6 +450,7 @@ impl ManagedClientStartup {
                         client_elicitation_capability,
                         supports_openai_form_elicitation,
                         tool_catalog_revision: Arc::clone(&tool_catalog_revision),
+                        discover_tools,
                     },
                 )
                 .await
@@ -530,6 +533,7 @@ impl AsyncManagedClient {
         client_elicitation_capability: ElicitationCapability,
         supports_openai_form_elicitation: bool,
         tool_catalog_revision: Arc<AtomicU64>,
+        discover_tools: bool,
     ) -> Self {
         let is_codex_apps_mcp_server = server_name == CODEX_APPS_MCP_SERVER_NAME;
         let reconnect_server_name = server_name.clone();
@@ -571,6 +575,7 @@ impl AsyncManagedClient {
             tool_catalog_revision: Arc::clone(&tool_catalog_revision),
             cancel_token: cancel_token.clone(),
             startup_complete: Arc::clone(&startup_complete),
+            discover_tools,
         });
         let client = startup.start();
         let startup_reconnect =
@@ -808,13 +813,21 @@ impl StartupOutcomeError {
 impl From<anyhow::Error> for StartupOutcomeError {
     fn from(error: anyhow::Error) -> Self {
         let is_authentication_required = is_authentication_required_error(&error);
-        let is_timeout = codex_rmcp_client::is_timeout_error(&error);
+        let is_timeout = codex_rmcp_client::is_timeout_error(&error)
+            || error.downcast_ref::<ToolDiscoveryTimeout>().is_some();
         Self::Failed {
             error: error.to_string(),
             is_authentication_required,
             is_timeout,
         }
     }
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("MCP server {server_name:?}: tools/list exhausted its discovery timeout of {budget:?}")]
+struct ToolDiscoveryTimeout {
+    server_name: String,
+    budget: Duration,
 }
 
 #[instrument(level = "trace", skip_all, fields(server_name = %server_name))]
@@ -827,11 +840,11 @@ pub(crate) async fn list_tools_for_client_uncached(
     server_instructions: Option<&str>,
 ) -> Result<Vec<ToolInfo>> {
     let fetch_start = Instant::now();
-    let tools = collect_tool_list_pages(server_name, |params| {
+    let tools = collect_tool_list_pages(server_name, timeout, |params, remaining| {
         let client = Arc::clone(client);
         async move {
             client
-                .list_tools_with_connector_ids(params, Some(timeout))
+                .list_tools_with_connector_ids_with_timing(params, Some(remaining))
                 .await
         }
     })
@@ -864,21 +877,35 @@ pub(crate) async fn list_tools_for_client_uncached(
 
 async fn collect_tool_list_pages<F, Fut>(
     server_name: &str,
+    mut remaining: Duration,
     mut fetch_page: F,
 ) -> Result<Vec<ToolWithConnectorId>>
 where
-    F: FnMut(Option<PaginatedRequestParams>) -> Fut,
-    Fut: Future<Output = Result<codex_rmcp_client::ListToolsWithConnectorIdResult>>,
+    F: FnMut(Option<PaginatedRequestParams>, Duration) -> Fut,
+    Fut: Future<Output = Result<(codex_rmcp_client::ListToolsWithConnectorIdResult, Duration)>>,
 {
+    let budget = remaining;
     let mut collected = Vec::new();
     let mut cursor: Option<String> = None;
     let mut seen_cursors = HashSet::new();
 
     for page in 1..=MAX_MCP_TOOL_LIST_PAGES {
+        if remaining.is_zero() {
+            return Err(ToolDiscoveryTimeout {
+                server_name: server_name.to_string(),
+                budget,
+            }
+            .into());
+        }
         let params = cursor
             .as_ref()
             .map(|next| PaginatedRequestParams::default().with_cursor(Some(next.clone())));
-        let response = fetch_page(params).await?;
+        // One configured budget covers the entire catalog, including retries
+        // and session recovery. The client reports active time, excluding user
+        // elicitation waits just as individual operation timeouts do.
+        let (response, active_time) = fetch_page(params, remaining).await?;
+        remaining = remaining.saturating_sub(active_time);
+        let processing_start = Instant::now();
         if collected.len().saturating_add(response.tools.len()) > MAX_MCP_TOOL_LIST_ITEMS {
             return Err(anyhow!(
                 "MCP server {server_name:?}: tools/list exceeded item limit of {MAX_MCP_TOOL_LIST_ITEMS} on page {page} ({} already collected, {} in this page)",
@@ -900,6 +927,7 @@ where
             }
             None => return Ok(collected),
         }
+        remaining = remaining.saturating_sub(processing_start.elapsed());
     }
 
     Err(anyhow!(
@@ -1309,6 +1337,7 @@ async fn start_server_task(
         client_elicitation_capability,
         supports_openai_form_elicitation,
         tool_catalog_revision,
+        discover_tools,
     } = params;
     let params = mcp_initialize_request_params(
         client_elicitation_capability,
@@ -1344,7 +1373,8 @@ async fn start_server_task(
         .and_then(|exp| exp.get(MCP_SANDBOX_STATE_META_CAPABILITY))
         .is_some();
     let server_supports_resources_capability = initialize_result.capabilities.resources.is_some();
-    let server_supports_tools_capability = initialize_result.capabilities.tools.is_some();
+    let server_supports_tools_capability =
+        discover_tools && initialize_result.capabilities.tools.is_some();
     let server_info = mcp_server_info_from_implementation(initialize_result.server_info);
     let server_instructions = initialize_result.instructions;
     let tools = discover_tools_if_supported(server_supports_tools_capability,
@@ -1453,6 +1483,7 @@ struct StartServerTaskParams {
     client_elicitation_capability: ElicitationCapability,
     supports_openai_form_elicitation: bool,
     tool_catalog_revision: Arc<AtomicU64>,
+    discover_tools: bool,
 }
 
 #[instrument(level = "trace", skip_all, fields(server_name = %server_name))]

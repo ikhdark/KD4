@@ -14,6 +14,14 @@ fn cloud_config_bundle_load_error(err: &std::io::Error) -> Option<&CloudConfigBu
 }
 
 fn config_load_error(err: &std::io::Error) -> JSONRPCErrorError {
+    if err
+        .get_ref()
+        .is_some_and(|source| source.is::<crate::config_manager::ConfigGenerationChanged>())
+    {
+        let mut error = internal_error(err.to_string());
+        error.data = Some(serde_json::json!({ "reason": "configurationChanged" }));
+        return error;
+    }
     let data = cloud_config_bundle_load_error(err).map(|cloud_error| {
         let mut data = serde_json::json!({
             "reason": "cloudConfigBundle",
@@ -32,6 +40,15 @@ fn config_load_error(err: &std::io::Error) -> JSONRPCErrorError {
     let mut error = invalid_request(format!("failed to load configuration: {err}"));
     error.data = data;
     error
+}
+
+pub(super) fn is_config_generation_changed(error: &JSONRPCErrorError) -> bool {
+    error
+        .data
+        .as_ref()
+        .and_then(|data| data.get("reason"))
+        .and_then(serde_json::Value::as_str)
+        == Some("configurationChanged")
 }
 
 pub(super) trait ConfigLoadResultExt<T> {

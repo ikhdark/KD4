@@ -7,11 +7,13 @@ use std::sync::LazyLock;
 use std::sync::Mutex;
 
 use super::ParsedProxyListDecision;
+use super::OutboundProxyRoute;
 use super::RequestOrigin;
 use super::RouteFailureClass;
 use super::SystemProxyDecision;
 use super::no_proxy_matches_origin;
-use super::parse_proxy_list;
+use super::proxy_list_tokens;
+use super::parse_proxy_token;
 use super::parse_static_proxy_list;
 use windows_sys::Win32::Foundation::ERROR_FILE_NOT_FOUND;
 use windows_sys::Win32::Foundation::FALSE;
@@ -233,7 +235,24 @@ fn proxy_info_decision(proxy_info: &ProxyInfo, origin: &RequestOrigin) -> System
 }
 
 fn proxy_list_decision(proxy_list: &str, origin: &RequestOrigin) -> SystemProxyDecision {
-    proxy_list_result_decision(parse_proxy_list(proxy_list, &origin.scheme))
+    let mut routes = Vec::new();
+    let mut saw_unsupported = false;
+    for token in proxy_list_tokens(proxy_list) {
+        match parse_proxy_token(token, &origin.scheme) {
+            ParsedProxyListDecision::Direct => routes.push(OutboundProxyRoute::Direct),
+            ParsedProxyListDecision::Proxy(url) => routes.push(OutboundProxyRoute::Proxy { url, no_proxy: None }),
+            ParsedProxyListDecision::UnsupportedScheme => saw_unsupported = true,
+            ParsedProxyListDecision::Unavailable => {},
+        }
+    }
+    match routes.as_slice() {
+        [] => proxy_list_result_decision(if saw_unsupported {
+            ParsedProxyListDecision::UnsupportedScheme
+        } else { ParsedProxyListDecision::Unavailable }),
+        [OutboundProxyRoute::Direct] => SystemProxyDecision::Direct,
+        [OutboundProxyRoute::Proxy { url, .. }] => SystemProxyDecision::Proxy { url: url.clone() },
+        _ => SystemProxyDecision::Fallback { routes },
+    }
 }
 
 fn proxy_list_result_decision(decision: ParsedProxyListDecision) -> SystemProxyDecision {

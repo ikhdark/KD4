@@ -908,16 +908,13 @@ impl TurnTimingSnapshot {
 /// Reuse the authenticated, bounded artifact store instead of inventing a
 /// second side-file lifecycle. Keep inline evidence if durable retention fails.
 pub(crate) async fn retain_turn_timing_details(
-    mut timing: TurnTiming,
+    timing: TurnTiming,
     codex_home: &std::path::Path,
     thread_id: &str,
 ) -> TurnTiming {
-    // Request details already live in sampling checkpoints. Terminal profiles
-    // keep cumulative metrics without duplicating the per-request history.
-    if !timing.model_requests.is_empty() {
-        timing.model_requests.clear();
-        timing.model_request_history_truncated = Some(true);
-    }
+    // The final request may complete after the last sampling checkpoint. Keep
+    // the bounded terminal history and its real eviction flag so readers can
+    // reconcile checkpoints without losing terminal usage and stream metrics.
     if timing
         .tool_calls
         .iter()

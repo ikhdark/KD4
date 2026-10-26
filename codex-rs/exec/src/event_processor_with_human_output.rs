@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::io::IsTerminal;
 use std::path::PathBuf;
@@ -19,6 +20,7 @@ use owo_colors::Style;
 
 use crate::event_processor::CodexStatus;
 use crate::event_processor::EventProcessor;
+use crate::event_processor::bounded_progress_text;
 use crate::event_processor::final_message_from_turn;
 use crate::event_processor::handle_last_message;
 
@@ -41,6 +43,16 @@ pub(crate) struct EventProcessorWithHumanOutput {
     last_total_token_usage: Option<ThreadTokenUsage>,
     displayed_warnings: VecDeque<String>,
     last_non_retry_error: Option<(String, String)>,
+    live_output: HashMap<String, LiveOutput>,
+    live_output_bytes: usize,
+    live_item: Option<String>,
+    live_output_limit_reported: bool,
+}
+
+#[derive(Default)]
+struct LiveOutput {
+    prefix: String,
+    stopped: bool,
 }
 
 impl EventProcessorWithHumanOutput {
@@ -69,11 +81,101 @@ impl EventProcessorWithHumanOutput {
             last_total_token_usage: None,
             displayed_warnings: VecDeque::new(),
             last_non_retry_error: None,
+            live_output: HashMap::new(),
+            live_output_bytes: 0,
+            live_item: None,
+            live_output_limit_reported: false,
         }
     }
 
-    fn render_item_started(&self, item: &ThreadItem) {
+    fn finish_live_line(&mut self) {
+        if self.live_item.take().is_some() {
+            eprintln!();
+        }
+    }
+
+    fn clear_live_output(&mut self) {
+        self.finish_live_line();
+        self.live_output.clear();
+        self.live_output_bytes = 0;
+        self.live_output_limit_reported = false;
+    }
+
+    fn render_live_text(&mut self, item_id: &str, text: String, label: &str) {
+        const MAX_ITEMS: usize = 64;
+        const MAX_ITEM_BYTES: usize = 64 * 1024;
+        const MAX_TOTAL_BYTES: usize = 1024 * 1024;
+        if text.is_empty() {
+            return;
+        }
+        if !self.live_output.contains_key(item_id)
+            && (self.live_output.len() >= MAX_ITEMS || item_id.len() > 512)
+        {
+            if !self.live_output_limit_reported {
+                self.finish_live_line();
+                eprintln!("[live output limit reached; completed items remain authoritative]");
+                self.live_output_limit_reported = true;
+            }
+            return;
+        }
+        let (text, mut truncated) = bounded_progress_text(text);
+        let output = self.live_output.entry(item_id.to_string()).or_default();
+        if output.stopped {
+            return;
+        }
+        let available = MAX_ITEM_BYTES
+            .saturating_sub(output.prefix.len())
+            .min(MAX_TOTAL_BYTES.saturating_sub(self.live_output_bytes));
+        let mut end = text.len().min(available);
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        truncated |= end < text.len();
+        output.prefix.push_str(&text[..end]);
+        output.stopped = truncated;
+        self.live_output_bytes += end;
+        if end > 0 {
+            if self.live_item.as_deref() != Some(item_id) {
+                self.finish_live_line();
+                eprintln!("{}", label.style(self.italic).style(self.magenta));
+                self.live_item = Some(item_id.to_string());
+            }
+            eprint!("{}", &text[..end]);
+        }
+        if truncated {
+            self.finish_live_line();
+            eprintln!("[live output truncated; completed item remains authoritative]");
+        }
+    }
+
+    fn render_completed_text(&mut self, item_id: &str, text: &str, label: &str) {
+        if let Some(output) = self.live_output.remove(item_id) {
+            self.live_output_bytes -= output.prefix.len();
+            if let Some(remaining) = text.strip_prefix(output.prefix.as_str()) {
+                if !remaining.is_empty() {
+                    if self.live_item.as_deref() != Some(item_id) {
+                        self.finish_live_line();
+                        eprintln!("{}", label.style(self.italic).style(self.magenta));
+                        self.live_item = Some(item_id.to_string());
+                    }
+                    eprint!("{remaining}");
+                }
+                if self.live_item.as_deref() == Some(item_id) {
+                    self.finish_live_line();
+                }
+                return;
+            }
+            self.finish_live_line();
+            eprintln!("[canonical output differs from live progress]");
+        }
+        eprintln!("{}\n{text}", label.style(self.italic).style(self.magenta));
+    }
+
+    fn render_item_started(&mut self, item: &ThreadItem) {
         match item {
+            ThreadItem::AgentMessage { id, text, .. } => {
+                self.render_live_text(id, text.clone(), "codex (streaming)");
+            }
             ThreadItem::CommandExecution { command, cwd, .. } => {
                 eprintln!(
                     "{}\n{} in {cwd}",
@@ -103,14 +205,11 @@ impl EventProcessorWithHumanOutput {
     }
 
     fn render_item_completed(&mut self, item: ThreadItem) {
+        let in_progress = crate::event_processor::item_is_in_progress(&item);
         self.streamed_final_message.observe(&item);
         match item {
-            ThreadItem::AgentMessage { text, .. } => {
-                eprintln!(
-                    "{}\n{}",
-                    "codex".style(self.italic).style(self.magenta),
-                    text
-                );
+            ThreadItem::AgentMessage { id, text, .. } => {
+                self.render_completed_text(&id, &text, "codex");
                 self.final_message = self.streamed_final_message.message();
                 self.final_message_rendered = self.final_message.as_ref() == Some(&text);
             }
@@ -126,6 +225,7 @@ impl EventProcessorWithHumanOutput {
                 }
             }
             ThreadItem::CommandExecution {
+                id,
                 command: _,
                 aggregated_output,
                 exit_code,
@@ -133,6 +233,7 @@ impl EventProcessorWithHumanOutput {
                 duration_ms,
                 ..
             } => {
+                self.finish_live_line();
                 let duration_suffix = duration_ms
                     .map(|duration_ms| format!(" in {duration_ms}ms"))
                     .unwrap_or_default();
@@ -163,10 +264,26 @@ impl EventProcessorWithHumanOutput {
                         );
                     }
                 }
-                if let Some(output) = aggregated_output
-                    && !output.trim().is_empty()
+                if let Some(output) = aggregated_output {
+                    if in_progress {
+                        let remaining = match self.live_output.get(&id) {
+                            Some(live) if !live.stopped => {
+                                output.strip_prefix(live.prefix.as_str()).map(str::to_string)
+                            }
+                            None => Some(output),
+                            _ => None,
+                        };
+                        if let Some(remaining) = remaining {
+                            self.render_live_text(&id, remaining, "output (streaming)");
+                        }
+                    } else if !output.trim().is_empty() || self.live_output.contains_key(&id) {
+                        self.render_completed_text(&id, &output, "output");
+                    }
+                } else if !in_progress
+                    && let Some(output) = self.live_output.remove(&id)
                 {
-                    eprintln!("{output}");
+                    self.live_output_bytes -= output.prefix.len();
+                    eprintln!("[completed output unavailable; live output is provisional]");
                 }
             }
             ThreadItem::FileChange {
@@ -241,6 +358,29 @@ impl EventProcessor for EventProcessorWithHumanOutput {
     }
 
     fn process_server_notification(&mut self, notification: ServerNotification) -> CodexStatus {
+        let live_item = match &notification {
+            ServerNotification::AgentMessageDelta(event) => Some(event.item_id.as_str()),
+            ServerNotification::CommandExecutionOutputDelta(event) => Some(event.item_id.as_str()),
+            ServerNotification::ItemCompleted(event) => Some(event.item.id()),
+            _ => None,
+        };
+        if self.live_item.as_deref() != live_item {
+            self.finish_live_line();
+        }
+        if let ServerNotification::TurnCompleted(event) = &notification {
+            // Recovery may carry terminal snapshots whose item/completed event
+            // was dropped. Reconcile only output we actually displayed live.
+            for item in &event.turn.items {
+                if self.live_output.contains_key(item.id())
+                    && !crate::event_processor::item_is_in_progress(item)
+                {
+                    self.render_item_completed(item.clone());
+                }
+            }
+            self.clear_live_output();
+        } else if matches!(&notification, ServerNotification::TurnStarted(_)) {
+            self.clear_live_output();
+        }
         if let ServerNotification::TurnCompleted(notification) = &notification
             && let Some(assessment) = notification
                 .timing
@@ -330,6 +470,37 @@ impl EventProcessor for EventProcessorWithHumanOutput {
             }
             ServerNotification::ItemCompleted(notification) => {
                 self.render_item_completed(notification.item);
+                CodexStatus::Running
+            }
+            ServerNotification::AgentMessageDelta(notification) => {
+                self.render_live_text(
+                    &notification.item_id,
+                    notification.delta,
+                    "codex (streaming)",
+                );
+                CodexStatus::Running
+            }
+            ServerNotification::CommandExecutionOutputDelta(notification) => {
+                self.render_live_text(
+                    &notification.item_id,
+                    notification.delta,
+                    "output (streaming)",
+                );
+                CodexStatus::Running
+            }
+            ServerNotification::McpToolCallProgress(notification) => {
+                let (message, truncated) = bounded_progress_text(notification.message);
+                let progress = match (notification.progress, notification.total) {
+                    (Some(progress), Some(total)) => format!(" ({progress}/{total})"),
+                    (Some(progress), None) => format!(" ({progress})"),
+                    _ => String::new(),
+                };
+                eprintln!(
+                    "{} {}{progress}: {message}{}",
+                    "mcp progress:".style(self.cyan),
+                    notification.item_id,
+                    if truncated { " [truncated]" } else { "" },
+                );
                 CodexStatus::Running
             }
             ServerNotification::ModelRerouted(notification) => {
@@ -451,6 +622,7 @@ impl EventProcessor for EventProcessorWithHumanOutput {
     }
 
     fn process_warning(&mut self, message: String) -> CodexStatus {
+        self.finish_live_line();
         if self.displayed_warnings.contains(&message) {
             return CodexStatus::Running;
         }
@@ -470,6 +642,7 @@ impl EventProcessor for EventProcessorWithHumanOutput {
     }
 
     fn process_event_stream_error(&mut self, message: String) {
+        self.clear_live_output();
         self.final_message = None;
         self.final_message_rendered = false;
         self.emit_final_message_on_shutdown = false;
@@ -477,6 +650,7 @@ impl EventProcessor for EventProcessorWithHumanOutput {
     }
 
     fn print_final_output(&mut self) -> std::io::Result<()> {
+        self.finish_live_line();
         let output_file_result = if self.emit_final_message_on_shutdown
             && let Some(path) = self.last_message_path.as_deref()
         {

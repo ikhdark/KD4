@@ -171,6 +171,11 @@ export class Thread {
           terminalSeen ||= parsed.type === "turn.completed" || parsed.type === "turn.failed";
           yield parsed;
         }
+        if (!terminalSeen) {
+          throw new Error(
+            "Incomplete turn stream: turn.completed or turn.failed event not received",
+          );
+        }
       } finally {
         await cleanup();
       }
@@ -225,6 +230,14 @@ export class Thread {
         ) {
           partialItems.set(event.item.id, event.item);
           if (event.item.type === "agent_message") partialResponse = event.item.text;
+        }
+        if (event.type === "item.progress" && event.kind === "agent_message") {
+          const item = partialItems.get(event.item_id);
+          if (item?.type === "agent_message") {
+            const partial = { ...item, text: item.text + event.delta };
+            partialItems.set(event.item_id, partial);
+            partialResponse = partial.text;
+          }
         }
         if (event.type === "item.completed") {
           if (

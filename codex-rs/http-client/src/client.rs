@@ -11,6 +11,7 @@ use opentelemetry::propagation::Injector;
 use reqwest::IntoUrl;
 use reqwest::Method;
 use serde::Serialize;
+use std::cell::Cell;
 use std::fmt::Display;
 use std::sync::Arc;
 use std::time::Duration;
@@ -29,6 +30,7 @@ pub struct HttpClient {
     inner: reqwest::Client,
     request_logging: RequestLogging,
     default_headers: Arc<HeaderMap>,
+    fallback: Option<Arc<FallbackTransports>>,
 }
 
 impl HttpClient {
@@ -49,11 +51,29 @@ impl HttpClient {
             inner,
             request_logging,
             default_headers: Arc::default(),
+            fallback: None,
         }
     }
 
     pub(crate) fn with_default_headers(mut self, headers: HeaderMap) -> Self {
         self.default_headers = Arc::new(headers);
+        self
+    }
+
+    pub(crate) fn with_fallbacks(
+        mut self,
+        primary_route: &crate::OutboundProxyRoute,
+        clients: Vec<(HttpClient, &crate::OutboundProxyRoute)>,
+        timeout: Option<Duration>,
+    ) -> Self {
+        self.fallback = Some(Arc::new(FallbackTransports {
+            primary_proxy_authority: proxy_credential_authority(primary_route),
+            clients: clients.into_iter().map(|(client, route)| FallbackTransport {
+                client: client.inner,
+                proxy_authority: proxy_credential_authority(route),
+            }).collect(),
+            timeout,
+        }));
         self
     }
 
@@ -99,6 +119,7 @@ impl HttpClient {
             diagnostic_url,
             self.request_logging,
             Arc::clone(&self.default_headers),
+            self.fallback.clone(),
         )
     }
 
@@ -134,7 +155,7 @@ impl HttpClient {
     ) -> Result<reqwest::Response, reqwest::Error> {
         request.headers_mut().extend(trace_headers());
         crate::transport::record_send_started();
-        let result = self.inner.execute(request).await;
+        let result = execute_with_fallbacks(&self.inner, request, self.fallback.as_deref()).await;
         if result.is_ok() {
             crate::transport::record_headers_received();
         }
@@ -197,6 +218,7 @@ pub struct RequestBuilder {
     diagnostic_url: Option<String>,
     request_logging: RequestLogging,
     default_headers: Arc<HeaderMap>,
+    fallback: Option<Arc<FallbackTransports>>,
 }
 
 impl std::fmt::Debug for RequestBuilder {
@@ -216,6 +238,7 @@ impl RequestBuilder {
         diagnostic_url: Option<String>,
         request_logging: RequestLogging,
         default_headers: Arc<HeaderMap>,
+        fallback: Option<Arc<FallbackTransports>>,
     ) -> Self {
         Self {
             builder,
@@ -223,6 +246,7 @@ impl RequestBuilder {
             diagnostic_url,
             request_logging,
             default_headers,
+            fallback,
         }
     }
 
@@ -233,6 +257,7 @@ impl RequestBuilder {
             diagnostic_url: self.diagnostic_url,
             request_logging: self.request_logging,
             default_headers: self.default_headers,
+            fallback: self.fallback,
         }
     }
 
@@ -300,7 +325,7 @@ impl RequestBuilder {
             Ok(mut request) => {
                 apply_default_headers(request.headers_mut(), &self.default_headers);
                 crate::transport::record_send_started();
-                let result = client.execute(request).await;
+                let result = execute_with_fallbacks(&client, request, self.fallback.as_deref()).await;
                 if result.is_ok() {
                     crate::transport::record_headers_received();
                 }
@@ -340,6 +365,95 @@ impl RequestBuilder {
                 }
                 Err(error)
             }
+        }
+    }
+}
+
+struct FallbackTransports {
+    primary_proxy_authority: Option<ProxyCredentialAuthority>,
+    clients: Vec<FallbackTransport>,
+    timeout: Option<Duration>,
+}
+
+struct FallbackTransport {
+    client: reqwest::Client,
+    proxy_authority: Option<ProxyCredentialAuthority>,
+}
+
+// Include the proxy transport scheme so an HTTPS-to-HTTP downgrade never
+// inherits credentials merely because its host/port happens to match.
+type ProxyCredentialAuthority = (String, String, u16);
+
+fn proxy_credential_authority(route: &crate::OutboundProxyRoute) -> Option<ProxyCredentialAuthority> {
+    let crate::OutboundProxyRoute::Proxy { url, no_proxy: None } = route else { return None };
+    let url = reqwest::Url::parse(url).ok()?;
+    if !matches!(url.scheme(), "http" | "https") { return None; }
+    Some((url.scheme().to_string(), url.host_str()?.to_ascii_lowercase(), url.port_or_known_default()?))
+}
+
+impl std::fmt::Debug for FallbackTransports {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FallbackTransports").field("fallback_count", &self.clients.len()).finish()
+    }
+}
+
+tokio::task_local! {
+    // Reqwest evaluates its redirect policy while polling the execute future.
+    // A scoped marker isolates concurrent requests without a client-global flag.
+    static FALLBACK_REDIRECT_SEEN: Cell<bool>;
+}
+
+pub(crate) fn record_fallback_redirect() {
+    let _ = FALLBACK_REDIRECT_SEEN.try_with(|seen| seen.set(true));
+}
+
+async fn execute_with_fallbacks(
+    primary: &reqwest::Client,
+    mut request: reqwest::Request,
+    fallback: Option<&FallbackTransports>,
+) -> Result<HttpResponse, HttpError> {
+    let Some(fallback) = fallback else { return primary.execute(request).await };
+    let deadline = request.timeout().copied().or(fallback.timeout)
+        .map(|timeout| tokio::time::Instant::now() + timeout);
+    // Own the current cheap client handle instead of retaining a chained iterator
+    // of differently borrowed clients across the Send transport future.
+    let mut client = primary.clone();
+    // Bind only the original caller-supplied values to the original proxy.
+    // A later client may inject its own credential, which must never become
+    // provenance for another attempt (including a return to the first proxy).
+    let credential_authority = fallback.primary_proxy_authority.as_ref();
+    let caller_proxy_authorization = request.headers()
+        .get_all(http::header::PROXY_AUTHORIZATION)
+        .iter().cloned().collect::<Vec<_>>();
+    let mut next_candidate = 0;
+    loop {
+        if let Some(deadline) = deadline {
+            *request.timeout_mut() = Some(deadline.saturating_duration_since(tokio::time::Instant::now()));
+        }
+        let replay = request.try_clone();
+        let (result, redirected) = FALLBACK_REDIRECT_SEEN.scope(Cell::new(false), async move {
+            let result = client.execute(request).await;
+            (result, FALLBACK_REDIRECT_SEEN.with(Cell::get))
+        }).await;
+        match result {
+            Err(error) if error.is_connect() && !redirected && next_candidate < fallback.clients.len() => {
+                let Some(mut replay) = replay else { return Err(error) };
+                let next = &fallback.clients[next_candidate];
+                // Restore from the original binding, not the preceding replay:
+                // A,B,A must authenticate A without disclosing A's header to B.
+                replay.headers_mut().remove(http::header::PROXY_AUTHORIZATION);
+                if credential_authority.zip(next.proxy_authority.as_ref())
+                    .is_some_and(|(original, next)| original == next)
+                {
+                    for value in &caller_proxy_authorization {
+                        replay.headers_mut().append(http::header::PROXY_AUTHORIZATION, value.clone());
+                    }
+                }
+                request = replay;
+                client = next.client.clone();
+                next_candidate += 1;
+            }
+            result => return result,
         }
     }
 }

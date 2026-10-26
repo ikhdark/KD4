@@ -64,6 +64,9 @@ pub struct McpServerStatus {
     pub tools: std::collections::HashMap<String, McpTool>,
     pub resources: Vec<McpResource>,
     pub resource_templates: Vec<McpResourceTemplate>,
+    /// Resource discovery errors for this server. Nonempty means its resource inventory is incomplete.
+    #[serde(default)]
+    pub resource_errors: Vec<String>,
     pub auth_status: McpAuthStatus,
 }
 

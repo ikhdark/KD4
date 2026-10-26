@@ -21,7 +21,7 @@ pub(super) fn public_cell_id_from_protocol(generation: u64, cell_id: &CellId) ->
     public_cell_id(generation, &WireCellId::new(cell_id.as_str()))
 }
 
-pub(super) fn remote_cell_id(
+pub(in crate::remote_session::connection) fn remote_cell_id(
     session: &RemoteSession,
     cell_id: &CellId,
 ) -> Result<WireCellId, String> {

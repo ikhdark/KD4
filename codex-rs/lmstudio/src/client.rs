@@ -17,6 +17,8 @@ const LMSTUDIO_CONNECTION_ERROR: &str = "LM Studio is not responding. Install fr
 // A server may accept a connection without ever answering a metadata request.
 // Downloads and model warm-up can legitimately take longer and use separate paths.
 const SETUP_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+// Keep best-effort background warm-up bounded, including response-body completion.
+const MODEL_WARMUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
 
 fn error_with_sources(err: &dyn std::error::Error) -> String {
     let mut message = err.to_string();
@@ -100,14 +102,16 @@ impl LMStudioClient {
         }
     }
 
-    // Load a model by sending an empty request with max_tokens 1
+    /// Complete a minimal warm-up response, not just its HTTP status headers.
+    /// This does not guarantee that LM Studio keeps the model resident afterward.
     pub async fn load_model(&self, model: &str) -> io::Result<()> {
         let url = format!("{}/responses", self.base_url.trim_end_matches('/'));
 
         let request_body = serde_json::json!({
             "model": model,
             "input": "",
-            "max_output_tokens": 1
+            "max_output_tokens": 1,
+            "stream": false
         });
 
         let response = self
@@ -115,19 +119,38 @@ impl LMStudioClient {
             .post(&url)
             .header("Content-Type", "application/json")
             .json(&request_body)
+            .timeout(MODEL_WARMUP_TIMEOUT)
             .send()
             .await
             .map_err(|e| io::Error::other(format!("Request failed: {e}")))?;
 
-        if response.status().is_success() {
-            tracing::info!("Successfully loaded model '{model}'");
-            Ok(())
-        } else {
-            Err(io::Error::other(format!(
+        if !response.status().is_success() {
+            return Err(io::Error::other(format!(
                 "Failed to load model: {}",
                 response.status()
-            )))
+            )));
         }
+        let response: serde_json::Value = response.json().await.map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("Failed to read LM Studio warm-up completion: {error}"),
+            )
+        })?;
+        let status = response.get("status").and_then(serde_json::Value::as_str);
+        let completed = status == Some("completed")
+            || (status == Some("incomplete")
+                && response
+                    .pointer("/incomplete_details/reason")
+                    .and_then(serde_json::Value::as_str)
+                    == Some("max_output_tokens"));
+        if !completed || response.get("error").is_some_and(|error| !error.is_null()) {
+            return Err(io::Error::other(format!(
+                "LM Studio warm-up did not complete successfully (status: {})",
+                status.unwrap_or("missing")
+            )));
+        }
+        tracing::info!("LM Studio warm-up response completed for model '{model}'");
+        Ok(())
     }
 
     // Return the list of models available on the LM Studio server.

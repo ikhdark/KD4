@@ -365,7 +365,7 @@ where
                 max_attempts = CLOUD_CONFIG_BUNDLE_MAX_ATTEMPTS,
                 "Cloud config bundle request was unauthorized; attempting auth recovery"
             );
-            match auth_recovery.next().await {
+            match auth_recovery.next_with_auth(auth).await {
                 Ok(_) => {
                     let Some(refreshed_auth) = self.auth_manager.auth().await else {
                         tracing::error!(

@@ -1141,6 +1141,10 @@ async fn run_websocket_response_stream(
                 let events = match interpreter.process_payload_with_error_mapper(&text, || {
                     let wrapped_error = parse_wrapped_websocket_error_event(&text)?;
                     map_wrapped_websocket_error_event(wrapped_error, text.to_string())
+                }, |observation| {
+                    if let Some(t) = telemetry.as_ref() {
+                        t.on_provider_observation(observation);
+                    }
                 }) {
                     Ok(events) => events,
                     Err(ResponsesEventError::Parse(error)) => {

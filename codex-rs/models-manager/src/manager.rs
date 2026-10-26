@@ -1073,11 +1073,18 @@ impl OpenAiModelsManager {
         reason = "Eligible disk loads join the refresh transaction only when the gate is free"
     )]
     async fn note_catalog_activity(&self, strategy: RefreshStrategy) {
+        self.ensure_current_cache_identity().await;
+        if strategy == RefreshStrategy::Offline {
+            // Metadata-only readers use the current identity's snapshot or the
+            // bundled/minimal fallback, not a network freshness guarantee. Do
+            // not join the background worker's network/persistence lifetime.
+            self.model_catalog_activity.note_activity_without_waiting();
+            return;
+        }
         // A periodic refresh must not hold up a consumer that can already use
         // an unexpired snapshot for the current account/provider. Identity
         // changes reset freshness before this check; explicit online requests
         // and cold/expired caches still join the first-refresh gate.
-        self.ensure_current_cache_identity().await;
         if strategy != RefreshStrategy::Online
             && self.model_catalog_activity.initial_refresh_wait_is_due()
             && !self.memory_is_fresh().await

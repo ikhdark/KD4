@@ -13,6 +13,13 @@ from .errors import CodexError
 from .models import Notification, UnknownNotification
 
 
+class _NotificationBufferFull(CodexError):
+    def __init__(self, *, item_limit: bool = False, oversized: bool = False) -> None:
+        super().__init__("notification buffer limit exceeded")
+        self.item_limit = item_limit
+        self.oversized = oversized
+
+
 class _BufferBudget:
     def __init__(self, max_items: int = 4096, max_bytes: int = 64 * 1024 * 1024) -> None:
         self.max_items = max_items
@@ -22,11 +29,6 @@ class _BufferBudget:
         self._lock = threading.Lock()
 
     def reserve(self, notification: Notification) -> int:
-        # Preserve the authoritative admission recheck below: another queue can
-        # reserve from this shared budget while accounting runs outside the lock.
-        with self._lock:
-            if self.items >= self.max_items:
-                raise CodexError("notification buffer limit exceeded")
         payload = notification.payload
         params = (
             payload.params
@@ -36,8 +38,10 @@ class _BufferBudget:
         # Default ensure_ascii=True makes character and UTF-8 byte counts equal.
         size = len(json.dumps({"method": notification.method, "params": params}))
         with self._lock:
+            if size > self.max_bytes:
+                raise _NotificationBufferFull(oversized=True)
             if self.items >= self.max_items or self.bytes + size > self.max_bytes:
-                raise CodexError("notification buffer limit exceeded")
+                raise _NotificationBufferFull(item_limit=self.items >= self.max_items)
             self.items += 1
             self.bytes += size
         return size
@@ -64,17 +68,23 @@ class _NotificationQueue:
         self.timeout_s = timeout_s
         self.deadline = time.monotonic() + timeout_s if operation_deadline else None
 
-    def put(self, item: Notification | BaseException) -> None:
+    def put(self, item: Notification | BaseException) -> bool:
         if isinstance(item, BaseException):
             self.fail(item)
-            return
+            return False
         with self._condition:
             if self._failure is not None:
-                return  # A route may be unregistered concurrently with delivery.
+                return False  # A route may be unregistered concurrently with delivery.
             size = self._budget.reserve(item)
             self._items.append((item, size))
             self._condition.notify()
             self._notify_async_locked()
+            return True
+
+    def buffered_size(self, *, items: bool = False) -> int:
+        """Return retained pressure for router-owned overflow isolation."""
+        with self._condition:
+            return len(self._items) if items else sum(size for _, size in self._items)
 
     def put_reserved(self, item: Notification, size: int) -> None:
         """Transfer an already charged early event without releasing its budget."""

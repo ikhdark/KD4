@@ -9071,6 +9071,14 @@
         "name": {
           "type": "string"
         },
+        "resourceErrors": {
+          "default": [],
+          "description": "Resource discovery errors for this server. Nonempty means its resource inventory is incomplete.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
         "resourceTemplates": {
           "items": {
             "$ref": "#/definitions/ResourceTemplate"

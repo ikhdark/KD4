@@ -1131,6 +1131,7 @@ impl ThreadManager {
 
     /// Roll back a newly spawned thread that failed before its creator could
     /// publish a successful response.
+    /// Returns true only after shutdown and persistence cleanup both succeed.
     #[doc(hidden)]
     pub async fn rollback_thread_spawn(
         &self,
@@ -1144,10 +1145,12 @@ impl ThreadManager {
         {
             return false;
         }
-        if let Err(err) = expected_thread.shutdown_and_wait().await {
+        let shutdown = expected_thread.shutdown_and_wait().await;
+        if let Err(err) = &shutdown {
             warn!("failed to shut down rolled-back thread {thread_id}: {err}");
         }
         rollback_created_thread_persistence(&self.state.thread_store, thread_id).await
+            && shutdown.is_ok()
     }
 
     /// Roll back a resumed thread that failed before its creator could publish

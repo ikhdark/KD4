@@ -136,6 +136,9 @@ impl RouteAwareRequestError {
             Self::Route(RouteAwareClientPoolError::Build(
                 BuildRouteAwareHttpClientError::InvalidProxyConfig { .. },
             )) => "local_proxy_configuration",
+            Self::Route(RouteAwareClientPoolError::Build(
+                BuildRouteAwareHttpClientError::OrderedProxyRoutesRequireFacade,
+            )) => "local_proxy_configuration",
             Self::Route(RouteAwareClientPoolError::BuildTask(_)) => "local_client_construction",
             Self::Build(_) => "request_validation",
             Self::UnsupportedRedirectScheme(_) | Self::TooManyRedirects => "redirect_policy",

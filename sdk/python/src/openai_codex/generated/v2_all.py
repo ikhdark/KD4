@@ -7619,6 +7619,13 @@ class McpServerStatus(BaseModel):
     )
     auth_status: Annotated[McpAuthStatus, Field(alias="authStatus")]
     name: str
+    resource_errors: Annotated[
+        list[str],
+        Field(
+            alias="resourceErrors",
+            description="Resource discovery errors for this server. Nonempty means its resource inventory is incomplete.",
+        ),
+    ] = []
     resource_templates: Annotated[list[ResourceTemplate], Field(alias="resourceTemplates")]
     resources: list[Resource]
     server_info: Annotated[McpServerInfo | None, Field(alias="serverInfo")] = None

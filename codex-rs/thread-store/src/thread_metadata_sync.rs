@@ -33,6 +33,9 @@ const THREAD_UPDATED_AT_TOUCH_INTERVAL: Duration = Duration::from_secs(5);
 /// filtering or making `append_items` infer metadata inside a `ThreadStore` implementation.
 pub(crate) struct ThreadMetadataSync {
     pub(crate) history_observation_uncertain: bool,
+    // An ambiguous append needs one ordering fence, independently of the
+    // metadata projection remaining stale until its recovery barrier.
+    pub(crate) append_ordering_uncertain: bool,
     thread_id: ThreadId,
     cwd_seen: bool,
     preview_seen: bool,
@@ -86,6 +89,7 @@ impl ThreadMetadataSync {
         Self {
             thread_id: params.thread_id,
             history_observation_uncertain: false,
+            append_ordering_uncertain: false,
             cwd_seen: !cwd.as_os_str().is_empty(),
             preview_seen: false,
             first_user_message_seen: false,
@@ -103,6 +107,7 @@ impl ThreadMetadataSync {
         let mut sync = Self {
             thread_id: params.thread_id,
             history_observation_uncertain: false,
+            append_ordering_uncertain: false,
             cwd_seen: params
                 .metadata
                 .cwd

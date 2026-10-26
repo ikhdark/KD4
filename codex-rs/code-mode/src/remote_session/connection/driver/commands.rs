@@ -52,9 +52,10 @@ impl ConnectionDriver {
             DriverCommand::Execute {
                 session,
                 request,
+                on_possible_execution,
                 caller_cancellation,
                 response_tx,
-            } => self.execute(session, request, caller_cancellation, response_tx),
+            } => self.execute(session, request, on_possible_execution, caller_cancellation, response_tx),
             DriverCommand::Wait {
                 session,
                 request,
@@ -129,6 +130,7 @@ impl ConnectionDriver {
         &mut self,
         session: RemoteSession,
         mut request: ExecuteRequest,
+        on_possible_execution: Box<dyn FnOnce() + Send>,
         caller_cancellation: CancellationToken,
         response_tx: oneshot::Sender<Result<DeliveredExecute, String>>,
     ) -> bool {
@@ -220,6 +222,7 @@ impl ConnectionDriver {
             request_id,
             PendingRequest::Execute {
                 session,
+                on_possible_execution,
                 response_tx,
                 initial_response_tx,
                 initial_response_rx,

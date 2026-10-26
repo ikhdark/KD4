@@ -37,6 +37,9 @@ struct ClientState {
     disconnect_token: CancellationToken,
     last_activity_at: Instant,
     last_inbound_seq_id: Option<u64>,
+    // Keep accepted identities across same-stream replacement until retirement.
+    // Count and serialized bytes share the existing ingress/message budgets.
+    admitted_initializes: Vec<(u64, JSONRPCMessage, usize)>,
     status_tx: watch::Sender<PongStatus>,
 }
 
@@ -157,7 +160,8 @@ impl ClientTracker {
             None if is_initialize => {
                 // TODO(ruslan): delete this fallback once all clients are updated to send stream_id.
                 self.legacy_stream_ids
-                    .remove(&client_id)
+                    .get(&client_id)
+                    .cloned()
                     .unwrap_or_else(StreamId::new_random)
             }
             None => self
@@ -178,6 +182,34 @@ impl ClientTracker {
         let client_key = (client_id.clone(), stream_id.clone());
         match event {
             ClientEvent::ClientMessage { message } => {
+                // Only an exact admitted replay is redundant. A new initialize,
+                // even with a reset sequence, still replaces the old generation.
+                let admitted_initialize_size = if is_initialize && seq_id.is_some() {
+                    let prior = self.clients.get(&client_key)
+                        .map(|client| client.admitted_initializes.as_slice()).unwrap_or_default();
+                    if prior.iter().any(|(admitted_seq_id, admitted, _)| {
+                        Some(*admitted_seq_id) == seq_id && admitted == &message
+                    }) {
+                        return Ok(());
+                    }
+                    let size = serde_json::to_vec(&message).map_err(|error| {
+                        warn!(%error, "failed to account initialize replay identity");
+                        Stopped
+                    })?.len();
+                    let retained_bytes: usize = prior.iter().map(|(_, _, size)| *size).sum();
+                    if prior.len() >= CHANNEL_CAPACITY
+                        || size > super::segment::REMOTE_CONTROL_REASSEMBLED_MAX_BYTES
+                            .saturating_sub(retained_bytes)
+                    {
+                        // Never evict an accepted identity and later replay its
+                        // effects. A new stream can start a fresh bounded ledger.
+                        warn!("remote control initialize replay identity capacity reached");
+                        return Err(Stopped);
+                    }
+                    Some(size)
+                } else {
+                    None
+                };
                 if let Some(seq_id) = seq_id
                     && let Some(client) = self.clients.get(&client_key)
                     && client
@@ -188,7 +220,9 @@ impl ClientTracker {
                     return Ok(());
                 }
 
-                if is_initialize && self.clients.contains_key(&client_key) {
+                let mut admitted_initializes = Vec::new();
+                if is_initialize && let Some(client) = self.clients.get_mut(&client_key) {
+                    admitted_initializes = std::mem::take(&mut client.admitted_initializes);
                     self.close_client(&client_key).await?;
                 }
 
@@ -239,12 +273,15 @@ impl ClientTracker {
                         disconnect_token,
                         last_activity_at: Instant::now(),
                         last_inbound_seq_id: None,
+                        admitted_initializes,
                         status_tx,
                     },
                 );
                 if is_legacy_stream_id {
                     self.legacy_stream_ids.insert(client_id.clone(), stream_id);
                 }
+                let admitted_initialize = seq_id.zip(admitted_initialize_size)
+                    .map(|(seq_id, size)| (seq_id, message.clone(), size));
                 if let Err(err) = self
                     .send_transport_event(TransportEvent::IncomingMessage {
                         connection_id,
@@ -260,6 +297,11 @@ impl ClientTracker {
                         self.cleanup.push(cleanup);
                     }
                     return Err(err);
+                }
+                if let Some(admitted_initialize) = admitted_initialize
+                    && let Some(client) = self.clients.get_mut(&client_key)
+                {
+                    client.admitted_initializes.push(admitted_initialize);
                 }
                 if !is_legacy_stream_id {
                     self.record_inbound_message_delivery(&client_key, seq_id);
@@ -358,6 +400,16 @@ impl ClientTracker {
                 (!remote_control_client_is_alive(client, now)).then_some(client_key.clone())
             })
             .collect()
+    }
+
+    pub(super) fn record_ack_activity(
+        &mut self,
+        client_key: &(ClientId, StreamId),
+        activity_at: Instant,
+    ) {
+        if let Some(client) = self.clients.get_mut(client_key) {
+            client.last_activity_at = client.last_activity_at.max(activity_at);
+        }
     }
 
     pub(super) async fn close_client(

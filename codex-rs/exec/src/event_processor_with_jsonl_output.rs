@@ -23,6 +23,7 @@ use codex_protocol::protocol::SessionConfiguredEvent;
 
 pub use crate::event_processor::CodexStatus;
 use crate::event_processor::EventProcessor;
+use crate::event_processor::bounded_progress_text;
 use crate::event_processor::handle_last_message;
 use crate::exec_events::AgentMessageItem;
 use crate::exec_events::CodeModeCellItem;
@@ -474,9 +475,7 @@ impl EventProcessorWithJsonOutput {
 
     fn map_started_item(&mut self, item: ThreadItem) -> Option<ExecThreadItem> {
         match item {
-            ThreadItem::AgentMessage { .. }
-            | ThreadItem::Plan { .. }
-            | ThreadItem::Reasoning { .. } => None,
+            ThreadItem::Plan { .. } | ThreadItem::Reasoning { .. } => None,
             other => {
                 let raw_id = other.id().to_string();
                 Self::map_item_with_id(other, || self.started_item_id(&raw_id))
@@ -490,7 +489,7 @@ impl EventProcessorWithJsonOutput {
             return Self::map_item_with_id(item, || self.started_item_id(&raw_id));
         }
         match &item {
-            ThreadItem::AgentMessage { .. } | ThreadItem::Reasoning { .. } => {
+            ThreadItem::Reasoning { .. } => {
                 Self::map_item_with_id(item, || self.next_item_id())
             }
             other => {
@@ -519,6 +518,12 @@ impl EventProcessorWithJsonOutput {
                     Some(ThreadEvent::ItemUpdated(ItemUpdatedEvent { item }))
                 } else {
                     self.raw_to_exec_item_id.remove(&raw_id);
+                    if matches!(
+                        &item.details,
+                        ThreadItemDetails::AgentMessage(_) | ThreadItemDetails::Plan(_)
+                    ) {
+                        self.completed_text_item_ids.insert(raw_id);
+                    }
                     Some(ThreadEvent::ItemCompleted(ItemCompletedEvent { item }))
                 }
             })
@@ -641,6 +646,12 @@ impl EventProcessorWithJsonOutput {
                 CodexStatus::Running
             }
             ServerNotification::ItemStarted(notification) => {
+                if self.completed_text_item_ids.contains(notification.item.id()) {
+                    return CollectedThreadEvents {
+                        events,
+                        status: CodexStatus::Running,
+                    };
+                }
                 let already_started = self
                     .raw_to_exec_item_id
                     .contains_key(notification.item.id());
@@ -680,6 +691,22 @@ impl EventProcessorWithJsonOutput {
                     } else {
                         events.push(ThreadEvent::ItemCompleted(ItemCompletedEvent { item }));
                     }
+                }
+                CodexStatus::Running
+            }
+            ServerNotification::AgentMessageDelta(notification) => {
+                if let Some(item_id) = self.raw_to_exec_item_id.get(&notification.item_id) {
+                    let (delta, truncated) = bounded_progress_text(notification.delta);
+                    events.push(ThreadEvent::ItemProgress(
+                        crate::exec_events::ItemProgressEvent {
+                            item_id: item_id.clone(),
+                            call_id: notification.item_id,
+                            progress: crate::exec_events::ItemProgress::AgentMessage {
+                                delta,
+                                truncated,
+                            },
+                        },
+                    ));
                 }
                 CodexStatus::Running
             }
@@ -894,20 +921,6 @@ impl EventProcessorWithJsonOutput {
 
         CollectedThreadEvents { events, status }
     }
-}
-
-// Bound each delta without accumulating or resending a growing transcript.
-fn bounded_progress_text(mut text: String) -> (String, bool) {
-    const MAX_PROGRESS_BYTES: usize = 16 * 1024;
-    if text.len() <= MAX_PROGRESS_BYTES {
-        return (text, false);
-    }
-    let mut end = MAX_PROGRESS_BYTES;
-    while !text.is_char_boundary(end) {
-        end -= 1;
-    }
-    text.truncate(end);
-    (text, true)
 }
 
 impl EventProcessor for EventProcessorWithJsonOutput {

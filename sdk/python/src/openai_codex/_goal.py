@@ -57,11 +57,17 @@ class _GoalOperationState:
     def observe(self, notification: Notification) -> bool:
         payload = notification.payload
         with self._condition:
+            if self._failure is not None:
+                return True  # Keep a failed private route quarantined until release.
             if not self._turn_routing_active and not isinstance(
                 payload,
                 ThreadGoalClearedNotification | ThreadGoalUpdatedNotification,
             ):
                 return False
+            # Retain before changing lifecycle state: overflow can be retried
+            # after another congested route is failed, without duplicate state.
+            if not self._notifications.put(notification):
+                return True
             if isinstance(payload, TurnStartedNotification):
                 if self.logical_turn_id is None:
                     self.logical_turn_id = payload.turn.id
@@ -85,7 +91,6 @@ class _GoalOperationState:
             ):
                 self._finished = True
             self._condition.notify_all()
-        self._notifications.put(notification)
         return True
 
     def activate_turn_routing(self) -> None:

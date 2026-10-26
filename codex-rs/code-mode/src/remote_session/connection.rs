@@ -378,12 +378,14 @@ impl Connection {
         &self,
         session: RemoteSession,
         request: ExecuteRequest,
+        on_possible_execution: Box<dyn FnOnce() + Send>,
     ) -> Result<StartedCell, String> {
         let cancellation = CallerCancellation::new();
         let (response_tx, response_rx) = oneshot::channel();
         self.send(DriverCommand::Execute {
             session,
             request,
+            on_possible_execution,
             caller_cancellation: cancellation.token(),
             response_tx,
         })
@@ -400,6 +402,10 @@ impl Connection {
             .map_err(|_| self.failure_message())?;
         cancellation.disarm();
         Ok(delivered.started)
+    }
+
+    pub(super) fn cell_is_current(session: &RemoteSession, cell_id: &CellId) -> bool {
+        driver::remote_cell_id(session, cell_id).is_ok()
     }
 
     /// Cancelling `release` asks the host to release this observer early while

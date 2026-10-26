@@ -2,6 +2,7 @@ use axum::http::HeaderMap;
 use axum::http::HeaderValue;
 use codex_api::SharedAuthProvider;
 use codex_login::AuthManager;
+use codex_login::CodexAuth;
 use codex_login::UnauthorizedRecovery;
 use std::io;
 use std::io::ErrorKind;
@@ -15,6 +16,7 @@ pub(super) const REMOTE_CONTROL_ACCOUNT_ID_HEADER: &str = "chatgpt-account-id";
 pub(super) struct RemoteControlConnectionAuth {
     pub(super) auth_provider: SharedAuthProvider,
     pub(super) account_id: String,
+    auth: CodexAuth,
 }
 
 impl RemoteControlConnectionAuth {
@@ -84,12 +86,14 @@ pub(super) async fn load_remote_control_auth(
                 "remote control enrollment is waiting for a ChatGPT account id",
             )
         })?,
+        auth,
     })
 }
 
 pub(super) async fn recover_remote_control_auth(
     auth_recovery: &mut UnauthorizedRecovery,
     auth_change_rx: &mut watch::Receiver<u64>,
+    rejected_auth: &RemoteControlConnectionAuth,
 ) -> bool {
     if !auth_recovery.has_next() {
         return false;
@@ -98,7 +102,7 @@ pub(super) async fn recover_remote_control_auth(
     let mode = auth_recovery.mode_name();
     let step = auth_recovery.step_name();
     let auth_change_revision_before_recovery = *auth_change_rx.borrow();
-    match auth_recovery.next().await {
+    match auth_recovery.next_with_auth(&rejected_auth.auth).await {
         Ok(step_result) => {
             if step_result.auth_state_changed() == Some(true) {
                 mark_recovery_auth_change_seen(

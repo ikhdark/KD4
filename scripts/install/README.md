@@ -21,7 +21,7 @@ platform npm archive layout is not probed or installed.
 ## Final builds
 
 `release` and `local-release` share the same settings: optimization level 3,
-Thin LTO, eight codegen units for workspace crates, one for dependencies, and
+Thin LTO, one codegen unit for workspace crates and dependencies, and
 incremental compilation disabled. `release` owns these settings; `local-release` inherits them
 without overrides so they cannot drift. Windows builds retain native CPU tuning,
 the 8 MiB stack, and static CRT from the shared Cargo configuration.
@@ -49,13 +49,14 @@ just publish-local-codex-fast -BuildOnly
 just publish-local-codex-fast
 ```
 
-The `local-fast` profile inherits release behavior, uses optimization level 2,
-disables LTO, enables incremental compilation, and uses 16 workspace codegen units
-and four dependency codegen units rather than the final profile's eight and one.
-It targets shorter rebuilds after local
-edits, at the cost of some runtime optimization. No speedup has been benchmarked.
-Only `icu_calendar` uses optimization level 0 in this profile to work around a
-Windows compiler `Missing .seh_endepilogue` error; final builds are unaffected.
+The `local-fast` profile prioritizes build speed, not runtime speed. It inherits
+release behavior (debug assertions and overflow checks remain disabled), uses
+optimization level 0, disables debug info and LTO, enables incremental compilation,
+and uses 16 workspace codegen units
+and four dependency codegen units rather than the final profile's one.
+It targets shorter rebuilds after local edits, at the cost of runtime optimization
+and source-level backtraces. No speedup has been benchmarked. All crates, including
+`icu_calendar`, use optimization level 0; final builds are unaffected.
 The first build warms a separate `codex-rs/target/publish-local-fast` cache;
 keep that directory for subsequent builds. Unchanged inputs and artifacts reuse
 the existing content-bound build stamp and skip Cargo entirely.

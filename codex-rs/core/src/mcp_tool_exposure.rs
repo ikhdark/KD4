@@ -89,31 +89,22 @@ pub(crate) fn resolve_selected_skill_mcp_exposure(
                     })
             })
             .collect::<BTreeSet<_>>();
-        let unavailable = declared_tools
-            .iter()
-            .filter(|entrypoint| {
-                !plugin.mcp_servers.contains_key(&entrypoint.server_name)
-                    || !all_mcp_tools.iter().any(|tool| {
-                        tool.server_name == entrypoint.server_name
-                            && tool.tool.name.as_ref() == entrypoint.tool_name
-                            && tool_is_model_visible(tool)
-                    })
-            })
-            .cloned()
-            .collect::<Vec<_>>();
-        if !unavailable.is_empty() {
-            for entrypoint in unavailable {
+        for entrypoint in declared_tools {
+            if plugin.mcp_servers.contains_key(&entrypoint.server_name)
+                && all_mcp_tools.iter().any(|tool| {
+                    tool.server_name == entrypoint.server_name
+                        && tool.tool.name.as_ref() == entrypoint.tool_name
+                        && tool_is_model_visible(tool)
+                })
+            {
+                result.selection.exact_tools.insert(entrypoint);
+            } else {
                 result.diagnostics.push(format!(
                     "plugin `{plugin_id}` skill `{skill_name}` declares unavailable MCP entrypoint `{}/{}`",
                     entrypoint.server_name, entrypoint.tool_name
                 ));
             }
-            result.diagnostics.push(format!(
-                "ignoring the invalid explicit toolExposure declaration for plugin `{plugin_id}` skill `{skill_name}`"
-            ));
-            continue;
         }
-        result.selection.exact_tools.extend(declared_tools);
     }
 
     let visible_tools = all_mcp_tools

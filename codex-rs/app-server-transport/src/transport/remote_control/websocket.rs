@@ -231,10 +231,10 @@ impl BoundedOutboundBuffer {
         stream_id: &StreamId,
         acked_seq_id: u64,
         acked_segment_id: Option<usize>,
-    ) {
+    ) -> bool {
         let key = (client_id.clone(), stream_id.clone());
         let Some(buffer) = self.buffer_by_stream.get_mut(&key) else {
-            return;
+            return false;
         };
         let acked_cursor = (acked_seq_id, acked_segment_id.unwrap_or(usize::MAX));
         // The single writer inserts sequence IDs and their segments in order.
@@ -251,6 +251,7 @@ impl BoundedOutboundBuffer {
         if buffer.is_empty() {
             self.buffer_by_stream.remove(&key);
         }
+        removed != 0
     }
 
     fn server_envelopes(&self) -> impl Iterator<Item = &BufferedServerEnvelope> {
@@ -328,14 +329,23 @@ async fn run_client_ingress(
                 continue;
             }
             _ = idle_sweep.tick() => {
-                let keys = tracker.expired_client_keys();
-                {
+                // The reader must never wait for the tracker lock to release
+                // ACK capacity while application forwarding is backpressured.
+                let keys = {
                     let mut state = state.lock().await;
+                    // Linearize ACK publication and the expiry decision. An ACK
+                    // accepted before this cutoff must participate in liveness.
+                    let activity = std::mem::take(&mut state.last_ack_activity_by_stream);
+                    for (key, activity_at) in activity {
+                        tracker.record_ack_activity(&key, activity_at);
+                    }
+                    let keys = tracker.expired_client_keys();
                     for (client, stream) in &keys {
                         state.client_segment_reassembler.invalidate_stream(client, stream);
                         state.invalidate_client_message_stream(client, stream);
                     }
-                }
+                    keys
+                };
                 for key in keys {
                     if tracker.close_client(&key).await.is_err() { return; }
                 }
@@ -360,6 +370,7 @@ struct WebsocketState {
     outbound_buffer: BoundedOutboundBuffer,
     subscribe_cursor: Option<String>,
     next_seq_id_by_stream: HashMap<(ClientId, StreamId), u64>,
+    last_ack_activity_by_stream: HashMap<(ClientId, StreamId), tokio::time::Instant>,
     last_completed_client_chunk_seq_id_by_stream: HashMap<(ClientId, Option<StreamId>), u64>,
     client_segment_reassembler: ClientSegmentReassembler,
 }
@@ -423,17 +434,28 @@ impl WebsocketState {
                 .insert(key, seq_id);
         }
         if let Some((client_id, stream_id, seq_id, segment_id)) = delivery.ack {
-            self.outbound_buffer
-                .ack(&client_id, &stream_id, seq_id, segment_id);
+            self.record_ack(&client_id, &stream_id, seq_id, segment_id);
+        }
+    }
+
+    fn record_ack(&mut self, client_id: &ClientId, stream_id: &StreamId, seq_id: u64, segment_id: Option<usize>) {
+        if self.outbound_buffer.ack(client_id, stream_id, seq_id, segment_id) {
+            // Confirmed consumption is activity; merely generating or buffering
+            // output is not proof that this virtual subscriber is alive.
+            self.last_ack_activity_by_stream.insert(
+                (client_id.clone(), stream_id.clone()), tokio::time::Instant::now(),
+            );
         }
     }
 
     fn invalidate_client_message_stream(&mut self, client_id: &ClientId, stream_id: &StreamId) {
+        self.last_ack_activity_by_stream.remove(&(client_id.clone(), stream_id.clone()));
         self.last_completed_client_chunk_seq_id_by_stream
             .remove(&(client_id.clone(), Some(stream_id.clone())));
     }
 
     fn invalidate_client_message_client(&mut self, client_id: &ClientId) {
+        self.last_ack_activity_by_stream.retain(|(client, _), _| client != client_id);
         self.last_completed_client_chunk_seq_id_by_stream
             .retain(|(cursor_client_id, _), _| cursor_client_id != client_id);
     }
@@ -675,6 +697,7 @@ impl RemoteControlWebsocket {
                 outbound_buffer,
                 subscribe_cursor: None,
                 next_seq_id_by_stream: HashMap::new(),
+                last_ack_activity_by_stream: HashMap::new(),
                 last_completed_client_chunk_seq_id_by_stream: HashMap::new(),
                 client_segment_reassembler: ClientSegmentReassembler::default(),
             })),
@@ -1262,6 +1285,7 @@ impl RemoteControlWebsocket {
         state.outbound_buffer.used_tx.send_replace(0);
         state.subscribe_cursor = None;
         state.next_seq_id_by_stream.clear();
+        state.last_ack_activity_by_stream.clear();
         state.last_completed_client_chunk_seq_id_by_stream.clear();
         state.client_segment_reassembler = ClientSegmentReassembler::default();
         self.transport_enrollment = None;
@@ -1597,7 +1621,7 @@ impl RemoteControlWebsocket {
             if let Some((client_id, stream_id, seq_id, segment_id)) = delivery.ack.take() {
                 // ACK resource effects are independent of application admission,
                 // but its subscribe cursor remains behind the completed prefix.
-                state.lock().await.outbound_buffer.ack(&client_id, &stream_id, seq_id, segment_id);
+                state.lock().await.record_ack(&client_id, &stream_id, seq_id, segment_id);
                 let _ = completion_tx.send(Ok(false));
             } else {
                 ingress_tx.try_send((client_envelope, completion_tx))
@@ -2035,6 +2059,7 @@ async fn prepare_remote_control_enrollment(
                 if recover_remote_control_auth(
                     auth_context.auth_recovery,
                     auth_context.auth_change_rx,
+                    &auth,
                 )
                 .await
                 {
@@ -2211,6 +2236,7 @@ async fn enroll_and_persist_remote_control_server(
                 && recover_remote_control_auth(
                     auth_context.recovery.auth_recovery,
                     auth_context.recovery.auth_change_rx,
+                    auth_context.auth,
                 )
                 .await =>
         {

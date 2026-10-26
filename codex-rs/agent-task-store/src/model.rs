@@ -1331,6 +1331,9 @@ pub struct AgentTask {
     /// Empty on legacy records whose admission provenance was not captured.
     #[serde(default)]
     pub dependency_admissions: Vec<DependencyAdmission>,
+    /// Current durable prerequisite authority at this read, not filesystem freshness.
+    #[serde(default)]
+    pub dependency_blockers: Vec<DependencyBlocker>,
     pub current_attempt: Attempt,
     pub gates: Vec<AgentGate>,
     pub receipt: Option<AgentReceipt>,

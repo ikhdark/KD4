@@ -108,13 +108,22 @@ impl AnalyticsSession {
             self.ensure_identity()
                 .await
                 .map_err(|error| RequestError::Other(anyhow::anyhow!(error)))?;
-            let result = request(self.client.clone()).await;
+            // A separate provider records the credentials attached to this
+            // request, not another concurrent Analytics request's headers.
+            let request_auth = codex_model_provider::auth_provider_from_auth_manager(
+                Arc::clone(&self.auth_manager),
+                &self.auth,
+            );
+            let result = request(self.client.clone().with_auth_provider(Arc::clone(&request_auth))).await;
             // Keep the original 401 when recovery fails so callers retain sign-in guidance.
-            if result.as_ref().is_err_and(RequestError::is_unauthorized)
-                && recovery.has_next()
-                && recovery.next().await.is_ok()
-            {
-                continue;
+            if result.as_ref().is_err_and(RequestError::is_unauthorized) && recovery.has_next() {
+                let refreshed = match request_auth.auth_recovery_revision() {
+                    Some(revision) => recovery.next_with_auth_revision(revision, Some(&self.auth)).await,
+                    None => recovery.next_with_auth(&self.auth).await,
+                };
+                if refreshed.is_ok() {
+                    continue;
+                }
             }
             self.ensure_identity()
                 .await

@@ -50,7 +50,7 @@ python -B scripts/build/benchmark_lto_runtime.py
 This builds **the actual `codex` CLI and `codex-code-mode-host`**, sequentially
 through the existing `lto-runtime` build lane: `baseline` and `fat`.
 The baseline inherits the frozen source's `local-release` profile without any
-profile overrides. Currently that means `lto = "thin"`, eight codegen units for
+profile overrides. Currently that means `lto = "thin"`, one codegen unit for
 workspace crates, one for dependencies, and incremental compilation disabled. Windows
 target flags also enable `target-cpu=native` for every variant. There is no separate LTO-disabled
 candidate. The baseline is rebuilt from matched source, not taken from the
@@ -59,8 +59,9 @@ are cleared for all builds; baseline means repository configuration.
 
 The FatLTO candidate also inherits `local-release`, but overrides LTO,
 speed optimization to 3, workspace codegen units to 16, and incremental
-compilation to off. Thus comparison against baseline is a configuration
-comparison, not an isolated LTO experiment. The native CPU screening candidate
+compilation to off. With the default 16 codegen units, both LTO and partitioning
+differ from the current baseline; use `--codegen-units 1` to change only LTO.
+The native CPU screening candidate
 is redundant with the current Windows baseline; opt-level 2 changes only that
 setting relative to baseline. Null variant fields
 in the report mean inherited settings, not disabled optimization.
@@ -154,4 +155,3 @@ native Desktop UI, Internet/provider latency, model reasoning quality, arbitrary
 coding tasks, or multi-agent coordination. It cannot establish the universally
 fastest `.exe` or a live-task speedup. For those claims, additionally compare
 matched real coding sessions through KDR with independently verified outcomes.
-

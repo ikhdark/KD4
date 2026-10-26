@@ -1,5 +1,6 @@
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
+use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 
 use codex_agent_identity::AgentIdentityKey;
@@ -354,6 +355,7 @@ struct AuthManagerAuthProvider {
     expected_scope: ProviderAccountScope,
     expected_epoch: u64,
     projection: Option<SharedAuthProvider>,
+    last_request_auth_revision: AtomicU64,
 }
 
 struct ManagedDispatchGuard {
@@ -372,7 +374,7 @@ impl codex_http_client::RequestDispatchGuard for ManagedDispatchGuard {
 impl AuthManagerAuthProvider {
     fn with_projection<T>(
         &self,
-        apply: impl FnOnce(&dyn AuthProvider) -> Result<T, AuthError>,
+        apply: impl FnOnce(&dyn AuthProvider, u64) -> Result<T, AuthError>,
     ) -> Result<T, AuthError> {
         self.auth_manager
             .check_auth_load()
@@ -393,13 +395,18 @@ impl AuthManagerAuthProvider {
             .projection
             .clone()
             .unwrap_or_else(|| auth_provider_from_auth(&auth));
+        let revision = self.auth_manager.auth_revision_for_snapshot(&auth).unwrap_or(u64::MAX);
         self.auth_manager
-            .with_policy_auth_epoch(epoch, || apply(projection.as_ref()))
+            .with_policy_auth_epoch(epoch, || apply(projection.as_ref(), revision))
             .map_err(|err| AuthError::Build(err.to_string()))?
     }
 }
 
 impl AuthProvider for AuthManagerAuthProvider {
+    fn auth_recovery_revision(&self) -> Option<u64> {
+        Some(self.last_request_auth_revision.load(Ordering::Acquire))
+    }
+
     fn dispatch_guard(&self) -> Option<Arc<dyn codex_http_client::RequestDispatchGuard>> {
         Some(Arc::new(ManagedDispatchGuard {
             manager: Arc::clone(&self.auth_manager),
@@ -422,12 +429,19 @@ impl AuthProvider for AuthManagerAuthProvider {
     }
 
     fn auth_header_telemetry(&self) -> codex_api::AuthHeaderTelemetry {
-        self.with_projection(|projection| Ok(projection.auth_header_telemetry()))
+        self.with_projection(|projection, _| Ok(projection.auth_header_telemetry()))
             .unwrap_or_default()
     }
 
     fn try_add_auth_headers(&self, headers: &mut HeaderMap) -> Result<(), AuthError> {
-        self.with_projection(|projection| projection.try_add_auth_headers(headers))
+        self.with_projection(|projection, revision| {
+            projection.try_add_auth_headers(headers)?;
+            // The projected snapshot may already have been replaced while the
+            // request was being prepared. Its rejection must not rotate the new
+            // credentials. MAX is an unmatched/stale revision, not fresh auth.
+            self.last_request_auth_revision.store(revision, Ordering::Release);
+            Ok(())
+        })
     }
 }
 
@@ -528,6 +542,7 @@ pub(crate) async fn resolve_provider_auth_for_scope(
             expected_scope: ProviderAccountScope::from_auth(Some(expected)),
             expected_epoch,
             projection,
+            last_request_auth_revision: AtomicU64::new(u64::MAX),
         });
     }
     Ok(resolved)
@@ -649,6 +664,7 @@ pub fn auth_provider_from_auth_manager(
         expected_scope: ProviderAccountScope::from_auth(Some(expected_auth)),
         expected_epoch,
         projection: None,
+        last_request_auth_revision: AtomicU64::new(u64::MAX),
     })
 }
 

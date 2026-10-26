@@ -1843,6 +1843,7 @@ pub struct UnauthorizedRecovery {
     expected_account_id: Option<String>,
     mode: UnauthorizedRecoveryMode,
     expected_epoch: u64,
+    replacement_retried: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1888,6 +1889,7 @@ impl UnauthorizedRecovery {
             expected_account_id,
             expected_epoch,
             mode,
+            replacement_retried: false,
         }
     }
 
@@ -1967,6 +1969,34 @@ impl UnauthorizedRecovery {
     }
 
     pub async fn next(&mut self) -> Result<UnauthorizedRecoveryStepResult, RefreshTokenError> {
+        let revision = *self.manager.auth_change_tx.borrow();
+        self.next_with_rejected_revision(Some(revision), None).await
+    }
+
+    /// Recover credentials from a request that used this immutable auth snapshot.
+    pub async fn next_with_auth(
+        &mut self,
+        rejected_auth: &CodexAuth,
+    ) -> Result<UnauthorizedRecoveryStepResult, RefreshTokenError> {
+        let revision = self.manager.auth_revision_for_snapshot(rejected_auth);
+        self.next_with_rejected_revision(revision, Some(rejected_auth)).await
+    }
+
+    /// The revision must come from the request's actual credential projection,
+    /// not from recovery construction or the time its 401 response arrives.
+    pub async fn next_with_auth_revision(
+        &mut self,
+        rejected_revision: u64,
+        rejected_auth: Option<&CodexAuth>,
+    ) -> Result<UnauthorizedRecoveryStepResult, RefreshTokenError> {
+        self.next_with_rejected_revision(Some(rejected_revision), rejected_auth).await
+    }
+
+    async fn next_with_rejected_revision(
+        &mut self,
+        rejected_revision: Option<u64>,
+        rejected_auth: Option<&CodexAuth>,
+    ) -> Result<UnauthorizedRecoveryStepResult, RefreshTokenError> {
         if !self.has_next() {
             return Err(RefreshTokenError::Permanent(RefreshTokenFailedError::new(
                 RefreshTokenFailedReason::Other,
@@ -1974,19 +2004,38 @@ impl UnauthorizedRecovery {
             )));
         }
 
-        let (current_epoch, current_auth) = self.manager.policy_auth_snapshot()?;
+        let (current_epoch, current_revision, current_auth) = self.manager.recovery_auth_snapshot()?;
         if self.mode == UnauthorizedRecoveryMode::External
             && self.expected_epoch == Self::UNRESOLVED_EXTERNAL_EPOCH
             && let Some(auth) = current_auth.as_ref()
         {
+            if let Some(rejected) = rejected_auth
+                && (auth.api_auth_mode() != rejected.api_auth_mode()
+                    || auth.get_account_id() != rejected.get_account_id()
+                    || auth.get_chatgpt_user_id() != rejected.get_chatgpt_user_id()
+                    || auth.account_plan_type() != rejected.account_plan_type()
+                    || auth.uses_codex_backend() != rejected.uses_codex_backend()
+                    || auth.lifecycle_id() != rejected.lifecycle_id())
+            {
+                self.step = UnauthorizedRecoveryStep::Done;
+                return Err(permanent_external_auth_error(
+                    REFRESH_TOKEN_ACCOUNT_MISMATCH_MESSAGE,
+                ));
+            }
             self.expected_epoch = current_epoch;
             self.expected_account_id = auth.get_account_id();
         }
-        if current_epoch != self.expected_epoch {
+        if current_epoch != self.expected_epoch
+            || current_auth.as_ref().and_then(CodexAuth::get_account_id)
+                != self.expected_account_id
+        {
             self.step = UnauthorizedRecoveryStep::Done;
             return Err(permanent_external_auth_error(
                 REFRESH_TOKEN_ACCOUNT_MISMATCH_MESSAGE,
             ));
+        }
+        if rejected_revision.is_none_or(|revision| current_revision != revision) {
+            return Ok(self.reuse_replacement());
         }
         match self.step {
             UnauthorizedRecoveryStep::Reload => {
@@ -2017,24 +2066,32 @@ impl UnauthorizedRecovery {
                 }
             }
             UnauthorizedRecoveryStep::RefreshToken => {
-                self.manager
+                let refreshed = self.manager
                     .refresh_token_for_recovery(
                         self.expected_epoch,
                         self.expected_account_id.as_deref(),
+                        rejected_revision,
                     )
                     .await?;
+                if !refreshed {
+                    return Ok(self.reuse_replacement());
+                }
                 self.step = UnauthorizedRecoveryStep::Done;
                 return Ok(UnauthorizedRecoveryStepResult {
                     auth_state_changed: Some(true),
                 });
             }
             UnauthorizedRecoveryStep::ExternalRefresh => {
-                self.manager
+                let refreshed = self.manager
                     .refresh_token_for_recovery(
                         self.expected_epoch,
                         self.expected_account_id.as_deref(),
+                        rejected_revision,
                     )
                     .await?;
+                if !refreshed {
+                    return Ok(self.reuse_replacement());
+                }
                 self.step = UnauthorizedRecoveryStep::Done;
                 return Ok(UnauthorizedRecoveryStepResult {
                     auth_state_changed: Some(true),
@@ -2045,6 +2102,23 @@ impl UnauthorizedRecovery {
         Ok(UnauthorizedRecoveryStepResult {
             auth_state_changed: None,
         })
+    }
+
+    fn reuse_replacement(&mut self) -> UnauthorizedRecoveryStepResult {
+        self.step = match self.step {
+            UnauthorizedRecoveryStep::Reload => UnauthorizedRecoveryStep::RefreshToken,
+            _ if self.replacement_retried => UnauthorizedRecoveryStep::Done,
+            UnauthorizedRecoveryStep::RefreshToken => UnauthorizedRecoveryStep::RefreshToken,
+            UnauthorizedRecoveryStep::ExternalRefresh => UnauthorizedRecoveryStep::ExternalRefresh,
+            UnauthorizedRecoveryStep::Done => UnauthorizedRecoveryStep::Done,
+        };
+        // Reusing a predecessor's credentials is not an authority refresh. Keep
+        // that step available if the replacement itself is rejected, but allow
+        // only one such extra retry so concurrent rotation cannot sustain a loop.
+        self.replacement_retried = true;
+        UnauthorizedRecoveryStepResult {
+            auth_state_changed: Some(true),
+        }
     }
 }
 
@@ -2271,6 +2345,20 @@ impl AuthManager {
         Ok((cached.policy_epoch, cached.auth.clone()))
     }
 
+    /// Request credential revision, or None when this snapshot is already stale.
+    /// Read the revision while holding the cache lock that publishes it.
+    pub fn auth_revision_for_snapshot(&self, auth: &CodexAuth) -> Option<u64> {
+        let cached = self.inner.read().ok()?;
+        Self::auths_equal_for_refresh(Some(auth), cached.auth.as_ref())
+            .then(|| *self.auth_change_tx.borrow())
+    }
+
+    fn recovery_auth_snapshot(&self) -> std::io::Result<(u64, u64, Option<CodexAuth>)> {
+        let cached = self.inner.read()
+            .map_err(|_| std::io::Error::other("auth lock is poisoned"))?;
+        Ok((cached.policy_epoch, *self.auth_change_tx.borrow(), cached.auth.clone()))
+    }
+
     /// Linearize a synchronous policy publication against identity transitions.
     /// The callback must not re-enter this manager or perform blocking work.
     pub fn with_policy_auth_epoch<T>(
@@ -2470,6 +2558,9 @@ impl AuthManager {
     }
 
     fn publish_auth_load(&self, result: std::io::Result<Option<CodexAuth>>) -> bool {
+        let preserve_cached_auth = result
+            .as_ref()
+            .is_err_and(|err| err.kind() == std::io::ErrorKind::WouldBlock);
         let (auth, error) = match result {
             Ok(auth) => (auth, None),
             Err(err) => (
@@ -2479,6 +2570,12 @@ impl AuthManager {
         };
         if let Ok(mut current) = self.load_error.write() {
             *current = error;
+        }
+        if preserve_cached_auth {
+            // A busy lifecycle transaction is not a logout. Keep the identity
+            // anchor, but retain the load error so dispatch still fails closed
+            // until a successful reload establishes the current credentials.
+            return false;
         }
         self.set_cached_auth(auth)
     }
@@ -3040,13 +3137,14 @@ impl AuthManager {
         &self,
         epoch: u64,
         account: Option<&str>,
-    ) -> Result<(), RefreshTokenError> {
+        rejected_revision: Option<u64>,
+    ) -> Result<bool, RefreshTokenError> {
         let _guard = self
             .refresh_lock
             .acquire()
             .await
             .map_err(|_| std::io::Error::other("auth refresh lock closed"))?;
-        let (current_epoch, auth) = self.policy_auth_snapshot()?;
+        let (current_epoch, current_revision, auth) = self.recovery_auth_snapshot()?;
         if current_epoch != epoch
             || auth.as_ref().and_then(CodexAuth::get_account_id).as_deref() != account
         {
@@ -3054,7 +3152,14 @@ impl AuthManager {
                 REFRESH_TOKEN_ACCOUNT_MISMATCH_MESSAGE,
             ));
         }
-        self.refresh_token_from_snapshot(auth).await
+        if rejected_revision.is_none_or(|revision| current_revision != revision) {
+            // A preceding recovery replaced the rejected credentials while we
+            // waited. Retry those credentials instead of rotating them again.
+            // Identity/eligibility checks above must still run on this path.
+            return Ok(false);
+        }
+        self.refresh_token_from_snapshot(auth).await?;
+        Ok(true)
     }
 
     async fn refresh_token_from_snapshot(

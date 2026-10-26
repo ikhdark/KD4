@@ -130,7 +130,7 @@ impl ToolExecutor<ToolCall> for ListTool {
             };
             if catalog.continuation.is_some()
                 && !catalog.discovery_blocked()
-                && (args.cursor.is_none() || start == skills.len())
+                && (start == skills.len() || (!search && args.cursor.is_none()))
             {
                 drop(skills);
                 catalog = self

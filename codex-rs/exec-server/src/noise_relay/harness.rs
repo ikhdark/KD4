@@ -19,7 +19,6 @@ use tracing::debug;
 use tracing::info;
 use uuid::Uuid;
 
-use crate::ExecServerError;
 use crate::connection::CHANNEL_CAPACITY;
 use crate::connection::JsonRpcConnection;
 use crate::connection::JsonRpcConnectionEvent;
@@ -302,6 +301,9 @@ where
         let mut next_outbound_seq = 0u32;
         let mut inbound_ciphertexts = OrderedCiphertextFrames::default();
         let mut inbound_decoder = JsonRpcMessageDecoder::default();
+        // One reordered ciphertext batch is bounded by OrderedCiphertextFrames.
+        // Do not read another batch until this one has reached bounded delivery.
+        let mut pending_inbound: std::collections::VecDeque<Vec<u8>> = std::collections::VecDeque::new();
         let mut keepalive = tokio::time::interval_at(
             tokio::time::Instant::now() + WEBSOCKET_KEEPALIVE_INTERVAL,
             WEBSOCKET_KEEPALIVE_INTERVAL,
@@ -314,6 +316,16 @@ where
         let mut frames_drained_after_pong_deadline = 0usize;
         let mut normal_close = false;
         'relay: loop {
+            if delivery.len() < CHANNEL_CAPACITY {
+                match inbound_decoder.push_with_limit(&[], CHANNEL_CAPACITY - delivery.len()) {
+                    Ok(messages) => delivery.extend(messages.into_iter().map(JsonRpcConnectionEvent::Message)),
+                    Err(error) => { send_malformed(&incoming_tx, error.to_string()); break; }
+                }
+            }
+            if !delivery.is_empty() {
+                delivery_deadline.get_or_insert_with(|| tokio::time::Instant::now() + WEBSOCKET_PONG_TIMEOUT);
+            }
+            let can_read = delivery.len() < CHANNEL_CAPACITY && pending_inbound.is_empty();
             let now = tokio::time::Instant::now();
             let gap_deadline = inbound_ciphertexts.gap_deadline();
             if gap_deadline.is_some_and(|deadline| deadline <= now) {
@@ -325,19 +337,23 @@ where
                 send_disconnected(&incoming_tx, &disconnected_tx, "application_backpressure".into());
                 return;
             }
-            let pong_expired = pong_watchdog.deadline().is_some_and(|deadline| deadline <= now);
+            // A Pong cannot be observed while we deliberately pause socket reads.
+            // Keep the existing application-stall deadline instead of declaring
+            // a healthy peer dead merely because its consumer is backpressured.
+            let pong_deadline = can_read.then(|| pong_watchdog.deadline()).flatten();
+            let pong_expired = pong_deadline.is_some_and(|deadline| deadline <= now);
             if pong_expired && (frames_drained_after_pong_deadline >= MAX_FRAMES_DRAINED_AFTER_PONG_DEADLINE
                 || std::pin::Pin::new(&mut reader).peek().now_or_never().is_none()) {
                 send_disconnected(&incoming_tx, &disconnected_tx, WEBSOCKET_PONG_TIMEOUT_REASON.into());
                 return;
             }
             // Give due keepalives priority over another data fragment.
-            if sink.is_some() && pong_watchdog.deadline().is_none() && keepalive.tick().now_or_never().is_some() {
+            if can_read && sink.is_some() && pong_watchdog.deadline().is_none() && keepalive.tick().now_or_never().is_some() {
                 writing = sink.take().map(|sink| Box::pin(write_owned(sink, Message::Ping(Vec::new().into()), true)));
                 ping_in_flight = true;
                 pong_during_ping = false;
             }
-            let next_deadline = [gap_deadline, delivery_deadline, pong_watchdog.deadline()]
+            let next_deadline = [gap_deadline, delivery_deadline, pong_deadline]
                 .into_iter().flatten().min();
             tokio::select! {
                 _ = async {
@@ -371,7 +387,7 @@ where
                     if let Some(event) = delivery.pop_front() { permit.send(event); }
                     delivery_deadline = (!delivery.is_empty()).then(|| tokio::time::Instant::now() + WEBSOCKET_PONG_TIMEOUT);
                 }
-                _ = keepalive.tick(), if sink.is_some() && pong_watchdog.deadline().is_none() => {
+                _ = keepalive.tick(), if can_read && sink.is_some() && pong_watchdog.deadline().is_none() => {
                     writing = sink.take().map(|sink| Box::pin(write_owned(sink, Message::Ping(Vec::new().into()), true)));
                 ping_in_flight = true;
                 pong_during_ping = false;
@@ -400,7 +416,18 @@ where
                     let message = Message::Binary(encode_relay_message_frame(&frame).into());
                     writing = sink.take().map(|sink| Box::pin(write_owned(sink, message, false)));
                 }
-                incoming = reader.next() => {
+                _ = std::future::ready(()), if delivery.len() < CHANNEL_CAPACITY && !pending_inbound.is_empty() => {
+                    let Some(ciphertext) = pending_inbound.pop_front() else { continue; };
+                    let plaintext = match transport.decrypt(&ciphertext) {
+                        Ok(plaintext) => plaintext,
+                        Err(error) => { send_malformed(&incoming_tx, format!("Noise relay decryption failed: {error}")); break; }
+                    };
+                    match inbound_decoder.push_with_limit(&plaintext, CHANNEL_CAPACITY - delivery.len()) {
+                        Ok(messages) => delivery.extend(messages.into_iter().map(JsonRpcConnectionEvent::Message)),
+                        Err(error) => { send_malformed(&incoming_tx, error.to_string()); break; }
+                    }
+                }
+                incoming = reader.next(), if can_read => {
                     // The deadline may have elapsed while select was waiting, even
                     // if the socket branch wins over the timer in this poll.
                     if pong_watchdog.deadline().is_some_and(|deadline| deadline <= tokio::time::Instant::now()) {
@@ -415,21 +442,10 @@ where
                             if frame.stream_id != stream_id { continue; }
                             match frame.validate() {
                                 Ok(RelayFrameBodyKind::Data) => {
-                                    let result = frame.into_data().and_then(|data| {
-                                        for ciphertext in inbound_ciphertexts.push(data.seq, data.payload)? {
-                                            let plaintext = transport.decrypt(&ciphertext).map_err(|error|
-                                                ExecServerError::Protocol(format!("Noise relay decryption failed: {error}")))?;
-                                            for message in inbound_decoder.push(&plaintext)? {
-                                                if delivery.len() >= CHANNEL_CAPACITY {
-                                                    return Err(ExecServerError::Protocol("Noise relay application staging queue is full".into()));
-                                                }
-                                                delivery.push_back(JsonRpcConnectionEvent::Message(message));
-                                            }
-                                        }
-                                        Ok(())
-                                    });
-                                    if let Err(error) = result { send_malformed(&incoming_tx, error.to_string()); break 'relay; }
-                                    if !delivery.is_empty() { delivery_deadline.get_or_insert_with(|| tokio::time::Instant::now() + WEBSOCKET_PONG_TIMEOUT); }
+                                    match frame.into_data().and_then(|data| inbound_ciphertexts.push(data.seq, data.payload)) {
+                                        Ok(ciphertexts) => pending_inbound.extend(ciphertexts),
+                                        Err(error) => { send_malformed(&incoming_tx, error.to_string()); break 'relay; }
+                                    }
                                 }
                                 Ok(RelayFrameBodyKind::Reset) => {
                                     send_disconnected(&incoming_tx, &disconnected_tx, NOISE_RELAY_RESET_DISCONNECT_REASON.into());

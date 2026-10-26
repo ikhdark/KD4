@@ -951,10 +951,10 @@ impl LocalAgentTaskStore {
         if assignment.integration_plan == IntegrationPlan::TypedIntegratorRequired {
             next_required_action = Some("required destination-bound integration evidence is unavailable; isolated completion is not integration".into());
         }
-        let dependency_admissions = sqlx::query_scalar::<_, String>(
-            "SELECT body_json FROM dependency_admissions WHERE assignment_id = ? ORDER BY dependency_id",
-        ).bind(assignment_id.to_string()).fetch_all(&mut *transaction).await?
-            .into_iter().map(|body| decode(&body)).collect::<StoreResult<Vec<crate::DependencyAdmission>>>()?;
+        let dependency_admissions = load_dependency_admissions_tx(&mut transaction, assignment_id).await?;
+        let dependency_blockers = dependency_authority_blockers_tx(
+            &mut transaction, &assignment, &dependency_admissions,
+        ).await?;
         let criterion_assessments = source_inspection::assess_with_calls_tx(
             &mut transaction, &assignment, &current_attempt,
             receipt.as_ref().map_or(&[], |receipt| receipt.criterion_results.as_slice()),
@@ -966,11 +966,23 @@ impl LocalAgentTaskStore {
         {
             next_required_action = Some("source-inspection evidence is no longer applicable; recover the criterion assessment before consuming this result".into());
         }
+        if !dependency_blockers.is_empty() {
+            let dependency_action = "prerequisite authority is unavailable or changed; recover dependency_blockers before consuming this result or create a replacement assignment against current prerequisites";
+            if let Some(action) = &mut next_required_action {
+                action.push_str("; ");
+                action.push_str(dependency_action);
+            } else {
+                next_required_action = Some(dependency_action.into());
+            }
+        }
+        let stale_reason = (!dependency_blockers.is_empty())
+            .then(|| "dependency authority no longer matches admission".to_string());
         transaction.commit().await?;
         hydrate_task_capsule(&self.pool, &self.coordination_root, &mut assignment).await?;
         Ok(AgentTask {
             assignment,
             dependency_admissions,
+            dependency_blockers,
             current_attempt,
             gates,
             receipt,
@@ -981,7 +993,7 @@ impl LocalAgentTaskStore {
                 last_progress_at,
                 lease_state,
                 pending_gates,
-                stale_reason: None,
+                stale_reason,
                 next_required_action,
                 nudge_sent_at,
             },
@@ -1628,6 +1640,13 @@ LIMIT 1
         if capsule_snapshot.as_ref().is_some_and(|(snapshot, _)| snapshot.task_capsule != assignment.task_capsule) {
             return Err(StoreError::InvalidTaskCapsule("capsule authority changed before completion".into()));
         }
+        if draft.status == AgentStatusClaim::Completed {
+            let admissions = load_dependency_admissions_tx(&mut transaction, assignment.assignment_id).await?;
+            let blockers = dependency_authority_blockers_tx(&mut transaction, &assignment, &admissions).await?;
+            if !blockers.is_empty() {
+                return Err(StoreError::DependencyBlocked { blockers });
+            }
+        }
         if host_legacy_outcome {
             if !matches!(
                 assignment.admission_origin,
@@ -2067,8 +2086,7 @@ LIMIT 1
                 (GateKind::Review, GateStatus::Failed)
                     | (GateKind::Verification, GateStatus::Failed | GateStatus::ChangesRequested)
             ) || kind == GateKind::Review
-                && status == GateStatus::ChangesRequested
-                && attempt.ordinal > 0)
+                && status == GateStatus::ChangesRequested)
         {
             transition_attempt_to_needs_main_tx(&mut transaction, &attempt).await?;
             append_observation_tx(
@@ -4308,7 +4326,7 @@ async fn load_receipt_tx(
                     (GateKind::Review, GateStatus::Failed)
                     | (GateKind::Verification, GateStatus::Failed | GateStatus::ChangesRequested))
                     || gate.kind == GateKind::Review
-                        && gate.status == GateStatus::ChangesRequested && attempt.ordinal > 0);
+                        && gate.status == GateStatus::ChangesRequested);
         }
     }
     if row.get::<String, _>("attempt_id") != attempt.attempt_id.to_string()
@@ -4476,6 +4494,125 @@ async fn validate_dependencies_tx(
     repository_id: Option<&str>,
     dependencies: &[AssignmentId],
 ) -> StoreResult<Vec<crate::DependencyAdmission>> {
+    let admitted = validate_direct_dependencies_tx(transaction, candidate_id, repository_id, dependencies, &[]).await?;
+    // Follow prerequisite provenance iteratively: a sealed intermediate result
+    // cannot hide a superseded input. One database snapshot, no recursive tasks
+    // or cross-transaction freshness cache; shared DAG nodes are visited once.
+    let mut pending = dependencies.to_vec();
+    let mut visited = HashSet::new();
+    while let Some(dependency_id) = pending.pop() {
+        if !visited.insert(dependency_id) {
+            continue;
+        }
+        let dependency = load_assignment_tx(transaction, dependency_id).await?;
+        let judged_targets = judged_dependency_targets(&dependency);
+        let current = validate_direct_dependencies_tx(
+            transaction, dependency_id, Some(&dependency.repository_id), &dependency.dependencies,
+            judged_targets,
+        ).await?;
+        let captured = load_dependency_admissions_tx(transaction, dependency_id).await?;
+        let blockers = compare_dependency_admissions(&dependency.dependencies, &captured, &current);
+        if !blockers.is_empty() {
+            return Err(StoreError::DependencyBlocked { blockers });
+        }
+        pending.extend(dependency.dependencies.iter().copied()
+            .filter(|dependency_id| !judged_targets.contains(dependency_id)));
+    }
+    Ok(admitted)
+}
+
+async fn load_dependency_admissions_tx(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    assignment_id: AssignmentId,
+) -> StoreResult<Vec<crate::DependencyAdmission>> {
+    sqlx::query_scalar::<_, String>(
+        "SELECT body_json FROM dependency_admissions WHERE assignment_id = ? ORDER BY dependency_id",
+    ).bind(assignment_id.to_string()).fetch_all(&mut **transaction).await?
+        .into_iter().map(|body| decode(&body)).collect()
+}
+
+fn compare_dependency_admissions(
+    dependencies: &[AssignmentId],
+    captured: &[crate::DependencyAdmission],
+    current: &[crate::DependencyAdmission],
+) -> Vec<DependencyBlocker> {
+    dependencies.iter().filter_map(|dependency_id| {
+        let pin = captured.iter().find(|pin| pin.assignment_id == *dependency_id);
+        let authority = current.iter().find(|authority| authority.assignment_id == *dependency_id);
+        match (pin, authority) {
+            (Some(pin), Some(authority))
+                if pin.attempt_id == authority.attempt_id
+                    && pin.receipt_sha256 == authority.receipt_sha256 => None,
+            (Some(_), Some(_)) => Some(DependencyBlocker {
+                assignment_id: *dependency_id,
+                state: DependencyState::Blocked,
+                detail: "dependency attempt or sealed receipt changed since admission; create a replacement assignment against current prerequisites".into(),
+            }),
+            _ => Some(DependencyBlocker {
+                assignment_id: *dependency_id,
+                state: DependencyState::Unknown,
+                detail: "dependency admission provenance or current authority is unavailable".into(),
+            }),
+        }
+    }).collect()
+}
+
+fn judged_dependency_targets(assignment: &Assignment) -> &[AssignmentId] {
+    assignment.relation.as_ref().filter(|relation| matches!(
+        (assignment.role, relation.kind),
+        (AgentRole::Reviewer, RelationKind::Review)
+            | (AgentRole::Verifier, RelationKind::Verification)
+    )).map(|relation| relation.target_assignment_ids.as_slice()).unwrap_or_default()
+}
+
+async fn dependency_authority_blockers_tx(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    assignment: &Assignment,
+    captured: &[crate::DependencyAdmission],
+) -> StoreResult<Vec<DependencyBlocker>> {
+    // A review/verification target is an immutable object being judged, not
+    // an accepted input. Its own negative verdict must not prevent the judge
+    // from sealing a report. A new target attempt still invalidates that pin.
+    let judged_targets = judged_dependency_targets(assignment);
+    let prerequisites = assignment.dependencies.iter().copied()
+        .filter(|dependency| !judged_targets.contains(dependency)).collect::<Vec<_>>();
+    match validate_dependencies_tx(
+        transaction, assignment.assignment_id, Some(&assignment.repository_id), &prerequisites,
+    ).await {
+        Ok(mut current) => {
+            let mut blockers = Vec::new();
+            for target_id in judged_targets {
+                let target = load_current_attempt_tx(transaction, *target_id).await?;
+                if let Some((receipt, body)) = load_receipt_tx(transaction, &target).await? {
+                    current.push(crate::DependencyAdmission {
+                        assignment_id: *target_id,
+                        attempt_id: receipt.attempt_id,
+                        receipt_sha256: hash_bytes(body.as_bytes()),
+                        gates: Vec::new(),
+                    });
+                } else {
+                    blockers.push(DependencyBlocker {
+                        assignment_id: *target_id,
+                        state: DependencyState::Incomplete,
+                        detail: "review/verification target has no current sealed receipt".into(),
+                    });
+                }
+            }
+            blockers.extend(compare_dependency_admissions(&assignment.dependencies, captured, &current));
+            Ok(blockers)
+        }
+        Err(StoreError::DependencyBlocked { blockers }) => Ok(blockers),
+        Err(error) => Err(error),
+    }
+}
+
+async fn validate_direct_dependencies_tx(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    candidate_id: AssignmentId,
+    repository_id: Option<&str>,
+    dependencies: &[AssignmentId],
+    judged_targets: &[AssignmentId],
+) -> StoreResult<Vec<crate::DependencyAdmission>> {
     let mut blockers = Vec::new();
     let mut admitted = Vec::new();
     // One transaction-local adjacency observation for overlapping DAG roots.
@@ -4544,6 +4681,15 @@ async fn validate_dependencies_tx(
             });
             continue;
         };
+        if judged_targets.contains(dependency) {
+            admitted.push(crate::DependencyAdmission {
+                assignment_id: *dependency,
+                attempt_id: receipt.attempt_id,
+                receipt_sha256: hash_bytes(receipt_json.as_bytes()),
+                gates: Vec::new(),
+            });
+            continue;
+        }
         if dependency_attempt.state == AttemptState::NeedsMain {
             blockers.push(DependencyBlocker {
                 assignment_id: *dependency,
@@ -4586,6 +4732,17 @@ async fn validate_dependencies_tx(
                 )));
             }
             if matches!(gate.kind, GateKind::Review | GateKind::Verification) {
+                // Pending review remains deliberately speculative. Only an
+                // explicit verdict bound to the current attempt fences it.
+                if matches!(gate.status, GateStatus::Failed | GateStatus::ChangesRequested | GateStatus::Violated) {
+                    let verdict = sqlx::query_scalar::<_, String>(
+                        "SELECT body_json FROM gate_verdicts WHERE attempt_id = ? AND kind = ?",
+                    ).bind(dependency_attempt.attempt_id.to_string()).bind(encode(&gate.kind)?)
+                        .fetch_optional(&mut **transaction).await?;
+                    if verdict.as_deref() == Some(encode(&gate)?.as_str()) {
+                        blocking_gates.push((gate.kind, gate.status));
+                    }
+                }
                 continue;
             }
             if !matches!(gate.status, GateStatus::Passed | GateStatus::Waived)

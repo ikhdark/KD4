@@ -48,6 +48,18 @@ the primary thread. Web-search `id` is the exec item identity; `call_id` preserv
 the provider identity. Known malformed envelopes and lifecycle mutations after a
 terminal are rejected. A fatal finalization error may follow `turn.completed`:
 always drain the process and inspect its outcome.
+If the stream reaches EOF without `turn.completed` or `turn.failed`, iteration
+throws after delivering the events already received; partial output is not completion.
+
+Live model text arrives as `item.progress` with `kind: "agent_message"` and `delta`.
+It shares `item_id` with the enclosing `item.started` / `item.completed` records.
+Each progress text payload is capped at 16 KiB of UTF-8 before JSON encoding and marks
+display reduction with `truncated`. Serialized records also include metadata and may be larger;
+progress is provisional, not accepted final text. Replace it with the complete
+`item.completed` snapshot rather than appending the snapshot to the deltas. `run()`
+still resolves only after terminal completion and retains observed partial text in
+`TurnRunError` on failure. Human exec progress is on stderr; canonical stdout and
+last-message files still contain only the accepted final answer.
 
 ```typescript
 const { events } = await thread.runStreamed("Diagnose the test failure and propose a fix");

@@ -697,7 +697,7 @@ fn wait_agent_timeout_options(turn_context: &TurnContext) -> WaitAgentTimeoutOpt
     }
 }
 
-fn is_hidden_by_code_mode_only(
+pub(crate) fn is_hidden_by_code_mode_only(
     turn_context: &TurnContext,
     tool_name: &ToolName,
     exposure: ToolExposure,

@@ -158,6 +158,10 @@ where
     let path_entry_guard = prepare_path_aliases();
     let current_exe = std::env::current_exe().ok();
 
+    if let Err(error) = codex_process_hardening::disable_execution_speed_throttling() {
+        eprintln!("WARNING: could not disable automatic background CPU throttling: {error}");
+    }
+
     // Regular invocation. Run the async entry point on a thread with the same
     // stack budget as Tokio workers; `Runtime::block_on` otherwise runs the
     // top-level future on the caller's OS stack.

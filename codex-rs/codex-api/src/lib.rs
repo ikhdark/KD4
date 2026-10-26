@@ -116,6 +116,7 @@ pub use crate::search::SportsToolName;
 pub use crate::search::TimeOperation;
 pub use crate::search::WeatherOperation;
 pub use crate::telemetry::SseCleanupOutcome;
+pub use crate::telemetry::ProviderObservation;
 pub use crate::telemetry::SsePollPhase;
 pub use crate::telemetry::SseTelemetry;
 pub use crate::telemetry::WebsocketTelemetry;

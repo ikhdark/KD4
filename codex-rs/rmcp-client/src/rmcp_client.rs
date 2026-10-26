@@ -767,8 +767,18 @@ impl RmcpClient {
         params: Option<PaginatedRequestParams>,
         timeout: Option<Duration>,
     ) -> Result<ListToolsResult> {
+        self.request_tools_page_with_timing(params, timeout)
+            .await
+            .map(|(result, _)| result)
+    }
+
+    async fn request_tools_page_with_timing(
+        &self,
+        params: Option<PaginatedRequestParams>,
+        timeout: Option<Duration>,
+    ) -> Result<(ListToolsResult, Duration)> {
         let result = self
-            .run_service_operation("tools/list", timeout, move |service, tracker| {
+            .run_service_operation_with_timing("tools/list", timeout, move |service, tracker| {
                 let request = params
                     .clone()
                     .map(ListToolsRequest::with_param)
@@ -789,8 +799,9 @@ impl RmcpClient {
                 .boxed()
             })
             .await;
+        let persist_start = Instant::now();
         self.persist_oauth_tokens().await;
-        result
+        result.map(|(result, active_time)| (result, active_time + persist_start.elapsed()))
     }
 
     #[instrument(level = "trace", skip_all)]
@@ -801,6 +812,19 @@ impl RmcpClient {
     ) -> Result<ListToolsWithConnectorIdResult> {
         let result = self.request_tools_page(params, timeout).await?;
         Ok(Self::tools_with_connector_ids(result))
+    }
+
+    /// Reports active time so a multi-page catalog can share one timeout budget
+    /// without charging interactive elicitation waits to that budget.
+    pub async fn list_tools_with_connector_ids_with_timing(
+        &self,
+        params: Option<PaginatedRequestParams>,
+        timeout: Option<Duration>,
+    ) -> Result<(ListToolsWithConnectorIdResult, Duration)> {
+        let (result, active_time) = self.request_tools_page_with_timing(params, timeout).await?;
+        let conversion_start = Instant::now();
+        let result = Self::tools_with_connector_ids(result);
+        Ok((result, active_time + conversion_start.elapsed()))
     }
 
     fn tools_with_connector_ids(result: ListToolsResult) -> ListToolsWithConnectorIdResult {
@@ -1390,7 +1414,23 @@ impl RmcpClient {
         F: Fn(Arc<RunningClientService>, OperationRequestTracker) -> Fut,
         Fut: std::future::Future<Output = std::result::Result<T, rmcp::service::ServiceError>>,
     {
+        self.run_service_operation_with_timing(label, timeout, operation)
+            .await
+            .map(|(result, _)| result)
+    }
+
+    async fn run_service_operation_with_timing<T, F, Fut>(
+        &self,
+        label: &str,
+        timeout: Option<Duration>,
+        operation: F,
+    ) -> Result<(T, Duration)>
+    where
+        F: Fn(Arc<RunningClientService>, OperationRequestTracker) -> Fut,
+        Fut: std::future::Future<Output = std::result::Result<T, rmcp::service::ServiceError>>,
+    {
         let tracker = OperationRequestTracker::new(self.elicitation_pause_state.clone());
+        let started = tracker.pause_state.timing.borrow().active_time();
         let mut cancellation_guard = OperationCancellationGuard::new(tracker.clone());
         let operation_future =
             self.run_service_operation_with_recovery(label, tracker.clone(), &operation);
@@ -1404,6 +1444,7 @@ impl RmcpClient {
             {
                 Ok(result) => result,
                 Err(()) => {
+                    let tracker = tracker.clone();
                     tokio::spawn(async move {
                         tracker.cancel_current("request timeout").await;
                     });
@@ -1417,7 +1458,13 @@ impl RmcpClient {
             None => operation_future.await,
         };
         cancellation_guard.disarm();
-        result
+        let active_time = tracker
+            .pause_state
+            .timing
+            .borrow()
+            .active_time()
+            .saturating_sub(started);
+        result.map(|result| (result, active_time))
     }
 
     async fn run_service_operation_with_recovery<T, F, Fut>(

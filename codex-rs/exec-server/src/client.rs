@@ -127,6 +127,7 @@ pub(crate) use recovery::is_retryable_registry_error;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const INITIALIZE_TIMEOUT: Duration = Duration::from_secs(10);
 const ENVIRONMENT_INFO_TIMEOUT: Duration = Duration::from_secs(30);
+const FILE_READ_RPC_TIMEOUT: Duration = Duration::from_secs(30);
 pub(crate) const PROCESS_START_TIMEOUT: Duration = Duration::from_secs(30);
 pub(crate) const PROCESS_TERMINATION_TIMEOUT: Duration = Duration::from_secs(30);
 const PROCESS_EVENT_CHANNEL_CAPACITY: usize = 256;
@@ -1266,7 +1267,18 @@ impl ExecServerClient {
         P: serde::Serialize,
         T: serde::de::DeserializeOwned,
     {
-        map_rpc_call_result(rpc_client.call(method, params).await)
+        // Handle reads are bounded operations, not caller-selected exec long polls
+        // or HTTP streams. A live socket/Pong does not prove their handler replied.
+        // Reuse the RPC deadline, including queue admission, without retrying an
+        // exchange or extending this policy to intentionally long-lived methods.
+        let result = if matches!(method, FS_OPEN_METHOD | FS_READ_BLOCK_METHOD) {
+            rpc_client
+                .call_with_timeout(method, params, FILE_READ_RPC_TIMEOUT)
+                .await
+        } else {
+            rpc_client.call(method, params).await
+        };
+        map_rpc_call_result(result)
     }
 
     async fn call_for_cleanup<P, T>(&self, method: &str, params: &P) -> Result<T, ExecServerError>

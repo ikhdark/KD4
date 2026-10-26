@@ -55,31 +55,10 @@ async fn connect_route(
     tcp_nodelay: TcpNodelay,
 ) -> Result<(ConnectionInner, Response), WebSocketError> {
     let disable_nagle = tcp_nodelay == TcpNodelay::Enabled;
-    let proxy_url = match proxy_route {
+    let routes = match proxy_route {
         OutboundProxyRoute::TransportDefault => {
             // The workspace enables tokio-tungstenite's `proxy` feature, so its default dialer
             // resolves HTTP_PROXY, HTTPS_PROXY, ALL_PROXY, and NO_PROXY before opening the socket.
-            let (stream, response) = connect_async_tls_with_config(
-                request,
-                Some(config),
-                disable_nagle,
-                Some(Connector::Rustls(tls_config)),
-            )
-            .await?;
-            return Ok((ConnectionInner::TransportDefault(stream), response));
-        }
-        OutboundProxyRoute::Direct => None,
-        OutboundProxyRoute::Proxy {
-            url,
-            no_proxy: None,
-        } => Some(url),
-        OutboundProxyRoute::Proxy {
-            url,
-            no_proxy: Some(_),
-        } => {
-            // Let Tungstenite apply its complete NO_PROXY semantics. Its environment parser does
-            // not accept HTTPS proxy URLs, but that error occurs only after it decides the target
-            // is not bypassed, so retry that case through the explicit TLS-to-proxy path below.
             match connect_async_tls_with_config(
                 request.clone(),
                 Some(config),
@@ -91,16 +70,63 @@ async fn connect_route(
                 Ok((stream, response)) => {
                     return Ok((ConnectionInner::TransportDefault(stream), response));
                 }
-                Err(WebSocketError::Url(UrlError::UnsupportedProxyScheme)) => Some(url),
+                Err(WebSocketError::Url(UrlError::UnsupportedProxyScheme)) => {
+                    // The environment parser has already applied NO_PROXY, but it cannot
+                    // establish TLS to an HTTPS proxy. Reuse our explicit TLS tunnel path.
+                    vec![OutboundProxyRoute::Proxy {
+                        url: https_proxy_from_env(&request).ok_or(WebSocketError::Url(
+                            UrlError::UnsupportedProxyScheme,
+                        ))?,
+                        no_proxy: None,
+                    }]
+                }
                 Err(error) => return Err(error),
             }
         }
+        OutboundProxyRoute::Fallback { routes } => routes,
+        route => vec![route],
     };
 
+    let mut routes = routes.into_iter().peekable();
+    let stream = loop {
+        let route = routes.next().ok_or_else(invalid_proxy_config)?;
+        match connect_routed_stream(&request, &tls_config, route, tcp_nodelay).await {
+            Ok(stream) => break stream,
+            Err(_) if routes.peek().is_some() => continue,
+            Err(error) => return Err(error),
+        }
+    };
+
+    // A WebSocket handshake is sent at most once. Only TCP/proxy tunnel setup
+    // above can advance to another explicitly supplied PAC candidate.
+    let (stream, response) = client_async_tls_with_config(
+        request,
+        stream,
+        Some(config),
+        Some(Connector::Rustls(tls_config)),
+    ).await?;
+    Ok((ConnectionInner::Routed(stream), response))
+}
+
+async fn connect_routed_stream(
+    request: &Request,
+    tls_config: &Arc<ClientConfig>,
+    route: OutboundProxyRoute,
+    tcp_nodelay: TcpNodelay,
+) -> Result<Box<dyn AsyncIo>, WebSocketError> {
+    let proxy_url = match route {
+        OutboundProxyRoute::Direct => None,
+        OutboundProxyRoute::Proxy { url, no_proxy } => {
+            let bypass = no_proxy.as_deref().is_some_and(|no_proxy| no_proxy_matches(no_proxy, request.uri()));
+            (!bypass).then_some(url)
+        }
+        // Resolved PAC plans are flat and never rediscover ambient policy.
+        OutboundProxyRoute::Fallback { .. } | OutboundProxyRoute::TransportDefault => return Err(invalid_proxy_config()),
+    };
     let stream: Box<dyn AsyncIo> = match proxy_url {
         None => {
-            let host = websocket_host(&request)?;
-            let port = websocket_port(&request)?;
+            let host = websocket_host(request)?;
+            let port = websocket_port(request)?;
             Box::new(
                 connect_tcp(host_port(host, port), tcp_nodelay)
                     .await
@@ -109,14 +135,14 @@ async fn connect_route(
         }
         Some(url) => {
             let proxy = ProxyEndpoint::parse(&url)?;
-            let host = websocket_host(&request)?;
-            let port = websocket_port(&request)?;
+            let host = websocket_host(request)?;
+            let port = websocket_port(request)?;
             let stream = connect_tcp(proxy.config.authority(), tcp_nodelay)
                 .await
                 .map_err(WebSocketError::Io)?;
             let stream: Box<dyn AsyncIo> = if proxy.tls {
                 let server_name = proxy_server_name(&proxy.config.host)?;
-                let stream = TlsConnector::from(Arc::clone(&tls_config))
+                let stream = TlsConnector::from(Arc::clone(tls_config))
                     .connect(server_name, stream)
                     .await
                     .map_err(WebSocketError::Io)?;
@@ -128,14 +154,29 @@ async fn connect_route(
         }
     };
 
-    let (stream, response) = client_async_tls_with_config(
-        request,
-        stream,
-        Some(config),
-        Some(Connector::Rustls(tls_config)),
-    )
-    .await?;
-    Ok((ConnectionInner::Routed(stream), response))
+    Ok(stream)
+}
+
+/// Match Tungstenite's environment precedence only after it rejects a non-bypassed proxy scheme.
+/// Keep all supported routes and NO_PROXY handling in the transport's existing parser.
+fn https_proxy_from_env(request: &Request) -> Option<String> {
+    let env_value = |upper: &str, lower: &str| {
+        std::env::var(upper)
+            .or_else(|_| std::env::var(lower))
+            .ok()
+            .filter(|value| !value.is_empty())
+    };
+    let proxy = match request.uri().scheme_str() {
+        Some("wss") => env_value("HTTPS_PROXY", "https_proxy")
+            .or_else(|| env_value("HTTP_PROXY", "http_proxy")),
+        Some("ws") => env_value("HTTP_PROXY", "http_proxy"),
+        _ => None,
+    }
+    .or_else(|| env_value("ALL_PROXY", "all_proxy"))?;
+    url::Url::parse(&proxy)
+        .ok()
+        .filter(|url| url.scheme() == "https")
+        .map(|_| proxy)
 }
 
 /// Proxy settings can carry credentials, and Tungstenite's environment parser echoes the value it
@@ -145,6 +186,54 @@ fn redact_proxy_config_error(error: WebSocketError) -> WebSocketError {
         WebSocketError::Url(UrlError::InvalidProxyConfig(_)) => invalid_proxy_config(),
         error => error,
     }
+}
+
+// Apply Tungstenite's host/suffix/port bypass semantics to the resolved value,
+// not to a second read of the process environment.
+fn no_proxy_matches(no_proxy: &str, uri: &tokio_tungstenite::tungstenite::http::Uri) -> bool {
+    let Some(host) = uri.host() else { return false };
+    let host = host
+        .strip_prefix('[')
+        .and_then(|host| host.strip_suffix(']'))
+        .unwrap_or(host);
+    let port = uri.port_u16().unwrap_or(if uri.scheme_str() == Some("wss") { 443 } else { 80 });
+    let no_proxy = no_proxy.trim();
+    if no_proxy == "*" {
+        return true;
+    }
+    no_proxy.split(',').map(str::trim).any(|entry| {
+        if entry.is_empty() {
+            return false;
+        }
+        let (entry_host, entry_port) = if entry.starts_with('[') {
+            if let Some(close) = entry.find(']') {
+                let host = &entry[..=close];
+                let remainder = &entry[close + 1..];
+                (host, remainder.strip_prefix(':').and_then(|port| port.parse::<u16>().ok()))
+            } else {
+                (entry, None)
+            }
+        } else if entry.matches(':').count() == 1 {
+            entry.rsplit_once(':').map_or((entry, None), |(host, port)| {
+                (host, port.parse::<u16>().ok())
+            })
+        } else {
+            (entry, None)
+        };
+        if entry_port.is_some_and(|entry_port| entry_port != port) { return false; }
+        let entry_host = entry_host
+            .strip_prefix('[')
+            .and_then(|host| host.strip_suffix(']'))
+            .unwrap_or(entry_host);
+        if host == entry_host {
+            return true;
+        }
+        if let Some(suffix) = entry_host.strip_prefix('.') {
+            host == suffix || host.ends_with(&format!(".{suffix}"))
+        } else {
+            host.ends_with(&format!(".{entry_host}"))
+        }
+    })
 }
 
 /// `ProxyConfig` keeps the URI brackets around an IPv6 literal, which rustls rejects as a name.

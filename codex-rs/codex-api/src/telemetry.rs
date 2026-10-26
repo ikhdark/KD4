@@ -62,7 +62,20 @@ impl SseCleanupOutcome {
     }
 }
 
+/// Content-free, admitted provider control event. Receipt time is NOT server execution time.
+#[derive(Debug)]
+pub struct ProviderObservation {
+    pub phase: &'static str,
+    pub response_id: Option<String>,
+    pub created_at: Option<f64>,
+    pub completed_at: Option<f64>,
+    pub safety_buffering: bool,
+    pub invalid_source_fields: bool,
+}
+
 pub trait SseTelemetry: Send + Sync {
+    fn on_provider_observation(&self, _observation: ProviderObservation) {}
+
     fn on_sse_poll(
         &self,
         result: &Result<
@@ -92,6 +105,8 @@ pub trait SseTelemetry: Send + Sync {
 
 /// Telemetry for Responses WebSocket transport.
 pub trait WebsocketTelemetry: Send + Sync {
+    fn on_provider_observation(&self, _observation: ProviderObservation) {}
+
     /// Fresh parsed response evidence; never called for replayed handshake metadata.
     fn on_response_event(&self) {}
     /// Stable local connection correlation, not a provider receipt or credential.

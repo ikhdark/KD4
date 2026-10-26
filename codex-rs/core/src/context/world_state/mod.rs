@@ -693,7 +693,17 @@ impl WorldState {
                     {
                         // Like explicit source removal, revoking prior policy is
                         // required control context, not an optional catalog excerpt.
-                        fragments.push(Box::new(WorldStateContextFragment(withdrawal)));
+                        let withdrawal = WorldStateContextFragment(withdrawal);
+                        let rendered = withdrawal.render();
+                        if !budget.try_take(&rendered) {
+                            // Required revocation stays whole, but its overflow
+                            // must not leave allowance for later optional sections.
+                            budget = ModelContextBudget::new(0);
+                        }
+                        fragments.push(Box::new(RenderedContextFragment::new(
+                            withdrawal.role(),
+                            rendered,
+                        )));
                     }
                     for (fragment, rendered) in delivery.into_iter().zip(rendered) {
                         if section.records_delivery() {

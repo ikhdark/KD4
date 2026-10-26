@@ -429,18 +429,61 @@ pub(crate) fn parse_mcp_input_schema(input: JsonValue) -> Result<JsonSchema, ser
     if let Ok(schema) = parse_owned_tool_input_schema(input.clone()) {
         return Ok(schema);
     }
+    // Root definition entries keep their identity through projection. Refs to
+    // relocated applicators, external resources or nested $id scopes do not.
+    let definitions = mcp_projection_has_single_resource(&input, true).then(|| {
+        DEFINITION_TABLE_KEYS
+            .into_iter()
+            .flat_map(|table| {
+                input.get(table).and_then(JsonValue::as_object).into_iter()
+                    .flat_map(move |entries| {
+                        entries.keys().map(move |name| DefinitionPointer {
+                            table,
+                            name: name.clone(),
+                        })
+                    })
+            })
+            .collect::<BTreeSet<_>>()
+    });
     let mut projected = input;
-    project_mcp_schema(&mut projected);
+    project_mcp_schema(&mut projected, definitions.as_ref());
     parse_owned_tool_input_schema(projected)
 }
 
-fn project_mcp_schema(value: &mut JsonValue) {
-    // This lossy presentation can relocate or remove referenced schema nodes.
-    // Widen the entire reference node (including draft-07 ignored siblings)
-    // rather than publish a dangling reference or introduce new constraints.
-    if value.get("$ref").is_some() {
-        *value = json!({});
-        return;
+fn mcp_projection_has_single_resource(value: &JsonValue, root: bool) -> bool {
+    match value {
+        JsonValue::Array(values) => values
+            .iter()
+            .all(|value| mcp_projection_has_single_resource(value, false)),
+        JsonValue::Object(map) => {
+            let mut single = root || !map.contains_key("$id");
+            for_each_schema_child(map, DefinitionTraversal::Include, &mut |child| {
+                single &= mcp_projection_has_single_resource(child, false);
+            });
+            single
+        }
+        _ => true,
+    }
+}
+
+fn project_mcp_schema(value: &mut JsonValue, definitions: Option<&BTreeSet<DefinitionPointer>>) {
+    if let Some(reference) = value.get("$ref") {
+        let stable = definitions.is_some_and(|definitions| {
+            reference.as_str().is_some_and(|reference| {
+                reference == "#"
+                    || (reference.strip_prefix('#')
+                        .and_then(|fragment| urlencoding::decode(fragment).ok())
+                        .is_some_and(|pointer| pointer.split('/').count() == 3)
+                        && parse_local_definition_ref(reference)
+                            .is_some_and(|pointer| definitions.contains(&pointer)))
+            })
+        });
+        // Widen an unproven reference node including draft-07 ignored siblings,
+        // never publishing dangling refs or accidentally imposing its siblings.
+        if !stable {
+            *value = json!({});
+            return;
+        }
     }
     if value == &JsonValue::Bool(false) {
         *value = json!({});
@@ -477,7 +520,7 @@ fn project_mcp_schema(value: &mut JsonValue) {
     for key in ["properties", "$defs", "definitions"] {
         if let Some(JsonValue::Object(children)) = map.get_mut(key) {
             for child in children.values_mut() {
-                project_mcp_schema(child);
+                project_mcp_schema(child, definitions);
             }
         }
     }
@@ -488,14 +531,14 @@ fn project_mcp_schema(value: &mut JsonValue) {
         if let Some(child) = map.get_mut(key) {
             // additionalProperties:false is representable and must stay closed.
             if key != "additionalProperties" || !child.is_boolean() {
-                project_mcp_schema(child);
+                project_mcp_schema(child, definitions);
             }
         }
     }
     for key in COMPOSITION_SCHEMA_KEYS {
         if let Some(JsonValue::Array(children)) = map.get_mut(key) {
             for child in children {
-                project_mcp_schema(child);
+                project_mcp_schema(child, definitions);
             }
         }
     }

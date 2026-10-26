@@ -162,6 +162,10 @@ pub trait ContextContributor: Send + Sync {
 /// value created by the host, not in these inputs.
 pub trait ThreadLifecycleContributor<C: Sync>: Send + Sync {
     /// Called after host startup has initialized the thread-scoped store.
+    ///
+    /// Startup callbacks share a 30-second host phase budget. They must yield
+    /// cooperatively and be cancellation safe: timeout or panic fails thread
+    /// initialization. Keep external cleanup owned when this future is dropped.
     fn on_thread_start<'a>(&'a self, input: ThreadStartInput<'a, C>) -> ExtensionFuture<'a, ()> {
         Box::pin(async move {
             let _self = self;

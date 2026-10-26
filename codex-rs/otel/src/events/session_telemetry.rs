@@ -1585,8 +1585,49 @@ impl SessionTelemetry {
         )
     }
 
+    /// Content-free attempt receipts are also available to trace-only captures.
+    pub fn model_attempt_telemetry_enabled(&self) -> bool {
+        self.model_attempt_logging_enabled()
+            || tracing::enabled!(
+                target: crate::targets::OTEL_TRACE_SAFE_TARGET,
+                tracing::Level::INFO
+            )
+    }
+
     /// Emits only the explicit allowlist in [`ModelAttemptTelemetry`].
     pub fn model_attempt_completed(&self, record: &ModelAttemptTelemetry) {
+        trace_event!(self,
+            event.name = if record.details_only { "codex.model_attempt_details" } else { "codex.model_attempt" },
+            schema_version = 2_u32,
+            clock_id = %record.clock_id,
+            attempt_started_us = record.attempt_started_us,
+            dispatch_boundary = "client_transport_submission",
+            turn_id = record.turn_id.as_deref(),
+            generation_index = record.generation_index,
+            sampling_request_id = %record.sampling_request_id,
+            attempt_id = %record.attempt_id,
+            retry_index = record.retry_index,
+            retry_reason = record.retry_reason.as_str(),
+            outcome = record.outcome.as_str(),
+            request_kind = record.request_kind.as_str(),
+            transport = record.transport.as_str(),
+            input_token_count = record.input_tokens,
+            cached_input_token_count = record.cached_input_tokens,
+            output_token_count = record.output_tokens,
+            reasoning_output_token_count = record.reasoning_output_tokens,
+            total_token_count = record.total_tokens,
+            request_construction_us = record.request_construction_us,
+            queue_us = record.queue_us,
+            connection_setup_us = record.connection_setup_us,
+            transport_us = record.transport_us,
+            dispatch_ready_us = record.dispatch_ready_us,
+            stream_established_us = record.stream_established_us,
+            first_provider_event_us = record.first_provider_event_us,
+            first_model_output_us = record.first_model_output_us,
+            first_actionable_output_us = record.first_actionable_output_us,
+            first_visible_output_us = record.first_visible_output_us,
+            completed_us = record.completed_us,
+        );
         if !self.model_attempt_logging_enabled() {
             return;
         }

@@ -1176,7 +1176,7 @@ async fn enroll_pairing_server(
         Err(err) if err.kind() == io::ErrorKind::PermissionDenied => {
             let mut auth_recovery = auth_manager.unauthorized_recovery();
             let mut auth_change_rx = auth_manager.auth_change_receiver();
-            if !recover_remote_control_auth(&mut auth_recovery, &mut auth_change_rx).await {
+            if !recover_remote_control_auth(&mut auth_recovery, &mut auth_change_rx, auth).await {
                 return Err(err);
             }
             *auth = load_remote_control_auth(auth_manager)
@@ -1242,7 +1242,7 @@ async fn refresh_pairing_enrollment(
     {
         let mut auth_recovery = auth_manager.unauthorized_recovery();
         let mut auth_change_rx = auth_manager.auth_change_receiver();
-        if recover_remote_control_auth(&mut auth_recovery, &mut auth_change_rx).await {
+        if recover_remote_control_auth(&mut auth_recovery, &mut auth_change_rx, auth).await {
             match load_remote_control_auth(auth_manager).await {
                 Ok(recovered_auth) if recovered_auth.account_id == enrollment.account_id => {
                     *auth = recovered_auth;

@@ -322,6 +322,7 @@ impl Session {
                 &model_info,
             );
             let mut client_session = model_client.new_speculative_session();
+            client_session.set_startup_timing(Arc::clone(&startup_timing));
             let result = tokio::select! {
                 biased;
                 _ = cancellation.cancelled() => return Err(CodexErr::TurnAborted),
@@ -470,6 +471,7 @@ async fn schedule_startup_prewarm_inner(
     );
 
     let startup_cancellation_token = CancellationToken::new();
+    let tools_preparation = session.startup_timing.begin_tool_preparation();
     let mut planning_generation = session.services.planning_generation();
     let built_tools_started_at = Instant::now();
     // Startup prewarm runs before run_turn and needs its own tool-building snapshot.
@@ -510,8 +512,9 @@ async fn schedule_startup_prewarm_inner(
             })
             .await;
     }
-    // Tool preparation is useful for every transport. Only the speculative
-    // model request depends on websocket support.
+    drop(tools_preparation);
+    // Connection ownership is resolved only after the preparation scope above ends.
+    // Tool preparation is useful for every transport; only preconnect depends on websocket support.
     if !session.services.model_client.startup_websocket_enabled() {
         return Ok(None);
     }

@@ -24,6 +24,9 @@ fn run() -> anyhow::Result<()> {
         .with_writer(telemetry_writer)
         .try_init()
         .map_err(|error| anyhow::anyhow!("initialize code-mode host telemetry: {error}"))?;
+    if let Err(error) = codex_process_hardening::disable_execution_speed_throttling() {
+        tracing::warn!(%error, "could not disable automatic background CPU throttling");
+    }
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;

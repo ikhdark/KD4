@@ -21,6 +21,7 @@ use codex_tools::validate_dynamic_tools;
 
 pub(super) const THREAD_PAGE_DEFAULT_LIMIT: usize = 25;
 pub(super) const THREAD_PAGE_MAX_LIMIT: usize = 100;
+const MAX_THREAD_START_CONFIG_ATTEMPTS: usize = 3;
 const CODEX_TUI_CLIENT_NAME: &str = "codex-tui";
 const THREAD_ROLLBACK_DEPRECATION_SUMMARY: &str =
     "thread/rollback is deprecated and will be removed soon";
@@ -912,32 +913,53 @@ impl ThreadRequestProcessor {
         let error_request_id = request_id.clone();
         let thread_store = Arc::clone(&self.thread_store);
         let thread_start_task = async move {
-            if let Err(error) = Self::thread_start_task(
-                listener_task_context,
-                thread_store,
-                config_manager,
-                request_id,
-                app_server_client_name,
-                app_server_client_version,
-                supports_openai_form_elicitation,
-                config,
-                typesafe_overrides,
-                dynamic_tools,
-                selected_capability_roots.unwrap_or_default(),
-                history_mode,
-                session_start_source,
-                thread_source,
-                project_id,
-                environment_selections,
-                service_name,
-                allow_provider_model_fallback,
-                experimental_raw_events,
-                request_trace,
-                initial_config_warnings,
-            )
-            .await
-            {
-                outgoing.send_error(error_request_id, error).await;
+            let thread_start_started_at = std::time::Instant::now();
+            let selected_capability_roots = selected_capability_roots.unwrap_or_default();
+            for attempt in 1..=MAX_THREAD_START_CONFIG_ATTEMPTS {
+                let result = Self::thread_start_task(
+                    listener_task_context.clone(),
+                    Arc::clone(&thread_store),
+                    config_manager.clone(),
+                    request_id.clone(),
+                    app_server_client_name.clone(),
+                    app_server_client_version.clone(),
+                    supports_openai_form_elicitation,
+                    config.clone(),
+                    typesafe_overrides.clone(),
+                    dynamic_tools.clone(),
+                    selected_capability_roots.clone(),
+                    history_mode,
+                    session_start_source,
+                    thread_source.clone(),
+                    project_id.clone(),
+                    environment_selections.clone(),
+                    service_name.clone(),
+                    allow_provider_model_fallback,
+                    experimental_raw_events,
+                    request_trace.clone(),
+                    Arc::clone(&initial_config_warnings),
+                    thread_start_started_at,
+                )
+                .await;
+                match result {
+                    Ok(()) => break,
+                    Err(error)
+                        if is_config_generation_changed(&error)
+                            && attempt < MAX_THREAD_START_CONFIG_ATTEMPTS =>
+                    {
+                        // Only unadmitted attempts with confirmed rollback may
+                        // reach this path. Reload all config and recheck policy;
+                        // never replay an accepted thread/start or a policy denial.
+                        warn!(
+                            attempt,
+                            "configuration changed during thread/start; retrying admission"
+                        );
+                    }
+                    Err(error) => {
+                        outgoing.send_error(error_request_id, error).await;
+                        break;
+                    }
+                }
             }
         };
         thread_start_task.instrument(request_context.span()).await;
@@ -1047,8 +1069,8 @@ impl ThreadRequestProcessor {
         experimental_raw_events: bool,
         request_trace: Option<W3cTraceContext>,
         initial_config_warnings: Arc<Vec<ConfigWarningNotification>>,
+        thread_start_started_at: std::time::Instant,
     ) -> Result<(), JSONRPCErrorError> {
-        let thread_start_started_at = std::time::Instant::now();
         let dynamic_tools = dynamic_tools.unwrap_or_default();
         if !dynamic_tools.is_empty() {
             validate_dynamic_tools(&dynamic_tools).map_err(invalid_request)?;
@@ -1231,12 +1253,21 @@ impl ThreadRequestProcessor {
             err => internal_error(format!("error creating thread: {err}")),
         })?;
         let session_telemetry = thread.session_telemetry();
-        if let Err(err) = config_manager.validate_policy_generation(policy_generation) {
-            listener_task_context
+        if let Err(error) = config_manager
+            .validate_policy_generation(policy_generation)
+            .map_config_load_error()
+        {
+            if !listener_task_context
                 .thread_manager
                 .rollback_thread_spawn(thread_id, &thread)
-                .await;
-            return Err(internal_error(err.to_string()));
+                .await
+            {
+                return Err(internal_error(format!(
+                    "{error_message}; failed to roll back thread {thread_id}; admission was not retried",
+                    error_message = error.message,
+                )));
+            }
+            return Err(error);
         }
         session_telemetry.record_startup_phase(
             "thread_start_create_thread",

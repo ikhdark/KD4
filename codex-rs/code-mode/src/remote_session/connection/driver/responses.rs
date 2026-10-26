@@ -117,12 +117,14 @@ impl ConnectionDriver {
             },
             PendingRequest::Execute {
                 session,
+                on_possible_execution,
                 response_tx,
                 initial_response_tx,
                 initial_response_rx,
                 cancellation,
             } => match result {
                 Ok(HostResponse::ExecutionStarted { cell_id }) => {
+                    on_possible_execution();
                     // The host owns a checked, never-reused ID sequence. Retain only live
                     // IDs so client memory scales with concurrency, not session lifetime.
                     let remote_cell_id = cell_id.clone();
@@ -174,11 +176,14 @@ impl ConnectionDriver {
                 }
                 Ok(_) => {
                     let reason = "code-mode host returned an invalid execute response".to_string();
+                    on_possible_execution();
                     let _ = response_tx.send(Err(reason.clone()));
                     self.fail(reason);
                     return false;
                 }
                 Err(err) => {
+                    // Execute errors are pre-start refusals. A missing/invalid
+                    // reply uses the conservative possible-execution callback.
                     let _ = response_tx.send(Err(err));
                 }
             },

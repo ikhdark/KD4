@@ -29,7 +29,6 @@ use crate::protocol::ReadParams;
 use crate::protocol::ReadResponse;
 use crate::rpc::RpcClient;
 use crate::rpc::RpcClientEvent;
-use crate::rpc::SESSION_ALREADY_ATTACHED_ERROR_CODE;
 
 // Leave margin inside the server's 30-second retention windows because the
 // client and server start their disconnect clocks independently.
@@ -807,20 +806,13 @@ impl ExecServerClient {
 }
 
 pub(super) fn is_retryable_recovery_error(error: &ExecServerError) -> bool {
+    let mut error = error;
+    while let ExecServerError::ConnectionAttempt(source) = error {
+        error = source;
+    }
     is_transport_closed_error(error)
-        || matches!(
-            error,
-            ExecServerError::WebSocketConnectTimeout { .. }
-                | ExecServerError::WebSocketConnect { .. }
-                | ExecServerError::InitializeTimedOut { .. }
-                | ExecServerError::EnvironmentInfoTimedOut { .. }
-        )
-        || is_retryable_registry_error(error)
-        || matches!(
-            error,
-            ExecServerError::Server { code, .. }
-                if *code == SESSION_ALREADY_ATTACHED_ERROR_CODE
-        )
+        || error.is_retryable_preparation_error()
+        || matches!(error, ExecServerError::EnvironmentInfoTimedOut { .. })
 }
 
 pub(crate) fn is_retryable_registry_error(error: &ExecServerError) -> bool {

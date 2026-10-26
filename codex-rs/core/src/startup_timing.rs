@@ -5,6 +5,86 @@ use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 
 const STARTUP_TIMING_SCHEMA_VERSION: u16 = 3;
+const MAX_STARTUP_LIFECYCLE_EVENTS: u32 = 128;
+
+#[derive(Debug, serde::Serialize)]
+struct StartupLifecycleEvent {
+    version: u16,
+    process_id: u32,
+    clock_id: String,
+    correlation_id: String,
+    started_at_unix_ms: i64,
+    sequence: u32,
+    offset_ns: u64,
+    kind: &'static str,
+    connection_id: Option<String>,
+    owner_id: Option<String>,
+    reason: Option<String>,
+    physical_attempt_id: Option<String>,
+    tool_preparation_active: bool,
+}
+
+impl StartupLifecycleEvent {
+    fn trace(&self) {
+        // Serialize/log after releasing the timing mutex; no I/O under its lock.
+        if let Ok(json) = serde_json::to_string(self) {
+            tracing::trace!(
+                target: "codex_core::session::turn",
+                startup_lifecycle_json = %json,
+                "startup transport lifecycle observation"
+            );
+        }
+    }
+}
+
+/// Travels with the actual transport, including transfer into the ordinary turn/cache.
+/// Release observes ownership, not a server close or proof the socket was still healthy.
+#[derive(Debug)]
+pub(crate) struct StartupConnectionObservation {
+    timing: Arc<StartupTimingState>,
+    connection_id: String,
+    owner_id: String,
+    release_reason: &'static str,
+}
+
+impl StartupConnectionObservation {
+    pub(crate) fn connection_id(&self) -> &str {
+        &self.connection_id
+    }
+
+    pub(crate) fn claimed(&self) {
+        self.timing.record_lifecycle(
+            "connection_claimed", Some(&self.connection_id), Some(&self.owner_id),
+            Some("adopted_by_ordinary_turn"),
+        );
+    }
+
+    pub(crate) fn release(mut self, reason: &'static str) {
+        self.release_reason = reason;
+    }
+}
+
+impl Drop for StartupConnectionObservation {
+    fn drop(&mut self) {
+        self.timing.record_lifecycle(
+            "connection_released", Some(&self.connection_id), Some(&self.owner_id),
+            Some(self.release_reason),
+        );
+    }
+}
+
+pub(crate) struct StartupToolPreparationGuard(Arc<StartupTimingState>);
+
+impl Drop for StartupToolPreparationGuard {
+    fn drop(&mut self) {
+        let event = {
+            let mut inner = self.0.inner();
+            inner.tool_preparation_active = inner.tool_preparation_active.saturating_sub(1);
+            inner.lifecycle_event(self.0.clock.sample(), "tools_preparation_ended", None, None, None)
+        };
+        if let Some(event) = event { event.trace(); }
+    }
+}
 
 #[derive(Clone, Copy, Debug)]
 struct ClockSample {
@@ -136,6 +216,9 @@ struct ActivePhases {
 #[derive(Debug)]
 struct StartupTimingInner {
     correlation_id: String,
+    lifecycle_clock_id: String,
+    lifecycle_sequence: u32,
+    tool_preparation_active: u32,
     started: ClockSample,
     last_monotonic_ns: u128,
     session_initializing: bool,
@@ -168,6 +251,9 @@ impl StartupTimingState {
             clock,
             inner: Mutex::new(StartupTimingInner {
                 correlation_id,
+                lifecycle_clock_id: uuid::Uuid::new_v4().to_string(),
+                lifecycle_sequence: 0,
+                tool_preparation_active: 0,
                 started,
                 last_monotonic_ns: started.monotonic_ns,
                 session_initializing: true,
@@ -215,6 +301,35 @@ impl StartupTimingState {
         }
     }
 
+    fn record_lifecycle(&self, kind: &'static str, connection: Option<&str>, owner: Option<&str>, reason: Option<&str>) {
+        let event = self.inner().lifecycle_event(self.clock.sample(), kind, connection, owner, reason);
+        if let Some(event) = event { event.trace(); }
+    }
+
+    pub(crate) fn begin_tool_preparation(self: &Arc<Self>) -> StartupToolPreparationGuard {
+        let event = {
+            let mut inner = self.inner();
+            inner.tool_preparation_active = inner.tool_preparation_active.saturating_add(1);
+            inner.lifecycle_event(self.clock.sample(), "tools_preparation_started", None, None, None)
+        };
+        if let Some(event) = event { event.trace(); }
+        StartupToolPreparationGuard(Arc::clone(self))
+    }
+
+    pub(crate) fn observe_connection_ready(self: &Arc<Self>, speculative: bool) -> Option<StartupConnectionObservation> {
+        let (connection_id, owner_id, event) = {
+            let mut inner = self.inner();
+            if inner.completed_snapshot.is_some() { return None; }
+            let connection_id = uuid::Uuid::new_v4().to_string();
+            let owner_id = uuid::Uuid::new_v4().to_string();
+            let event = inner.lifecycle_event(self.clock.sample(), "connection_ready", Some(&connection_id), Some(&owner_id),
+                Some(if speculative { "speculative" } else { "ordinary" }));
+            (connection_id, owner_id, event)
+        };
+        if let Some(event) = event { event.trace(); }
+        Some(StartupConnectionObservation { timing: Arc::clone(self), connection_id, owner_id, release_reason: "owner_dropped" })
+    }
+
     /// Close speculative observation at handoff without awaiting task cleanup.
     /// Late task starts/drops are harmless; required phases remain strict.
     pub(crate) fn cutoff_speculative_prewarm(&self, status: &str) {
@@ -228,6 +343,9 @@ impl StartupTimingState {
         inner.active.transport_preconnect = 0;
         inner.active.prewarm_preparation = 0;
         inner.active.prewarm_request = 0;
+        let event = inner.lifecycle_event(self.clock.sample(), "cancellation_requested", None, None, Some(status));
+        drop(inner);
+        if let Some(event) = event { event.trace(); }
     }
 
     pub(crate) fn record_executor_status(&self, status: &'static str) {
@@ -239,14 +357,18 @@ impl StartupTimingState {
 
     /// Client transport-attempt entry is not proof of successful send or provider receipt.
     /// Speculative generate=false traffic must not call this boundary.
-    pub(crate) fn freeze_at_first_transport_attempt(&self) {
-        let snapshot = {
+    pub(crate) fn freeze_at_first_transport_attempt(&self, connection_id: Option<&str>, transport: &str, attempt_id: Option<&str>) {
+        let (snapshot, event) = {
             let mut inner = self.inner();
             if inner.completed_snapshot.is_some() {
                 return;
             }
-            inner.complete(self.clock.sample())
+            let sample = self.clock.sample();
+            let mut event = inner.lifecycle_event(sample, "first_transport_attempt", connection_id, None, Some(transport));
+            if let Some(event) = &mut event { event.physical_attempt_id = attempt_id.map(str::to_owned); }
+            (inner.complete(sample), event)
         };
+        if let Some(event) = event { event.trace(); }
         snapshot.trace_frozen_at_first_model_send();
     }
 
@@ -269,6 +391,29 @@ impl Drop for StartupTimingGuard {
 }
 
 impl StartupTimingInner {
+    fn lifecycle_event(&mut self, sample: ClockSample, kind: &'static str, connection: Option<&str>, owner: Option<&str>, reason: Option<&str>) -> Option<StartupLifecycleEvent> {
+        // One explicit overflow marker; late cleanup remains observable after the frozen
+        // duration snapshot, but cannot create an unbounded per-session event stream.
+        if self.lifecycle_sequence > MAX_STARTUP_LIFECYCLE_EVENTS { return None; }
+        let sequence = self.lifecycle_sequence;
+        self.lifecycle_sequence += 1;
+        Some(StartupLifecycleEvent {
+            version: 1,
+            process_id: std::process::id(),
+            clock_id: self.lifecycle_clock_id.clone(),
+            correlation_id: self.correlation_id.clone(),
+            started_at_unix_ms: self.started.wall_unix_ms,
+            sequence,
+            offset_ns: u64::try_from(sample.monotonic_ns.saturating_sub(self.started.monotonic_ns)).unwrap_or(u64::MAX),
+            kind: if sequence == MAX_STARTUP_LIFECYCLE_EVENTS { "overflow" } else { kind },
+            connection_id: connection.map(str::to_owned),
+            owner_id: owner.map(str::to_owned),
+            reason: reason.map(str::to_owned),
+            physical_attempt_id: None,
+            tool_preparation_active: self.tool_preparation_active > 0,
+        })
+    }
+
     fn begin_phase(&mut self, now_ns: u128, phase: StartupPhase) -> bool {
         if self.completed_snapshot.is_some()
             || (self.prewarm_cancel_requested && phase.is_speculative())

@@ -1804,6 +1804,7 @@ dependencies = [
  "codex-apply-patch",
  "codex-exec-server",
  "codex-install-context",
+ "codex-process-hardening",
  "codex-utils-home-dir",
  "codex-windows-sandbox",
  "dotenvy",
@@ -2002,6 +2003,7 @@ dependencies = [
  "anyhow",
  "codex-code-mode-protocol",
  "codex-code-mode-runtime",
+ "codex-process-hardening",
  "tokio",
  "tokio-util",
  "tracing",
@@ -2889,6 +2891,7 @@ name = "codex-process-hardening"
 version = "0.0.0"
 dependencies = [
  "libc",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

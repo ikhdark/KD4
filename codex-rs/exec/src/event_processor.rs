@@ -223,3 +223,17 @@ pub(crate) fn item_is_in_progress(item: &ThreadItem) -> bool {
     }
 }
 
+/// Bound live evidence without retaining or resending a growing transcript.
+pub(crate) fn bounded_progress_text(mut text: String) -> (String, bool) {
+    const MAX_PROGRESS_BYTES: usize = 16 * 1024;
+    if text.len() <= MAX_PROGRESS_BYTES {
+        return (text, false);
+    }
+    let mut end = MAX_PROGRESS_BYTES;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    text.truncate(end);
+    (text, true)
+}
+

@@ -218,7 +218,7 @@ pub fn create_list_agents_tool() -> ToolSpec {
         "Opt in to liveness polling without task previews or completed report/surfaced-result bodies. Completed statuses become distinct completed/completed_with_surface strings with exact immutable completed_report_recovery arguments. If report retention fails, completed reports remain inline. Errors, stopped reports, blockers and required actions remain complete. Default false.".into(),
     )));
     properties.insert("since_revision".into(), JsonSchema::string(Some(
-        "Prior display revision for the same root, prefix, compact and status_only modes. An exact match returns unchanged:true with empty arrays (retain the previous snapshot); otherwise a replacement snapshot for the requested view includes additions and deletions. Changes to omitted reports also change the revision.".into(),
+        "Prior visible-view revision for the same root, prefix, compact and status_only modes. An exact match returns unchanged:true with empty arrays (retain the previous visible snapshot); otherwise a replacement snapshot includes additions and deletions. Omitted task previews do not affect this revision. Omitted reports have a separate canonical completed_report_recovery identity, returned even when the visible view is unchanged.".into(),
     )));
 
     ToolSpec::Function(ResponsesApiTool {
@@ -414,12 +414,12 @@ fn list_agents_output_schema() -> Value {
                 "type": "array",
                 "items": { "type": "array", "items": { "type": "string" }, "minItems": 2, "maxItems": 2 }
             },
-            "revision": { "type": "string", "description": "Opaque display identity, not a source or acceptance revision." },
-            "unchanged": { "type": "boolean", "description": "If true retain the prior snapshot; empty arrays do not revoke existing failures or agents." },
+            "revision": { "type": "string", "description": "Opaque visible-view identity, independent of omitted content; not a source or acceptance revision." },
+            "unchanged": { "type": "boolean", "description": "If true retain the prior visible snapshot; empty arrays do not revoke existing failures or agents. Hidden report recovery may still change." },
             "task_text_recovery": { "type": ["string", "null"] },
             "completed_report_recovery": {
                 "type": "object",
-                "description": "Exact immutable completed statuses from this revision, including final messages and authoritative surfaced values. Invoke tool through its advertised namespace with these arguments and follow any continuation; the artifact is caller-thread scoped and survives later report changes or agent deletion.",
+                "description": "Exact immutable completed statuses captured by this call, including final messages and authoritative surfaced values. Its canonical_sha256 identifies omitted content independently of the visible revision and can change on unchanged:true. Invoke tool through its advertised namespace with these arguments and follow any continuation; the artifact is caller-thread scoped and survives later report changes or agent deletion.",
                 "properties": {
                     "tool": { "type": "string", "enum": ["read_tool_output"] },
                     "arguments": {

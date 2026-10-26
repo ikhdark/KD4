@@ -492,7 +492,7 @@ split-debuginfo = "off"
 strip = "symbols"
 
 # Final publish and ordinary release share one source of optimization settings.
-codegen-units = 4
+codegen-units = 1
 incremental = false
 
 [profile.release.package."*"]
@@ -502,12 +502,13 @@ codegen-units = 1
 [profile.local-release]
 inherits = "release"
 
-# Warm local publish builds: reuse incremental codegen and avoid whole-program LTO.
+# Build-speed-first local publishes: disable optimization, debug info, and LTO.
 # Keep release semantics (no debug assertions/overflow checks), but trade peak
 # runtime optimization for shorter edit/build/publish cycles.
 [profile.local-fast]
 inherits = "release"
-opt-level = 2
+opt-level = 0
+debug = "none"
 lto = "off"
 codegen-units = 16
 incremental = true
@@ -515,12 +516,6 @@ incremental = true
 # Preserve fast-build dependency parallelism when the release defaults change.
 [profile.local-fast.package."*"]
 codegen-units = 4
-
-# rustc 1.99.1/LLVM 23 reports `Missing .seh_endepilogue` while optimizing
-# icu_calendar's AnyCalendar::day_of_year for Windows. Limit the workaround to
-# this dependency in local-fast; leave the other crates and final builds alone.
-[profile.local-fast.package.icu_calendar]
-opt-level = 0
 
 # Both PGO passes use this same Cargo profile, in separate target directories.
 [profile.local-pgo]

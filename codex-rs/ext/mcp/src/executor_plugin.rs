@@ -33,10 +33,13 @@ pub(crate) struct SelectedExecutorPluginMcpState {
     cache: Mutex<Vec<CachedSelectedRoot>>,
 }
 
+#[derive(Clone)]
 struct CachedSelectedRoot {
     root: SelectedCapabilityRoot,
     binding: Option<codex_exec_server::ResolvedSelectedCapabilityRoot>,
     metadata: Option<SelectedPluginMetadata>,
+    servers_loaded: bool,
+    connectors_loaded: bool,
 }
 
 pub(crate) struct SelectedExecutorPluginMcpContributor {
@@ -53,9 +56,9 @@ impl SelectedExecutorPluginMcpContributor {
     /// Returns metadata for one stable selected root.
     ///
     /// Successful resolution, including a root that is not a plugin or declares no capabilities,
-    /// is cached until the thread state is dropped. A failed MCP or connector declaration load is
-    /// projected without its failed part but not cached, so the next projection retries it.
-    /// This includes per-server parse failures, while retaining valid sibling servers.
+    /// is cached until the thread state is dropped. Cache successful components independently;
+    /// failed components (including per-server parse failures) retry on the next projection,
+    /// while valid sibling declarations remain available. Resolution failures still retry.
     /// Environment availability never invalidates this cache; it only controls whether the cached
     /// metadata is projected into a model step.
     async fn metadata_for_root(
@@ -64,12 +67,16 @@ impl SelectedExecutorPluginMcpContributor {
         selected_root: &SelectedCapabilityRoot,
         binding: Option<&codex_exec_server::ResolvedSelectedCapabilityRoot>,
     ) -> Option<SelectedPluginMetadata> {
-        if let Some(cached) = state
+        let cached = state
             .cache
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .iter()
             .find(|cached| cached.root == *selected_root && cached.binding.as_ref() == binding)
+            .cloned();
+        if let Some(cached) = &cached
+            && cached.servers_loaded
+            && cached.connectors_loaded
         {
             return cached.metadata.clone();
         }
@@ -86,65 +93,90 @@ impl SelectedExecutorPluginMcpContributor {
                     error = %err,
                     "failed to resolve selected executor plugin"
                 );
-                return None;
+                return cached.and_then(|cached| cached.metadata);
             }
         };
-        let mut load_failed = false;
-        let metadata = match plugin {
+        let mut servers_loaded = cached.as_ref().is_some_and(|cached| cached.servers_loaded);
+        let mut connectors_loaded = cached.as_ref().is_some_and(|cached| cached.connectors_loaded);
+        let mut metadata = match plugin {
             Some(plugin) => {
-                let servers = load_executor_plugin_mcp_servers(&plugin)
-                    .await
-                    .unwrap_or_else(|err| {
-                        load_failed = true;
-                        tracing::warn!(
+                let mut metadata = cached.and_then(|cached| cached.metadata).unwrap_or_else(|| {
+                    SelectedPluginMetadata {
+                        plugin_id: plugin.plugin().selected_root_id().to_string(),
+                        plugin_display_name: plugin.plugin().manifest().display_name().to_string(),
+                        servers: Vec::new(),
+                        connector_ids: Vec::new(),
+                    }
+                });
+                if !servers_loaded {
+                    match load_executor_plugin_mcp_servers(&plugin).await {
+                        Ok(servers) => {
+                            servers_loaded = servers.errors.is_empty();
+                            metadata.servers = servers.servers.into_iter().collect();
+                        }
+                        Err(err) => tracing::warn!(
                             selected_root = selected_root.id,
                             error = %err,
                             "failed to load selected executor plugin MCP servers"
-                        );
-                        Default::default()
-                    });
-                load_failed |= !servers.errors.is_empty();
-                let connector_ids = load_executor_plugin_connectors(&plugin)
-                    .await
-                    .unwrap_or_else(|err| {
-                        load_failed = true;
-                        tracing::warn!(
+                        ),
+                    }
+                }
+                if !connectors_loaded {
+                    match load_executor_plugin_connectors(&plugin).await {
+                        Ok(connectors) => {
+                            connectors_loaded = true;
+                            metadata.connector_ids = connectors
+                                .into_iter()
+                                .map(|declaration| declaration.connector_id.0)
+                                .collect();
+                        }
+                        Err(err) => tracing::warn!(
                             selected_root = selected_root.id,
                             error = %err,
                             "failed to load selected executor plugin connectors"
-                        );
-                        Vec::new()
-                    })
-                    .into_iter()
-                    .map(|declaration| declaration.connector_id.0)
-                    .collect();
-                Some(SelectedPluginMetadata {
-                    plugin_id: plugin.plugin().selected_root_id().to_string(),
-                    plugin_display_name: plugin.plugin().manifest().display_name().to_string(),
-                    servers: servers.servers.into_iter().collect(),
-                    connector_ids,
-                })
+                        ),
+                    }
+                }
+                Some(metadata)
             }
-            None => None,
+            None => {
+                servers_loaded = true;
+                connectors_loaded = true;
+                None
+            }
         };
         let mut cache = state
             .cache
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(cached) = cache
-            .iter()
+            .iter_mut()
             .find(|cached| cached.root == *selected_root && cached.binding.as_ref() == binding)
         {
-            return cached.metadata.clone();
+            if cached.servers_loaded && cached.connectors_loaded {
+                return cached.metadata.clone();
+            }
+            // Concurrent projections may complete different components. Never
+            // replace a successful component with an older partial attempt.
+            if let (Some(previous), Some(metadata)) = (&cached.metadata, &mut metadata) {
+                if cached.servers_loaded {
+                    metadata.servers.clone_from(&previous.servers);
+                    servers_loaded = true;
+                }
+                if cached.connectors_loaded {
+                    metadata.connector_ids.clone_from(&previous.connector_ids);
+                    connectors_loaded = true;
+                }
+            }
         }
-        if !load_failed {
-            cache.retain(|cached| cached.root != *selected_root);
-            cache.push(CachedSelectedRoot {
-                root: selected_root.clone(),
-                binding: binding.cloned(),
-                metadata: metadata.clone(),
-            });
-        }
+        cache.retain(|cached| cached.root != *selected_root);
+        cache.push(CachedSelectedRoot {
+            root: selected_root.clone(),
+            binding: binding.cloned(),
+            metadata: metadata.clone(),
+            servers_loaded,
+            connectors_loaded,
+        });
         metadata
     }
 }

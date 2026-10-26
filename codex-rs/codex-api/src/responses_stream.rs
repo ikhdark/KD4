@@ -161,8 +161,9 @@ impl ResponsesEventInterpreter {
     pub(crate) fn process_payload(
         &mut self,
         payload: &str,
+        observe: impl FnOnce(crate::telemetry::ProviderObservation),
     ) -> Result<std::vec::Drain<'_, ResponseEvent>, ResponsesEventError> {
-        self.process_payload_with_error_mapper(payload, || None)
+        self.process_payload_with_error_mapper(payload, || None, observe)
     }
 
     /// Let a transport interpret its error envelope without reparsing ordinary events.
@@ -172,6 +173,7 @@ impl ResponsesEventInterpreter {
         &mut self,
         payload: &str,
         map_error: impl FnOnce() -> Option<ApiError>,
+        observe: impl FnOnce(crate::telemetry::ProviderObservation),
     ) -> Result<std::vec::Drain<'_, ResponseEvent>, ResponsesEventError> {
         // Retain the allocation across frames, including when a previous frame
         // failed after interpreting metadata. Both transports drain in order.
@@ -298,6 +300,8 @@ impl ResponsesEventInterpreter {
         } else {
             None
         };
+        let provider_observation = event.provider_observation(self.events.iter()
+            .any(|event| matches!(event, ResponseEvent::SafetyBuffering(_))));
         let interpreted = self
             .lifecycle
             .process(event, payload.len(), completion_usage, &mut ownership_admitted)
@@ -312,6 +316,9 @@ impl ResponsesEventInterpreter {
                 (error, _) => error,
             });
         if interpreted.is_ok() || (terminal_failure && ownership_admitted) {
+            if let Some(observation) = provider_observation {
+                observe(observation);
+            }
             if let Some(response_turn_state) = response_turn_state
                 && let Some(turn_state) = self.turn_state.as_deref()
             {
@@ -376,6 +383,8 @@ pub(crate) struct ResponsesStreamEvent<'a> {
 #[derive(Debug, Deserialize)]
 struct ResponseEnvelope {
     id: Option<Value>,
+    created_at: Option<Value>,
+    completed_at: Option<Value>,
     service_tier: Option<Value>,
     model: Option<Value>,
     usage: Option<Value>,
@@ -617,6 +626,43 @@ pub(crate) struct RateLimitStreamEvent {
 }
 
 impl ResponsesStreamEvent<'_> {
+    fn provider_observation(&self, safety_buffering: bool) -> Option<crate::telemetry::ProviderObservation> {
+        // Control/item boundaries only: no per-delta timing, allocation or callback.
+        let phase = match self.kind.as_ref() {
+            "response.created" => "created",
+            "response.queued" => "queued",
+            "response.in_progress" => "in_progress",
+            "response.completed" => "completed",
+            "response.failed" => "failed",
+            "response.incomplete" => "incomplete",
+            "response.output_item.added" if self.item.as_ref().and_then(|v| v.get("type"))
+                .and_then(Value::as_str) == Some("reasoning") => "reasoning_started",
+            "response.output_item.done" if self.item.as_ref().and_then(|v| v.get("type"))
+                .and_then(Value::as_str) == Some("reasoning") => "reasoning_finished",
+            _ if safety_buffering => "safety_buffering",
+            _ => return None,
+        };
+        let response = self.response.as_ref();
+        let raw_id = response.and_then(|v| v.id.as_ref()).and_then(Value::as_str)
+            .or(self.response_id.as_deref());
+        let response_id = raw_id.filter(|id| !id.is_empty() && id.len() <= 256
+            && id.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.')));
+        let timestamp = |value: Option<&Value>| value.and_then(Value::as_f64)
+            .filter(|v| v.is_finite() && *v >= 0.0 && *v < 9_007_199_254_740_992.0);
+        let created = response.and_then(|v| v.created_at.as_ref());
+        let completed = response.and_then(|v| v.completed_at.as_ref());
+        let created_at = timestamp(created);
+        let completed_at = timestamp(completed);
+        Some(crate::telemetry::ProviderObservation {
+            phase, response_id: response_id.map(str::to_owned), created_at, completed_at,
+            safety_buffering,
+            invalid_source_fields: raw_id.is_some() && response_id.is_none()
+                || response.and_then(|v| v.id.as_ref()).is_some_and(|v| !v.is_null() && !v.is_string())
+                || created.is_some_and(|v| !v.is_null()) && created_at.is_none()
+                || completed.is_some_and(|v| !v.is_null()) && completed_at.is_none(),
+        })
+    }
+
     pub(crate) fn kind(&self) -> &str {
         &self.kind
     }

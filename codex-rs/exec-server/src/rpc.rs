@@ -300,9 +300,8 @@ impl RpcClient {
                         if let Err(err) =
                             handle_server_message(&pending_for_reader, &event_tx, message).await
                         {
-                            // Preserve responses already received before terminating an
-                            // overloaded notification stream. Missing notifications are
-                            // recovered by the session protocol after reconnecting.
+                            // Preserve responses already received before terminating a
+                            // failed notification consumer or invalid protocol stream.
                             while let Ok(event) = incoming_rx.try_recv() {
                                 if let JsonRpcConnectionEvent::Message(
                                     message @ (JSONRPCMessage::Response(_)
@@ -724,14 +723,13 @@ async fn handle_server_message(
             }
         }
         JSONRPCMessage::Notification(notification) => {
+            // Saturation is ordinary bounded backpressure, not a reason to lose
+            // notifications and replay a session. No pending-request lock is held
+            // while the single ordered consumer catches up.
             event_tx
-                .try_send(RpcClientEvent::Notification(notification))
-                .map_err(|error| match error {
-                    mpsc::error::TrySendError::Full(_) =>
-                        "exec-server notification backlog exceeded capacity; session replay required".to_string(),
-                    mpsc::error::TrySendError::Closed(_) =>
-                        "exec-server notification consumer closed".to_string(),
-                })?;
+                .send(RpcClientEvent::Notification(notification))
+                .await
+                .map_err(|_| "exec-server notification consumer closed".to_string())?;
         }
         JSONRPCMessage::Request(request) => {
             return Err(format!(

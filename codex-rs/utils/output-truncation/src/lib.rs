@@ -444,8 +444,9 @@ fn json_outline(value: &serde_json::Value, depth: usize, out: &mut String) {
     }
 }
 
-/// Also returns the exact omitted line ranges when every cut is a line-marked
-/// seam; outlined JSON lines and tiny-budget fallbacks report none.
+/// Also returns the exact line-marked cut ranges, including cuts after JSON
+/// outlining (which preserves line coordinates). Outlining alone and tiny
+/// budgets report no cut ranges.
 fn truncate_over_budget_text_with_markers(
     content: &str,
     max_tokens: usize,
@@ -458,9 +459,7 @@ fn truncate_over_budget_text_with_markers(
         if !approx_token_count_exceeds(&outlined, max_tokens) {
             return (outlined, Vec::new());
         }
-        let (text, _) =
-            truncate_over_budget_lines_with_markers(&outlined, max_tokens, line_markers);
-        return (text, Vec::new());
+        return truncate_over_budget_lines_with_markers(&outlined, max_tokens, line_markers);
     }
     truncate_over_budget_lines_with_markers(content, max_tokens, line_markers)
 }
@@ -635,7 +634,7 @@ pub struct LineMarkedTruncation {
     pub output: TruncatedTextOutput,
     /// 1-based inclusive line runs of the source that the markers report
     /// omitted, in order. Empty when no cut could be marked in line coordinates
-    /// (an outlined JSON line or a tiny budget); infer those from the text.
+    /// (outlining without a marked seam, or a tiny budget); infer those from the text.
     pub omitted_lines: Vec<(usize, usize)>,
 }
 

@@ -122,6 +122,10 @@ pub enum OutboundProxyRoute {
         url: String,
         no_proxy: Option<String>,
     },
+    /// Try PAC candidates in order, advancing only before application dispatch.
+    /// Candidates are flat direct/proxy routes with destination bypass already
+    /// resolved; proxy candidates do not carry an additional `no_proxy` policy.
+    Fallback { routes: Vec<OutboundProxyRoute> },
 }
 
 impl fmt::Debug for OutboundProxyRoute {
@@ -129,6 +133,8 @@ impl fmt::Debug for OutboundProxyRoute {
         match self {
             Self::TransportDefault => f.write_str("TransportDefault"),
             Self::Direct => f.write_str("Direct"),
+            Self::Fallback { routes } => f.debug_struct("Fallback")
+                .field("candidate_count", &routes.len()).finish(),
             Self::Proxy { .. } => f
                 .debug_struct("Proxy")
                 .field("url", &"<redacted>")
@@ -270,6 +276,9 @@ impl HttpClientFactory {
     }
 
     /// Builds a reqwest client for a concrete outbound route.
+    ///
+    /// Ordered PAC plans require [`Self::build_client`] or [`crate::RouteAwareClientPool`].
+    /// A raw reqwest client cannot implement safe ordered connection fallback.
     pub fn build_reqwest_client(
         &self,
         builder: reqwest::ClientBuilder,
@@ -282,22 +291,6 @@ impl HttpClientFactory {
             route_class,
             self.outbound_proxy_policy,
             CustomCaPolicy::HonorProcessEnvironment,
-        )
-    }
-
-    pub(crate) fn build_reqwest_client_with_custom_ca_policy(
-        &self,
-        builder: reqwest::ClientBuilder,
-        request_url: &str,
-        route_class: ClientRouteClass,
-        custom_ca_policy: CustomCaPolicy,
-    ) -> Result<reqwest::Client, BuildRouteAwareHttpClientError> {
-        build_reqwest_client_for_route(
-            builder,
-            request_url,
-            route_class,
-            self.outbound_proxy_policy,
-            custom_ca_policy,
         )
     }
 
@@ -348,6 +341,8 @@ fn route_from_system_decision(
             no_proxy: None,
         },
         SystemProxyDecision::Unavailable { .. } => resolve_env_proxy_route(env, env_proxy_kind),
+        #[cfg(target_os = "windows")]
+        SystemProxyDecision::Fallback { routes } => OutboundProxyRoute::Fallback { routes },
     }
 }
 
@@ -417,13 +412,16 @@ pub enum BuildRouteAwareHttpClientError {
 
     #[error("Failed to configure outbound proxy selected for {route_class}")]
     InvalidProxyConfig { route_class: ClientRouteClass },
+    #[error("Ordered PAC routes require the HTTP client facade, not a raw reqwest client")]
+    OrderedProxyRoutesRequireFacade,
 }
 
 impl From<BuildRouteAwareHttpClientError> for io::Error {
     fn from(error: BuildRouteAwareHttpClientError) -> Self {
         match error {
             BuildRouteAwareHttpClientError::CustomCa(error) => error.into(),
-            BuildRouteAwareHttpClientError::InvalidProxyConfig { .. } => io::Error::other(error),
+            BuildRouteAwareHttpClientError::InvalidProxyConfig { .. }
+            | BuildRouteAwareHttpClientError::OrderedProxyRoutesRequireFacade => io::Error::other(error),
         }
     }
 }
@@ -431,9 +429,8 @@ impl From<BuildRouteAwareHttpClientError> for io::Error {
 /// Builds a reqwest client with conservative route selection and shared CA handling.
 ///
 /// Unavailable platform resolution falls back to environment proxies and then direct. Errors after
-/// a route is selected are returned without trying another route. Ordered PAC candidates are
-/// currently collapsed to one route on Windows; later proxy or `DIRECT` candidates
-/// are not retried after a connection failure.
+/// a route is selected are returned without trying another route. Ordered PAC candidates require
+/// the HTTP facade, which distinguishes pre-dispatch failure from a possibly accepted request.
 fn build_reqwest_client_for_route(
     builder: reqwest::ClientBuilder,
     request_url: &str,
@@ -476,6 +473,7 @@ fn configure_builder_for_resolved_route(
 ) -> Result<reqwest::ClientBuilder, BuildRouteAwareHttpClientError> {
     match route {
         OutboundProxyRoute::TransportDefault => Ok(builder),
+        OutboundProxyRoute::Fallback { .. } => Err(BuildRouteAwareHttpClientError::OrderedProxyRoutesRequireFacade),
         OutboundProxyRoute::Direct => Ok(builder.no_proxy()),
         OutboundProxyRoute::Proxy { url, no_proxy } => {
             let no_proxy = no_proxy.as_deref().and_then(reqwest::NoProxy::from_string);
@@ -525,6 +523,8 @@ impl RequestOrigin {
 enum SystemProxyDecision {
     Direct,
     Proxy { url: String },
+    #[cfg(target_os = "windows")]
+    Fallback { routes: Vec<OutboundProxyRoute> },
     Unavailable { failure: RouteFailureClass },
 }
 
@@ -657,6 +657,8 @@ fn insert_system_proxy_cache_entry(
     now: Instant,
 ) {
     let ttl = match &decision {
+        #[cfg(target_os = "windows")]
+        SystemProxyDecision::Fallback { .. } => SYSTEM_PROXY_SUCCESS_CACHE_TTL,
         SystemProxyDecision::Direct | SystemProxyDecision::Proxy { .. } => {
             SYSTEM_PROXY_SUCCESS_CACHE_TTL
         }
@@ -813,55 +815,36 @@ fn parse_static_proxy_list(input: &str, target_scheme: &str) -> ParsedProxyListD
 
 fn parse_proxy_list(input: &str, target_scheme: &str) -> ParsedProxyListDecision {
     let mut saw_unsupported = false;
-
-    {
-        let mut process_token = |token: &str| {
-            let decision = parse_proxy_token(token, target_scheme);
-            match decision {
-                ParsedProxyListDecision::Direct => Some(ParsedProxyListDecision::Direct),
-                ParsedProxyListDecision::Proxy(url) => Some(ParsedProxyListDecision::Proxy(url)),
-                ParsedProxyListDecision::UnsupportedScheme => {
-                    saw_unsupported = true;
-                    None
-                }
-                ParsedProxyListDecision::Unavailable => None,
-            }
-        };
-
-        for segment in input
-            .split(';')
-            .map(str::trim)
-            .filter(|segment| !segment.is_empty())
-        {
-            let mut parts = segment.split_whitespace();
-            let directive = parts.next();
-            let hostport = parts.next();
-            let extra = parts.next();
-            let is_proxy_directive = matches!(
-                directive.map(str::to_ascii_lowercase).as_deref(),
-                Some("proxy" | "http" | "https" | "socks" | "socks4" | "socks5")
-            ) && hostport.is_some()
-                && extra.is_none();
-
-            if is_proxy_directive {
-                if let Some(decision) = process_token(segment) {
-                    return decision;
-                }
-            } else {
-                for token in segment.split_whitespace() {
-                    if let Some(decision) = process_token(token) {
-                        return decision;
-                    }
-                }
-            }
+    for token in proxy_list_tokens(input) {
+        match parse_proxy_token(token, target_scheme) {
+            decision @ (ParsedProxyListDecision::Direct | ParsedProxyListDecision::Proxy(_)) => return decision,
+            ParsedProxyListDecision::UnsupportedScheme => saw_unsupported = true,
+            ParsedProxyListDecision::Unavailable => {},
         }
     }
-
     if saw_unsupported {
         ParsedProxyListDecision::UnsupportedScheme
     } else {
         ParsedProxyListDecision::Unavailable
     }
+}
+
+fn proxy_list_tokens(input: &str) -> impl Iterator<Item = &str> {
+    input.split(';').map(str::trim).filter(|segment| !segment.is_empty()).flat_map(|segment| {
+        let mut parts = segment.split_whitespace();
+        let directive = parts.next();
+        let hostport = parts.next();
+        let extra = parts.next();
+        let is_proxy_directive = matches!(
+            directive.map(str::to_ascii_lowercase).as_deref(),
+            Some("proxy" | "http" | "https" | "socks" | "socks4" | "socks5")
+        ) && hostport.is_some() && extra.is_none();
+        // Keep a PAC directive and its authority together. Bare WinHTTP proxy
+        // lists may instead contain whitespace-separated authorities.
+        let directive = is_proxy_directive.then_some(segment);
+        let tokens = (!is_proxy_directive).then(|| segment.split_whitespace());
+        directive.into_iter().chain(tokens.into_iter().flatten())
+    })
 }
 
 fn parse_proxy_token(token: &str, target_scheme: &str) -> ParsedProxyListDecision {

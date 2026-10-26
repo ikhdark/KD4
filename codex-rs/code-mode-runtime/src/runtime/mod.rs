@@ -1135,6 +1135,50 @@ fn send_result(
         }
     }
     let error_text = error_text.map(|text| {
+        if let Some((diagnostic, graph)) = text.split_once("\nHelper results:\n")
+            && let Some(state) = scope.get_slot::<RuntimeState>()
+        {
+            let evidence_prefix = format!("Code mode helper evidence {}\n", uuid::Uuid::new_v4());
+            let evidence_text = format!("{evidence_prefix}{text}");
+            let evidence_bytes = evidence_text.len();
+            // The full item uses the normal bounded output owner. The core
+            // hides it only after matching this host envelope and exact size;
+            // admission loss remains explicit and never authorizes replay.
+            state.emit_output(FunctionCallOutputContentItem::InputText { text: evidence_text });
+            let nodes = serde_json::Deserializer::from_str(graph).into_iter::<JsonValue>()
+                .next().and_then(Result::ok);
+            let nodes = nodes.as_ref().filter(|_| graph.starts_with("{\n")).and_then(JsonValue::as_object);
+            let first_node_line = diagnostic.bytes().filter(|byte| *byte == b'\n').count() + 5;
+            let mut summaries = Vec::new();
+            let mut summary_bytes = 2;
+            for (index, (id, node)) in nodes.into_iter().flat_map(|nodes| nodes.iter()).enumerate() {
+                let summary = serde_json::json!({
+                    "node_id": id,
+                    "status": node.get("status").and_then(JsonValue::as_str)
+                        .filter(|status| matches!(*status, "fulfilled" | "rejected" | "skipped")),
+                    "input_index": node.get("input_index").and_then(JsonValue::as_u64),
+                    "evidence_line": first_node_line + index,
+                    "evidence_complete": node.get("_codex_evidence").is_none_or(|metadata| metadata["complete"] != false),
+                });
+                summary_bytes += summary.to_string().len() + 1;
+                if summaries.len() >= 16 || summary_bytes > 4096 { break; }
+                summaries.push(summary);
+            }
+            let mut end = diagnostic.len().min(1024);
+            while !diagnostic.is_char_boundary(end) { end -= 1; }
+            let omitted_node_summaries = nodes.map_or(0, |nodes| nodes.len().saturating_sub(summaries.len()));
+            return serde_json::json!({
+                "kind": "code_mode_helper_failure", "version": 1,
+                "diagnostic": &diagnostic[..end],
+                "evidence_prefix": evidence_prefix, "evidence_bytes": evidence_bytes,
+                "node_count": nodes.map(serde_json::Map::len),
+                "omitted_node_summaries": omitted_node_summaries,
+                "nodes": summaries,
+                "evidence_complete": nodes.is_some_and(|nodes| nodes.values().all(|node|
+                    node.get("_codex_evidence").is_none_or(|metadata| metadata["complete"] != false))),
+                "retry_safe": false,
+            }).to_string();
+        }
         if text.len() > MAX_ERROR_TEXT_BYTES {
             // Error frames stay small, but settled helper evidence belongs
             // in the existing bounded content/artifact path before clipping.

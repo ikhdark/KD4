@@ -293,10 +293,22 @@ impl ToolRouter {
     ) -> Arc<ToolSchemaArtifact> {
         if crate::tools::effective_tool_mode(turn)
             != codex_protocol::openai_models::ToolMode::CodeModeOnly
-            || !turn.config.code_mode.excluded_tool_namespaces.is_empty()
         {
             // Direct calls need activated schemas in the API tools array.
             return self.tool_schema_snapshot(&turn.activated_deferred_tools());
+        }
+        // Apply the planner's direct/nested boundary to each activation. An
+        // excluded namespace must not expose unrelated nested capabilities.
+        let mut direct_activations = turn.activated_deferred_tools();
+        direct_activations.retain(|name| {
+            !super::spec_plan::is_hidden_by_code_mode_only(
+                turn,
+                name,
+                crate::tools::registry::ToolExposure::Deferred,
+            )
+        });
+        if !direct_activations.is_empty() {
+            return self.tool_schema_snapshot(&direct_activations);
         }
         // Activated schemas travel in appended history, never ahead of it.
         // A rebuilt router can have new eager capabilities within this same

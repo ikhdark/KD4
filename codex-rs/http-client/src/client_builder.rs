@@ -29,6 +29,7 @@ use crate::with_chatgpt_cloudflare_cookie_store;
 pub struct HttpClientBuilder {
     default_headers: Option<HeaderMap>,
     follow_redirects: bool,
+    track_fallback_redirects: bool,
     connect_timeout: Option<Duration>,
     request_timeout: Option<Option<Duration>>,
     tls_certs_only: Option<Vec<reqwest::Certificate>>,
@@ -164,11 +165,15 @@ impl HttpClientBuilder {
         route_class: ClientRouteClass,
     ) -> Result<HttpClient, BuildRouteAwareHttpClientError> {
         self.chatgpt_cookie_store = http_client_factory.chatgpt_cookie_store();
+        let route = http_client_factory.resolve_proxy_route(request_url);
+        if matches!(&route, OutboundProxyRoute::Fallback { .. }) {
+            return self.build_for_resolved_route(http_client_factory, route_class, &route);
+        }
         let (builder, request_logging, custom_ca_policy) = self.into_reqwest_parts();
-        let inner = http_client_factory.build_reqwest_client_with_custom_ca_policy(
+        let inner = http_client_factory.build_reqwest_client_for_resolved_route(
             builder,
-            request_url,
             route_class,
+            &route,
             custom_ca_policy,
         )?;
         Ok(HttpClient::from_parts(inner, request_logging))
@@ -181,6 +186,26 @@ impl HttpClientBuilder {
         route_class: ClientRouteClass,
         route: &OutboundProxyRoute,
     ) -> Result<HttpClient, BuildRouteAwareHttpClientError> {
+        if let OutboundProxyRoute::Fallback { routes } = route {
+            // PAC/WPAD bypass has already been applied to the destination.
+            // Never guess an ambient or per-candidate bypass while deciding
+            // whether caller proxy credentials may follow a fallback.
+            if routes.iter().any(|route| !matches!(route,
+                OutboundProxyRoute::Direct | OutboundProxyRoute::Proxy { no_proxy: None, .. }
+            )) {
+                return Err(BuildRouteAwareHttpClientError::InvalidProxyConfig { route_class });
+            }
+            let timeout = self.configured_timeout();
+            self.track_fallback_redirects = true;
+            let mut candidates = routes.iter().map(|route| {
+                self.clone().build_for_resolved_route(http_client_factory, route_class, route)
+                    .map(|client| (client, route))
+            });
+            let (primary, primary_route) = candidates.next()
+                .ok_or(BuildRouteAwareHttpClientError::InvalidProxyConfig { route_class })??;
+            let fallbacks = candidates.collect::<Result<Vec<_>, _>>()?;
+            return Ok(primary.with_fallbacks(primary_route, fallbacks, timeout));
+        }
         self.chatgpt_cookie_store = http_client_factory.chatgpt_cookie_store();
         // The facade applies these only to independent requests. Manual redirect hops already
         // carry the defaults that survived redirect transformations.
@@ -262,6 +287,11 @@ impl HttpClientBuilder {
         }
         if !self.follow_redirects {
             builder = builder.redirect(reqwest::redirect::Policy::none());
+        } else if self.track_fallback_redirects {
+            builder = builder.redirect(reqwest::redirect::Policy::custom(|attempt| {
+                crate::client::record_fallback_redirect();
+                reqwest::redirect::Policy::default().redirect(attempt)
+            }));
         }
         if let Some(connect_timeout) = self.connect_timeout {
             builder = builder.connect_timeout(connect_timeout);
@@ -291,6 +321,7 @@ impl Default for HttpClientBuilder {
         Self {
             default_headers: None,
             follow_redirects: true,
+            track_fallback_redirects: false,
             connect_timeout: None,
             request_timeout: None,
             tls_certs_only: None,

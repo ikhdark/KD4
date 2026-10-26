@@ -330,15 +330,12 @@ impl McpRequestProcessor {
             server_names: _,
         } = snapshot;
 
-        if !resource_errors.is_empty() {
-            return Err(internal_error(format!(
-                "MCP resource discovery failed: {}",
-                resource_errors
-                    .iter()
-                    .map(|error| format!("{}: {}", error.server, error.message))
-                    .collect::<Vec<_>>()
-                    .join("; ")
-            )));
+        let mut resource_errors_by_server = std::collections::HashMap::<String, Vec<String>>::new();
+        for error in resource_errors {
+            resource_errors_by_server
+                .entry(error.server)
+                .or_default()
+                .push(error.message);
         }
 
         let data: Vec<McpServerStatus> = selected_server_names
@@ -349,6 +346,7 @@ impl McpRequestProcessor {
                 tools: tools_by_server.remove(name).unwrap_or_default(),
                 resources: resources.remove(name).unwrap_or_default(),
                 resource_templates: resource_templates.remove(name).unwrap_or_default(),
+                resource_errors: resource_errors_by_server.remove(name).unwrap_or_default(),
                 auth_status: auth_statuses
                     .remove(name)
                     .unwrap_or(CoreMcpAuthStatus::Unsupported)

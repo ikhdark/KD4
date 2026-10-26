@@ -157,11 +157,13 @@ pub(crate) async fn run_remote_compact_task(
         .await;
         return Err(error);
     }
-    if let Some(advice) = error.retry_after() {
-        let _retry_timing_guard = turn_context.turn_timing_state.begin_retry_backoff();
-        crate::responses_retry::wait_for_retry_deadline(advice.deadline(), cancellation_token)
-            .await?;
-    }
+    crate::responses_retry::wait_for_response_retry_after(
+        &error,
+        sess.as_ref(),
+        turn_context.as_ref(),
+        cancellation_token,
+    )
+    .await?;
     if cancellation_token.is_cancelled() {
         return Err(CodexErr::TurnAborted);
     }
@@ -324,14 +326,13 @@ async fn run_remote_compact_task_inner_impl(
             if !should_retry_with_current_model(&error) {
                 return Err(error);
             }
-            if let Some(advice) = error.retry_after() {
-                let _retry_timing_guard = turn_context.turn_timing_state.begin_retry_backoff();
-                crate::responses_retry::wait_for_retry_deadline(
-                    advice.deadline(),
-                    cancellation_token,
-                )
-                .await?;
-            }
+            crate::responses_retry::wait_for_response_retry_after(
+                &error,
+                sess.as_ref(),
+                turn_context.as_ref(),
+                cancellation_token,
+            )
+            .await?;
             let fallback_turn_context = &fallback_step_context.turn;
             analytics_details.active_context_tokens_before = active_context_tokens_before;
             let fallback_result = run_remote_compact_v2_attempt(
@@ -445,6 +446,7 @@ async fn run_remote_compaction_request_v2(
     let mut retry_state = ResponsesStreamRetryState::default();
     turn_context.turn_timing_state.begin_compaction_generation();
     loop {
+        retry_state.check_retry_budget(cancellation_token)?;
         let attempt_started = tokio::time::Instant::now();
         let model_request_timing_guard = turn_context.turn_timing_state.begin_model_request_wait();
         let service_tier =

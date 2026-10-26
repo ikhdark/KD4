@@ -387,10 +387,11 @@ impl LiveThread {
             .fork_history
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Weak::new();
-        if observation_was_uncertain {
+        if metadata_sync.append_ordering_uncertain {
             // Settle any previously admitted write before submitting a successor,
             // even when rebuilding its metadata projection is unavailable.
             self.thread_store.persist_thread(self.thread_id).await?;
+            metadata_sync.append_ordering_uncertain = false;
         }
         let terminal_append =
             TerminalAppendGuard::new(Arc::clone(&self.terminal_events), items.as_slice());
@@ -398,9 +399,11 @@ impl LiveThread {
         // append. The store still owns stream ordering; do not replay the
         // uncertain batch or acknowledge metadata derived from a partial prefix.
         metadata_sync.history_observation_uncertain = true;
+        metadata_sync.append_ordering_uncertain = true;
         self.thread_store
             .append_persisted_items_ordered(self.thread_id, items.as_slice())
             .await?;
+        metadata_sync.append_ordering_uncertain = false;
         // Commit measurements in canonical acceptance order, not arrival order.
         // A later durability failure does not undo an accepted append.
         if let Some(measurement) = measurement.as_ref() {
@@ -729,6 +732,7 @@ impl LiveThread {
     ) -> ThreadStoreResult<()> {
         if sync.history_observation_uncertain {
             self.thread_store.flush_thread(self.thread_id).await?;
+            sync.append_ordering_uncertain = false;
             // Never replay an uncertain write. The store's authoritative history
             // barrier waits for its admitted projection worker as well.
             let history = self

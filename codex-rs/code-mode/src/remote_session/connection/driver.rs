@@ -11,6 +11,7 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 pub(in crate::remote_session) use self::cleanup::SessionCleanup;
+pub(super) use self::cell_ids::remote_cell_id;
 use self::delegate_runtime::DelegateRuntime;
 use self::request_tracker::RequestTracker;
 use self::session_registry::SessionRegistry;

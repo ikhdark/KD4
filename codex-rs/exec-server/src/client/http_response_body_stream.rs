@@ -7,6 +7,7 @@
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
+use std::time::Duration;
 
 use bytes::Bytes;
 use codex_http_client::HttpError;
@@ -16,8 +17,6 @@ use serde_json::Value;
 use serde_json::from_value;
 use tokio::runtime::Handle;
 use tokio::sync::mpsc;
-use tokio::sync::mpsc::error::TrySendError;
-use tracing::debug;
 
 use crate::client::ExecServerError;
 use crate::client::HttpBodyStreams;
@@ -25,6 +24,11 @@ use crate::client::Inner;
 use crate::protocol::HTTP_REQUEST_BODY_DELTA_METHOD;
 use crate::protocol::HttpRequestBodyDeltaNotification;
 use crate::rpc::RpcNotificationSender;
+
+// A full queue is not an error while its consumer makes progress. Bound only
+// a completely stalled delivery so it cannot pin the shared notification reader
+// (and unrelated RPC/control responses) indefinitely.
+const HTTP_BODY_DELIVERY_STALL_TIMEOUT: Duration = Duration::from_secs(60);
 
 pub(super) struct HttpBodyStreamRegistration {
     inner: Arc<Inner>,
@@ -248,31 +252,45 @@ impl Inner {
         // Unknown request ids are ignored intentionally: a stream may have already
         // reached EOF and released its route.
         let request_id = params.request_id.clone();
-        let mut state = self.http_body_streams.lock().await;
-        if let Some(tx) = state.streams.get(&request_id) {
+        let tx = {
+            let mut state = self.http_body_streams.lock().await;
+            let Some(tx) = state.streams.get(&request_id).cloned() else {
+                return Ok(());
+            };
             if params.done || params.error.is_some() {
                 if !tx.is_closed() {
                     // Publish before closing data admission, independently of queue capacity.
                     state.terminals.insert(request_id.clone(), Ok(params));
                 }
                 state.streams.remove(&request_id);
-            } else {
-                match tx.try_send(params) {
-                    Ok(()) => {}
-                    Err(TrySendError::Closed(_)) => {
-                        state.streams.remove(&request_id);
-                    }
-                    Err(TrySendError::Full(_)) => {
+                return Ok(());
+            }
+            tx
+        };
+        // One notification reader preserves per-response ordering. Await bounded
+        // capacity without the route mutex so recv/drop/disconnect cleanup can
+        // proceed. Dropping the receiver wakes this wait; no per-delta task or
+        // unbounded side queue is needed. A consumer that stops entirely still
+        // has a finite stall budget; do not strand unrelated RPC/control work.
+        match tokio::time::timeout(HTTP_BODY_DELIVERY_STALL_TIMEOUT, tx.send(params)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(_)) => {
+                self.http_body_streams.lock().await.streams.remove(&request_id);
+            }
+            Err(_) => {
+                let active = {
+                    let mut state = self.http_body_streams.lock().await;
+                    let active = state.streams.remove(&request_id).is_some();
+                    if active && !tx.is_closed() {
                         state.terminals.insert(
                             request_id.clone(),
-                            Err("body delta channel filled before delivery".into()),
-                        );
-                        state.streams.remove(&request_id);
-                        self.cancel_remote_http_body(&request_id);
-                        debug!(
-                            "closing http response stream `{request_id}` after body delta backpressure"
+                            Err("body delta consumer made no progress for 60 seconds".into()),
                         );
                     }
+                    active
+                };
+                if active {
+                    self.cancel_remote_http_body(&request_id);
                 }
             }
         }

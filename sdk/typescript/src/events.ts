@@ -98,6 +98,12 @@ export type ItemProgressEvent = {
   call_id: string;
 } & (
   | {
+      /** Noncanonical model text; item.completed is the complete snapshot. */
+      kind: "agent_message";
+      delta: string;
+      truncated: boolean;
+    }
+  | {
       kind: "command_output";
       delta: string;
       stream: "stdout" | "stderr" | null;

@@ -250,6 +250,7 @@ struct ClientReuseContext {
     codex_apps_tools_cache_key: CodexAppsToolsCacheKey,
     client_elicitation_capability: ElicitationCapability,
     supports_openai_form_elicitation: bool,
+    discover_tools: bool,
 }
 
 impl ClientReuseContext {
@@ -263,6 +264,7 @@ impl ClientReuseContext {
             && self.codex_apps_tools_cache_key == other.codex_apps_tools_cache_key
             && self.client_elicitation_capability == other.client_elicitation_capability
             && self.supports_openai_form_elicitation == other.supports_openai_form_elicitation
+            && self.discover_tools == other.discover_tools
     }
 }
 
@@ -426,6 +428,62 @@ impl McpConnectionManager {
         elicitation_router: ElicitationRequestRouter,
         previous_manager: Option<&McpConnectionManager>,
     ) -> Self {
+        Self::new_with_tool_discovery(
+            mcp_servers,
+            store_mode,
+            keyring_backend_kind,
+            auth_entries,
+            approval_policy,
+            submit_id,
+            tx_event,
+            startup_cancellation_token,
+            initial_permission_profile,
+            runtime_context,
+            codex_home,
+            codex_apps_tools_cache,
+            codex_apps_tools_cache_key,
+            prefix_mcp_tool_names,
+            client_elicitation_capability,
+            supports_openai_form_elicitation,
+            tool_plugin_provenance,
+            auth,
+            codex_apps_auth_manager,
+            elicitation_lifecycle,
+            elicitation_router,
+            previous_manager,
+            /*discover_tools*/ true,
+        )
+        .await
+    }
+
+    /// Resource-only helpers negotiate the same transport/auth/elicitation
+    /// lifecycle without depending on an unrelated tools catalog.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn new_with_tool_discovery(
+        mcp_servers: &HashMap<String, EffectiveMcpServer>,
+        store_mode: OAuthCredentialsStoreMode,
+        keyring_backend_kind: AuthKeyringBackendKind,
+        auth_entries: HashMap<String, McpAuthStatusEntry>,
+        approval_policy: &Constrained<AskForApproval>,
+        submit_id: String,
+        tx_event: Sender<Event>,
+        startup_cancellation_token: CancellationToken,
+        initial_permission_profile: PermissionProfile,
+        runtime_context: McpRuntimeContext,
+        codex_home: PathBuf,
+        codex_apps_tools_cache: CodexAppsToolsCache,
+        codex_apps_tools_cache_key: CodexAppsToolsCacheKey,
+        prefix_mcp_tool_names: bool,
+        client_elicitation_capability: ElicitationCapability,
+        supports_openai_form_elicitation: bool,
+        tool_plugin_provenance: ToolPluginProvenance,
+        auth: Option<&CodexAuth>,
+        codex_apps_auth_manager: Option<Arc<AuthManager>>,
+        elicitation_lifecycle: Option<crate::ElicitationLifecycle>,
+        elicitation_router: ElicitationRequestRouter,
+        previous_manager: Option<&McpConnectionManager>,
+        discover_tools: bool,
+    ) -> Self {
         let mut required_servers = mcp_servers
             .iter()
             .filter(|(_, server)| server.enabled() && server.required())
@@ -443,6 +501,7 @@ impl McpConnectionManager {
             codex_apps_tools_cache_key: codex_apps_tools_cache_key.clone(),
             client_elicitation_capability: client_elicitation_capability.clone(),
             supports_openai_form_elicitation,
+            discover_tools,
         };
         let reusable_previous_manager = previous_manager.filter(|previous| {
             !previous.shutdown_started()
@@ -559,7 +618,8 @@ impl McpConnectionManager {
                     McpServerTransportConfig::Stdio { .. } => false,
                 });
             let shares_codex_apps_tools_cache =
-                should_share_codex_apps_tools_cache(&server_name, uses_env_bearer_token)
+                discover_tools
+                    && should_share_codex_apps_tools_cache(&server_name, uses_env_bearer_token)
                     && configured_config.is_some_and(cache_transport_has_only_account_auth);
             let codex_apps_tools_cache_context = if shares_codex_apps_tools_cache
                 && let Some(configured_config) = configured_config
@@ -614,6 +674,7 @@ impl McpConnectionManager {
                 client_elicitation_capability.clone(),
                 supports_openai_form_elicitation,
                 Arc::clone(&tool_catalog_revision),
+                discover_tools,
             )
             .await;
             manager
@@ -835,6 +896,7 @@ impl McpConnectionManager {
                 },
                 client_elicitation_capability: ElicitationCapability::default(),
                 supports_openai_form_elicitation: false,
+                discover_tools: true,
             },
             shutdown_started: AtomicBool::new(false),
             shutdown_complete: tokio::sync::watch::channel(false).0,

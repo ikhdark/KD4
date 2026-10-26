@@ -89,6 +89,11 @@ pub struct ItemProgressEvent {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, TS)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ItemProgress {
+    /// Noncanonical model text; item.completed remains the complete snapshot.
+    AgentMessage {
+        delta: String,
+        truncated: bool,
+    },
     CommandOutput {
         delta: String,
         stream: Option<codex_protocol::protocol::ExecOutputStream>,

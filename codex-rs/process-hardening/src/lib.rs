@@ -51,6 +51,62 @@ pub fn harden_process() {
     pre_main_hardening_windows();
 }
 
+/// Keeps latency-sensitive runtime work independent of Windows' automatic
+/// foreground/background CPU QoS classification. Call before starting workers.
+/// This does not raise scheduling priority or change timer-resolution policy.
+/// Other platforms are unchanged.
+pub fn disable_execution_speed_throttling() -> std::io::Result<()> {
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::System::Threading::GetCurrentProcess;
+        use windows_sys::Win32::System::Threading::GetProcessInformation;
+        use windows_sys::Win32::System::Threading::PROCESS_POWER_THROTTLING_CURRENT_VERSION;
+        use windows_sys::Win32::System::Threading::PROCESS_POWER_THROTTLING_EXECUTION_SPEED;
+        use windows_sys::Win32::System::Threading::PROCESS_POWER_THROTTLING_STATE;
+        use windows_sys::Win32::System::Threading::ProcessPowerThrottling;
+        use windows_sys::Win32::System::Threading::SetProcessInformation;
+
+        let mut state = PROCESS_POWER_THROTTLING_STATE {
+            Version: PROCESS_POWER_THROTTLING_CURRENT_VERSION,
+            ControlMask: 0,
+            StateMask: 0,
+        };
+        let size = std::mem::size_of_val(&state) as u32;
+        // SAFETY: The pseudo-handle refers to this process; state is writable,
+        // correctly sized, and remains alive for the synchronous call.
+        let process = unsafe { GetCurrentProcess() };
+        if unsafe {
+            GetProcessInformation(
+                process,
+                ProcessPowerThrottling,
+                std::ptr::from_mut(&mut state).cast(),
+                size,
+            )
+        } == 0
+        {
+            return Err(std::io::Error::last_os_error());
+        }
+        // Preserve all other mechanisms, including explicit timer policy.
+        // A zero ControlMask would restore heuristics rather than opt out.
+        state.ControlMask |= PROCESS_POWER_THROTTLING_EXECUTION_SPEED;
+        state.StateMask &= !PROCESS_POWER_THROTTLING_EXECUTION_SPEED;
+        // SAFETY: The same process handle and fully initialized state remain
+        // valid; SetProcessInformation only reads this structure.
+        if unsafe {
+            SetProcessInformation(
+                process,
+                ProcessPowerThrottling,
+                std::ptr::from_ref(&state).cast(),
+                size,
+            )
+        } == 0
+        {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
+    Ok(())
+}
+
 #[cfg(any(target_os = "linux", target_os = "android"))]
 const PRCTL_FAILED_EXIT_CODE: i32 = 5;
 

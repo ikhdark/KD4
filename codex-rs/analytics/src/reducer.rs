@@ -1881,14 +1881,38 @@ impl AnalyticsReducer {
     }
 
     async fn maybe_emit_turn_event(&mut self, turn_id: &str, out: &mut Vec<TrackEventRequest>) {
+        self.emit_turn_event(turn_id, out, false).await;
+    }
+
+    pub(crate) async fn flush_completed_turns(&mut self, out: &mut Vec<TrackEventRequest>) {
+        // The queue owner has reduced every already-queued fact. A completion
+        // must survive even if all of its earlier enrichment was dropped before
+        // the reducer first saw this turn. Keep the existing bounded turn store.
+        let pending = self.turns.iter()
+            .filter(|(_, turn)| !turn.emitted && turn.completed.is_some())
+            .map(|(turn_id, _)| turn_id.clone())
+            .collect::<Vec<_>>();
+        for turn_id in pending {
+            self.emit_turn_event(&turn_id, out, true).await;
+        }
+    }
+
+    async fn emit_turn_event(
+        &mut self,
+        turn_id: &str,
+        out: &mut Vec<TrackEventRequest>,
+        allow_incomplete: bool,
+    ) {
         let Some(turn_state) = self.turns.get(turn_id) else {
             return;
         };
-        if turn_state.thread_id.is_none()
-            || turn_state.num_input_images.is_none()
-            || turn_state.resolved_config.is_none()
-            || turn_state.profile.is_none()
-            || turn_state.completed.is_none()
+        if turn_state.thread_id.is_none() || turn_state.completed.is_none() {
+            return;
+        }
+        if !allow_incomplete
+            && (turn_state.num_input_images.is_none()
+                || turn_state.resolved_config.is_none()
+                || turn_state.profile.is_none())
         {
             return;
         }
@@ -3055,95 +3079,58 @@ fn codex_turn_event_params(
     turn_state: &TurnState,
     thread_metadata: &ThreadMetadataState,
 ) -> CodexTurnEventParams {
-    let (
-        Some(thread_id),
-        Some(num_input_images),
-        Some(resolved_config),
-        Some(profile),
-        Some(completed),
-    ) = (
-        turn_state.thread_id.clone(),
-        turn_state.num_input_images,
-        turn_state.resolved_config.clone(),
-        turn_state.profile.clone(),
-        turn_state.completed.clone(),
-    )
+    let (Some(thread_id), Some(completed)) =
+        (turn_state.thread_id.clone(), turn_state.completed.as_ref())
     else {
-        unreachable!("turn event params require a fully populated turn state");
+        unreachable!("turn event params require thread and terminal authority");
     };
-    let started_at = turn_state.started_at;
-    let TurnResolvedConfigFact {
-        turn_id: _resolved_turn_id,
-        thread_id: _resolved_thread_id,
-        num_input_images: _resolved_num_input_images,
-        submission_type,
-        ephemeral,
-        session_source: _session_source,
-        model,
-        model_provider,
-        permission_profile,
-        permission_profile_cwd,
-        reasoning_effort,
-        reasoning_summary,
-        service_tier,
-        approval_policy,
-        sandbox_network_access,
-        collaboration_mode,
-        personality,
-        workspace_kind,
-        is_first_turn,
-    } = resolved_config;
-    let TurnProfile {
-        before_first_sampling_ms,
-        sampling_ms,
-        between_sampling_overhead_ms,
-        tool_blocking_ms,
-        after_last_sampling_ms,
-        sampling_request_count,
-        sampling_retry_count,
-        compaction,
-        tool_result,
-        server_end_turn_false,
-        pending_input,
-        stop_hook,
-        invalid_image_recovery,
-    } = profile;
-    let token_usage = turn_state.token_usage.clone();
+    let config = turn_state.resolved_config.as_ref();
+    let profile = turn_state.profile.as_ref();
+    let token_usage = turn_state.token_usage.as_ref();
     let codex_error = turn_state.codex_error.as_ref();
     let tool_counts_complete =
         turn_state.tool_count_baseline_seen && !turn_state.tool_counts_incomplete;
+    let mut missing_facts = Vec::new();
+    if config.is_none() {
+        missing_facts.push("resolved_config");
+    }
+    if profile.is_none() {
+        missing_facts.push("turn_profile");
+    }
+    if token_usage.is_none() {
+        missing_facts.push("token_usage");
+    }
     CodexTurnEventParams {
         thread_id,
         session_id: thread_metadata.session_id.clone(),
         turn_id,
         app_server_client,
         runtime,
-        submission_type,
-        ephemeral,
+        submission_type: config.and_then(|config| config.submission_type),
+        ephemeral: config.map(|config| config.ephemeral),
         thread_source: thread_metadata.thread_source.clone(),
         initialization_mode: thread_metadata.initialization_mode,
         subagent_source: thread_metadata.subagent_source.clone(),
         parent_thread_id: thread_metadata.parent_thread_id.clone(),
-        model: Some(model),
-        model_provider,
-        sandbox_policy: Some(sandbox_policy_mode(
-            &permission_profile,
-            permission_profile_cwd.as_path(),
-        )),
-        reasoning_effort: reasoning_effort.map(|value| value.to_string()),
-        reasoning_summary: reasoning_summary_mode(reasoning_summary),
-        service_tier: service_tier
-            .map(|value| value.to_string())
-            .unwrap_or_else(|| "default".to_string()),
-        approval_policy: approval_policy.to_string(),
-        sandbox_network_access,
-        collaboration_mode: Some(collaboration_mode_mode(collaboration_mode)),
-        personality: personality_mode(personality),
-        workspace_kind,
-        num_input_images,
-        is_first_turn,
+        model: config.map(|config| config.model.clone()),
+        model_provider: config.map(|config| config.model_provider.clone()),
+        sandbox_policy: config.map(|config| {
+            sandbox_policy_mode(&config.permission_profile, config.permission_profile_cwd.as_path())
+        }),
+        reasoning_effort: config.and_then(|config| config.reasoning_effort.as_ref().map(ToString::to_string)),
+        reasoning_summary: config.and_then(|config| reasoning_summary_mode(config.reasoning_summary)),
+        service_tier: config.map(|config| {
+            config.service_tier.map(|value| value.to_string()).unwrap_or_else(|| "default".to_string())
+        }),
+        approval_policy: config.map(|config| config.approval_policy.to_string()),
+        sandbox_network_access: config.map(|config| config.sandbox_network_access),
+        collaboration_mode: config.map(|config| collaboration_mode_mode(config.collaboration_mode)),
+        personality: config.and_then(|config| personality_mode(config.personality)),
+        workspace_kind: config.and_then(|config| config.workspace_kind.clone()),
+        num_input_images: turn_state.num_input_images,
+        is_first_turn: config.map(|config| config.is_first_turn),
         status: completed.status,
-        turn_error: completed.turn_error,
+        turn_error: completed.turn_error.clone(),
         codex_error_kind: codex_error.map(|error| error.kind),
         codex_error_http_status_code: codex_error.and_then(|error| error.http_status_code),
         steer_count: Some(turn_state.steer_count),
@@ -3151,47 +3138,35 @@ fn codex_turn_event_params(
         shell_command_count: tool_counts_complete.then_some(turn_state.tool_counts.shell_command),
         file_change_count: tool_counts_complete.then_some(turn_state.tool_counts.file_change),
         mcp_tool_call_count: tool_counts_complete.then_some(turn_state.tool_counts.mcp_tool_call),
-        dynamic_tool_call_count: tool_counts_complete
-            .then_some(turn_state.tool_counts.dynamic_tool_call),
-        subagent_tool_call_count: tool_counts_complete
-            .then_some(turn_state.tool_counts.subagent_tool_call),
+        dynamic_tool_call_count: tool_counts_complete.then_some(turn_state.tool_counts.dynamic_tool_call),
+        subagent_tool_call_count: tool_counts_complete.then_some(turn_state.tool_counts.subagent_tool_call),
         web_search_count: tool_counts_complete.then_some(turn_state.tool_counts.web_search),
-        image_generation_count: tool_counts_complete
-            .then_some(turn_state.tool_counts.image_generation),
+        image_generation_count: tool_counts_complete.then_some(turn_state.tool_counts.image_generation),
         token_usage_scope: "turn",
-        token_usage_coverage: token_usage.as_ref().and_then(|usage| usage.coverage),
-        input_tokens: token_usage
-            .as_ref()
-            .map(|token_usage| token_usage.input_tokens),
-        cached_input_tokens: token_usage
-            .as_ref()
-            .map(|token_usage| token_usage.cached_input_tokens),
-        output_tokens: token_usage
-            .as_ref()
-            .map(|token_usage| token_usage.output_tokens),
-        reasoning_output_tokens: token_usage
-            .as_ref()
-            .map(|token_usage| token_usage.reasoning_output_tokens),
-        total_tokens: token_usage
-            .as_ref()
-            .map(|token_usage| token_usage.total_tokens),
-        before_first_sampling_ms,
-        sampling_ms,
-        between_sampling_overhead_ms,
-        tool_blocking_ms,
-        after_last_sampling_ms,
-        sampling_request_count,
-        sampling_retry_count,
-        compaction,
-        tool_result,
-        server_end_turn_false,
-        pending_input,
-        stop_hook,
-        invalid_image_recovery,
+        token_usage_coverage: token_usage.and_then(|usage| usage.coverage),
+        input_tokens: token_usage.map(|usage| usage.input_tokens),
+        cached_input_tokens: token_usage.map(|usage| usage.cached_input_tokens),
+        output_tokens: token_usage.map(|usage| usage.output_tokens),
+        reasoning_output_tokens: token_usage.map(|usage| usage.reasoning_output_tokens),
+        total_tokens: token_usage.map(|usage| usage.total_tokens),
+        before_first_sampling_ms: profile.map(|profile| profile.before_first_sampling_ms),
+        sampling_ms: profile.map(|profile| profile.sampling_ms),
+        between_sampling_overhead_ms: profile.map(|profile| profile.between_sampling_overhead_ms),
+        tool_blocking_ms: profile.map(|profile| profile.tool_blocking_ms),
+        after_last_sampling_ms: profile.map(|profile| profile.after_last_sampling_ms),
+        sampling_request_count: profile.map(|profile| profile.sampling_request_count),
+        sampling_retry_count: profile.map(|profile| profile.sampling_retry_count),
+        compaction: profile.map(|profile| profile.compaction),
+        tool_result: profile.map(|profile| profile.tool_result),
+        server_end_turn_false: profile.map(|profile| profile.server_end_turn_false),
+        pending_input: profile.map(|profile| profile.pending_input),
+        stop_hook: profile.map(|profile| profile.stop_hook),
+        invalid_image_recovery: profile.map(|profile| profile.invalid_image_recovery),
         timing: turn_state.timing.clone(),
         duration_ms: completed.duration_ms,
-        started_at,
+        started_at: turn_state.started_at,
         completed_at: completed.completed_at,
+        missing_facts,
     }
 }
 

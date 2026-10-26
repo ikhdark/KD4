@@ -280,12 +280,7 @@ impl CodeModeWaitHandler {
                     .code_mode_service
                     .observe_packet_retention(&cell_id, args.terminate || super::observation_failed(&response), &cancellation_token)
                     .await;
-                let delivery = exec
-                    .session
-                    .services
-                    .code_mode_service
-                    .delivery_for_response(&cell_id, &exec.turn, &response);
-                let (mut output, delivered_call_ids) =
+                let (mut output, delivered_call_ids, delivery) =
                     handle_runtime_response(&exec, response, effective_max_tokens, started_at)
                         .map_err(FunctionCallError::RespondToModel)?;
                 exec.session

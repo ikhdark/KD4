@@ -340,7 +340,7 @@ pub async fn read_mcp_resource(
     let (tx_event, rx_event) = unbounded();
     drop(rx_event);
     let cancel_token = CancellationToken::new();
-    let manager = McpConnectionManager::new(
+    let manager = McpConnectionManager::new_with_tool_discovery(
         &mcp_servers,
         config.mcp_oauth_credentials_store_mode,
         config.auth_keyring_backend_kind,
@@ -367,6 +367,7 @@ pub async fn read_mcp_resource(
         /*elicitation_lifecycle*/ None,
         crate::elicitation::ElicitationRequestRouter::default(),
         /*previous_manager*/ None,
+        /*discover_tools*/ false,
     )
     .await;
 

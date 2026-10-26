@@ -37,6 +37,7 @@ pub(in crate::remote_session::connection) enum DriverCommand {
     Execute {
         session: RemoteSession,
         request: ExecuteRequest,
+        on_possible_execution: Box<dyn FnOnce() + Send>,
         caller_cancellation: CancellationToken,
         response_tx: oneshot::Sender<Result<DeliveredExecute, String>>,
     },
@@ -141,6 +142,8 @@ pub(super) enum PendingRequest {
     },
     Execute {
         session: RemoteSession,
+        // Retained across dropped observers; drop only on proven pre-start Err.
+        on_possible_execution: Box<dyn FnOnce() + Send>,
         response_tx: oneshot::Sender<Result<DeliveredExecute, String>>,
         initial_response_tx: oneshot::Sender<Result<RuntimeResponse, String>>,
         initial_response_rx: oneshot::Receiver<Result<RuntimeResponse, String>>,
@@ -187,7 +190,9 @@ impl PendingRequest {
             Self::OpenSession { response_tx, .. } | Self::ShutdownSession { response_tx, .. } => {
                 let _ = response_tx.send(Err(reason));
             }
-            Self::Execute { response_tx, .. } => {
+            Self::Execute { response_tx, on_possible_execution, .. } => {
+                // Transport loss is not proof that an accepted request never ran.
+                on_possible_execution();
                 let _ = response_tx.send(Err(reason));
             }
             Self::Wait { response_tx, .. } | Self::Terminate { response_tx, .. } => {

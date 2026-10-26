@@ -238,9 +238,10 @@ passed to `run(...)` or `turn(...)` applies to that turn and subsequent turns.
 
 ### TurnHandle
 
+- `close(*, cancel=False) -> None` / `abandon(*, cancel=False) -> None`
 - `steer(input: str | Input) -> TurnSteerResponse`
 - `interrupt() -> TurnInterruptResponse`
-- `stream() -> Iterator[Notification]`
+- `stream(*, cancel_on_close=False) -> Iterator[Notification]`
 - `run() -> TurnResult`
 
 Behavior notes:
@@ -250,15 +251,24 @@ Behavior notes:
 
 ### AsyncTurnHandle
 
+- `close(*, cancel=False) -> Awaitable[None]` / `abandon(*, cancel=False) -> Awaitable[None]`
 - `steer(input: str | Input) -> Awaitable[TurnSteerResponse]`
 - `interrupt() -> Awaitable[TurnInterruptResponse]`
-- `stream() -> AsyncIterator[Notification]`
+- `stream(*, cancel_on_close=False) -> AsyncIterator[Notification]`
 - `run() -> Awaitable[TurnResult]`
 
 Behavior notes:
 
 - `stream()` and `run()` consume only notifications for their own turn ID
 - one `AsyncCodex` instance can stream multiple active turns concurrently
+
+Handle close/abandon and early stream exit detach by default. Opt into cancellation
+with `close(cancel=True)` or `stream(cancel_on_close=True)`; explicitly close/aclose
+the iterator on early exit. Interruption failures propagate after route cleanup.
+Closing a generator before its first iteration does not run its cleanup; close the
+handle directly in that case. `CodexConfig.turn_timeout_s` optionally sets a hard
+whole-turn cap; `notification_timeout_s` bounds each wait independently of the RPC
+`operation_timeout_s`. Interrupt/steer use bounded reserved control capacity.
 
 ## Inputs
 

@@ -762,13 +762,17 @@ class TurnHandle:
         if self._client.process_epoch != self._epoch:
             raise TransportClosedError("turn handle belongs to a closed Codex process")
 
-    def close(self) -> None:
-        """Release this handle's notification route without consuming the turn."""
+    def close(self, *, cancel: bool = False) -> None:
+        """Detach by default; optionally interrupt before releasing the route."""
         if self._closed:
             return
-        self._closed = True
-        if self._client.process_epoch == self._epoch:
-            self._client.unregister_turn_notifications(self.id)
+        try:
+            if cancel:
+                self.interrupt()
+        finally:
+            self._closed = True
+            if self._client.process_epoch == self._epoch:
+                self._client.unregister_turn_notifications(self.id)
 
     abandon = close
 
@@ -792,22 +796,24 @@ class TurnHandle:
         self._ensure_current()
         return self._client.turn_interrupt(self.thread_id, self.id)
 
-    def stream(self) -> Iterator[Notification]:
+    def stream(self, *, cancel_on_close: bool = False) -> Iterator[Notification]:
         """Yield only notifications routed to this turn handle."""
         self._ensure_current()
         self._client.register_turn_notifications(self.id)
+        completed = False
         try:
             while True:
                 event = self._client.next_turn_notification(self.id)
-                yield event
-                if (
+                completed = (
                     event.method == "turn/completed"
                     and isinstance(event.payload, TurnCompletedNotification)
                     and event.payload.turn.id == self.id
-                ):
+                )
+                yield event
+                if completed:
                     break
         finally:
-            self.close()
+            self.close(cancel=cancel_on_close and not completed)
 
     def run(self) -> TurnResult:
         """Consume the turn stream and return its completed result."""
@@ -839,12 +845,16 @@ class AsyncTurnHandle:
         if not self._codex._initialized or self._codex._client.process_epoch != self._epoch:
             raise TransportClosedError("turn handle belongs to a closed Codex process")
 
-    async def close(self) -> None:
-        """Release this handle's notification route without consuming the turn."""
+    async def close(self, *, cancel: bool = False) -> None:
+        """Detach by default; optionally interrupt before releasing the route."""
         if self._closed:
             return
-        self._closed = True
-        self._router.unregister_turn(self.id)
+        try:
+            if cancel:
+                await self.interrupt()
+        finally:
+            self._closed = True
+            self._router.unregister_turn(self.id)
 
     abandon = close
 
@@ -863,6 +873,7 @@ class AsyncTurnHandle:
         return await self._codex._client._run_sync(
             lambda: self._codex._client._sync.turn_steer(self.thread_id, self.id, items),
             expected_epoch=self._epoch,
+            control=True,
         )
 
     async def interrupt(self) -> TurnInterruptResponse:
@@ -871,28 +882,29 @@ class AsyncTurnHandle:
         return await self._codex._client._run_sync(
             lambda: self._codex._client._sync.turn_interrupt(self.thread_id, self.id),
             expected_epoch=self._epoch,
+            control=True,
         )
 
-    async def stream(self) -> AsyncIterator[Notification]:
+    async def stream(self, *, cancel_on_close: bool = False) -> AsyncIterator[Notification]:
         """Yield only notifications routed to this async turn handle."""
         self._ensure_current()
         self._router.register_turn(self.id)
+        completed = False
         try:
             while True:
                 self._ensure_current()
-                event = await self._codex._client._poll_notification(
-                    lambda: self._router.next_turn_notification(self.id, 0.0)
-                )
+                event = await self._codex._client.next_turn_notification(self.id)
                 self._ensure_current()
-                yield event
-                if (
+                completed = (
                     event.method == "turn/completed"
                     and isinstance(event.payload, TurnCompletedNotification)
                     and event.payload.turn.id == self.id
-                ):
+                )
+                yield event
+                if completed:
                     break
         finally:
-            await self.close()
+            await self.close(cancel=cancel_on_close and not completed)
 
     async def run(self) -> TurnResult:
         """Consume the turn stream and return its completed result."""

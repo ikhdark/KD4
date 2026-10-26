@@ -932,6 +932,7 @@ impl CodeModeService {
         cell_id: &CellId,
         turn: &TurnContext,
         response: &RuntimeResponse,
+        command_states: &[JsonValue],
     ) -> Result<Option<String>, JsonValue> {
         self.restore_terminal_packet(cell_id.as_str());
         let mut admission = self
@@ -950,6 +951,16 @@ impl CodeModeService {
         let Some(metrics) = cells.get_mut(cell_id.as_str()) else {
             return Ok(None);
         };
+        if metrics.delivery_intent.is_some() {
+            // An empty runtime yield can still deliver an owner settlement.
+            // Keep its proof so the next wait neither re-drains nor re-emits it.
+            metrics.command_states = command_states.iter().cloned().map(|mut state| {
+                if let Some(state) = state.as_object_mut() {
+                    state.remove("unobserved_settlement_output");
+                }
+                state
+            }).collect();
+        }
         if let RuntimeResponse::Yielded { content_items, .. }
         | RuntimeResponse::ExplicitYield { content_items, .. } = response
         {
@@ -1032,10 +1043,11 @@ impl CodeModeService {
             }
             return Err(serde_json::json!({"category":category}));
         }
-        if let Some(state) = metrics.command_states.iter().find(|state| {
+        if let Some(state) = command_states.iter().find(|state| {
             // Absence of a running flag is not terminal proof. The command
             // owner must settle execution and deferred work affirmatively.
             state.get("execution_state").and_then(JsonValue::as_str) != Some("exited")
+                || state["unobserved_settlement_output"] == true
                 || state.get("session_id").is_some_and(|id| !id.is_null())
                 || state.get("process_exited").and_then(JsonValue::as_bool) != Some(true)
                 || !(state.get("exit_code").and_then(JsonValue::as_i64) == Some(0)
@@ -1045,7 +1057,9 @@ impl CodeModeService {
                     .get("pending_deferred_completions")
                     .is_some_and(|pending| !pending.as_array().is_some_and(Vec::is_empty))
         }) {
-            let category = if state
+            let category = if state["unobserved_settlement_output"] == true {
+                "command_output_unobserved"
+            } else if state
                 .get("pending_deferred_completions")
                 .is_some_and(|pending| !pending.as_array().is_some_and(Vec::is_empty))
             {
@@ -1681,6 +1695,13 @@ fn refresh_ready_command_states(exec: &ExecContext, packet: &mut CodeModePacketR
         ) else { continue; };
         let result = result.code_mode_result(&ToolPayload::Function { arguments: "{}".into() });
         let Some(mut refreshed) = command_result_state(&result) else { continue; };
+        // Completion proof may be fresh even though the script saw only a live
+        // handle. New output still needs model attention before direct delivery.
+        if result["output"].as_str().is_some_and(|output| !output.is_empty())
+            || result["output_reduced"] == true
+        {
+            refreshed["unobserved_settlement_output"] = true.into();
+        }
         for key in ["call_id", "tool", "polled_session_id", "pending_deferred_completions"] {
             if let Some(value) = state.get(key) { refreshed[key] = value.clone(); }
         }
@@ -1699,7 +1720,7 @@ pub(super) fn handle_runtime_response(
     response: RuntimeResponse,
     max_output_tokens: Option<usize>,
     started_at: std::time::Instant,
-) -> Result<(FunctionToolOutput, Vec<String>), String> {
+) -> Result<(FunctionToolOutput, Vec<String>, Result<Option<String>, JsonValue>), String> {
     // Nested tool results have already crossed their owning tool boundary. Keep
     // one coherent, model-safe exec packet here instead of applying the much
     // smaller generic per-tool diagnostic budget a second time.
@@ -1734,6 +1755,14 @@ pub(super) fn handle_runtime_response(
             .collect()
     };
     refresh_ready_command_states(exec, &mut packet);
+    // Ready-only settlement stays outside the packet-admission lock. Eligibility
+    // consumes the owner's refreshed proof, never a guessed process-exit flag.
+    let delivery = exec.session.services.code_mode_service.delivery_for_response(
+        &CellId::new(cell_id.to_string()),
+        &exec.turn,
+        &response,
+        &packet.command_states,
+    );
     tracing::info!(
         target: "codex.code_mode.packet",
         cell_id,
@@ -1932,7 +1961,7 @@ pub(super) fn handle_runtime_response(
     if let Some(calls) = cancelled_nested_calls {
         output.essential_inline.insert("cancelled_nested_calls".into(), calls);
     }
-    Ok((output, delivered_call_ids))
+    Ok((output, delivered_call_ids, delivery))
 }
 
 /// Host observation is not a rollback. Route failure through packet formatting
@@ -2351,7 +2380,7 @@ fn format_runtime_response(
     // A yielded cell still owns its work. Publish required failures with its
     // terminal response, even if a nested call finishes just after yielding.
     let required_terminal = if yielded { None } else { required_terminal };
-    let (mut content_items, mut outcome, mut success, script_error) = match response {
+    let (mut content_items, mut outcome, mut success, mut script_error) = match response {
         RuntimeResponse::Yielded { content_items, .. }
         | RuntimeResponse::ExplicitYield { content_items, .. } => {
             let content_items = into_function_call_output_content_items(content_items);
@@ -2376,6 +2405,28 @@ fn format_runtime_response(
             (content_items, outcome, success, error_text)
         }
     };
+
+    // Host-generated helper envelopes identify the exact automatically emitted
+    // item. Keep its full evidence under the existing canonical artifact owner,
+    // independently of the bounded model diagnostic. Never infer this custody
+    // from script-printed marker text or from a partial/admission-lost item.
+    let mut helper_failure = script_error.as_deref()
+        .and_then(|error| serde_json::from_str::<JsonValue>(error).ok())
+        .filter(|receipt| receipt["kind"] == "code_mode_helper_failure" && receipt["version"] == 1);
+    let helper_evidence = helper_failure.as_mut().and_then(|receipt| {
+        let prefix = receipt["evidence_prefix"].as_str()?;
+        let bytes = receipt["evidence_bytes"].as_u64()?;
+        let index = content_items.iter().rposition(|item| matches!(item,
+            FunctionCallOutputContentItem::InputText { text }
+                if text.starts_with(prefix) && text.len() as u64 == bytes))?;
+        receipt.as_object_mut()?.remove("evidence_prefix");
+        Some(content_items.remove(index))
+    });
+    if let Some(receipt) = &mut helper_failure {
+        script_error = Some(receipt["diagnostic"].as_str().unwrap_or("dependency graph failed").to_owned());
+        receipt["evidence_output_available"] = JsonValue::Bool(helper_evidence.is_some());
+        receipt["notice"] = "All started nodes settled; do not replay completed work. Recover only needed node selectors from the canonical cell-output artifact; unavailable evidence is not permission to rerun effects.".into();
+    }
 
     // Read only the runtime's error envelope, never script-printed output.
     // Reuse the existing nested-result ledger rather than maintaining another
@@ -2455,6 +2506,50 @@ fn format_runtime_response(
     // The saved artifact includes a four-line status prefix (three header lines
     // plus the item separator), and optionally one output-loss metadata line.
     let line_offset = script_status.lines().count() + 3 + usize::from(output_loss.is_some());
+    let mut helper_recovery_selector = None;
+    if let Some(receipt) = &mut helper_failure {
+        if let Some(FunctionCallOutputContentItem::InputText { text }) = &helper_evidence {
+            let text_only = canonical_content_items.iter().all(|item|
+                matches!(item, FunctionCallOutputContentItem::InputText { .. }));
+            let start = text_only.then(|| {
+                let prefix = code_mode_text_content(&canonical_content_items);
+                // The two summary newlines below precede this canonical-only item.
+                line_offset + prefix.bytes().filter(|byte| *byte == b'\n').count()
+                    + usize::from(!prefix.is_empty()) + 3
+            });
+            if let Some(nodes) = receipt["nodes"].as_array_mut() {
+                for node in nodes {
+                    if let (Some(start), Some(relative)) = (start, node["evidence_line"].as_u64()) {
+                        let line = start + relative.saturating_sub(1) as usize;
+                        node["selector"] = serde_json::json!({"kind":"lines", "start":line, "end":line});
+                    }
+                    if let Some(node) = node.as_object_mut() { node.remove("evidence_line"); }
+                }
+            }
+            let selector = match start {
+                Some(start) => serde_json::json!({"kind":"lines", "start":start,
+                    "end":start + text.lines().count().saturating_sub(1)}),
+                None => {
+                    // Mixed-modality canonical output is a JSON item array,
+                    // not line-oriented text. Address the exact helper item.
+                    let index = canonical_content_items.len() + 1 + usize::from(output_loss.is_some());
+                    serde_json::json!({"kind":"json_pointer", "pointer":format!("/{index}/text")})
+                }
+            };
+            receipt["evidence_selector"] = selector.clone();
+            helper_recovery_selector = Some(selector);
+        }
+        if let Some(index) = diagnostic_index {
+            let summary = format!("\nHelper summary:\n{receipt}");
+            if let FunctionCallOutputContentItem::InputText { text } = &mut content_items[index] {
+                text.push_str(&summary);
+            }
+            if let FunctionCallOutputContentItem::InputText { text } = &mut canonical_content_items[index] {
+                text.push_str(&summary);
+            }
+        }
+    }
+    canonical_content_items.extend(helper_evidence);
     let total_lines = line_offset
         + code_mode_text_content(&canonical_content_items)
             .lines()
@@ -2521,15 +2616,25 @@ fn format_runtime_response(
         output.essential_inline.insert("cell_execution_state".into(), "unknown".into());
         output.essential_inline.insert("retry_safe".into(), false.into());
     }
-    if visible_output_truncated {
+    if visible_output_truncated || helper_recovery_selector.is_some() {
         output.essential_inline.insert(
             VISIBLE_OUTPUT_TRUNCATED_KEY.to_string(),
             JsonValue::Bool(true),
         );
-        if let Some((start, end)) = omitted_lines {
+        let recovery_selector = match (omitted_lines, helper_recovery_selector) {
+            (Some((a, b)), Some(helper)) if helper["kind"] == "lines" => {
+                let start = a.min(helper["start"].as_u64().unwrap_or(a as u64) as usize);
+                let end = b.max(helper["end"].as_u64().unwrap_or(b as u64) as usize);
+                Some(serde_json::json!({"kind":"lines", "start":start, "end":end}))
+            }
+            (Some(_), Some(_)) => Some(serde_json::json!({"kind":"json_pointer", "pointer":""})),
+            (None, helper) => helper,
+            (Some((start, end)), None) => Some(serde_json::json!({"kind":"lines", "start":start, "end":end})),
+        };
+        if let Some(selector) = recovery_selector {
             output.essential_inline.insert(
                 "cell_output_recovery_selector".into(),
-                serde_json::json!({"kind":"lines", "start":start, "end":end}),
+                selector,
             );
         }
     }

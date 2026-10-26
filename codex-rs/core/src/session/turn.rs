@@ -4696,6 +4696,7 @@ async fn retire_after_failed_local_compaction(
         return Err(local_error);
     };
     if matches!(local_error, CodexErr::Interrupted | CodexErr::TurnAborted)
+        || crate::responses_retry::is_retry_wait_budget_exhausted(&local_error)
         || !retire_consumed_tool_outputs_for_context_pressure(
             sess,
             turn_context,
@@ -4792,7 +4793,9 @@ fn run_auto_compact<'a>(
             )
             .await;
             if let Err(remote_error) = remote_result {
-                if matches!(remote_error, CodexErr::TurnAborted) {
+                if matches!(remote_error, CodexErr::TurnAborted)
+                    || crate::responses_retry::is_retry_wait_budget_exhausted(&remote_error)
+                {
                     return Err(remote_error);
                 }
                 // A failed summary must not end a long turn: exact retirement
@@ -4823,14 +4826,13 @@ fn run_auto_compact<'a>(
                 {
                     return Err(remote_error);
                 }
-                if let Some(advice) = remote_error.retry_after() {
-                    let _retry_timing_guard = turn_context.turn_timing_state.begin_retry_backoff();
-                    crate::responses_retry::wait_for_retry_deadline(
-                        advice.deadline(),
-                        cancellation_token,
-                    )
-                    .await?;
-                }
+                crate::responses_retry::wait_for_response_retry_after(
+                    &remote_error,
+                    sess.as_ref(),
+                    turn_context.as_ref(),
+                    cancellation_token,
+                )
+                .await?;
                 sess.send_event(
                     turn_context,
                     EventMsg::Warning(WarningEvent {
@@ -4886,15 +4888,13 @@ fn run_auto_compact<'a>(
                     if !should_retry_with_current_model(&previous_error) {
                         return Err(previous_error);
                     }
-                    if let Some(advice) = previous_error.retry_after() {
-                        let _retry_timing_guard =
-                            turn_context.turn_timing_state.begin_retry_backoff();
-                        crate::responses_retry::wait_for_retry_deadline(
-                            advice.deadline(),
-                            cancellation_token,
-                        )
-                        .await?;
-                    }
+                    crate::responses_retry::wait_for_response_retry_after(
+                        &previous_error,
+                        sess.as_ref(),
+                        turn_context.as_ref(),
+                        cancellation_token,
+                    )
+                    .await?;
 
                     let fallback_turn_context = &fallback_step_context.turn;
                     let fallback_result = run_inline_auto_compact_task(
@@ -5599,12 +5599,12 @@ fn run_sampling_request<'a>(
             )
         });
         drop(worker_preparation_guard);
+        client_session.refresh_transport_after_cooldown();
         let max_retries = turn_context.provider.info().stream_max_retries();
         let mut retry_state = ResponsesStreamRetryState::default();
         let recovery_episode_id = format!("{}:{}", generation_id.turn_id, generation_id.ordinal);
         let mut outer_attempt_ordinal = 0_u64;
         let mut outer_retry_reason = "initial";
-        let mut account_wait_deadline = None;
         let mut accepted_attempt_input = prepared_input.shared_items();
         sess.services
             .code_mode_service
@@ -5632,10 +5632,11 @@ fn run_sampling_request<'a>(
         loop {
             // During a logout or account switch a dispatched request carries no
             // credentials and is rejected; wait for the login instead.
+            retry_state.check_retry_budget(&cancellation_token)?;
             if turn_context.provider.missing_required_credentials()
                 && wait_for_account_change(
                     AccountChangeWait::MissingCredentials,
-                    &mut account_wait_deadline,
+                    &mut retry_state,
                     sess.as_ref(),
                     turn_context.as_ref(),
                     &cancellation_token,
@@ -5690,7 +5691,7 @@ fn run_sampling_request<'a>(
                     // succeed; it does not spend the stream retry budget.
                     if !wait_for_account_change(
                         AccountChangeWait::UsageLimit(&e, client_session.dispatched_account()),
-                        &mut account_wait_deadline,
+                        &mut retry_state,
                         sess.as_ref(),
                         turn_context.as_ref(),
                         &cancellation_token,
@@ -7394,8 +7395,11 @@ pub(crate) async fn service_tier_for_sampling(
     // Settings bursts may settle while planning or tools are running. Collapse
     // them at the request boundary instead of pinning every request to the
     // transient value captured when the turn was constructed.
+    let configured_service_tier = sess.configured_service_tier().await;
+    sess.maybe_emit_service_tier_warning(turn, configured_service_tier.as_deref())
+        .await;
     super::get_service_tier(
-        sess.configured_service_tier().await,
+        configured_service_tier,
         turn.config.features.enabled(Feature::FastMode),
         &turn.model_info,
     )

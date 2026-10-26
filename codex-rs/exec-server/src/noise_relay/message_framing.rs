@@ -79,6 +79,16 @@ impl JsonRpcMessageDecoder {
         &mut self,
         plaintext_record: &[u8],
     ) -> Result<Vec<JSONRPCMessage>, ExecServerError> {
+        self.push_with_limit(plaintext_record, usize::MAX)
+    }
+
+    /// Retain complete messages beyond the caller's bounded delivery capacity.
+    /// An empty record drains already authenticated bytes without reading more.
+    pub(crate) fn push_with_limit(
+        &mut self,
+        plaintext_record: &[u8],
+        max_messages: usize,
+    ) -> Result<Vec<JSONRPCMessage>, ExecServerError> {
         if plaintext_record.len() > NOISE_RECORD_PLAINTEXT_LEN {
             return Err(ExecServerError::Protocol(
                 "Noise relay plaintext record exceeds maximum length".to_string(),
@@ -91,7 +101,10 @@ impl JsonRpcMessageDecoder {
         // and the full declared payload are present.
         let mut messages = Vec::new();
         let mut consumed = 0;
-        while let Some(prefix) = self.buffered.get(consumed..consumed + LENGTH_PREFIX_BYTES) {
+        while messages.len() < max_messages {
+            let Some(prefix) = self.buffered.get(consumed..consumed + LENGTH_PREFIX_BYTES) else {
+                break;
+            };
             let message_len =
                 u32::from_be_bytes([prefix[0], prefix[1], prefix[2], prefix[3]]) as usize;
             // Reject the authenticated length before waiting for its payload.

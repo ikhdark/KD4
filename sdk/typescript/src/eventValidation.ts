@@ -181,11 +181,12 @@ export function validateThreadEvent(value: unknown): ThreadEvent {
         valid =
           identity(value.item_id) &&
           identity(value.call_id) &&
-          (value.kind === "command_output"
+          (value.kind === "command_output" || value.kind === "agent_message"
             ? text(value.delta)
             : value.kind === "mcp"
               ? text(value.message)
               : true);
+        if (value.kind === "agent_message") valid &&= typeof value.truncated === "boolean";
         break;
     }
     if (

@@ -452,11 +452,11 @@ fn structured_compiler_summary_with_streams(
             source_lines.borrow_mut().remove(&(line as usize));
         }
     };
-    // Keep stderr independently and verbatim. If it cannot fit, fall back to
-    // ordinary output projection/recovery rather than silently dropping it.
-    if stderr.is_some_and(|stderr| stderr.len() > SUMMARY_MAX_BYTES / 4) {
-        return None;
-    }
+    // Independently bound stderr instead of disabling structured stdout
+    // diagnostics. Every abbreviation has recovery against canonical aggregate
+    // bytes; stream offsets must never be used as aggregate offsets.
+    let mut stderr_preview = stderr
+        .map(|text| summarize_oversized_line(text, SUMMARY_MAX_BYTES / 4));
     let mut diagnostics: Vec<serde_json::Value> = Vec::new();
     // A bounded directory of evicted groups, not another diagnostic body.
     // Build selectors only for these few omissions against canonical bytes.
@@ -507,7 +507,7 @@ fn structured_compiler_summary_with_streams(
             .map(|(index, _)| index)
     };
     let mut text_lines = Vec::new();
-    let mut text_bytes = stderr.map_or(0, str::len);
+    let mut text_bytes = 0usize;
     let mut total = 0usize;
     let mut records = 0usize;
     let mut omitted = 0usize;
@@ -687,7 +687,11 @@ fn structured_compiler_summary_with_streams(
             "diagnostics_complete": omitted == 0 && diagnostics.iter().all(|item| item["details_omitted"] != true && item["unlisted_occurrences"].as_u64().unwrap_or(0) == 0),
             "text_lines": text_lines,
             "diagnostic_stream": diagnostic_stream,
-            "stderr": stderr,
+            "stderr": stderr_preview,
+            "stderr_original_bytes": stderr.map(str::len),
+            "stderr_complete": stderr.map(|text| stderr_preview.as_deref() == Some(text)),
+            "stderr_recovery_selector": stderr.filter(|text| stderr_preview.as_deref() != Some(*text))
+                .map(|_| serde_json::json!({"kind":"bytes", "start":0, "end":output.len()})),
             "projection": "Redundant rendered text, code explanations and build artifacts omitted. Identical bodies share bounded occurrences; occurrence_count includes unlisted_occurrences, recoverable through occurrence_recovery_selector. details_omitted marks abbreviated prose/excerpts or omitted children without locations or fixes. Omitted whole diagnostics may include locations and fixes; recover them with recovery_selector against the retained aggregate bytes.",
             "recovery_selector": (omitted > 0).then(|| serde_json::json!({"kind":"bytes", "start":0, "end":output.len()})),
             "diagnostics": null,
@@ -722,6 +726,13 @@ fn structured_compiler_summary_with_streams(
                 omitted_groups.pop();
             }
             return (summary.len() < output.len()).then_some(summary);
+        }
+        // Advisory stderr yields before any actionable compiler diagnostic.
+        // Keep an explicit recovery receipt even when only an empty preview fits.
+        if let Some(preview) = stderr_preview.as_ref().filter(|text| !text.is_empty()) {
+            stderr_preview = stderr
+                .map(|text| summarize_oversized_line(text, (preview.len() / 2).min(1_024)));
+            continue;
         }
         let index = lowest_priority_index(&diagnostics)?;
         // Optional provenance detail yields before any distinct diagnostic.

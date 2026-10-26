@@ -55,9 +55,13 @@ const handleEvent = (event: ThreadEvent): void => {
       handleItemUpdated(event.item);
       break;
     case "turn.completed":
-      console.log(
-        `Used ${event.usage.input_tokens} input tokens, ${event.usage.cached_input_tokens} cached input tokens, ${event.usage.output_tokens} output tokens, ${event.usage.reasoning_output_tokens} reasoning output tokens.`,
-      );
+      if (event.usage === null) {
+        console.log("Token usage unavailable.");
+      } else {
+        console.log(
+          `Used ${event.usage.input_tokens} input tokens, ${event.usage.cached_input_tokens} cached input tokens, ${event.usage.output_tokens} output tokens, ${event.usage.reasoning_output_tokens} reasoning output tokens.`,
+        );
+      }
       break;
     case "turn.failed":
       console.error(`Turn failed: ${event.error.message}`);

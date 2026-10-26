@@ -516,8 +516,28 @@ pub(super) fn value_to_error_text(
                 continue;
             };
             let remaining = MAX_PAYLOAD_BYTES.saturating_sub(text.len() + field.len() + 32);
-            let mut serialized = super::output_projection::stringify(&mut tc, attached)
-                .and_then(|json| bounded_string(&mut tc, json, remaining).ok());
+            let mut serialized = if field == "results" {
+                // Graph receipts are canonical evidence, not a tool-display
+                // projection. One JSON node per line allows selective recovery
+                // through the existing cell-output artifact without replay.
+                super::output_projection::bounded_graph_json_codec(&mut tc, attached, remaining)
+                    .and_then(|value| v8::Local::<v8::String>::try_from(value).ok())
+                    .and_then(|json| bounded_string(&mut tc, json, remaining).ok())
+                    .and_then(|json| {
+                        let value = serde_json::from_str::<JsonValue>(&json).ok()?;
+                        let nodes = value.as_object()?;
+                        let rows = nodes.iter().map(|(id, node)| {
+                            format!("{}:{}", serde_json::to_string(id).unwrap_or_default(), node)
+                        }).collect::<Vec<_>>();
+                        let indexed = format!("{{\n{}\n}}", rows.join(",\n"));
+                        // Framing must not exceed the existing error-evidence
+                        // cap. Keep exact compact JSON at that rare boundary.
+                        Some(if indexed.len() <= remaining { indexed } else { json })
+                    })
+            } else {
+                super::output_projection::stringify(&mut tc, attached)
+                    .and_then(|json| bounded_string(&mut tc, json, remaining).ok())
+            };
             if tc.is_execution_terminating() {
                 return EXECUTION_TERMINATED_MESSAGE.to_string();
             }

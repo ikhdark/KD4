@@ -818,6 +818,7 @@ async fn run_compact_task_inner_impl(
                 let mut retry_state = ResponsesStreamRetryState::default();
                 let mut retried_invalid_summary = false;
                 loop {
+                    retry_state.check_retry_budget(cancellation_token)?;
                     let attempt_result = drain_to_completed(
                         &sess,
                         turn_context.as_ref(),

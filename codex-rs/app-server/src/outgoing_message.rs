@@ -1597,24 +1597,19 @@ impl OutgoingMessageSender {
         true
     }
 
-    /// Tries a resource-owned delta without blocking its pipe reader. The caller
-    /// must retain rejected bytes for its terminal response instead of dropping them.
-    pub(crate) fn try_send_server_notification_to_connection(
-        &self,
-        connection_id: ConnectionId,
-        notification: ServerNotification,
+    /// Reserve notification capacity while a resource owner independently drains
+    /// its pipes. Keep this future in that owner's select loop, never await it
+    /// instead of draining; unadmitted bytes belong in the terminal suffix.
+    pub(crate) async fn reserve_server_notification_capacity<'a>(
+        &'a self,
         cancellation: &CancellationToken,
-    ) -> bool {
-        if cancellation.is_cancelled() || self.delivery_shutdown.is_cancelled() {
-            return false;
+    ) -> Option<mpsc::Permit<'a, OutgoingEnvelope>> {
+        tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => None,
+            _ = self.delivery_shutdown.cancelled() => None,
+            permit = self.notification_sender().reserve() => permit.ok(),
         }
-        self.notification_sender()
-            .try_send(OutgoingEnvelope::ToConnection {
-                connection_id,
-                message: OutgoingMessage::AppServerNotification(notification),
-                write_complete_tx: None,
-            })
-            .is_ok()
     }
 
     // Keep the timed fanout state out of callers that dispatch many notification variants.

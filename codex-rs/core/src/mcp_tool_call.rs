@@ -592,6 +592,7 @@ async fn execute_approved_mcp_tool_call(
     }
 
     let start = Instant::now();
+    let preparation_timing_guard = turn_context.turn_timing_state.begin_tool_execution();
     let rewrite = prepare_mcp_tool_arguments_for_openai_files(
         sess,
         step_context,
@@ -599,6 +600,7 @@ async fn execute_approved_mcp_tool_call(
         metadata.and_then(|metadata| metadata.openai_file_input_params.as_deref()),
     )
     .await;
+    drop(preparation_timing_guard);
     let tool_input = rewrite
         .as_ref()
         .ok()
@@ -776,6 +778,7 @@ async fn execute_mcp_tool_call(
     dispatched: &std::sync::atomic::AtomicBool,
 ) -> Result<ExecutedMcpToolCall, String> {
     let turn_context = step_context.turn.as_ref();
+    let tool_execution_timing_guard = turn_context.turn_timing_state.begin_tool_execution();
     let request_meta =
         build_mcp_tool_call_request_meta(turn_context, &invocation.server, call_id, metadata);
     let manager = step_context.mcp.manager();
@@ -790,7 +793,6 @@ async fn execute_mcp_tool_call(
     .map_err(|e| format!("failed to build MCP tool request metadata: {e:#}"))?;
     let request_meta =
         with_tool_call_progress_token_meta(request_meta, turn_context.sub_id.as_str(), call_id);
-    let tool_execution_timing_guard = turn_context.turn_timing_state.begin_tool_execution();
     dispatched.store(true, std::sync::atomic::Ordering::Release);
     let result = manager
         .call_tool(
@@ -831,6 +833,7 @@ async fn maybe_request_codex_apps_auth_elicitation(
     metadata: Option<&McpToolApprovalMetadata>,
     result: CallToolResult,
 ) -> CallToolResult {
+    let auth_preparation_timing_guard = turn_context.turn_timing_state.begin_tool_execution();
     if !manager.is_host_owned_codex_apps_server(server) {
         return result;
     }
@@ -873,6 +876,8 @@ async fn maybe_request_codex_apps_auth_elicitation(
         url: plan.elicitation.url,
         elicitation_id: plan.elicitation.elicitation_id,
     };
+    // User consent is an interactive wait, not active tool machine time.
+    drop(auth_preparation_timing_guard);
     let response = sess
         .request_mcp_server_elicitation(
             turn_context,
@@ -882,6 +887,7 @@ async fn maybe_request_codex_apps_auth_elicitation(
         )
         .await
         .response;
+    let _auth_completion_timing_guard = turn_context.turn_timing_state.begin_tool_execution();
     if !response
         .as_ref()
         .is_some_and(|response| response.action == ElicitationAction::Accept)

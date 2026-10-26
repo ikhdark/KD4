@@ -68,6 +68,8 @@ use url::Url;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const INITIALIZE_TIMEOUT: Duration = Duration::from_secs(10);
 const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
+const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
+const HEARTBEAT_PONG_TIMEOUT: Duration = Duration::from_secs(30);
 const REMOTE_APP_SERVER_MAX_WEBSOCKET_MESSAGE_SIZE: usize = 128 << 20;
 const METHOD_NOT_FOUND_ERROR_CODE: i64 = -32601;
 const INVALID_REQUEST_ERROR_CODE: i64 = -32600;
@@ -261,14 +263,32 @@ enum RemoteClientCommand {
 }
 
 struct RemoteWrite {
-    // None is an ordered close, after all previously admitted frames.
-    message: Option<JSONRPCMessage>,
+    message: RemoteWriteMessage,
     response_tx: Option<oneshot::Sender<IoResult<()>>>,
+}
+
+enum RemoteWriteMessage {
+    JsonRpc(JSONRPCMessage),
+    Ping(Vec<u8>),
+    // An ordered close, after all previously admitted frames.
+    Close,
 }
 
 fn queue_remote_write(
     writer_tx: &mpsc::Sender<RemoteWrite>,
     message: Option<JSONRPCMessage>,
+    response_tx: Option<oneshot::Sender<IoResult<()>>>,
+) -> IoResult<()> {
+    queue_remote_frame(
+        writer_tx,
+        message.map_or(RemoteWriteMessage::Close, RemoteWriteMessage::JsonRpc),
+        response_tx,
+    )
+}
+
+fn queue_remote_frame(
+    writer_tx: &mpsc::Sender<RemoteWrite>,
+    message: RemoteWriteMessage,
     response_tx: Option<oneshot::Sender<IoResult<()>>>,
 ) -> IoResult<()> {
     writer_tx
@@ -397,11 +417,17 @@ impl RemoteAppServerClient {
             let writer_endpoint = endpoint.clone();
             let mut writer_handle = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(async move {
                 while let Some(write) = writer_rx.recv().await {
-                    let close = write.message.is_none();
+                    let close = matches!(&write.message, RemoteWriteMessage::Close);
                     let result = timeout(WRITE_TIMEOUT, async {
-                        if let Some(message) = write.message {
-                            let payload = serde_json::to_string(&message).map_err(IoError::other)?;
-                            sink.send(Message::Text(payload.into())).await.map_err(|error| {
+                        let frame = match write.message {
+                            RemoteWriteMessage::JsonRpc(message) => Some(Message::Text(
+                                serde_json::to_string(&message).map_err(IoError::other)?.into(),
+                            )),
+                            RemoteWriteMessage::Ping(payload) => Some(Message::Ping(payload.into())),
+                            RemoteWriteMessage::Close => None,
+                        };
+                        if let Some(frame) = frame {
+                            sink.send(frame).await.map_err(|error| {
                                 IoError::other(format!(
                                     "failed to write websocket message to `{writer_endpoint}`: {error}"
                                 ))
@@ -439,9 +465,72 @@ impl RemoteAppServerClient {
             let mut pending_delivery = PendingRemoteEvents::default();
             let mut skipped_events = 0usize;
             let mut worker_exit_error: Option<(ErrorKind, String)> = None;
+            let mut heartbeat_deadline = tokio::time::Instant::now() + HEARTBEAT_INTERVAL;
+            let mut heartbeat_sequence = 0_u64;
+            let mut pending_ping: Option<Vec<u8>> = None;
+            let mut pending_ping_write: Option<oneshot::Receiver<IoResult<()>>> = None;
             loop {
+                let can_read = pending_delivery.is_empty()
+                    || pending_requests.values().any(|waiter| !waiter.is_closed());
+                if !can_read || closing {
+                    // Local event backpressure is not transport failure. A pong
+                    // cannot be observed while this coordinator pauses reads.
+                    pending_ping = None;
+                    pending_ping_write = None;
+                    heartbeat_deadline = tokio::time::Instant::now() + HEARTBEAT_INTERVAL;
+                }
                 tokio::select! {
                     _ = event_tx.closed() => break,
+                    _ = tokio::time::sleep_until(heartbeat_deadline),
+                        if can_read && !closing && pending_ping_write.is_none() => {
+                        if pending_ping.is_some() {
+                            worker_exit_error = Some((ErrorKind::TimedOut, format!(
+                                "remote app server at `{endpoint}` did not acknowledge its transport heartbeat; connection retired"
+                            )));
+                            break;
+                        }
+                        // Do not treat a busy local writer queue as a dead peer.
+                        if writer_tx.capacity() == 0 {
+                            heartbeat_deadline = tokio::time::Instant::now() + HEARTBEAT_INTERVAL;
+                            continue;
+                        }
+                        heartbeat_sequence = heartbeat_sequence.wrapping_add(1);
+                        let payload = heartbeat_sequence.to_be_bytes().to_vec();
+                        let (response_tx, response_rx) = oneshot::channel();
+                        if let Err(error) = queue_remote_frame(
+                            &writer_tx,
+                            RemoteWriteMessage::Ping(payload.clone()),
+                            Some(response_tx),
+                        ) {
+                            worker_exit_error = Some((error.kind(), error.to_string()));
+                            break;
+                        }
+                        pending_ping = Some(payload);
+                        pending_ping_write = Some(response_rx);
+                    }
+                    receipt = async {
+                        match pending_ping_write.as_mut() {
+                            Some(receipt) => receipt.await,
+                            None => std::future::pending().await,
+                        }
+                    }, if pending_ping_write.is_some() => {
+                        pending_ping_write = None;
+                        match receipt {
+                            Ok(Ok(())) => {
+                                // Queueing is not a write receipt. Bound only the
+                                // remote acknowledgement wait after actual send.
+                                heartbeat_deadline = tokio::time::Instant::now() + HEARTBEAT_PONG_TIMEOUT;
+                            }
+                            result => {
+                                let error = match result {
+                                    Ok(Err(error)) => error,
+                                    _ => IoError::new(ErrorKind::BrokenPipe, "remote heartbeat writer closed"),
+                                };
+                                worker_exit_error = Some((error.kind(), error.to_string()));
+                                break;
+                            }
+                        }
+                    }
                     result = &mut writer_handle => {
                         writer_finished = true;
                         match result {
@@ -579,7 +668,16 @@ impl RemoteAppServerClient {
                     // Retained lossless events pause reads for backpressure, except while a
                     // caller awaits an RPC: its response shares this socket, and a consumer
                     // blocked on that response cannot drain the event queue.
-                    message = stream.next(), if pending_delivery.is_empty() || pending_requests.values().any(|waiter| !waiter.is_closed()) => {
+                    message = stream.next(), if can_read => {
+                        if let Some(Ok(frame)) = &message {
+                            let acknowledged = matches!(frame, Message::Pong(payload)
+                                if pending_ping.as_deref() == Some(payload.as_ref()));
+                            if acknowledged {
+                                pending_ping = None;
+                                pending_ping_write = None;
+                                heartbeat_deadline = tokio::time::Instant::now() + HEARTBEAT_INTERVAL;
+                            }
+                        }
                         match message {
                             Some(Ok(Message::Text(text))) => {
                                 match serde_json::from_str::<JSONRPCMessage>(&text) {

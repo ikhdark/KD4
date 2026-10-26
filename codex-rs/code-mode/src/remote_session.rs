@@ -32,6 +32,7 @@ use crate::NoopCodeModeSessionDelegate;
 mod connection;
 
 const CODE_MODE_HOST_PATH_ENV: &str = "CODEX_CODE_MODE_HOST_PATH";
+const LOST_CELL_WAIT_NOTICE: &str = "The Code Mode host process exited and was replaced. The requested cell belongs to the lost runtime, so a live-cell wait cannot establish its final outcome. It may have completed nested effects; do not replay the cell. Stored values are lost unless committed by completed persist cells; supported terminal-receipt recovery remains available. Rebuild required state before starting new work.";
 
 type ShutdownResultReceiver = watch::Receiver<Option<Result<(), String>>>;
 type PendingWait = Arc<tokio::sync::Mutex<Option<RetainedWait>>>;
@@ -274,6 +275,14 @@ struct SessionBinding {
     cleanup: SessionCleanup,
 }
 
+#[derive(Default)]
+struct RuntimeRecovery {
+    issued_attempts: u64,
+    refuse_through: u64,
+    lost_generation: u64,
+    pending: bool,
+}
+
 struct SessionInner {
     runtime: OnceLock<tokio::runtime::Handle>,
     process_host: Arc<OwnedProcessHost>,
@@ -281,11 +290,11 @@ struct SessionInner {
     delegate: Arc<dyn CodeModeSessionDelegate>,
     state: StdMutex<SessionState>,
     next_generation: AtomicU64,
-    /// The generation that last started a cell; 0 before any cell.
+    /// The generation that last started or may have started a cell.
     executed_generation: AtomicU64,
-    /// That generation's host exited, taking its stored values; the next
-    /// `execute` reports this instead of running.
-    lost_state: AtomicBool,
+    /// A loss notice fences every execute already issued when it is observed.
+    /// Only a new call after that observation may enter the replacement runtime.
+    recovery: StdMutex<RuntimeRecovery>,
     shutdown_requested: AtomicBool,
     shutdown_result: StdMutex<Option<ShutdownResultReceiver>>,
     // Retiring a binding must not drop the last connection owner while its
@@ -323,7 +332,7 @@ impl ProcessOwnedCodeModeSession {
                 state: StdMutex::new(SessionState::New),
                 next_generation: AtomicU64::new(1),
                 executed_generation: AtomicU64::new(0),
-                lost_state: AtomicBool::new(false),
+                recovery: StdMutex::new(RuntimeRecovery::default()),
                 shutdown_requested: AtomicBool::new(false),
                 shutdown_result: StdMutex::new(None),
                 retired_cleanups: StdMutex::new(Vec::new()),
@@ -337,12 +346,18 @@ impl ProcessOwnedCodeModeSession {
     }
 
     pub async fn execute(&self, request: ExecuteRequest) -> Result<StartedCell, String> {
+        let attempt = self.inner.begin_execute_attempt()?;
         let binding = self.connection().await?;
-        if self.inner.lost_state.swap(false, Ordering::AcqRel) {
+        if self.inner.acknowledge_runtime_loss(Some(attempt)) {
             return Err(RUNTIME_REPLACED_NOTICE.to_string());
         }
-        self.inner.record_execution_generation(binding.remote.generation);
-        binding.connection.execute(binding.remote, request).await
+        let inner = Arc::downgrade(&self.inner);
+        let generation = binding.remote.generation;
+        binding.connection.execute(binding.remote, request, Box::new(move || {
+            if let Some(inner) = inner.upgrade() {
+                inner.record_execution_generation(generation);
+            }
+        })).await
     }
 
     #[expect(
@@ -351,6 +366,12 @@ impl ProcessOwnedCodeModeSession {
     )]
     pub async fn wait(&self, request: WaitRequest) -> Result<WaitOutcome, String> {
         let binding = self.connection().await?;
+        if request.recovery.is_none()
+            && !Connection::cell_is_current(&binding.remote, &request.cell_id)
+            && self.inner.acknowledge_runtime_loss(None)
+        {
+            return Err(LOST_CELL_WAIT_NOTICE.to_string());
+        }
         let key = (binding.remote.generation, request.cell_id.clone());
         let pending = {
             let mut waits = self
@@ -473,9 +494,40 @@ fn prune_pending_waits(
 }
 
 impl SessionInner {
+    fn begin_execute_attempt(&self) -> Result<u64, String> {
+        let mut recovery = self.recovery.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        recovery.issued_attempts = recovery.issued_attempts.checked_add(1)
+            .ok_or_else(|| "code-mode execute attempt sequence exhausted".to_string())?;
+        Ok(recovery.issued_attempts)
+    }
+
+    fn acknowledge_runtime_loss(&self, attempt: Option<u64>) -> bool {
+        let mut recovery = self.recovery.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if recovery.pending {
+            recovery.pending = false;
+            recovery.refuse_through = recovery.issued_attempts;
+            return true;
+        }
+        attempt.is_some_and(|attempt| attempt <= recovery.refuse_through)
+    }
+
+    fn note_runtime_loss(&self, generation: u64) {
+        let mut recovery = self.recovery.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if generation > recovery.lost_generation {
+            recovery.lost_generation = generation;
+            recovery.pending = true;
+        }
+    }
+
     fn record_execution_generation(&self, generation: u64) {
+        let state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         // A caller holding an obsolete binding cannot erase a newer host's state.
         self.executed_generation.fetch_max(generation, Ordering::AcqRel);
+        // A late start/unknown-effect receipt can follow replacement detection.
+        // Serialize with rebind so that proof cannot miss the loss notification.
+        if !matches!(&*state, SessionState::Open(binding) if binding.remote.generation == generation) {
+            self.note_runtime_loss(generation);
+        }
     }
 
     async fn connection(self: &Arc<Self>) -> Result<SessionBinding, String> {
@@ -511,7 +563,7 @@ impl SessionInner {
                         if self.executed_generation.load(Ordering::Acquire)
                             == binding.remote.generation
                         {
-                            self.lost_state.store(true, Ordering::Release);
+                            self.note_runtime_loss(binding.remote.generation);
                         }
                         self.retain_cleanup(binding);
                         *state = SessionState::New;

@@ -406,6 +406,9 @@ pub struct TurnContext {
     pub(crate) agent_task_binding: Arc<OnceLock<Option<codex_agent_task_store::AgentTaskBinding>>>,
     pub(crate) server_model_warning_emitted: AtomicBool,
     pub(crate) model_verification_emitted: AtomicBool,
+    /// Last tier rejection for this turn; shared with temporary model variants
+    /// so repeated sampling does not repeat the same warning.
+    pub(crate) service_tier_warning: Arc<std::sync::Mutex<Option<String>>>,
     /// Flat tool names dispatched earlier in this turn, in dispatch order.
     /// PreToolUse hooks receive it so advice the turn already acted on is not
     /// injected again.
@@ -836,6 +839,7 @@ impl TurnContext {
             model_verification_emitted: AtomicBool::new(
                 self.model_verification_emitted.load(Ordering::Relaxed),
             ),
+            service_tier_warning: Arc::clone(&self.service_tier_warning),
             dispatched_tool_names: Arc::clone(&self.dispatched_tool_names),
             cancellation_cause: Arc::new(OnceLock::new()),
             runtime_identity_cache: Default::default(),
@@ -1227,6 +1231,7 @@ impl Session {
             agent_task_binding: Arc::new(OnceLock::new()),
             server_model_warning_emitted: AtomicBool::new(false),
             model_verification_emitted: AtomicBool::new(false),
+            service_tier_warning: Arc::default(),
             dispatched_tool_names: Arc::new(std::sync::Mutex::new(Vec::new())),
             cancellation_cause: Arc::new(OnceLock::new()),
             runtime_identity_cache: Default::default(),
@@ -1441,7 +1446,40 @@ impl Session {
         turn_context
     }
 
+    pub(crate) async fn maybe_emit_service_tier_warning(
+        &self,
+        tc: &TurnContext,
+        configured_service_tier: Option<&str>,
+    ) {
+        let warning = unsupported_service_tier_warning(
+            configured_service_tier,
+            tc.config.features.enabled(Feature::FastMode),
+            &tc.model_info,
+        );
+        {
+            let mut previous = tc
+                .service_tier_warning
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if *previous == warning {
+                return;
+            }
+            *previous = warning.clone();
+        }
+        // Never hold the deduplication lock while publishing or persisting.
+        if let Some(message) = warning {
+            self.send_event(tc, EventMsg::Warning(WarningEvent { message }))
+                .await;
+        }
+    }
+
     pub(crate) async fn maybe_emit_model_warnings_for_turn(&self, tc: &TurnContext) {
+        // Turn config has already been filtered. Inspect the live requested
+        // preference instead, just as the sampling boundary does.
+        let service_tier = self.configured_service_tier().await;
+        self.maybe_emit_service_tier_warning(tc, service_tier.as_deref())
+            .await;
+
         if tc.model_info.used_fallback_model_metadata {
             self.send_event(
                 tc,

@@ -153,7 +153,6 @@ impl Handler {
             task_text_recovery: None,
             completed_report_recovery: None,
         };
-        result.apply_view(&args, &session.thread_id.to_string())?;
         if args.status_only && let Some(reports) = result.completed_report_snapshot() {
             // Retain the exact omitted bodies, not a later current-state reread.
             // The existing snapshot owner protects and registers the recovery
@@ -184,6 +183,7 @@ impl Handler {
                     .push_str(&format!(" Status-only report retention failed; completed reports remain inline: {}", artifact.error.as_deref().unwrap_or("incomplete snapshot")));
             }
         }
+        result.apply_view(&args, &session.thread_id.to_string())?;
         Ok(boxed_tool_output(result))
     }
 }
@@ -253,13 +253,20 @@ pub(crate) struct ListAgentsResult {
 impl ListAgentsResult {
     fn apply_view(&mut self, args: &ListAgentsArgs, root: &str) -> Result<(), FunctionCallError> {
         use sha2::Digest;
-        // Hash the complete fresh projection, before removing any prose/results. Lease
-        // expiry, a changed answer, deletion, failed delivery and attempt/gate
-        // transitions must invalidate an unchanged response. This is a display
-        // fingerprint, never a task-store or source-freshness witness.
+        if args.compact || args.status_only {
+            for agent in &mut self.agents {
+                agent.last_task_message = None;
+            }
+            let failure = self.task_text_recovery.take().unwrap_or_default();
+            self.task_text_recovery = Some(format!("Call the advertised list_agents entrypoint with compact:false, status_only:false, the same path_prefix and no since_revision to retrieve current task messages and completed reports. Use completed_report_recovery for the exact omitted report snapshot. A changed/unknown revision returns a replacement snapshot for the requested view; unchanged:true preserves the prior visible snapshot, including its failures. Hidden report recovery can change independently.{failure}"));
+        }
+        // Hash only the delivered view. Omitted report bytes have their own
+        // canonical recovery identity, which is returned even on unchanged
+        // views. Retention failures leave full reports inline and therefore
+        // still invalidate this fingerprint. This is never a freshness witness.
         let bytes = serde_json::to_vec(&json!([
             root, args.path_prefix, args.compact, args.status_only, self.agents, self.typed_tasks,
-            self.unresolved_descendants,
+            self.unresolved_descendants, self.task_text_recovery,
         ]))
         .map_err(|error| FunctionCallError::RespondToModel(format!("list_agents: snapshot serialization failed: {error}")))?;
         self.revision = hex::encode(sha2::Sha256::digest(bytes));
@@ -268,15 +275,6 @@ impl ListAgentsResult {
             self.agents.clear();
             self.typed_tasks.clear();
             self.unresolved_descendants.clear();
-        } else {
-            for agent in &mut self.agents {
-                if args.compact || args.status_only {
-                    agent.last_task_message = None;
-                }
-            }
-            if args.compact || args.status_only {
-                self.task_text_recovery = Some("Call the advertised list_agents entrypoint with compact:false, status_only:false, the same path_prefix and no since_revision to retrieve current task messages and completed reports. Use completed_report_recovery for the exact omitted report snapshot. A changed/unknown revision returns a replacement snapshot for the requested view; unchanged:true preserves the prior snapshot, including its failures.".into());
-            }
         }
         Ok(())
     }
@@ -290,7 +288,6 @@ impl ListAgentsResult {
             "agent_status": agent.agent_status,
         })).collect::<Vec<_>>();
         (!completed_reports.is_empty()).then(|| json!({
-            "revision": self.revision,
             "agents": completed_reports,
         }))
     }

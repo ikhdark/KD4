@@ -42,8 +42,8 @@ const MAX_TOOL_SEARCH_LIMIT: usize = 64;
 const TOOL_SEARCH_CANDIDATE_MULTIPLIER: usize = 3;
 // BM25 ranks results but has no corpus-independent absolute cutoff. Require
 // at least half of the indexed query terms before exposing a schema. Unknown
-// task entities are not negative capability evidence. A single indexed term
-// qualifies a multiword query only within an explicit canonical source scope.
+// task entities are not negative capability evidence. One recognized term
+// qualifies even when the query also names an unknown task entity.
 const MIN_TOOL_ACTIVATION_RELEVANCE: f32 = 0.5;
 
 #[derive(Debug, Default)]
@@ -140,20 +140,14 @@ impl ToolSearchIndex {
                 })
             })
             .collect::<Vec<_>>();
-        // A scope may disambiguate one capability plus unknown task entities,
-        // but must not erase known capabilities belonging to another source.
-        let single_scoped_capability = source.is_some()
-            && indexed_terms.len() == 1
-            && terms
-                .iter()
-                .filter(|term| self.postings.contains_key(**term))
-                .count()
-                == 1;
-        let minimum_matches = if terms.len() > 1 && !single_scoped_capability {
-            2
-        } else {
-            1
-        };
+        // Unknown project/person names are not missing capabilities. Count
+        // recognized inventory terms instead, globally so a source scope still
+        // cannot erase a known capability belonging to another source.
+        let minimum_matches = terms
+            .iter()
+            .filter(|term| self.postings.contains_key(**term))
+            .count()
+            .clamp(1, 2);
         ToolSearchQueryEvidence {
             indexed_terms,
             minimum_matches,

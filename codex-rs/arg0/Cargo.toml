@@ -17,6 +17,7 @@ anyhow = { workspace = true }
 codex-apply-patch = { workspace = true }
 codex-exec-server = { workspace = true }
 codex-install-context = { workspace = true }
+codex-process-hardening = { workspace = true }
 codex-utils-home-dir = { workspace = true }
 dotenvy = { workspace = true }
 tempfile = { workspace = true }

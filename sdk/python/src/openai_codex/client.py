@@ -1,4 +1,5 @@
 import json
+import logging
 import math
 import os
 import queue
@@ -73,6 +74,14 @@ _STDERR_TAIL_MAX_BYTES = 64 * 1024
 _STDERR_READ_CHARS = 8 * 1024
 _STDERR_DRAIN_JOIN_TIMEOUT_S = 1.0
 _STDERR_TRUNCATION_MARKER = f"[stderr truncated; showing last {_STDERR_TAIL_MAX_BYTES} bytes]\n"
+_CONTROL_METHODS = frozenset({"turn/interrupt", "turn/steer"})
+_LOGGER = logging.getLogger(__name__)
+# Display-only mirrors/progress. Never relax item, delta, usage, account,
+# lifecycle, terminal or error validation: those carry authoritative evidence.
+_RECOVERABLE_NOTIFICATION_METHODS = frozenset({
+    "thread/started", "thread/status/changed", "turn/diff/updated",
+    "turn/plan/updated", "item/mcpToolCall/progress",
+})
 
 
 @dataclass(slots=True)
@@ -90,6 +99,9 @@ class _Write:
     line: str
     done: threading.Event = field(default_factory=threading.Event)
     error: BaseException | None = None
+    lock: LockType = field(default_factory=threading.Lock)
+    started: bool = False
+    cancelled: bool = False
 
 
 @dataclass(slots=True)
@@ -238,10 +250,17 @@ class CodexConfig:
     max_buffer_bytes: int = 64 * 1024 * 1024
     max_notification_routes: int = 256
     max_in_flight_requests: int = 32
+    max_control_requests: int = 2
+    notification_timeout_s: float = 300.0
+    turn_timeout_s: float | None = None
 
     def __post_init__(self) -> None:
-        for name in ("operation_timeout_s", "shutdown_timeout_s"):
+        for name in (
+            "operation_timeout_s", "shutdown_timeout_s", "notification_timeout_s", "turn_timeout_s"
+        ):
             value = getattr(self, name)
+            if name == "turn_timeout_s" and value is None:
+                continue
             if (
                 not isinstance(value, (int, float))
                 or isinstance(value, bool)
@@ -255,6 +274,7 @@ class CodexConfig:
             "max_buffer_bytes",
             "max_notification_routes",
             "max_in_flight_requests",
+            "max_control_requests",
         ):
             value = getattr(self, name)
             if not isinstance(value, int) or isinstance(value, bool) or value < 1:
@@ -282,9 +302,12 @@ class CodexClient:
         self._router = self._new_router()
         self._operation_local = threading.local()
         self._operation_slots = threading.BoundedSemaphore(self.config.max_in_flight_requests)
+        self._control_slots = threading.BoundedSemaphore(self.config.max_control_requests)
         self._closing = False
         self._stopped = threading.Event()
-        self._writes: queue.Queue[_Write | None] = queue.Queue(self.config.max_in_flight_requests)
+        self._writes: queue.Queue[_Write | None] = queue.Queue(
+            self.config.max_in_flight_requests + self.config.max_control_requests + 5
+        )
         self._writer_thread: threading.Thread | None = None
         self._stderr_lock = threading.Lock()
         self._stderr_tail_bytes = bytearray()
@@ -299,18 +322,23 @@ class CodexClient:
             max_buffer_bytes=self.config.max_buffer_bytes,
             max_routes=self.config.max_notification_routes,
             max_requests=self.config.max_in_flight_requests,
+            max_control_requests=self.config.max_control_requests,
             operation_timeout_s=self.config.operation_timeout_s,
+            notification_timeout_s=self.config.notification_timeout_s,
+            turn_timeout_s=self.config.turn_timeout_s,
         )
 
     @contextmanager
     def _operation(
-        self, cancelled: threading.Event | None = None, *, control: bool = False
+        self, cancelled: threading.Event | None = None, *, control: bool = False,
+        rpc_control: bool = False,
     ) -> Iterator[_Operation]:
         current = getattr(self._operation_local, "current", None)
         if current is not None:
             yield current
             return
-        if not control and not self._operation_slots.acquire(blocking=False):
+        slots = self._control_slots if rpc_control else self._operation_slots
+        if not control and not slots.acquire(blocking=False):
             raise CodexError("in-flight operation limit exceeded")
         with self._lifecycle_lock:
             operation = _Operation(
@@ -326,7 +354,7 @@ class CodexClient:
         finally:
             del self._operation_local.current
             if not control:
-                self._operation_slots.release()
+                slots.release()
 
     @contextmanager
     def _cleanup_operation(self, origin: _Operation) -> Iterator[None]:
@@ -348,12 +376,10 @@ class CodexClient:
         remaining = operation.deadline - time.monotonic()
         error: BaseException | None = None
         if operation.cancelled.is_set():
-            error = TransportClosedError("operation cancelled; transport closed")
+            error = TransportClosedError("operation cancelled")
         elif remaining <= 0:
-            error = TimeoutError("operation deadline exceeded; transport closed")
+            error = TimeoutError("operation deadline exceeded")
         if error is not None:
-            if operation.proc is not None:
-                self._abort_transport(operation.proc, operation.router, error)
             raise error
         return min(remaining, 0.05)
 
@@ -433,7 +459,10 @@ class CodexClient:
             self._proc = proc
             self._process_epoch += 1
             self._stopped = threading.Event()
-            self._writes = queue.Queue(self.config.max_in_flight_requests)
+            # Ordinary RPCs, reserved controls, four callbacks and a reader reply.
+            self._writes = queue.Queue(
+                self.config.max_in_flight_requests + self.config.max_control_requests + 5
+            )
             self._writer_thread = threading.Thread(
                 target=self._writer_loop,
                 args=(proc, router, self._writes, self._stopped),
@@ -560,7 +589,7 @@ class CodexClient:
 
     def _request_raw(self, method: str, params: JsonObject | None = None) -> JsonValue:
         """Send one bounded JSON-RPC operation through this transport generation."""
-        with self._operation() as operation:
+        with self._operation(rpc_control=method in _CONTROL_METHODS) as operation:
             with self._lifecycle_lock:
                 proc, router = self._proc, self._router
                 if proc is None or self._closing:
@@ -571,14 +600,24 @@ class CodexClient:
                     raise TransportClosedError("operation belongs to a previous transport")
                 operation.proc, operation.router = proc, router
                 request_id = str(uuid.uuid4())
-                waiter = router.create_response_waiter(request_id)
+                waiter = router.create_response_waiter(
+                    request_id, control=method in _CONTROL_METHODS
+                )
             try:
                 message: JsonObject = {"id": request_id, "method": method}
                 if params is not None:
                     message["params"] = params
                 self._write_message(message, proc=proc)
                 while True:
-                    timeout = self._check_operation(operation)
+                    if method == "turn/start" and operation.cancelled.is_set():
+                        # The bounded async worker retains ownership until the
+                        # start result can be interrupted by its on_cancel hook.
+                        remaining = operation.deadline - time.monotonic()
+                        if remaining <= 0:
+                            raise TimeoutError("turn/start response deadline exceeded")
+                        timeout = min(remaining, 0.05)
+                    else:
+                        timeout = self._check_operation(operation)
                     try:
                         item = waiter.get(timeout=timeout)
                         break
@@ -620,7 +659,7 @@ class CodexClient:
         """Start routing notifications for one turn into its dedicated queue."""
         operation = getattr(self._operation_local, "current", None)
         router = operation.router if operation is not None else self._router
-        router.register_turn(turn_id, deadline=operation.deadline if operation else None)
+        router.register_turn(turn_id)
 
     def unregister_turn_notifications(self, turn_id: str) -> None:
         """Stop routing notifications for one turn into its dedicated queue."""
@@ -968,7 +1007,7 @@ class CodexClient:
         initial_delay_s: float = 0.25,
         max_delay_s: float = 2.0,
     ) -> ModelT:
-        with self._operation() as operation:
+        with self._operation(rpc_control=method in _CONTROL_METHODS) as operation:
             return retry_on_overload(
                 lambda: self.request(method, params, response_model=response_model),
                 max_attempts=max_attempts,
@@ -1016,11 +1055,14 @@ class CodexClient:
         thread_id: str,
         text: str,
         params: V2TurnStartParams | JsonObject | None = None,
+        *,
+        cancel_on_close: bool = False,
     ) -> Iterator[AgentMessageDeltaNotification]:
         """Yield text deltas; failed turns raise, interrupted turns end normally."""
         started = self.turn_start(thread_id, text, params=params)
         turn_id = started.turn.id
         self.register_turn_notifications(turn_id)
+        completed = False
         try:
             while True:
                 notification = self.next_turn_notification(turn_id)
@@ -1036,10 +1078,15 @@ class CodexClient:
                     and isinstance(notification.payload, TurnCompletedNotification)
                     and notification.payload.turn.id == turn_id
                 ):
+                    completed = True
                     _raise_for_failed_turn(notification.payload.turn)
                     break
         finally:
-            self.unregister_turn_notifications(turn_id)
+            try:
+                if cancel_on_close and not completed:
+                    self.turn_interrupt(thread_id, turn_id)
+            finally:
+                self.unregister_turn_notifications(turn_id)
 
     def _coerce_notification(self, method: str, params: object) -> Notification:
         params_dict = params if isinstance(params, dict) else {}
@@ -1051,6 +1098,14 @@ class CodexClient:
         try:
             payload = model.model_validate(params_dict)
         except Exception as exc:  # noqa: BLE001
+            if method in _RECOVERABLE_NOTIFICATION_METHODS and isinstance(params, dict):
+                try:
+                    _LOGGER.warning(
+                        "Invalid nonessential notification %r; retained as raw payload", method
+                    )
+                except Exception:
+                    pass  # A caller's logging handler must not break the reader.
+                return Notification(method=method, payload=UnknownNotification(params=params_dict))
             raise CodexError(f"Invalid payload for known notification {method!r}") from exc
         return Notification(method=method, payload=payload)
 
@@ -1338,6 +1393,11 @@ class CodexClient:
                     continue
                 if pending is None:
                     break
+                with pending.lock:
+                    if pending.cancelled:
+                        pending.done.set()
+                        continue
+                    pending.started = True
                 try:
                     if stopped.is_set() or proc.stdin is None:
                         raise TransportClosedError("Codex process was closed")
@@ -1348,7 +1408,8 @@ class CodexClient:
                     self._abort_transport(proc, router, exc)
                     break
                 finally:
-                    pending.done.set()
+                    with pending.lock:
+                        pending.done.set()
         finally:
             if proc.stdin is not None:
                 try:
@@ -1386,6 +1447,15 @@ class CodexClient:
                     raise TransportClosedError("operation belongs to a previous transport")
                 operation.proc, operation.router = target, self._router
                 self._check_operation_before_write(operation)
+                if (
+                    "method" in payload
+                    and payload["method"] not in _CONTROL_METHODS
+                    and self._writes.qsize() >= self.config.max_in_flight_requests
+                ):
+                    # Cancelled queued frames may outlive their operation slot.
+                    # They must not let replacement ordinary RPCs consume the
+                    # bounded write headroom reserved for controls and replies.
+                    raise CodexError("ordinary outbound message queue limit exceeded")
                 try:
                     self._writes.put_nowait(pending)
                 except queue.Full as exc:
@@ -1394,10 +1464,29 @@ class CodexClient:
                 # The bounded writer owns delivery and transport failure. The
                 # stdout reader must keep routing while child stdin is blocked.
                 return
-            while not pending.done.wait(self._check_operation(operation)):
-                operation.router.check_failure()
-                if self._stopped.is_set():
-                    raise TransportClosedError("Codex process was closed during write")
+            try:
+                while not pending.done.is_set():
+                    if pending.done.wait(self._check_operation(operation)):
+                        break
+                    operation.router.check_failure()
+                    if self._stopped.is_set():
+                        raise TransportClosedError("Codex process was closed during write")
+            except BaseException as exc:
+                with pending.lock:
+                    ambiguous_write = pending.started and not pending.done.is_set()
+                    if not pending.started:
+                        pending.cancelled = True
+                    completed_write = pending.done.is_set() and pending.error is None
+                # A queued frame can be skipped; a completed frame's late
+                # response can be ignored. An in-progress pipe write cannot be
+                # retracted or safely reused, so that generation fails closed.
+                if ambiguous_write:
+                    self._abort_transport(target, operation.router, exc)
+                if completed_write and isinstance(exc, (TimeoutError, TransportClosedError)) and (
+                    operation.cancelled.is_set() or time.monotonic() >= operation.deadline
+                ):
+                    return  # Preserve ownership of a successfully sent start result.
+                raise
             if pending.error is not None:
                 raise pending.error
 

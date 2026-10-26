@@ -230,6 +230,7 @@ impl AnalyticsEventsQueue {
                 let drained_epoch = worker_loss_epoch.load(Ordering::Acquire);
                 if receiver.is_empty() {
                     reducer.delivery_queue_drained(drained_epoch);
+                    reducer.flush_completed_turns(&mut events).await;
                 }
                 if let Some(epoch) = reducer_epoch
                     && !events.is_empty()

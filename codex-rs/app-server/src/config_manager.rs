@@ -37,6 +37,10 @@ const CONFIG_LOAD_CACHE_TTL: Duration = Duration::from_millis(250);
 const CONFIG_LOAD_CACHE_ENTRIES: usize = 8;
 const CONFIG_LOAD_TRACKED_FLIGHTS: usize = 32;
 
+#[derive(Debug, thiserror::Error)]
+#[error("configuration changed before managed policy admission; retry the request")]
+pub(crate) struct ConfigGenerationChanged;
+
 #[derive(Debug, Clone, PartialEq)]
 struct ConfigLoadCacheKey {
     cli_overrides: Vec<(String, TomlValue)>,
@@ -287,9 +291,7 @@ impl ConfigManager {
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if self.policy_generation() != generation {
-            return Err(std::io::Error::other(
-                "configuration changed before managed policy admission; retry the request",
-            ));
+            return Err(std::io::Error::other(ConfigGenerationChanged));
         }
         loader
             .publish_if_current(publish)

@@ -503,6 +503,7 @@ fn build_receipt_handoff(
             .map(|admission| admission.attempt_id == target.current_attempt.attempt_id),
         admitted_dependency,
         receipt: target.receipt.clone(),
+        dependency_blockers: target.dependency_blockers.clone(),
         validation_calls,
         unavailable_evidence_call_ids,
         gates: target.gates.clone(),
@@ -1024,6 +1025,7 @@ struct TaskReceiptHandoff {
     admitted_dependency: Option<codex_agent_task_store::DependencyAdmission>,
     admitted_attempt_is_current: Option<bool>,
     receipt: Option<AgentReceipt>,
+    dependency_blockers: Vec<codex_agent_task_store::DependencyBlocker>,
     validation_calls: Vec<ValidationCall>,
     unavailable_evidence_call_ids: Vec<String>,
     gates: Vec<AgentGate>,
@@ -1281,6 +1283,7 @@ fn task_projection(result: &GetAgentTaskResult) -> JsonValue {
                 "attempt_id": handoff.current_attempt.attempt_id,
                 "attempt_state": handoff.current_attempt.state,
                 "admitted_attempt_is_current": handoff.admitted_attempt_is_current,
+                "dependency_blocker_count": handoff.dependency_blockers.len(),
                 "receipt": handoff.receipt.as_ref().map(|receipt| json!({
                     "status": receipt.status,
                     "sealed_at": receipt.sealed_at,
@@ -1328,9 +1331,11 @@ fn task_projection(result: &GetAgentTaskResult) -> JsonValue {
         "role": task.assignment.role,
         "attempt_state": task.current_attempt.state,
         "dependency_provenance": {
-            "policy": "pin_at_admission; not a current-acceptance or filesystem-freshness claim",
+            "policy": "pin_at_admission; current durable authority checked separately; not a filesystem-freshness claim",
             "captured": task.dependency_admissions.len(),
             "recovery_json_pointer": "/task/dependency_admissions",
+            "current_blockers": task.dependency_blockers.len(),
+            "blockers_recovery_json_pointer": "/task/dependency_blockers",
         },
         "gates": task.gates.iter().map(|gate| json!({
             "kind": gate.kind,
@@ -1480,6 +1485,9 @@ fn task_projection_json_pointers(
 ) -> Vec<codex_tools::ToolOutputProjectionJsonPointer> {
     let task = &result.task;
     let mut selectors = Vec::new();
+    if !task.dependency_blockers.is_empty() {
+        push_predetermined_json_pointer(&mut selectors, "task:dependency-blockers", "/task/dependency_blockers");
+    }
     if !task.criterion_assessments.is_empty() {
         push_predetermined_json_pointer(&mut selectors, "task:criterion-assessments", "/task/criterion_assessments");
     }
