@@ -433,14 +433,8 @@ impl LocalThreadProjection {
             item_key: item.item.id().to_string(),
             item_ordinal: item.ordinal,
             item_created_at_ms: i64::try_from(item.ordinal).unwrap_or(i64::MAX),
-            materialized_thread_item_json: serde_json::to_vec(&item.item).map_err(|err| {
-                ThreadStoreError::Internal {
-                    message: format!(
-                        "failed to serialize projected thread item {}: {err}",
-                        item.item.id()
-                    ),
-                }
-            })?,
+            materialized_thread_item_json: Vec::new(),
+            materialized_thread_item: Some(item.item.clone()),
         })
     }
 
@@ -486,11 +480,7 @@ impl LocalThreadProjection {
         Ok(StoredTurn {
             turn_id: turn_id.to_string(),
             items: Vec::new(),
-            metadata_json: Some(serde_json::to_vec(&turn).map_err(|err| {
-                ThreadStoreError::Internal {
-                    message: format!("failed to serialize projected turn {turn_id}: {err}"),
-                }
-            })?),
+            metadata_json: None,
             turn_created_at_ms: None,
             items_view,
             status: stored_turn_status(&status),
@@ -501,6 +491,7 @@ impl LocalThreadProjection {
             started_at: turn.started_at,
             completed_at: turn.completed_at,
             duration_ms: turn.duration_ms,
+            materialized_turn: Some(turn),
         })
     }
 }

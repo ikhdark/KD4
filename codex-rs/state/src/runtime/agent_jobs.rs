@@ -117,6 +117,23 @@ impl StateRuntime {
         params: &AgentJobCreateParams,
         items: &[AgentJobItemCreateParams],
     ) -> anyhow::Result<AgentJob> {
+        self.create_agent_job_with_cancellation(params, items, || false).await
+    }
+
+    /// Import atomically, observing cancellation before admitting another batch.
+    /// A cancellation racing commit may leave a complete Pending job, never a
+    /// runnable partial import; the caller retains its existing cleanup owner.
+    pub async fn create_agent_job_with_cancellation(
+        &self,
+        params: &AgentJobCreateParams,
+        items: &[AgentJobItemCreateParams],
+        is_cancelled: impl Fn() -> bool + Send + Sync,
+    ) -> anyhow::Result<AgentJob> {
+        let observed = tracing::enabled!(target: "codex_csv_admission", tracing::Level::DEBUG)
+            .then(std::time::Instant::now);
+        tracing::debug!(target: "codex_csv_admission", phase = "import_begin",
+            job_id = %params.id, rows = items.len());
+        anyhow::ensure!(!is_cancelled(), "agent job cancelled during setup");
         anyhow::ensure!(self.agent_job_runner_registered, "non-owning state runtime cannot own agent jobs");
         let now = Utc::now().timestamp();
         let input_headers_json = serde_json::to_string(&params.input_headers)?;
@@ -131,7 +148,12 @@ impl StateRuntime {
             .transpose()
             .map_err(|_| anyhow::anyhow!("invalid max_runtime_seconds value"))?;
         self.ensure_agent_job_runner_registered().await?;
+        anyhow::ensure!(!is_cancelled(), "agent job cancelled during setup");
         let mut tx = self.pool.begin().await?;
+        if is_cancelled() {
+            tx.rollback().await?;
+            anyhow::bail!("agent job cancelled during setup");
+        }
         sqlx::query(
             r#"
 INSERT INTO agent_jobs (
@@ -171,11 +193,19 @@ INSERT INTO agent_jobs (
         .await?;
 
         // Eight bound columns per item, below SQLite's supported variable limit.
+        let mut imported_rows = 0usize;
         for chunk in items.chunks(4_000) {
-            let rows = chunk
-                .iter()
-                .map(|item| serde_json::to_string(&item.row_json))
-                .collect::<Result<Vec<_>, _>>()?;
+            let mut rows = Vec::with_capacity(chunk.len());
+            for item in chunk {
+                if is_cancelled() {
+                    tx.rollback().await?;
+                    tracing::debug!(target: "codex_csv_admission", phase = "import_cancelled",
+                        job_id = %params.id, imported_rows, rolled_back = true,
+                        elapsed_us = observed.as_ref().map_or(0, |started| started.elapsed().as_micros() as u64));
+                    anyhow::bail!("agent job cancelled during setup");
+                }
+                rows.push(serde_json::to_string(&item.row_json)?);
+            }
             let mut builder = QueryBuilder::<Sqlite>::new(
                 "INSERT INTO agent_job_items (job_id, item_id, row_index, source_id, row_json, status, created_at, updated_at) ",
             );
@@ -190,9 +220,24 @@ INSERT INTO agent_jobs (
                     .push_bind(now);
             });
             builder.build().execute(&mut *tx).await?;
+            imported_rows += chunk.len();
+            tracing::debug!(target: "codex_csv_admission", phase = "import_batch",
+                job_id = %params.id, imported_rows, total_rows = items.len());
         }
 
+        if is_cancelled() {
+            tx.rollback().await?;
+            tracing::debug!(target: "codex_csv_admission", phase = "import_cancelled",
+                job_id = %params.id, imported_rows, rolled_back = true,
+                elapsed_us = observed.as_ref().map_or(0, |started| started.elapsed().as_micros() as u64));
+            anyhow::bail!("agent job cancelled during setup");
+        }
         tx.commit().await?;
+        if let Some(started) = observed {
+            tracing::debug!(target: "codex_csv_admission", phase = "import_commit",
+                job_id = %params.id, imported_rows,
+                elapsed_us = started.elapsed().as_micros() as u64);
+        }
         self.notify_agent_job_change();
 
         let job_id = params.id.as_str();

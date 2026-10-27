@@ -39,6 +39,12 @@ pub fn map_api_error(err: ApiError) -> CodexErr {
             token_usage,
         },
         ApiError::ProviderFailure { code, message } => CodexErr::ProviderFailure { code, message },
+        ApiError::WebsocketConnect(message) => {
+            CodexErr::ConnectionFailed(ConnectionFailedError {
+                message,
+                status: None,
+            })
+        }
         ApiError::WebsocketClosed { code, message } => {
             // RFC policy/protocol/payload rejection cannot be repaired by
             // replaying the same inference over another transport. Other codes

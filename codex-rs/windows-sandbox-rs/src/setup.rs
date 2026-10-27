@@ -757,6 +757,12 @@ pub(crate) fn check_setup_cancellation(cancellation: Option<&crate::WindowsSandb
 }
 
 fn wait_setup_child(command: &mut Command, cancellation: Option<&crate::WindowsSandboxCancellationToken>) -> Result<std::process::ExitStatus> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Foundation::WAIT_FAILED;
+    use windows_sys::Win32::Foundation::WAIT_OBJECT_0;
+    use windows_sys::Win32::Foundation::WAIT_TIMEOUT;
+    use windows_sys::Win32::System::Threading::WaitForSingleObject;
+
     check_setup_cancellation(cancellation)?;
     let mut child = command.spawn()?;
     loop {
@@ -770,7 +776,21 @@ fn wait_setup_child(command: &mut Command, cancellation: Option<&crate::WindowsS
             let reaped = child.wait();
             return Err(err.context(format!("setup helper termination: {killed:?}; reap: {reaped:?}")));
         }
-        std::thread::sleep(std::time::Duration::from_millis(25));
+        // Completion wakes this wait immediately; the timeout only bounds how
+        // long cancellation can go unchecked. The child retains handle ownership.
+        // SAFETY: child owns this process handle and cannot close it during this
+        // synchronous, bounded wait. Waiting does not consume the handle.
+        let waited = unsafe { WaitForSingleObject(child.as_raw_handle().cast(), 25) };
+        let error = match waited {
+            WAIT_OBJECT_0 | WAIT_TIMEOUT => continue,
+            WAIT_FAILED => std::io::Error::last_os_error(),
+            result => std::io::Error::other(format!(
+                "unexpected setup helper wait result: {result}"
+            )),
+        };
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(error.into());
     }
 }
 

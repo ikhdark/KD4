@@ -31,6 +31,8 @@ pub struct PreToolUseRequest {
     pub permission_mode: String,
     pub tool_name: String,
     pub matcher_aliases: Vec<String>,
+    pub mcp_server_name: Option<String>,
+    pub mcp_tool_name: Option<String>,
     pub tool_use_id: String,
     pub tool_input: Value,
     /// Flat names of tools already dispatched earlier in this turn, in order.
@@ -198,6 +200,8 @@ fn command_input_json(request: PreToolUseRequest) -> Result<String, serde_json::
         model: request.model,
         permission_mode: request.permission_mode,
         tool_name: request.tool_name,
+        mcp_server_name: request.mcp_server_name,
+        mcp_tool_name: request.mcp_tool_name,
         tool_input: request.tool_input,
         tool_use_id: request.tool_use_id,
         turn_tool_calls: request.turn_tool_calls,

@@ -23,6 +23,13 @@
       "const": "PreToolUse",
       "type": "string"
     },
+    "mcp_server_name": {
+      "description": "Authoritative MCP routing identity, independent of model aliases.",
+      "type": "string"
+    },
+    "mcp_tool_name": {
+      "type": "string"
+    },
     "model": {
       "type": "string"
     },

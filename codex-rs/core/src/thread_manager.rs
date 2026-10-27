@@ -840,8 +840,12 @@ impl ThreadManager {
                     .await,
             );
         }
-        for (pending_config, config) in pending_configs.iter_mut().zip(configs) {
-            **pending_config = Some(Arc::new(config));
+        for ((pending_config, config), thread) in pending_configs.iter_mut().zip(configs).zip(&threads) {
+            let pending = Arc::new(config);
+            if crate::session::plugin_refresh_trace_enabled() {
+                tracing::info!(target: "codex_plugin_refresh", phase = "pending", thread_id = %thread.session_configured().thread_id, pending_id = Arc::as_ptr(&pending) as usize as u64, server_count = pending.mcp_servers.as_object().map_or(0, serde_json::Map::len));
+            }
+            **pending_config = Some(pending);
         }
         Ok(())
     }

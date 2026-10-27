@@ -26,7 +26,7 @@ pub fn create_spawn_agents_on_csv_tool() -> ToolSpec {
     let properties = BTreeMap::from([
         (
             "csv_path".to_string(),
-            JsonSchema::string(Some("Path to the CSV file containing input rows.".to_string())),
+            JsonSchema::string(Some("Path to a regular CSV file: at most 8 MiB, 10,000 data rows, 128 columns, 1 KiB per header/source ID before collision suffixing, 64 KiB per field and 32 MiB charged materialized input. Split larger inputs into separate jobs; worker concurrency does not raise these admission limits.".to_string())),
         ),
         (
             "instruction".to_string(),

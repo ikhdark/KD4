@@ -164,7 +164,7 @@ pub async fn list_accessible_connectors_from_mcp_tools_with_options_and_status(
     let local_runtime_paths =
         ExecServerRuntimePaths::from_optional_path(config.codex_self_exe.clone())?;
     let environment_manager =
-        EnvironmentManager::from_codex_home(config.codex_home.clone(), Some(local_runtime_paths))
+        EnvironmentManager::from_codex_home_with_http_client_factory(config.codex_home.clone(), Some(local_runtime_paths), config.http_client_factory())
             .await?;
     list_accessible_connectors_from_mcp_tools_with_environment_manager(
         config,

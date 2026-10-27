@@ -228,7 +228,8 @@ where
         // `tracing-log` checks filters with the original log target before
         // dispatching an event whose tracing target is `log`, so the outer
         // target filter cannot reliably reject these bridged events.
-        if metadata.target() == "log" {
+        if matches!(metadata.target(), "log" | "codex_state::log_batch_observation" | "codex_storage_runtime")
+        {
             return;
         }
 
@@ -444,6 +445,17 @@ async fn run_inserter(
                 match maybe_command {
                     Some(LogDbCommand::Entry(entry)) => {
                         buffer.push(*entry);
+                        if tracing::enabled!(target: "codex_state::log_batch_observation", tracing::Level::TRACE)
+                            && let Some(thread_id) = buffer.last().and_then(|entry| entry.thread_id.as_deref())
+                        {
+                            tracing::trace!(
+                                target: "codex_state::log_batch_observation",
+                                thread_id,
+                                pending_entries = buffer.len(),
+                                batch_limit = config.batch_size,
+                                "log_entry_buffered"
+                            );
+                        }
                         if buffer.len() >= config.batch_size {
                             merge_pending_retention(
                                 &state_db,

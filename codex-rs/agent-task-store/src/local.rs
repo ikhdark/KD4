@@ -1651,10 +1651,11 @@ LIMIT 1
             if !matches!(
                 assignment.admission_origin,
                 crate::AssignmentAdmissionOrigin::LegacyMessage { .. }
-            ) || assignment.workspace_strategy != crate::WorkspaceStrategy::Shared
+            ) || !matches!(assignment.workspace_strategy,
+                crate::WorkspaceStrategy::Shared | crate::WorkspaceStrategy::Isolated)
             {
                 return Err(StoreError::InvalidAssignment(
-                    "host turn outcomes require a shared plain-message assignment".to_string(),
+                    "host turn outcomes require a plain-message assignment with a concrete workspace strategy".to_string(),
                 ));
             }
             // A final response establishes turn completion, not acceptance or validation.
@@ -1768,10 +1769,11 @@ LIMIT 1
             && (!matches!(
                 assignment.admission_origin,
                 crate::AssignmentAdmissionOrigin::LegacyMessage { .. }
-            ) || assignment.workspace_strategy != crate::WorkspaceStrategy::Shared)
+            ) || !matches!(assignment.workspace_strategy,
+                crate::WorkspaceStrategy::Shared | crate::WorkspaceStrategy::Isolated))
         {
             return Err(StoreError::InvalidAssignment(
-                "host follow-up attempts require a shared plain-message assignment".to_string(),
+                "host follow-up attempts require a plain-message assignment with a concrete workspace strategy".to_string(),
             ));
         }
         if assignment.role != AgentRole::Worker
@@ -5244,6 +5246,8 @@ async fn selective_admission_tx(
 ) -> StoreResult<(AdmissionOverlapSummary, IntegrationPlan)> {
     // Admission and integration planning concern this root's team only.
     // Other sessions in the checkout do not constrain spawning.
+    let observed = tracing::enabled!(target: "codex_storage_runtime", tracing::Level::TRACE)
+        .then(std::time::Instant::now);
     let rows = sqlx::query(
         "SELECT assignments.body_json, repositories.workspace_id, attempts.state,
                 attempts.sealed_at
@@ -5265,6 +5269,11 @@ async fn selective_admission_tx(
     .bind(encode(&AttemptState::Active)?)
     .fetch_all(&mut **transaction)
     .await?;
+
+    if let Some(started) = observed {
+        tracing::trace!(target: "codex_storage_runtime", stage = "admission_lookup",
+            elapsed_us = started.elapsed().as_micros() as u64, matched_rows = rows.len());
+    }
 
     let mut overlaps = AdmissionOverlapSummary::default();
     let mut conflicting_writer_count = 0_u32;
@@ -5328,13 +5337,21 @@ async fn selective_admission_tx(
     let integration_plan = if assignment.write_scope.is_empty() {
         IntegrationPlan::SingleWriter
     } else if assignment.workspace_strategy == WorkspaceStrategy::Isolated {
-        if !isolated_integrator_available {
-            return Err(StoreError::AdmissionRejected {
-                reason: AdmissionRejectionReason::IsolatedIntegratorUnavailable,
-                reusable_assignment_id: None,
-            });
+        if matches!(assignment.admission_origin,
+            crate::AssignmentAdmissionOrigin::LegacyMessage { .. })
+        {
+            // Public message spawns report an outcome to their root; they do
+            // not certify integration or invent an available typed integrator.
+            IntegrationPlan::RootOwned
+        } else {
+            if !isolated_integrator_available {
+                return Err(StoreError::AdmissionRejected {
+                    reason: AdmissionRejectionReason::IsolatedIntegratorUnavailable,
+                    reusable_assignment_id: None,
+                });
+            }
+            IntegrationPlan::TypedIntegratorRequired
         }
-        IntegrationPlan::TypedIntegratorRequired
     } else if conflicting_writer_count == 0 {
         IntegrationPlan::SingleWriter
     } else if conflicting_writer_in_another_workspace {

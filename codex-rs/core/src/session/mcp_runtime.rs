@@ -90,6 +90,10 @@ impl McpRuntimeSnapshot {
     }
 
 
+    pub(crate) fn generation(&self) -> u64 {
+        self.generation
+    }
+
     pub fn config(&self) -> &McpConfig {
         self.config.as_ref()
     }

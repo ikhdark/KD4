@@ -1,6 +1,5 @@
 mod firewall;
 mod read_acl_mutex;
-mod setup_mutex;
 
 use anyhow::Context;
 use anyhow::Result;
@@ -81,7 +80,7 @@ use sandbox_users::prepare_setup_marker;
 use sandbox_users::provision_sandbox_users;
 use sandbox_users::resolve_sandbox_users_group_sid;
 use sandbox_users::sid_bytes_to_local_sid;
-use setup_mutex::acquire_setup_mutex;
+use codex_windows_sandbox::acquire_setup_mutex;
 
 fn log_line(log: &mut dyn Write, msg: &str) -> Result<()> {
     let ts = chrono::Utc::now().to_rfc3339();
@@ -642,6 +641,13 @@ fn configure_offline_sandbox_network(
     offline_sid_str: &str,
     log: &mut dyn Write,
 ) -> Result<()> {
+    // run_setup holds the existing global setup mutex across this operation.
+    let update = codex_windows_sandbox::OfflineNetworkPolicyUpdate::begin(
+        &payload.offline_username, &payload.proxy_ports, payload.allow_local_binding,
+    )?;
+    if !update.needed() {
+        return Ok(());
+    }
     let proxy_allowlist_result = firewall::ensure_offline_proxy_allowlist(
         offline_sid_str,
         &payload.proxy_ports,
@@ -683,7 +689,7 @@ fn configure_offline_sandbox_network(
             format!("required WFP loopback isolation setup failed: {err}"),
         ))
     })?;
-    Ok(())
+    update.commit()
 }
 
 fn lock_persistent_sandbox_dirs(

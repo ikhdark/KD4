@@ -131,13 +131,13 @@ pub(crate) struct PendingThreadResumeRequest {
     pub(crate) history_items: Option<Vec<RolloutItem>>,
     pub(crate) history_generation: u64,
     pub(crate) listener_generation: u64,
+    pub(crate) dynamic_tool_executor: bool,
     pub(crate) config_snapshot: ThreadConfigSnapshot,
     pub(crate) instruction_sources: Vec<LegacyAppPathString>,
     pub(crate) thread_summary: codex_app_server_protocol::Thread,
     pub(crate) include_turns: bool,
     pub(crate) initial_turns_page:
         Option<codex_app_server_protocol::ThreadResumeInitialTurnsPageParams>,
-    pub(crate) redact_resume_payloads: bool,
 }
 
 // ThreadListenerCommand is used to perform operations in the context of the thread listener, for serialization purposes.

@@ -25,6 +25,37 @@ use tracing::trace;
 
 const MAX_SSE_EVENT_BYTES: usize = 32 * 1024 * 1024;
 
+fn prepare_sse_frame(
+    mut frame: bytes::Bytes,
+    first_frame: &mut bool,
+) -> Result<bytes::Bytes, codex_client::TransportError> {
+    // eventsource-stream retains every invalid suffix until EOF, including
+    // permanent errors. Validate each bounded frame once, without allocating,
+    // so one bad byte cannot accumulate the rest of the response in its decoder.
+    // An incomplete suffix is possible only in the final, unterminated frame:
+    // leave that to the decoder's distinct truncated-at-EOF error path.
+    if let Err(error) = std::str::from_utf8(&frame) {
+        if error.error_len().is_some() {
+            trace!(target: "codex_network_stream_observation", frame_bytes = frame.len(), "sse_invalid_utf8");
+            return Err(codex_client::TransportError::Build(
+                "invalid UTF-8 in SSE event".into(),
+            ));
+        }
+        trace!(target: "codex_network_stream_observation", incomplete_bytes = frame.len() - error.valid_up_to(), "sse_incomplete_utf8_eof");
+    }
+    if *first_frame {
+        *first_frame = false;
+        // The dependency slices a leading BOM at byte 1 rather than byte 3.
+        // Raw framing has already joined split wire chunks, so remove exactly
+        // one stream-leading BOM at its complete byte boundary, without copying.
+        if frame.starts_with(b"\xef\xbb\xbf") {
+            trace!(target: "codex_network_stream_observation", "sse_bom_removed");
+            frame = frame.slice(3..);
+        }
+    }
+    Ok(frame)
+}
+
 // Bound parser accumulation before UTF-8/JSON decoding. Scan raw bytes once,
 // recognizing LF, CRLF and CR even across chunks. Only pass complete events to
 // eventsource-stream: partial payloads make it repeatedly scan the same line.
@@ -39,6 +70,7 @@ fn bound_sse_events(stream: ByteStream, limit: usize) -> ByteStream {
         finished: bool,
         since_yield: usize,
         observed_body_byte: bool,
+        first_frame: bool,
     }
     let state = Framing {
         stream,
@@ -50,6 +82,7 @@ fn bound_sse_events(stream: ByteStream, limit: usize) -> ByteStream {
         finished: false,
         since_yield: 0,
         observed_body_byte: false,
+        first_frame: true,
     };
     futures::stream::unfold(state, move |mut state| async move {
         if state.finished {
@@ -67,6 +100,7 @@ fn bound_sse_events(stream: ByteStream, limit: usize) -> ByteStream {
             if state.pending.is_empty() {
                 match state.stream.next().await {
                     Some(Ok(chunk)) => {
+                        trace!(target: "codex_network_stream_observation", chunk_bytes = chunk.len(), "sse_chunk_polled");
                         if !state.observed_body_byte && !chunk.is_empty() {
                             state.observed_body_byte = true;
                             codex_http_client::record_first_response_body_byte();
@@ -83,7 +117,9 @@ fn bound_sse_events(stream: ByteStream, limit: usize) -> ByteStream {
                         return if state.event.is_empty() {
                             None
                         } else {
-                            Some((Ok(state.event.split().freeze()), state))
+                            let frame = state.event.split().freeze();
+                            let frame = prepare_sse_frame(frame, &mut state.first_frame);
+                            Some((frame, state))
                         };
                     }
                 }
@@ -149,20 +185,25 @@ fn bound_sse_events(stream: ByteStream, limit: usize) -> ByteStream {
             }
             state.since_yield += index;
             let chunk = state.pending.split_to(index);
-            if complete && state.event.is_empty() && !state.after_cr {
+            let frame = if complete && state.event.is_empty() && !state.after_cr {
                 // Common case: an event in one network chunk needs no copy.
-                return Some((Ok(chunk), state));
-            }
-            state.event.extend_from_slice(&chunk);
-            if complete {
+                chunk
+            } else {
+                state.event.extend_from_slice(&chunk);
+                if !complete {
+                    continue;
+                }
                 if state.after_cr {
                     // nom's streaming CRLF parser needs lookahead after CR.
                     // Finish an empty CR line without waiting for another event;
                     // swallow its optional wire LF on the next iteration.
                     state.event.extend_from_slice(b"\n");
                 }
-                return Some((Ok(state.event.split().freeze()), state));
-            }
+                state.event.split().freeze()
+            };
+            let frame = prepare_sse_frame(frame, &mut state.first_frame);
+            state.finished = frame.is_err();
+            return Some((frame, state));
         }
     })
     .boxed()
@@ -215,7 +256,15 @@ async fn process_sse_with_metadata(
     metadata: ResponsesStreamMetadata,
     turn_state: Option<Arc<OnceLock<String>>>,
 ) {
-    let mut stream = bound_sse_events(stream, MAX_SSE_EVENT_BYTES).eventsource();
+    // Initialize the dependency with a protocol no-op so it never runs its
+    // byte-incorrect BOM slicing. prepare_sse_frame removes exactly one wire
+    // BOM; a second BOM must remain ordinary field data, not panic the parser.
+    let parser_prefix = futures::stream::once(futures::future::ready(
+        Ok::<_, codex_client::TransportError>(bytes::Bytes::from_static(b":\n")),
+    ));
+    let mut stream = parser_prefix
+        .chain(bound_sse_events(stream, MAX_SSE_EVENT_BYTES))
+        .eventsource();
     let mut interpreter = ResponsesEventInterpreter::new(&metadata, turn_state);
     let mut poll_ordinal = 0_u64;
     let mut received_events = 0_u64;

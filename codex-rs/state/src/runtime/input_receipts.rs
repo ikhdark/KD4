@@ -76,8 +76,11 @@ impl StateRuntime {
         Ok(())
     }
 
-    pub async fn cancel_start_input_receipts(&self, thread_id: ThreadId, turn_id: &str) -> anyhow::Result<()> {
-        sqlx::query("UPDATE input_receipts SET consumed = 1, payload = NULL WHERE thread_id = ? AND kind = 'start' AND turn_id = ?")
+    pub async fn cancel_turn_input_receipts(&self, thread_id: ThreadId, turn_id: &str) -> anyhow::Result<()> {
+        // Accepted start payloads must reach the nonexecuting cold-recovery
+        // history/artifact barrier before consumption. Revoke steering and
+        // unaccepted reservations without erasing that accepted source.
+        sqlx::query("UPDATE input_receipts SET consumed = 1, payload = NULL WHERE thread_id = ? AND turn_id = ? AND (kind != 'start' OR payload IS NULL)")
             .bind(thread_id.to_string()).bind(turn_id)
             .execute(self.input_receipts_pool().await?).await?;
         Ok(())

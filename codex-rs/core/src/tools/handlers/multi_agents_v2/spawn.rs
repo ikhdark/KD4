@@ -176,6 +176,10 @@ async fn handle_spawn_agent(
         .join(&args.task_name)
         .map_err(FunctionCallError::RespondToModel)?;
     args.validate_generic()?;
+    let workspace_strategy = args
+        .workspace_strategy
+        .or_else(|| args.assignment.as_ref().map(|assignment| assignment.workspace_strategy))
+        .unwrap_or(WorkspaceStrategy::Shared);
     // Keep the historical Worker tag for durable-record compatibility. New
     // subagents all have the same runtime profile; this is not a role selector.
     let typed_role = AgentRole::Worker;
@@ -373,11 +377,6 @@ async fn handle_spawn_agent(
             .map_err(typed_task_store_error)?;
         let cwd = admission_cwd.to_path_buf();
         let main_repo_root = get_git_repo_root(&cwd).unwrap_or(cwd);
-        let workspace_strategy = args
-            .assignment
-            .as_ref()
-            .map(|assignment| assignment.workspace_strategy)
-            .unwrap_or(WorkspaceStrategy::Shared);
         let repo_root = if workspace_strategy == WorkspaceStrategy::Isolated {
             let workspace = Box::pin(create_isolated_worktree(
                 &main_repo_root,
@@ -440,6 +439,7 @@ async fn handle_spawn_agent(
                     })?,
                     legacy_parent_assignment_id,
                     role,
+                    workspace_strategy,
                 ),
                 Vec::new(),
             ),
@@ -1115,6 +1115,8 @@ async fn create_isolated_worktree(
         .arg("-C")
         .arg(repo_root)
         .args(["-c", "checkout.workers=0"])
+        .arg("-c")
+        .arg(format!("core.hooksPath={}", codex_git_utils::DISABLED_HOOKS_PATH))
         .args(["worktree", "add", "--detach"])
         .arg(&workspace.path)
         .arg(&initial_overlay.head);
@@ -1156,12 +1158,15 @@ async fn create_isolated_worktree(
                 _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {}
             }
         }
-        if !initial_overlay.tracked_diff.is_empty() {
+        let expected_overlay = Arc::new(initial_overlay);
+        if !expected_overlay.tracked_diff.is_empty() {
             let mut command = Command::new(codex_git_utils::git_executable_async().await);
+            // Keep snapshot additions in the child's tracked-path inventory so
+            // validation can compare the overlay independently of parent staging.
             command.arg("-C")
                 .arg(&workspace.path)
-                .args(["apply", "--binary", "--whitespace=nowarn", "-"]);
-            let output = run_worktree_git(command, Some(&initial_overlay.tracked_diff), cancellation_token, terminal_tasks)
+                .args(["apply", "--intent-to-add", "--binary", "--whitespace=nowarn", "-"]);
+            let output = run_worktree_git(command, Some(&expected_overlay.tracked_diff), cancellation_token, terminal_tasks)
                 .await
                 .map_err(|error| {
                     FunctionCallError::RespondToModel(format!(
@@ -1176,12 +1181,14 @@ async fn create_isolated_worktree(
             }
         }
         use futures::StreamExt;
-        let copies = futures::stream::iter(initial_overlay.working_files.into_iter().map(|(relative_path, bytes)| {
+        let copies = futures::stream::iter((0..expected_overlay.working_files.len()).map(|index| {
             let workspace = Arc::clone(&workspace);
+            let expected_overlay = Arc::clone(&expected_overlay);
             async move {
                 tokio::task::spawn_blocking(move || {
                     // Keep rollback ownership in the blocking worker, including
                     // when the caller is cancelled while this write is in flight.
+                    let (relative_path, bytes) = &expected_overlay.working_files[index];
                     let target = workspace.path.join(relative_path);
                     if let Some(parent) = target.parent() {
                         std::fs::create_dir_all(parent).map_err(|error| {
@@ -1209,6 +1216,13 @@ async fn create_isolated_worktree(
         // operation does not cancel the underlying blocking filesystem call.
         for result in copies {
             result?;
+        }
+        let isolated_overlay =
+            capture_workspace_overlay(&workspace.path, cancellation_token, terminal_tasks).await?;
+        if isolated_overlay != *expected_overlay {
+            return Err(FunctionCallError::RespondToModel(
+                "spawn_agent: the isolated worktree does not match the captured source snapshot".into(),
+            ));
         }
         Ok(())
     })
@@ -1595,6 +1609,8 @@ async fn cleanup_isolated_worktree_paths(
     command
         .arg("-C")
         .arg(repo_root)
+        .arg("-c")
+        .arg(format!("core.hooksPath={}", codex_git_utils::DISABLED_HOOKS_PATH))
         .args(["worktree", "remove", "--force"])
         .arg(path);
     let output = run_worktree_git(command, None, &CancellationToken::new(), terminal_tasks).await?;
@@ -1633,6 +1649,7 @@ struct SpawnAgentArgs {
     // message only; even this input always uses the same generic runtime profile.
     assignment: Option<TypedAssignmentArgs>,
     task_name: String,
+    workspace_strategy: Option<WorkspaceStrategy>,
     agent_type: Option<String>,
     model: Option<String>,
     reasoning_effort: Option<ReasoningEffort>,
@@ -1652,6 +1669,16 @@ impl SpawnAgentArgs {
             return Err(FunctionCallError::RespondToModel(format!(
                 "spawn_agent: model and reasoning overrides are not supported; subagents use {DEFAULT_SPAWN_AGENT_MODEL} with {DEFAULT_SPAWN_AGENT_REASONING_EFFORT} reasoning"
             )));
+        }
+        if self.workspace_strategy == Some(WorkspaceStrategy::Auto) {
+            return Err(FunctionCallError::RespondToModel(
+                "spawn_agent: workspace_strategy must be shared or isolated; omit it to use shared".to_string(),
+            ));
+        }
+        if self.workspace_strategy.is_some() && self.assignment.is_some() {
+            return Err(FunctionCallError::RespondToModel(
+                "spawn_agent: workspace_strategy cannot be combined with a legacy assignment; use its existing workspace_strategy field".to_string(),
+            ));
         }
         Ok(())
     }
@@ -1768,6 +1795,7 @@ fn legacy_message_draft(
     message: &str,
     parent_assignment_id: Option<AssignmentId>,
     role: AgentRole,
+    workspace_strategy: WorkspaceStrategy,
 ) -> AssignmentDraft {
     // The claim covers the whole repository. Only a Worker claims it for
     // writing; a read-only role reads it and keeps an empty write scope, so it
@@ -1803,7 +1831,7 @@ fn legacy_message_draft(
         required_evidence: Vec::new(),
         prohibited_changes: Vec::new(),
         contract_claims: Vec::new(),
-        workspace_strategy: WorkspaceStrategy::Shared,
+        workspace_strategy,
         relation: None,
         architecture_contract_ref: None,
     }

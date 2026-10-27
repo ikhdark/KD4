@@ -44,7 +44,7 @@ pub async fn build_prompt_input(
     let thread_store = thread_store_from_config(&config, state_db.clone());
     let installation_id = resolve_installation_id(&config.codex_home).await?;
     let environment_manager = Arc::new(
-        EnvironmentManager::from_codex_home(config.codex_home.clone(), Some(local_runtime_paths))
+        EnvironmentManager::from_codex_home_with_http_client_factory(config.codex_home.clone(), Some(local_runtime_paths), config.http_client_factory())
             .await
             .map_err(|err| CodexErr::Fatal(err.to_string()))?,
     );

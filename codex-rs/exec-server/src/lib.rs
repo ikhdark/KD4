@@ -168,6 +168,7 @@ pub use resolved_capability::ResolvedSelectedCapabilityRoot;
 pub use resolved_capability::SelectedCapabilityRootsStatus;
 pub use runtime_paths::ExecServerRuntimePaths;
 pub use server::DEFAULT_LISTEN_URL;
+pub use server::EXEC_SERVER_AUTH_TOKEN_ENV_VAR;
 pub use server::ExecServerListenUrlParseError;
 pub use server::run_main;
 pub use server::run_main_with_shutdown;

@@ -270,7 +270,7 @@ impl OutputCapture {
 pub struct ProcessHandle {
     stdin_close_receipt: Option<StdinCloseReceipt>,
     output_capture: OutputCapture,
-    writer_tx: StdMutex<Option<mpsc::Sender<Vec<u8>>>>,
+    writer_tx: StdMutex<Option<crate::StdinSender>>,
     killer: StdMutex<Option<Box<dyn ChildTerminator>>>,
     reader_handle: StdMutex<Option<JoinHandle<()>>>,
     reader_abort_handles: StdMutex<Vec<AbortHandle>>,
@@ -298,7 +298,7 @@ impl fmt::Debug for ProcessHandle {
 impl ProcessHandle {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
-        writer_tx: mpsc::Sender<Vec<u8>>,
+        writer_tx: crate::StdinSender,
         killer: Box<dyn ChildTerminator>,
         reader_handle: JoinHandle<()>,
         reader_abort_handles: Vec<AbortHandle>,
@@ -346,15 +346,15 @@ impl ProcessHandle {
         self.output_capture.clone()
     }
 
-    /// Returns a channel sender for writing raw bytes to the child stdin.
-    pub fn writer_sender(&self) -> mpsc::Sender<Vec<u8>> {
+    /// Returns a byte-budgeted sender for writing raw bytes to the child stdin.
+    pub fn writer_sender(&self) -> crate::StdinSender {
         if let Ok(writer_tx) = self.writer_tx.lock()
             && let Some(writer_tx) = writer_tx.as_ref()
         {
             return writer_tx.clone();
         }
 
-        let (writer_tx, writer_rx) = mpsc::channel(1);
+        let (writer_tx, writer_rx) = crate::stdin_channel(1);
         drop(writer_rx);
         writer_tx
     }
@@ -616,7 +616,7 @@ pub struct SpawnedProcess {
 
 /// Driver-backed process handles for non-standard spawn backends.
 pub struct ProcessDriver {
-    pub writer_tx: mpsc::Sender<Vec<u8>>,
+    pub writer_tx: crate::StdinSender,
     pub stdout_rx: ProcessOutputReceiver,
     pub stderr_rx: Option<ProcessOutputReceiver>,
     pub exit_rx: oneshot::Receiver<i32>,

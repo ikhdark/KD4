@@ -506,6 +506,7 @@ impl Session {
         input: Vec<TurnInput>,
         task: T,
     ) -> CodexResult<()> {
+        let explicit_input = !input.is_empty();
         let turn_state = {
             let mut active_turn = self.active_turn.lock().await;
             match active_turn.as_ref() {
@@ -698,6 +699,9 @@ impl Session {
             ));
         };
         startup_guard.disarm();
+        if explicit_input {
+            self.session_start_suspended.store(false, Ordering::Release);
+        }
         let _ = start_tx.send(());
         Ok(())
     }
@@ -821,7 +825,9 @@ impl Session {
             .shutting_down
             .load(std::sync::atomic::Ordering::Acquire)
             || self.terminal_interaction_pending.load(Ordering::Acquire)
+            || self.session_start_suspended.load(Ordering::Acquire)
         {
+            tracing::debug!(target: "codex_input_custody", phase = "pending_wake_blocked", thread_id = %self.thread_id, hook_suspended = self.session_start_suspended.load(Ordering::Acquire), "input custody boundary");
             return;
         }
         if !self.input_queue.has_pending_turn_start_work().await {
@@ -838,6 +844,7 @@ impl Session {
             .shutting_down
             .load(std::sync::atomic::Ordering::Acquire)
             || self.terminal_interaction_pending.load(Ordering::Acquire)
+            || self.session_start_suspended.load(Ordering::Acquire)
             || !self.input_queue.has_pending_turn_start_work().await
         {
             return;
@@ -880,6 +887,7 @@ impl Session {
         if self.pending_work_retry.swap(true, Ordering::AcqRel) {
             return;
         }
+        tracing::debug!(target: "codex_input_custody", phase = "capacity_wait", thread_id = %self.thread_id, turn_id = %context.sub_id, "input custody boundary");
         let pending = Arc::clone(&self.pending_work_retry);
         let session = Arc::downgrade(self);
         let control = self.services.agent_control.clone();
@@ -896,6 +904,7 @@ impl Session {
                 guard = control.wait_for_execution_capacity(context.multi_agent_version, &context.session_source) => guard,
             };
             let Some(session) = session.upgrade() else { return; };
+            tracing::debug!(target: "codex_input_custody", phase = "capacity_wake", thread_id = %session.thread_id, turn_id = %context.sub_id, "input custody boundary");
             // Registration holds the acquired permit until exactly this retry
             // consumes it, or drops it if the input/turn/shutdown state changed.
             let Ok(_registration) = control.register_execution_permit(
@@ -1334,6 +1343,12 @@ impl Session {
         // Execution and its durable record are separate outcomes, so a record
         // that could not be saved is reported to the client, not only logged.
         let mut unsaved_records = Vec::new();
+        if matches!(finalization.outcome, TurnTerminalOutcome::Aborted(_))
+            && let Err(err) = self.cancel_turn_receipts(&turn_context.sub_id).await
+        {
+            warn!(turn_id = %turn_context.sub_id, "failed to revoke cancelled input receipts: {err}");
+            unsaved_records.push(format!("cancelled input receipts ({err})"));
+        }
         if let Err(err) = self
             .flush_rollout_after_ordered_commits(&turn_context)
             .await

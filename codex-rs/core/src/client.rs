@@ -4111,25 +4111,24 @@ impl ModelClient {
 
     fn prepare_response_items_for_request(&self, input: &mut codex_api::ResponsesInput) {
         let strip_all_ids = !self.state.provider.info().is_openai();
-        let requires_change = input.iter().any(|item| {
-            item.id()
-                .is_some_and(|id| strip_all_ids || !id.is_prefixed())
-        });
-        if !requires_change {
+        // Item IDs are optional on the wire. Keep durable receipt/recovery IDs
+        // intact in history, but omit those exceeding the API's 64-character cap.
+        let should_strip_id = |item: &ResponseItem| {
+            item.id().is_some_and(|id| {
+                strip_all_ids
+                    || !id.is_prefixed()
+                    || (id.len() > 64 && id.chars().take(65).count() > 64)
+            })
+        };
+        if !input.iter().any(should_strip_id) {
             return;
         }
         input.update_segments(|input| {
-            if !input.iter().any(|item| {
-                item.id()
-                    .is_some_and(|id| strip_all_ids || !id.is_prefixed())
-            }) {
+            if !input.iter().any(should_strip_id) {
                 return;
             }
             for item in Arc::make_mut(input).iter_mut() {
-                if item
-                    .id()
-                    .is_some_and(|id| strip_all_ids || !id.is_prefixed())
-                {
+                if should_strip_id(item) {
                     item.set_id(/*new_id*/ None);
                 }
             }

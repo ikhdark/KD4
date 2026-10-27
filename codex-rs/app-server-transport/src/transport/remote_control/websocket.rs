@@ -40,7 +40,8 @@ use codex_app_server_protocol::RemoteControlConnectionStatus;
 use codex_app_server_protocol::RemoteControlStatusChangedNotification;
 use codex_client::capped_backoff;
 use codex_http_client::RouteAwareClientPool;
-use codex_http_client::maybe_build_rustls_client_config_with_custom_ca;
+use codex_websocket_client::WebSocketConnection;
+use codex_websocket_client::WebSocketConnector;
 use codex_login::AuthManager;
 use codex_login::UnauthorizedRecovery;
 use codex_login::default_client::default_headers;
@@ -56,17 +57,12 @@ use std::fmt::Write as _;
 use std::io;
 use std::io::ErrorKind;
 use std::sync::Arc;
-use tokio::net::TcpStream;
 use tokio::sync::Mutex;
 use tokio::sync::Semaphore;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 use tokio::sync::watch;
 use tokio::time::MissedTickBehavior;
-use tokio_tungstenite::Connector;
-use tokio_tungstenite::MaybeTlsStream;
-use tokio_tungstenite::WebSocketStream;
-use tokio_tungstenite::connect_async_tls_with_config;
 use tokio_tungstenite::tungstenite;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_util::sync::CancellationToken;
@@ -152,7 +148,10 @@ impl ServerWriterQueue {
         frame
     }
 
-    async fn enqueue(&mut self, state: &Mutex<WebsocketState>, queued: super::QueuedServerEnvelope) -> io::Result<((ClientId, StreamId), u64)> {
+    async fn enqueue(&mut self, state: &Mutex<WebsocketState>, queued: super::QueuedServerEnvelope) -> io::Result<Option<((ClientId, StreamId), u64)>> {
+        if queued.delivery_failure.as_ref().is_some_and(CancellationToken::is_cancelled) {
+            return Ok(None);
+        }
         let key = (queued.client_id.clone(), queued.stream_id.clone());
         let seq_id = {
             let state = state.lock().await;
@@ -167,7 +166,20 @@ impl ServerWriterQueue {
             event: queued.event, client_id: queued.client_id, stream_id: queued.stream_id, seq_id,
         };
         // Complete encoding before publishing any sequence/replay mutation.
-        let encoded = encode_server_payloads_for_transport(envelope)?;
+        let encoded = match encode_server_payloads_for_transport(envelope) {
+            Ok(encoded) => encoded,
+            Err(error) => {
+                // No sequence/replay entry exists yet. Retire only the owning
+                // virtual connection and drop its unsuccessful write receipt;
+                // restarting the shared socket cannot recover this envelope.
+                warn!(client_id = %key.0.0, stream_id = %key.1.0, %error,
+                    "retiring remote client after outbound encoding failure");
+                if let Some(failure) = queued.delivery_failure {
+                    failure.cancel();
+                }
+                return Ok(None);
+            }
+        };
         let count = encoded.len();
         let mut completion = queued.write_complete_tx;
         let mut state = state.lock().await;
@@ -178,7 +190,7 @@ impl ServerWriterQueue {
             state.outbound_buffer.insert_encoded(buffered);
         }
         state.next_seq_id_by_stream.insert(key.clone(), seq_id.saturating_add(1));
-        Ok((key, seq_id))
+        Ok(Some((key, seq_id)))
     }
 }
 
@@ -523,7 +535,7 @@ struct RemoteControlEnrollmentAuthContext<'a, 'b> {
 }
 
 enum ConnectOutcome {
-    Connected(Box<WebSocketStream<MaybeTlsStream<TcpStream>>>),
+    Connected(Box<WebSocketConnection>),
     Disabled,
     Shutdown,
 }
@@ -1218,7 +1230,7 @@ impl RemoteControlWebsocket {
 
     async fn run_connection(
         &mut self,
-        websocket_connection: WebSocketStream<MaybeTlsStream<TcpStream>>,
+        websocket_connection: WebSocketConnection,
         shutdown_token: CancellationToken,
     ) -> ConnectionEndReason {
         let (websocket_writer, websocket_reader) = websocket_connection.split();
@@ -1338,7 +1350,7 @@ impl RemoteControlWebsocket {
         server_event_rx: Arc<Mutex<mpsc::Receiver<super::QueuedServerEnvelope>>>,
         used_rx: watch::Receiver<usize>,
         websocket_writer: SplitSink<
-            WebSocketStream<MaybeTlsStream<TcpStream>>,
+            WebSocketConnection,
             tungstenite::Message,
         >,
         ping_interval: std::time::Duration,
@@ -1413,7 +1425,7 @@ impl RemoteControlWebsocket {
                 match server_event_rx.try_recv() {
                     Ok(envelope) => {
                         let admitted = pending.enqueue(&state, envelope).await?;
-                        if saturated { fairness_overdraft = Some(admitted); }
+                        if saturated { fairness_overdraft = admitted; }
                     }
                     Err(mpsc::error::TryRecvError::Empty) => break,
                     Err(mpsc::error::TryRecvError::Disconnected) if pending.is_empty() => {
@@ -1440,7 +1452,7 @@ impl RemoteControlWebsocket {
                     let envelope = envelope.ok_or_else(|| io::Error::new(ErrorKind::UnexpectedEof, "server event channel closed"))?;
                     let saturated = *used_rx.borrow() >= super::CHANNEL_CAPACITY;
                     let admitted = pending.enqueue(&state, envelope).await?;
-                    if saturated { fairness_overdraft = Some(admitted); }
+                    if saturated { fairness_overdraft = admitted; }
                     continue;
                 }
             }
@@ -1483,7 +1495,7 @@ impl RemoteControlWebsocket {
     async fn run_websocket_reader(
         client_tracker: Arc<Mutex<ClientTracker>>,
         state: Arc<Mutex<WebsocketState>>,
-        websocket_reader: SplitStream<WebSocketStream<MaybeTlsStream<TcpStream>>>,
+        websocket_reader: SplitStream<WebSocketConnection>,
         pong_timeout: std::time::Duration,
         shutdown_token: CancellationToken,
     ) {
@@ -1505,7 +1517,7 @@ impl RemoteControlWebsocket {
     async fn run_websocket_reader_inner(
         client_tracker: Arc<Mutex<ClientTracker>>,
         state: Arc<Mutex<WebsocketState>>,
-        mut websocket_reader: SplitStream<WebSocketStream<MaybeTlsStream<TcpStream>>>,
+        mut websocket_reader: SplitStream<WebSocketConnection>,
         pong_timeout: std::time::Duration,
         shutdown_token: CancellationToken,
     ) -> io::Result<()> {
@@ -1769,15 +1781,16 @@ pub(super) async fn connect_remote_control_websocket(
     connect_options: RemoteControlConnectOptions<'_>,
     status_publisher: &RemoteControlStatusPublisher,
 ) -> io::Result<(
-    WebSocketStream<MaybeTlsStream<TcpStream>>,
+    WebSocketConnection,
     tungstenite::http::Response<()>,
     RemoteControlEnrollment,
 )> {
     // CA reads and native-root initialization may block. Keep them off the
     // connection task, before enrollment can change state or contact the server.
-    let prepare_connector = AbortOnDropHandle::new(tokio::task::spawn_blocking(|| {
+    let http_client_factory = connect_options.http_clients.http_client_factory().clone();
+    let prepare_connector = AbortOnDropHandle::new(tokio::task::spawn_blocking(move || {
         ensure_rustls_crypto_provider();
-        maybe_build_rustls_client_config_with_custom_ca()
+        WebSocketConnector::new(&http_client_factory)
     }));
     let connector =
         tokio::time::timeout(REMOTE_CONTROL_WEBSOCKET_CONNECT_TIMEOUT, prepare_connector)
@@ -1789,8 +1802,7 @@ pub(super) async fn connect_remote_control_websocket(
                 )
             })?
             .map_err(io::Error::other)?
-            .map_err(io::Error::from)?
-            .map(Connector::Rustls);
+            .map_err(io::Error::from)?;
 
     let (auth, enrollment) = {
         let mut current_enrollment = current_enrollment.lock().await;
@@ -1821,9 +1833,7 @@ pub(super) async fn connect_remote_control_websocket(
     current_enrollment.admit_request()?;
     let websocket_connect_result = tokio::time::timeout(
         REMOTE_CONTROL_WEBSOCKET_CONNECT_TIMEOUT,
-        connect_async_tls_with_config(
-            request, /*config*/ None, /*disable_nagle*/ false, connector,
-        ),
+        connector.connect(request, tungstenite::protocol::WebSocketConfig::default()),
     )
     .await
     .map_err(|_| {

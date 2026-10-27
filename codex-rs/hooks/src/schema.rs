@@ -319,6 +319,11 @@ pub(crate) struct PreToolUseCommandInput {
     #[schemars(schema_with = "permission_mode_schema")]
     pub permission_mode: String,
     pub tool_name: String,
+    /// Authoritative MCP routing identity, independent of model aliases.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mcp_server_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mcp_tool_name: Option<String>,
     pub tool_input: Value,
     pub tool_use_id: String,
     /// Codex extension: flat names of tools already dispatched earlier in this
@@ -346,6 +351,11 @@ pub(crate) struct PermissionRequestCommandInput {
     #[schemars(schema_with = "permission_mode_schema")]
     pub permission_mode: String,
     pub tool_name: String,
+    /// Authoritative MCP routing identity, independent of model aliases.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mcp_server_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mcp_tool_name: Option<String>,
     pub tool_input: Value,
 }
 
@@ -368,6 +378,11 @@ pub(crate) struct PostToolUseCommandInput {
     #[schemars(schema_with = "permission_mode_schema")]
     pub permission_mode: String,
     pub tool_name: String,
+    /// Authoritative MCP routing identity, independent of model aliases.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mcp_server_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mcp_tool_name: Option<String>,
     pub tool_input: Value,
     pub tool_response: Value,
     pub tool_use_id: String,

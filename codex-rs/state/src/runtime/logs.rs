@@ -109,6 +109,8 @@ impl StateRuntime {
         }
 
         let scope = LogRetentionScope::from_entries(entries);
+        let observation_started = tracing::enabled!(target: "codex_state::log_batch_observation", tracing::Level::TRACE)
+            .then(Instant::now);
         let started = Instant::now();
         let connection_result = self.logs_pool.acquire().await.map_err(anyhow::Error::from);
         crate::telemetry::record_log_phase(
@@ -120,7 +122,11 @@ impl StateRuntime {
         );
         let mut connection = connection_result?;
         let started = Instant::now();
-        let transaction_result = connection.begin().await.map_err(anyhow::Error::from);
+        // Reserve the log writer before consulting the durable deletion fence.
+        // Deletion releases its state transaction before purging logs, so a
+        // concurrent batch is either filtered here or removed by that purge.
+        let transaction_result = sqlx::Connection::begin_with(&mut *connection, "BEGIN IMMEDIATE")
+            .await.map_err(anyhow::Error::from);
         crate::telemetry::record_log_phase(
             self.db_telemetry.as_deref(),
             "insert",
@@ -129,8 +135,24 @@ impl StateRuntime {
             &transaction_result,
         );
         let mut tx = transaction_result?;
+        let deleted = if scope.thread_ids.is_empty() {
+            BTreeSet::new()
+        } else {
+            let thread_ids = scope.thread_ids.iter().collect::<Vec<_>>();
+            sqlx::query_scalar::<_, String>(
+                "SELECT thread_id FROM deleted_thread_owners WHERE thread_id IN (SELECT value FROM json_each(?))",
+            )
+            .bind(serde_json::to_string(&thread_ids)?)
+            .fetch_all(self.pool.as_ref())
+            .await?
+            .into_iter()
+            .collect::<BTreeSet<_>>()
+        };
+        let admitted = entries.iter().filter(|entry| {
+            entry.thread_id.as_ref().is_none_or(|id| !deleted.contains(id))
+        }).collect::<Vec<_>>();
         // Eleven binds per row; cap each statement below SQLite's 32,766 limit.
-        for entries in entries.chunks(2_978) {
+        for entries in admitted.chunks(2_978) {
             let mut builder = QueryBuilder::<Sqlite>::new(
                 "INSERT INTO logs (ts, ts_nanos, level, target, feedback_log_body, thread_id, process_uuid, module_path, file, line, estimated_bytes) ",
             );
@@ -182,6 +204,30 @@ impl StateRuntime {
             &commit_result,
         );
         commit_result?;
+        if let Some(started) = observation_started {
+            // Content-free, opt-in settlement evidence. This target is excluded
+            // from the SQLite tracing exporter so observing a writer cannot
+            // recursively enqueue more writer work.
+            let mut counts = std::collections::BTreeMap::<&str, usize>::new();
+            for entry in entries {
+                if let Some(thread_id) = entry.thread_id.as_deref() {
+                    *counts.entry(thread_id).or_default() += 1;
+                }
+            }
+            for (thread_id, input_entries) in counts {
+                let fenced_entries = if deleted.contains(thread_id) { input_entries } else { 0 };
+                tracing::trace!(
+                    target: "codex_state::log_batch_observation",
+                    thread_id,
+                    input_entries,
+                    admitted_entries = input_entries - fenced_entries,
+                    fenced_entries,
+                    batch_entries = entries.len(),
+                    batch_elapsed_us = started.elapsed().as_micros() as u64,
+                    "log_batch_settled"
+                );
+            }
+        }
         Ok(scope)
     }
 

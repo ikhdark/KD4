@@ -6,6 +6,7 @@ use axum::extract::ws::WebSocketUpgrade;
 use axum::http::Request;
 use axum::http::StatusCode;
 use axum::http::header::ORIGIN;
+use axum::http::header::AUTHORIZATION;
 use axum::middleware;
 use axum::middleware::Next;
 use axum::response::IntoResponse;
@@ -29,6 +30,35 @@ use crate::server::processor::ConnectionProcessor;
 use crate::telemetry::ConnectionTransport;
 
 pub const DEFAULT_LISTEN_URL: &str = "ws://127.0.0.1:0";
+/// Per-launch capability passed privately by the launcher to the server and its loopback clients.
+pub const EXEC_SERVER_AUTH_TOKEN_ENV_VAR: &str = "CODEX_EXEC_SERVER_AUTH_TOKEN";
+
+fn listener_authorization() -> io::Result<http::HeaderValue> {
+    let token = std::env::var(EXEC_SERVER_AUTH_TOKEN_ENV_VAR).map_err(|_| {
+        io::Error::new(io::ErrorKind::PermissionDenied,
+            "exec-server WebSocket mode requires a private per-launch CODEX_EXEC_SERVER_AUTH_TOKEN; use stdio for a private parent-child transport")
+    })?;
+    if token.len() < 32 || !token.bytes().all(|byte| byte.is_ascii_alphanumeric() || b"-_.~".contains(&byte)) {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput,
+            "CODEX_EXEC_SERVER_AUTH_TOKEN must contain at least 32 URL-safe ASCII characters"));
+    }
+    let mut authorization = http::HeaderValue::from_str(&format!("Bearer {token}"))
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid exec-server authorization"))?;
+    authorization.set_sensitive(true);
+    Ok(authorization)
+}
+
+pub(crate) fn loopback_authorization(url: &str) -> Result<Option<http::HeaderValue>, tokio_tungstenite::tungstenite::Error> {
+    let is_loopback = url::Url::parse(url).ok().and_then(|url| url.host().map(|host| match host {
+        url::Host::Ipv4(ip) => ip.is_loopback(),
+        url::Host::Ipv6(ip) => ip.is_loopback(),
+        url::Host::Domain(_) => false,
+    })).unwrap_or(false);
+    if is_loopback && std::env::var_os(EXEC_SERVER_AUTH_TOKEN_ENV_VAR).is_some() {
+        return listener_authorization().map(Some).map_err(tokio_tungstenite::tungstenite::Error::Io);
+    }
+    Ok(None)
+}
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub(crate) enum ExecServerListenTransport {
@@ -160,10 +190,12 @@ async fn run_websocket_listener(
     if !bind_address.ip().is_loopback() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "the unauthenticated exec-server WebSocket listener requires a loopback address",
+            "the exec-server WebSocket listener requires a loopback address",
         )
         .into());
     }
+    // Fail closed before opening a port. Never print the capability with the endpoint.
+    let authorization = listener_authorization()?;
     let listener = TcpListener::bind(bind_address).await?;
     let local_addr = listener.local_addr()?;
     let processor = ConnectionProcessor::new_with_telemetry(runtime_paths, telemetry)
@@ -177,6 +209,7 @@ async fn run_websocket_listener(
         .route("/readyz", get(readiness_handler))
         .layer(middleware::from_fn(reject_requests_with_origin_header))
         .with_state(ExecServerWebSocketState {
+            authorization,
             processor: processor.clone(),
             connections: std::sync::Arc::new(tokio::sync::Semaphore::new(128)),
         });
@@ -193,6 +226,7 @@ async fn run_websocket_listener(
 
 #[derive(Clone)]
 struct ExecServerWebSocketState {
+    authorization: http::HeaderValue,
     processor: ConnectionProcessor,
     connections: std::sync::Arc<tokio::sync::Semaphore>,
 }
@@ -219,9 +253,17 @@ async fn reject_requests_with_origin_header(
 
 async fn websocket_upgrade_handler(
     websocket: WebSocketUpgrade,
+    headers: http::HeaderMap,
     ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
     State(state): State<ExecServerWebSocketState>,
 ) -> impl IntoResponse {
+    let mut values = headers.get_all(AUTHORIZATION).iter();
+    let authorized = values.next().is_some_and(|value| {
+        constant_time_eq::constant_time_eq(value.as_bytes(), state.authorization.as_bytes())
+    }) && values.next().is_none();
+    if !authorized {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
     let Ok(connection_permit) = state.connections.clone().try_acquire_owned() else {
         return (
             StatusCode::SERVICE_UNAVAILABLE,

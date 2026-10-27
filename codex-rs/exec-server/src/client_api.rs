@@ -31,6 +31,8 @@ pub struct RemoteExecServerConnectArgs {
     pub connect_timeout: Duration,
     pub initialize_timeout: Duration,
     pub resume_session_id: Option<String>,
+    /// Effective application routing policy, retained by reconnection.
+    pub http_client_factory: codex_http_client::HttpClientFactory,
 }
 
 /// Registry-authorized material for one Noise rendezvous connection attempt.
@@ -59,6 +61,8 @@ pub struct NoiseRendezvousConnectArgs {
     pub connect_timeout: Duration,
     pub initialize_timeout: Duration,
     pub resume_session_id: Option<String>,
+    /// Effective application routing policy for this physical connection attempt.
+    pub http_client_factory: codex_http_client::HttpClientFactory,
 }
 
 /// Supplies fresh registry-authorized material for Noise rendezvous connections.

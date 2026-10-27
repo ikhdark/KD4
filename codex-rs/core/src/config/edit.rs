@@ -756,14 +756,17 @@ fn apply_blocking_to_resolved_file(
         return Ok(ConfigApplyOutcome::Applied);
     }
 
-    let doc = if serialized.is_empty() {
+    let mut doc = if serialized.is_empty() {
         DocumentMut::new()
     } else {
         serialized.parse::<DocumentMut>()?
     };
 
+    // The semantic paths above refer to migrated configuration. Canonicalize
+    // under this same writer lock so clearing one cannot resurrect a raw alias.
+    let migrated = codex_config::loader::migrate_config_document(&mut doc, resolved_config_file)?;
     let mut document = ConfigDocument::new(doc);
-    let mut mutated = false;
+    let mut mutated = migrated;
 
     for edit in edits {
         mutated |= document.apply(edit)?;

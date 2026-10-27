@@ -593,9 +593,7 @@ impl CommandExecManager {
         }
 
         let delta = match params.delta_base64 {
-            Some(delta_base64) => STANDARD
-                .decode(delta_base64)
-                .map_err(|err| invalid_params(format!("invalid deltaBase64: {err}")))?,
+            Some(delta_base64) => decode_stdin_delta(&delta_base64)?,
             None => Vec::new(),
         };
 
@@ -1221,6 +1219,22 @@ fn spawn_process_output(
             reached_eof,
         }
     })
+}
+
+pub(crate) fn decode_stdin_delta(delta_base64: &str) -> Result<Vec<u8>, JSONRPCErrorError> {
+    let max_bytes = codex_utils_pty::MAX_STDIN_CHUNK_BYTES;
+    // Bound the decoder allocation first, then check the exact decoded size
+    // (the final padded quartet can encode one, two, or three bytes).
+    if delta_base64.len() > max_bytes.div_ceil(3) * 4 {
+        return Err(invalid_params("stdin chunk exceeds the 4 MiB limit"));
+    }
+    let delta = STANDARD
+        .decode(delta_base64)
+        .map_err(|err| invalid_params(format!("invalid deltaBase64: {err}")))?;
+    if delta.len() > max_bytes {
+        return Err(invalid_params("stdin chunk exceeds the 4 MiB limit"));
+    }
+    Ok(delta)
 }
 
 pub(crate) fn spawn_stdin_writer(

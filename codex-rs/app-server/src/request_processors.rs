@@ -428,7 +428,6 @@ use std::time::Duration;
 use std::time::Instant;
 use tokio::sync::Mutex;
 use tokio::sync::Semaphore;
-use tokio::sync::SemaphorePermit;
 use tokio::sync::oneshot;
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
@@ -486,6 +485,8 @@ pub(crate) use projects::ProjectRequestProcessor;
 pub(crate) use remote_control_processor::RemoteControlRequestProcessor;
 pub(crate) use search::SearchRequestProcessor;
 pub(crate) use thread_processor::ThreadRequestProcessor;
+mod thread_list_state;
+pub(crate) use thread_list_state::ThreadListState;
 pub(crate) use thread_queue::QueueOrigin;
 pub(crate) use thread_queue::ThreadQueueRequestProcessor;
 pub(crate) use turn_processor::TurnRequestProcessor;
@@ -559,12 +560,10 @@ fn resolve_runtime_workspace_roots(workspace_roots: Vec<AbsolutePathBuf>) -> Vec
 mod config_errors;
 mod thread_delete;
 mod thread_lifecycle;
-mod thread_resume_redaction;
 mod thread_summary;
 
 use self::config_errors::*;
 use self::thread_lifecycle::*;
-use self::thread_resume_redaction::*;
 use self::thread_summary::*;
 
 pub(crate) use self::thread_lifecycle::PendingThreadUnloads;

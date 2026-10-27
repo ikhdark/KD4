@@ -512,11 +512,19 @@ const PROJECTOR: &str = r#"((isProxy, boxedKind, projectTool) => {
   function canonicalReplacer(maxBytes) {
     let remaining = maxBytes, root = true;
     const parents = [];
+    // A batch can reference the same immutable body repeatedly. Cache only
+    // successfully counted strings, within this traversal and a small bound;
+    // every occurrence still spends its full encoded byte cost.
+    let stringCosts;
+    let cachedChars = 0;
     const take = bytes => {
       if (bytes > remaining) throw budgetExceeded;
       remaining -= bytes;
     };
     const stringBytes = (text, quoted) => {
+      const cached = quoted && text.length >= 512 ? stringCosts?.get(text) : undefined;
+      if (cached !== undefined) { take(cached); return; }
+      const before = remaining;
       if (quoted) take(2);
       // Every UTF-16 code unit needs at least one encoded byte. Reject a giant
       // primitive before allocating another escaped copy of it.
@@ -534,6 +542,11 @@ const PROJECTOR: &str = r#"((isProxy, boxedKind, projectTool) => {
             take(4); ++i;
           } else take(quoted ? 6 : 3);
         } else take(3);
+      }
+      if (quoted && text.length >= 512 && (stringCosts?.size || 0) < 256 &&
+          cachedChars + text.length <= 4 * 1024 * 1024) {
+        (stringCosts ??= new Map()).set(text, before - remaining);
+        cachedChars += text.length;
       }
     };
     return function bounded(key, item) {
@@ -752,11 +765,23 @@ const PROJECTOR: &str = r#"((isProxy, boxedKind, projectTool) => {
       }
       return;
     }
+    // Display uses its own budget while retaining its projection/framing
+    // semantics. Charge within the same native traversal: never replay getters
+    // or toJSON merely to estimate the eventual representation's size.
+    const displayLimit = arguments.length === 3 && original === 'display' ? projected : undefined;
+    const render = (item, replace = displayReplacer) => {
+      if (displayLimit === undefined) return stringify(item, replace);
+      const charge = canonicalReplacer(displayLimit);
+      return stringify(item, function(key, value) {
+        return charge.call(this, key, replace(key, value));
+      });
+    };
+    try {
     // A small unchanged command has no source body to frame or share.
     const direct = value !== null && typeof value === 'object' ? get(value) : undefined;
     if (direct && !direct.root && typeof direct.projected?.output === 'string' &&
         !escapes(direct.projected.output) && inert(value, new Set()) && same(value, direct.original)) {
-      return displayStringify(direct.projected);
+      return render(direct.projected);
     }
     const texts = [];
     // Both caches die with this serialization. No cross-call provenance,
@@ -801,7 +826,7 @@ const PROJECTOR: &str = r#"((isProxy, boxedKind, projectTool) => {
       if (!roots.has(entry.root)) roots.set(entry.root, same(entry.root, entry.rootOriginal));
       return roots.get(entry.root);
     };
-    const rendered = stringify(value, (_key, item) => {
+    const rendered = render(value, (_key, item) => {
       if (typeof item === 'bigint') return displayReplacer(_key, item);
       if (item instanceof NativeError) return errorProjection(item);
       const entry = item !== null && typeof item === 'object' ? get(item) : undefined;
@@ -844,9 +869,26 @@ const PROJECTOR: &str = r#"((isProxy, boxedKind, projectTool) => {
       append(raw, entry.original);
       return raw.envelope;
     });
-    return texts.length ? rendered + '\n' + texts.map((body, index) =>
-      '[source ' + displayStringify({body: index + 1, ...body.source, same_as_body: body.same_as_body}) + ']\n' +
-        (body.same_as_body === undefined ? body.text : '')).join('\n') : rendered;
+    if (!texts.length) return rendered;
+    let used = utf8Size(rendered) + 1;
+    const outputFrames = [];
+    for (const [index, body] of texts.entries()) {
+      const label = render({body: index + 1, ...body.source, same_as_body: body.same_as_body});
+      const raw = body.same_as_body === undefined ? body.text : '';
+      const framingBytes = 10 + utf8Size(label) + (index ? 1 : 0);
+      // A raw body already exists. Check its lower bound before scanning it,
+      // and the complete frame before allocating any concatenated copy.
+      if (displayLimit !== undefined && used + framingBytes + raw.length > displayLimit)
+        throw budgetExceeded;
+      used += framingBytes + utf8Size(raw);
+      if (displayLimit !== undefined && used > displayLimit) throw budgetExceeded;
+      outputFrames.push('[source ' + label + ']\n' + raw);
+    }
+    return rendered + '\n' + outputFrames.join('\n');
+    } catch (error) {
+      if (displayLimit !== undefined && error === budgetExceeded) return null;
+      throw error;
+    }
   };
 })"#;
 
@@ -1015,6 +1057,18 @@ pub(super) fn stringify<'s>(
     function
         .call(scope, receiver, &[value])
         .and_then(|value| v8::Local::<v8::String>::try_from(value).ok())
+}
+
+pub(super) fn stringify_with_limit<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    value: v8::Local<'_, v8::Value>,
+    max_bytes: usize,
+) -> Result<Option<v8::Local<'s, v8::String>>, String> {
+    let value = bounded_json_codec_mode(scope, value, max_bytes, "display");
+    if value.is_some_and(|value| value.is_null()) {
+        return Err(format!("payload exceeds its limit of {max_bytes} bytes"));
+    }
+    Ok(value.and_then(|value| v8::Local::<v8::String>::try_from(value).ok()))
 }
 
 pub(super) fn json_codec<'s>(

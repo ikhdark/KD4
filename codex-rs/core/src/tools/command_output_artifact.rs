@@ -8744,6 +8744,41 @@ const UNRESUMABLE_THREAD_ARTIFACT_GRACE: std::time::Duration =
     std::time::Duration::from_secs(7 * 24 * 60 * 60);
 const UNRESUMABLE_THREAD_ARTIFACT_SWEEP_INTERVAL: std::time::Duration =
     std::time::Duration::from_secs(24 * 60 * 60);
+const UNRESUMABLE_THREAD_ARTIFACT_BATCH: usize = 64;
+const UNRESUMABLE_THREAD_ARTIFACT_SCAN_ENTRIES: usize = 4096;
+const UNRESUMABLE_THREAD_ARTIFACT_MOVE_BUDGET: std::time::Duration =
+    std::time::Duration::from_millis(250);
+
+/// Measurement follows the actual move owner into blocking removal, including
+/// cancellation. Release the existing lock before publishing its observed window.
+struct ReclaimMoveOwner {
+    file: Option<File>,
+    observed: Option<(std::time::Instant, u64, usize)>,
+}
+
+impl ReclaimMoveOwner {
+    fn new(file: File, candidates: usize) -> Self {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let observed = tracing::enabled!(target: "codex_storage_runtime", tracing::Level::TRACE)
+            .then(|| {
+                let id = NEXT.fetch_add(1, Ordering::Relaxed);
+                tracing::trace!(target: "codex_storage_runtime", stage = "cleanup_lock_acquired",
+                    batch_id = id, candidates);
+                (std::time::Instant::now(), id, candidates)
+            });
+        Self { file: Some(file), observed }
+    }
+}
+
+impl Drop for ReclaimMoveOwner {
+    fn drop(&mut self) {
+        drop(self.file.take());
+        if let Some((started, id, candidates)) = self.observed {
+            tracing::trace!(target: "codex_storage_runtime", stage = "cleanup_lock_released",
+                batch_id = id, candidates, elapsed_us = started.elapsed().as_micros() as u64);
+        }
+    }
+}
 
 /// Starts a background reclaim at most once per sweep interval per home.
 pub(crate) fn spawn_unresumable_thread_artifact_reclaim(
@@ -8768,17 +8803,22 @@ pub(crate) fn spawn_unresumable_thread_artifact_reclaim(
         last_sweeps.insert(codex_home.clone(), std::time::Instant::now());
     }
     runtime.spawn(async move {
-        let lookup_home = codex_home.clone();
+        let observed = tracing::enabled!(target: "codex_storage_runtime", tracing::Level::TRACE)
+            .then(std::time::Instant::now);
+        if observed.is_some() {
+            tracing::trace!(target: "codex_storage_runtime", stage = "cleanup_started");
+        }
         let reclaimed = reclaim_unresumable_thread_artifacts(
             &codex_home,
             &active_thread_id,
             SystemTime::now(),
-            |thread_id| {
-                let codex_home = lookup_home.clone();
-                async move { thread_rollout_exists(&codex_home, &thread_id).await }
-            },
         )
         .await;
+        if let Some(started) = observed {
+            tracing::trace!(target: "codex_storage_runtime", stage = "cleanup_finished",
+                elapsed_us = started.elapsed().as_micros() as u64,
+                removed = reclaimed.as_ref().copied().unwrap_or(0), success = reclaimed.is_ok());
+        }
         match reclaimed {
             Ok(0) => {}
             Ok(removed) => tracing::info!(removed, "reclaimed artifacts of unresumable threads"),
@@ -8787,65 +8827,86 @@ pub(crate) fn spawn_unresumable_thread_artifact_reclaim(
     });
 }
 
-/// Rollout files are authoritative here. A stale state-db row would only add an
-/// error log per thread before the same filesystem lookup.
-async fn thread_rollout_exists(codex_home: &Path, thread_id: &str) -> std::io::Result<bool> {
-    Ok(
-        crate::find_thread_path_by_id_str(codex_home, thread_id, /*state_db_ctx*/ None)
-            .await?
-            .is_some()
-            || crate::find_archived_thread_path_by_id_str(
-                codex_home, thread_id, /*state_db_ctx*/ None,
-            )
-            .await?
-            .is_some(),
-    )
-}
-
-async fn reclaim_unresumable_thread_artifacts<F, Fut>(
+async fn reclaim_unresumable_thread_artifacts(
     codex_home: &Path,
     active_thread_id: &str,
     now: SystemTime,
-    thread_is_resumable: F,
-) -> std::io::Result<usize>
-where
-    F: Fn(String) -> Fut,
-    Fut: std::future::Future<Output = std::io::Result<bool>>,
-{
+) -> std::io::Result<usize> {
     let mut removed = 0;
     for directory in ["tool-output", "command-output"] {
         removed += reclaim_unresumable_thread_artifacts_under_root(
-            codex_home, codex_home.join(directory), active_thread_id, now, &thread_is_resumable,
+            codex_home, codex_home.join(directory), active_thread_id, now,
         ).await?;
     }
     Ok(removed)
 }
 
-async fn reclaim_unresumable_thread_artifacts_under_root<F, Fut>(
+async fn reclaim_unresumable_thread_artifacts_under_root(
     codex_home: &Path,
     root: PathBuf,
     active_thread_id: &str,
     now: SystemTime,
-    thread_is_resumable: &F,
-) -> std::io::Result<usize>
-where
-    F: Fn(String) -> Fut,
-    Fut: std::future::Future<Output = std::io::Result<bool>>,
-{
-    let Some(move_owner) = codex_rollout::try_lock_rollout_moves(codex_home).await? else {
-        return Ok(0);
-    };
-    if codex_rollout::has_recoverable_delete_staging(codex_home).await? {
-        return Ok(0);
-    }
+) -> std::io::Result<usize> {
+    // Candidate discovery needs no movement exclusion. Actual absence is
+    // established by one fresh inventory after acquiring that exclusion.
     let scan_root = root.clone();
     let active_thread_id = active_thread_id.to_string();
     let idle = run_blocking_artifact_io(move || {
         idle_thread_artifact_directories(&scan_root, &active_thread_id, now)
     })
     .await?;
+    tracing::trace!(target: "codex_storage_runtime", stage = "cleanup_discovery",
+        eligible_directories = idle.len());
+    let mut removed = 0;
+    // Preserve complete discovery outside movement ownership. Process every
+    // candidate in bounded batches instead of starving entries behind a kept
+    // prefix on every daily sweep.
+    for batch in idle.chunks(UNRESUMABLE_THREAD_ARTIFACT_BATCH) {
+        removed += reclaim_unresumable_thread_artifact_batch(
+            codex_home, root.clone(), now, batch.to_vec(),
+        ).await?;
+        tokio::task::yield_now().await;
+    }
+    Ok(removed)
+}
+
+async fn reclaim_unresumable_thread_artifact_batch(
+    codex_home: &Path,
+    root: PathBuf,
+    now: SystemTime,
+    idle: Vec<String>,
+) -> std::io::Result<usize> {
+    if idle.is_empty() {
+        return Ok(0);
+    }
+    let Some(move_owner) = codex_rollout::try_lock_rollout_moves(codex_home).await? else {
+        return Ok(0);
+    };
+    let move_owner = ReclaimMoveOwner::new(move_owner, idle.len());
+    let deadline = tokio::time::Instant::now() + UNRESUMABLE_THREAD_ARTIFACT_MOVE_BUDGET;
+    if codex_rollout::has_recoverable_delete_staging(codex_home).await? {
+        return Ok(0);
+    }
+    let ids = idle.iter()
+        .filter_map(|id| codex_protocol::ThreadId::from_string(id).ok())
+        .collect::<Vec<_>>();
+    let Ok(mut inventory) = tokio::time::timeout_at(
+        deadline,
+        codex_rollout::ThreadRolloutInventory::scan(codex_home, &ids),
+    ).await else {
+        tracing::trace!(target: "codex_storage_runtime", stage = "cleanup_inventory_timeout");
+        return Ok(0);
+    };
+    // An incomplete traversal cannot prove absence for ANY candidate, even
+    // after a previous take_paths call consumed its enumeration error.
+    if !inventory.is_complete() {
+        return Ok(0);
+    }
     let mut unresumable = Vec::new();
     for thread_id in idle {
+        if tokio::time::Instant::now() >= deadline {
+            return Ok(0);
+        }
         // Explicit-path resume has durable ownership outside the home-local
         // discovery roots. Its known provenance is not proof of unresumability.
         if !matches!(
@@ -8867,15 +8928,19 @@ where
                 Ok(owner) => owner,
                 Err(_) => continue, // live or uncertain liveness: never wait under movement ownership
             };
-        // Only a proven absence releases a directory; a failed lookup keeps it.
-        if matches!(thread_is_resumable(thread_id.clone()).await, Ok(false)) {
+        // Header/identity failures remain conservative, just like uncertain
+        // liveness. The bulk inventory retains legacy filename suffixes.
+        let id = codex_protocol::ThreadId::from_string(&thread_id)
+            .map_err(std::io::Error::other)?;
+        if matches!(tokio::time::timeout_at(deadline, inventory.take_paths(id)).await,
+            Ok(Ok(paths)) if paths.is_empty()) {
             unresumable.push((thread_id, residency));
         }
     }
     if unresumable.is_empty() {
         return Ok(0);
     }
-    let Some(permit) = retention_sweep_permit(&root).await else {
+    let Ok(Some(permit)) = tokio::time::timeout_at(deadline, retention_sweep_permit(&root)).await else {
         return Ok(0);
     };
     run_blocking_artifact_io(move || {
@@ -8884,6 +8949,9 @@ where
         let _move_owner = move_owner;
         let mut removed = 0;
         for (thread_id, _residency) in unresumable {
+            if tokio::time::Instant::now() >= deadline {
+                break;
+            }
             // First publication may have raced the initial age scan before we
             // acquired residency. Recheck under ownership through removal.
             let aged = std::fs::symlink_metadata(root.join(&thread_id))
@@ -8902,9 +8970,11 @@ where
             // Appending an existing file does not refresh directory mtime.
             // Ownership proves quiescence, not that its newest output is old.
             let contents_aged =
-                std::fs::read_dir(root.join(&thread_id)).is_ok_and(|mut entries| {
-                    entries.all(|entry| {
-                        entry.is_ok_and(|entry| {
+                std::fs::read_dir(root.join(&thread_id)).is_ok_and(|entries| {
+                    entries.enumerate().all(|(index, entry)| {
+                        index < UNRESUMABLE_THREAD_ARTIFACT_SCAN_ENTRIES
+                            && tokio::time::Instant::now() < deadline
+                            && entry.is_ok_and(|entry| {
                             std::fs::symlink_metadata(entry.path()).is_ok_and(|metadata| {
                                 metadata.is_file()
                                     && !metadata_is_reparse_point(&metadata)

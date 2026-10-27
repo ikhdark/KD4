@@ -861,6 +861,8 @@ ON CONFLICT(child_thread_id) DO NOTHING
         &self,
         path: &Path,
     ) -> anyhow::Result<Option<crate::ThreadMetadata>> {
+        let observed = tracing::enabled!(target: "codex_storage_runtime", tracing::Level::TRACE)
+            .then(std::time::Instant::now);
         let mut query = QueryBuilder::<Sqlite>::new("");
         push_thread_select_columns(&mut query);
         query.push(" FROM threads WHERE rollout_path IN (");
@@ -869,6 +871,10 @@ ON CONFLICT(child_thread_id) DO NOTHING
         query.push_bind(path.with_extension("jsonl.zst").display().to_string());
         query.push(") LIMIT 1");
         let row = query.build().fetch_optional(self.pool.as_ref()).await?;
+        if let Some(started) = observed {
+            tracing::trace!(target: "codex_storage_runtime", stage = "rollout_lookup",
+                elapsed_us = started.elapsed().as_micros() as u64, matched = row.is_some());
+        }
         row.map(|row| ThreadRow::try_from_row(&row).and_then(ThreadMetadata::try_from))
             .transpose()
     }

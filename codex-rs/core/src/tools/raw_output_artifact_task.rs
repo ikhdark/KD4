@@ -214,7 +214,9 @@ impl RawOutputArtifactTask {
         let residency = super::artifact_residency_file(home, thread_id, false)?;
         std::fs::create_dir_all(thread)?;
         let file = OpenOptions::new().create_new(true).read(true).write(true).open(&self.path)?;
-        self.handle = Some(Arc::new(file.try_clone()?));
+        // Retained receipts only read this plain log. Do not keep write access
+        // alive after EOF: it would prevent recovery's immutable read pin.
+        self.handle = Some(Arc::new(command_log_read_handle(&file)?));
         self.writer = Some(BufWriter::with_capacity(64 * 1024, file));
         self._residency = Some(residency);
         Ok(())
@@ -302,6 +304,126 @@ impl Drop for RawOutputArtifactTask {
     }
 }
 
+fn command_log_read_handle(file: &File) -> std::io::Result<File> {
+    use std::os::windows::io::{AsRawHandle, FromRawHandle};
+    use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_GENERIC_READ, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, ReOpenFile,
+    };
+    // Reopen the same object, never the mutable pathname. The producer keeps its
+    // original write handle until finish; all published snapshots get read access.
+    // SAFETY: `file` owns a live synchronous disk handle. A successful reopen
+    // returns a new owned handle, transferred exactly once into File below.
+    let handle = unsafe { ReOpenFile(file.as_raw_handle(), FILE_GENERIC_READ,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, 0) };
+    if handle == INVALID_HANDLE_VALUE {
+        // Unsupported filesystems retain the old capture behavior and simply
+        // miss the optional recovery cache while their write handle is alive.
+        file.try_clone()
+    } else {
+        Ok(unsafe { File::from_raw_handle(handle) })
+    }
+}
+
+#[derive(Clone, Eq, PartialEq)]
+struct CommandLogIdentity {
+    path: PathBuf,
+    volume: u64,
+    file_id: [u8; 16],
+    created: i64,
+    changed: i64,
+    bytes: u64,
+}
+
+#[derive(Clone, Default)]
+struct CommandLogLineIndex {
+    // Exact line starts only. No UTF-8 decoding or fixed-width assumption.
+    points: Vec<(usize, u64)>,
+}
+
+const COMMAND_LOG_INDEX_POINTS: usize = 1024;
+const COMMAND_LOG_INDEX_CACHE_BYTES: usize = 2 * 1024 * 1024;
+const COMMAND_LOG_INDEX_CACHE_ENTRIES: usize = 32;
+
+impl CommandLogLineIndex {
+    fn before(&self, line: usize) -> (usize, u64) {
+        let end = self.points.partition_point(|(known, _)| *known <= line);
+        end.checked_sub(1).map_or((1, 0), |index| self.points[index])
+    }
+
+    fn record(&mut self, line: usize, offset: u64) {
+        if self.points.binary_search_by_key(&line, |(line, _)| *line).is_ok() { return; }
+        if self.points.len() == COMMAND_LOG_INDEX_POINTS { self.points.remove(0); }
+        let index = self.points.partition_point(|(known, _)| *known < line);
+        self.points.insert(index, (line, offset));
+    }
+}
+
+struct CachedCommandLogIndex {
+    identity: CommandLogIdentity,
+    index: CommandLogLineIndex,
+    bytes: usize,
+}
+
+static COMMAND_LOG_INDEXES: std::sync::LazyLock<std::sync::Mutex<std::collections::VecDeque<CachedCommandLogIndex>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::VecDeque::new()));
+
+fn retain_command_log_index(identity: CommandLogIdentity, mut index: CommandLogLineIndex) {
+    let mut cache = COMMAND_LOG_INDEXES.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(position) = cache.iter().position(|entry| entry.identity == identity)
+        && let Some(previous) = cache.remove(position)
+    {
+        for (line, offset) in previous.index.points { index.record(line, offset); }
+    }
+    let bytes = std::mem::size_of::<CachedCommandLogIndex>()
+        .saturating_add(identity.path.capacity().saturating_mul(2))
+        .saturating_add(index.points.capacity().saturating_mul(std::mem::size_of::<(usize, u64)>()));
+    if bytes > COMMAND_LOG_INDEX_CACHE_BYTES { return; }
+    while cache.len() >= COMMAND_LOG_INDEX_CACHE_ENTRIES
+        || cache.iter().map(|entry| entry.bytes).sum::<usize>().saturating_add(bytes) > COMMAND_LOG_INDEX_CACHE_BYTES
+    { cache.pop_front(); }
+    cache.push_back(CachedCommandLogIndex { identity, index, bytes });
+}
+
+// A cache hit requires an actual file identity and its change generation, not
+// path/mtime or the unauthenticated status digest. Deny writes only during this
+// read; retain no file handles in the cache and do not block rename/cleanup.
+fn open_command_log(path: &Path) -> std::io::Result<(File, Option<CommandLogIdentity>)> {
+    use std::mem::MaybeUninit;
+    use std::os::windows::fs::OpenOptionsExt;
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_BASIC_INFO, FILE_ID_INFO, FILE_SHARE_DELETE, FILE_SHARE_READ,
+        FileBasicInfo, FileIdInfo, GetFileInformationByHandleEx,
+    };
+
+    let file = match OpenOptions::new().read(true).share_mode(FILE_SHARE_READ | FILE_SHARE_DELETE).open(path) {
+        Ok(file) => file,
+        // An active writer or unsupported pin uses the original uncached read.
+        Err(_) => return File::open(path).map(|file| (file, None)),
+    };
+    let mut id = MaybeUninit::<FILE_ID_INFO>::zeroed();
+    let mut basic = MaybeUninit::<FILE_BASIC_INFO>::zeroed();
+    // SAFETY: the live pinned file owns this handle; both aligned buffers and
+    // exact sizes match their query classes. Failed queries are never consumed.
+    let identified = unsafe {
+        GetFileInformationByHandleEx(file.as_raw_handle(), FileIdInfo, id.as_mut_ptr().cast(),
+            std::mem::size_of::<FILE_ID_INFO>() as u32) != 0
+            && GetFileInformationByHandleEx(file.as_raw_handle(), FileBasicInfo, basic.as_mut_ptr().cast(),
+                std::mem::size_of::<FILE_BASIC_INFO>() as u32) != 0
+    };
+    let identity = if identified {
+        // SAFETY: both successful queries initialized these complete buffers.
+        let (id, basic) = unsafe { (id.assume_init(), basic.assume_init()) };
+        file.metadata().ok().filter(|metadata| metadata.is_file()).map(|metadata| CommandLogIdentity {
+            path: path.to_owned(), volume: id.VolumeSerialNumber, file_id: id.FileId.Identifier,
+            created: basic.CreationTime, changed: basic.ChangeTime, bytes: metadata.len(),
+        }).filter(|identity| identity.created > 0 && identity.changed > 0
+            && (identity.volume != 0 || identity.file_id.iter().any(|byte| *byte != 0)))
+    } else { None };
+    Ok((file, identity))
+}
+
 /// Return None for an old/indexed artifact so its existing recovery owner handles it.
 /// Reads are thread-confined, bounded-memory and never mutate saved logs.
 pub(crate) async fn read_command_log(
@@ -364,12 +486,26 @@ pub(crate) async fn read_command_log(
             }
         }
         let io_error = |error: std::io::Error| super::ReadToolOutputError::Io(error.to_string());
-        let mut reader = BufReader::new(File::open(&path).map_err(io_error)?);
+        let (file, identity) = if offsets.is_empty() {
+            (File::open(&path).map_err(io_error)?, None)
+        } else {
+            open_command_log(&path).map_err(io_error)?
+        };
+        let mut line_index = identity.as_ref().and_then(|identity|
+            COMMAND_LOG_INDEXES.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+                .iter().find(|entry| &entry.identity == identity).map(|entry| entry.index.clone())
+        ).unwrap_or_default();
+        let mut reader = BufReader::new(file);
         let mut scanned_line = 1usize;
         let mut offset = 0u64;
-        // Index only requested starts, in one bounded-memory prefix scan.
-        // Delivery uses canonical source order and a shared byte budget.
+        // Resume at an authenticated exact checkpoint. Cold reads retain the
+        // original prefix scan, recording only requested starts and page cursors.
         for (start, position) in &mut offsets {
+            let (known_line, known_offset) = line_index.before(*start);
+            if known_line > scanned_line {
+                reader.seek(SeekFrom::Start(known_offset)).map_err(io_error)?;
+                (scanned_line, offset) = (known_line, known_offset);
+            }
             while scanned_line < *start {
                 let available = reader.fill_buf().map_err(io_error)?;
                 if available.is_empty() { break; }
@@ -379,7 +515,10 @@ pub(crate) async fn read_command_log(
                 offset += count as u64;
                 if newline.is_some() { scanned_line += 1; }
             }
-            if scanned_line == *start { *position = Some(offset); }
+            if scanned_line == *start {
+                *position = Some(offset);
+                line_index.record(scanned_line, offset);
+            }
         }
         for selector in selectors {
             let ToolOutputSelector::Lines { start, end } = selector else {
@@ -397,6 +536,7 @@ pub(crate) async fn read_command_log(
             let mut next_line = None;
             let mut next_bytes = None;
             let mut error = None;
+            let mut indexed_end = None;
             while position.is_some() && line <= end {
                 let mut bytes = Vec::new();
                 let count = Read::by_ref(&mut reader).take(remaining.saturating_add(1) as u64)
@@ -404,6 +544,7 @@ pub(crate) async fn read_command_log(
                     .map_err(|error| super::ReadToolOutputError::Io(error.to_string()))?;
                 if count == 0 { break; }
                 if count > remaining {
+                    line_index.record(line, position.unwrap_or(0) + selection.len() as u64);
                     if selection.is_empty() && remaining == max_bytes {
                         // Find the whole unconsumed selection's exact byte extent
                         // without buffering it, including later requested lines.
@@ -432,9 +573,12 @@ pub(crate) async fn read_command_log(
                     break;
                 }
                 remaining -= count;
+                let newline = bytes.last() == Some(&b'\n');
                 selection.extend_from_slice(&bytes);
                 line += 1;
+                if newline { indexed_end = Some((line, position.unwrap_or(0) + selection.len() as u64)); }
             }
+            if let Some((line, offset)) = indexed_end { line_index.record(line, offset); }
             let mut item = serde_json::json!({
                 "selector":{"kind":"lines","start":start,"end":end},
                 "status":if error.is_some() { "selector_too_large" } else { "ok" }, "complete":complete,
@@ -490,6 +634,7 @@ pub(crate) async fn read_command_log(
             results.push(item);
         }
         results.sort_by_key(|result| result["canonical_range"]["start"].as_u64().unwrap_or(u64::MAX));
+        if let Some(identity) = identity { retain_command_log_index(identity, line_index); }
         Ok(Some(serde_json::json!({
             "artifact_id":artifact_id,
             "canonical_sha256":status["sha256"],

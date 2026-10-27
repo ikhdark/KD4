@@ -173,6 +173,9 @@ impl RemoteExecServerConnectArgs {
             connect_timeout: CONNECT_TIMEOUT,
             initialize_timeout: INITIALIZE_TIMEOUT,
             resume_session_id: None,
+            http_client_factory: codex_http_client::HttpClientFactory::new(
+                codex_http_client::OutboundProxyPolicy::ReqwestDefault,
+            ),
         }
     }
 }
@@ -294,6 +297,7 @@ type ConnectionAttempt = OnceCell<ConnectionResult>;
 pub(crate) struct LazyRemoteExecServerClient {
     bound_client: Option<ExecServerClient>,
     transport_params: ExecServerTransportParams,
+    http_client_factory: codex_http_client::HttpClientFactory,
     recovery_policy: RecoveryPolicy,
     // Saves the first startup result so callers share it. Retryable failures reconnect.
     startup: Arc<ConnectionAttempt>,
@@ -307,11 +311,19 @@ impl LazyRemoteExecServerClient {
         Self {
             bound_client: None,
             transport_params,
+            http_client_factory: codex_http_client::HttpClientFactory::new(
+                codex_http_client::OutboundProxyPolicy::ReqwestDefault,
+            ),
             recovery_policy: RecoveryPolicy::Wait,
             startup: Arc::new(ConnectionAttempt::new()),
             current_client: Arc::new(StdMutex::new(None)),
             reconnect: Arc::new(StdMutex::new(None)),
         }
+    }
+
+    pub(crate) fn with_http_client_factory(mut self, factory: codex_http_client::HttpClientFactory) -> Self {
+        self.http_client_factory = factory;
+        self
     }
 
     pub(crate) fn start_connecting(&self) -> Option<AbortOnDropHandle<()>> {
@@ -419,7 +431,7 @@ impl LazyRemoteExecServerClient {
         }
         let result = self
             .startup
-            .get_or_init(|| connect_once(self.transport_params.clone()))
+            .get_or_init(|| connect_once(self.transport_params.clone(), self.http_client_factory.clone()))
             .await;
         match result {
             Ok(client) => {
@@ -452,7 +464,7 @@ impl LazyRemoteExecServerClient {
         };
         let result = attempt
             .get_or_init(|| async {
-                let result = connect_once(self.transport_params.clone()).await;
+                let result = connect_once(self.transport_params.clone(), self.http_client_factory.clone()).await;
                 if let Ok(client) = &result {
                     *self
                         .current_client
@@ -500,12 +512,21 @@ impl LazyRemoteExecServerClient {
     }
 }
 
-async fn connect_once(transport_params: ExecServerTransportParams) -> ConnectionResult {
-    let client = ExecServerClient::connect_for_transport(transport_params)
+async fn connect_once(
+    transport_params: ExecServerTransportParams,
+    http_client_factory: codex_http_client::HttpClientFactory,
+) -> ConnectionResult {
+    let client = ExecServerClient::connect_for_transport(transport_params, http_client_factory)
         .await
         .map_err(Arc::new)?;
     let info = client.environment_info().await.map_err(Arc::new)?;
     validate_windows_environment_info(&info).map_err(Arc::new)?;
+    debug!(
+        event.name = "codex.exec_server.environment_ready",
+        operating_system = ?info.operating_system,
+        shell_kind = %info.shell.name,
+        "initialized remote execution environment"
+    );
     let _ = client.inner.environment_info.set(info);
     Ok(client)
 }

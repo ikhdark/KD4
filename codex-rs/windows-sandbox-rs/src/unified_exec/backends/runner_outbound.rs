@@ -13,6 +13,7 @@ use crate::ipc_framed::OutputStream;
 use crate::ipc_framed::ResizePayload;
 use crate::ipc_framed::write_frame;
 use std::sync::Arc;
+use std::collections::VecDeque;
 use std::sync::Condvar;
 use std::sync::Mutex;
 use std::sync::PoisonError;
@@ -23,6 +24,7 @@ struct State {
     resize: Option<ResizePayload>,
     output_acks: [usize; 2],
     credits: usize,
+    input_custody: VecDeque<Arc<codex_utils_pty::StdinPayload>>,
     input_closed: bool,
     stopped: bool,
     draining: bool,
@@ -50,11 +52,11 @@ impl Drop for Senders {
 pub(crate) struct RunnerOutbound(Arc<Senders>);
 
 fn stop(shared: &Shared) {
-    shared
-        .state
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .stopped = true;
+    {
+        let mut state = shared.state.lock().unwrap_or_else(PoisonError::into_inner);
+        state.stopped = true;
+        state.input_custody.clear();
+    }
     shared.ready.notify_all();
     shared.changed.notify_waiters();
 }
@@ -67,6 +69,7 @@ impl RunnerOutbound {
                 resize: None,
                 output_acks: [0; 2],
                 credits: IO_WINDOW_CHUNKS,
+                input_custody: VecDeque::new(),
                 input_closed: false,
                 stopped: false,
                 draining: false,
@@ -136,12 +139,11 @@ impl RunnerOutbound {
         stop(&self.0.0);
     }
     pub(super) fn close_input(&self) {
-        self.0
-            .0
-            .state
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .input_closed = true;
+        {
+            let mut state = self.0.0.state.lock().unwrap_or_else(PoisonError::into_inner);
+            state.input_closed = true;
+            state.input_custody.clear();
+        }
         self.0.0.changed.notify_waiters();
     }
 
@@ -177,12 +179,20 @@ impl RunnerOutbound {
             "runner over-credited stdin"
         );
         state.credits += 1;
+        // Each credit follows the actual native child write. The last frame
+        // referencing a caller payload releases its per-process/global permits.
+        state.input_custody.pop_front();
         self.0.0.changed.notify_waiters();
         Ok(())
     }
 
-    pub(super) async fn send_data(&self, message: Message) -> anyhow::Result<()> {
+    pub(super) async fn send_data(
+        &self,
+        message: Message,
+        custody: Option<Arc<codex_utils_pty::StdinPayload>>,
+    ) -> anyhow::Result<()> {
         let stdin = matches!(message, Message::Stdin { .. });
+        anyhow::ensure!(stdin == custody.is_some(), "stdin frame must retain byte custody");
         loop {
             let notified = self.0.0.changed.notified();
             tokio::pin!(notified);
@@ -198,6 +208,9 @@ impl RunnerOutbound {
                 if state.data.is_none() && (!stdin || state.credits > 0) {
                     if stdin {
                         state.credits -= 1;
+                    }
+                    if let Some(custody) = custody {
+                        state.input_custody.push_back(custody);
                     }
                     state.data = Some(FramedMessage {
                         version: IPC_PROTOCOL_VERSION,
@@ -224,6 +237,7 @@ impl RunnerOutbound {
                 state.terminate = true;
                 state.stopped = true;
                 state.data = None;
+                state.input_custody.clear();
             }
             Message::Resize { payload } => state.resize = Some(payload),
             Message::OutputAck { payload } => {

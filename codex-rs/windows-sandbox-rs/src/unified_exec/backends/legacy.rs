@@ -86,7 +86,7 @@ fn spawn_legacy_process(
     stdin_open: bool,
     stdout_tx: mpsc::Sender<Vec<u8>>,
     stderr_tx: Option<mpsc::Sender<Vec<u8>>>,
-    writer_rx: mpsc::Receiver<Vec<u8>>,
+    writer_rx: mpsc::Receiver<codex_utils_pty::StdinPayload>,
     logs_base_dir: Option<&Path>,
 ) -> Result<LegacyProcessHandles> {
     let (pi, job, output_join, writer_handle, hpc, conpty_owner, desktop) = if tty {
@@ -181,7 +181,7 @@ fn spawn_output_reader(
 
 fn spawn_input_writer(
     input_write: Option<HANDLE>,
-    mut writer_rx: mpsc::Receiver<Vec<u8>>,
+    mut writer_rx: mpsc::Receiver<codex_utils_pty::StdinPayload>,
     normalize_newlines: bool,
 ) -> tokio::task::JoinHandle<()> {
     let input_write = input_write.map(|handle| handle as usize);
@@ -193,12 +193,9 @@ fn spawn_input_writer(
                 continue;
             };
             let handle = handle_addr as HANDLE;
-            let bytes = if normalize_newlines {
-                windows_input.normalize(&bytes)
-            } else {
-                bytes
-            };
-            if write_all_handle(handle, &bytes).is_err() {
+            let normalized = normalize_newlines.then(|| windows_input.normalize(&bytes));
+            let input = normalized.as_deref().unwrap_or(&bytes);
+            if write_all_handle(handle, input).is_err() {
                 break;
             }
         }
@@ -559,7 +556,7 @@ fn spawn_windows_sandbox_session_legacy_blocking(
         anyhow::bail!("Windows legacy spawn cancelled before process admission");
     }
 
-    let (writer_tx, writer_rx) = mpsc::channel::<Vec<u8>>(128);
+    let (writer_tx, writer_rx) = codex_utils_pty::stdin_channel(128);
     let (stdout_tx, stdout_rx) = mpsc::channel::<Vec<u8>>(256);
     let stderr_rx = if tty {
         None

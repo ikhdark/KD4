@@ -598,7 +598,8 @@ impl PluginRequestProcessor {
         thread_manager: Arc<ThreadManager>,
         config_manager: ConfigManager,
     ) {
-        // Cache invalidation is part of mutation completion; only MCP refresh is best-effort.
+        // Cache invalidation is part of mutation completion; loaded-session
+        // user-layer/hooks and MCP publication share the best-effort refresh owner.
         config_manager.invalidate_load_cache();
         thread_manager.plugins_manager().clear_cache();
         thread_manager.skills_service().clear_cache();

@@ -14,6 +14,7 @@
 pub(crate) struct HookToolName {
     name: String,
     matcher_aliases: Vec<String>,
+    mcp_identity: Option<(String, String)>,
 }
 
 impl HookToolName {
@@ -22,6 +23,33 @@ impl HookToolName {
         Self {
             name: name.into(),
             matcher_aliases: Vec::new(),
+            mcp_identity: None,
+        }
+    }
+
+    /// Use routing identity, not the lossy/model-specific callable aliases, at
+    /// every hook stage. Only unambiguous legacy names retain their spelling.
+    pub(crate) fn mcp(server: &str, tool: &str) -> Self {
+        fn legacy_component(value: &str) -> bool {
+            !value.is_empty()
+                && !value.starts_with('_')
+                && !value.ends_with('_')
+                && !value.contains("__")
+                && value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+        }
+        let name = if legacy_component(server) && legacy_component(tool) {
+            format!("mcp__{server}__{tool}")
+        } else {
+            // The extra separator cannot occur in an admitted legacy pair.
+            // Hex is reversible and cannot introduce delimiter ambiguity.
+            format!("mcp__v1__{}__{}", hex::encode(server), hex::encode(tool))
+        };
+        Self {
+            name,
+            matcher_aliases: Vec::new(),
+            mcp_identity: Some((server.to_string(), tool.to_string())),
         }
     }
 
@@ -35,6 +63,7 @@ impl HookToolName {
         Self {
             name: "apply_patch".to_string(),
             matcher_aliases: vec!["Write".to_string(), "Edit".to_string()],
+            mcp_identity: None,
         }
     }
 
@@ -47,6 +76,7 @@ impl HookToolName {
         Self {
             name: "spawn_agent".to_string(),
             matcher_aliases: vec!["Agent".to_string()],
+            mcp_identity: None,
         }
     }
 
@@ -64,6 +94,7 @@ impl HookToolName {
         Self {
             name: "Bash".to_string(),
             matcher_aliases: vec!["shell_command".to_string()],
+            mcp_identity: None,
         }
     }
 
@@ -76,6 +107,7 @@ impl HookToolName {
         Self {
             name: "Bash".to_string(),
             matcher_aliases: vec!["exec_command".to_string()],
+            mcp_identity: None,
         }
     }
 
@@ -87,6 +119,14 @@ impl HookToolName {
     /// Returns additional matcher inputs that should select the same handlers.
     pub(crate) fn matcher_aliases(&self) -> &[String] {
         &self.matcher_aliases
+    }
+
+    pub(crate) fn mcp_server_name(&self) -> Option<String> {
+        self.mcp_identity.as_ref().map(|(server, _)| server.clone())
+    }
+
+    pub(crate) fn mcp_tool_name(&self) -> Option<String> {
+        self.mcp_identity.as_ref().map(|(_, tool)| tool.clone())
     }
 }
 

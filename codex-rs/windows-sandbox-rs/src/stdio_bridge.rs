@@ -43,6 +43,7 @@ pub async fn forward_sandbox_session_stdio(spawned: SpawnedProcess) -> StdioBrid
     // do not keep their JoinHandles; dropping the handle does not stop the
     // thread, it just means we are not going to wait on it later.
     drop(spawn_input_forwarder(
+        tokio_runtime.clone(),
         std::io::stdin(),
         session.writer_sender(),
         stdin_eof_tx,
@@ -117,8 +118,9 @@ fn record_completion(
 }
 
 fn spawn_input_forwarder<R>(
+    tokio_runtime: tokio::runtime::Handle,
     mut input: R,
-    writer_tx: mpsc::Sender<Vec<u8>>,
+    writer_tx: codex_utils_pty::StdinSender,
     stdin_eof_tx: oneshot::Sender<std::io::Result<()>>,
 ) -> std::thread::JoinHandle<()>
 where
@@ -131,7 +133,7 @@ where
             match input.read(&mut buffer) {
                 Ok(0) => break Ok(()),
                 Ok(n) => {
-                    if writer_tx.blocking_send(buffer[..n].to_vec()).is_err() {
+                    if tokio_runtime.block_on(writer_tx.send(buffer[..n].to_vec())).is_err() {
                         // Child input can close before exit is published. It is
                         // not an input-source read error and needs no replay.
                         break Ok(());

@@ -779,6 +779,8 @@ pub(crate) struct Session {
     /// Admission stays closed while the prior turn is between terminal claim and the
     /// interaction-released milestone, even if its raw active-turn slot is being detached.
     pub(crate) terminal_interaction_pending: std::sync::atomic::AtomicBool,
+    /// Startup-hook stops retain input but forbid automatic pending-work starts.
+    pub(crate) session_start_suspended: std::sync::atomic::AtomicBool,
     /// Prevents terminal cleanup from waking queued work after shutdown begins.
     pub(crate) shutting_down: std::sync::atomic::AtomicBool,
     /// Whether any attached consumer asked for `RawResponseItem` events.
@@ -2112,6 +2114,7 @@ impl Session {
                 persistence_shutdown_result: Default::default(),
                 rollout_durability_error: Default::default(),
                 terminal_interaction_pending: std::sync::atomic::AtomicBool::new(false),
+                session_start_suspended: std::sync::atomic::AtomicBool::new(false),
                 shutting_down: std::sync::atomic::AtomicBool::new(false),
                 raw_response_items_requested: std::sync::atomic::AtomicBool::new(false),
                 raw_user_turn_boundaries_requested: std::sync::atomic::AtomicBool::new(false),

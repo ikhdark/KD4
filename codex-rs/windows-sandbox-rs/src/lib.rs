@@ -145,6 +145,7 @@ mod helper_materialization;
 mod hide_users;
 
 mod identity;
+mod offline_network_policy;
 
 mod logging;
 
@@ -177,6 +178,12 @@ mod proc_thread_attr;
 mod sandbox_utils;
 
 mod setup;
+mod setup_mutex;
+
+#[doc(hidden)]
+pub use offline_network_policy::OfflineNetworkPolicyUpdate;
+#[doc(hidden)]
+pub use setup_mutex::acquire_setup_mutex;
 
 #[doc(hidden)]
 pub mod setup_protocol;
@@ -313,6 +320,7 @@ pub use logging::current_log_file_path_for_codex_home;
 pub use logging::log_file_path_for_utc_date;
 
 pub use logging::log_note;
+pub use logging::custody_diagnostic;
 
 pub use logging::log_writer;
 

@@ -298,6 +298,7 @@ impl ConfigRequestProcessor {
     }
 
     async fn reload_user_config(&self, refreshed_features: &[Feature]) {
+        let _refresh_guard = self.config_manager.lock_runtime_refresh().await;
         let thread_ids = self.thread_manager.list_thread_ids().await;
         // handle_config_mutation already invalidated the shared discovery state.
         // Do not let one refreshed thread evict another's newly loaded plugins.

@@ -112,7 +112,7 @@ impl HttpClient {
     {
         let diagnostic_url = self
             .request_logging_enabled()
-            .then(|| url.as_str().to_string());
+            .then(|| diagnostic_url(url.as_str()));
         RequestBuilder::new(
             self.inner.request(method.clone(), url),
             method,
@@ -164,6 +164,7 @@ impl HttpClient {
 
     pub(crate) fn log_response(&self, method: &Method, url: &str, response: &reqwest::Response) {
         if self.request_logging == RequestLogging::Enabled {
+            let url = diagnostic_url(url);
             tracing::debug!(
                 method = %method,
                 url = %url,
@@ -177,17 +178,19 @@ impl HttpClient {
 
     pub(crate) fn log_error(&self, method: &Method, url: &str, error: &reqwest::Error) {
         if self.request_logging == RequestLogging::Enabled {
+            let url = diagnostic_url(url);
             tracing::debug!(
                 method = %method,
                 url = %url,
                 status = error.status().map(|status| status.as_u16()),
-                error = %error,
+                error = %diagnostic_error(error),
                 "Request failed"
             );
         }
     }
     pub(crate) fn log_error_summary(&self, method: &Method, url: &str, error: &reqwest::Error) {
         if self.request_logging == RequestLogging::Enabled {
+            let url = diagnostic_url(url);
             tracing::debug!(
                 method = %method,
                 url = %url,
@@ -359,7 +362,7 @@ impl RequestBuilder {
                         method = %self.method,
                         url = %url,
                         status = status.map(|s| s.as_u16()),
-                        error = %error,
+                        error = %diagnostic_error(&error),
                         "Request failed"
                     );
                 }
@@ -458,6 +461,27 @@ async fn execute_with_fallbacks(
             }
             result => return result,
         }
+    }
+}
+
+// Query parameters are provider-defined, so no value is presumed non-secret.
+// Only diagnostics use this projection; transport retains the complete URL.
+fn diagnostic_url(raw: &str) -> String {
+    let Ok(mut url) = reqwest::Url::parse(raw) else {
+        return "<invalid URL>".to_string();
+    };
+    let _ = url.set_username("");
+    let _ = url.set_password(None);
+    url.set_query(None);
+    url.set_fragment(None);
+    url.to_string()
+}
+
+fn diagnostic_error(error: &reqwest::Error) -> String {
+    let message = error.to_string();
+    match error.url() {
+        Some(url) => message.replace(url.as_str(), &diagnostic_url(url.as_str())),
+        None => message,
     }
 }
 

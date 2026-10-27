@@ -319,7 +319,7 @@ pub(super) struct ListenerTaskContext {
     pub(super) outgoing: Arc<OutgoingMessageSender>,
     pub(super) pending_thread_unloads: Arc<PendingThreadUnloads>,
     pub(super) thread_watch_manager: ThreadWatchManager,
-    pub(super) thread_list_state_permit: Arc<Semaphore>,
+    pub(super) thread_list_state_permit: Arc<ThreadListState>,
     pub(super) fallback_model_provider: String,
     pub(super) codex_home: PathBuf,
     pub(super) skills_watcher: Arc<SkillsWatcher>,
@@ -1246,11 +1246,10 @@ pub(super) async fn handle_pending_thread_resume_request(
     pending_thread_unloads: &Arc<PendingThreadUnloads>,
     pending: crate::thread_state::PendingThreadResumeRequest,
 ) {
-    let needs_stream_prefix = !pending.redact_resume_payloads
-        && !thread_state_manager
-            .subscribed_connection_ids(conversation_id)
-            .await
-            .contains(&pending.request_id.connection_id);
+    let needs_stream_prefix = !thread_state_manager
+        .subscribed_connection_ids(conversation_id)
+        .await
+        .contains(&pending.request_id.connection_id);
     let mut stream_prefix = Vec::new();
     let mut resume_turns = None;
     let mut indexed_initial_page = None;
@@ -1353,7 +1352,7 @@ pub(super) async fn handle_pending_thread_resume_request(
         thread_status,
         has_live_in_progress_turn,
     );
-    let mut initial_turns_page = if let Some(mut page) = indexed_initial_page {
+    let initial_turns_page = if let Some(mut page) = indexed_initial_page {
         super::thread_processor::normalize_thread_turns_status(&mut page.turns, thread.status.clone(), has_live_in_progress_turn);
         let cursors = (|| {
             let backwards_cursor = page.turns.first()
@@ -1393,13 +1392,6 @@ pub(super) async fn handle_pending_thread_resume_request(
     } else {
         None
     };
-    if pending.redact_resume_payloads {
-        redact_thread_resume_payloads(&mut thread.turns);
-        if let Some(initial_turns_page) = initial_turns_page.as_mut() {
-            redact_thread_resume_payloads(&mut initial_turns_page.data);
-        }
-    }
-
     let config_snapshot = pending.config_snapshot;
     let selected_environment =
         super::thread_processor::selected_thread_environment(&config_snapshot);
@@ -1451,7 +1443,16 @@ pub(super) async fn handle_pending_thread_resume_request(
                 )
                 .await?
             {
-                ThreadConnectionAdmission::Admitted(guard) => Ok(Some(guard)),
+                ThreadConnectionAdmission::Admitted(guard) => {
+                    // The listener-generation fence remains held through the
+                    // live-connection claim and synchronous response enqueue.
+                    if pending.dynamic_tool_executor
+                        && !outgoing.register_dynamic_tool_owner(conversation_id, connection_id).await
+                    {
+                        return Ok(None);
+                    }
+                    Ok(Some(guard))
+                }
                 ThreadConnectionAdmission::ThreadClosing => Err(invalid_request(format!(
                     "thread {conversation_id} is closing; retry thread/resume after the thread is closed"
                 ))),

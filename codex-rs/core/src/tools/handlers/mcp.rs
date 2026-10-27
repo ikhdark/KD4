@@ -19,7 +19,6 @@ use crate::tools::registry::PreToolUsePayload;
 use crate::tools::registry::ToolExecutionTiming;
 use crate::tools::registry::ToolExecutor;
 use crate::tools::registry::ToolTelemetryTags;
-use codex_mcp::LEGACY_MCP_TOOL_NAME_PREFIX;
 use codex_mcp::MCP_TOOL_NAME_DELIMITER;
 use codex_mcp::ToolInfo;
 use codex_protocol::mcp::CallToolResult;
@@ -244,9 +243,7 @@ impl McpHandler {
     }
 
     fn hook_tool_name(&self) -> HookToolName {
-        HookToolName::new(ensure_mcp_prefix(&join_tool_name(
-            &self.tool_info.canonical_tool_name(),
-        )))
+        HookToolName::mcp(&self.tool_info.server_name, &self.tool_info.tool.name)
     }
 
     pub(crate) fn external_mutation_intent(&self) -> ExternalMutationIntent {
@@ -254,25 +251,6 @@ impl McpHandler {
         ExternalMutationIntent::MayMutate
     }
 }
-fn join_tool_name(tool_name: &ToolName) -> String {
-    match tool_name.namespace.as_deref() {
-        Some(namespace) => {
-            let namespace = namespace.trim_end_matches('_');
-            let name = tool_name.name.trim_start_matches('_');
-            format!("{namespace}{MCP_TOOL_NAME_DELIMITER}{name}")
-        }
-        None => tool_name.name.clone(),
-    }
-}
-
-fn ensure_mcp_prefix(name: &str) -> String {
-    if name.starts_with(LEGACY_MCP_TOOL_NAME_PREFIX) {
-        name.to_string()
-    } else {
-        format!("{LEGACY_MCP_TOOL_NAME_PREFIX}{name}")
-    }
-}
-
 impl ToolExecutor<ToolInvocation> for McpHandler {
     fn tool_name(&self) -> ToolName {
         self.tool_name.clone()

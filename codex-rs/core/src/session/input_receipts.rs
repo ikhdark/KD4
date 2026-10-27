@@ -1,5 +1,6 @@
 //! Durable client submission identities and recovery of accepted, unrecorded input.
 use super::*;
+use codex_protocol::protocol::TurnStartedEvent;
 use codex_state::InputReceipt;
 use serde::Deserialize;
 use serde::Serialize;
@@ -71,11 +72,13 @@ impl InputReceiptStore {
         }
     }
 
-    pub(super) async fn cancel_start_input_receipts(&self, thread: ThreadId, turn_id: &str) -> anyhow::Result<()> {
+    pub(super) async fn cancel_turn_input_receipts(&self, thread: ThreadId, turn_id: &str) -> anyhow::Result<()> {
         match self {
-            Self::Durable(db) => db.cancel_start_input_receipts(thread, turn_id).await,
+            Self::Durable(db) => db.cancel_turn_input_receipts(thread, turn_id).await,
             Self::Volatile(receipts) => {
-                for (receipt, consumed) in receipts.lock().await.iter_mut().filter(|(receipt, _)| receipt.kind == "start" && receipt.turn_id == turn_id) { *consumed = true; receipt.payload = None; }
+                // Mirror durable revocation: accepted starts retain their
+                // source until the existing recovery/recording barrier.
+                for (receipt, consumed) in receipts.lock().await.iter_mut().filter(|(receipt, _)| receipt.turn_id == turn_id && (receipt.kind != "start" || receipt.payload.is_none())) { *consumed = true; receipt.payload = None; }
                 Ok(())
             }
         }
@@ -101,11 +104,11 @@ pub(super) fn fingerprint(value: &impl Serialize) -> std::io::Result<String> {
 }
 
 impl Session {
-    pub(crate) async fn cancel_start_receipts(&self, turn_id: &str) -> CodexResult<()> {
+    pub(crate) async fn cancel_turn_receipts(&self, turn_id: &str) -> CodexResult<()> {
         // Optional-state fallback remains usable for ordinary submissions. An
         // explicit durable identity could not have been admitted in this mode.
         if self.state_db().is_none() && self.live_thread().is_some() { return Ok(()); }
-        self.receipt_db()?.cancel_start_input_receipts(self.thread_id, turn_id).await.map_err(std::io::Error::other)?;
+        self.receipt_db()?.cancel_turn_input_receipts(self.thread_id, turn_id).await.map_err(std::io::Error::other)?;
         Ok(())
     }
     pub(super) fn receipt_db(&self) -> std::io::Result<InputReceiptStore> {
@@ -134,6 +137,7 @@ impl Session {
         let receipt = InputReceipt { kind: "start".into(), scope: String::new(), client_id: client_id.into(),
             fingerprint: fingerprint.into(), turn_id: turn_id.into(), payload: None };
         if self.receipt_db()?.reserve_input_receipt(self.thread_id, &receipt).await.map_err(std::io::Error::other)? {
+            tracing::debug!(target: "codex_input_custody", phase = "reserved", thread_id = %self.thread_id, turn_id, receipt_kind = "start", "input custody boundary");
             Ok(turn_id.into())
         } else {
             self.find_start_receipt(client_id, fingerprint).await?.ok_or_else(|| CodexErr::Fatal("input receipt disappeared".into()))
@@ -149,6 +153,7 @@ impl Session {
         }
         let payload = self.receipt_payload(&receipt, input, additional_context)?;
         db.accept_input_receipt(self.thread_id, "start", "", client_id, turn_id, &payload).await.map_err(std::io::Error::other)?;
+        tracing::debug!(target: "codex_input_custody", phase = "accepted", thread_id = %self.thread_id, turn_id, payload_bytes = payload.len(), "input custody boundary");
         self.input_queue.remember_input_receipt(&serde_json::from_str::<ReceiptInput>(&payload).map_err(std::io::Error::other)?.item_id_suffix);
         Ok(())
     }
@@ -177,12 +182,14 @@ impl Session {
         if let Some(live_thread) = self.live_thread() {
             live_thread.flush_durable().await.map_err(std::io::Error::other)?;
         }
+        tracing::debug!(target: "codex_input_custody", phase = "rollout_barrier", thread_id = %self.thread_id, turn_id = %receipt.turn_id, receipt_kind = %receipt.kind, "input custody boundary");
         self.receipt_db()?.consume_input_receipt(self.thread_id, receipt).await.map_err(std::io::Error::other)?;
+        tracing::debug!(target: "codex_input_custody", phase = "consumed", thread_id = %self.thread_id, turn_id = %receipt.turn_id, receipt_kind = %receipt.kind, "input custody boundary");
         self.input_queue.forget_input_receipt(suffix);
         Ok(())
     }
 
-    pub(super) async fn reconcile_input_receipts(&self, history: &[RolloutItem]) -> std::io::Result<()> {
+    pub(super) async fn reconcile_input_receipts(&self, history: &[RolloutItem], turn_context: &TurnContext) -> std::io::Result<()> {
         if self.state_db().is_none() && self.live_thread().is_some() { return Ok(()); }
         let db = self.receipt_db()?;
         let recorded = history.iter().filter_map(|item| match item {
@@ -191,9 +198,60 @@ impl Session {
         let aborted = history.iter().filter_map(|item| match item {
             RolloutItem::EventMsg(EventMsg::TurnAborted(event)) => event.turn_id.clone(), _ => None,
         }).collect::<HashSet<_>>();
+        let cancelled = history.iter().filter_map(|item| match item {
+            RolloutItem::EventMsg(EventMsg::TurnAborted(event))
+                if event.reason != TurnAbortReason::ProcessLost => event.turn_id.clone(),
+            _ => None,
+        }).collect::<HashSet<_>>();
         let mut recovered_input = Vec::new();
         for receipt in db.pending_input_receipts(self.thread_id).await.map_err(std::io::Error::other)? {
+            let payload = receipt.payload.as_deref().map(serde_json::from_str::<ReceiptInput>)
+                .transpose().map_err(std::io::Error::other)?;
             if receipt.kind == "start" {
+                if let Some(payload) = payload.as_ref() {
+                    let id = ResponseItemId::with_suffix(crate::event_mapping::USER_INPUT_ITEM_ID_BASE, &payload.item_id_suffix);
+                    if !recorded.contains(&id.to_string()) {
+                        // Preserve the accepted source without resampling it or
+                        // re-reading mutable local attachments. The existing
+                        // artifact owner retains the exact prompt/context and
+                        // the existing item lifecycle exposes its disposition.
+                        let recovery = self.retain_context_source("interrupted_input", serde_json::json!({
+                            "turn_id": receipt.turn_id, "client_id": receipt.client_id,
+                            "input": payload.input, "additional_context": payload.additional_context,
+                        })).await.map_err(std::io::Error::other)?;
+                        self.flush_tool_history_persistence().await.map_err(std::io::Error::other)?;
+                        tracing::debug!(target: "codex_input_custody", phase = "recovery_artifact_checkpoint", thread_id = %self.thread_id, turn_id = %receipt.turn_id, "input custody boundary");
+                        let notice = format!("Accepted submission for turn {} was interrupted before recording and has not been re-admitted or executed by recovery. Its exact prompt and context are retained at /items/input and /items/additional_context. Do not resume it without an explicit user request. Preserve each source's original authority. {recovery}", receipt.turn_id);
+                        let mut user_item = UserMessageItem::new(&payload.input);
+                        user_item.id = id.to_string();
+                        user_item.client_id = Some(receipt.client_id.clone());
+                        user_item.content.push(UserInput::Text { text: notice.clone(), text_elements: Vec::new() });
+                        let response = ResponseItem::Message {
+                            id: Some(id), role: "user".to_string(),
+                            content: vec![codex_protocol::models::ContentItem::InputText { text: notice }],
+                            phase: None, internal_chat_message_metadata_passthrough: None,
+                        };
+                        let mut records = Vec::new();
+                        if !history.iter().any(|item| matches!(item, RolloutItem::EventMsg(EventMsg::TurnStarted(event)) if event.turn_id == receipt.turn_id)) {
+                            records.push(RolloutItem::EventMsg(EventMsg::TurnStarted(TurnStartedEvent {
+                                turn_id: receipt.turn_id.clone(), trace_id: None, started_at: None,
+                                model_context_window: turn_context.model_context_window(),
+                                collaboration_mode_kind: turn_context.collaboration_mode.mode,
+                            })));
+                        }
+                        // Put the visible item before its deterministic response
+                        // marker: even a prefix-only crash cannot consume the
+                        // receipt before its visible recovery item is durable.
+                        records.push(RolloutItem::EventMsg(EventMsg::ItemCompleted(ItemCompletedEvent {
+                            thread_id: self.thread_id, turn_id: receipt.turn_id.clone(),
+                            item: TurnItem::UserMessage(user_item), completed_at_ms: now_unix_timestamp_ms(),
+                        })));
+                        records.push(RolloutItem::ResponseItem(response.clone()));
+                        self.persist_rollout_items_ordered(&records).await?;
+                        tracing::debug!(target: "codex_input_custody", phase = "recovery_append", thread_id = %self.thread_id, turn_id = %receipt.turn_id, item_count = records.len(), "input custody boundary");
+                        self.state.lock().await.record_items(std::slice::from_ref(&response), turn_context.model_info.truncation_policy.into());
+                    }
+                }
                 // Process loss cannot be interpreted as a request to launch the
                 // logical submission again. Close an unresolved reserved start
                 // under its original ID; callers can intentionally submit new
@@ -204,17 +262,17 @@ impl Session {
                     } else { None };
                     if terminal.is_none() {
                         self.persist_rollout_items_ordered(&[RolloutItem::EventMsg(EventMsg::TurnAborted(TurnAbortedEvent {
-                            turn_id: Some(receipt.turn_id.clone()), reason: TurnAbortReason::Interrupted,
+                            turn_id: Some(receipt.turn_id.clone()), reason: TurnAbortReason::ProcessLost,
                             completed_at: None, duration_ms: None, timing: None,
                         }))]).await?;
                     }
                 }
-                self.complete_input_receipt(&receipt, "").await?;
+                self.complete_input_receipt(&receipt, payload.as_ref().map_or("", |payload| payload.item_id_suffix.as_str())).await?;
                 continue;
             }
-            let payload: ReceiptInput = serde_json::from_str(receipt.payload.as_deref().unwrap_or_default()).map_err(std::io::Error::other)?;
+            let Some(payload) = payload else { continue; };
             let item_id = ResponseItemId::with_suffix(crate::event_mapping::USER_INPUT_ITEM_ID_BASE, &payload.item_id_suffix).to_string();
-            if recorded.contains(&item_id) {
+            if recorded.contains(&item_id) || cancelled.contains(&receipt.turn_id) {
                 self.complete_input_receipt(&receipt, &payload.item_id_suffix).await?;
             } else {
                 recovered_input.push((payload.item_id_suffix, vec![

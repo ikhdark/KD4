@@ -339,6 +339,10 @@ pub(super) async fn desktop_runtime_chain_check(
         }
     };
     push_desktop_runtime_receipt_details(&mut details, &receipt);
+    let desktop_path = processes
+        .iter()
+        .find(|process| process.pid == receipt.pid)
+        .and_then(|process| process.desktop_path.clone());
     let validation = tokio::task::spawn_blocking(move || {
         validate_desktop_runtime_receipt(
             &receipt,
@@ -347,26 +351,46 @@ pub(super) async fn desktop_runtime_chain_check(
             target_sha256.as_deref().map_err(String::as_str),
             std::process::id(),
             &expected_codex_home,
-        )
+        )?;
+        Ok(verify_desktop_gui_binding(
+            &receipt,
+            &target_path,
+            desktop_path.as_deref(),
+        ))
     })
     .await
     .map_err(|err| err.to_string())
     .and_then(|result| result);
-    if let Err(err) = validation {
-        details.push(format!("desktop runtime receipt status: {err}"));
-        return DoctorCheck::new(
-            "desktop.runtime_chain",
-            "desktop",
-            CheckStatus::Warning,
-            "Desktop runtime provenance does not match the selected local fork",
-        )
-        .details(details)
-        .remediation("Restart Codex Desktop with the selected local binary and CODEX_HOME.");
-    }
+    let gui_validation = match validation {
+        Ok(result) => result,
+        Err(err) => {
+            details.push(format!("desktop runtime receipt status: {err}"));
+            return DoctorCheck::new(
+                "desktop.runtime_chain",
+                "desktop",
+                CheckStatus::Warning,
+                "Desktop runtime provenance does not match the selected local fork",
+            )
+            .details(details)
+            .remediation("Restart Codex Desktop with the selected local binary and CODEX_HOME.");
+        }
+    };
     details.push(
         "app-server runtime receipt status: binary, build and CODEX_HOME matched".to_string(),
     );
-    details.push("Desktop GUI binding: unavailable; no checked GUI/backend process creation identities or verified connection peer are supplied by this receipt".to_string());
+    match gui_validation {
+        Ok(proof) => {
+            details.extend(proof);
+            return DoctorCheck::new(
+                "desktop.runtime_chain",
+                "desktop",
+                CheckStatus::Ok,
+                "Desktop GUI connection is verified",
+            )
+            .details(details);
+        }
+        Err(err) => details.push(format!("Desktop GUI binding: unavailable; {err}")),
+    }
 
     DoctorCheck::new(
         "desktop.runtime_chain",
@@ -376,6 +400,58 @@ pub(super) async fn desktop_runtime_chain_check(
     )
     .details(details)
     .remediation("Obtain a GUI-bound transport/peer receipt before claiming Desktop activation; a client name or another matching app-server is insufficient.")
+}
+
+fn verify_desktop_gui_binding(
+    receipt: &DesktopRuntimeReceipt,
+    target_path: &Path,
+    desktop_path: Option<&Path>,
+) -> Result<Vec<String>, String> {
+    if receipt.schema_version != 3
+        || receipt.process_rpc_transport.as_deref() != Some("stdio")
+        || receipt.connection_id != Some(0)
+    {
+        return Err("receipt has no connection-scoped Windows stdio identity".to_string());
+    }
+    let peer = receipt
+        .stdio_peer
+        .as_ref()
+        .ok_or_else(|| "receipt has no OS-reported stdio peer".to_string())?;
+    let desktop_path =
+        desktop_path.ok_or_else(|| "installed Desktop executable is unavailable".to_string())?;
+    #[cfg(windows)]
+    {
+        use codex_utils_build_info::windows_process::{StdioPeer, verify_stdio_peer};
+        verify_stdio_peer(
+            receipt.pid,
+            StdioPeer {
+                backend_creation_time: peer.backend_creation_time,
+                input_handle: peer.input_handle,
+                output_handle: peer.output_handle,
+                peer_pid: peer.peer_pid,
+                peer_creation_time: peer.peer_creation_time,
+            },
+            target_path,
+            desktop_path,
+        )
+        .map_err(|err| err.to_string())?;
+        Ok(vec![
+            "Desktop GUI proof version: 1".to_string(),
+            "Desktop GUI binding: verified live stdio peer".to_string(),
+            format!("Desktop GUI executable: {}", desktop_path.display()),
+            format!("Desktop GUI PID: {}", peer.peer_pid),
+            format!("Desktop GUI creation time: {}", peer.peer_creation_time),
+            format!(
+                "Desktop backend creation time: {}",
+                peer.backend_creation_time
+            ),
+        ])
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (peer, target_path, desktop_path);
+        Err("Windows stdio peer verification is unavailable on this platform".to_string())
+    }
 }
 
 /// Verifies that the search command selected by the install context is usable.
@@ -576,6 +652,8 @@ struct DesktopProcessEvidence {
     pid: u32,
     path: Option<PathBuf>,
     is_app_server: bool,
+    #[serde(default)]
+    desktop_path: Option<PathBuf>,
 }
 
 fn read_desktop_runtime_receipt(path: &Path) -> Result<DesktopRuntimeReceipt, String> {
@@ -591,7 +669,7 @@ fn validate_desktop_runtime_receipt(
     current_pid: u32,
     expected_codex_home: &Path,
 ) -> Result<(), String> {
-    if receipt.schema_version != 2 {
+    if !matches!(receipt.schema_version, 2 | 3) {
         return Err(format!(
             "unsupported schema version {}",
             receipt.schema_version
@@ -680,6 +758,15 @@ async fn desktop_process_probe(
             "-NoProfile",
             "-Command",
             r#"
+$desktopPath = $null
+$package = Get-AppxPackage -Name OpenAI.Codex -ErrorAction Stop | Sort-Object Version -Descending | Select-Object -First 1
+if ($null -ne $package) {
+    [xml]$manifest = Get-Content -LiteralPath (Join-Path $package.InstallLocation 'AppxManifest.xml') -Raw -ErrorAction Stop
+    $application = @($manifest.Package.Applications.Application) | Where-Object { $_.Id -eq 'App' } | Select-Object -First 1
+    if (-not [string]::IsNullOrWhiteSpace([string]$application.Executable)) {
+        $desktopPath = Join-Path $package.InstallLocation ([string]$application.Executable)
+    }
+}
 Get-CimInstance Win32_Process -Filter $env:CODEX_DOCTOR_PROCESS_FILTER -OperationTimeoutSec 2 -ErrorAction Stop |
     Where-Object { $_.ProcessId -ne [uint32]$env:CODEX_DOCTOR_CURRENT_PID } |
     ForEach-Object {
@@ -687,6 +774,7 @@ Get-CimInstance Win32_Process -Filter $env:CODEX_DOCTOR_PROCESS_FILTER -Operatio
             pid = [uint32]$_.ProcessId
             path = $_.ExecutablePath
             isAppServer = [bool]($_.CommandLine -match '(?i)(^|\s)app-server(?:\s|$)')
+            desktopPath = $desktopPath
         } | ConvertTo-Json -Compress
     }
 "#,
@@ -775,4 +863,3 @@ fn push_desktop_process_details(
         );
     }
 }
-

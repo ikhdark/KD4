@@ -2243,7 +2243,13 @@ impl ExecCommandToolOutput {
     ) -> Option<JsonValue> {
         let retained = artifact_bytes?;
         if self.raw_output_artifact.as_ref().is_some_and(RawOutputArtifact::is_plain_command_log) {
-            if retained == self.raw_output.len() as u64 {
+            // Equal lengths do not prove equal order after per-stream UTF-8
+            // aggregation. Whole-log line numbers require the collector's map.
+            if retained == self.raw_output.len() as u64
+                && self.output_ranges.as_ref().is_some_and(|ranges| {
+                    ranges.range == (0..retained) && ranges.gap.is_none()
+                })
+            {
                 if let Some((start, end)) = marked_lines.or_else(||
                     codex_utils_output_truncation::first_omitted_line_range(raw_output, output)) {
                     return Some(serde_json::json!({"kind":"lines","start":start,"end":end}));

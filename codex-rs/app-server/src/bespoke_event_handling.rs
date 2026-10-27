@@ -150,7 +150,7 @@ pub(crate) async fn apply_bespoke_event_handling(
     outgoing: ThreadScopedOutgoingMessageSender,
     thread_state: Arc<tokio::sync::Mutex<ThreadState>>,
     thread_watch_manager: ThreadWatchManager,
-    thread_list_state_permit: Arc<tokio::sync::Semaphore>,
+    thread_list_state_permit: Arc<crate::request_processors::ThreadListState>,
     fallback_model_provider: String,
 ) {
     let Event {

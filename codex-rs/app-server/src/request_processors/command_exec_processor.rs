@@ -110,7 +110,7 @@ async fn permission_profile_command_exec_config(
 
 #[derive(Clone)]
 pub(crate) struct CommandExecRequestProcessor {
-    config: Arc<Config>,
+    fallback_cwd: AbsolutePathBuf,
     outgoing: Arc<OutgoingMessageSender>,
     config_manager: ConfigManager,
     environment_manager: Arc<EnvironmentManager>,
@@ -125,7 +125,7 @@ impl CommandExecRequestProcessor {
         environment_manager: Arc<EnvironmentManager>,
     ) -> Self {
         Self {
-            config,
+            fallback_cwd: config.cwd.clone(),
             outgoing,
             config_manager,
             environment_manager,
@@ -252,9 +252,42 @@ impl CommandExecRequestProcessor {
             ));
         }
 
-        let cwd = cwd.map_or_else(|| self.config.cwd.clone(), |cwd| self.config.cwd.join(cwd));
+        let cwd = cwd.map_or_else(|| self.fallback_cwd.clone(), |cwd| self.fallback_cwd.join(cwd));
+        // Resolve every execution setting from one effective snapshot. In particular,
+        // sandbox setup and persisted permission changes must not leave one-off
+        // commands using the server's startup environment or Windows backend.
+        let config = if let Some(permission_profile) = permission_profile {
+            permission_profile_command_exec_config(
+                &self.config_manager,
+                &self.fallback_cwd,
+                &cwd,
+                permission_profile,
+            )
+            .await?
+        } else {
+            let config = self
+                .config_manager
+                .load_for_cwd(
+                    None,
+                    ConfigOverrides {
+                        cwd: Some(cwd.to_path_buf()),
+                        ..Default::default()
+                    },
+                    Some(self.fallback_cwd.to_path_buf()),
+                )
+                .await
+                .map_err(|err| {
+                    internal_error(format!("failed to load command configuration: {err}"))
+                })?;
+            if let Some(policy) = sandbox_policy.map(|policy| policy.to_core()) {
+                legacy_command_exec_config(&config, &cwd, policy)
+                    .map_err(|err| invalid_request(format!("invalid sandbox policy: {err}")))?
+            } else {
+                config
+            }
+        };
         let mut env = create_env(
-            &self.config.permissions.shell_environment_policy,
+            &config.permissions.shell_environment_policy,
             /*thread_id*/ None,
         );
         if let Some(env_overrides) = env_overrides {
@@ -287,7 +320,7 @@ impl CommandExecRequestProcessor {
             },
             None => None,
         };
-        let windows_sandbox_level = WindowsSandboxLevel::from_config(&self.config);
+        let windows_sandbox_level = WindowsSandboxLevel::from_config(&config);
         let output_bytes_cap = if disable_output_cap {
             None
         } else {
@@ -306,52 +339,27 @@ impl CommandExecRequestProcessor {
         } else {
             ExecCapturePolicy::ShellTool
         };
-        let sandbox_cwd = if permission_profile.is_some() || sandbox_policy.is_some() {
-            cwd.clone()
-        } else {
-            self.config.cwd.clone()
-        };
-        let (
-            effective_permission_profile,
-            windows_sandbox_workspace_roots,
-        ) = if let Some(permission_profile) = permission_profile {
-            let config = permission_profile_command_exec_config(
-                &self.config_manager,
-                &self.config.cwd,
-                &cwd,
-                permission_profile,
-            )
-            .await?;
-            (
-                config.permissions.effective_permission_profile(),
-                config.effective_workspace_roots(),
-            )
-        } else if let Some(policy) = sandbox_policy.map(|policy| policy.to_core()) {
-            let config = legacy_command_exec_config(&self.config, &sandbox_cwd, policy)
-                .map_err(|err| invalid_request(format!("invalid sandbox policy: {err}")))?;
-            (
-                config.permissions.effective_permission_profile(),
-                config.effective_workspace_roots(),
-            )
-        } else {
-            (
-                self.config.permissions.effective_permission_profile(),
-                self.config.effective_workspace_roots(),
-            )
-        };
+        let sandbox_cwd = config.cwd.clone();
+        let effective_permission_profile = config.permissions.effective_permission_profile();
+        let windows_sandbox_workspace_roots = config.effective_workspace_roots();
+        tracing::debug!(target: "codex_app_server::desktop_benchmark",
+            kdr_desktop_event = "command_config",
+            windows_sandbox_level = ?windows_sandbox_level,
+            private_desktop = config.permissions.windows_sandbox_private_desktop,
+            permissions_disabled = matches!(&effective_permission_profile,
+                codex_protocol::models::PermissionProfile::Disabled),
+            environment_keys = env.len(),
+            workspace_roots = windows_sandbox_workspace_roots.len());
         let exec_params = ExecParams {
             command,
-            codex_home: self.config.codex_home.clone(),
+            codex_home: config.codex_home.clone(),
             cwd: cwd.clone(),
             expiration,
             capture_policy,
             env,
             sandbox_permissions: SandboxPermissions::UseDefault,
             windows_sandbox_level,
-            windows_sandbox_private_desktop: self
-                .config
-                .permissions
-                .windows_sandbox_private_desktop,
+            windows_sandbox_private_desktop: config.permissions.windows_sandbox_private_desktop,
             justification: None,
             arg0: None,
         };

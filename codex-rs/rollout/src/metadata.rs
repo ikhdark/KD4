@@ -24,6 +24,7 @@ use codex_state::DB_METRIC_BACKFILL_DURATION_MS;
 use codex_state::ExtractionOutcome;
 use codex_state::ThreadMetadataBuilder;
 use codex_state::ThreadMetadataRolloutReducer;
+use codex_utils_absolute_path::normalize_for_native_workdir;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::collections::VecDeque;
@@ -127,8 +128,8 @@ pub(crate) async fn rollout_source_version(
 
 /// Pre-extraction authority snapshot for a rollout. The index lookup matches
 /// the stored path spelling exactly, while reconciliation compares locations
-/// as paths. A row indexed under another spelling of this same file (such as
-/// mixed separators) is its existing authority, not a concurrent insert.
+/// as paths. A row indexed under another safe spelling of this same file (such
+/// as a Windows verbatim prefix) is its existing authority, not a concurrent insert.
 pub(crate) async fn expected_thread_metadata_for_rollout(
     runtime: &codex_state::StateRuntime,
     rollout_path: &Path,
@@ -147,9 +148,13 @@ pub(crate) async fn expected_thread_metadata_for_rollout(
         return Ok(None);
     };
     let thread_id = ThreadId::from_string(&uuid.to_string())?;
+    let rollout_path = normalize_for_native_workdir(rollout_path);
     Ok(runtime.get_thread(thread_id).await?.filter(|metadata| {
-        metadata.rollout_path == rollout_path
-            || metadata.rollout_path == rollout_path.with_extension("jsonl.zst")
+        // Reuse the platform's safe namespace simplification only: do not fold
+        // case or treat a genuinely moved rollout as the observed authority.
+        let stored_path = normalize_for_native_workdir(&metadata.rollout_path);
+        stored_path == rollout_path
+            || stored_path == rollout_path.with_extension("jsonl.zst")
     }))
 }
 

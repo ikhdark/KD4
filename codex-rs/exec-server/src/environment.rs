@@ -58,6 +58,7 @@ pub struct EnvironmentManager {
     pub(super) environments: RwLock<IndexMap<String, Arc<Environment>>>,
     local_environment: Option<Arc<Environment>>,
     local_runtime_paths: Option<ExecServerRuntimePaths>,
+    http_client_factory: codex_http_client::HttpClientFactory,
 }
 
 pub const LOCAL_ENVIRONMENT_ID: &str = "local";
@@ -73,6 +74,7 @@ impl EnvironmentManager {
             environments: RwLock::new(IndexMap::new()),
             local_environment: None,
             local_runtime_paths: None,
+            http_client_factory: default_http_client_factory(),
         }
     }
 
@@ -87,8 +89,16 @@ impl EnvironmentManager {
         codex_home: impl AsRef<std::path::Path>,
         local_runtime_paths: Option<ExecServerRuntimePaths>,
     ) -> Result<Self, ExecServerError> {
-        if let Some(config) = noise_environment_config_from_env()? {
-            return Self::from_noise_environment_config(config, local_runtime_paths);
+        Self::from_codex_home_with_http_client_factory(codex_home, local_runtime_paths, default_http_client_factory()).await
+    }
+
+    pub async fn from_codex_home_with_http_client_factory(
+        codex_home: impl AsRef<std::path::Path>,
+        local_runtime_paths: Option<ExecServerRuntimePaths>,
+        http_client_factory: codex_http_client::HttpClientFactory,
+    ) -> Result<Self, ExecServerError> {
+        if let Some(config) = noise_environment_config_from_env(&http_client_factory)? {
+            return Self::from_noise_environment_config(config, local_runtime_paths, http_client_factory);
         }
         let codex_home = codex_home.as_ref().to_path_buf();
         let provider =
@@ -99,7 +109,7 @@ impl EnvironmentManager {
                         "environment config discovery task failed: {error}"
                     ))
                 })??;
-        Self::from_snapshot(provider.snapshot().await?, local_runtime_paths)
+        Self::from_snapshot(provider.snapshot().await?, local_runtime_paths, http_client_factory)
     }
 
     /// Builds a manager from the legacy environment-variable provider without
@@ -107,23 +117,32 @@ impl EnvironmentManager {
     pub async fn from_env(
         local_runtime_paths: Option<ExecServerRuntimePaths>,
     ) -> Result<Self, ExecServerError> {
-        if let Some(config) = noise_environment_config_from_env()? {
-            return Self::from_noise_environment_config(config, local_runtime_paths);
+        Self::from_env_with_http_client_factory(local_runtime_paths, default_http_client_factory()).await
+    }
+
+    pub async fn from_env_with_http_client_factory(
+        local_runtime_paths: Option<ExecServerRuntimePaths>,
+        http_client_factory: codex_http_client::HttpClientFactory,
+    ) -> Result<Self, ExecServerError> {
+        if let Some(config) = noise_environment_config_from_env(&http_client_factory)? {
+            return Self::from_noise_environment_config(config, local_runtime_paths, http_client_factory);
         }
         let provider = DefaultEnvironmentProvider::from_env();
-        Self::from_snapshot(provider.snapshot().await?, local_runtime_paths)
+        Self::from_snapshot(provider.snapshot().await?, local_runtime_paths, http_client_factory)
     }
 
 
     fn from_noise_environment_config(
         config: NoiseRendezvousEnvironmentConfig,
         local_runtime_paths: Option<ExecServerRuntimePaths>,
+        http_client_factory: codex_http_client::HttpClientFactory,
     ) -> Result<Self, ExecServerError> {
         let manager = Self {
             default_environment: Some(REMOTE_ENVIRONMENT_ID.to_string()),
             environments: RwLock::new(IndexMap::new()),
             local_environment: None,
             local_runtime_paths,
+            http_client_factory,
         };
         manager.upsert_noise_environment(
             REMOTE_ENVIRONMENT_ID.to_string(),
@@ -136,6 +155,7 @@ impl EnvironmentManager {
     fn from_snapshot(
         snapshot: EnvironmentProviderSnapshot,
         local_runtime_paths: Option<ExecServerRuntimePaths>,
+        http_client_factory: codex_http_client::HttpClientFactory,
     ) -> Result<Self, ExecServerError> {
         let EnvironmentProviderSnapshot {
             environments,
@@ -171,7 +191,7 @@ impl EnvironmentManager {
                 )));
             }
             if environment_map
-                .insert(id.clone(), Arc::new(environment))
+                .insert(id.clone(), Arc::new(environment.with_http_client_factory(http_client_factory.clone())))
                 .is_some()
             {
                 return Err(ExecServerError::Protocol(format!(
@@ -199,6 +219,7 @@ impl EnvironmentManager {
             environments: RwLock::new(environment_map),
             local_environment,
             local_runtime_paths,
+            http_client_factory,
         })
     }
 
@@ -290,7 +311,7 @@ impl EnvironmentManager {
                 connect_timeout.unwrap_or(DEFAULT_REMOTE_EXEC_SERVER_CONNECT_TIMEOUT),
             ),
             self.local_runtime_paths.clone(),
-        ));
+        ).with_http_client_factory(self.http_client_factory.clone()));
         environment.start_connecting();
         self.environments
             .write()
@@ -327,7 +348,7 @@ impl EnvironmentManager {
         let environment = Arc::new(Environment::remote_with_transport(
             ExecServerTransportParams::NoiseRendezvous { provider, identity },
             self.local_runtime_paths.clone(),
-        ));
+        ).with_http_client_factory(self.http_client_factory.clone()));
         environment.start_connecting();
         self.environments
             .write()
@@ -337,13 +358,18 @@ impl EnvironmentManager {
     }
 }
 
-fn noise_environment_config_from_env()
+fn default_http_client_factory() -> codex_http_client::HttpClientFactory {
+    codex_http_client::HttpClientFactory::new(codex_http_client::OutboundProxyPolicy::ReqwestDefault)
+}
+
+fn noise_environment_config_from_env(http_client_factory: &codex_http_client::HttpClientFactory)
 -> Result<Option<NoiseRendezvousEnvironmentConfig>, ExecServerError> {
     noise_environment_config_from_values(
         optional_environment_value(CODEX_EXEC_SERVER_NOISE_REGISTRY_URL_ENV_VAR),
         optional_environment_value(CODEX_EXEC_SERVER_NOISE_ENVIRONMENT_ID_ENV_VAR),
         optional_environment_value(CODEX_EXEC_SERVER_NOISE_AUTH_TOKEN_ENV_VAR),
         optional_environment_value(CODEX_EXEC_SERVER_NOISE_CHATGPT_ACCOUNT_ID_ENV_VAR),
+        http_client_factory,
     )
 }
 
@@ -352,6 +378,7 @@ fn noise_environment_config_from_values(
     environment_id: Option<String>,
     auth_token: Option<String>,
     chatgpt_account_id: Option<String>,
+    http_client_factory: &codex_http_client::HttpClientFactory,
 ) -> Result<Option<NoiseRendezvousEnvironmentConfig>, ExecServerError> {
     let (registry_url, environment_id, auth_token) =
         match (registry_url, environment_id, auth_token) {
@@ -373,6 +400,7 @@ fn noise_environment_config_from_values(
         environment_id,
         auth_token,
         chatgpt_account_id,
+        http_client_factory.clone(),
     )?;
     Ok(Some(config))
 }
@@ -422,6 +450,18 @@ pub struct EnvironmentRuntime {
 
 
 impl Environment {
+    // Called only while admitting a provider snapshot or a new environment, before startup.
+    fn with_http_client_factory(mut self, factory: codex_http_client::HttpClientFactory) -> Self {
+        if let Some(client) = self.remote_client.take() {
+            let client = client.with_http_client_factory(factory);
+            self.exec_backend = Arc::new(RemoteProcess::new(client.clone()));
+            self.filesystem = Arc::new(RemoteFileSystem::new(client.clone()));
+            self.http_client = Arc::new(client.clone());
+            self.remote_client = Some(client);
+        }
+        self
+    }
+
     fn runtime_for_client(client: crate::client::ExecServerClient) -> Option<EnvironmentRuntime> {
         Some(EnvironmentRuntime {
             session_id: client.session_id()?,

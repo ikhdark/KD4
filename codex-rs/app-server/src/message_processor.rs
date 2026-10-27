@@ -82,7 +82,6 @@ use codex_state::log_db::LogDbLayer;
 use futures::FutureExt;
 use serde::Serialize;
 use std::panic::AssertUnwindSafe;
-use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
 
@@ -366,7 +365,7 @@ impl MessageProcessor {
             );
         let thread_watch_manager =
             crate::thread_status::ThreadWatchManager::new_with_outgoing(outgoing.clone());
-        let thread_list_state_permit = Arc::new(Semaphore::new(/*permits*/ 1));
+        let thread_list_state_permit = Arc::new(crate::request_processors::ThreadListState::default());
         let workspace_settings_cache =
             Arc::new(workspace_settings::WorkspaceSettingsCache::default());
         let app_list_shutdown_token = CancellationToken::new();

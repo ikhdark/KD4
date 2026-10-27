@@ -22,6 +22,7 @@ use crate::transport::remote_control::websocket::RemoteControlStatusPublisher;
 use crate::transport::remote_control::websocket::RemoteControlWebsocket;
 
 pub use self::protocol::ClientId;
+pub use self::segment::remote_control_response_size_error;
 use self::protocol::RemoteControlPairingStatusCode;
 use self::protocol::ServerEvent;
 use self::protocol::StreamId;
@@ -112,6 +113,7 @@ pub(super) struct QueuedServerEnvelope {
     pub(super) client_id: ClientId,
     pub(super) stream_id: StreamId,
     pub(super) write_complete_tx: Option<oneshot::Sender<std::time::Instant>>,
+    pub(super) delivery_failure: Option<CancellationToken>,
 }
 
 #[derive(Clone)]
@@ -1173,38 +1175,34 @@ async fn enroll_pairing_server(
     let client = http_clients
         .client_for_url(&remote_control_target.enroll_url)
         .await?;
-    match enroll_remote_control_server_with_client(
-        &client,
-        http_clients.request_state(),
-        remote_control_target,
-        auth,
-        installation_id,
-        server_name,
-    )
-    .await
-    {
-        Ok(enrollment) => return Ok(enrollment),
-        Err(err) if err.kind() == io::ErrorKind::PermissionDenied => {
-            let mut auth_recovery = auth_manager.unauthorized_recovery();
-            let mut auth_change_rx = auth_manager.auth_change_receiver();
-            if !recover_remote_control_auth(&mut auth_recovery, &mut auth_change_rx, auth).await {
-                return Err(err);
+    let mut auth_recovery = auth_manager.unauthorized_recovery();
+    let mut auth_change_rx = auth_manager.auth_change_receiver();
+    for attempt in 0..auth::REMOTE_CONTROL_AUTH_ATTEMPTS {
+        match enroll_remote_control_server_with_client(
+            &client,
+            http_clients.request_state(),
+            remote_control_target,
+            auth,
+            installation_id,
+            server_name,
+        )
+        .await
+        {
+            Ok(enrollment) => return Ok(enrollment),
+            Err(err) if err.kind() == io::ErrorKind::PermissionDenied => {
+                if attempt + 1 == auth::REMOTE_CONTROL_AUTH_ATTEMPTS
+                    || !recover_remote_control_auth(&mut auth_recovery, &mut auth_change_rx, auth).await
+                {
+                    return Err(err);
+                }
+                *auth = load_remote_control_auth(auth_manager)
+                    .await
+                    .map_err(|_| pairing_unavailable_error())?;
             }
-            *auth = load_remote_control_auth(auth_manager)
-                .await
-                .map_err(|_| pairing_unavailable_error())?;
+            Err(err) => return Err(err),
         }
-        Err(err) => return Err(err),
     }
-    enroll_remote_control_server_with_client(
-        &client,
-        http_clients.request_state(),
-        remote_control_target,
-        auth,
-        installation_id,
-        server_name,
-    )
-    .await
+    unreachable!("bounded auth attempts always return the last result")
 }
 
 fn remote_control_pairing_status_code(
@@ -1247,12 +1245,15 @@ async fn refresh_pairing_enrollment(
         enrollment,
     )
     .await;
-    if refresh_result
-        .as_ref()
-        .is_err_and(|err| err.kind() == io::ErrorKind::PermissionDenied)
-    {
-        let mut auth_recovery = auth_manager.unauthorized_recovery();
-        let mut auth_change_rx = auth_manager.auth_change_receiver();
+    let mut auth_recovery = auth_manager.unauthorized_recovery();
+    let mut auth_change_rx = auth_manager.auth_change_receiver();
+    for _ in 1..auth::REMOTE_CONTROL_AUTH_ATTEMPTS {
+        if !refresh_result
+            .as_ref()
+            .is_err_and(|err| err.kind() == io::ErrorKind::PermissionDenied)
+        {
+            break;
+        }
         if recover_remote_control_auth(&mut auth_recovery, &mut auth_change_rx, auth).await {
             match load_remote_control_auth(auth_manager).await {
                 Ok(recovered_auth) if recovered_auth.account_id == enrollment.account_id => {
@@ -1269,10 +1270,12 @@ async fn refresh_pairing_enrollment(
                 Ok(_) | Err(_) => {
                     enrollment.clear_server_token();
                     refresh_result = Err(pairing_unavailable_error());
+                    break;
                 }
             }
         } else {
             enrollment.clear_server_token();
+            break;
         }
     }
     if refresh_result

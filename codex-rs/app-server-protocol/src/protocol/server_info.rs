@@ -25,6 +25,9 @@ pub struct DesktopRuntimeReceipt {
     pub connection_id: Option<u64>,
     #[serde(default)]
     pub enabled_features: Vec<String>,
+    /// Windows stdio snapshot; consumers must recheck the live pipe endpoints.
+    #[serde(default)]
+    pub stdio_peer: Option<DesktopStdioPeer>,
     pub build_version: String,
     pub build_commit: String,
     pub build_dirty: String,
@@ -38,6 +41,16 @@ pub struct DesktopRuntimeReceipt {
     pub expected_codex_home: Option<PathBuf>,
     #[serde(default)]
     pub codex_home_match: Option<bool>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct DesktopStdioPeer {
+    pub backend_creation_time: u64,
+    pub input_handle: u64,
+    pub output_handle: u64,
+    pub peer_pid: u32,
+    pub peer_creation_time: u64,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]

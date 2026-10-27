@@ -9,7 +9,7 @@
 use crate::desktop::LaunchDesktop;
 use crate::proc_thread_attr::ProcThreadAttributeList;
 use crate::winutil::format_last_error;
-use crate::winutil::quote_windows_arg;
+use crate::winutil::argv_to_command_line;
 use crate::winutil::to_wide;
 use anyhow::Context;
 use anyhow::Result;
@@ -103,11 +103,7 @@ pub unsafe fn spawn_conpty_process_as_user(
     use_private_desktop: bool,
     logs_base_dir: Option<&Path>,
 ) -> Result<(PROCESS_INFORMATION, ConptyInstance)> {
-    let cmdline_str = argv
-        .iter()
-        .map(|arg| quote_windows_arg(arg))
-        .collect::<Vec<_>>()
-        .join(" ");
+    let cmdline_str = argv_to_command_line(argv);
     let mut cmdline: Vec<u16> = to_wide(&cmdline_str);
     let env_block = make_env_block(env_map)?;
     // SAFETY: STARTUPINFOEXW contains integer and pointer fields with a valid all-zero initial
@@ -121,6 +117,8 @@ pub unsafe fn spawn_conpty_process_as_user(
     let desktop = LaunchDesktop::prepare(use_private_desktop, logs_base_dir)?;
     si.StartupInfo.lpDesktop = desktop.startup_info_desktop();
     let job = Arc::new(JobObject::create().context("create process job")?);
+    job.require_descendant_containment()
+        .context("require sandbox descendant containment")?;
 
     let raw = RawConPty::new(/*cols*/ 80, /*rows*/ 24)?;
     let (pseudoconsole, input_write, output_read) = raw.into_handles();
@@ -171,5 +169,13 @@ pub unsafe fn spawn_conpty_process_as_user(
         );
         return Err(std::io::Error::from_raw_os_error(err)).context(message);
     }
+    crate::logging::custody_diagnostic(|| {
+        let mut member = 0;
+        let queried = unsafe { windows_sys::Win32::System::JobObjects::IsProcessInJob(
+            pi.hProcess, job.as_raw_handle() as HANDLE, &mut member,
+        ) };
+        format!("event=spawn route=conpty pid={} job={} membership_query={} member={}",
+            pi.dwProcessId, job.as_raw_handle() as usize, queried, member)
+    }, logs_base_dir);
     Ok((pi, conpty))
 }

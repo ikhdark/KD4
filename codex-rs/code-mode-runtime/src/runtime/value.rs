@@ -76,6 +76,19 @@ pub(super) fn serialize_output_text_with_limit(
     value: v8::Local<'_, v8::Value>,
     max_bytes: usize,
 ) -> Result<String, String> {
+    let observation = super::display_metrics::Observation::start(scope, "text", max_bytes);
+    let result = serialize_output_text_with_limit_inner(scope, value, max_bytes);
+    if let Some(observation) = observation {
+        observation.finish(scope, &result);
+    }
+    result
+}
+
+fn serialize_output_text_with_limit_inner(
+    scope: &mut v8::PinScope<'_, '_>,
+    value: v8::Local<'_, v8::Value>,
+    max_bytes: usize,
+) -> Result<String, String> {
     if scope.is_execution_terminating() {
         return Err(EXECUTION_TERMINATED_MESSAGE.to_string());
     }
@@ -94,7 +107,7 @@ pub(super) fn serialize_output_text_with_limit(
 
     let tc = std::pin::pin!(v8::TryCatch::new(scope));
     let mut tc = tc.init();
-    if let Some(stringified) = super::output_projection::stringify(&mut tc, value) {
+    if let Some(stringified) = super::output_projection::stringify_with_limit(&mut tc, value, max_bytes)? {
         return bounded_string(&mut tc, stringified, max_bytes);
     }
     if tc.is_execution_terminating() {
@@ -113,6 +126,19 @@ pub(super) fn serialize_output_text_with_limit(
 }
 
 pub(super) fn serialize_console_text(
+    scope: &mut v8::PinScope<'_, '_>,
+    value: v8::Local<'_, v8::Value>,
+    max_bytes: usize,
+) -> Result<String, String> {
+    let observation = super::display_metrics::Observation::start(scope, "console", max_bytes);
+    let result = serialize_console_text_inner(scope, value, max_bytes);
+    if let Some(observation) = observation {
+        observation.finish(scope, &result);
+    }
+    result
+}
+
+fn serialize_console_text_inner(
     scope: &mut v8::PinScope<'_, '_>,
     value: v8::Local<'_, v8::Value>,
     max_bytes: usize,
@@ -160,7 +186,7 @@ pub(super) fn serialize_console_text(
     }
     tc.reset();
     if value.is_object() {
-        if let Some(stringified) = super::output_projection::stringify(&mut tc, value) {
+        if let Some(stringified) = super::output_projection::stringify_with_limit(&mut tc, value, max_bytes)? {
             return bounded_string(&mut tc, stringified, max_bytes);
         }
         if tc.is_execution_terminating() {

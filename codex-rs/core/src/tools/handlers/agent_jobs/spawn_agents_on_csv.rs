@@ -121,68 +121,49 @@ async fn handle_owned(
     let db = required_state_db(&session)?;
     let input_path = cwd.join(args.csv_path);
     let input_path_display = input_path.display().to_string();
-    let csv_content = tokio::fs::read_to_string(&input_path)
-        .await
-        .map_err(|err| {
-            FunctionCallError::RespondToModel(format!(
-                "failed to read csv input {input_path_display}: {err}"
-            ))
-        })?;
-    let (headers, rows) = parse_csv(csv_content.as_str()).map_err(|err| {
-        FunctionCallError::RespondToModel(format!("failed to parse csv input: {err}"))
-    })?;
-    if headers.is_empty() {
-        return Err(FunctionCallError::RespondToModel(
-            "csv input must include a header row".to_string(),
-        ));
-    }
-    ensure_unique_headers(headers.as_slice())?;
-
-    let id_column_index = args.id_column.as_ref().map_or(Ok(None), |column_name| {
-        headers
-            .iter()
-            .position(|header| header == column_name)
-            .map(Some)
-            .ok_or_else(|| {
-                FunctionCallError::RespondToModel(format!(
-                    "id_column {column_name} was not found in csv headers"
-                ))
-            })
-    })?;
-
-    let mut items = Vec::with_capacity(rows.len());
-    let mut item_ids = JobItemIds::default();
-    for (idx, row) in rows.into_iter().enumerate() {
-        if row.len() != headers.len() {
-            let row_index = idx + 2;
-            let row_len = row.len();
-            let header_len = headers.len();
-            return Err(FunctionCallError::RespondToModel(format!(
-                "csv row {row_index} has {row_len} fields but header has {header_len}"
-            )));
+    let parse_path = input_path.clone();
+    let parse_cancellation = cancellation_token.clone();
+    let id_column = args.id_column.clone();
+    // The tracked owner awaits this bounded cooperative parser even after its
+    // observer cancels. No unbounded string/rows copy or detached parse survives.
+    let (headers, items) = tokio::task::spawn_blocking(move || {
+        if parse_cancellation.is_cancelled() {
+            return Err(FunctionCallError::RespondToModel(
+                "agent job cancelled during CSV setup".to_string(),
+            ));
         }
-
-        let source_id = id_column_index
-            .and_then(|index| row.get(index).cloned())
-            .filter(|value| !value.trim().is_empty());
-        let row_index = idx + 1;
-        let base_item_id = source_id
-            .clone()
-            .unwrap_or_else(|| format!("row-{row_index}"));
-        let item_id = item_ids.allocate(base_item_id)?;
-
-        let row_object = headers
-            .iter()
-            .zip(row.iter())
-            .map(|(header, value)| (header.clone(), Value::String(value.clone())))
-            .collect::<serde_json::Map<_, _>>();
-        items.push(codex_state::AgentJobItemCreateParams {
-            item_id,
-            row_index: idx as i64,
-            source_id,
-            row_json: Value::Object(row_object),
-        });
-    }
+        let read_error = |error| FunctionCallError::RespondToModel(format!(
+            "failed to read csv input {input_path_display}: {error}"
+        ));
+        let validate_file = |metadata: &std::fs::Metadata| {
+            if !metadata.is_file() {
+                return Err(FunctionCallError::RespondToModel(
+                    "csv input must be a regular file".to_string(),
+                ));
+            }
+            if metadata.len() > MAX_AGENT_JOB_CSV_BYTES {
+                return Err(FunctionCallError::RespondToModel(format!(
+                    "csv input exceeds {MAX_AGENT_JOB_CSV_BYTES} bytes; split the input into smaller jobs"
+                )));
+            }
+            Ok(())
+        };
+        validate_file(&std::fs::metadata(&parse_path).map_err(read_error)?)?;
+        let file = std::fs::File::open(&parse_path).map_err(read_error)?;
+        validate_file(&file.metadata().map_err(read_error)?)?;
+        let observed = tracing::enabled!(target: "codex_csv_admission", tracing::Level::DEBUG)
+            .then(std::time::Instant::now);
+        tracing::debug!(target: "codex_csv_admission", phase = "parse_begin");
+        let result = parse_csv(file, id_column.as_deref(), &parse_cancellation);
+        if let Some(started) = observed {
+            tracing::debug!(target: "codex_csv_admission", phase = "parse_end",
+                elapsed_us = started.elapsed().as_micros() as u64,
+                completed = result.is_ok(), cancelled = parse_cancellation.is_cancelled());
+        }
+        result
+    })
+    .await
+    .map_err(|error| FunctionCallError::Fatal(format!("CSV setup owner failed: {error}")))??;
 
     let job_id = Uuid::new_v4().to_string();
     let mut cleanup = AgentJobCleanupOwner {
@@ -203,7 +184,7 @@ async fn handle_owned(
             .or(turn.config.agent_job_max_runtime_seconds),
     )?;
     let _job = db
-        .create_agent_job(
+        .create_agent_job_with_cancellation(
             &codex_state::AgentJobCreateParams {
                 id: job_id.clone(),
                 name: job_name,
@@ -216,16 +197,21 @@ async fn handle_owned(
                 output_csv_path: output_csv_path.display().to_string(),
             },
             items.as_slice(),
+            || cancellation_token.is_cancelled(),
         )
         .await
         .map_err(|err| {
             FunctionCallError::RespondToModel(format!("failed to create agent job: {err}"))
         })?;
+    // The parser's file/record/ID tracker already ended; release the last import
+    // materialization before any worker setup, execution or final export awaits.
+    drop(items);
 
     let requested_concurrency = args.max_concurrency.or(args.max_workers);
     let options_result = tokio::select! {
-        options = build_runner_options(&session, &step, requested_concurrency) => options,
+        biased;
         _ = cancellation_token.cancelled() => Err(FunctionCallError::RespondToModel("agent job cancelled during setup".to_string())),
+        options = build_runner_options(&session, &step, requested_concurrency) => options,
     };
     let options = match options_result {
         Ok(options) => Some(options),

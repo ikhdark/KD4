@@ -394,7 +394,9 @@ async fn finish_stopped_session_start(
     turn_context: &TurnContext,
     input: Vec<TurnInput>,
 ) -> TurnTaskResult {
-    let defer_pending_input = !input.is_empty();
+    // Retained input is not permission to bypass a supported startup-hook stop.
+    // Only a new explicit submission may release this session-level fence.
+    sess.session_start_suspended.store(true, Ordering::Release);
     let owned = if let Some(state) = sess
         .input_queue
         .turn_state_for_sub_id(&sess.active_turn, &turn_context.sub_id)
@@ -411,8 +413,12 @@ async fn finish_stopped_session_start(
             .restore_transferred_startup_input(input)
             .await;
     }
+    sess.send_event(turn_context, EventMsg::Error(codex_protocol::protocol::ErrorEvent {
+        message: "SessionStart hook suspended this turn. Accepted input is retained; a new explicit submission is required to resume it.".to_string(),
+        codex_error_info: Some(codex_protocol::protocol::CodexErrorInfo::Other),
+    })).await;
     TurnTaskResult {
-        defer_pending_input,
+        defer_pending_input: true,
         ..TurnTaskResult::default()
     }
 }
@@ -466,6 +472,7 @@ pub(crate) fn run_turn(
         });
         let mut finalized_mutation_revision = None;
         let mut seen_stop_repairs = Vec::new();
+        let mut stop_hook_bookkeeping_revisions = 0_u64;
         let mut completion_evidence = None;
         let mut provider_overflow_recovery_attempted = false;
         // How the overflow arm last relieved the context, until a request
@@ -542,6 +549,7 @@ pub(crate) fn run_turn(
             .begin_local_phase(TurnLocalPhase::Planning);
         let mut planning_iterations = 0;
         let mut completed_mcp_effect = None;
+        let mut completed_model_transition = None;
         let pending_turn_plan_result = loop {
             let mut pending_turn_plan = match Box::pin(stabilize_pending_turn_plan(
                 &sess,
@@ -550,6 +558,7 @@ pub(crate) fn run_turn(
                 &mut client_session,
                 &mut planning_iterations,
                 &mut completed_mcp_effect,
+                &mut completed_model_transition,
                 &cancellation_token,
             ))
             .await
@@ -575,6 +584,16 @@ pub(crate) fn run_turn(
                 Err(error) => break Err(CodexErr::from(error)),
             };
             let Some(world_state) = world_state else {
+                tracing::debug!(
+                    turn_id = %turn_context.sub_id,
+                    thread_id = %sess.thread_id,
+                    maintenance_event = "publication_invalidated",
+                    expected_generation = pending_turn_plan.planning_generation,
+                    current_generation = sess.services.planning_generation(),
+                    completed_model_transition = completed_model_transition.is_some(),
+                    planning_iterations,
+                    "pending-turn maintenance observation"
+                );
                 turn_context
                     .turn_timing_state
                     .record_planning_invalidation();
@@ -623,7 +642,13 @@ pub(crate) fn run_turn(
 
         let mut last_agent_message: Option<String> = None;
         let mut surfaced_result: Option<SurfacedToolResult> = None;
-        let mut output_state = TurnOutputState::default();
+        let mut output_state = TurnOutputState {
+            no_prose_authorized: turn_context
+                .extension_data
+                .get::<NoProseAuthorization>()
+                .is_some(),
+            ..Default::default()
+        };
         let mut accepted_final_message = None;
         let mut completion_assessment: Option<codex_protocol::protocol::TurnCompletionAssessment>;
         let mut stop_hook_active = false;
@@ -731,6 +756,7 @@ pub(crate) fn run_turn(
                 pending_workspace_prefetch = None;
                 prefetched_workspace_identity = None;
                 seen_stop_repairs.clear();
+                stop_hook_bookkeeping_revisions = 0;
                 completion_evidence = None;
                 provider_overflow_recovery_attempted = false;
                 turn_execution.accepted_context_input(recorded_input.instructions_changed);
@@ -1643,8 +1669,29 @@ pub(crate) fn run_turn(
                             completion_stop_report.continuation_prompt
                         {
                             let mut repair_state = settled_state.clone();
-                            repair_state.mutation_revision =
+                            let current_revision =
                                 turn_diff_tracker.lock().await.current_mutation_revision();
+                            if completion_stop_report
+                                .mutation_receipt
+                                .as_ref()
+                                .is_some_and(|receipt| {
+                                    receipt.covers_only_hook_effect(
+                                        settled_state.mutation_revision,
+                                        current_revision,
+                                    )
+                                })
+                            {
+                                stop_hook_bookkeeping_revisions =
+                                    stop_hook_bookkeeping_revisions.saturating_add(1);
+                            }
+                            // A possible hook effect remains an unknown mutation for
+                            // validation. Its own accounting is not independent repair
+                            // progress, and cannot keep identical blocked answers alive.
+                            // Other mutations, new input, evidence and verdicts still
+                            // distinguish repairs. Repetition fails closed, never proves
+                            // the hook or its descendants harmless.
+                            repair_state.mutation_revision = current_revision
+                                .saturating_sub(stop_hook_bookkeeping_revisions);
                             let repair = (
                                 completion_stop_report
                                     .continuation_feedback
@@ -1974,6 +2021,11 @@ fn validation_mode_base_instructions(turn: &TurnContext) -> Arc<BaseInstructions
     instructions.text.push_str(&format!(
         "\n\n<validation_mode>\n{directive}\nFollow the base instructions for validation authorization, retry, evidence, and completion rules.\nThere is no validation attempt cap. When compilation is authorized, repair recompiles require changed relevant inputs. Explicit user restrictions still apply. Consume already-running work through its owner without launching duplicates.\n</validation_mode>",
     ));
+    if turn.final_output_json_schema.is_none()
+        && turn.extension_data.get::<NoProseAuthorization>().is_some()
+    {
+        instructions.text.push_str("\n\n<answer_delivery>\nThe original turn/start request explicitly permits completion without prose. After completing all required work, you may declare that disposition with an exactly empty completed final_answer message, not an absent final item, commentary, or an interrupted response. This permission does not waive completion hooks or a truthful blocker. Later accepted input revokes this permission.\n</answer_delivery>");
+    }
     Arc::new(instructions)
 }
 
@@ -2325,14 +2377,18 @@ fn rewrites_original_lines(before: &str, after: Option<&str>) -> bool {
     let Some(after) = after else {
         return true;
     };
-    let mut config = similar::TextDiff::configure();
-    config.timeout(std::time::Duration::from_millis(100));
-    config.diff_lines(before, after).ops().iter().any(|op| {
-        matches!(
-            op.tag(),
-            similar::DiffTag::Delete | similar::DiffTag::Replace
-        )
-    })
+    use similar::DiffableStr;
+
+    // Only ask whether all original line tokens survive in order. Building a
+    // general edit script adds a fresh timeout for every unsupported file.
+    // Keep similar's tokenizer: CRLF, lone CR and final-newline differences
+    // are significant, and repeated lines must retain their multiplicity.
+    let after_lines = after.tokenize_lines();
+    let mut remaining = after_lines.into_iter();
+    before
+        .tokenize_lines()
+        .into_iter()
+        .any(|line| !remaining.by_ref().any(|candidate| candidate == line))
 }
 
 /// An edited or removed existing test can change what the suite asserts, and
@@ -2752,7 +2808,7 @@ async fn run_completion_stop_hook<
     }
     CompletionStopHookReport {
         assessment,
-        mutation_receipt: mutation_receipt.filter(|_| !stop.should_block && !stop.should_stop),
+        mutation_receipt,
         should_block: stop.should_block,
         continuation_prompt,
         continuation_feedback: stop
@@ -2955,7 +3011,15 @@ async fn inspect_inputs(
     let mut blocked_input = false;
     let mut accepted_context_input = false;
     let mut renews_budget = false;
-    for input_item in input {
+    for (index, input_item) in input.iter().enumerate() {
+        // Admission pairs each supplied snapshot with the following prompt.
+        // Inspect them as one submission: a rejected prompt cannot leave its
+        // automatic (even empty/unchanged) context carrier as accepted work.
+        if matches!(input_item, TurnInput::AdditionalContext { .. })
+            && matches!(input.get(index + 1), Some(TurnInput::UserInput { .. }))
+        {
+            continue;
+        }
         let hook_outcome = inspect_pending_input(sess, turn_context, input_item).await;
         if hook_outcome.should_stop {
             blocked_input = true;
@@ -2967,10 +3031,19 @@ async fn inspect_inputs(
             )
             .await;
         } else {
-            if resets_turn_execution(input_item) {
+            if matches!(input_item, TurnInput::UserInput { .. })
+                && let Some(context @ TurnInput::AdditionalContext { .. }) = index.checked_sub(1).and_then(|index| input.get(index))
+            {
+                items.push(context.clone());
+            }
+            let effective_input = match input_item {
+                TurnInput::AdditionalContext { values, .. } => !sess.state.lock().await.additional_context.is_current(values),
+                _ => resets_turn_execution(input_item),
+            };
+            if effective_input {
                 accepted_context_input = true;
             }
-            renews_budget |= renews_generation_budget(input_item);
+            renews_budget |= effective_input && renews_generation_budget(input_item);
             items.push(input_item.clone());
         }
         items.extend(
@@ -3001,6 +3074,7 @@ struct PendingTurnPlan {
     injection_items: Vec<ResponseItem>,
     explicitly_enabled_connectors: HashSet<String>,
     projected_prompt_pressure: ProjectedPromptPressure,
+    pending_body_floor_tokens: i64,
     mcp_dependency_effect: Option<PlannedMcpDependencyEffect>,
     warnings: Vec<String>,
     skill_plan: PlannedSkillInjections,
@@ -3457,6 +3531,7 @@ async fn build_pure_pending_turn_plan(
         prepared_context_update: Some(prepared_context_update),
         first_router,
         projected_prompt_pressure,
+        pending_body_floor_tokens: pending_token_estimate.input_tokens,
         injection_items,
         explicitly_enabled_connectors,
         mcp_dependency_effect: planned_mcp.effect,
@@ -3475,6 +3550,7 @@ fn stabilize_pending_turn_plan<'a>(
     client_session: &'a mut ModelClientSession,
     planning_iterations: &'a mut usize,
     completed_mcp_effect: &'a mut Option<(String, Option<HashSet<String>>)>,
+    completed_model_transition: &'a mut Option<(PreviousTurnSettings, PreviousTurnSettings)>,
     cancellation_token: &'a CancellationToken,
 ) -> impl std::future::Future<Output = CodexResult<PendingTurnPlan>> + 'a {
     Box::pin(async move {
@@ -3498,6 +3574,7 @@ fn stabilize_pending_turn_plan<'a>(
                     turn_context,
                     client_session,
                     check_previous_model_compaction,
+                    completed_model_transition,
                     cancellation_token,
                 )
             })
@@ -3563,6 +3640,7 @@ fn stabilize_pending_turn_plan<'a>(
                     client_session,
                     Arc::clone(&plan.step_context),
                     plan.projected_prompt_pressure,
+                    plan.pending_body_floor_tokens,
                     !incoming_precompaction_completed,
                     cancellation_token,
                 )
@@ -3629,6 +3707,14 @@ fn stabilize_pending_turn_plan<'a>(
                     .record_planning_invalidation();
                 continue;
             }
+            tracing::debug!(
+                turn_id = %turn_context.sub_id,
+                thread_id = %sess.thread_id,
+                maintenance_event = "plan_ready",
+                planning_generation = plan.planning_generation,
+                completed_model_transition = completed_model_transition.is_some(),
+                "pending-turn maintenance observation"
+            );
             return Ok(plan);
         }
     })
@@ -3758,6 +3844,8 @@ fn planning_failure_with_timing(
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct PendingTokenEstimate {
     total_tokens: i64,
+    /// Incoming items are not part of the committed history a compactor can reduce.
+    input_tokens: i64,
     body_growth_tokens: i64,
     has_real_user_boundary: bool,
 }
@@ -3863,6 +3951,7 @@ fn estimate_pending_tokens(
     )
     .unwrap_or(i64::MAX);
     PendingTokenEstimate {
+        input_tokens,
         total_tokens: input_tokens
             .saturating_add(injection_tokens)
             .saturating_add(context_update_tokens)
@@ -4234,6 +4323,7 @@ async fn run_history_pre_sampling_compact(
     turn_context: &Arc<TurnContext>,
     client_session: &mut ModelClientSession,
     check_previous_model: bool,
+    completed_model_transition: &mut Option<(PreviousTurnSettings, PreviousTurnSettings)>,
     cancellation_token: &CancellationToken,
 ) -> CodexResult<Option<PreSamplingCompactionReason>> {
     if check_previous_model
@@ -4241,6 +4331,7 @@ async fn run_history_pre_sampling_compact(
             sess,
             turn_context,
             client_session,
+            completed_model_transition,
             cancellation_token,
         )
         .await?
@@ -4257,6 +4348,7 @@ async fn run_pending_input_pre_sampling_compact(
     client_session: &mut ModelClientSession,
     step_context: Arc<StepContext>,
     projected_prompt_pressure: ProjectedPromptPressure,
+    pending_body_floor_tokens: i64,
     allow_pending_input_compaction: bool,
     cancellation_token: &CancellationToken,
 ) -> CodexResult<Option<PreSamplingCompactionReason>> {
@@ -4273,6 +4365,44 @@ async fn run_pending_input_pre_sampling_compact(
     if !token_status.token_limit_reached {
         return Ok(None);
     }
+    // This total floor contains only incoming items. For BodyAfterPrefix,
+    // retirement may reduce active history below the existing prefill baseline
+    // without resetting that baseline. Preserve that possible credit rather
+    // than claiming the raw input is an unconditional scoped floor.
+    let pending_scope_floor_tokens = match turn_context.config.model_auto_compact_token_limit_scope {
+        AutoCompactTokenLimitScope::Total => pending_body_floor_tokens,
+        AutoCompactTokenLimitScope::BodyAfterPrefix => pending_body_floor_tokens
+            .saturating_sub(
+                token_status
+                    .auto_compact_window_prefill_tokens
+                    .unwrap_or(token_status.active_context_tokens)
+                    .max(0),
+            )
+            .max(0),
+    };
+    if token_status
+        .auto_compact_scope_limit
+        .is_some_and(|limit| pending_scope_floor_tokens >= limit)
+        || token_status
+            .full_context_window_limit
+            .is_some_and(|limit| pending_body_floor_tokens >= limit)
+    {
+        tracing::debug!(
+            turn_id = %turn_context.sub_id,
+            thread_id = %sess.thread_id,
+            maintenance_event = "incoming_floor_refused",
+            incoming_tokens = pending_body_floor_tokens,
+            scoped_floor_tokens = pending_scope_floor_tokens,
+            scope = ?turn_context.config.model_auto_compact_token_limit_scope,
+            soft_limit = ?token_status.auto_compact_scope_limit,
+            full_limit = ?token_status.full_context_window_limit,
+            "pending-turn maintenance observation"
+        );
+        return Err(planning_failure_with_timing(
+            turn_context,
+            "the incoming input alone exceeds its configured token limit; compacting prior history cannot make it fit. Reduce the input or start a new task",
+        ));
+    }
     if !allow_pending_input_compaction {
         return Err(planning_failure_with_timing(
             turn_context,
@@ -4283,6 +4413,16 @@ async fn run_pending_input_pre_sampling_compact(
     // Reuse the step context the pending-turn plan was built from. Capturing another one
     // would re-run AGENTS.md discovery and MCP runtime resolution for the same step, and any
     // compaction invalidates this plan and restarts the loop with a fresh capture anyway.
+    tracing::debug!(
+        turn_id = %turn_context.sub_id,
+        thread_id = %sess.thread_id,
+        maintenance_event = "pending_pressure_relief_started",
+        incoming_tokens = pending_body_floor_tokens,
+        scoped_floor_tokens = pending_scope_floor_tokens,
+        projected_tokens = projected_prompt_pressure.total_tokens,
+        projected_scoped_tokens = projected_prompt_pressure.auto_compact_scope_tokens,
+        "pending-turn maintenance observation"
+    );
     run_auto_compact(
         sess,
         step_context,
@@ -4344,11 +4484,32 @@ async fn maybe_run_previous_model_inline_compact(
     sess: &Arc<Session>,
     turn_context: &Arc<TurnContext>,
     client_session: &mut ModelClientSession,
+    completed_model_transition: &mut Option<(PreviousTurnSettings, PreviousTurnSettings)>,
     cancellation_token: &CancellationToken,
 ) -> CodexResult<bool> {
     let Some(previous_turn_settings) = sess.previous_turn_settings().await else {
         return Ok(false);
     };
+    let transition = (
+        previous_turn_settings.clone(),
+        PreviousTurnSettings {
+            model: turn_context.model_info.slug.clone(),
+            comp_hash: turn_context.model_info.comp_hash.clone(),
+        },
+    );
+    // The publication owner retries stale plans without publishing new previous
+    // turn settings. Remember only successful maintenance for this exact model /
+    // hash transition across both inner and outer planning retries.
+    if completed_model_transition.as_ref() == Some(&transition) {
+        tracing::debug!(
+            turn_id = %turn_context.sub_id,
+            thread_id = %sess.thread_id,
+            maintenance_event = "model_transition_reused",
+            planning_generation = sess.services.planning_generation(),
+            "pending-turn maintenance observation"
+        );
+        return Ok(false);
+    }
     let should_compact_for_comp_hash_change = comp_hash_changed(
         previous_turn_settings.comp_hash.as_deref(),
         turn_context.model_info.comp_hash.as_deref(),
@@ -4373,6 +4534,15 @@ async fn maybe_run_previous_model_inline_compact(
             previous_model.as_str(),
         )
         .await;
+        let diagnostic_started = tracing::enabled!(tracing::Level::DEBUG)
+            .then(std::time::Instant::now);
+        tracing::debug!(
+            turn_id = %turn_context.sub_id,
+            thread_id = %sess.thread_id,
+            maintenance_event = "model_transition_started",
+            reason = "comp_hash_changed",
+            "pending-turn maintenance observation"
+        );
         run_auto_compact(
             sess,
             step_context,
@@ -4388,6 +4558,15 @@ async fn maybe_run_previous_model_inline_compact(
             cancellation_token,
         )
         .await?;
+        *completed_model_transition = Some(transition);
+        tracing::debug!(
+            turn_id = %turn_context.sub_id,
+            thread_id = %sess.thread_id,
+            maintenance_event = "model_transition_completed",
+            reason = "comp_hash_changed",
+            elapsed_us = diagnostic_started.map(|started| started.elapsed().as_micros() as u64),
+            "pending-turn maintenance observation"
+        );
         return Ok(true);
     }
 
@@ -4425,6 +4604,15 @@ async fn maybe_run_previous_model_inline_compact(
             previous_model.as_str(),
         )
         .await;
+        let diagnostic_started = tracing::enabled!(tracing::Level::DEBUG)
+            .then(std::time::Instant::now);
+        tracing::debug!(
+            turn_id = %turn_context.sub_id,
+            thread_id = %sess.thread_id,
+            maintenance_event = "model_transition_started",
+            reason = "model_downshift",
+            "pending-turn maintenance observation"
+        );
         run_auto_compact(
             sess,
             step_context,
@@ -4440,6 +4628,15 @@ async fn maybe_run_previous_model_inline_compact(
             cancellation_token,
         )
         .await?;
+        *completed_model_transition = Some(transition);
+        tracing::debug!(
+            turn_id = %turn_context.sub_id,
+            thread_id = %sess.thread_id,
+            maintenance_event = "model_transition_completed",
+            reason = "model_downshift",
+            elapsed_us = diagnostic_started.map(|started| started.elapsed().as_micros() as u64),
+            "pending-turn maintenance observation"
+        );
         return Ok(true);
     }
     Ok(false)
@@ -6370,6 +6567,9 @@ fn goal_surface_state(
     }
 }
 
+/// Host-only, turn-scoped opt-in; schema absence and model text cannot grant it.
+pub(super) struct NoProseAuthorization;
+
 const MISSING_ANSWER_REPAIR_DIRECTIVE: &str = "The response ended without a completed final answer. Deliver the answer required by the current request, including any requested explanation or truthful blocker; Commentary and successful tool stdout are not a final answer. Do not repeat completed effects or invent validation. If and only if the request explicitly authorizes no prose, and no structured output schema applies, declare that disposition with an empty final_answer message rather than an empty response. Otherwise supply a nonempty final answer. This is the single missing-answer repair attempt.";
 
 #[derive(Debug, Default)]
@@ -6397,6 +6597,7 @@ struct TurnOutputState {
     answer: AnswerDelivery,
     last_visible: Option<(String, Option<MessagePhase>, [u8; 32])>,
     missing_answer_repair_attempted: bool,
+    no_prose_authorized: bool,
 }
 
 impl TurnOutputState {
@@ -6434,7 +6635,7 @@ impl TurnOutputState {
         } else if let Some(candidate) = candidate {
             self.answer = AnswerDelivery::Message(candidate);
         } else if allow_no_prose
-            && self.missing_answer_repair_attempted
+            && (self.no_prose_authorized || self.missing_answer_repair_attempted)
             && output.as_ref().is_some_and(|output| {
                 output.phase == Some(MessagePhase::FinalAnswer) && output.text.is_empty()
             })

@@ -115,7 +115,9 @@ console.log(turn.finalResponse);
 ### Attaching images
 
 Provide structured input entries when you need to include images alongside text. Text entries are
-concatenated into the final prompt while image entries are passed to the Codex CLI via `--image`.
+concatenated into the final prompt while image entries are passed to the Codex CLI via the repeatable
+literal `--image-path` option. Commas in filenames are preserved; the CLI's legacy `--image` syntax
+continues to accept comma-separated paths.
 
 ```typescript
 const turn = await thread.run([

@@ -342,7 +342,7 @@ pub(crate) struct ThreadRequestProcessor {
     pub(super) pending_thread_unloads: Arc<PendingThreadUnloads>,
     pub(crate) thread_state_manager: ThreadStateManager,
     pub(crate) thread_watch_manager: ThreadWatchManager,
-    pub(super) thread_list_state_permit: Arc<Semaphore>,
+    pub(super) thread_list_state_permit: Arc<ThreadListState>,
     pub(super) state_db: Option<StateDbHandle>,
     pub(super) log_db: Option<LogDbLayer>,
     pub(crate) background_tasks: TaskTracker,
@@ -483,7 +483,7 @@ impl ThreadRequestProcessor {
         pending_thread_unloads: Arc<PendingThreadUnloads>,
         thread_state_manager: ThreadStateManager,
         thread_watch_manager: ThreadWatchManager,
-        thread_list_state_permit: Arc<Semaphore>,
+        thread_list_state_permit: Arc<ThreadListState>,
         state_db: Option<StateDbHandle>,
         log_db: Option<LogDbLayer>,
         skills_watcher: Arc<SkillsWatcher>,
@@ -656,7 +656,7 @@ impl ThreadRequestProcessor {
 
     pub(super) async fn acquire_thread_list_state_permit(
         &self,
-    ) -> Result<SemaphorePermit<'_>, JSONRPCErrorError> {
+    ) -> Result<tokio::sync::RwLockWriteGuard<'_, ()>, JSONRPCErrorError> {
         self.thread_list_state_permit
             .acquire()
             .await
@@ -667,7 +667,7 @@ impl ThreadRequestProcessor {
 
     async fn acquire_owned_thread_list_state_permit(
         &self,
-    ) -> Result<tokio::sync::OwnedSemaphorePermit, JSONRPCErrorError> {
+    ) -> Result<tokio::sync::OwnedRwLockWriteGuard<()>, JSONRPCErrorError> {
         Arc::clone(&self.thread_list_state_permit)
             .acquire_owned()
             .await
@@ -1226,9 +1226,8 @@ impl ThreadRequestProcessor {
         let _project_permit = if let Some(id) = project_id.as_ref() {
             let permit = listener_task_context
                 .thread_list_state_permit
-                .acquire()
-                .await
-                .map_err(|error| internal_error(error.to_string()))?;
+                .acquire_publication()
+                .await;
             if thread_store
                 .read_project(id.clone())
                 .await
@@ -2585,6 +2584,9 @@ impl ThreadRequestProcessor {
                         .turns
                         .into_iter()
                         .map(|stored| {
+                            if let Some(turn) = stored.materialized_turn {
+                                return Ok(turn);
+                            }
                             if let Some(metadata) = stored.metadata_json.as_deref() {
                                 return serde_json::from_slice::<Turn>(metadata).map_err(|err| {
                                     internal_error(format!(
@@ -2930,6 +2932,9 @@ impl ThreadRequestProcessor {
             page.items
                 .into_iter()
                 .map(|item| {
+                    if let Some(projected) = item.materialized_thread_item {
+                        return Ok(projected);
+                    }
                     serde_json::from_slice::<ThreadItem>(&item.materialized_thread_item_json)
                         .map_err(|err| {
                             internal_error(format!(
@@ -3206,16 +3211,22 @@ impl ThreadRequestProcessor {
                 .await;
             return Ok(());
         }
-        let redact_resume_payloads =
-            should_redact_thread_resume_payloads(app_server_client_name.as_deref());
-
-        let _thread_list_state_permit = match self.acquire_thread_list_state_permit().await {
-            Ok(permit) => permit,
-            Err(error) => {
-                self.outgoing.send_error(request_id, error).await;
-                return Ok(());
-            }
+        // Path-addressed and ID-addressed requests must share one admission
+        // identity. This read is only a hint; the probe below reloads it after
+        // admission, so an intervening delete or metadata edit is not revived.
+        let resume_identity = if params.history.is_none() && params.path.is_some() {
+            self.read_stored_thread_for_resume(&parsed_thread_id, params.path.as_ref(), false)
+                .await?
+                .thread_id
+                .to_string()
+        } else {
+            parsed_thread_id.valid().map(|id| id.to_string())
+                .unwrap_or_else(|| params.thread_id.clone())
         };
+        let mut _thread_list_state_permit = self
+            .thread_list_state_permit
+            .acquire_resume(resume_identity)
+            .await;
         let stored_thread_from_running_probe = match self
             .resume_running_thread(
                 &request_id,
@@ -3234,10 +3245,14 @@ impl ThreadRequestProcessor {
             }
         };
 
+        // Cold history/config work is per-thread. Keep only its identity gate;
+        // mutations can proceed, then the metadata fence below revalidates it.
+        _thread_list_state_permit.release_state();
         // Core may borrow a runtime loaded while cold history/config were awaited.
         let running_resume_params = params.history.is_none().then(|| params.clone());
         let ThreadResumeParams {
             thread_id: _,
+            dynamic_tool_executor,
             history,
             path,
             model,
@@ -3271,7 +3286,7 @@ impl ThreadRequestProcessor {
                 .await
                 .map(|(thread_history, stored_thread)| (thread_history, Some(stored_thread)))
         };
-        let (thread_history, resume_source_thread) = match resume_result {
+        let (thread_history, mut resume_source_thread) = match resume_result {
             Ok(value) => value,
             Err(error) => {
                 self.outgoing.send_error(request_id, error).await;
@@ -3355,6 +3370,25 @@ impl ThreadRequestProcessor {
                 };
         }
 
+        _thread_list_state_permit.reacquire_state().await;
+        if let Some(source) = resume_source_thread.as_ref() {
+            let current = self
+                .read_stored_thread_for_resume(&parsed_thread_id, path.as_ref(), false)
+                .await?;
+            if source.thread_id != current.thread_id
+                || source.rollout_path != current.rollout_path
+                || source.updated_at != current.updated_at
+                || source.project_id != current.project_id
+                || persisted_fallback != persisted_settings_fallback(&current)
+            {
+                tracing::debug!(target: "codex_app_server::desktop_benchmark",
+                    kdr_desktop_event = "resume_revalidation_restart");
+                params = running_resume_params.expect("persisted resume request retained");
+                continue 'resume;
+            }
+            resume_source_thread = Some(current);
+        }
+
         match crate::bespoke_event_handling::with_startup_mcp_elicitation(
             Arc::clone(&self.outgoing),
             request_id.connection_id,
@@ -3398,6 +3432,8 @@ impl ThreadRequestProcessor {
                             // The live owner may have retired an idle cache for
                             // overrides. Restart cold preparation with fresh history;
                             // leaving this iteration releases its list-state permit.
+                            tracing::debug!(target: "codex_app_server::desktop_benchmark",
+                                kdr_desktop_event = "resume_runtime_restart");
                             params = running_resume_params.expect("live resume request retained");
                             continue 'resume;
                         }
@@ -3484,7 +3520,7 @@ impl ThreadRequestProcessor {
                     config_snapshot.active_permission_profile,
                 );
                 let permission_profile = config_snapshot.permission_profile.clone();
-                let mut initial_turns_page = if let Some(page) = prepared_initial_turns_page {
+                let initial_turns_page = if let Some(page) = prepared_initial_turns_page {
                     Some(page)
                 } else if let Some(params) = initial_turns_page.as_ref() {
                     let page = if include_turns {
@@ -3521,13 +3557,6 @@ impl ThreadRequestProcessor {
                 } else {
                     None
                 };
-                if redact_resume_payloads {
-                    redact_thread_resume_payloads(&mut thread.turns);
-                    if let Some(initial_turns_page) = initial_turns_page.as_mut() {
-                        redact_thread_resume_payloads(&mut initial_turns_page.data);
-                    }
-                }
-
                 let thread_originator = config_snapshot.originator.clone();
                 let response = ThreadResumeResponse {
                     thread,
@@ -3547,11 +3576,17 @@ impl ThreadRequestProcessor {
                 };
 
                 let connection_id = request_id.connection_id;
+                if dynamic_tool_executor
+                    && !self.outgoing.register_dynamic_tool_owner(thread_id, connection_id).await
+                {
+                    return Ok(());
+                }
                 // Own response delivery through idle finalization so disconnects
                 // cannot strand an already resumed thread.
                 let processor = self.clone();
                 self.background_tasks
                     .spawn(async move {
+                        let _thread_list_state_permit = _thread_list_state_permit;
                         processor
                             .outgoing
                             .send_response_with_thread_originator(
@@ -3741,8 +3776,6 @@ impl ThreadRequestProcessor {
                     "rejoining loaded thread without applying config or instruction overrides"
                 );
             }
-            let redact_resume_payloads =
-                should_redact_thread_resume_payloads(app_server_client_name.as_deref());
             let thread_state = self
                 .thread_state_manager
                 .thread_state(existing_thread_id)
@@ -3815,12 +3848,12 @@ impl ThreadRequestProcessor {
                     history_items,
                     history_generation,
                     listener_generation,
+                    dynamic_tool_executor: params.dynamic_tool_executor,
                     config_snapshot,
                     instruction_sources,
                     thread_summary,
                     include_turns,
                     initial_turns_page: params.initial_turns_page.clone(),
-                    redact_resume_payloads,
                 }),
             );
             if listener_command_tx.send(command).await.is_err() {
@@ -4166,7 +4199,7 @@ impl ThreadRequestProcessor {
             .await?;
         let source_thread_id = source_thread.thread_id;
         let _project_permit = if let Some(id) = source_thread.project_id.as_ref() {
-            let permit = self.acquire_thread_list_state_permit().await?;
+            let permit = self.thread_list_state_permit.acquire_publication().await;
             if self
                 .thread_store
                 .read_project(id.clone())

@@ -181,6 +181,7 @@ enum InitialOperation {
     UserTurn {
         items: Vec<UserInput>,
         output_schema: Option<Value>,
+        allow_no_prose: bool,
     },
 }
 
@@ -277,11 +278,13 @@ pub async fn run_main(cli: Cli, arg0_paths: Arg0DispatchPaths) -> anyhow::Result
         json: json_mode,
         prompt,
         output_schema: output_schema_path,
+        allow_no_prose,
+        image_paths,
         config_overrides,
     } = cli;
     let shared = shared.into_inner();
     let SharedCliOptions {
-        images,
+        mut images,
         model: model_cli_arg,
         oss,
         oss_provider,
@@ -292,11 +295,18 @@ pub async fn run_main(cli: Cli, arg0_paths: Arg0DispatchPaths) -> anyhow::Result
         cwd,
         add_dir,
     } = shared;
+    images.extend(image_paths);
 
     // Deterministic input failures must precede configuration, authentication,
     // provider readiness and any persistent session initialization.
-    let (initial_operation, prompt_summary) =
-        prepare_initial_operation(command.as_ref(), prompt, images, output_schema_path).await?;
+    let (initial_operation, prompt_summary) = prepare_initial_operation(
+        command.as_ref(),
+        prompt,
+        images,
+        output_schema_path,
+        allow_no_prose,
+    )
+    .await?;
 
     let (_stdout_with_ansi, stderr_with_ansi) = match color {
         cli::Color::Always => (true, true),
@@ -740,9 +750,9 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<bool> {
         ExecServerRuntimePaths::from_optional_path(arg0_paths.codex_self_exe.clone())?;
     let state_db = codex_core::init_state_db(&config).await;
     let environment_manager = if loader_overrides.ignore_user_config {
-        EnvironmentManager::from_env(Some(local_runtime_paths)).await?
+        EnvironmentManager::from_env_with_http_client_factory(Some(local_runtime_paths), config.http_client_factory()).await?
     } else {
-        EnvironmentManager::from_codex_home(config.codex_home.clone(), Some(local_runtime_paths))
+        EnvironmentManager::from_codex_home_with_http_client_factory(config.codex_home.clone(), Some(local_runtime_paths), config.http_client_factory())
             .await?
     };
     let in_process_start_args = InProcessClientStartArgs {
@@ -862,6 +872,7 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<bool> {
         InitialOperation::UserTurn {
             items,
             output_schema,
+            allow_no_prose,
         } => {
             event_processor.record_turn_submission();
             let response: TurnStartResponse = send_request_with_response(
@@ -888,6 +899,7 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<bool> {
                         summary: None,
                         personality: None,
                         output_schema,
+                        allow_no_prose: allow_no_prose.then_some(true),
                         collaboration_mode: None,
                     },
                 },
@@ -1962,6 +1974,7 @@ async fn prepare_initial_operation(
     prompt: Option<String>,
     mut images: Vec<PathBuf>,
     output_schema_path: Option<PathBuf>,
+    allow_no_prose: bool,
 ) -> anyhow::Result<(InitialOperation, String)> {
     let output_schema = load_output_schema(output_schema_path).await?;
     let prompt_text = match command {
@@ -2004,6 +2017,7 @@ async fn prepare_initial_operation(
         InitialOperation::UserTurn {
             items,
             output_schema,
+            allow_no_prose,
         },
         prompt_text,
     ))

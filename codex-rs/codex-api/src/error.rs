@@ -12,6 +12,9 @@ pub enum ApiError {
     Api { status: StatusCode, message: String },
     #[error("stream error: {0}")]
     Stream(String),
+    /// WebSocket establishment failed before any model request was dispatched.
+    #[error("websocket connection failed: {0}")]
+    WebsocketConnect(String),
     #[error("{message}")]
     WebsocketClosed { code: Option<u16>, message: String },
     #[error("{0}")]

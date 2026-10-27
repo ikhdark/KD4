@@ -344,6 +344,25 @@ pub(super) struct EncodedServerPayload {
     pub(super) payload: String,
 }
 
+/// Reject a response while its request still owns the bounded error path.
+/// Keep this budget identical to the encoder's inner-message ceiling.
+pub fn remote_control_response_size_error(
+    response: &crate::outgoing_message::OutgoingResponse,
+) -> Option<codex_app_server_protocol::JSONRPCErrorError> {
+    (crate::transport::serialized_request_bytes_up_to(
+        response,
+        REMOTE_CONTROL_REASSEMBLED_MAX_BYTES,
+    ) > REMOTE_CONTROL_REASSEMBLED_MAX_BYTES)
+        .then(|| codex_app_server_protocol::JSONRPCErrorError {
+            code: -32603,
+            message: "Response exceeds the Remote message size limit; request paginated history with thread/turns/list or thread/items/list, or resume with excludeTurns=true.".to_string(),
+            data: Some(serde_json::json!({
+                "reason": "responseTooLarge",
+                "maxBytes": REMOTE_CONTROL_REASSEMBLED_MAX_BYTES,
+            })),
+        })
+}
+
 pub(super) fn encode_server_payloads_for_transport(
     envelope: ServerEnvelope,
 ) -> io::Result<Vec<EncodedServerPayload>> {

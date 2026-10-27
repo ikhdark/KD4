@@ -333,6 +333,11 @@ impl RouteAwareRequestBuilder {
 }
 
 impl RouteAwareClientPool {
+    /// Effective routing policy shared with non-HTTP transports owned by this pool's component.
+    pub fn http_client_factory(&self) -> &HttpClientFactory {
+        &self.http_client_factory
+    }
+
     pub fn outbound_proxy_policy(&self) -> OutboundProxyPolicy {
         self.http_client_factory.outbound_proxy_policy()
     }
@@ -730,6 +735,9 @@ impl RouteAwareClientPool {
         });
         tracing::debug!(
             event.name = "codex.http.proxy_resolution",
+            policy = ?self.http_client_factory.outbound_proxy_policy(),
+            route = ?route,
+            destination_port = reqwest::Url::parse(request_url).ok().and_then(|url| url.port_or_known_default()),
             duration_us = route_start.elapsed().as_micros() as u64,
             provenance = "route_resolver_boundary",
         );

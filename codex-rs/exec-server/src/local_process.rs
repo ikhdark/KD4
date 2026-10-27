@@ -768,7 +768,7 @@ impl LocalProcess {
         }
 
         let permit = writer_tx
-            .reserve()
+            .reserve(params.chunk.into_inner())
             .await
             .map_err(|_| internal_error("failed to write to process stdin".to_string()))?;
         let mut accepted_stdin_write_ids = accepted_stdin_write_ids.lock().await;
@@ -780,9 +780,8 @@ impl LocalProcess {
 
         // After this synchronous send, record the write id before any further await.
         // Otherwise a cancelled RPC handler could retry and write the same bytes again.
-        // Typed local callers can supply a short Vec with an arbitrarily large
-        // spare capacity. The accepted queue owns only the bounded payload.
-        permit.send(params.chunk.into_inner().into_boxed_slice().into_vec());
+        // The shared stdin owner trims spare capacity and retains byte custody.
+        permit.send();
         accepted_stdin_write_ids.remember(params.write_id.into_boxed_str().into_string());
 
         Ok(WriteResponse {

@@ -37,12 +37,12 @@ use codex_thread_store::StoredProjectRoot;
 use codex_thread_store::ThreadStore;
 use codex_thread_store::ThreadStoreError;
 use codex_thread_store::UpdateProjectParams as StoreUpdateProjectParams;
-use tokio::sync::Semaphore;
 use tokio_util::task::TaskTracker;
 use tracing::Instrument;
 
 use super::thread_processor::THREAD_PAGE_DEFAULT_LIMIT as THREAD_LIST_DEFAULT_LIMIT;
 use super::thread_processor::THREAD_PAGE_MAX_LIMIT as THREAD_LIST_MAX_LIMIT;
+use super::ThreadListState;
 use crate::error_code::internal_error;
 use crate::error_code::invalid_params;
 use crate::error_code::method_not_found;
@@ -53,7 +53,7 @@ pub(crate) struct ProjectRequestProcessor {
     thread_store: Arc<dyn ThreadStore>,
     thread_state_manager: crate::thread_state::ThreadStateManager,
     outgoing: Arc<OutgoingMessageSender>,
-    thread_list_state_permit: Arc<Semaphore>,
+    thread_list_state_permit: Arc<ThreadListState>,
     background_tasks: TaskTracker,
 }
 
@@ -62,7 +62,7 @@ impl ProjectRequestProcessor {
         thread_store: Arc<dyn ThreadStore>,
         thread_state_manager: crate::thread_state::ThreadStateManager,
         outgoing: Arc<OutgoingMessageSender>,
-        thread_list_state_permit: Arc<Semaphore>,
+        thread_list_state_permit: Arc<ThreadListState>,
         background_tasks: TaskTracker,
     ) -> Self {
         Self {

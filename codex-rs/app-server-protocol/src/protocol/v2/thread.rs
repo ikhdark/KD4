@@ -355,6 +355,12 @@ pub struct ThreadSettingsUpdatedNotification {
 pub struct ThreadResumeParams {
     pub thread_id: String,
 
+    /// Claim execution of this thread's existing dynamic tools for this live
+    /// connection. Only future calls transfer; outstanding calls are not replayed.
+    #[experimental("thread/resume.dynamicToolExecutor")]
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub dynamic_tool_executor: bool,
+
     /// [UNSTABLE] FOR CODEX CLOUD - DO NOT USE.
     /// If specified, the thread will be resumed with the provided history
     /// instead of loaded from disk.

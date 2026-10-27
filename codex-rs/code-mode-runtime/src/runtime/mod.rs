@@ -1,4 +1,5 @@
 mod callbacks;
+mod display_metrics;
 mod globals;
 mod module_loader;
 mod output_projection;

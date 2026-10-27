@@ -468,9 +468,7 @@ impl ProcessExecRequestProcessor {
         }
 
         let delta = match params.delta_base64 {
-            Some(delta_base64) => STANDARD
-                .decode(delta_base64)
-                .map_err(|err| invalid_params(format!("invalid deltaBase64: {err}")))?,
+            Some(delta_base64) => crate::command_exec::decode_stdin_delta(&delta_base64)?,
             None => Vec::new(),
         };
 

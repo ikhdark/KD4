@@ -458,7 +458,9 @@ struct ExecServerCommand {
     #[arg(long = "strict-config", default_value_t = false)]
     strict_config: bool,
 
-    /// Transport endpoint URL. Supported values: `ws://IP:PORT` (default), `stdio`, `stdio://`.
+    /// Transport endpoint URL. `ws://IP:PORT` (default) requires a private per-launch
+    /// CODEX_EXEC_SERVER_AUTH_TOKEN (at least 32 URL-safe ASCII characters).
+    /// `stdio` and `stdio://` use the private parent-child channel without a token.
     #[arg(long = "listen", value_name = "URL", conflicts_with = "remote")]
     listen: Option<String>,
 
@@ -1171,7 +1173,8 @@ async fn run_exec_server_command(
         if let Some(name) = cmd.name {
             remote_config.name = name;
         }
-        let remote_config = remote_config.with_telemetry(telemetry);
+        let remote_config = remote_config.with_telemetry(telemetry)
+            .with_http_client_factory(config.http_client_factory());
         exec_server_telemetry::run_until_shutdown(move |shutdown| async move {
             codex_exec_server::run_remote_environment_with_shutdown(
                 remote_config,

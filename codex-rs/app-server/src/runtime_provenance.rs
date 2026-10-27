@@ -5,6 +5,8 @@ use std::path::PathBuf;
 use codex_app_server_protocol::DESKTOP_CLIENT_NAME;
 use codex_app_server_protocol::DESKTOP_RUNTIME_RECEIPT_RELATIVE_PATH;
 use codex_app_server_protocol::DesktopRuntimeReceipt;
+#[cfg(windows)]
+use codex_app_server_protocol::DesktopStdioPeer;
 use codex_app_server_protocol::ServerPackageLayout;
 use codex_app_server_protocol::ServerRuntimeInfo;
 use codex_app_server_protocol::ServerRuntimeWarning;
@@ -29,18 +31,21 @@ pub(crate) fn write_desktop_runtime_receipt(
     if !matches!(client_name, DESKTOP_CLIENT_NAME | "Codex Desktop") {
         return Ok(None);
     }
+    let started = std::time::Instant::now();
+    tracing::debug!("publishing Desktop runtime receipt");
     let executable_path = std::env::current_exe()?;
     let executable_sha256 = codex_utils_build_info::executable_sha256()
         .ok_or_else(|| io::Error::other("could not hash the running executable"))?
         .to_string();
     let build_info = BuildInfo::current();
+    tracing::debug!(elapsed_ms = started.elapsed().as_millis(), "hashed running Desktop backend");
     // This owner runs after readiness. Hash bytes rather than interpreting path
     // equality as evidence that the running build is the published build.
     let published = expected_local_binary_path();
     let (published_executable_sha256, published_build_match, expected_codex_home, codex_home_match) =
         published_identity(published.as_ref(), &executable_sha256, codex_home);
     let receipt = DesktopRuntimeReceipt {
-        schema_version: 2,
+        schema_version: 3,
         pid: std::process::id(),
         executable_path,
         executable_sha256,
@@ -52,6 +57,7 @@ pub(crate) fn write_desktop_runtime_receipt(
         process_rpc_transport: Some(process_rpc_transport.to_string()),
         connection_id: Some(connection_id),
         enabled_features,
+        stdio_peer: desktop_stdio_peer(process_rpc_transport, connection_id),
         build_version: build_info.version.to_string(),
         build_commit: build_info.commit.to_string(),
         build_dirty: build_info.dirty.to_string(),
@@ -65,7 +71,35 @@ pub(crate) fn write_desktop_runtime_receipt(
     let contents = serde_json::to_string_pretty(&receipt).map_err(io::Error::other)?;
     let receipt_path = codex_home.join(DESKTOP_RUNTIME_RECEIPT_RELATIVE_PATH);
     codex_file_system::write_atomically(&receipt_path, &contents)?;
+    tracing::debug!(elapsed_ms = started.elapsed().as_millis(), "published Desktop runtime receipt");
     Ok(Some(receipt_path))
+}
+
+fn desktop_stdio_peer(
+    transport: &str,
+    connection_id: u64,
+) -> Option<codex_app_server_protocol::DesktopStdioPeer> {
+    // The stdio listener is opened before remote-control listeners and receives
+    // connection zero. A process-wide stdio label alone must not attest a later
+    // remote connection initialized with a Desktop client name.
+    if transport != "stdio" || connection_id != 0 {
+        return None;
+    }
+    #[cfg(windows)]
+    {
+        let peer = codex_utils_build_info::windows_process::stdio_peer()?;
+        Some(DesktopStdioPeer {
+            backend_creation_time: peer.backend_creation_time,
+            input_handle: peer.input_handle,
+            output_handle: peer.output_handle,
+            peer_pid: peer.peer_pid,
+            peer_creation_time: peer.peer_creation_time,
+        })
+    }
+    #[cfg(not(windows))]
+    {
+        None
+    }
 }
 
 fn published_identity(
@@ -262,4 +296,3 @@ fn build_warnings(
         action: Some(ACTION_PUBLISH_LOCAL_CODEX.to_string()),
     }]
 }
-

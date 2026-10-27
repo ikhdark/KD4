@@ -839,15 +839,76 @@ pub(crate) fn compilation_rust_inputs(
             }
             Err(_) => continue,
         };
-        fingerprints.insert(path.clone(), hex::encode(Sha256::digest(&bytes)));
+        let digest: [u8; 32] = Sha256::digest(&bytes).into();
+        fingerprints.insert(path.clone(), hex::encode(digest));
         if path.extension().is_some_and(|extension| extension == "rs")
             && expanded.insert(dunce::canonicalize(&path).unwrap_or_else(|_| path.clone()))
             && let Ok(source) = std::str::from_utf8(&bytes) {
-            pending.extend(crate::tools::handlers::compilation_module_paths(&path, source, crate_root)
+            pending.extend(cached_compilation_module_paths(&path, source, digest, crate_root)
                 .into_iter().map(|path| (path, false)));
         }
     }
     (named.into_iter().collect(), fingerprints)
+}
+
+#[derive(Clone, Eq, Hash, PartialEq)]
+struct CompilationModuleKey {
+    path: PathBuf,
+    digest: [u8; 32],
+    crate_root: bool,
+}
+
+struct CompilationModuleEntry {
+    paths: Vec<PathBuf>,
+    bytes: usize,
+}
+
+struct CompilationModuleCache {
+    entries: lru::LruCache<CompilationModuleKey, CompilationModuleEntry>,
+    bytes: usize,
+}
+
+// Only compact derived module links are retained, never source bytes, input
+// fingerprints or compilation results. Binary-local lifetime versions the parser.
+const COMPILATION_MODULE_CACHE_BYTES: usize = 8 * 1024 * 1024;
+const COMPILATION_MODULE_CACHE_ENTRIES: usize = 4096;
+static COMPILATION_MODULES: std::sync::LazyLock<StdMutex<CompilationModuleCache>> =
+    std::sync::LazyLock::new(|| StdMutex::new(CompilationModuleCache {
+        entries: lru::LruCache::unbounded(), bytes: 0,
+    }));
+
+fn cached_compilation_module_paths(
+    path: &Path, source: &str, digest: [u8; 32], crate_root: bool,
+) -> Vec<PathBuf> {
+    let key = CompilationModuleKey { path: path.to_owned(), digest, crate_root };
+    if let Some(paths) = COMPILATION_MODULES.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+        .entries.get(&key).map(|entry| entry.paths.clone())
+    {
+        return paths;
+    }
+    // Fresh reads/hashes remain with the graph owner. Neither parsing nor graph
+    // traversal holds the cache lock; concurrent cold misses may parse twice.
+    let (paths, complete) = crate::tools::handlers::compilation_module_paths(path, source, crate_root);
+    let bytes = std::mem::size_of::<CompilationModuleKey>()
+        .saturating_add(std::mem::size_of::<CompilationModuleEntry>())
+        .saturating_add(key.path.capacity().saturating_mul(2))
+        .saturating_add(paths.capacity().saturating_mul(std::mem::size_of::<PathBuf>()))
+        .saturating_add(paths.iter().map(|path| path.capacity().saturating_mul(2)).sum::<usize>());
+    // Failed, timed-out and recovered parses never become complete warm hits.
+    if complete && bytes <= COMPILATION_MODULE_CACHE_BYTES {
+        let mut cache = COMPILATION_MODULES.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !cache.entries.contains(&key) {
+            while cache.entries.len() >= COMPILATION_MODULE_CACHE_ENTRIES
+                || cache.bytes.saturating_add(bytes) > COMPILATION_MODULE_CACHE_BYTES
+            {
+                let Some((_, entry)) = cache.entries.pop_lru() else { break; };
+                cache.bytes = cache.bytes.saturating_sub(entry.bytes);
+            }
+            cache.bytes += bytes;
+            cache.entries.put(key, CompilationModuleEntry { paths: paths.clone(), bytes });
+        }
+    }
+    paths
 }
 
 fn stable_file_identity(file: &File) -> Option<StableFileIdentity> {

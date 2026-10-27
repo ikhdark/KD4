@@ -662,6 +662,11 @@ impl Session {
             return;
         };
 
+        let refresh_started = std::time::Instant::now();
+        if plugin_refresh_trace_enabled() {
+            tracing::info!(target: "codex_plugin_refresh", phase = "apply_started", thread_id = %self.thread_id, pending_id = Arc::as_ptr(&requested) as usize as u64, runtime_generation = self.services.latest_mcp_runtime().generation());
+        }
+
         let McpServerRefreshConfig {
             mcp_servers,
             mcp_oauth_credentials_store_mode,
@@ -762,6 +767,9 @@ impl Session {
             && runtime.config().mcp_oauth_credentials_store_mode == store_mode
             && runtime.config().auth_keyring_backend_kind == keyring_backend_kind
         {
+            if plugin_refresh_trace_enabled() {
+                tracing::info!(target: "codex_plugin_refresh", phase = "applied", thread_id = %self.thread_id, pending_id = Arc::as_ptr(&requested) as usize as u64, runtime_generation = runtime.generation(), server_count = mcp_servers.len(), elapsed_us = refresh_started.elapsed().as_micros() as u64);
+            }
             self.acknowledge_mcp_server_refresh(&requested).await;
         }
     }

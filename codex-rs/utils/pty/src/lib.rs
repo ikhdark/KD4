@@ -1,6 +1,7 @@
 mod managed_process;
 pub mod pipe;
 mod process;
+mod stdin;
 pub mod process_group;
 pub mod process_observation;
 pub mod pty;
@@ -12,6 +13,10 @@ mod win;
 mod windows_input;
 
 pub const DEFAULT_OUTPUT_BYTES_CAP: usize = 1024 * 1024;
+pub use stdin::MAX_STDIN_CHUNK_BYTES;
+pub use stdin::StdinPayload;
+pub use stdin::StdinSender;
+pub use stdin::stdin_channel;
 
 pub use managed_process::ManagedRootAdmissionReclaimerGuard;
 pub use managed_process::ManagedRootProcess;
@@ -91,7 +96,7 @@ pub fn configure_windows_command_args<S>(
 }
 
 #[cfg(windows)]
-pub(crate) fn windows_cmd_payload_index<S>(program: &std::ffi::OsStr, args: &[S]) -> Option<usize>
+pub fn windows_cmd_payload_index<S>(program: &std::ffi::OsStr, args: &[S]) -> Option<usize>
 where
     S: AsRef<std::ffi::OsStr>,
 {

@@ -22,6 +22,15 @@ impl AdditionalContextUserFragment {
     pub fn new(key: String, value: String) -> Self {
         Self { key, value }
     }
+
+    /// Whether rendering this untrusted value would omit source text.
+    pub fn value_requires_recovery(value: &str) -> bool {
+        let mut bytes = 0usize;
+        value.chars().any(|ch| {
+            bytes = bytes.saturating_add(escaped_text_char_len(ch));
+            bytes > MAX_ADDITIONAL_CONTEXT_VALUE_BYTES
+        })
+    }
 }
 
 impl ContextualUserFragment for AdditionalContextUserFragment {

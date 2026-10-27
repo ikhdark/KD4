@@ -325,6 +325,7 @@ impl ClientTracker {
                     client_id,
                     stream_id,
                     write_complete_tx: None,
+                    delivery_failure: None,
                 });
                 Ok(())
             }
@@ -372,6 +373,7 @@ impl ClientTracker {
                     client_id: client_id.clone(),
                     stream_id: stream_id.clone(),
                     write_complete_tx,
+                    delivery_failure: Some(disconnect_token.clone()),
                 }) => send_result,
             };
             if send_result.is_err() {

@@ -1123,8 +1123,34 @@ async fn handle_read_tool_output(
         }
         let success = output["results"].as_array().is_some_and(|results|
             results.iter().all(|result| result["status"] == "ok"));
+        // Plain command logs bypass the snapshot path below. Completed native
+        // selections must still discharge this artifact's recovery obligations.
+        // Never treat a partial selection or merely retained bytes as delivery.
+        let evidence = (success && output["complete"] == true
+            && output["retained_artifact_complete"] == true)
+            .then(|| output["results"].as_array())
+            .flatten()
+            .map(|results| results.iter().filter_map(|result| {
+                if !result["text"].is_string() && !result["data_base64"].is_string() {
+                    return None;
+                }
+                let start = result["canonical_range"]["start"].as_u64()?;
+                let end = result["canonical_range"]["end"].as_u64()?;
+                (start <= end && end <= output["canonical_bytes"].as_u64()?)
+                    .then(|| serde_json::json!([start, end]))
+            }).collect::<Vec<_>>())
+            .filter(|ranges| !ranges.is_empty())
+            .map(|ranges| serde_json::json!({
+                "source": "artifact", "scope": output["artifact_id"],
+                "identity": {"sha256": output["canonical_sha256"], "ranges": ranges},
+            }));
         let mut result = JsonToolOutput::with_success(output, Some(success))
             .with_code_mode_failure_as_data();
+        if let Some(evidence) = evidence {
+            result = result.with_sampling_request_signal(
+                crate::tools::context::semantic_evidence_sampling_signal(evidence),
+            );
+        }
         if let Some(model_value) = model_value {
             result = result.with_model_value(model_value);
         }

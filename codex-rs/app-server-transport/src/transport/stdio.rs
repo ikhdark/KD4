@@ -38,6 +38,10 @@ pub async fn start_stdio_connection(
     stdio_handles: &mut Vec<JoinHandle<()>>,
     initialize_client_name_tx: oneshot::Sender<String>,
 ) -> IoResult<()> {
+    #[cfg(windows)]
+    if let Err(error) = codex_utils_build_info::windows_process::initialize_stdio_peer() {
+        tracing::debug!(%error, "Windows stdio peer identity is unavailable");
+    }
     start_stdio_connection_with_io(
         transport_event_tx,
         stdio_handles,

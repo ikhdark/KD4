@@ -10,6 +10,8 @@ pub(crate) use handler::ExecServerHandler;
 pub(crate) use processor::ConnectionProcessor;
 pub use transport::DEFAULT_LISTEN_URL;
 pub use transport::ExecServerListenUrlParseError;
+pub use transport::EXEC_SERVER_AUTH_TOKEN_ENV_VAR;
+pub(crate) use transport::loopback_authorization;
 
 use crate::ExecServerRuntimePaths;
 use crate::ExecServerTelemetry;

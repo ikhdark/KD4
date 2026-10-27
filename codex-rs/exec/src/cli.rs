@@ -42,6 +42,14 @@ pub struct Cli {
     /// Path to a JSON Schema file describing the model's final response shape.
     #[arg(long = "output-schema", value_name = "FILE", global = true)]
     pub output_schema: Option<PathBuf>,
+    /// Allow an exactly empty completed final answer for this request only.
+    /// Does not waive required work or completion hooks; ignored with --output-schema.
+    #[arg(long = "allow-no-prose", global = true, default_value_t = false)]
+    pub allow_no_prose: bool,
+
+    /// Attach one literal image path per occurrence, without comma splitting.
+    #[arg(long = "image-path", value_name = "FILE", num_args = 1)]
+    pub image_paths: Vec<PathBuf>,
 
     #[clap(skip)]
     pub config_overrides: CliConfigOverrides,
@@ -177,6 +185,10 @@ struct ResumeArgsRaw {
     )]
     images: Vec<PathBuf>,
 
+    /// Attach one literal image path per occurrence, without comma splitting.
+    #[arg(long = "image-path", value_name = "FILE", num_args = 1)]
+    image_paths: Vec<PathBuf>,
+
     /// Prompt to send after resuming the session. If `-` is used, read from stdin.
     #[arg(value_name = "PROMPT", value_hint = clap::ValueHint::Other, conflicts_with = "last")]
     prompt: Option<String>,
@@ -214,7 +226,7 @@ impl From<ResumeArgsRaw> for ResumeArgs {
             session_id,
             last: raw.last,
             all: raw.all,
-            images: raw.images,
+            images: raw.images.into_iter().chain(raw.image_paths).collect(),
             prompt,
         }
     }

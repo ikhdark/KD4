@@ -182,6 +182,7 @@ pub(super) async fn user_input_or_turn_inner(
     let Op::UserInput {
         items,
         final_output_json_schema,
+        allow_no_prose,
         responsesapi_client_metadata,
         additional_context,
         thread_settings,
@@ -378,6 +379,11 @@ pub(super) async fn user_input_or_turn_inner(
         .await;
     sess.maybe_emit_model_warnings_for_turn(current_context.as_ref())
         .await;
+    if allow_no_prose && current_context.final_output_json_schema.is_none() {
+        current_context
+            .extension_data
+            .insert(super::turn::NoProseAuthorization);
+    }
     if let Some(responsesapi_client_metadata) = responsesapi_client_metadata {
         current_context
             .turn_metadata_state

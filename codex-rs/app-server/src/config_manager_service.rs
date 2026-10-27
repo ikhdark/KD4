@@ -393,6 +393,13 @@ impl ConfigManager {
         // when no live thread exists to receive a runtime config refresh.
         self.invalidate_load_cache();
 
+        // Report the persisted effective layer, not a projection that may differ
+        // after migration or an intervening writer's independent changes.
+        let updated_layers = self
+            .load_thread_agnostic_config()
+            .await
+            .map_err(|err| ConfigManagerError::io("failed to reload written configuration", err))?;
+        let effective = updated_layers.effective_config();
         let overridden = first_overridden_edit(&updated_layers, &effective, &parsed_segments);
         let status = overridden
             .as_ref()

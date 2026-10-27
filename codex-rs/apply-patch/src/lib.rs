@@ -3290,14 +3290,56 @@ pub async fn unified_diff_from_chunks_with_context(
     sandbox: Option<&FileSystemSandboxContext>,
 ) -> std::result::Result<ApplyPatchFileUpdate, ApplyPatchError> {
     derive_new_contents_from_chunks(path, chunks, /*hunk_ordinal*/ None, fs, sandbox)
+        .await?
+        .into_file_update(context)
         .await
-        .map(|update| update.into_file_update(context))
 }
 
 impl AppliedPatch {
     /// Renders an already derived update without reading its source again.
-    fn into_file_update(self, context: usize) -> ApplyPatchFileUpdate {
-        let unified_diff = TextDiff::from_lines(&self.original_contents, &self.new_contents)
+    async fn into_file_update(
+        self,
+        context: usize,
+    ) -> std::result::Result<ApplyPatchFileUpdate, ApplyPatchError> {
+        // Small previews retain their existing algorithm and avoid a worker
+        // handoff. Large comparisons must not monopolize an async polling
+        // thread or multiply CPU/memory pressure across concurrent patches.
+        const OFFLOAD_BYTES: usize = 256 * 1024;
+        static RENDER_SLOTS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
+        if self
+            .original_contents
+            .len()
+            .saturating_add(self.new_contents.len())
+            < OFFLOAD_BYTES
+        {
+            return Ok(self.render_file_update(context, false));
+        }
+        let permit = RENDER_SLOTS.acquire().await.map_err(|error| {
+            ApplyPatchError::ComputeReplacements(format!("patch preview unavailable: {error}"))
+        })?;
+        tokio::task::spawn_blocking(move || {
+            // Cancellation of the waiter must not free a CPU slot while its
+            // read-only renderer is still running. No filesystem work is done
+            // here; all source identity checks and mutation stay with callers.
+            let _permit = permit;
+            self.render_file_update(context, true)
+        })
+        .await
+        .map_err(|error| {
+            ApplyPatchError::ComputeReplacements(format!("patch preview failed: {error}"))
+        })
+    }
+
+    fn render_file_update(self, context: usize, bounded: bool) -> ApplyPatchFileUpdate {
+        let mut config = TextDiff::configure();
+        if bounded {
+            // Bounds search, not formatting: similar falls back to a coarser
+            // complete edit script, retaining every old/new byte for approval.
+            // Authoritative inserted-line diagnostics do not use this preview.
+            config.timeout(std::time::Duration::from_millis(100));
+        }
+        let unified_diff = config
+            .diff_lines(&self.original_contents, &self.new_contents)
             .unified_diff()
             .context_radius(context)
             .to_string();

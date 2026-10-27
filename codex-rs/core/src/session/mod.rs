@@ -2096,7 +2096,7 @@ impl Session {
                 if !unfinished_turn_boundary.is_empty() {
                     self.persist_rollout_items(&unfinished_turn_boundary).await;
                 }
-                self.reconcile_input_receipts(&rollout_items).await?;
+                self.reconcile_input_receipts(&rollout_items, &turn_context).await?;
 
                 // If resuming, warn when the last recorded model differs from the current one.
                 let curr: &str = turn_context.model_info.slug.as_str();
@@ -2554,6 +2554,7 @@ impl Session {
         refreshed_features: &[Feature],
         invalidate_discovery: bool,
     ) {
+        let refresh_started = std::time::Instant::now();
         // Serialize refreshes with environment/profile updates while preparing
         // the hooks that will be published with this configuration.
         let Ok(_refresh_guard) = self.configuration_update_lock.acquire().await else {
@@ -2614,6 +2615,9 @@ impl Session {
             (previous_config, new_config)
         };
         self.emit_config_changed_contributors(previous_config.as_ref(), new_config.as_ref());
+        if plugin_refresh_trace_enabled() {
+            tracing::info!(target: "codex_plugin_refresh", phase = "user_layer_published", thread_id = %self.thread_id, elapsed_us = refresh_started.elapsed().as_micros() as u64);
+        }
     }
 
     fn emit_config_changed_contributors(
@@ -7578,8 +7582,8 @@ impl Session {
             estimated_total_tokens,
         )
         .await;
-        let (info, rate_limits) = self.state.lock().await.token_info_and_rate_limits();
-        Some(TokenCountEvent { info, rate_limits })
+        let (info, _) = self.state.lock().await.token_info_and_rate_limits();
+        Some(TokenCountEvent { info, rate_limits: None })
     }
 
     pub(crate) async fn bind_rate_limit_account(
@@ -7597,15 +7601,17 @@ impl Session {
         turn_context
             .turn_timing_state
             .observe_credits(new_rate_limits.credits.as_ref());
-        self.record_rate_limits_info(new_rate_limits).await;
-        self.send_token_count_event(turn_context).await;
-    }
-
-    pub(crate) async fn record_rate_limits_info(&self, new_rate_limits: RateLimitSnapshot) {
-        {
+        // Only this fresh provider observation may publish account quota. Usage
+        // updates must not replay this session's older account-wide snapshot.
+        let (mut info, rate_limits) = {
             let mut state = self.state.lock().await;
             state.set_rate_limits(new_rate_limits);
+            state.token_info_and_rate_limits()
+        };
+        if let Some(info) = info.as_mut() {
+            info.model_context_window = turn_context.model_context_window();
         }
+        self.send_token_count(turn_context, TokenCountEvent { info, rate_limits }).await;
     }
 
     pub(crate) async fn mcp_dependency_prompted(&self) -> HashSet<String> {
@@ -7622,7 +7628,7 @@ impl Session {
     }
 
     pub(crate) async fn send_token_count_event(&self, turn_context: &TurnContext) {
-        let (mut info, rate_limits) = {
+        let (mut info, _) = {
             let state = self.state.lock().await;
             state.token_info_and_rate_limits()
         };
@@ -7631,7 +7637,7 @@ impl Session {
             // active model's capacity, including an explicitly unknown value.
             info.model_context_window = turn_context.model_context_window();
         }
-        self.send_token_count(turn_context, TokenCountEvent { info, rate_limits }).await;
+        self.send_token_count(turn_context, TokenCountEvent { info, rate_limits: None }).await;
     }
 
     /// Publishes usage and rate limits unless they exactly repeat the last
@@ -8021,6 +8027,13 @@ pub(crate) fn emit_subagent_session_started(
         subagent_source,
         created_at,
     });
+}
+
+// Explicit opt-in is needed even when a log database enables INFO globally.
+pub(crate) fn plugin_refresh_trace_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("CODEX_PLUGIN_REFRESH_TRACE")
+        .is_some_and(|value| value == "1"))
 }
 
 /// Builds the hook engine for one config snapshot, including any enabled plugin hooks.

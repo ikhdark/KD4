@@ -12,6 +12,8 @@ use tracing::info;
 use tracing::warn;
 
 pub(super) const REMOTE_CONTROL_ACCOUNT_ID_HEADER: &str = "chatgpt-account-id";
+// Initial attempt plus the managed Reload and RefreshToken recovery steps.
+pub(super) const REMOTE_CONTROL_AUTH_ATTEMPTS: usize = 3;
 
 pub(super) struct RemoteControlConnectionAuth {
     pub(super) auth_provider: SharedAuthProvider,
@@ -95,32 +97,40 @@ pub(super) async fn recover_remote_control_auth(
     auth_change_rx: &mut watch::Receiver<u64>,
     rejected_auth: &RemoteControlConnectionAuth,
 ) -> bool {
-    if !auth_recovery.has_next() {
-        return false;
-    }
+    // A no-change reload did not repair the rejected credential. Advance directly to
+    // refresh instead of spending another HTTP attempt on the identical snapshot.
+    for _ in 0..REMOTE_CONTROL_AUTH_ATTEMPTS - 1 {
+        if !auth_recovery.has_next() {
+            return false;
+        }
 
-    let mode = auth_recovery.mode_name();
-    let step = auth_recovery.step_name();
-    let auth_change_revision_before_recovery = *auth_change_rx.borrow();
-    match auth_recovery.next_with_auth(&rejected_auth.auth).await {
-        Ok(step_result) => {
-            if step_result.auth_state_changed() == Some(true) {
-                mark_recovery_auth_change_seen(
-                    auth_change_rx,
-                    auth_change_revision_before_recovery,
+        let mode = auth_recovery.mode_name();
+        let step = auth_recovery.step_name();
+        let auth_change_revision_before_recovery = *auth_change_rx.borrow();
+        match auth_recovery.next_with_auth(&rejected_auth.auth).await {
+            Ok(step_result) => {
+                if step_result.auth_state_changed() == Some(true) {
+                    mark_recovery_auth_change_seen(
+                        auth_change_rx,
+                        auth_change_revision_before_recovery,
+                    );
+                }
+                info!(
+                    "remote control auth recovery succeeded: mode={mode}, step={step}, auth_state_changed={:?}",
+                    step_result.auth_state_changed()
                 );
+                if step_result.auth_state_changed() == Some(false) {
+                    continue;
+                }
+                return true;
             }
-            info!(
-                "remote control auth recovery succeeded: mode={mode}, step={step}, auth_state_changed={:?}",
-                step_result.auth_state_changed()
-            );
-            true
-        }
-        Err(err) => {
-            warn!("remote control auth recovery failed: mode={mode}, step={step}: {err}");
-            false
+            Err(err) => {
+                warn!("remote control auth recovery failed: mode={mode}, step={step}: {err}");
+                return false;
+            }
         }
     }
+    false
 }
 
 pub(super) fn mark_recovery_auth_change_seen(

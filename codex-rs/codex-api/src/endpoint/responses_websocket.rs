@@ -1027,7 +1027,7 @@ fn map_ws_error(err: WsError, url: &Url) -> ApiError {
             })
         }
         WsError::ConnectionClosed | WsError::AlreadyClosed => {
-            ApiError::Stream("websocket closed".to_string())
+            ApiError::WebsocketConnect("websocket closed during connection establishment".to_string())
         }
         WsError::Tls(error) if codex_http_client::is_permanent_connection_error(&error) => {
             ApiError::Transport(TransportError::Build(format!(
@@ -1054,8 +1054,11 @@ fn map_ws_error(err: WsError, url: &Url) -> ApiError {
                 "permanent websocket configuration failure: {err}"
             )))
         }
-        WsError::Io(err) => ApiError::Transport(TransportError::Network(err.to_string())),
-        other => ApiError::Transport(TransportError::Network(other.to_string())),
+        // This adapter is only called by connector.connect, before a usable
+        // socket or response.create exists. Established reads and ambiguous
+        // writes have separate adapters and retain their replay budget.
+        WsError::Io(err) => ApiError::WebsocketConnect(err.to_string()),
+        other => ApiError::WebsocketConnect(other.to_string()),
     }
 }
 

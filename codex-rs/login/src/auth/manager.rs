@@ -919,25 +919,77 @@ pub async fn logout_with_revoke(
     keyring_backend_kind: AuthKeyringBackendKind,
     auth_route_config: &AuthRouteConfig,
 ) -> std::io::Result<bool> {
-    let auth_dot_json = match load_auth_dot_json(
+    let snapshot = PreparedAuthLogout::capture(
         codex_home,
         auth_credentials_store_mode,
         keyring_backend_kind,
-    ) {
-        Ok(auth_dot_json) => auth_dot_json,
-        Err(err) => {
-            tracing::warn!("failed to load stored auth during logout: {err}");
-            None
-        }
-    };
-    if let Err(err) = revoke_auth_tokens(auth_dot_json.as_ref(), auth_route_config).await {
+    )?;
+    if let Err(err) = revoke_auth_tokens(snapshot.managed_auth(), auth_route_config).await {
         tracing::warn!("failed to revoke auth tokens during logout: {err}");
     }
-    logout_all_stores(
-        codex_home,
-        auth_credentials_store_mode,
-        keyring_backend_kind,
-    )
+    let (removed, changed) = snapshot.retire()?;
+    if changed {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Interrupted,
+            "authentication changed during logout; newer credentials were not deleted",
+        ));
+    }
+    Ok(removed)
+}
+
+/// Keeps credentials and lifecycle from the same locked read. The storage
+/// owner fences retirement; no lock crosses revocation I/O.
+struct PreparedAuthLogout {
+    stores: Vec<(Arc<dyn AuthStorageBackend>, Option<AuthDotJson>)>,
+}
+
+impl PreparedAuthLogout {
+    fn capture(
+        codex_home: &Path,
+        mode: AuthCredentialsStoreMode,
+        keyring: AuthKeyringBackendKind,
+    ) -> std::io::Result<Self> {
+        let managed = create_auth_storage(codex_home.to_path_buf(), mode, keyring);
+        let auth = managed.load()?;
+        let mut stores = vec![(managed, auth)];
+        if mode != AuthCredentialsStoreMode::Ephemeral {
+            let ephemeral = create_auth_storage(
+                codex_home.to_path_buf(),
+                AuthCredentialsStoreMode::Ephemeral,
+                keyring,
+            );
+            let auth = ephemeral.load()?;
+            stores.push((ephemeral, auth));
+        }
+        Ok(Self { stores })
+    }
+
+    fn managed_auth(&self) -> Option<&AuthDotJson> {
+        self.stores.first().and_then(|(_, auth)| auth.as_ref())
+    }
+
+    fn retire(self) -> std::io::Result<(bool, bool)> {
+        let started = tracing::enabled!(target: "codex_login::desktop_benchmark", tracing::Level::DEBUG)
+            .then(Instant::now);
+        let storage_count = self.stores.len();
+        let mut removed = false;
+        let mut changed = false;
+        for (storage, auth) in self.stores {
+            match storage.delete_if_lifecycle_unchanged(auth.as_ref()) {
+                Ok(value) => removed |= value,
+                // Replacement logins, even with identical credentials, belong
+                // to a newer lifecycle and must survive this logout.
+                Err(err) if crate::auth::storage::is_auth_changed(&err) => changed = true,
+                Err(err) => return Err(err),
+            }
+        }
+        if let Some(started) = started {
+            tracing::debug!(target: "codex_login::desktop_benchmark",
+                kdr_desktop_event = "credential_retirement", storage_count,
+                removed, changed, elapsed_us = started.elapsed().as_micros() as u64);
+        }
+        Ok((removed, changed))
+    }
 }
 
 /// Writes an `auth.json` that contains only the API key.
@@ -3261,6 +3313,14 @@ impl AuthManager {
 
     pub async fn logout_with_revoke(&self) -> std::io::Result<bool> {
         self.ensure_logout_allowed()?;
+        let snapshot = PreparedAuthLogout::capture(
+            &self.codex_home,
+            self.auth_credentials_store_mode,
+            self.keyring_backend_kind,
+        )?;
+        let (generation, _) = self
+            .external_auth_snapshot()
+            .ok_or_else(|| std::io::Error::other("external auth lock is poisoned"))?;
         let auth_dot_json = self
             .auth_cached()
             .and_then(|auth| auth.get_current_auth_json());
@@ -3268,7 +3328,36 @@ impl AuthManager {
         {
             tracing::warn!("failed to revoke auth tokens during logout: {err}");
         }
-        self.logout().await
+        let (removed, _) = snapshot.retire()?;
+        let removed_external = with_ephemeral_auth_entry(&self.codex_home, |entry| {
+            let mut state = self
+                .external_auth
+                .write()
+                .map_err(|_| std::io::Error::other("external auth lock is poisoned"))?;
+            if Arc::ptr_eq(&state.generation, &generation) {
+                let removed = state.source.take().is_some();
+                state.generation = Arc::new(());
+                // Match the existing store -> source -> cache lock order. A
+                // same-source refresh may have mirrored rotated tokens while
+                // revocation waited; remove only that source's current value.
+                let current = self.auth_cached().and_then(|auth| auth.get_current_auth_json());
+                let removed_entry = match entry {
+                    std::collections::hash_map::Entry::Occupied(entry)
+                        if Some(entry.get()) == current.as_ref() => {
+                            entry.remove();
+                            true
+                        }
+                    _ => false,
+                };
+                Ok(removed || removed_entry)
+            } else {
+                Ok(false)
+            }
+        })?;
+        // Reload rather than clearing the current cache: another process may
+        // have replaced storage, or this manager may have a newer external source.
+        self.reload().await;
+        Ok(removed || removed_external)
     }
 
     fn ensure_logout_allowed(&self) -> std::io::Result<()> {

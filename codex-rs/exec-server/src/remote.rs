@@ -4,9 +4,11 @@ use std::time::Instant;
 
 use codex_api::AuthProvider;
 use codex_api::SharedAuthProvider;
-use codex_http_client::HttpClient;
-use codex_http_client::HttpClientBuilder;
+use codex_http_client::ClientRouteClass;
+use codex_http_client::HttpClientFactory;
 use codex_http_client::HttpResponse;
+use codex_http_client::RouteAwareClientPool;
+use codex_websocket_client::WebSocketConnection;
 use futures::FutureExt;
 use http::HeaderMap;
 use http::HeaderName;
@@ -14,9 +16,6 @@ use http::HeaderValue;
 use http::StatusCode;
 use serde::Deserialize;
 use tokio::time::sleep;
-use tokio_tungstenite::MaybeTlsStream;
-use tokio_tungstenite::WebSocketStream;
-use tokio_tungstenite::connect_async_tls_with_config;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tracing::debug;
 use tracing::info;
@@ -38,7 +37,7 @@ use crate::NoiseChannelPublicKey;
 use crate::NoiseRendezvousConnectBundle;
 use crate::NoiseRendezvousConnectProvider;
 use crate::client_api::DEFAULT_REMOTE_EXEC_SERVER_CONNECT_TIMEOUT;
-use crate::client_transport::websocket_connector_with_custom_ca;
+use crate::client_transport::routed_websocket_connector;
 use crate::noise_relay::noise_relay_websocket_config;
 use crate::relay::HarnessKeyValidator;
 use crate::relay::run_multiplexed_environment;
@@ -53,7 +52,7 @@ const STABLE_RENDEZVOUS_SESSION: Duration = Duration::from_secs(30);
 struct EnvironmentRegistryClient {
     base_url: String,
     auth_provider: SharedAuthProvider,
-    http: HttpClient,
+    http: RouteAwareClientPool,
     connect_timeout: Duration,
     telemetry: ExecServerTelemetry,
 }
@@ -73,15 +72,13 @@ impl EnvironmentRegistryClient {
         base_url: String,
         auth_provider: SharedAuthProvider,
         telemetry: ExecServerTelemetry,
+        http_client_factory: HttpClientFactory,
     ) -> Result<Self, ExecServerError> {
         let base_url = normalize_base_url(base_url)?;
         Ok(Self {
             base_url,
             auth_provider,
-            http: HttpClientBuilder::new()
-                .without_redirects()
-                .build_with_transport_default_proxy()
-                .map_err(|error| ExecServerError::EnvironmentRegistryConfig(error.to_string()))?,
+            http: RouteAwareClientPool::new_without_redirects(http_client_factory, ClientRouteClass::Api),
             connect_timeout: DEFAULT_REMOTE_EXEC_SERVER_CONNECT_TIMEOUT,
             telemetry,
         })
@@ -119,9 +116,11 @@ impl EnvironmentRegistryClient {
         environment_id: &str,
         executor_public_key: &NoiseChannelPublicKey,
     ) -> Result<EnvironmentRegistryRegistrationResponse, ExecServerError> {
-        let response = self
-            .http
-            .post(endpoint_url(&self.base_url, environment_id, "register")?)
+        let url = endpoint_url(&self.base_url, environment_id, "register")?;
+        let client = self.http.client_for_url(&url).await
+            .map_err(|error| ExecServerError::EnvironmentRegistryConfig(error.to_string()))?;
+        let response = client
+            .post(url)
             .timeout(self.connect_timeout)
             .headers(self.auth_provider.to_auth_headers())
             .headers(current_trace_context_headers())
@@ -170,9 +169,11 @@ impl EnvironmentRegistryClient {
         environment_id: &str,
         harness_public_key: NoiseChannelPublicKey,
     ) -> Result<NoiseRendezvousConnectBundle, ExecServerError> {
-        let response = self
-            .http
-            .post(endpoint_url(&self.base_url, environment_id, "connect")?)
+        let url = endpoint_url(&self.base_url, environment_id, "connect")?;
+        let client = self.http.client_for_url(&url).await
+            .map_err(|error| ExecServerError::EnvironmentRegistryConfig(error.to_string()))?;
+        let response = client
+            .post(url)
             .headers(self.auth_provider.to_auth_headers())
             .json(&EnvironmentRegistryConnectRequest { harness_public_key })
             .timeout(self.connect_timeout)
@@ -258,14 +259,15 @@ impl HarnessKeyValidator for RegistryHarnessKeyValidator {
         authorization: &str,
     ) -> Result<(), ExecServerError> {
         let environment_id = &self.environment_id;
-        let response = self
-            .client
-            .http
-            .post(endpoint_url(
+        let url = endpoint_url(
                 &self.client.base_url,
                 environment_id,
                 "validate",
-            )?)
+            )?;
+        let client = self.client.http.client_for_url(&url).await
+            .map_err(|error| ExecServerError::EnvironmentRegistryConfig(error.to_string()))?;
+        let response = client
+            .post(url)
             .headers(self.client.auth_provider.to_auth_headers())
             .json(&EnvironmentRegistryHarnessKeyValidationRequest {
                 executor_registration_id: self.executor_registration_id.clone(),
@@ -324,6 +326,7 @@ impl NoiseRendezvousEnvironmentConfig {
         environment_id: String,
         bearer_token: String,
         chatgpt_account_id: Option<String>,
+        http_client_factory: HttpClientFactory,
     ) -> Result<Self, ExecServerError> {
         let environment_id = normalize_environment_id(environment_id)?;
         let auth_provider = static_bearer_auth_provider(bearer_token, chatgpt_account_id)?;
@@ -331,6 +334,7 @@ impl NoiseRendezvousEnvironmentConfig {
             base_url,
             auth_provider,
             ExecServerTelemetry::default(),
+            http_client_factory,
         )?;
         Ok(Self {
             provider: Arc::new(EnvironmentRegistryNoiseConnectProvider {
@@ -437,6 +441,7 @@ pub struct RemoteEnvironmentConfig {
     pub name: String,
     auth_provider: SharedAuthProvider,
     telemetry: ExecServerTelemetry,
+    http_client_factory: HttpClientFactory,
 }
 
 impl std::fmt::Debug for RemoteEnvironmentConfig {
@@ -463,11 +468,17 @@ impl RemoteEnvironmentConfig {
             name: "codex-exec-server".to_string(),
             auth_provider,
             telemetry: ExecServerTelemetry::default(),
+            http_client_factory: HttpClientFactory::new(codex_http_client::OutboundProxyPolicy::ReqwestDefault),
         })
     }
 
     pub fn with_telemetry(mut self, telemetry: ExecServerTelemetry) -> Self {
         self.telemetry = telemetry;
+        self
+    }
+
+    pub fn with_http_client_factory(mut self, factory: HttpClientFactory) -> Self {
+        self.http_client_factory = factory;
         self
     }
 }
@@ -496,6 +507,7 @@ pub async fn run_remote_environment_with_shutdown(
         config.base_url.clone(),
         config.auth_provider.clone(),
         config.telemetry.clone(),
+        config.http_client_factory.clone(),
     )?;
     let processor =
         ConnectionProcessor::new_with_telemetry(runtime_paths, config.telemetry.clone())
@@ -516,7 +528,7 @@ pub async fn run_remote_environment_with_shutdown(
         loop {
             let connection = tokio::select! {
                 _ = shutdown.cancelled() => return Ok(()),
-                connection = connect_rendezvous(&response.url, &config.telemetry) => connection,
+                connection = connect_rendezvous(&response.url, &config.telemetry, &config.http_client_factory) => connection,
             };
             match connection {
                 Ok(websocket) => {
@@ -636,25 +648,19 @@ async fn register_with_retry(
 async fn connect_rendezvous(
     url: &str,
     telemetry: &ExecServerTelemetry,
+    http_client_factory: &HttpClientFactory,
 ) -> Result<
-    WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>,
+    WebSocketConnection,
     tokio_tungstenite::tungstenite::Error,
 > {
     let started_at = Instant::now();
     let result = tokio::time::timeout(DEFAULT_REMOTE_EXEC_SERVER_CONNECT_TIMEOUT, async {
-        let connector = websocket_connector_with_custom_ca(url).await?;
+        let connector = routed_websocket_connector(http_client_factory.clone()).await?;
         let mut request = url.into_client_request()?;
         request
             .headers_mut()
             .extend(current_trace_context_headers());
-        connect_async_tls_with_config(
-            request,
-            Some(noise_relay_websocket_config()),
-            // Rendezvous sends small, latency-sensitive frames, so avoid Nagle's coalescing delay.
-            /*disable_nagle*/
-            true,
-            connector,
-        )
+        connector.with_tcp_nodelay().connect(request, noise_relay_websocket_config())
         .await
         .map(|(websocket, _)| websocket)
     })

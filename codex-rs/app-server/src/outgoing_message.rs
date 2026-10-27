@@ -15,6 +15,7 @@ use codex_analytics::TurnDeliveryFact;
 use codex_analytics::TurnDeliveryStatus;
 use codex_app_server_protocol::ClientResponsePayload;
 use codex_app_server_protocol::JSONRPCErrorError;
+use codex_app_server_protocol::McpServerElicitationRequest;
 use codex_app_server_protocol::RateLimitSnapshot;
 use codex_app_server_protocol::RequestId;
 use codex_app_server_protocol::Result;
@@ -177,7 +178,25 @@ struct ActiveConnection {
     outstanding_control: Arc<tokio::sync::Semaphore>,
     outstanding_bytes: Arc<tokio::sync::Semaphore>,
     initialized: Arc<AtomicBool>,
+    supports_openai_form_elicitation: bool,
+    remote_control: bool,
     delivery_failure: CancellationToken,
+}
+
+impl ActiveConnection {
+    fn accepts_request(&self, request: &ServerRequest) -> bool {
+        if !self.initialized.load(Ordering::Acquire) {
+            return false;
+        }
+        match request {
+            ServerRequest::McpServerElicitationRequest { params, .. }
+                if matches!(&params.request, McpServerElicitationRequest::OpenAiForm { .. }) =>
+            {
+                self.supports_openai_form_elicitation
+            }
+            _ => true,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -708,11 +727,21 @@ impl OutgoingMessageSender {
         &self,
         thread_id: ThreadId,
         connection_id: ConnectionId,
-    ) {
+    ) -> bool {
+        // Share active -> owners ordering with disconnect and fresh-call routing.
+        // A registration cannot recreate ownership for a closed connection.
+        let active_connections = self.active_connections.lock().await;
+        if !active_connections.get(&connection_id).is_some_and(|connection| {
+            connection.initialized.load(Ordering::Acquire)
+                && !connection.delivery_failure.is_cancelled()
+        }) {
+            return false;
+        }
         self.dynamic_tool_owners
             .lock()
             .await
             .insert(thread_id, connection_id);
+        true
     }
 
     pub(crate) async fn forget_dynamic_tool_owner(&self, thread_id: ThreadId) {
@@ -740,6 +769,7 @@ impl OutgoingMessageSender {
     pub(crate) async fn connection_opened_with_runtime(
         &self,
         connection_id: ConnectionId,
+        origin: codex_app_server_transport::ConnectionOrigin,
         initialized: Arc<AtomicBool>,
         delivery_failure: CancellationToken,
     ) {
@@ -755,9 +785,41 @@ impl OutgoingMessageSender {
                 // A maximum-size fs/writeFile request includes base64 expansion.
                 outstanding_bytes: Arc::new(tokio::sync::Semaphore::new(16 * 1024 * 1024)),
                 initialized,
+                supports_openai_form_elicitation: false,
+                remote_control: matches!(
+                    origin,
+                    codex_app_server_transport::ConnectionOrigin::RemoteControl
+                ),
                 delivery_failure,
             },
         );
+    }
+
+    pub(crate) async fn set_connection_openai_form_elicitation(
+        &self,
+        connection_id: ConnectionId,
+        supported: bool,
+    ) {
+        if let Some(connection) = self.active_connections.lock().await.get_mut(&connection_id) {
+            connection.supports_openai_form_elicitation = supported;
+        }
+    }
+
+    async fn response_delivery_error(
+        &self,
+        connection_id: ConnectionId,
+        response: &OutgoingResponse,
+    ) -> Option<JSONRPCErrorError> {
+        let remote_control = self.active_connections.lock().await
+            .get(&connection_id)
+            .is_some_and(|connection| connection.remote_control);
+        // Counting is bounded and allocation-free; do not pin connection
+        // registration/teardown while walking a large retained history.
+        if remote_control {
+            codex_app_server_transport::remote_control_response_size_error(response)
+        } else {
+            None
+        }
     }
 
     pub(crate) async fn fail_all_connection_delivery(&self) {
@@ -783,6 +845,10 @@ impl OutgoingMessageSender {
             if let Some(connection) = active_connections.remove(&connection_id) {
                 connection.delivery_failure.cancel();
             }
+            self.dynamic_tool_owners
+                .lock()
+                .await
+                .retain(|_, owner| *owner != connection_id);
             let mut request_id_to_callback = self
                 .request_id_to_callback
                 .lock()
@@ -983,6 +1049,11 @@ impl OutgoingMessageSender {
             return Ok((outgoing_message_id, rx_approve));
         }
         let request = request.request_with_id(outgoing_message_id.clone());
+        let explicit_recipients = connection_ids.is_some();
+        // Keep the active-connection snapshot locked through callback registration.
+        // Explicit target sets are only a capability/subscription filter; transport
+        // liveness remains authoritative here.
+        let active_connections = Arc::clone(&self.active_connections).lock_owned().await;
         let dynamic_owner = match thread_id {
             Some(thread_id) => self
                 .dynamic_tool_owners
@@ -992,11 +1063,6 @@ impl OutgoingMessageSender {
                 .copied(),
             None => None,
         };
-        let explicit_recipients = connection_ids.is_some();
-        // Keep the active-connection snapshot locked through callback registration.
-        // Explicit target sets are only a capability/subscription filter; transport
-        // liveness remains authoritative here.
-        let active_connections = Arc::clone(&self.active_connections).lock_owned().await;
         let mut target_connection_ids = match connection_ids {
             Some(connection_ids) => connection_ids
                 .iter()
@@ -1004,15 +1070,14 @@ impl OutgoingMessageSender {
                 .filter(|connection_id| {
                     active_connections
                         .get(connection_id)
-                        .is_some_and(|connection| connection.initialized.load(Ordering::Acquire))
+                        .is_some_and(|connection| connection.accepts_request(&request))
                 })
                 .collect::<Vec<_>>(),
             None => active_connections
                 .iter()
-                .filter_map(|(connection_id, initialized)| {
-                    initialized
-                        .initialized
-                        .load(Ordering::Acquire)
+                .filter_map(|(connection_id, connection)| {
+                    connection
+                        .accepts_request(&request)
                         .then_some(*connection_id)
                 })
                 .collect(),
@@ -1181,6 +1246,9 @@ impl OutgoingMessageSender {
                     if matches!(entry.request, ServerRequest::DynamicToolCall { .. }) {
                         return None;
                     }
+                    if !active_connections[&connection_id].accepts_request(&entry.request) {
+                        return None;
+                    }
                     Some((request_id.clone(), entry.settlement.clone()))
                 })
                 .collect::<Vec<_>>();
@@ -1226,6 +1294,9 @@ impl OutgoingMessageSender {
             let Some(entry) = request_id_to_callback.get_mut(&request_id) else {
                 continue;
             };
+            if !active_connections[&connection_id].accepts_request(&entry.request) {
+                continue;
+            }
             entry.connection_ids.insert(connection_id);
             entry.delivered_connection_ids.insert(connection_id);
             permit.send(OutgoingEnvelope::ToConnection {
@@ -1460,6 +1531,14 @@ impl OutgoingMessageSender {
                 return false;
             }
         };
+        let outgoing_response = OutgoingResponse { id, result };
+        if let Some(error) = self
+            .response_delivery_error(request_id.connection_id, &outgoing_response)
+            .await
+        {
+            self.send_error(request_id, error).await;
+            return false;
+        }
         let request_context = self.request_context(&request_id).await;
         let reserve = async {
             tokio::select! {
@@ -1512,7 +1591,7 @@ impl OutgoingMessageSender {
                         );
                 }
                 (
-                    OutgoingMessage::Response(OutgoingResponse { id, result }),
+                    OutgoingMessage::Response(outgoing_response),
                     Some(guard),
                 )
             }
@@ -1520,7 +1599,10 @@ impl OutgoingMessageSender {
                 self.finish_request_context(request_context.as_ref()).await;
                 return false;
             }
-            Err(error) => (OutgoingMessage::Error(OutgoingError { id, error }), None),
+            Err(error) => (
+                OutgoingMessage::Error(OutgoingError { id: outgoing_response.id, error }),
+                None,
+            ),
         };
         let committed = guard.is_some();
         permit.send(OutgoingEnvelope::ToConnection {
@@ -1962,6 +2044,19 @@ impl OutgoingMessageSender {
         message: OutgoingMessage,
         message_kind: &'static str,
     ) {
+        let (route_failed, remote_control) = self.active_connections.lock().await
+            .get(&connection_id)
+            .map(|connection| (connection.delivery_failure.clone(), connection.remote_control))
+            .unwrap_or_default();
+        let message = match message {
+            OutgoingMessage::Response(response) if remote_control => {
+                match codex_app_server_transport::remote_control_response_size_error(&response) {
+                    Some(error) => OutgoingMessage::Error(OutgoingError { id: response.id, error }),
+                    None => OutgoingMessage::Response(response),
+                }
+            }
+            message => message,
+        };
         let request_span = request_context.as_ref().map(RequestContext::span);
         if let Some(span) = request_span.as_ref() {
             match &message {
@@ -1977,9 +2072,6 @@ impl OutgoingMessageSender {
                 _ => {}
             }
         }
-        let route_failed = self.active_connections.lock().await
-            .get(&connection_id).map(|connection| connection.delivery_failure.clone())
-            .unwrap_or_default();
         let send_fut = self.sender.send(OutgoingEnvelope::ToConnection {
             connection_id,
             message,

@@ -1757,6 +1757,7 @@ dependencies = [
  "codex-utils-build-info",
  "codex-utils-home-dir",
  "codex-utils-rustls-provider",
+ "codex-websocket-client",
  "constant_time_eq 0.6.1",
  "futures",
  "gethostname",
@@ -2043,6 +2044,7 @@ dependencies = [
  "tracing",
  "uuid",
  "v8",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2387,7 +2389,9 @@ dependencies = [
  "codex-utils-path-uri",
  "codex-utils-pty",
  "codex-utils-rustls-provider",
+ "codex-websocket-client",
  "codex-windows-sandbox",
+ "constant_time_eq 0.6.1",
  "futures",
  "http",
  "indexmap 2.14.2",
@@ -3217,6 +3221,7 @@ version = "0.0.0"
 dependencies = [
  "hex",
  "sha2 0.11.1",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3376,6 +3381,7 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tokio-tungstenite",
+ "tracing",
  "url",
 ]
 
@@ -10203,7 +10209,6 @@ dependencies = [
 [[package]]
 name = "tungstenite"
 version = "0.27.0"
-source = "git+https://github.com/openai-oss-forks/tungstenite-rs?rev=4fffad30fe373adbdcffab9545e9e9bf4f2fc19f#4fffad30fe373adbdcffab9545e9e9bf4f2fc19f"
 dependencies = [
  "bytes",
  "data-encoding",

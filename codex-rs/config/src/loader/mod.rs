@@ -587,6 +587,57 @@ fn migrate_config_toml(value: TomlValue, path: &Path) -> io::Result<TomlValue> {
     migrate_config_toml_for_source(value, &path.display().to_string())
 }
 
+/// Apply the loader's migrations before semantic edits, preserving unrelated
+/// document formatting. Callers must hold the config writer lock.
+pub fn migrate_config_document(
+    document: &mut toml_edit::DocumentMut,
+    path: &Path,
+) -> io::Result<bool> {
+    let original: TomlValue = toml::from_str(&document.to_string())
+        .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
+    let migrated = migrate_config_toml(original.clone(), path)?;
+    if original == migrated {
+        return Ok(false);
+    }
+    let canonical = toml::to_string(&migrated)
+        .map_err(io::Error::other)?
+        .parse::<toml_edit::DocumentMut>()
+        .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
+    reconcile_migrated_table(
+        document.as_table_mut(),
+        original.as_table().expect("config root is a table"),
+        migrated.as_table().expect("migrated config root is a table"),
+        canonical.as_table(),
+    );
+    Ok(true)
+}
+
+fn reconcile_migrated_table(
+    document: &mut dyn toml_edit::TableLike,
+    original: &toml::map::Map<String, TomlValue>,
+    migrated: &toml::map::Map<String, TomlValue>,
+    canonical: &dyn toml_edit::TableLike,
+) {
+    for key in original.keys().filter(|key| !migrated.contains_key(*key)) {
+        document.remove(key);
+    }
+    for (key, value) in migrated {
+        if original.get(key) == Some(value) {
+            continue;
+        }
+        let replacement = canonical.get(key).expect("serialized migrated entry");
+        if let (Some(TomlValue::Table(before)), TomlValue::Table(after)) =
+            (original.get(key), value)
+            && let Some(table) = document.get_mut(key).and_then(toml_edit::Item::as_table_like_mut)
+            && let Some(canonical_table) = replacement.as_table_like()
+        {
+            reconcile_migrated_table(table, before, after, canonical_table);
+        } else {
+            document.insert(key, replacement.clone());
+        }
+    }
+}
+
 pub(crate) fn migrate_config_toml_for_source(
     mut value: TomlValue,
     source: &str,

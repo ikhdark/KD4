@@ -1872,19 +1872,7 @@ async fn find_rollout_location_by_id_from_filenames(
             let Some(rollout_file) = compression::RolloutFile::from_path(path) else {
                 continue;
             };
-            // Legacy names may use a custom timestamp/prefix, but the UUID
-            // must be a complete final component, never a fuzzy subsequence.
-            let stem = rollout_file
-                .plain_file_name()
-                .strip_suffix(".jsonl")
-                .unwrap_or_default();
-            let id = parse_timestamp_uuid_from_filename(rollout_file.plain_file_name())
-                .map(|(_, id)| id)
-                .or_else(|| {
-                    stem.char_indices()
-                        .filter(|(_, c)| *c == '-')
-                        .find_map(|(i, _)| Uuid::parse_str(&stem[i + 1..]).ok())
-                });
+            let id = rollout_filename_uuid(rollout_file.plain_file_name());
             if id != Some(target) {
                 continue;
             }
@@ -1903,6 +1891,17 @@ async fn find_rollout_location_by_id_from_filenames(
     Ok(found)
 }
 
+// Keep bulk absence checks equivalent to the single-ID lookup, including
+// alternate UUID spellings and legacy timestamp/prefix forms.
+fn rollout_filename_uuid(name: &str) -> Option<Uuid> {
+    let stem = name.strip_suffix(".jsonl")?;
+    parse_timestamp_uuid_from_filename(name)
+        .map(|(_, id)| id)
+        .or_else(|| stem.char_indices()
+            .filter(|(_, c)| *c == '-')
+            .find_map(|(i, _)| Uuid::parse_str(&stem[i + 1..]).ok()))
+}
+
 /// One bounded directory inventory for a set of thread IDs. Header validation
 /// remains per-ID so callers can preserve their existing database/error order.
 #[derive(Debug)]
@@ -1913,11 +1912,13 @@ pub struct ThreadRolloutInventory {
 
 impl ThreadRolloutInventory {
     pub async fn scan(home: &Path, thread_ids: &[ThreadId]) -> Self {
-        let suffixes: HashMap<_, _> = thread_ids.iter().copied()
-            .map(|id| (format!("-{id}.jsonl"), id)).collect();
-        let suffix_lengths: HashSet<_> = suffixes.keys().map(String::len).collect();
+        let observed = tracing::enabled!(target: "codex_storage_runtime", tracing::Level::TRACE)
+            .then(std::time::Instant::now);
+        let requested: HashMap<_, _> = thread_ids.iter().copied()
+            .filter_map(|id| Uuid::parse_str(&id.to_string()).ok().map(|uuid| (uuid, id)))
+            .collect();
         let mut inventory = Self { paths: HashMap::new(), enumeration_error: None };
-        if suffixes.is_empty() { return inventory; }
+        if requested.is_empty() { return inventory; }
         let mut stack = vec![home.join(SESSIONS_SUBDIR), home.join(ARCHIVED_SESSIONS_SUBDIR)];
         let mut visited = 0usize;
         let result = async {
@@ -1941,11 +1942,8 @@ impl ThreadRolloutInventory {
                     }
                     if !kind.is_file() { continue; }
                     let Some(file) = compression::RolloutFile::from_path(entry.path()) else { continue; };
-                    let name = file.plain_file_name();
-                    let id = suffix_lengths.iter().find_map(|length| {
-                        let start = name.len().checked_sub(*length)?;
-                        suffixes.get(name.get(start..)?).copied()
-                    });
+                    let id = rollout_filename_uuid(file.plain_file_name())
+                        .and_then(|uuid| requested.get(&uuid).copied());
                     if let Some(id) = id {
                         inventory.paths.entry(id).or_default().push(file.into_path());
                     }
@@ -1957,7 +1955,18 @@ impl ThreadRolloutInventory {
         // error. Keep the traversed prefix and report the latter after those
         // headers, exactly where a first per-ID traversal would encounter it.
         inventory.enumeration_error = result.err();
+        if let Some(started) = observed {
+            tracing::trace!(target: "codex_storage_runtime", stage = "rollout_inventory",
+                elapsed_us = started.elapsed().as_micros() as u64, visited_entries = visited,
+                requested_ids = requested.len(), matched_ids = inventory.paths.len(),
+                complete = inventory.enumeration_error.is_none());
+        }
         inventory
+    }
+
+    /// Whether the inventory can establish absence, rather than only presence.
+    pub fn is_complete(&self) -> bool {
+        self.enumeration_error.is_none()
     }
 
     /// Consume one requested ID in the caller's original first-seen order.

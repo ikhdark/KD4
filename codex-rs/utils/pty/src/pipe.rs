@@ -297,7 +297,7 @@ async fn finish_pipe_process_setup(
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
 
-    let (writer_tx, mut writer_rx) = mpsc::channel::<Vec<u8>>(128);
+    let (writer_tx, mut writer_rx) = crate::stdin_channel(128);
     let (stdout_tx, stdout_rx) = mpsc::channel::<Vec<u8>>(128);
     let (stderr_tx, stderr_rx) = mpsc::channel::<Vec<u8>>(128);
     let writer_handle = if let Some(stdin) = stdin {

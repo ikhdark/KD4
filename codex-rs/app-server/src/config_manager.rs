@@ -110,6 +110,9 @@ pub(crate) struct ConfigManager {
     thread_config_loader: Arc<RwLock<Arc<dyn ThreadConfigLoader>>>,
     load_cache: Arc<RwLock<ConfigLoadCache>>,
     load_generation: Arc<AtomicU64>,
+    // One publication owner across plugin/account/MCP and explicit user-layer
+    // refreshes. Acquire before capturing any per-thread configuration.
+    runtime_refresh_lock: Arc<tokio::sync::Mutex<()>>,
     remote_control_handle: Arc<RwLock<Option<crate::transport::RemoteControlHandle>>>,
 }
 
@@ -134,12 +137,17 @@ impl ConfigManager {
             thread_config_loader: Arc::new(RwLock::new(thread_config_loader)),
             load_cache: Arc::new(RwLock::new(ConfigLoadCache::default())),
             load_generation: Arc::new(AtomicU64::new(0)),
+            runtime_refresh_lock: Arc::new(tokio::sync::Mutex::new(())),
             remote_control_handle: Arc::new(RwLock::new(None)),
         }
     }
 
     pub(crate) fn codex_home(&self) -> &Path {
         self.codex_home.as_path()
+    }
+
+    pub(crate) async fn lock_runtime_refresh(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.runtime_refresh_lock.lock().await
     }
 
     pub(crate) fn user_config_path(&self) -> std::io::Result<AbsolutePathBuf> {

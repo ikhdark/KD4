@@ -239,16 +239,18 @@ async fn send_client_management_request(
 ) -> io::Result<ClientManagementResponse> {
     let mut auth_recovery = auth_manager.unauthorized_recovery();
     let mut auth_change_rx = auth_manager.auth_change_receiver();
-    let auth = load_remote_control_auth(auth_manager).await?;
-    let response =
-        send_client_management_request_once(client, request_state, &auth, &request, action).await?;
-    if response.status.as_u16() != 401
-        || !recover_remote_control_auth(&mut auth_recovery, &mut auth_change_rx, &auth).await
-    {
-        return Ok(response);
+    for attempt in 0..super::auth::REMOTE_CONTROL_AUTH_ATTEMPTS {
+        let auth = load_remote_control_auth(auth_manager).await?;
+        let response =
+            send_client_management_request_once(client, request_state, &auth, &request, action).await?;
+        if response.status.as_u16() != 401
+            || attempt + 1 == super::auth::REMOTE_CONTROL_AUTH_ATTEMPTS
+            || !recover_remote_control_auth(&mut auth_recovery, &mut auth_change_rx, &auth).await
+        {
+            return Ok(response);
+        }
     }
-    let auth = load_remote_control_auth(auth_manager).await?;
-    send_client_management_request_once(client, request_state, &auth, &request, action).await
+    unreachable!("bounded auth attempts always return the last response")
 }
 
 async fn send_client_management_request_once(

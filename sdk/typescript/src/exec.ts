@@ -26,6 +26,8 @@ export type CodexExecArgs = {
   skipGitRepoCheck?: boolean;
   // --output-schema
   outputSchemaFile?: string;
+  // --allow-no-prose (turn-scoped; does not waive work, schemas, or hooks)
+  allowNoProse?: boolean;
   // --config model_reasoning_effort
   modelReasoningEffort?: ModelReasoningEffort;
   // AbortSignal to cancel the execution
@@ -132,6 +134,9 @@ export class CodexExec {
     if (args.outputSchemaFile) {
       commandArgs.push("--output-schema", args.outputSchemaFile);
     }
+    if (args.allowNoProse === true) {
+      commandArgs.push("--allow-no-prose");
+    }
 
     if (args.modelReasoningEffort) {
       commandArgs.push(
@@ -168,7 +173,7 @@ export class CodexExec {
 
     if (args.images?.length) {
       for (const image of args.images) {
-        commandArgs.push("--image", image);
+        commandArgs.push("--image-path", image);
       }
     }
 

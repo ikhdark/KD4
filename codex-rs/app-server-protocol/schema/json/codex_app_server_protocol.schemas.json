@@ -21259,6 +21259,13 @@
       "TurnStartParams": {
         "$schema": "http://json-schema.org/draft-07/schema#",
         "properties": {
+          "allowNoProse": {
+            "description": "Allow an exactly empty completed final answer for this request only. Defaults to false. Does not waive required work or completion hooks, and is ignored when an output schema applies. Later accepted input revokes it.",
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
           "approvalPolicy": {
             "anyOf": [
               {

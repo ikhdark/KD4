@@ -8,6 +8,9 @@ use std::sync::OnceLock;
 use sha2::Digest;
 use sha2::Sha256;
 
+#[cfg(windows)]
+pub mod windows_process;
+
 /// Version an executable reports about itself: `--version`, the TUI,
 /// `codex doctor`, and app-server build info. Release packaging embeds it
 /// through `CODEX_RELEASE_VERSION`; other builds use the Cargo package version.

@@ -721,9 +721,9 @@ pub async fn run_main(
     let local_runtime_paths =
         ExecServerRuntimePaths::from_optional_path(arg0_paths.codex_self_exe.clone())?;
     let environment_manager = if ignore_user_config {
-        EnvironmentManager::from_env(Some(local_runtime_paths)).await
+        EnvironmentManager::from_env_with_http_client_factory(Some(local_runtime_paths), config.http_client_factory()).await
     } else {
-        EnvironmentManager::from_codex_home(codex_home.clone(), Some(local_runtime_paths)).await
+        EnvironmentManager::from_codex_home_with_http_client_factory(codex_home.clone(), Some(local_runtime_paths), config.http_client_factory()).await
     }
     .map(Arc::new)
     .map_err(std::io::Error::other)?;
@@ -1198,6 +1198,7 @@ pub async fn run_main(
                                         _ = cancelled.cancelled() => return,
                                         _ = outgoing.connection_opened_with_runtime(
                                             connection_id,
+                                            origin,
                                             Arc::clone(&worker_connection.outbound_initialized),
                                             worker_connection.disconnect.clone(),
                                         ) => {},

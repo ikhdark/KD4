@@ -92,6 +92,15 @@ impl InitializeRequestProcessor {
         let user_agent_suffix = format!("{name}; {version}");
         let mutates_global_identity = !NON_ORIGINATING_CLIENT_NAMES.contains(&name.as_str());
         let codex_home = self.config.codex_home.clone();
+        // Publish routing capability before the synchronous session commit. A
+        // canceled initializer must never expose an initialized connection with
+        // stale request eligibility. Failed initialization is still not ready.
+        self.outgoing
+            .set_connection_openai_form_elicitation(
+                connection_id,
+                supports_openai_form_elicitation,
+            )
+            .await;
         {
             let mut experimental_api_mode = self
                 .experimental_api_mode

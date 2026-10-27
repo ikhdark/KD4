@@ -16,6 +16,38 @@ pub(super) fn omitted_output_marker(omitted_bytes: usize) -> Vec<u8> {
     .into_bytes()
 }
 
+pub(super) fn split_valid_utf8_prefix_with_max<'a>(
+    buffer: &mut &'a [u8],
+    max_bytes: usize,
+    flush_incomplete: bool,
+) -> Option<&'a [u8]> {
+    if buffer.is_empty() || max_bytes == 0 {
+        return None;
+    }
+
+    let max_len = buffer.len().min(max_bytes);
+    let split = match std::str::from_utf8(&buffer[..max_len]) {
+        Ok(_) => max_len,
+        Err(error) => {
+            let valid_up_to = error.valid_up_to();
+            if valid_up_to > 0 {
+                valid_up_to
+            } else if error.error_len().is_some() || flush_incomplete {
+                // Definitively invalid bytes must make progress immediately. At the
+                // end of the stream, treat a permanently incomplete sequence the
+                // same way so every received byte is emitted exactly once.
+                1
+            } else {
+                return None;
+            }
+        }
+    };
+
+    let (prefix, remaining) = buffer.split_at(split);
+    *buffer = remaining;
+    Some(prefix)
+}
+
 /// A capped buffer that preserves a stable prefix ("head") and suffix ("tail"),
 /// dropping the middle once it exceeds the configured maximum. The buffer is
 /// symmetric meaning 50% of the capacity is allocated to the head and 50% is
@@ -135,6 +167,14 @@ impl HeadTailBuffer {
         // These bytes are not present in the cumulative producer artifact.
         self.start_offset = None;
         self.push_chunk(notice);
+    }
+
+    /// Display ordering no longer has contiguous coordinates in the raw artifact.
+    pub(crate) fn invalidate_output_ranges(&mut self) {
+        self.start_offset = None;
+        if let Some(report) = self.pending_report.as_mut() {
+            report.invalidate_output_ranges();
+        }
     }
 
     pub(crate) fn has_unreported_output(&self) -> bool {

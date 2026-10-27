@@ -1101,8 +1101,13 @@ impl CodeModeService {
             return Err(serde_json::json!({"category":"retained_answer_stale",
                 "reason":"input or the output schema changed after the refusal; print the answer"}));
         }
-        if codex_utils_output_truncation::model_token_count(&retained.text) > limit {
-            return Err(serde_json::json!({"category":"output_budget", "limit":limit}));
+        let required_tokens = codex_utils_output_truncation::model_token_count(&retained.text);
+        if required_tokens > limit {
+            // A smaller retry budget does not invalidate an otherwise fresh
+            // answer. Keep it for another empty retry with an adequate budget.
+            retained_answers.insert(turn.sub_id.clone(), retained);
+            return Err(serde_json::json!({"category":"output_budget", "limit":limit,
+                "required_tokens":required_tokens, "retained_answer":"kept"}));
         }
         Ok(Some(retained.text))
     }

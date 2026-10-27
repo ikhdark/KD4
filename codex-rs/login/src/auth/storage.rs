@@ -202,6 +202,12 @@ pub(super) trait AuthStorageBackend: Debug + Send + Sync {
     fn load(&self) -> std::io::Result<Option<AuthDotJson>>;
     fn save(&self, auth: &AuthDotJson) -> std::io::Result<()>;
     fn delete(&self) -> std::io::Result<bool>;
+    fn delete_if_lifecycle_unchanged(&self, expected: Option<&AuthDotJson>) -> std::io::Result<bool> {
+        if self.load()?.as_ref() != expected {
+            return Err(auth_changed());
+        }
+        self.delete()
+    }
     fn save_if_unchanged(
         &self,
         expected: Option<&AuthDotJson>,
@@ -342,6 +348,26 @@ impl AuthStorageBackend for TransactionalAuthStorage {
 
     fn delete(&self) -> std::io::Result<bool> {
         self.transaction(|revision| {
+            self.advance(revision)?;
+            self.inner.delete()
+        })
+    }
+
+    fn delete_if_lifecycle_unchanged(&self, expected: Option<&AuthDotJson>) -> std::io::Result<bool> {
+        self.transaction(|revision| {
+            let observed = self
+                .observed
+                .lock()
+                .map_err(|_| std::io::Error::other("auth snapshot lock poisoned"))?
+                .clone();
+            // Managed refreshes keep their lifecycle and must still be
+            // retired. Runtime external credentials also have direct
+            // process-local writers, so fence their payload separately.
+            if observed.as_deref() != Some(revision.as_str())
+                || (self.ephemeral && self.inner.load()?.as_ref() != expected)
+            {
+                return Err(auth_changed());
+            }
             self.advance(revision)?;
             self.inner.delete()
         })

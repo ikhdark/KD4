@@ -38,10 +38,11 @@ pub(crate) async fn connect(
     tls_config: Arc<ClientConfig>,
     proxy_route: OutboundProxyRoute,
     tcp_nodelay: TcpNodelay,
+    direct_route_only: bool,
 ) -> Result<(ConnectionInner, Response), WebSocketError> {
     // An explicit port must not let an unsupported scheme reach TCP or proxy setup.
     uri_mode(request.uri())?;
-    connect_route(request, config, tls_config, proxy_route, tcp_nodelay)
+    connect_route(request, config, tls_config, proxy_route, tcp_nodelay, direct_route_only)
         .await
         .map_err(redact_proxy_config_error)
 }
@@ -52,6 +53,7 @@ async fn connect_route(
     tls_config: Arc<ClientConfig>,
     proxy_route: OutboundProxyRoute,
     tcp_nodelay: TcpNodelay,
+    direct_route_only: bool,
 ) -> Result<(ConnectionInner, Response), WebSocketError> {
     // Resolve the default environment path without rediscovering system policy.
     // Snapshot bypass matching below preserves the WebSocket transport contract.
@@ -69,6 +71,23 @@ async fn connect_route(
     let mut routes = routes.into_iter().peekable();
     let stream = loop {
         let route = routes.next().ok_or_else(invalid_proxy_config)?;
+        if direct_route_only {
+            let direct = match &route {
+                OutboundProxyRoute::Direct => true,
+                OutboundProxyRoute::Proxy { no_proxy, .. } => no_proxy
+                    .as_deref()
+                    .is_some_and(|bypass| no_proxy_matches(bypass, request.uri())),
+                OutboundProxyRoute::Fallback { .. } | OutboundProxyRoute::TransportDefault => false,
+            };
+            if !direct {
+                // Do not skip a mandatory/PAC proxy to try a later DIRECT alternative.
+                // No TCP or CONNECT operation for this route has started.
+                return Err(WebSocketError::Io(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "credential-bound WebSocket requires an explicitly direct or bypassed route; use a permitted local route or private stdio",
+                )));
+            }
+        }
         match connect_routed_stream(&request, &tls_config, route, tcp_nodelay).await {
             Ok(stream) => break stream,
             Err(error) if routes.peek().is_some()

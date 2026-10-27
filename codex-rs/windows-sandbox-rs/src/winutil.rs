@@ -27,10 +27,24 @@ pub use codex_shell_command::quote_windows_arg;
 
 /// Build a Windows command line for CreateProcess-style APIs.
 pub fn argv_to_command_line(argv: &[String]) -> String {
-    argv.iter()
-        .map(|arg| quote_windows_arg(arg))
-        .collect::<Vec<_>>()
-        .join(" ")
+    let Some((program, args)) = argv.split_first() else {
+        return String::new();
+    };
+    // Share the native pipe/ConPTY CMD contract: only a final /c script is
+    // raw-quoted. Ordinary executable arguments retain CRT escaping.
+    let payload_index = codex_utils_pty::windows_cmd_payload_index(OsStr::new(program), args);
+    let mut command_line = quote_windows_arg(program);
+    for (index, arg) in args.iter().enumerate() {
+        command_line.push(' ');
+        if Some(index) == payload_index {
+            command_line.push('"');
+            command_line.push_str(arg);
+            command_line.push('"');
+        } else {
+            command_line.push_str(&quote_windows_arg(arg));
+        }
+    }
+    command_line
 }
 
 // Produce a readable description for a Win32 error code.

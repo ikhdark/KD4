@@ -347,6 +347,10 @@ pub struct StoredTurn {
     pub items: Vec<RolloutItem>,
     /// Opaque serialized turn metadata supplied by a projected durable store.
     pub metadata_json: Option<Vec<u8>>,
+    /// In-process projection snapshot, avoiding an encode/decode of identical API types.
+    /// Serialized metadata remains supported for stores without a typed projection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub materialized_turn: Option<codex_app_server_protocol::Turn>,
     /// Semantic turn creation timestamp in milliseconds, when supplied by a projected durable
     /// store.
     pub turn_created_at_ms: Option<i64>,
@@ -393,13 +397,16 @@ pub struct ListItemsParams {
 }
 
 /// A projected app-server `ThreadItem` snapshot within a turn.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct StoredThreadItem {
     pub turn_id: Option<String>,
     pub item_key: String,
     pub item_ordinal: u64,
     pub item_created_at_ms: i64,
     pub materialized_thread_item_json: Vec<u8>,
+    /// Owned response snapshot; the cached projection retains its original item.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub materialized_thread_item: Option<codex_app_server_protocol::ThreadItem>,
 }
 
 /// A page of persisted items within a thread, optionally filtered to a turn.

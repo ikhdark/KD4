@@ -43,4 +43,9 @@ personality?: Personality | null, /**
  * Optional JSON Schema used to constrain the final assistant message for
  * this turn.
  */
-outputSchema?: JsonValue | null};
+outputSchema?: JsonValue | null, /**
+ * Allow an exactly empty completed final answer for this request only.
+ * Defaults to false. Does not waive required work or completion hooks,
+ * and is ignored when an output schema applies. Later accepted input revokes it.
+ */
+allowNoProse?: boolean | null};

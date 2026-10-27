@@ -46,6 +46,14 @@ pub use spawn_agents_on_csv::SpawnAgentsOnCsvHandler;
 
 const DEFAULT_AGENT_JOB_CONCURRENCY: usize = 16;
 const MAX_AGENT_JOB_CONCURRENCY: usize = 64;
+// Input admission is independent of worker concurrency. Charge cloned map keys,
+// values and item/ID bookkeeping as well as bounding the source and row count.
+const MAX_AGENT_JOB_CSV_BYTES: u64 = 8 * 1024 * 1024;
+const MAX_AGENT_JOB_CSV_ROWS: usize = 10_000;
+const MAX_AGENT_JOB_CSV_COLUMNS: usize = 128;
+const MAX_AGENT_JOB_CSV_HEADER_BYTES: usize = 1024;
+const MAX_AGENT_JOB_CSV_FIELD_BYTES: usize = 64 * 1024;
+const MAX_AGENT_JOB_CSV_MATERIALIZED_BYTES: usize = 32 * 1024 * 1024;
 const MISSING_STATUS_RECHECK_INTERVAL: Duration = Duration::from_millis(250);
 const DEFAULT_AGENT_JOB_ITEM_TIMEOUT: Duration = Duration::from_secs(60 * 30);
 const ORPHANED_AGENT_JOB_RECONCILIATION_INTERVAL: Duration = Duration::from_secs(5);
@@ -1438,23 +1446,151 @@ fn default_output_csv_path(input_csv_path: &AbsolutePathBuf, job_id: &str) -> Ab
     output_dir.join(format!("{stem}.agent-job-{job_id}.csv"))
 }
 
-fn parse_csv(content: &str) -> Result<(Vec<String>, Vec<Vec<String>>), String> {
+fn parse_csv(
+    input: impl std::io::Read,
+    id_column: Option<&str>,
+    cancellation_token: &CancellationToken,
+) -> Result<(Vec<String>, Vec<codex_state::AgentJobItemCreateParams>), FunctionCallError> {
+    struct BoundedInput<'a, R> {
+        input: R,
+        remaining: u64,
+        cancellation_token: &'a CancellationToken,
+        observe: bool,
+        read_calls: usize,
+        read_wall_ns: u64,
+    }
+    impl<R: std::io::Read> std::io::Read for BoundedInput<'_, R> {
+        fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+            if self.cancellation_token.is_cancelled() {
+                return Err(std::io::Error::other("agent job cancelled during CSV setup"));
+            }
+            // Bound each blocking read and probe one byte past the limit so a
+            // file growing after metadata admission cannot silently truncate.
+            let limit = bytes.len().min(8192).min((self.remaining + 1) as usize);
+            let observed = self.observe.then(std::time::Instant::now);
+            let read = self.input.read(&mut bytes[..limit])?;
+            if let Some(started) = observed {
+                self.read_calls += 1;
+                self.read_wall_ns = self.read_wall_ns.saturating_add(started.elapsed().as_nanos() as u64);
+            }
+            if read as u64 > self.remaining {
+                return Err(std::io::Error::other(format!(
+                    "csv input exceeds {MAX_AGENT_JOB_CSV_BYTES} bytes; split the input into smaller jobs"
+                )));
+            }
+            self.remaining -= read as u64;
+            Ok(read)
+        }
+    }
+    let invalid = |message: String| FunctionCallError::RespondToModel(message);
+    let check_cancelled = || {
+        if cancellation_token.is_cancelled() {
+            Err(invalid("agent job cancelled during CSV setup".to_string()))
+        } else {
+            Ok(())
+        }
+    };
+    check_cancelled()?;
     let mut reader = csv::ReaderBuilder::new()
         .has_headers(true)
         .flexible(true)
-        .from_reader(content.as_bytes());
-    let headers_record = reader.headers().map_err(|err| err.to_string())?;
+        .from_reader(BoundedInput {
+            input,
+            remaining: MAX_AGENT_JOB_CSV_BYTES,
+            cancellation_token,
+            observe: tracing::enabled!(target: "codex_csv_admission", tracing::Level::DEBUG),
+            read_calls: 0,
+            read_wall_ns: 0,
+        });
+    let headers_record = reader.headers().map_err(|error| {
+        invalid(format!("failed to parse csv input: {error}"))
+    })?;
+    if headers_record.is_empty() {
+        return Err(invalid("csv input must include a header row".to_string()));
+    }
+    if headers_record.len() > MAX_AGENT_JOB_CSV_COLUMNS
+        || headers_record.iter().any(|header| header.len() > MAX_AGENT_JOB_CSV_HEADER_BYTES)
+    {
+        return Err(invalid(format!(
+            "csv headers exceed admission limits ({MAX_AGENT_JOB_CSV_COLUMNS} columns, {MAX_AGENT_JOB_CSV_HEADER_BYTES} bytes per header); split the input into smaller jobs"
+        )));
+    }
     let mut headers: Vec<String> = headers_record.iter().map(str::to_string).collect();
     if let Some(first) = headers.first_mut() {
         *first = first.trim_start_matches('\u{feff}').to_string();
     }
-    let mut rows = Vec::new();
-    for record in reader.records() {
-        let record = record.map_err(|err| err.to_string())?;
-        let row: Vec<String> = record.iter().map(str::to_string).collect();
-        rows.push(row);
+    ensure_unique_headers(&headers)?;
+    let id_column_index = id_column.map(|column| {
+        headers.iter().position(|header| header == column).ok_or_else(|| {
+            invalid(format!("id_column {column} was not found in csv headers"))
+        })
+    }).transpose()?;
+    let mut items = Vec::new();
+    let mut item_ids = JobItemIds::default();
+    let mut materialized_bytes = headers.iter().map(|header| header.len() + 128).sum::<usize>();
+    let mut record = csv::StringRecord::new();
+    loop {
+        check_cancelled()?;
+        if !reader.read_record(&mut record).map_err(|error| {
+            invalid(format!("failed to parse csv input: {error}"))
+        })? {
+            break;
+        }
+        check_cancelled()?;
+        let idx = items.len();
+        if idx >= MAX_AGENT_JOB_CSV_ROWS {
+            return Err(invalid(format!(
+                "csv input exceeds {MAX_AGENT_JOB_CSV_ROWS} rows; split the input into smaller jobs"
+            )));
+        }
+        if record.len() != headers.len() {
+            return Err(invalid(format!(
+                "csv row {} has {} fields but header has {}",
+                idx + 2, record.len(), headers.len()
+            )));
+        }
+        if record.iter().any(|field| field.len() > MAX_AGENT_JOB_CSV_FIELD_BYTES) {
+            return Err(invalid(format!(
+                "csv row {} exceeds {MAX_AGENT_JOB_CSV_FIELD_BYTES} bytes per field; split large fields before importing",
+                idx + 2
+            )));
+        }
+        let source_id = id_column_index.and_then(|index| record.get(index))
+            .filter(|value| !value.trim().is_empty());
+        if source_id.is_some_and(|id| id.len() > MAX_AGENT_JOB_CSV_HEADER_BYTES) {
+            return Err(invalid(format!(
+                "csv row {} source ID before collision suffixing exceeds {MAX_AGENT_JOB_CSV_HEADER_BYTES} bytes",
+                idx + 2
+            )));
+        }
+        let row_bytes = headers.iter().zip(record.iter()).fold(256usize, |bytes, (header, value)| {
+            bytes.saturating_add(header.len()).saturating_add(value.len()).saturating_add(128)
+        }).saturating_add(source_id.map_or(128, |id| id.len().saturating_add(32).saturating_mul(4)));
+        materialized_bytes = materialized_bytes.saturating_add(row_bytes);
+        if materialized_bytes > MAX_AGENT_JOB_CSV_MATERIALIZED_BYTES {
+            return Err(invalid(format!(
+                "csv materialized input exceeds {MAX_AGENT_JOB_CSV_MATERIALIZED_BYTES} charged bytes; split the input into smaller jobs"
+            )));
+        }
+        let item_id = item_ids.allocate(source_id.map(str::to_owned)
+            .unwrap_or_else(|| format!("row-{}", idx + 1)))?;
+        let row_object = headers.iter().zip(record.iter())
+            .map(|(header, value)| (header.clone(), Value::String(value.to_owned())))
+            .collect::<serde_json::Map<_, _>>();
+        items.push(codex_state::AgentJobItemCreateParams {
+            item_id,
+            row_index: idx as i64,
+            source_id: source_id.map(str::to_owned),
+            row_json: Value::Object(row_object),
+        });
     }
-    Ok((headers, rows))
+    check_cancelled()?;
+    tracing::debug!(target: "codex_csv_admission", phase = "parse_complete",
+        rows = items.len(), columns = headers.len(),
+        source_bytes = MAX_AGENT_JOB_CSV_BYTES - reader.get_ref().remaining,
+        read_calls = reader.get_ref().read_calls, read_wall_us = reader.get_ref().read_wall_ns / 1000,
+        materialized_charged_bytes = materialized_bytes);
+    Ok((headers, items))
 }
 
 #[derive(Default)]

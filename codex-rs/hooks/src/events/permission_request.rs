@@ -44,6 +44,8 @@ pub struct PermissionRequestRequest {
     pub permission_mode: String,
     pub tool_name: String,
     pub matcher_aliases: Vec<String>,
+    pub mcp_server_name: Option<String>,
+    pub mcp_tool_name: Option<String>,
     pub run_id_suffix: String,
     pub tool_input: Value,
 }
@@ -188,6 +190,8 @@ fn build_command_input(request: PermissionRequestRequest) -> PermissionRequestCo
         model: request.model,
         permission_mode: request.permission_mode,
         tool_name: request.tool_name,
+        mcp_server_name: request.mcp_server_name,
+        mcp_tool_name: request.mcp_tool_name,
         tool_input: request.tool_input,
     }
 }

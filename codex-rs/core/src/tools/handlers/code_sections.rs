@@ -357,17 +357,18 @@ pub(super) fn parse_with_completeness(
 /// Resolve the parser's context-dependent module candidates when a compilation
 /// owner supplies crate-root context. No directory enumeration or macro
 /// evaluation is performed; missing declared modules remain named inputs.
-pub(crate) fn compilation_module_paths(path: &Path, source: &str, crate_root: bool) -> Vec<std::path::PathBuf> {
-    let Some(items) = parse(&path.to_string_lossy(), source, "compilation-input",
-        Instant::now() + std::time::Duration::from_secs(2)) else { return Vec::new(); };
+pub(crate) fn compilation_module_paths(path: &Path, source: &str, crate_root: bool) -> (Vec<std::path::PathBuf>, bool) {
+    let Some((items, complete)) = parse_with_completeness(&path.to_string_lossy(), source, "compilation-input",
+        Instant::now() + std::time::Duration::from_secs(2)) else { return (Vec::new(), false); };
     let use_first = crate_root || path.file_stem().is_some_and(|stem| stem == "mod");
-    items.into_iter().filter(|item| item.kind == "mod" && !item.in_test_context).flat_map(|item| {
+    let paths = items.into_iter().filter(|item| item.kind == "mod" && !item.in_test_context).flat_map(|item| {
         if let Some(path) = item.linked_path { return vec![std::path::PathBuf::from(path)]; }
         let count = item.module_candidate_group_size.min(item.linked_path_candidates.len());
         let start = if use_first { 0 } else { item.linked_path_candidates.len() - count };
         item.linked_path_candidates.into_iter().skip(start).take(count)
             .map(std::path::PathBuf::from).collect::<Vec<_>>()
-    }).collect()
+    }).collect();
+    (paths, complete)
 }
 
 /// Whether `after` removes or rewrites a test item of `before`: an item under

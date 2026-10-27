@@ -1,5 +1,5 @@
+use crate::winutil::to_wide;
 use anyhow::Result;
-use codex_windows_sandbox::to_wide;
 use std::ffi::OsStr;
 use windows_sys::Win32::Foundation::CloseHandle;
 use windows_sys::Win32::Foundation::GetLastError;
@@ -13,7 +13,7 @@ use windows_sys::Win32::System::Threading::WaitForSingleObject;
 
 const SETUP_MUTEX_NAME: &str = "Global\\CodexSandboxSetup";
 
-pub(super) struct SetupMutexGuard {
+pub struct SetupMutexGuard {
     handle: HANDLE,
 }
 
@@ -28,11 +28,15 @@ impl Drop for SetupMutexGuard {
     }
 }
 
-pub(super) fn acquire_setup_mutex() -> Result<SetupMutexGuard> {
-    acquire_named_setup_mutex(SETUP_MUTEX_NAME)
+pub fn acquire_setup_mutex() -> Result<SetupMutexGuard> {
+    acquire_named_setup_mutex(SETUP_MUTEX_NAME, INFINITE)
 }
 
-fn acquire_named_setup_mutex(name: &str) -> Result<SetupMutexGuard> {
+pub(crate) fn acquire_setup_mutex_for_launch() -> Result<SetupMutexGuard> {
+    acquire_named_setup_mutex(SETUP_MUTEX_NAME, 5_000)
+}
+
+fn acquire_named_setup_mutex(name: &str, timeout_ms: u32) -> Result<SetupMutexGuard> {
     let name = to_wide(OsStr::new(name));
     // SAFETY: name is a terminated UTF-16 buffer retained for the call, and the optional
     // security attributes are null.
@@ -45,7 +49,7 @@ fn acquire_named_setup_mutex(name: &str) -> Result<SetupMutexGuard> {
 
     // SAFETY: handle is the live mutex handle returned by CreateMutexW and is not closed while
     // the wait is in progress.
-    let wait_result = unsafe { WaitForSingleObject(handle, INFINITE) };
+    let wait_result = unsafe { WaitForSingleObject(handle, timeout_ms) };
     if wait_result != WAIT_OBJECT_0 && wait_result != WAIT_ABANDONED {
         // SAFETY: GetLastError reads only this thread's error code immediately after the
         // unsuccessful wait.
@@ -62,4 +66,3 @@ fn acquire_named_setup_mutex(name: &str) -> Result<SetupMutexGuard> {
 
     Ok(SetupMutexGuard { handle })
 }
-

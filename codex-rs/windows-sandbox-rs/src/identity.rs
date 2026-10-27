@@ -32,6 +32,7 @@ struct SandboxIdentity {
 pub struct SandboxCreds {
     pub username: String,
     pub password: String,
+    pub(crate) offline_proxy_settings: Option<crate::setup::OfflineProxySettings>,
 }
 
 /// Returns true when the on-disk setup artifacts exist and match the current
@@ -206,6 +207,12 @@ pub(crate) fn require_logon_sandbox_creds_with_additional_read_roots(
         env_map,
         network_identity,
     );
+    let machine_policy_matches = !network_identity.uses_offline_identity()
+        || crate::offline_network_policy::policy_matches(
+            crate::setup::OFFLINE_USERNAME,
+            &desired_offline_proxy_settings.proxy_ports,
+            desired_offline_proxy_settings.allow_local_binding,
+        )?;
     // NOTE: Do not add CODEX_HOME/.sandbox to `needed_write`; it must remain non-writable by the
     // restricted capability token. The setup helper's `lock_sandbox_dir` is responsible for
     // granting the sandbox group access to this directory without granting the capability SID.
@@ -217,6 +224,9 @@ pub(crate) fn require_logon_sandbox_creds_with_additional_read_roots(
                 marker.request_mismatch_reason(network_identity, &desired_offline_proxy_settings)
             {
                 setup_reason = Some(reason);
+                None
+            } else if !machine_policy_matches {
+                setup_reason = Some("machine-wide offline network policy differs".to_string());
                 None
             } else {
                 let selected = match select_identity(network_identity, codex_home) {
@@ -299,6 +309,8 @@ pub(crate) fn require_logon_sandbox_creds_with_additional_read_roots(
     Ok(SandboxCreds {
         username: identity.username,
         password: identity.password,
+        offline_proxy_settings: network_identity.uses_offline_identity()
+            .then_some(desired_offline_proxy_settings),
     })
 }
 

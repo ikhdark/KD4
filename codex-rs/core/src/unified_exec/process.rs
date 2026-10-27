@@ -1,5 +1,6 @@
 #![allow(clippy::module_inception)]
 
+use std::borrow::Cow;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 use std::sync::atomic::AtomicBool;
@@ -36,7 +37,9 @@ use codex_utils_pty::SpawnedPty;
 use super::PendingSpawnRegistration;
 use super::UNIFIED_EXEC_OUTPUT_MAX_TOKENS;
 use super::UnifiedExecError;
+use super::async_watcher::lagged_output_marker;
 use super::head_tail_buffer::HeadTailBuffer;
+use super::head_tail_buffer::split_valid_utf8_prefix_with_max;
 use super::process_state::ProcessState;
 
 const EARLY_EXIT_GRACE_PERIOD: Duration = Duration::from_millis(150);
@@ -99,14 +102,54 @@ impl SpawnLifecycle for ObservedSpawnLifecycle {
 
 pub(crate) type OutputBuffer = Arc<Mutex<HeadTailBuffer>>;
 
+/// Only incomplete scalars are delayed; raw streams and artifacts bypass this projection.
+#[derive(Default)]
+struct AggregateOutputDecoder {
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+}
+
+impl AggregateOutputDecoder {
+    fn decode<'a>(
+        &mut self,
+        stream: &ExecOutputStream,
+        chunk: &'a [u8],
+    ) -> (Cow<'a, [u8]>, bool) {
+        let (tail, other_tail) = match stream {
+            ExecOutputStream::Stdout => (&mut self.stdout, &self.stderr),
+            ExecOutputStream::Stderr => (&mut self.stderr, &self.stdout),
+        };
+        let mut decoded = if tail.is_empty() {
+            Cow::Borrowed(chunk)
+        } else {
+            let mut joined = std::mem::take(tail);
+            joined.extend_from_slice(chunk);
+            Cow::Owned(joined)
+        };
+        let max_bytes = decoded.len();
+        let mut remaining = decoded.as_ref();
+        while split_valid_utf8_prefix_with_max(&mut remaining, max_bytes, false).is_some() {}
+        let complete_len = decoded.len() - remaining.len();
+        // The shared live-delta decoder leaves at most three incomplete bytes.
+        tail.extend_from_slice(remaining);
+        match &mut decoded {
+            Cow::Borrowed(bytes) => *bytes = &bytes[..complete_len],
+            Cow::Owned(bytes) => bytes.truncate(complete_len),
+        }
+        (decoded, other_tail.is_empty() || complete_len == 0)
+    }
+}
+
 #[expect(
     clippy::await_holding_invalid_type,
     reason = "Acquire every output copy in a fixed order before mutating any of them"
 )]
-pub(super) async fn append_output_chunk(
+async fn append_output_chunk(
     pending: &OutputBuffer,
     completion: &OutputBuffer,
     stream: &OutputBuffer,
+    decoder: &mut AggregateOutputDecoder,
+    output_stream: &ExecOutputStream,
     chunk: &[u8],
 ) {
     // Acquire in pending/completion/stream order before mutating anything. There
@@ -114,9 +157,58 @@ pub(super) async fn append_output_chunk(
     let mut pending = pending.lock().await;
     let mut completion = completion.lock().await;
     let mut stream = stream.lock().await;
-    pending.push_chunk(chunk);
-    completion.push_chunk(chunk);
+    let (decoded, raw_order_preserved) = decoder.decode(output_stream, chunk);
+    if !raw_order_preserved {
+        pending.invalidate_output_ranges();
+        completion.invalidate_output_ranges();
+    }
+    pending.push_chunk(&decoded);
+    completion.push_chunk(&decoded);
     stream.push_chunk(chunk);
+    let observed_ranges = tracing::enabled!(target: "codex_unicode_output", tracing::Level::DEBUG)
+        .then(|| pending.output_ranges().is_some());
+    drop(stream);
+    drop(completion);
+    drop(pending);
+    if let Some(aggregate_ranges_known) = observed_ranges {
+        tracing::debug!(target: "codex_unicode_output", phase = "aggregate_chunk",
+            stream = ?output_stream, raw_bytes = chunk.len(), emitted_bytes = decoded.len(),
+            pending_stdout_bytes = decoder.stdout.len(), pending_stderr_bytes = decoder.stderr.len(),
+            raw_order_preserved, aggregate_ranges_known);
+    }
+}
+
+#[expect(
+    clippy::await_holding_invalid_type,
+    reason = "Acquire both aggregate copies in producer lock order before flushing decoder tails"
+)]
+async fn flush_aggregate_output(
+    pending: &OutputBuffer,
+    completion: &OutputBuffer,
+    decoder: &mut AggregateOutputDecoder,
+    skipped: Option<u64>,
+) {
+    if decoder.stdout.is_empty() && decoder.stderr.is_empty() {
+        return;
+    }
+    let mut pending = pending.lock().await;
+    let mut completion = completion.lock().await;
+    let marker = skipped.map(lagged_output_marker);
+    for buffer in [&mut *pending, &mut *completion] {
+        if !decoder.stdout.is_empty() && !decoder.stderr.is_empty() {
+            buffer.invalidate_output_ranges();
+        }
+        // Flush only at complete capture closure (not individual pipe EOF). Both
+        // tails begin with a leading byte, so they cannot complete each other.
+        buffer.push_chunk(&decoder.stdout);
+        buffer.push_chunk(&decoder.stderr);
+        if let Some(marker) = marker.as_ref() {
+            // A gap must not let later continuation bytes complete an old scalar.
+            buffer.push_display_notice(marker);
+        }
+    }
+    decoder.stdout.clear();
+    decoder.stderr.clear();
 }
 
 async fn snapshot_retained_output(buffer: &OutputBuffer) -> (Vec<u8>, bool) {
@@ -1080,6 +1172,7 @@ impl UnifiedExecProcess {
             let mut exit_known = false;
             let mut replay = std::collections::VecDeque::new();
             let mut capture_closed = false;
+            let mut decoder = AggregateOutputDecoder::default();
             loop {
                 let replayed = !replay.is_empty();
                 let received = if let Some(event) = replay.pop_front() {
@@ -1156,6 +1249,15 @@ impl UnifiedExecProcess {
                 match event {
                     ExecProcessEvent::OutputGap { through_seq } => {
                         let skipped = through_seq.saturating_sub(last_seq);
+                        if skipped > 0 {
+                            flush_aggregate_output(
+                                &output_buffer,
+                                &completion_output_buffer,
+                                &mut decoder,
+                                Some(skipped),
+                            )
+                            .await;
+                        }
                         if skipped > 0
                             && let Some(task) = artifact_task.as_mut()
                         {
@@ -1191,6 +1293,8 @@ impl UnifiedExecProcess {
                             &output_buffer,
                             &completion_output_buffer,
                             stream_buffer,
+                            &mut decoder,
+                            &stream,
                             &bytes,
                         )
                         .await;
@@ -1232,6 +1336,13 @@ impl UnifiedExecProcess {
                     }
                 }
             }
+            flush_aggregate_output(
+                &output_buffer,
+                &completion_output_buffer,
+                &mut decoder,
+                None,
+            )
+            .await;
             output_closed.store(true, Ordering::Release);
             output_closed_notify.notify_waiters();
             cancellation_token.cancel();
@@ -1271,6 +1382,7 @@ impl UnifiedExecProcess {
                 RawOutputArtifactTask::spawn_with_target(raw_output_artifact, artifact_ready, raw_output_target);
             let mut stdout_open = true;
             let mut stderr_open = true;
+            let mut decoder = AggregateOutputDecoder::default();
             loop {
                 let output = tokio::select! {
                     chunk = stdout_rx.recv(), if stdout_open => match chunk {
@@ -1307,6 +1419,8 @@ impl UnifiedExecProcess {
                         &output_buffer,
                         &completion_output_buffer,
                         stream_buffer,
+                        &mut decoder,
+                        &output.stream,
                         &output.bytes,
                     )
                     .await;
@@ -1314,6 +1428,13 @@ impl UnifiedExecProcess {
                     output_notify.notify_waiters();
                 }
             }
+            flush_aggregate_output(
+                &output_buffer,
+                &completion_output_buffer,
+                &mut decoder,
+                None,
+            )
+            .await;
             if !capture.complete() {
                 if let Some(task) = artifact_task.as_mut() {
                     task.mark_output_gap();

@@ -6,11 +6,14 @@ use std::os::windows::io::RawHandle;
 use std::sync::Mutex;
 use winapi::um::jobapi2::AssignProcessToJobObject;
 use winapi::um::jobapi2::CreateJobObjectW;
+use winapi::um::jobapi2::QueryInformationJobObject;
 use winapi::um::jobapi2::SetInformationJobObject;
 use winapi::um::jobapi2::TerminateJobObject;
 use winapi::um::winnt::JOB_OBJECT_LIMIT_BREAKAWAY_OK;
 use winapi::um::winnt::JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
 use winapi::um::winnt::JOBOBJECT_EXTENDED_LIMIT_INFORMATION;
+use winapi::um::winnt::JOBOBJECT_BASIC_ACCOUNTING_INFORMATION;
+use winapi::um::winnt::JobObjectBasicAccountingInformation;
 use winapi::um::winnt::JobObjectExtendedLimitInformation;
 
 /// Owns a Windows Job Object used to terminate a spawned process tree.
@@ -31,6 +34,23 @@ enum JobState {
 }
 
 impl JobObject {
+    fn custody_diagnostic(&self, phase: &str, flags: u32) {
+        if std::env::var("CODEX_SANDBOX_CUSTODY_DIAGNOSTICS").ok().as_deref() != Some("1") {
+            return;
+        }
+        let mut accounting: JOBOBJECT_BASIC_ACCOUNTING_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: This owner retains the job and the exact accounting output.
+        let queried = unsafe { QueryInformationJobObject(
+            self.handle.as_raw_handle().cast(), JobObjectBasicAccountingInformation,
+            std::ptr::addr_of_mut!(accounting).cast(),
+            std::mem::size_of_val(&accounting) as u32, std::ptr::null_mut(),
+        ) };
+        static ORIGIN: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+        let elapsed = ORIGIN.get_or_init(std::time::Instant::now).elapsed().as_micros();
+        eprintln!("job_custody observer_pid={} t_us={} job={} phase={} flags={} query={} active={}",
+            std::process::id(), elapsed, self.handle.as_raw_handle() as usize, phase, flags, queried, accounting.ActiveProcesses);
+    }
+
     /// Creates a Job Object configured to terminate all members when its last handle closes.
     pub fn create() -> io::Result<Self> {
         // SAFETY: Both null arguments request the default security descriptor and an unnamed
@@ -103,7 +123,9 @@ impl JobObject {
         if *state != JobState::Active {
             return Err(io::Error::other("job containment is no longer active"));
         }
-        Self::set_limit_flags(&self.handle, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE)
+        Self::set_limit_flags(&self.handle, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE)?;
+        self.custody_diagnostic("contained", JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE);
+        Ok(())
     }
 
     /// Allows contained descendants to keep running after the root exits normally.
@@ -125,6 +147,7 @@ impl JobObject {
         }
 
         Self::set_limit_flags(&self.handle, JOB_OBJECT_LIMIT_BREAKAWAY_OK)?;
+        self.custody_diagnostic("preserved", JOB_OBJECT_LIMIT_BREAKAWAY_OK);
         *state = JobState::PreserveDescendants;
         Ok(())
     }
@@ -143,6 +166,7 @@ impl JobObject {
 
         // SAFETY: self.handle owns the live job throughout the call; the exit code is a scalar
         // and the state mutex serializes transitions.
+        self.custody_diagnostic("terminate_requested", 0);
         let terminated = unsafe {
             TerminateJobObject(self.handle.as_raw_handle().cast(), /*uExitCode*/ 1)
         };

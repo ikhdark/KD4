@@ -2276,10 +2276,23 @@ function Test-DesktopRuntimeProof {
         if ($process.ExitCode -ne 0) {
             throw "Desktop runtime probe exited with $($process.ExitCode): $($stderr.Trim())"
         }
-        # Older doctor binaries can report ok from a backend-only receipt. This
-        # script must not promote that to proof of the checked GUI's connection.
-        # No GUI PID/creation identity and authenticated transport peer binding
-        # are currently available here, so positive activation remains unknown.
+        # Older doctors can report ok from backend-only metadata. Require the
+        # versioned live peer contract and the specifically selected GUI identity.
+        $proof = $checksProperty.Value.PSObject.Properties['desktop.runtime_chain'].Value.details
+        if ($null -ne $proof -and
+            $null -ne $proof.PSObject.Properties['Desktop GUI proof version'] -and
+            [string]$proof.'Desktop GUI proof version' -eq '1' -and
+            [string]$proof.'Desktop GUI binding' -eq 'verified live stdio peer' -and
+            [string]::Equals([string]$proof.'Desktop GUI executable', (Get-CodexDesktopExecutableProof), [StringComparison]::OrdinalIgnoreCase)) {
+            $gui = Get-Process -Id ([int]$proof.'Desktop GUI PID') -ErrorAction Stop
+            try {
+                if ([string]::Equals($gui.Path, [string]$proof.'Desktop GUI executable', [StringComparison]::OrdinalIgnoreCase) -and
+                    $gui.StartTime.ToUniversalTime().ToFileTimeUtc() -eq [long]$proof.'Desktop GUI creation time') {
+                    return $true
+                }
+            }
+            finally { $gui.Dispose() }
+        }
         if ($null -ne $ProofUnavailable) {
             $ProofUnavailable.Value = $true
         }

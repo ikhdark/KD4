@@ -45,8 +45,8 @@ pub(crate) enum ResponsesStreamRequest {
 
 /// Retry bookkeeping for one Responses stream loop.
 ///
-/// `retries` tracks the bounded provider retry budget. Connection-loss waits are
-/// tracked separately, but interactive recovery shares one elapsed-time budget.
+/// `retries` tracks the bounded generation replay budget. Pre-dispatch connection
+/// failures are tracked separately; interactive recovery shares one wait budget.
 #[derive(Debug)]
 pub(crate) struct ResponsesStreamRetryState {
     retries: u64,
@@ -204,28 +204,26 @@ pub(crate) async fn handle_retryable_response_stream_error(
         &turn_context.session_source,
         turn_context.provider.info(),
     );
+    let failed_upgrade = is_websocket_upgrade_failure(&err);
+    let pre_dispatch_failure = matches!(err, CodexErr::ConnectionFailed(_)) || failed_upgrade;
     // The ordinary dial already ran immediately. Account for a matching failed
     // speculative dial once, without inserting a backoff before transient
     // recovery or granting another retry window after persistent failure.
     if preconnect_failed && max_retries > 0 {
-        if wait_for_connection_recovery {
+        if pre_dispatch_failure {
             retry_state.connection_retries = retry_state.connection_retries.saturating_add(1);
         } else {
             retry_state.retries = retry_state.retries.saturating_add(1);
         }
     }
-    // Connection recovery has its own retry counter. It must still reach the
-    // HTTPS fallback when the WebSocket endpoint remains unavailable.
-    let retry_budget_exhausted = retry_state.retries >= max_retries
-        || (wait_for_connection_recovery && retry_state.connection_retries >= max_retries);
     // ConnectionFailed is pre-dispatch: try healthy HTTPS before spending a
-    // whole provider retry window on blocked upgrades. Stream-read failures
-    // retain their existing first-failure fallback and bounded replay policy.
-    if (matches!(
-        err,
-        CodexErr::ConnectionFailed(_) | CodexErr::ResponseStreamFailed(_)
-    ) || retry_budget_exhausted)
-        && (matches!(err, CodexErr::ConnectionFailed(_)) || !retry_budget_exhausted)
+    // whole provider retry window on blocked upgrades. HTTP upgrade failures
+    // fall back after their separate connection budget, even when it is zero.
+    // A possibly accepted generation may fall back only while replay is allowed.
+    let fallback_due = matches!(err, CodexErr::ConnectionFailed(_))
+        || (failed_upgrade && retry_state.connection_retries >= max_retries)
+        || (matches!(err, CodexErr::ResponseStreamFailed(_)) && retry_state.retries < max_retries);
+    if fallback_due
         && should_switch_fallback_transport(&err)
         && client_session
             .try_switch_fallback_transport_after_error(&turn_context.session_telemetry, &err)
@@ -240,7 +238,7 @@ pub(crate) async fn handle_retryable_response_stream_error(
         .await;
         // A post-dispatch HTTPS replay spends the same budget as a reconnect.
         // Proven pre-dispatch connection recovery does not spend that budget.
-        if !matches!(err, CodexErr::ConnectionFailed(_)) {
+        if !pre_dispatch_failure {
             retry_state.retries += 1;
         }
         if let Some(advice) = retry_after {
@@ -296,9 +294,16 @@ pub(crate) async fn handle_retryable_response_stream_error(
         return Ok(());
     }
 
-    if retry_state.retries < max_retries {
-        retry_state.retries += 1;
-        let retry_count = retry_state.retries;
+    // Failed connections and HTTP upgrades never dispatched response.create.
+    // They cannot consume the later accepted generation's replay budget.
+    let retries = if pre_dispatch_failure {
+        &mut retry_state.connection_retries
+    } else {
+        &mut retry_state.retries
+    };
+    if *retries < max_retries {
+        *retries += 1;
+        let retry_count = *retries;
         let delay = response_stream_retry_delay(&err, retry_count);
         let retry_at = retry_after
             .map(RetryAfter::deadline)
@@ -714,6 +719,21 @@ fn should_switch_fallback_transport(err: &CodexErr) -> bool {
         CodexErr::UnexpectedStatus(error) => error.status.is_server_error(),
         _ => false,
     }
+}
+
+/// Only connect_websocket attaches a ws(s) URL to an HTTP status error.
+/// Established WebSocket error frames carry no URL; ordinary HTTP failures
+/// carry http(s). Preserve that provenance and its Retry-After/diagnostics
+/// instead of treating a rejected upgrade as an accepted generation.
+fn is_websocket_upgrade_failure(err: &CodexErr) -> bool {
+    matches!(
+        err,
+        CodexErr::UnexpectedStatus(error)
+            if error.status.is_server_error()
+                && error.url.as_deref().is_some_and(|url| {
+                    url.starts_with("ws://") || url.starts_with("wss://")
+                })
+    )
 }
 
 fn is_server_busy(err: &CodexErr) -> bool {

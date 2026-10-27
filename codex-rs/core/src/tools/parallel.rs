@@ -742,7 +742,7 @@ enum WorkspaceResourceGateGuard {
 
 enum WorkspaceGateGuard {
     ReadCohort {
-        _guard: Arc<OwnedRwLockWriteGuard<()>>,
+        _guard: Arc<WorkspaceReadCohort>,
     },
     HookExclusive {
         _guard: Arc<OwnedRwLockWriteGuard<()>>,
@@ -811,10 +811,15 @@ type WorkspaceGlobalHolders = Arc<Mutex<WorkspaceGlobalState>>;
 #[derive(Debug, Default)]
 struct WorkspaceGlobalState {
     holders: Vec<Arc<WorkspaceGateHolder>>,
-    read_cohort: Weak<OwnedRwLockWriteGuard<()>>,
+    read_cohort: Weak<WorkspaceReadCohort>,
     cohort_closed: bool,
     cohort_arrivals: usize,
-    cohort_epoch: u64,
+}
+
+struct WorkspaceReadCohort {
+    admission: futures::future::Shared<
+        futures::future::BoxFuture<'static, Arc<OwnedRwLockWriteGuard<()>>>,
+    >,
 }
 
 fn close_read_cohort(holders: &WorkspaceGlobalHolders) {
@@ -822,40 +827,50 @@ fn close_read_cohort(holders: &WorkspaceGlobalHolders) {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     state.cohort_closed = true;
-    state.cohort_epoch = state.cohort_epoch.wrapping_add(1);
 }
 
 async fn acquire_read_cohort(
     gate: Arc<RwLock<()>>,
     timing: &Arc<TurnTimingState>,
     holders: &WorkspaceGlobalHolders,
-) -> Arc<OwnedRwLockWriteGuard<()>> {
-    let epoch = {
+) -> Arc<WorkspaceReadCohort> {
+    let cohort = {
         let mut state = holders
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         // A finite cohort cannot be extended indefinitely by a read stream.
         if !state.cohort_closed
             && state.cohort_arrivals < 16
-            && let Some(guard) = state.read_cohort.upgrade()
+            && let Some(cohort) = state.read_cohort.upgrade()
         {
             state.cohort_arrivals += 1;
-            return guard;
+            cohort
+        } else {
+            // Publish the shared acquisition BEFORE waiting so readers already
+            // queued behind a writer (or a full cohort) share the next lease.
+            // Retain an exclusive barrier: known-root writers use shared global
+            // admission and must not overlap these unknown-root reads.
+            let cohort = Arc::new(WorkspaceReadCohort {
+                admission: async move { Arc::new(gate.write_owned().await) }
+                    .boxed()
+                    .shared(),
+            });
+            // Poll once under the admission mutex to establish its FIFO queue
+            // position before another cohort/writer can close or replace it.
+            // This never waits or spawns a task. All cancelled members dropping
+            // the shared future also cancel its queued acquisition/held guard.
+            let _ = cohort.admission.clone().now_or_never();
+            state.read_cohort = Arc::downgrade(&cohort);
+            state.cohort_closed = false;
+            state.cohort_arrivals = 1;
+            cohort
         }
-        state.cohort_epoch
     };
-    // Retain an EXCLUSIVE mutation barrier: known-root writers hold shared
-    // global admission, so downgrading it would allow forbidden overlap.
-    let guard = Arc::new(acquire_exclusive_workspace_gate(gate, timing).await);
-    let mut state = holders
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    state.read_cohort = Arc::downgrade(&guard);
-    // A writer may close admission between barrier grant and publication on
-    // another runtime thread. Never reopen that writer's closed cohort.
-    state.cohort_closed = state.cohort_epoch != epoch;
-    state.cohort_arrivals = 1;
-    guard
+    if cohort.admission.peek().is_none() {
+        let _waiter = LifecycleCounterGuard::increment(timing, LifecycleCounter::ParallelGateWaiter);
+        cohort.admission.clone().await;
+    }
+    cohort
 }
 
 struct WorkspaceGlobalHolder {

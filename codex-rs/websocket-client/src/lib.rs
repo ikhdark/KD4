@@ -33,6 +33,7 @@ pub struct WebSocketConnector {
     http_client_factory: HttpClientFactory,
     tls_config: Arc<ClientConfig>,
     tcp_nodelay: TcpNodelay,
+    direct_route_only: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -53,12 +54,20 @@ impl WebSocketConnector {
             http_client_factory: http_client_factory.clone(),
             tls_config: build_rustls_client_config_with_custom_ca()?,
             tcp_nodelay: TcpNodelay::Default,
+            direct_route_only: false,
         })
     }
 
     /// Disables Nagle's algorithm for latency-sensitive WebSocket connections.
     pub fn with_tcp_nodelay(mut self) -> Self {
         self.tcp_nodelay = TcpNodelay::Enabled;
+        self
+    }
+
+    /// Refuses a proxy route before dispatch instead of bypassing configured policy.
+    /// Use for credentials whose authority is confined to a direct local peer.
+    pub fn with_direct_route_only(mut self) -> Self {
+        self.direct_route_only = true;
         self
     }
 
@@ -75,12 +84,23 @@ impl WebSocketConnector {
             .resolve_proxy_route_async(route_url.clone())
             .await
             .map_err(WebSocketError::Io)?;
+        tracing::debug!(
+            target: "codex_websocket_client::routing", {
+            event.name = "codex.websocket.route_selected",
+            policy = ?self.http_client_factory.outbound_proxy_policy(),
+            route = ?proxy_route,
+            destination_port = request.uri().port_u16(),
+            direct_route_only = self.direct_route_only,
+            },
+            "WebSocket route selected without endpoint or credential content"
+        );
         let result = codex_http_client::admit_dispatch(dialer::connect(
             request,
             config,
             Arc::clone(&self.tls_config),
             proxy_route,
             self.tcp_nodelay,
+            self.direct_route_only,
         ))
         .await
         .map_err(|error| {

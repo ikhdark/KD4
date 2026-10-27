@@ -533,6 +533,7 @@ async fn start_uninitialized(args: InProcessStartArgs) -> IoResult<InProcessClie
         outgoing_message_sender
             .connection_opened_with_runtime(
                 IN_PROCESS_CONNECTION_ID,
+                codex_app_server_transport::ConnectionOrigin::InProcess,
                 Arc::clone(&outbound_initialized),
                 delivery_failure.clone(),
             )

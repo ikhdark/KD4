@@ -61,8 +61,12 @@ impl MarketplaceRequestProcessor {
         )
         .await
         .map(|outcome| {
-            // The marketplace edit bypasses ConfigManager; publish it to the next read.
-            self.config_manager.invalidate_load_cache();
+            // Removing a marketplace changes its effective plugins too, even
+            // when only the user entry (not an installed root) was removed.
+            PluginRequestProcessor::invalidate_effective_plugins_and_spawn_refresh(
+                Arc::clone(&self.thread_manager),
+                self.config_manager.clone(),
+            );
             MarketplaceRemoveResponse {
                 marketplace_name: outcome.marketplace_name,
                 installed_root: outcome.removed_installed_root,

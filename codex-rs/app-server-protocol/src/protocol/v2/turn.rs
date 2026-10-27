@@ -156,6 +156,12 @@ pub struct TurnStartParams {
     /// this turn.
     #[ts(optional = nullable)]
     pub output_schema: Option<JsonValue>,
+    /// Allow an exactly empty completed final answer for this request only.
+    /// Defaults to false. Does not waive required work or completion hooks,
+    /// and is ignored when an output schema applies. Later accepted input revokes it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional = nullable)]
+    pub allow_no_prose: Option<bool>,
 
     /// EXPERIMENTAL - Set a pre-set collaboration mode.
     /// Takes precedence over model, reasoning_effort, and developer instructions if set.

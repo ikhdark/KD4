@@ -2,15 +2,14 @@ use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 
-use codex_http_client::maybe_build_rustls_client_config_with_custom_ca;
+use codex_http_client::HttpClientFactory;
 use codex_utils_pty::ManagedRootProcess;
 use codex_utils_pty::WINDOWS_CREATE_SUSPENDED;
+use codex_websocket_client::WebSocketConnector;
 use tokio::io::AsyncBufReadExt;
 use tokio::io::BufReader;
 use tokio::process::Command;
 use tokio::time::timeout;
-use tokio_tungstenite::Connector;
-use tokio_tungstenite::connect_async_tls_with_config;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tracing::debug;
 use tracing::warn;
@@ -53,6 +52,7 @@ pub(crate) enum ExecServerReconnectStrategy {
         client_name: String,
         connect_timeout: Duration,
         initialize_timeout: Duration,
+        http_client_factory: HttpClientFactory,
     },
 }
 
@@ -74,6 +74,7 @@ impl ExecServerReconnectStrategy {
                 client_name,
                 connect_timeout,
                 initialize_timeout,
+                http_client_factory,
             } => {
                 let bundle = provider.connect_bundle(identity.public_key()).await?;
                 ExecServerClient::open_noise_rendezvous_connection(NoiseRendezvousConnectArgs {
@@ -83,6 +84,7 @@ impl ExecServerReconnectStrategy {
                     connect_timeout: *connect_timeout,
                     initialize_timeout: *initialize_timeout,
                     resume_session_id: Some(session_id.to_string()),
+                    http_client_factory: http_client_factory.clone(),
                 })
                 .await
             }
@@ -96,6 +98,7 @@ impl ExecServerClient {
     /// and authorization without replacing the harness identity.
     pub(crate) async fn connect_for_transport(
         transport_params: crate::client_api::ExecServerTransportParams,
+        http_client_factory: HttpClientFactory,
     ) -> Result<Self, ExecServerError> {
         match transport_params {
             crate::client_api::ExecServerTransportParams::WebSocketUrl {
@@ -109,6 +112,7 @@ impl ExecServerClient {
                     connect_timeout,
                     initialize_timeout,
                     resume_session_id: None,
+                    http_client_factory,
                 })
                 .await
             }
@@ -122,9 +126,14 @@ impl ExecServerClient {
                     client_name: ENVIRONMENT_CLIENT_NAME.to_string(),
                     connect_timeout: DEFAULT_REMOTE_EXEC_SERVER_CONNECT_TIMEOUT,
                     initialize_timeout: DEFAULT_REMOTE_EXEC_SERVER_INITIALIZE_TIMEOUT,
+                    http_client_factory: http_client_factory.clone(),
                 };
                 let (connection, options) =
-                    Self::open_initial_noise_rendezvous_connection(&provider, &identity).await?;
+                    Self::open_initial_noise_rendezvous_connection(
+                        &provider,
+                        &identity,
+                        &http_client_factory,
+                    ).await?;
                 Self::connect_with_recovery(connection, options, Some(reconnect_strategy)).await
             }
             crate::client_api::ExecServerTransportParams::StdioCommand {
@@ -145,6 +154,7 @@ impl ExecServerClient {
     async fn open_initial_noise_rendezvous_connection(
         provider: &Arc<dyn NoiseRendezvousConnectProvider>,
         identity: &NoiseChannelIdentity,
+        http_client_factory: &HttpClientFactory,
     ) -> Result<(JsonRpcConnection, ExecServerClientConnectOptions), ExecServerError> {
         let open_connection = |bundle: NoiseRendezvousConnectBundle| {
             Self::open_noise_rendezvous_connection(NoiseRendezvousConnectArgs {
@@ -154,6 +164,7 @@ impl ExecServerClient {
                 connect_timeout: DEFAULT_REMOTE_EXEC_SERVER_CONNECT_TIMEOUT,
                 initialize_timeout: DEFAULT_REMOTE_EXEC_SERVER_INITIALIZE_TIMEOUT,
                 resume_session_id: None,
+                http_client_factory: http_client_factory.clone(),
             })
         };
         let bundle = provider.connect_bundle(identity.public_key()).await?;
@@ -196,14 +207,15 @@ impl ExecServerClient {
         let websocket_url = args.websocket_url.clone();
         let connect_timeout = args.connect_timeout;
         let (stream, _) = timeout(connect_timeout, async {
-            let connector = websocket_connector_with_custom_ca(&websocket_url).await?;
-            connect_async_tls_with_config(
-                websocket_url.as_str(),
-                Some(jsonrpc_websocket_config()),
-                /*disable_nagle*/ false,
-                connector,
-            )
-            .await
+            let mut connector = routed_websocket_connector(args.http_client_factory.clone()).await?;
+            let mut request = websocket_url.as_str().into_client_request()?;
+            if let Some(authorization) = crate::server::loopback_authorization(&websocket_url)? {
+                connector = connector.with_direct_route_only();
+                request
+                    .headers_mut()
+                    .insert(http::header::AUTHORIZATION, authorization);
+            }
+            connector.connect(request, jsonrpc_websocket_config()).await
         })
         .await
         .map_err(|_| ExecServerError::WebSocketConnectTimeout {
@@ -259,6 +271,7 @@ impl ExecServerClient {
             connect_timeout,
             initialize_timeout,
             resume_session_id,
+            http_client_factory,
         } = args;
         let NoiseRendezvousConnectBundle {
             websocket_url,
@@ -283,16 +296,11 @@ impl ExecServerClient {
             .headers_mut()
             .extend(current_trace_context_headers());
         let (stream, _) = timeout(connect_timeout, async {
-            let connector = websocket_connector_with_custom_ca(&websocket_url).await?;
-            connect_async_tls_with_config(
-                request,
-                Some(noise_relay_websocket_config()),
-                // Rendezvous sends small, latency-sensitive frames, so avoid Nagle's coalescing delay.
-                /*disable_nagle*/
-                true,
-                connector,
-            )
-            .await
+            let connector = routed_websocket_connector(http_client_factory).await?;
+            connector
+                .with_tcp_nodelay()
+                .connect(request, noise_relay_websocket_config())
+                .await
         })
         .await
         .map_err(|_| ExecServerError::WebSocketConnectTimeout {
@@ -362,24 +370,13 @@ impl ExecServerClient {
     }
 }
 
-pub(crate) async fn websocket_connector_with_custom_ca(
-    websocket_url: &str,
-) -> Result<Option<Connector>, tokio_tungstenite::tungstenite::Error> {
-    let request = websocket_url.into_client_request()?;
-    if request.uri().scheme_str() != Some("wss") {
-        return Ok(None);
-    }
-    tokio::task::spawn_blocking(|| {
-        maybe_build_rustls_client_config_with_custom_ca()
-            .map(|config| config.map(Connector::Rustls))
-            .map_err(|error| tokio_tungstenite::tungstenite::Error::Io(error.into()))
-    })
-    .await
-    .map_err(|error| {
-        tokio_tungstenite::tungstenite::Error::Io(std::io::Error::other(format!(
-            "websocket TLS configuration task failed: {error}"
-        )))
-    })?
+pub(crate) async fn routed_websocket_connector(
+    http_client_factory: HttpClientFactory,
+) -> Result<WebSocketConnector, tokio_tungstenite::tungstenite::Error> {
+    tokio::task::spawn_blocking(move || WebSocketConnector::new(&http_client_factory))
+        .await
+        .map_err(|error| tokio_tungstenite::tungstenite::Error::Io(std::io::Error::other(error)))?
+        .map_err(|error| tokio_tungstenite::tungstenite::Error::Io(error.into()))
 }
 
 fn is_rendezvous_harness_url(websocket_url: &str) -> bool {

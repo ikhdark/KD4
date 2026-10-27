@@ -105,7 +105,7 @@ fn platform_native_pty_system() -> Box<dyn portable_pty::PtySystem + Send> {
 // queue even when external sender clones remain. At most one native write is in
 // flight; terminating/releasing the process closes its PTY and releases that write.
 #[cfg(not(unix))]
-fn spawn_pty_writer<W>(mut writer: W, mut receiver: mpsc::Receiver<Vec<u8>>) -> JoinHandle<()>
+fn spawn_pty_writer<W>(mut writer: W, mut receiver: mpsc::Receiver<crate::StdinPayload>) -> JoinHandle<()>
 where
     W: std::io::Write + Send + 'static,
 {
@@ -114,9 +114,17 @@ where
         let mut windows_input = crate::WindowsTtyInputNormalizer::default();
         while let Some(bytes) = receiver.recv().await {
             #[cfg(windows)]
-            let bytes = windows_input.normalize(&bytes);
+            let normalized = windows_input.normalize(&bytes);
             let result = tokio::task::spawn_blocking(move || {
-                let result = writer.write_all(&bytes).and_then(|()| writer.flush());
+                // The blocking operation, not its abortable async waiter, owns
+                // custody while native WriteFile can still retain this input.
+                let custody = bytes;
+                #[cfg(windows)]
+                let bytes = &normalized;
+                #[cfg(not(windows))]
+                let bytes = &custody;
+                let result = writer.write_all(bytes).and_then(|()| writer.flush());
+                drop(custody);
                 (writer, result)
             })
             .await;
@@ -291,7 +299,7 @@ async fn spawn_process_portable(
 
     let killer = child.clone_killer();
 
-    let (writer_tx, writer_rx) = mpsc::channel::<Vec<u8>>(128);
+    let (writer_tx, writer_rx) = crate::stdin_channel(128);
     let (stdout_tx, stdout_rx) = mpsc::channel::<Vec<u8>>(128);
     let (_stderr_tx, stderr_rx) = mpsc::channel::<Vec<u8>>(1);
     let capture = crate::process::OutputCapture::default();
@@ -468,7 +476,7 @@ async fn spawn_process_preserving_fds(
     drop(slave);
     let process_group = Arc::new(crate::process::ProcessGroupControl::new(child.id()));
 
-    let (writer_tx, writer_rx) = mpsc::channel::<Vec<u8>>(128);
+    let (writer_tx, writer_rx) = crate::stdin_channel(128);
     let (stdout_tx, stdout_rx) = mpsc::channel::<Vec<u8>>(128);
     let (_stderr_tx, stderr_rx) = mpsc::channel::<Vec<u8>>(1);
     let capture = crate::process::OutputCapture::default();
@@ -591,7 +599,7 @@ async fn write_unix_pty_bytes(
 #[cfg(unix)]
 async fn write_unix_pty_stdin(
     writer: tokio::io::unix::AsyncFd<File>,
-    mut input: mpsc::Receiver<Vec<u8>>,
+    mut input: mpsc::Receiver<crate::StdinPayload>,
 ) -> std::io::Result<()> {
     while let Some(bytes) = input.recv().await {
         write_unix_pty_bytes(&writer, &bytes).await?;

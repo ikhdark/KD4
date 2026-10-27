@@ -392,7 +392,7 @@ impl CodexThread {
     }
 
     pub async fn cancel_start_input_receipts(&self, turn_id: &str) -> CodexResult<()> {
-        self.codex.session.cancel_start_receipts(turn_id).await
+        self.codex.session.cancel_turn_receipts(turn_id).await
     }
 
     pub async fn submit_user_input_with_reserved_turn_id(

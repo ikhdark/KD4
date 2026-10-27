@@ -2061,8 +2061,7 @@ impl ToolRegistry {
                             &hook_invocation.step_context.turn,
                             plan,
                             post_tool_use_payload.tool_use_id,
-                            post_tool_use_payload.tool_name.name().to_string(),
-                            post_tool_use_payload.tool_name.matcher_aliases().to_vec(),
+                            post_tool_use_payload.tool_name,
                             post_tool_use_payload.tool_input,
                             post_tool_use_payload.tool_response,
                         )

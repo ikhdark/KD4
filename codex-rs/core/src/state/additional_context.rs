@@ -72,7 +72,9 @@ impl AdditionalContextStore {
                 AdditionalContextDeveloperFragment::new(key.clone(), entry.value.clone())
                     .into_response_input_item();
             let bytes = serialized_item_bytes(&full_source).saturating_add(1);
-            if bytes <= remaining || entry.kind == AdditionalContextKind::Application {
+            let clipped_value = entry.kind == AdditionalContextKind::Untrusted
+                && AdditionalContextUserFragment::value_requires_recovery(&entry.value);
+            if (!clipped_value && bytes <= remaining) || entry.kind == AdditionalContextKind::Application {
                 remaining = remaining.saturating_sub(bytes);
             } else {
                 sources.push(key.clone());

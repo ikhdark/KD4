@@ -540,6 +540,13 @@ fn spawn_agent_common_properties_v2(
             )),
         ),
         (
+            "workspace_strategy".to_string(),
+            JsonSchema::string_enum(
+                vec![json!("shared"), json!("isolated")],
+                Some("Optional workspace choice. Omitted or shared uses the current checkout. Isolated creates a detached worktree with the captured source overlay; changes remain there for integration. This does not broaden inherited authority.".to_string()),
+            ),
+        ),
+        (
             "fork_turns".to_string(),
             JsonSchema::string(Some(format!(
                 "Optional fork mode. Omitted or `none` creates a lineage-preserving TaskCapsule fork with no parent conversation; prefer this for self-contained tasks. Use the smallest sufficient integer string from 1 through 5 only when prior conversation is needed. Full history (`all`) is disabled by default.{full_history_override_guidance}"

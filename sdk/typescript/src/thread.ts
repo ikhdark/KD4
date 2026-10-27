@@ -126,6 +126,7 @@ export class Thread {
           workingDirectory: options?.workingDirectory,
           skipGitRepoCheck: options?.skipGitRepoCheck,
           outputSchemaFile: schemaPath,
+          allowNoProse: turnOptions.allowNoProse,
           modelReasoningEffort: options?.modelReasoningEffort,
           signal: turnOptions.signal,
           networkAccessEnabled: options?.networkAccessEnabled,

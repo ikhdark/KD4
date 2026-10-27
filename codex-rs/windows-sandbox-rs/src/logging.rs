@@ -99,6 +99,18 @@ pub fn debug_log(msg: &str, base_dir: Option<&Path>) {
     }
 }
 
+/// Opt-in content-free process/policy receipts, independent of command debug
+/// logging. Lazy formatting keeps default launches free of diagnostic queries.
+pub fn custody_diagnostic(message: impl FnOnce() -> String, base_dir: Option<&Path>) {
+    if std::env::var("CODEX_SANDBOX_CUSTODY_DIAGNOSTICS").ok().as_deref() == Some("1") {
+        static ORIGIN: OnceLock<std::time::Instant> = OnceLock::new();
+        let elapsed = ORIGIN.get_or_init(std::time::Instant::now).elapsed().as_micros();
+        let message = format!("sandbox_custody observer_pid={} t_us={} {}", std::process::id(), elapsed, message());
+        append_line(&message, base_dir);
+        eprintln!("{message}");
+    }
+}
+
 // Unconditional note logging to the daily sandbox log.
 pub fn log_note(msg: &str, base_dir: Option<&Path>) {
     let ts = chrono::Local::now().format("%Y-%m-%d %H:%M:%S%.3f");

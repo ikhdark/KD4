@@ -34,6 +34,7 @@ codex-utils-absolute-path = { workspace = true }
 codex-utils-build-info = { workspace = true }
 codex-utils-home-dir = { workspace = true }
 codex-utils-rustls-provider = { workspace = true }
+codex-websocket-client = { workspace = true }
 constant_time_eq = { workspace = true }
 futures = { workspace = true }
 gethostname = { workspace = true }

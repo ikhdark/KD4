@@ -116,6 +116,8 @@ pub unsafe fn create_process_as_user(
     let env_block = make_env_block(env_map)?;
     let desktop = LaunchDesktop::prepare(use_private_desktop, logs_base_dir)?;
     let job = Arc::new(JobObject::create().context("create process job")?);
+    job.require_descendant_containment()
+        .context("require sandbox descendant containment")?;
     let mut pi: PROCESS_INFORMATION = std::mem::zeroed();
     let cwd_wide = to_wide(cwd);
     let env_block_len = env_block.len();
@@ -194,6 +196,14 @@ pub unsafe fn create_process_as_user(
         return Err(std::io::Error::from_raw_os_error(err)).context(msg);
     }
 
+    logging::custody_diagnostic(|| {
+        let mut member = 0;
+        let queried = unsafe { windows_sys::Win32::System::JobObjects::IsProcessInJob(
+            pi.hProcess, job.as_raw_handle() as HANDLE, &mut member,
+        ) };
+        format!("event=spawn route=pipe pid={} job={} membership_query={} member={}",
+            pi.dwProcessId, job.as_raw_handle() as usize, queried, member)
+    }, logs_base_dir);
     codex_utils_pty::process_observation::observe_process_start(
         "windows_sandbox",
         codex_utils_pty::process_observation::ProcessRole::RequestedRoot,

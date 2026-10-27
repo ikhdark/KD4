@@ -267,6 +267,7 @@ impl PreparedCodexOneShot {
                     op: Op::UserInput {
                         items: input,
                         final_output_json_schema,
+                        allow_no_prose: false,
                         responsesapi_client_metadata: None,
                         additional_context: Default::default(),
                         thread_settings: Default::default(),

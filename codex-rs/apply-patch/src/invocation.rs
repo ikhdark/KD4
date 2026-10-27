@@ -280,6 +280,7 @@ async fn try_verify_apply_patch_args(
         crate::capture_destination_preimages(&hunks, &effective_cwd, fs, sandbox).await?;
 
     let mut changes = HashMap::new();
+    let mut updates = HashMap::new();
     // Repeated updates of one file propose one change under the first hunk's
     // path, from the source it read to the last hunk's result.
     let mut first_updates = HashMap::new();
@@ -300,18 +301,18 @@ async fn try_verify_apply_patch_args(
                 } else if previous_updates.contains(&Some(index)) {
                     first_updates.insert(index, (path.clone(), prepared.original_contents.clone()));
                 }
-                let ApplyPatchFileUpdate {
-                    unified_diff,
-                    content: new_content,
-                    ..
-                } = prepared.into_file_update(/*context*/ 1);
-                ApplyPatchFileChange::Update {
-                    unified_diff,
-                    move_path: move_path
-                        .map(|path| effective_cwd.join(&path.to_string_lossy()))
-                        .transpose()?,
-                    new_content,
-                }
+                // Preflight validated every intermediate result. Only the last
+                // result is observable, so do not render discarded previews.
+                updates.insert(
+                    path,
+                    (
+                        prepared,
+                        move_path
+                            .map(|path| effective_cwd.join(&path.to_string_lossy()))
+                            .transpose()?,
+                    ),
+                );
+                continue;
             }
             (Hunk::DeleteFile { .. } | Hunk::UpdateFile { .. }, None) => {
                 return Err(ApplyPatchError::ComputeReplacements(format!(
@@ -321,6 +322,21 @@ async fn try_verify_apply_patch_args(
             }
         };
         changes.insert(path, change);
+    }
+    for (path, (prepared, move_path)) in updates {
+        let ApplyPatchFileUpdate {
+            unified_diff,
+            content: new_content,
+            ..
+        } = prepared.into_file_update(/*context*/ 1).await?;
+        changes.insert(
+            path,
+            ApplyPatchFileChange::Update {
+                unified_diff,
+                move_path,
+                new_content,
+            },
+        );
     }
     Ok(ApplyPatchAction {
         changes,

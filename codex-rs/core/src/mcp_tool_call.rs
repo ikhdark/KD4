@@ -446,20 +446,7 @@ fn changed_mcp_contract_message(tool_info: &ToolInfo) -> String {
 }
 
 fn live_mcp_hook_tool_name(tool_info: &ToolInfo) -> HookToolName {
-    let tool_name = tool_info.canonical_tool_name();
-    let joined_name = match tool_name.namespace.as_deref() {
-        Some(namespace) => format!(
-            "{}__{}",
-            namespace.trim_end_matches('_'),
-            tool_name.name.trim_start_matches('_')
-        ),
-        None => tool_name.name,
-    };
-    HookToolName::new(if joined_name.starts_with("mcp__") {
-        joined_name
-    } else {
-        format!("mcp__{joined_name}")
-    })
+    HookToolName::mcp(&tool_info.server_name, &tool_info.tool.name)
 }
 
 pub(crate) struct HandledMcpToolCall {

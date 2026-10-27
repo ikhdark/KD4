@@ -27,7 +27,6 @@ use std::ptr;
 use std::sync::atomic::Ordering;
 use std::thread;
 use std::time::Duration;
-use windows_sys::Win32::Foundation::CloseHandle;
 use windows_sys::Win32::Foundation::ERROR_BROKEN_PIPE;
 use windows_sys::Win32::Foundation::ERROR_LOGON_FAILURE;
 use windows_sys::Win32::Foundation::ERROR_NO_DATA;
@@ -335,6 +334,15 @@ pub(crate) fn spawn_runner_transport_with_admission(
     // IDs, so zero is a valid initial representation.
     let mut pi: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
     let env_block: Option<Vec<u16>> = None;
+    // Serialize policy validation plus suspended-root assignment with setup.
+    // Only this short launch transaction holds the mutex, never pipe readiness.
+    let policy_launch = sandbox_creds.offline_proxy_settings.as_ref().map(|settings| -> Result<_> {
+        let guard = crate::setup_mutex::acquire_setup_mutex_for_launch()?;
+        anyhow::ensure!(crate::offline_network_policy::policy_matches(
+            &sandbox_creds.username, &settings.proxy_ports, settings.allow_local_binding,
+        )?, "offline network policy changed during launch preparation; retry the command");
+        Ok((guard, crate::offline_network_policy::OfflinePolicyJob::open()?))
+    }).transpose()?;
 
     // CreateProcessWithLogonW uses the default child error mode by default.
     // Do not exchange the parent's process-wide mode: overlapping launches
@@ -351,7 +359,8 @@ pub(crate) fn spawn_runner_transport_with_admission(
             exe_w.as_ptr(),
             cmdline_vec.as_mut_ptr(),
             windows_sys::Win32::System::Threading::CREATE_NO_WINDOW
-                | windows_sys::Win32::System::Threading::CREATE_UNICODE_ENVIRONMENT,
+                | windows_sys::Win32::System::Threading::CREATE_UNICODE_ENVIRONMENT
+                | if policy_launch.is_some() { windows_sys::Win32::System::Threading::CREATE_SUSPENDED } else { 0 },
             env_block
                 .as_ref()
                 .map(|block| block.as_ptr() as *const c_void)
@@ -377,8 +386,19 @@ pub(crate) fn spawn_runner_transport_with_admission(
     // Own process rollback until the async caller accepts transport delivery.
     // SAFETY: CreateProcessWithLogonW returned this unique owned process handle.
     let runner = RunnerProcess { process: unsafe { File::from_raw_handle(pi.hProcess as _) }, disarmed: false };
-    // SAFETY: The successful process creation returned one thread handle, closed once here.
-    unsafe { if !pi.hThread.is_null() { CloseHandle(pi.hThread); } }
+    // SAFETY: The successful process creation returned this owned thread handle.
+    let thread = unsafe { File::from_raw_handle(pi.hThread as _) };
+    if let Some((_, job)) = &policy_launch {
+        job.attach(pi.hProcess)?;
+        crate::logging::custody_diagnostic(|| format!(
+            "event=policy_attach runner_pid={} attached=true", pi.dwProcessId), log_dir);
+        // SAFETY: Assignment succeeded while the newly-created root is suspended.
+        if unsafe { windows_sys::Win32::System::Threading::ResumeThread(pi.hThread) } == u32::MAX {
+            return Err(std::io::Error::last_os_error()).context("resume offline policy-contained runner");
+        }
+    }
+    drop(thread);
+    drop(policy_launch);
     connect_pipe_with_deadline(&pipe_write, pi.dwProcessId, deadline, admission)?;
     connect_pipe_with_deadline(&pipe_read, pi.dwProcessId, deadline, admission)?;
     admission.admit()?;

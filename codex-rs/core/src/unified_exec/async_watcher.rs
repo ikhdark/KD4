@@ -13,6 +13,7 @@ use tokio_util::sync::CancellationToken;
 use super::UnifiedExecContext;
 use super::UnifiedExecError;
 pub(super) use super::head_tail_buffer::omitted_output_marker;
+use super::head_tail_buffer::split_valid_utf8_prefix_with_max;
 use super::process::ProcessOutputChunk;
 use super::process::UnifiedExecProcess;
 use crate::exec::EXEC_OUTPUT_DELTA_CAP_NOTICE;
@@ -903,6 +904,14 @@ pub(crate) async fn emit_exec_end_for_unified_exec(
             output_drained && !tty,
             snapshot.as_ref(),
         );
+    // A drained terminal result must not lose its recovery locator to a busy
+    // artifact mutex or an unfinished EOF publication. Reuse the process owner's
+    // bounded readiness wait; events that precede drain remain nonblocking.
+    let raw_output_artifact = match process {
+        Some(process) if output_drained => process.raw_output_artifact().await,
+        Some(process) => process.try_raw_output_artifact(),
+        None => None,
+    };
     let mut metadata = codex_protocol::items::CommandExecutionOutputMetadata {
         process_exited,
         output_drained,
@@ -918,8 +927,7 @@ pub(crate) async fn emit_exec_end_for_unified_exec(
         display_reduced: false,
         search_no_match,
         failure_cause,
-        raw_output_artifact_id: process
-            .and_then(UnifiedExecProcess::try_raw_output_artifact)
+        raw_output_artifact_id: raw_output_artifact
             .and_then(|artifact| match artifact {
                 crate::tools::command_output_artifact::RawOutputArtifact::Stored { id, .. } => {
                     Some(id.to_string())
@@ -1019,38 +1027,6 @@ pub(crate) async fn emit_exec_end_for_unified_exec(
             },
         )
         .await
-}
-
-fn split_valid_utf8_prefix_with_max<'a>(
-    buffer: &mut &'a [u8],
-    max_bytes: usize,
-    flush_incomplete: bool,
-) -> Option<&'a [u8]> {
-    if buffer.is_empty() || max_bytes == 0 {
-        return None;
-    }
-
-    let max_len = buffer.len().min(max_bytes);
-    let split = match std::str::from_utf8(&buffer[..max_len]) {
-        Ok(_) => max_len,
-        Err(error) => {
-            let valid_up_to = error.valid_up_to();
-            if valid_up_to > 0 {
-                valid_up_to
-            } else if error.error_len().is_some() || flush_incomplete {
-                // Definitively invalid bytes must make progress immediately. At the
-                // end of the stream, treat a permanently incomplete sequence the
-                // same way so every received byte is emitted exactly once.
-                1
-            } else {
-                return None;
-            }
-        }
-    };
-
-    let (prefix, remaining) = buffer.split_at(split);
-    *buffer = remaining;
-    Some(prefix)
 }
 
 pub(super) async fn resolve_aggregated_output(

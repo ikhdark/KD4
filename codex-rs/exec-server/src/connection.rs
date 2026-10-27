@@ -20,7 +20,6 @@ use tokio::process::Child;
 use tokio::sync::mpsc;
 use tokio::sync::watch;
 use tokio::time::timeout;
-use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use tracing::debug;
@@ -463,14 +462,14 @@ impl JsonRpcConnection {
         }
     }
 
-    pub(crate) fn from_websocket<S>(stream: WebSocketStream<S>, connection_label: String) -> Self
-    where
-        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
-    {
+    pub(crate) fn from_axum_websocket(stream: AxumWebSocket, connection_label: String) -> Self {
         Self::from_websocket_stream(stream, connection_label, Some(WEBSOCKET_KEEPALIVE_INTERVAL))
     }
 
-    pub(crate) fn from_axum_websocket(stream: AxumWebSocket, connection_label: String) -> Self {
+    pub(crate) fn from_websocket(
+        stream: codex_websocket_client::WebSocketConnection,
+        connection_label: String,
+    ) -> Self {
         Self::from_websocket_stream(stream, connection_label, Some(WEBSOCKET_KEEPALIVE_INTERVAL))
     }
 

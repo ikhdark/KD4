@@ -37,7 +37,7 @@ pub(crate) fn start_runner_pipe_writer(pipe_write: File) -> RunnerOutbound {
 }
 
 pub(crate) fn start_runner_stdin_writer(
-    mut writer_rx: mpsc::Receiver<Vec<u8>>,
+    mut writer_rx: mpsc::Receiver<codex_utils_pty::StdinPayload>,
     outbound_tx: RunnerOutbound,
     normalize_newlines: bool,
     stdin_open: bool,
@@ -50,18 +50,16 @@ pub(crate) fn start_runner_stdin_writer(
                 _ = outbound_tx.input_closed() => return,
                 bytes = writer_rx.recv() => match bytes { Some(bytes) => bytes, None => break },
             };
-            let bytes = if normalize_newlines {
-                windows_input.normalize(&bytes)
-            } else {
-                bytes
-            };
-            for chunk in bytes.chunks(IO_CHUNK_BYTES) {
+            let bytes = std::sync::Arc::new(bytes);
+            let normalized = normalize_newlines.then(|| windows_input.normalize(&bytes));
+            let input = normalized.as_deref().unwrap_or(&bytes);
+            for chunk in input.chunks(IO_CHUNK_BYTES) {
                 let message = Message::Stdin {
                     payload: StdinPayload {
                         data_b64: encode_bytes(chunk),
                     },
                 };
-                if outbound_tx.send_data(message).await.is_err() {
+                if outbound_tx.send_data(message, Some(std::sync::Arc::clone(&bytes))).await.is_err() {
                     return;
                 }
             }
@@ -70,7 +68,7 @@ pub(crate) fn start_runner_stdin_writer(
             let _ = outbound_tx
                 .send_data(Message::CloseStdin {
                     payload: EmptyPayload::default(),
-                })
+                }, None)
                 .await;
         }
     })
