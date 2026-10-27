@@ -263,7 +263,8 @@ async fn process_connection_request(
     request: JSONRPCRequest,
     transport: &AppServerTransport,
     connection: &ConnectionState,
-    remote_status: RemoteControlStatusChangedNotification,
+    remote_status_rx: &tokio::sync::watch::Receiver<RemoteControlStatusChangedNotification>,
+    remote_status_publication: &tokio::sync::Mutex<()>,
 ) {
     let was_initialized = connection.session.initialized();
     processor
@@ -280,15 +281,20 @@ async fn process_connection_request(
             .store(experimental_api_enabled, std::sync::atomic::Ordering::Release);
         processor.initialize_processor
             .send_initialize_notifications_to_connection(connection_id).await;
-        outgoing.send_server_notification_to_connections(
-            &[connection_id], ServerNotification::RemoteControlStatusChanged(remote_status),
-        ).await;
         processor.thread_processor.thread_state_manager.connection_initialized(
             connection_id,
             ConnectionCapabilities {
                 request_attestation: connection.session.request_attestation(),
                 experimental_api: experimental_api_enabled,
             },
+        ).await;
+        // Serialize the initial snapshot and readiness with changed-status sends.
+        // Sample only after acquiring publication ownership: a value captured
+        // before initialization can otherwise overwrite a newer broadcast.
+        let _publication = remote_status_publication.lock().await;
+        let remote_status = remote_status_rx.borrow().clone();
+        outgoing.send_server_notification_to_connections(
+            &[connection_id], ServerNotification::RemoteControlStatusChanged(remote_status),
         ).await;
         connection.outbound_initialized.store(true, std::sync::atomic::Ordering::Release);
     }
@@ -1060,19 +1066,25 @@ pub async fn run_main(
         // when the loop exits so shutdown cleanup does not wait out their timer.
         let init_watchdog_shutdown = CancellationToken::new();
         let remote_control_status_rx = remote_control_handle.status_receiver();
+        let remote_status_publication = Arc::new(tokio::sync::Mutex::new(()));
         {
             // Watch coalesces status changes while the bounded output owner is
             // congested. No status send can hold the shared ingress dispatcher.
             let mut status_rx = remote_control_status_rx.clone();
             let outgoing = Arc::clone(&initialize_notification_sender);
             let stop = init_watchdog_shutdown.clone();
+            let publication = Arc::clone(&remote_status_publication);
             connection_cleanup_tasks.spawn(async move {
                 loop {
                     tokio::select! {
                         _ = stop.cancelled() => break,
                         changed = status_rx.changed() => if changed.is_err() { break; },
                     }
-                    let status = status_rx.borrow().clone();
+                    let _publication = tokio::select! {
+                        _ = stop.cancelled() => break,
+                        guard = publication.lock() => guard,
+                    };
+                    let status = status_rx.borrow_and_update().clone();
                     tokio::select! {
                         _ = stop.cancelled() => break,
                         _ = outgoing.send_server_notification(ServerNotification::RemoteControlStatusChanged(status)) => {},
@@ -1178,6 +1190,7 @@ pub async fn run_main(
                                 let outgoing = Arc::clone(&initialize_notification_sender);
                                 let worker_transport = transport.clone();
                                 let status_rx = remote_control_status_rx.clone();
+                                let status_publication = Arc::clone(&remote_status_publication);
                                 connection_cleanup_tasks.spawn(async move {
                                     let cancelled = worker_connection.session.rpc_gate.cancellation_token();
                                     tokio::select! {
@@ -1196,13 +1209,13 @@ pub async fn run_main(
                                             next = requests.recv() => next,
                                         };
                                         let Some(queued) = next else { break; };
-                                        let status = status_rx.borrow().clone();
                                         tokio::select! {
                                             biased;
                                             _ = cancelled.cancelled() => break,
                                             _ = process_connection_request(
                                                 &worker_processor, &outgoing, connection_id,
-                                                queued.request, &worker_transport, &worker_connection, status,
+                                                queued.request, &worker_transport, &worker_connection,
+                                                &status_rx, &status_publication,
                                             ) => {},
                                         }
                                         drop(queued._credit);

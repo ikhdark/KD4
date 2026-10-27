@@ -133,6 +133,7 @@ impl WindowsSandboxRequestProcessor {
             .await;
 
         let outgoing = Arc::clone(&self.outgoing);
+        let config_manager = self.config_manager.clone();
         let connection_id = request_id.connection_id;
         let permission_profile = inline_permission_profile
             .unwrap_or_else(|| config.permissions.effective_permission_profile());
@@ -148,6 +149,11 @@ impl WindowsSandboxRequestProcessor {
             };
             let setup_result =
                 codex_core::windows_sandbox::run_windows_sandbox_setup(setup_request).await;
+            if setup_result.is_ok() {
+                // Setup persists outside ConfigManager. Publish the new mode
+                // before a client reacts to the successful completion event.
+                config_manager.invalidate_load_cache();
+            }
             let notification = WindowsSandboxSetupCompletedNotification {
                 mode: setup_mode.into(),
                 success: setup_result.is_ok(),

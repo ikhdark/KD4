@@ -83,21 +83,28 @@ impl MarketplaceRequestProcessor {
         let MarketplaceUpgradeParams { marketplace_name } = params;
         let plugins_input = config.plugins_config_input();
         let reload_config = self.config_manager.plugin_config_reload_for_cwd(config.cwd.clone());
+        let thread_manager = Arc::clone(&self.thread_manager);
+        let config_manager = self.config_manager.clone();
 
         let outcome = tokio::task::spawn_blocking(move || {
-            plugins_manager.upgrade_configured_marketplaces_for_config(
+            let outcome = plugins_manager.upgrade_configured_marketplaces_for_config(
                 &plugins_input,
                 marketplace_name.as_deref(),
                 &reload_config,
-            )
+            )?;
+            if !outcome.upgraded_roots.is_empty() {
+                // The blocking upgrade owns publication too: disconnect must not
+                // leave same-version installed bytes behind stale host snapshots.
+                PluginRequestProcessor::invalidate_effective_plugins_and_spawn_refresh(
+                    thread_manager,
+                    config_manager,
+                );
+            }
+            Ok::<_, String>(outcome)
         })
         .await
         .map_err(|err| internal_error(format!("failed to upgrade marketplaces: {err}")))?
         .map_err(invalid_request)?;
-        if !outcome.upgraded_roots.is_empty() {
-            // Base-user upgrades may record their revision outside ConfigManager.
-            self.config_manager.invalidate_load_cache();
-        }
 
         Ok(MarketplaceUpgradeResponse {
             selected_marketplaces: outcome.selected_marketplaces,

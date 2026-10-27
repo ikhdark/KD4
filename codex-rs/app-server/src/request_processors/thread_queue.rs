@@ -592,7 +592,17 @@ impl ThreadQueueRequestProcessor {
         id: ThreadId,
         mutation: impl FnOnce(&mut Queue) -> Result<(R, bool), JSONRPCErrorError>,
     ) -> Result<R, JSONRPCErrorError> {
-        let (guard, publication) = self.lock(id).await?;
+        let admission = self.lock(id).await?;
+        self.mutate_locked(id, admission, mutation).await
+    }
+
+    async fn mutate_locked<R>(
+        &self,
+        id: ThreadId,
+        admission: (File, Arc<Mutex<u64>>),
+        mutation: impl FnOnce(&mut Queue) -> Result<(R, bool), JSONRPCErrorError>,
+    ) -> Result<R, JSONRPCErrorError> {
+        let (guard, publication) = admission;
         let mut queue = self.load(id).await?;
         self.recover(id, &mut queue).await?;
         let (result, changed) = mutation(&mut queue)?;
@@ -611,7 +621,22 @@ impl ThreadQueueRequestProcessor {
         params: ThreadQueueListParams,
     ) -> Result<ThreadQueueListResponse, JSONRPCErrorError> {
         let id = parse_thread_id_for_request(&params.thread_id)?;
-        let _guard = self.lock(id).await?;
+        let admission = self.lock(id).await?;
+        let processor = self.clone();
+        // Recovery can commit too. Keep durable state, capability bookkeeping
+        // and change publication together when the requesting connection closes.
+        self.background_tasks
+            .spawn(async move { processor.list_owned(params, id, admission).await })
+            .await
+            .map_err(queue_error)?
+    }
+
+    async fn list_owned(
+        &self,
+        params: ThreadQueueListParams,
+        id: ThreadId,
+        _admission: (File, Arc<Mutex<u64>>),
+    ) -> Result<ThreadQueueListResponse, JSONRPCErrorError> {
         let mut queue = self.load(id).await?;
         self.recover(id, &mut queue).await?;
         queue.page(&params)
@@ -624,31 +649,72 @@ impl ThreadQueueRequestProcessor {
     ) -> Result<(), JSONRPCErrorError> {
         TurnRequestProcessor::validate_queue_input(&params.input)?;
         let id = parse_thread_id_for_request(&params.thread_id)?;
-        let (mut guard, mut publication) = self.lock(id).await?;
-        let mut queue = self.load(id).await?;
-        self.recover(id, &mut queue).await?;
-        // Duplicate accepted IDs are resolved before reading mutable source paths.
-        let (queued_submission, added) = if params.input.iter().any(|input| matches!(input, V2UserInput::LocalImage { .. })) {
-            if let Some(existing) = queue.existing_submission(&params)? {
-                (existing, false)
+        let mut admission = self.lock(id).await?;
+        let mut sealed = None;
+        let mut prepared_queue = None;
+        if params.input.iter().any(|input| matches!(input, V2UserInput::LocalImage { .. })) {
+            let processor = self.clone();
+            // Recovery may commit, but mutable image preparation must remain
+            // cancellable. Return ownership only after recovery has settled.
+            let (returned_admission, queue) = self.background_tasks
+                .spawn(async move {
+                    let mut queue = processor.load(id).await?;
+                    processor.recover(id, &mut queue).await?;
+                    Ok::<_, JSONRPCErrorError>((admission, queue))
+                })
+                .await
+                .map_err(queue_error)??;
+            admission = returned_admission;
+            if queue.existing_submission(&params)?.is_none() {
+                if queue.submissions.len() >= MAX_QUEUE_ENTRIES {
+                    return Err(invalid_params("thread queue is full"));
+                }
+                drop(admission);
+                drop(queue);
+                // A failed seal is retained until the locked duplicate check:
+                // a winning retry still owns its original immutable snapshot.
+                sealed = Some(seal_queue_input(params.input.clone()).await);
+                admission = self.lock(id).await?;
             } else {
-            if queue.submissions.len() >= MAX_QUEUE_ENTRIES {
-                return Err(invalid_params("thread queue is full"));
+                prepared_queue = Some(queue);
             }
-            drop(guard);
-            drop(queue);
-            let sealed = seal_queue_input(params.input.clone()).await;
-            (guard, publication) = self.lock(id).await?;
-            queue = self.load(id).await?;
-            self.recover(id, &mut queue).await?;
-            // Capacity and identity can change during preparation. A winning
-            // duplicate keeps its snapshot, even if our source read failed.
-            let (item, added) = queue.add(params)?;
-            queue.finish_sealed_add(item, added, sealed)?
+        }
+        let processor = self.clone();
+        // Recovery can commit too. Keep durable state, capability bookkeeping
+        // and change publication together when the requesting connection closes.
+        self.background_tasks
+            .spawn(async move {
+                processor.add_owned(params, origin, id, admission, sealed, prepared_queue).await
+            })
+            .await
+            .map_err(queue_error)?
+    }
+
+    async fn add_owned(
+        &self,
+        params: ThreadQueueAddParams,
+        origin: QueueOrigin,
+        id: ThreadId,
+        admission: (File, Arc<Mutex<u64>>),
+        sealed: Option<Result<Vec<V2UserInput>, JSONRPCErrorError>>,
+        prepared_queue: Option<Queue>,
+    ) -> Result<(), JSONRPCErrorError> {
+        let (guard, publication) = admission;
+        let mut queue = match prepared_queue {
+            Some(queue) => queue,
+            None => {
+                let mut queue = self.load(id).await?;
+                self.recover(id, &mut queue).await?;
+                queue
             }
-        } else {
-            queue.add(params)?
         };
+        // Duplicate accepted IDs are resolved before reading mutable source paths.
+        let (queued_submission, added) = queue.add(params)?;
+        let (queued_submission, added) = if queued_submission.input.iter().any(|input| matches!(input, V2UserInput::LocalImage { .. })) {
+            queue.finish_sealed_add(queued_submission, added, sealed.unwrap_or_else(|| {
+                Err(internal_error("queued image preparation is missing"))
+            }))?
+        } else { (queued_submission, added) };
         if added {
             self.save(id, &mut queue).await?;
         }
@@ -701,8 +767,25 @@ impl ThreadQueueRequestProcessor {
             None
         };
         let id = parse_thread_id_for_request(&params.thread_id)?;
+        let admission = self.lock(id).await?;
+        let processor = self.clone();
+        self.background_tasks
+            .spawn(async move {
+                processor.update_owned(params, execution_input, id, admission).await
+            })
+            .await
+            .map_err(queue_error)?
+    }
+
+    async fn update_owned(
+        &self,
+        params: ThreadQueueUpdateParams,
+        execution_input: Option<Vec<V2UserInput>>,
+        id: ThreadId,
+        admission: (File, Arc<Mutex<u64>>),
+    ) -> Result<ThreadQueueUpdateResponse, JSONRPCErrorError> {
         let queued_submission = self
-            .mutate(id, |queue| {
+            .mutate_locked(id, admission, |queue| {
                 if queue
                     .pending_start
                     .as_ref()
@@ -736,8 +819,24 @@ impl ThreadQueueRequestProcessor {
         params: ThreadQueueDeleteParams,
     ) -> Result<ThreadQueueDeleteResponse, JSONRPCErrorError> {
         let id = parse_thread_id_for_request(&params.thread_id)?;
+        let admission = self.lock(id).await?;
+        let processor = self.clone();
+        // Recovery can commit too. Keep durable state, capability bookkeeping
+        // and change publication together when the requesting connection closes.
+        self.background_tasks
+            .spawn(async move { processor.delete_owned(params, id, admission).await })
+            .await
+            .map_err(queue_error)?
+    }
+
+    async fn delete_owned(
+        &self,
+        params: ThreadQueueDeleteParams,
+        id: ThreadId,
+        admission: (File, Arc<Mutex<u64>>),
+    ) -> Result<ThreadQueueDeleteResponse, JSONRPCErrorError> {
         let deleted = self
-            .mutate(id, |queue| {
+            .mutate_locked(id, admission, |queue| {
                 if queue
                     .pending_start
                     .as_ref()
@@ -766,7 +865,23 @@ impl ThreadQueueRequestProcessor {
         params: ThreadQueueReorderParams,
     ) -> Result<ThreadQueueReorderResponse, JSONRPCErrorError> {
         let id = parse_thread_id_for_request(&params.thread_id)?;
-        self.mutate(id, |queue| {
+        let admission = self.lock(id).await?;
+        let processor = self.clone();
+        // Recovery can commit too. Keep durable state, capability bookkeeping
+        // and change publication together when the requesting connection closes.
+        self.background_tasks
+            .spawn(async move { processor.reorder_owned(params, id, admission).await })
+            .await
+            .map_err(queue_error)?
+    }
+
+    async fn reorder_owned(
+        &self,
+        params: ThreadQueueReorderParams,
+        id: ThreadId,
+        admission: (File, Arc<Mutex<u64>>),
+    ) -> Result<ThreadQueueReorderResponse, JSONRPCErrorError> {
+        self.mutate_locked(id, admission, |queue| {
             queue
                 .reorder(&params.queued_submission_ids)
                 .map(|changed| ((), changed))

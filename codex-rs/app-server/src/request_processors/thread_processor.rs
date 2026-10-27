@@ -552,22 +552,37 @@ impl ThreadRequestProcessor {
         request_id: ConnectionRequestId,
         params: ThreadSetNameParams,
     ) -> Result<Option<ClientResponsePayload>, JSONRPCErrorError> {
-        match self.thread_set_name_response_inner(params).await {
-            Ok((response, notification)) => {
-                self.outgoing
-                    .send_response(request_id.clone(), response)
-                    .await;
-                if let Some(notification) = notification {
-                    self.outgoing
-                        .send_server_notification(ServerNotification::ThreadNameUpdated(
-                            notification,
-                        ))
-                        .await;
+        let ThreadSetNameParams { thread_id, name } = params;
+        let thread_id = ThreadId::from_string(&thread_id)
+            .map_err(|err| invalid_request(format!("invalid thread id: {err}")))?;
+        let Some(name) = codex_thread_store::normalize_thread_name(&name) else {
+            return Err(invalid_request("thread name must not be empty"));
+        };
+        let permit = self.acquire_owned_thread_list_state_permit().await?;
+        let processor = self.clone();
+        // Admission stays cancellable; an admitted durable mutation owns its
+        // publication even if the originating connection closes while it commits.
+        self.background_tasks
+            .spawn(
+                async move {
+                    let _thread_list_state_permit = permit;
+                    let (response, notification) =
+                        processor.thread_set_name_response_inner(thread_id, name).await?;
+                    processor.outgoing.send_response(request_id, response).await;
+                    if let Some(notification) = notification {
+                        processor
+                            .outgoing
+                            .send_server_notification(ServerNotification::ThreadNameUpdated(
+                                notification,
+                            ))
+                            .await;
+                    }
+                    Ok(None)
                 }
-                Ok(None)
-            }
-            Err(error) => Err(error),
-        }
+                .instrument(tracing::Span::current()),
+            )
+            .await
+            .map_err(|error| internal_error(format!("set thread name task failed: {error}")))?
     }
 
     pub(crate) async fn thread_unarchive(
@@ -575,18 +590,24 @@ impl ThreadRequestProcessor {
         request_id: ConnectionRequestId,
         params: ThreadUnarchiveParams,
     ) -> Result<Option<ClientResponsePayload>, JSONRPCErrorError> {
-        match self.thread_unarchive_inner(params).await {
-            Ok((response, notification)) => {
-                self.outgoing
-                    .send_response(request_id.clone(), response)
-                    .await;
-                self.outgoing
-                    .send_server_notification(ServerNotification::ThreadUnarchived(notification))
-                    .await;
-                Ok(None)
-            }
-            Err(error) => Err(error),
-        }
+        let permit = self.acquire_owned_thread_list_state_permit().await?;
+        let processor = self.clone();
+        self.background_tasks
+            .spawn(
+                async move {
+                    let _thread_list_state_permit = permit;
+                    let (response, notification) = processor.thread_unarchive_inner(params).await?;
+                    processor.outgoing.send_response(request_id, response).await;
+                    processor
+                        .outgoing
+                        .send_server_notification(ServerNotification::ThreadUnarchived(notification))
+                        .await;
+                    Ok(None)
+                }
+                .instrument(tracing::Span::current()),
+            )
+            .await
+            .map_err(|error| internal_error(format!("unarchive task failed: {error}")))?
     }
 
     pub(crate) async fn thread_rollback(
@@ -638,6 +659,17 @@ impl ThreadRequestProcessor {
     ) -> Result<SemaphorePermit<'_>, JSONRPCErrorError> {
         self.thread_list_state_permit
             .acquire()
+            .await
+            .map_err(|err| {
+                internal_error(format!("failed to acquire thread list state permit: {err}"))
+            })
+    }
+
+    async fn acquire_owned_thread_list_state_permit(
+        &self,
+    ) -> Result<tokio::sync::OwnedSemaphorePermit, JSONRPCErrorError> {
+        Arc::clone(&self.thread_list_state_permit)
+            .acquire_owned()
             .await
             .map_err(|err| {
                 internal_error(format!("failed to acquire thread list state permit: {err}"))
@@ -1659,17 +1691,10 @@ impl ThreadRequestProcessor {
 
     async fn thread_set_name_response_inner(
         &self,
-        params: ThreadSetNameParams,
+        thread_id: ThreadId,
+        name: String,
     ) -> Result<(ThreadSetNameResponse, Option<ThreadNameUpdatedNotification>), JSONRPCErrorError>
     {
-        let ThreadSetNameParams { thread_id, name } = params;
-        let thread_id = ThreadId::from_string(&thread_id)
-            .map_err(|err| invalid_request(format!("invalid thread id: {err}")))?;
-        let Some(name) = codex_thread_store::normalize_thread_name(&name) else {
-            return Err(invalid_request("thread name must not be empty"));
-        };
-
-        let _thread_list_state_permit = self.acquire_thread_list_state_permit().await?;
         self.thread_manager
             .update_thread_metadata(
                 thread_id,
@@ -1763,55 +1788,66 @@ impl ThreadRequestProcessor {
         } else {
             None
         };
-        let updated_thread = {
-            let _thread_list_state_permit = self.acquire_thread_list_state_permit().await?;
-            let previous_project_id = if project_update.is_some() {
-                Some(
-                    self.thread_store
-                        .read_thread(StoreReadThreadParams {
-                            thread_id: thread_uuid,
-                            include_archived: true,
-                            include_history: false,
-                        })
+        let permit = self.acquire_owned_thread_list_state_permit().await?;
+        let processor = self.clone();
+        let updated_thread = self
+            .background_tasks
+            .spawn(
+                async move {
+                    let _thread_list_state_permit = permit;
+                    let previous_project_id = if project_update.is_some() {
+                        Some(
+                            processor
+                                .thread_store
+                                .read_thread(StoreReadThreadParams {
+                                    thread_id: thread_uuid,
+                                    include_archived: true,
+                                    include_history: false,
+                                })
+                                .await
+                                .map_err(|err| match err {
+                                    ThreadStoreError::ThreadNotFound { .. } => {
+                                        invalid_request(format!("thread not found: {thread_id}"))
+                                    }
+                                    ThreadStoreError::Unsupported { operation } => {
+                                        unsupported_thread_store_operation(operation)
+                                    }
+                                    err => internal_error(format!("failed to read thread metadata: {err}")),
+                                })?
+                                .project_id,
+                        )
+                    } else {
+                        None
+                    };
+                    let patch = StoreThreadMetadataPatch {
+                        git_info,
+                        project_id: project_update.clone(),
+                        ..Default::default()
+                    };
+                    let updated_thread = processor
+                        .thread_manager
+                        .update_thread_metadata(thread_uuid, patch, /*include_archived*/ true)
                         .await
-                        .map_err(|err| match err {
-                            ThreadStoreError::ThreadNotFound { .. } => {
-                                invalid_request(format!("thread not found: {thread_id}"))
-                            }
-                            ThreadStoreError::Unsupported { operation } => {
-                                unsupported_thread_store_operation(operation)
-                            }
-                            err => internal_error(format!("failed to read thread metadata: {err}")),
-                        })?
-                        .project_id,
-                )
-            } else {
-                None
-            };
-            let patch = StoreThreadMetadataPatch {
-                git_info,
-                project_id: project_update.clone(),
-                ..Default::default()
-            };
-            let updated_thread = self
-                .thread_manager
-                .update_thread_metadata(thread_uuid, patch, /*include_archived*/ true)
-                .await
-                .map_err(|err| core_thread_write_error("update thread metadata", err))?;
-            if let Some(project_id) = project_update.as_ref()
-                && previous_project_id.as_ref() != Some(project_id)
-            {
-                self.outgoing
-                    .send_server_notification(ServerNotification::ThreadProjectUpdated(
-                        ThreadProjectUpdatedNotification {
-                            thread_id: thread_id.clone(),
-                            project_id: project_id.clone(),
-                        },
-                    ))
-                    .await;
-            }
-            updated_thread
-        };
+                        .map_err(|err| core_thread_write_error("update thread metadata", err))?;
+                    if let Some(project_id) = project_update.as_ref()
+                        && previous_project_id.as_ref() != Some(project_id)
+                    {
+                        processor
+                            .outgoing
+                            .send_server_notification(ServerNotification::ThreadProjectUpdated(
+                                ThreadProjectUpdatedNotification {
+                                    thread_id: thread_id.clone(),
+                                    project_id: project_id.clone(),
+                                },
+                            ))
+                            .await;
+                    }
+                    Ok::<_, JSONRPCErrorError>(updated_thread)
+                }
+                .instrument(tracing::Span::current()),
+            )
+            .await
+            .map_err(|error| internal_error(format!("thread metadata update task failed: {error}")))??;
         let (mut thread, _) = thread_from_stored_thread(
             updated_thread,
             self.config.model_provider_id.as_str(),
@@ -1851,7 +1887,6 @@ impl ThreadRequestProcessor {
         &self,
         params: ThreadUnarchiveParams,
     ) -> Result<(ThreadUnarchiveResponse, ThreadUnarchivedNotification), JSONRPCErrorError> {
-        let _thread_list_state_permit = self.acquire_thread_list_state_permit().await?;
         let (response, thread_id) = self.thread_unarchive_response(params).await?;
         Ok((response, ThreadUnarchivedNotification { thread_id }))
     }

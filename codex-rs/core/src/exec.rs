@@ -768,7 +768,9 @@ async fn exec_windows_sandbox(
     let aggregate_capture = Arc::new(Mutex::new(OutputCapture::aggregate(retained_bytes_cap)));
     let aggregate_capture_for_sink = Arc::clone(&aggregate_capture);
     let limiter = Arc::new(OutputDeltaLimiter::default());
-    let live_output_enabled = Arc::new(AtomicBool::new(true));
+    // Recovery has a separate bounded suffix for each pipe. Exhausting one
+    // pipe must not prevent the other from reaching its recovery owner.
+    let live_output_enabled = Arc::new([AtomicBool::new(true), AtomicBool::new(true)]);
     let live_output_enabled_for_sink = Arc::clone(&live_output_enabled);
     let output_sink = Some(
         Arc::new(move |capture_stream: CaptureOutputStream, chunk: &[u8]| {
@@ -782,17 +784,19 @@ async fn exec_windows_sandbox(
             if let Some(progress) = stream.progress.as_ref() {
                 progress.record_output();
             }
-            if !live_output_enabled_for_sink.load(Ordering::Acquire) {
+            let is_stderr = matches!(capture_stream, CaptureOutputStream::Stderr);
+            let live_output_enabled = &live_output_enabled_for_sink[usize::from(is_stderr)];
+            if !live_output_enabled.load(Ordering::Acquire) {
                 return;
             }
             if try_send_limited_output_delta(
                 stream,
-                matches!(capture_stream, CaptureOutputStream::Stderr),
+                is_stderr,
                 chunk.to_vec(),
                 &limiter,
             ) == OutputDeltaSendOutcome::Stop
             {
-                live_output_enabled_for_sink.store(false, Ordering::Release);
+                live_output_enabled.store(false, Ordering::Release);
             }
         }) as CaptureOutputSink,
     );

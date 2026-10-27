@@ -1,4 +1,5 @@
 use std::collections::HashSet;
+use std::future::Future;
 use std::sync::Arc;
 
 use codex_app_server_protocol::ClientResponsePayload;
@@ -37,7 +38,8 @@ use codex_thread_store::ThreadStore;
 use codex_thread_store::ThreadStoreError;
 use codex_thread_store::UpdateProjectParams as StoreUpdateProjectParams;
 use tokio::sync::Semaphore;
-use tokio::sync::SemaphorePermit;
+use tokio_util::task::TaskTracker;
+use tracing::Instrument;
 
 use super::thread_processor::THREAD_PAGE_DEFAULT_LIMIT as THREAD_LIST_DEFAULT_LIMIT;
 use super::thread_processor::THREAD_PAGE_MAX_LIMIT as THREAD_LIST_MAX_LIMIT;
@@ -52,6 +54,7 @@ pub(crate) struct ProjectRequestProcessor {
     thread_state_manager: crate::thread_state::ThreadStateManager,
     outgoing: Arc<OutgoingMessageSender>,
     thread_list_state_permit: Arc<Semaphore>,
+    background_tasks: TaskTracker,
 }
 
 impl ProjectRequestProcessor {
@@ -60,12 +63,14 @@ impl ProjectRequestProcessor {
         thread_state_manager: crate::thread_state::ThreadStateManager,
         outgoing: Arc<OutgoingMessageSender>,
         thread_list_state_permit: Arc<Semaphore>,
+        background_tasks: TaskTracker,
     ) -> Self {
         Self {
             thread_store,
             thread_state_manager,
             outgoing,
             thread_list_state_permit,
+            background_tasks,
         }
     }
 
@@ -137,16 +142,25 @@ impl ProjectRequestProcessor {
         &self,
         params: ProjectCreateParams,
     ) -> Result<Option<ClientResponsePayload>, JSONRPCErrorError> {
-        let (project, created, _) = self
-            .create_project(
-                params.name,
-                params.roots,
-                params.metadata,
-                Vec::new(),
-                params.idempotency_key,
-                "project/create",
-            )
-            .await?;
+        let params = Self::prepare_project_create(
+            params.name,
+            params.roots,
+            params.metadata,
+            Vec::new(),
+            params.idempotency_key,
+        )
+        .await?;
+        self.run_mutation("project/create", move |processor| async move {
+            processor.project_create_inner(params).await
+        })
+        .await
+    }
+
+    async fn project_create_inner(
+        &self,
+        params: StoreCreateProjectParams,
+    ) -> Result<Option<ClientResponsePayload>, JSONRPCErrorError> {
+        let (project, created, _) = self.create_project(params, "project/create").await?;
         if created {
             self.notify_project_changed(&project.id, ProjectChangeType::Created)
                 .await;
@@ -158,17 +172,25 @@ impl ProjectRequestProcessor {
         &self,
         params: ProjectImportParams,
     ) -> Result<Option<ClientResponsePayload>, JSONRPCErrorError> {
-        let _thread_list_state_permit = self.acquire_thread_list_state_permit().await?;
-        let (project, created, thread_ids) = self
-            .create_project(
-                params.name,
-                params.roots,
-                params.metadata,
-                params.threads.unwrap_or_default(),
-                params.idempotency_key,
-                "project/import",
-            )
-            .await?;
+        let params = Self::prepare_project_create(
+            params.name,
+            params.roots,
+            params.metadata,
+            params.threads.unwrap_or_default(),
+            params.idempotency_key,
+        )
+        .await?;
+        self.run_mutation("project/import", move |processor| async move {
+            processor.project_import_inner(params).await
+        })
+        .await
+    }
+
+    async fn project_import_inner(
+        &self,
+        params: StoreCreateProjectParams,
+    ) -> Result<Option<ClientResponsePayload>, JSONRPCErrorError> {
+        let (project, created, thread_ids) = self.create_project(params, "project/import").await?;
         if created {
             self.notify_project_changed(&project.id, ProjectChangeType::Created)
                 .await;
@@ -187,17 +209,29 @@ impl ProjectRequestProcessor {
             Some(roots) => Some(validate_roots_off_thread(roots).await?),
             None => None,
         };
+        let params = StoreUpdateProjectParams {
+            project_id: params.project_id,
+            name,
+            roots,
+            metadata: params.metadata,
+        };
+        self.run_mutation("project/update", move |processor| async move {
+            processor.project_update_inner(params).await
+        })
+        .await
+    }
+
+    async fn project_update_inner(
+        &self,
+        params: StoreUpdateProjectParams,
+    ) -> Result<Option<ClientResponsePayload>, JSONRPCErrorError> {
+        let project_id = params.project_id.clone();
         let updated = self
             .thread_store
-            .update_project(StoreUpdateProjectParams {
-                project_id: params.project_id.clone(),
-                name,
-                roots,
-                metadata: params.metadata,
-            })
+            .update_project(params)
             .await
             .map_err(|error| project_store_error("project/update", error))?
-            .ok_or_else(|| invalid_params(format!("project not found: {}", params.project_id)))?;
+            .ok_or_else(|| invalid_params(format!("project not found: {project_id}")))?;
         let project = api_project(updated.project)?;
         if updated.changed {
             self.notify_project_changed(&project.id, ProjectChangeType::Updated)
@@ -207,6 +241,16 @@ impl ProjectRequestProcessor {
     }
 
     pub(crate) async fn project_move(
+        &self,
+        params: ProjectMoveParams,
+    ) -> Result<Option<ClientResponsePayload>, JSONRPCErrorError> {
+        self.run_mutation("project/move", move |processor| async move {
+            processor.project_move_inner(params).await
+        })
+        .await
+    }
+
+    async fn project_move_inner(
         &self,
         params: ProjectMoveParams,
     ) -> Result<Option<ClientResponsePayload>, JSONRPCErrorError> {
@@ -231,7 +275,16 @@ impl ProjectRequestProcessor {
         &self,
         params: ProjectDeleteParams,
     ) -> Result<Option<ClientResponsePayload>, JSONRPCErrorError> {
-        let _thread_list_state_permit = self.acquire_thread_list_state_permit().await?;
+        self.run_mutation("project/delete", move |processor| async move {
+            processor.project_delete_inner(params).await
+        })
+        .await
+    }
+
+    async fn project_delete_inner(
+        &self,
+        params: ProjectDeleteParams,
+    ) -> Result<Option<ClientResponsePayload>, JSONRPCErrorError> {
         let mut deleted = self
             .thread_store
             .delete_project(params.project_id.clone())
@@ -252,28 +305,35 @@ impl ProjectRequestProcessor {
         Ok(Some(ProjectDeleteResponse {}.into()))
     }
 
-    async fn create_project(
-        &self,
+    async fn prepare_project_create(
         name: String,
         roots: Vec<ProjectRoot>,
         metadata: Option<std::collections::BTreeMap<String, String>>,
         thread_ids: Vec<String>,
         idempotency_key: String,
-        operation: &'static str,
-    ) -> Result<(Project, bool, Vec<String>), JSONRPCErrorError> {
+    ) -> Result<StoreCreateProjectParams, JSONRPCErrorError> {
         let idempotency_key = validate_idempotency_key(idempotency_key)?;
         let thread_ids = validate_thread_ids(thread_ids)?;
         let name = validate_name(name)?;
         let roots = validate_roots_off_thread(roots).await?;
+        Ok(StoreCreateProjectParams {
+            name,
+            roots,
+            metadata: metadata.unwrap_or_default(),
+            thread_ids,
+            idempotency_key,
+        })
+    }
+
+    async fn create_project(
+        &self,
+        params: StoreCreateProjectParams,
+        operation: &'static str,
+    ) -> Result<(Project, bool, Vec<String>), JSONRPCErrorError> {
+        let thread_ids = params.thread_ids.clone();
         let created = self
             .thread_store
-            .create_project(StoreCreateProjectParams {
-                name,
-                roots,
-                metadata: metadata.unwrap_or_default(),
-                thread_ids: thread_ids.clone(),
-                idempotency_key,
-            })
+            .create_project(params)
             .await
             .map_err(|error| project_store_error(operation, error))?;
         Ok((api_project(created.project)?, created.created, thread_ids))
@@ -303,15 +363,35 @@ impl ProjectRequestProcessor {
         }
     }
 
-    async fn acquire_thread_list_state_permit(
+    async fn run_mutation<F, Fut>(
         &self,
-    ) -> Result<SemaphorePermit<'_>, JSONRPCErrorError> {
-        self.thread_list_state_permit
-            .acquire()
+        operation: &'static str,
+        mutation: F,
+    ) -> Result<Option<ClientResponsePayload>, JSONRPCErrorError>
+    where
+        F: FnOnce(Self) -> Fut + Send + 'static,
+        Fut: Future<Output = Result<Option<ClientResponsePayload>, JSONRPCErrorError>> + Send + 'static,
+    {
+        // Preparation and waiting admission remain cancellable. Once admitted,
+        // keep mutation, volatile state repair and notifications under the existing task owner
+        // and gate even when the originating RPC connection disappears.
+        let permit = Arc::clone(&self.thread_list_state_permit)
+            .acquire_owned()
             .await
             .map_err(|err| {
                 internal_error(format!("failed to acquire thread list state permit: {err}"))
-            })
+            })?;
+        let processor = self.clone();
+        self.background_tasks
+            .spawn(
+                async move {
+                    let _thread_list_state_permit = permit;
+                    mutation(processor).await
+                }
+                .instrument(tracing::Span::current()),
+            )
+            .await
+            .map_err(|error| internal_error(format!("{operation} task failed: {error}")))?
     }
 }
 

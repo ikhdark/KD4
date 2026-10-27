@@ -594,7 +594,7 @@ impl PluginRequestProcessor {
         );
     }
 
-    fn invalidate_effective_plugins_and_spawn_refresh(
+    pub(super) fn invalidate_effective_plugins_and_spawn_refresh(
         thread_manager: Arc<ThreadManager>,
         config_manager: ConfigManager,
     ) {

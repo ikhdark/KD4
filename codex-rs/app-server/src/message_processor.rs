@@ -440,12 +440,6 @@ impl MessageProcessor {
         );
         let remote_control_processor = RemoteControlRequestProcessor::new(remote_control_handle);
         let search_processor = SearchRequestProcessor::new(outgoing.clone());
-        let project_processor = ProjectRequestProcessor::new(
-            Arc::clone(&thread_store),
-            thread_state_manager.clone(),
-            outgoing.clone(),
-            Arc::clone(&thread_list_state_permit),
-        );
         let mut thread_processor = ThreadRequestProcessor::new(
             auth_manager.clone(),
             Arc::clone(&thread_manager),
@@ -462,6 +456,13 @@ impl MessageProcessor {
             log_db,
             Arc::clone(&skills_watcher),
             config_warnings,
+        );
+        let project_processor = ProjectRequestProcessor::new(
+            Arc::clone(&thread_store),
+            thread_state_manager.clone(),
+            outgoing.clone(),
+            Arc::clone(&thread_list_state_permit),
+            thread_processor.background_tasks.clone(),
         );
         let turn_processor = TurnRequestProcessor::new(
             auth_manager.clone(),
